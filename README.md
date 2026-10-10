@@ -61,6 +61,7 @@ provided.
 Some files that I host as examples for everyone to download :)
 
 The Communist Manifesto - bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya
+The OG SCP-106 Image - bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a
 
 ## Settings
 
