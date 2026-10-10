@@ -1,0 +1,328 @@
+"""Tests for the provider record store: TTL, republishing, withdrawal, eviction, replies and persistence."""
+import json
+import os
+import random
+import tempfile
+import threading
+import unittest
+
+from rnfs.constants import DAY, ID_LENGTH, K, PROVIDER_TTL
+from rnfs.dht.providers import ProviderStore
+
+
+def ident(n: int) -> bytes:
+    """The 16-byte ID whose big-endian value is n."""
+    return n.to_bytes(ID_LENGTH, "big")
+
+
+KEY = ident(0xABC)
+
+
+class FakeClock:
+    """A manually advanced wall clock."""
+
+    def __init__(self):
+        """Clock at an arbitrary start time; tests advance it by setting now."""
+        self.now = 1_700_000_000.0
+
+    def __call__(self) -> float:
+        """The current fake time."""
+        return self.now
+
+
+class StoreTestCase(unittest.TestCase):
+    """Base: an in-memory store with a fake clock and seeded rng."""
+
+    max_records = 1000
+
+    def setUp(self):
+        """Create the store."""
+        self.clock = FakeClock()
+        self.store = ProviderStore(self.max_records, None, clock=self.clock, rng=random.Random(1))
+
+
+class RecordTest(StoreTestCase):
+    """Storing, refreshing, expiring and withdrawing records."""
+
+    def test_store_and_list(self):
+        self.assertTrue(self.store.store(KEY, ident(1)))
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+        self.assertEqual(self.store.record_count(), 1)
+        self.assertEqual(self.store.providers(ident(5)), [])
+
+    def test_rejects_malformed_ids(self):
+        with self.assertRaises(ValueError):
+            self.store.store(b"short", ident(1))
+        with self.assertRaises(ValueError):
+            self.store.store(KEY, b"short")
+
+    def test_expires_ttl_after_last_stored(self):
+        self.store.store(KEY, ident(1))
+        self.clock.now += PROVIDER_TTL - 1
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+        self.clock.now += 1
+        self.assertEqual(self.store.providers(KEY), [])
+        self.assertEqual(self.store.for_reply(KEY), [])
+        self.assertEqual(self.store.expire(), 1)
+        self.assertEqual(self.store.record_count(), 0)
+        self.assertEqual(self.store.publisher_count(), 0)
+
+    def test_republish_extends_expiry_and_keeps_first_stored(self):
+        self.store.store(KEY, ident(1))
+        self.clock.now += 10
+        self.store.store(KEY, ident(2))
+        self.clock.now += DAY
+        self.store.store(KEY, ident(1))  # republished, but still the older record
+        self.assertEqual(self.store.providers(KEY), [ident(1), ident(2)])
+        self.clock.now += PROVIDER_TTL - 1
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+        self.assertEqual(self.store.record_count(), 2)
+
+    def test_withdraw_removes_record_and_publisher(self):
+        self.store.store(KEY, ident(1))
+        self.assertIsNotNone(self.store.first_seen(ident(1)))
+        self.assertTrue(self.store.withdraw(KEY, ident(1)))
+        self.assertFalse(self.store.withdraw(KEY, ident(1)))
+        self.assertEqual(self.store.providers(KEY), [])
+        self.assertIsNone(self.store.first_seen(ident(1)))
+
+    def test_provide_batch(self):
+        keys = [ident(100 + i) for i in range(5)]
+        self.assertEqual(self.store.provide(ident(1), keys), 5)
+        self.assertEqual(self.store.provide(ident(1), [ident(200)], withdrawn=keys[:3]), 1)
+        self.assertEqual(self.store.record_count(), 3)
+        self.assertEqual(self.store.providers(keys[0]), [])
+        self.assertEqual(self.store.providers(keys[4]), [ident(1)])
+
+    def test_providers_exclude(self):
+        self.store.store(KEY, ident(1))
+        self.store.store(KEY, ident(2))
+        self.assertEqual(self.store.providers(KEY, exclude=lambda p: p == ident(1)), [ident(2)])
+
+
+class ReplyTest(StoreTestCase):
+    """for_reply: the K/2 oldest records first, then K/2 at random from the rest."""
+
+    def fill(self, count: int):
+        """Store count providers of KEY, one second apart: ident(1) is the oldest."""
+        for i in range(1, count + 1):
+            self.store.store(KEY, ident(i))
+            self.clock.now += 1
+
+    def test_few_providers_all_listed_oldest_first(self):
+        self.fill(4)
+        self.assertEqual(self.store.for_reply(KEY), [ident(i) for i in range(1, 5)])
+
+    def test_oldest_half_then_random_half(self):
+        self.fill(50)
+        replies = [self.store.for_reply(KEY) for _ in range(30)]
+        for reply in replies:
+            self.assertEqual(len(reply), K)
+            self.assertEqual(reply[:K // 2], [ident(i) for i in range(1, K // 2 + 1)])
+            self.assertEqual(len(set(reply)), K)
+            self.assertTrue(all(p not in reply[:K // 2] for p in reply[K // 2:]))
+        # The random half varies, so later providers get listed too
+        listed = {p for reply in replies for p in reply[K // 2:]}
+        self.assertGreater(len(listed), 20)
+
+    def test_random_half_fills_up_to_k(self):
+        self.fill(K - 2)
+        self.assertEqual(sorted(self.store.for_reply(KEY)), [ident(i) for i in range(1, K - 1)])
+
+    def test_banned_and_expired_left_out(self):
+        self.fill(3)
+        self.clock.now += PROVIDER_TTL - 1.5  # ident(1) and ident(2) expired, ident(3) not
+        self.store.store(KEY, ident(4))
+        reply = self.store.for_reply(KEY, exclude=lambda p: p == ident(4))
+        self.assertEqual(reply, [ident(3)])
+
+    def test_squatters_cannot_hold_every_slot(self):
+        # Early squatters take the oldest slots, but honest later providers still appear in the random half
+        for i in range(K // 2):
+            self.store.store(KEY, ident(1000 + i))
+        self.clock.now += 1
+        honest = ident(1)
+        self.store.store(KEY, honest)
+        for i in range(30):
+            self.store.store(KEY, ident(2000 + i))
+        seen = sum(honest in self.store.for_reply(KEY) for _ in range(50))
+        self.assertGreater(seen, 0)
+
+
+class EvictionTest(StoreTestCase):
+    """When full, records of the publisher first seen most recently are evicted."""
+
+    max_records = 10
+
+    def test_new_publisher_refused_when_full(self):
+        for i in range(10):
+            self.store.store(ident(100 + i), ident(1))
+        self.assertFalse(self.store.store(KEY, ident(2)))
+        self.assertEqual(self.store.record_count(), 10)
+        self.assertIsNone(self.store.first_seen(ident(2)))
+
+    def test_newest_publisher_cannot_churn_its_own_records(self):
+        self.store.store(ident(100), ident(1))
+        self.clock.now += 1
+        for i in range(9):
+            self.store.store(ident(200 + i), ident(2))
+        self.assertFalse(self.store.store(ident(300), ident(2)))
+        self.assertEqual(self.store.providers(ident(300)), [])
+
+    def test_older_publisher_displaces_newest(self):
+        self.store.store(ident(100), ident(1))  # oldest publisher
+        self.clock.now += 1
+        for i in range(4):
+            self.store.store(ident(200 + i), ident(2))
+        self.clock.now += 1
+        for i in range(5):
+            self.store.store(ident(300 + i), ident(3))  # newest publisher
+            self.clock.now += 1
+        self.assertTrue(self.store.store(ident(101), ident(1)))
+        self.assertEqual(self.store.record_count(), 10)
+        # The newest publisher's least recently stored record went
+        self.assertEqual(self.store.providers(ident(300)), [])
+        # And again: the newest publisher keeps losing its least recently stored records
+        self.assertTrue(self.store.store(ident(201), ident(1)))
+        self.assertEqual(self.store.providers(ident(301)), [])
+
+    def test_flood_of_new_identities_displaces_only_itself(self):
+        for i in range(5):
+            self.store.store(ident(100 + i), ident(1))
+            self.store.store(ident(100 + i), ident(2))
+        self.clock.now += 1
+        accepted = sum(self.store.store(ident(500 + i), ident(10_000 + i)) for i in range(1000))
+        self.assertEqual(accepted, 0)
+        for i in range(5):
+            self.assertEqual(sorted(self.store.providers(ident(100 + i))), [ident(1), ident(2)])
+
+    def test_flood_after_honest_records_only_churns_flooders(self):
+        for i in range(6):
+            self.store.store(ident(100 + i), ident(1))
+        self.clock.now += 1
+        # Flooders fill the remaining room, then established publishers still get in by evicting them
+        for i in range(4):
+            self.store.store(ident(500 + i), ident(10_000 + i))
+            self.clock.now += 1
+        self.assertEqual(self.store.record_count(), 10)
+        for i in range(4):
+            self.assertTrue(self.store.store(ident(200 + i), ident(1)))
+        self.assertEqual(self.store.record_count(), 10)
+        self.assertEqual(self.store.publisher_count(), 1)
+        self.assertEqual(len(self.store.providers(ident(103))), 1)
+
+    def test_expired_records_make_room(self):
+        for i in range(10):
+            self.store.store(ident(100 + i), ident(1))
+        self.clock.now += PROVIDER_TTL
+        self.assertTrue(self.store.store(KEY, ident(2)))
+        self.assertEqual(self.store.record_count(), 1)
+
+
+class PersistenceTest(unittest.TestCase):
+    """Records and first-seen times survive a restart; the file is replaced atomically."""
+
+    def setUp(self):
+        """A temporary state directory."""
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "state", "providers.json")
+        self.clock = FakeClock()
+
+    def tearDown(self):
+        """Remove the state directory."""
+        self.directory.cleanup()
+
+    def open(self) -> ProviderStore:
+        """A store at self.path."""
+        return ProviderStore(100, self.path, clock=self.clock)
+
+    def test_round_trip(self):
+        store = self.open()
+        store.store(KEY, ident(1))
+        self.clock.now += 5
+        store.store(KEY, ident(2))
+        store.store(ident(7), ident(2))
+        store.save()
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), ["providers.json"])  # no temp files left
+
+        self.clock.now += 100
+        loaded = self.open()
+        self.assertEqual(loaded.providers(KEY), [ident(1), ident(2)])
+        self.assertEqual(loaded.record_count(), 3)
+        self.assertEqual(loaded.first_seen(ident(1)), store.first_seen(ident(1)))
+        self.assertEqual(loaded.first_seen(ident(2)), store.first_seen(ident(2)))
+
+    def test_first_seen_order_survives_restart(self):
+        store = ProviderStore(3, self.path, clock=self.clock)
+        store.store(ident(100), ident(1))
+        self.clock.now += 1
+        store.store(ident(101), ident(2))
+        store.store(ident(102), ident(2))
+        store.save()
+        loaded = ProviderStore(3, self.path, clock=self.clock)
+        self.assertTrue(loaded.store(ident(103), ident(1)))  # evicts a record of ident(2), the newest
+        self.assertEqual(loaded.record_count(), 3)
+        self.assertEqual(len(loaded.providers(ident(101)) + loaded.providers(ident(102))), 1)
+
+    def test_expired_records_dropped_on_load(self):
+        store = self.open()
+        store.store(KEY, ident(1))
+        store.save()
+        self.clock.now += PROVIDER_TTL
+        loaded = self.open()
+        self.assertEqual(loaded.record_count(), 0)
+        self.assertIsNone(loaded.first_seen(ident(1)))
+
+    def test_corrupt_file_starts_empty(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        self.assertEqual(self.open().record_count(), 0)
+
+    def test_save_only_when_changed(self):
+        store = self.open()
+        store.save()
+        self.assertFalse(os.path.exists(self.path))
+        store.store(KEY, ident(1))
+        store.save()
+        with open(self.path) as f:
+            self.assertEqual(len(json.load(f)["records"]), 1)
+
+
+class ThreadSafetyTest(StoreTestCase):
+    """Concurrent stores, withdrawals and replies."""
+
+    max_records = 200
+
+    def test_concurrent_use_keeps_counts_consistent(self):
+        errors = []
+
+        def worker(seed: int):
+            """A mix of operations on a small key and publisher space."""
+            r = random.Random(seed)
+            try:
+                for _ in range(3000):
+                    key, publisher = ident(r.randrange(50)), ident(1000 + r.randrange(30))
+                    action = r.random()
+                    if action < 0.6:
+                        self.store.store(key, publisher)
+                    elif action < 0.8:
+                        self.store.withdraw(key, publisher)
+                    else:
+                        self.store.for_reply(key)
+            except Exception as e:  # pragma: no cover - reported below
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        total = sum(len(self.store.providers(ident(k))) for k in range(50))
+        self.assertEqual(total, self.store.record_count())
+        self.assertLessEqual(total, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()

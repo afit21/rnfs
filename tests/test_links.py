@@ -1,0 +1,342 @@
+"""Tests for LinkPool: shared and identified links, idle close, per-link request limits and retry, with a fake RNS."""
+import threading
+import time
+import types
+import unittest
+from unittest import mock
+
+from rnfs.config import Config
+from rnfs.network import links
+
+NODE = bytes(16)
+OTHER = bytes([1]) * 16
+
+
+class FakeReceipt:
+    """Stands in for RNS.RequestReceipt."""
+
+    def __init__(self, link):
+        """Receipt for a request on link."""
+        self.link = link
+        self.request_id = bytes([len(link.requests)]) * 16
+        self.response = None
+        self.response_size = None
+        self.progress = 0.0
+
+    def get_response(self):
+        """The response."""
+        return self.response
+
+    def get_progress(self):
+        """Progress receiving the response."""
+        return self.progress
+
+
+class FakeLink:
+    """Stands in for RNS.Link: becomes active immediately; answers requests with FakeLink.responder."""
+
+    PENDING, ACTIVE, CLOSED = 0, 2, 4
+    TRAFFIC_TIMEOUT_FACTOR = 6
+    establish_delay = 0.0
+    responder = None  # function(link, path, data) -> response, SILENT, FAIL or a Stall
+    response_size = 10  # what receipts report as the response's size
+    created: list["FakeLink"] = []
+
+    def __init__(self, destination, established_callback, closed_callback):
+        """Link that establishes after establish_delay, as RNS.Link's constructor is called."""
+        self.closed_callback = closed_callback
+        self.status = FakeLink.PENDING
+        self.rtt = 0.01
+        self.establishment_timeout = 1
+        self.identities = []
+        self.requests = []
+        self.idle = 0.0
+        self.expected_rate = None
+        FakeLink.created.append(self)
+
+        def establish():
+            """Become active and report it."""
+            time.sleep(FakeLink.establish_delay)
+            if self.status == FakeLink.PENDING:
+                self.status = FakeLink.ACTIVE
+                established_callback(self)
+        threading.Thread(target=establish, daemon=True).start()
+
+    def identify(self, identity):
+        """Record the identity."""
+        self.identities.append(identity)
+
+    def teardown(self):
+        """Close the link; like RNS, the closed callback runs synchronously inside teardown."""
+        if self.status == FakeLink.CLOSED:
+            return
+        self.status = FakeLink.CLOSED
+        self.closed_callback(self)
+
+    def no_data_for(self):
+        """Seconds without data, set by tests."""
+        return self.idle
+
+    def get_mdu(self):
+        """Default MDU."""
+        return 431 if self.status == FakeLink.ACTIVE else None
+
+    def get_mtu(self):
+        """Default MTU."""
+        return 500 if self.status == FakeLink.ACTIVE else None
+
+    def get_expected_rate(self):
+        """Rate set by tests."""
+        return self.expected_rate
+
+    def request(self, path, data, response_callback=None, failed_callback=None, progress_callback=None,
+                timeout=None, max_response_size=None):
+        """Answer on another thread with FakeLink.responder."""
+        assert timeout is None, "requesters use RNS's RTT-based timeout"
+        receipt = FakeReceipt(self)
+        self.requests.append((path, data, max_response_size))
+
+        def answer():
+            """Call back like RNS would."""
+            response = FakeLink.responder(self, path, data)
+            if response is SILENT:
+                return
+            if response is FAIL:
+                failed_callback(receipt)
+                return
+            if isinstance(response, Stall):
+                # The response starts arriving, then never progresses again
+                receipt.response_size = response.size
+                receipt.progress = 0.1
+                progress_callback(receipt)
+                return
+            receipt.response = response
+            receipt.response_size = FakeLink.response_size
+            receipt.progress = 1.0
+            progress_callback(receipt)
+            response_callback(receipt)
+        threading.Thread(target=answer, daemon=True).start()
+        return receipt
+
+
+SILENT = object()  # responder result: never answer
+FAIL = object()  # responder result: RNS reports the request failed
+
+
+class Stall:
+    """Responder result: a response of size bytes starts arriving and then stops."""
+
+    def __init__(self, size: int):
+        """A stalling response of size bytes."""
+        self.size = size
+
+
+def fake_rns():
+    """A stand-in for the RNS module where every node is reachable and links are FakeLinks."""
+    return types.SimpleNamespace(
+        Link=FakeLink,
+        Destination=mock.Mock(),
+        Identity=types.SimpleNamespace(recall=lambda node_id: object()),
+        Transport=types.SimpleNamespace(await_path=lambda node_id, timeout: True, has_path=lambda node_id: True,
+                                        request_path=lambda node_id: None),
+        log=lambda *args: None, prettyhexrep=lambda b: b.hex(), LOG_INFO=4, LOG_VERBOSE=5,
+    )
+
+
+def run(test, function, timeout=5):
+    """Return function(), run on a thread so a deadlock fails the test instead of hanging it."""
+    result = []
+    thread = threading.Thread(target=lambda: result.append(function()), daemon=True)
+    thread.start()
+    thread.join(timeout)
+    test.assertFalse(thread.is_alive(), "deadlocked")
+    return result[0]
+
+
+class LinkPoolTest(unittest.TestCase):
+    """LinkPool behaviour with RNS replaced by fake_rns()."""
+
+    def setUp(self):
+        """Patch RNS in the links module and create an empty LinkPool."""
+        patcher = mock.patch.object(links, "RNS", fake_rns())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        FakeLink.created = []
+        FakeLink.establish_delay = 0.0
+        FakeLink.response_size = 10
+        FakeLink.responder = staticmethod(lambda link, path, data: True)
+        self.identity = object()
+        self.pool = links.LinkPool(self.identity, Config(link_idle_timeout=300))
+        self.addCleanup(self.pool.close_all)
+
+    def test_reuses_shared_link(self):
+        first = run(self, lambda: self.pool.get(NODE))
+        self.assertIs(run(self, lambda: self.pool.get(NODE)), first)
+        self.assertTrue(self.pool.has_link(NODE))
+        self.assertEqual(self.pool.open_nodes(), [NODE])
+
+    def test_shared_link_does_not_identify(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.assertFalse(peer.identified)
+        self.assertEqual(peer.link.identities, [])
+
+    def test_private_mode_identifies_every_link(self):
+        pool = links.LinkPool(self.identity, Config(private=True))
+        self.addCleanup(pool.close_all)
+        peer = run(self, lambda: pool.get(NODE))
+        self.assertEqual(peer.link.identities, [self.identity])
+
+    def test_concurrent_gets_open_one_link(self):
+        FakeLink.establish_delay = 0.2
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.pool.get(NODE))) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(len(FakeLink.created), 1)
+        self.assertEqual(len({id(peer) for peer in results}), 1)
+
+    def test_identified_link_is_separate(self):
+        shared = run(self, lambda: self.pool.get(NODE))
+        identified = run(self, lambda: self.pool.open_identified(NODE))
+        self.assertIsNot(identified, shared)
+        self.assertEqual(identified.link.identities, [self.identity])
+        self.pool.close_link(identified)
+        self.assertEqual(identified.link.status, FakeLink.CLOSED)
+        self.assertIs(self.pool.get(NODE), shared)
+
+    def test_close_tears_down_and_forgets(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.pool.close(NODE)
+        self.assertEqual(peer.link.status, FakeLink.CLOSED)
+        self.assertFalse(self.pool.has_link(NODE))
+        self.pool.close(NODE)  # closing again is harmless
+
+    def test_closed_link_is_forgotten(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.teardown()
+        self.assertFalse(self.pool.has_link(NODE))
+        self.assertIsNot(run(self, lambda: self.pool.get(NODE)), peer)
+
+    def test_unreachable(self):
+        links.RNS.Transport.await_path = lambda node_id, timeout: False
+        self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
+
+    def test_sweep_closes_only_idle_links(self):
+        idle = run(self, lambda: self.pool.get(NODE))
+        busy = run(self, lambda: self.pool.get(OTHER))
+        idle.link.idle = busy.link.idle = 301
+        busy.acquire(blocks=False)
+        self.assertEqual(self.pool.sweep(), 1)
+        self.assertEqual(idle.link.status, FakeLink.CLOSED)
+        self.assertEqual(busy.link.status, FakeLink.ACTIVE)
+
+    def test_sweep_keeps_recent_links(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.idle = 299
+        self.assertEqual(self.pool.sweep(), 0)
+
+    def test_request_answers(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: [path, data])
+        peer = run(self, lambda: self.pool.get(NODE))
+        exchange = run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        self.assertTrue(exchange.answered)
+        self.assertEqual(exchange.response, ["/find", b"k"])
+
+    def test_request_failure(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
+
+    def test_request_gives_up_when_link_closes(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: SILENT)
+        peer = run(self, lambda: self.pool.get(NODE))
+        threading.Timer(0.3, peer.link.teardown).start()
+        exchange = run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        self.assertFalse(exchange.answered)
+        self.assertEqual(peer.requests, 0)
+
+    def test_watchdog_stops_waiting(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: SILENT)
+        peer = run(self, lambda: self.pool.get(NODE))
+        exchange = run(self, lambda: self.pool.request(peer, "/blocks", [], blocks=True,
+                                                         watchdog=lambda ex, now: "stuck"))
+        self.assertEqual(exchange.stalled, "stuck")
+        self.assertEqual(peer.blocks, 0)
+
+    def test_false_on_identified_link_is_retried_once_after_identifying(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: False)
+        peer = run(self, lambda: self.pool.open_identified(NODE))
+        exchange = run(self, lambda: self.pool.call(peer, "/provide", [[], []]))
+        self.assertIs(exchange.response, False)
+        self.assertEqual(len(peer.link.requests), 2)
+        self.assertEqual(peer.link.identities, [self.identity, self.identity])
+
+    def test_retry_succeeds(self):
+        answers = iter([False, True])
+        FakeLink.responder = staticmethod(lambda link, path, data: next(answers))
+        peer = run(self, lambda: self.pool.open_identified(NODE))
+        self.assertIs(run(self, lambda: self.pool.call(peer, "/provide", [[], []])).response, True)
+
+    def test_false_on_unidentified_link_is_not_retried(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: False)
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.assertIs(run(self, lambda: self.pool.call(peer, "/blocks", [0, []])).response, False)
+        self.assertEqual(len(peer.link.requests), 1)
+
+
+class PeerLinkSlotsTest(unittest.TestCase):
+    """Requesters keep within MAX_REQUESTS_PER_LINK, at most one of them /blocks."""
+
+    def setUp(self):
+        """A PeerLink over an active fake link."""
+        patcher = mock.patch.object(links, "RNS", fake_rns())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.peer = links.PeerLink(NODE, identified=False, shared=True)
+        self.peer.link = types.SimpleNamespace(status=FakeLink.ACTIVE)
+
+    def test_two_requests_at_most(self):
+        self.assertTrue(self.peer.acquire(False))
+        self.assertTrue(self.peer.acquire(False))
+        self.assertFalse(self.peer.acquire(False, timeout=0.1))
+        self.peer.release(False)
+        self.assertTrue(self.peer.acquire(False, timeout=0.1))
+
+    def test_one_blocks_at_most(self):
+        self.assertTrue(self.peer.acquire(True))
+        self.assertFalse(self.peer.acquire(True, timeout=0.1))
+        self.assertTrue(self.peer.acquire(False, timeout=0.1))
+
+    def test_waiter_gets_slot_when_released(self):
+        self.peer.acquire(True)
+        got = []
+        thread = threading.Thread(target=lambda: got.append(self.peer.acquire(True, timeout=5)))
+        thread.start()
+        time.sleep(0.1)
+        self.peer.release(True)
+        thread.join(5)
+        self.assertEqual(got, [True])
+
+    def test_waiter_fails_when_link_closes(self):
+        self.peer.acquire(True)
+        got = []
+        thread = threading.Thread(target=lambda: got.append(self.peer.acquire(True)))
+        thread.start()
+        time.sleep(0.1)
+        self.peer.mark_closed()
+        thread.join(5)
+        self.assertEqual(got, [False])
+
+    def test_rate_recorded_from_large_responses_only(self):
+        exchange = links.Exchange(time.monotonic)
+        exchange.response_size, exchange.expected_rate = 1000, 5000.0
+        self.assertFalse(self.peer.record_rate(exchange, 16384))
+        exchange.response_size = 20000
+        self.assertTrue(self.peer.record_rate(exchange, 16384))
+        self.assertEqual(self.peer.rate, 5000.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

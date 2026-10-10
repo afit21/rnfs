@@ -1,0 +1,459 @@
+"""Tests for iterative DHT lookups over simulated in-memory networks of RoutingTable/ProviderStore nodes."""
+import random
+import threading
+import time
+import unittest
+
+from rnfs.config import Config
+from rnfs.constants import ID_LENGTH, K
+from rnfs.dht.lookup import Lookup
+from rnfs.dht.providers import ProviderStore
+from rnfs.dht.routing import RoutingTable, distance
+
+CONFIG = Config()
+
+
+def ident(n: int) -> bytes:
+    """The 16-byte ID whose big-endian value is n."""
+    return n.to_bytes(ID_LENGTH, "big")
+
+
+class FakeNode:
+    """A DHT server: its own routing table and provider store, answering /find as section 6 says."""
+
+    def __init__(self, node_id: bytes, clock):
+        """Empty server node_id."""
+        self.node_id = node_id
+        self.table = RoutingTable(node_id, CONFIG, clock=clock)
+        self.store = ProviderStore(10_000, None, clock=clock, rng=random.Random(node_id))
+
+    def find(self, key: bytes) -> tuple[list[bytes], list[bytes]]:
+        """The /find reply: providers, then the servers it knows closest to key."""
+        return self.store.for_reply(key), self.table.closest(key, K, for_reply=True)
+
+
+class FakeNetwork:
+    """In-memory nodes reachable by ID. IDs not in `nodes` are unreachable.
+
+    `liars` answer with no providers and only other liars as nodes; `hang` nodes block until released.
+    """
+
+    def __init__(self, count: int = 0, seed: int = 0):
+        """count servers with random IDs, each having heard every other (full buckets keep the first K)."""
+        self.rng = random.Random(seed)
+        self.now = 1_700_000_000.0
+        self.nodes: dict[bytes, FakeNode] = {}
+        self.queried: list[bytes] = []
+        self.liars: set[bytes] = set()
+        self.hang: set[bytes] = set()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        ids = [self.rng.randbytes(ID_LENGTH) for _ in range(count)]
+        for n in ids:
+            self.add(n)
+        for n in ids:
+            order = ids[:]
+            self.rng.shuffle(order)
+            for other in order:
+                self.nodes[n].table.heard(other)
+
+    def clock(self) -> float:
+        """The network's shared fake wall clock."""
+        return self.now
+
+    def add(self, n: bytes, knows: tuple[bytes, ...] = ()) -> FakeNode:
+        """Add server n that has heard the nodes in `knows`."""
+        node = self.nodes[n] = FakeNode(n, self.clock)
+        for other in knows:
+            node.table.heard(other)
+        return node
+
+    def query(self, n: bytes, key: bytes):
+        """/find sent to n: its reply, or None if unreachable."""
+        with self.lock:
+            self.queried.append(n)
+        if n in self.hang:
+            self.release.wait()
+            return None
+        node = self.nodes.get(n)
+        if node is None:
+            return None
+        if n in self.liars:
+            return [], sorted(self.liars - {n}, key=lambda m: distance(m, key))[:K]
+        return node.find(key)
+
+    def true_closest(self, key: bytes, count: int = K) -> list[bytes]:
+        """The count reachable nodes closest to key, by brute force."""
+        return sorted(self.nodes, key=lambda n: distance(n, key))[:count]
+
+    def publish(self, key: bytes, publisher: bytes):
+        """Store publisher as a provider of key at the K nodes closest to it."""
+        for n in self.true_closest(key):
+            self.nodes[n].store.store(key, publisher)
+
+
+class LookupTestCase(unittest.TestCase):
+    """Base: releases hung queries after each test, so no worker thread outlives it."""
+
+    def setUp(self):
+        """Nothing shared yet; tests build their own networks."""
+        self.networks: list[FakeNetwork] = []
+
+    def network(self, *args, **kwargs) -> FakeNetwork:
+        """A FakeNetwork whose hung queries tearDown releases."""
+        net = FakeNetwork(*args, **kwargs)
+        self.networks.append(net)
+        return net
+
+    def tearDown(self):
+        """Release hung queries."""
+        for net in self.networks:
+            net.release.set()
+
+    def lookup(self, net: FakeNetwork, key: bytes, start: list[bytes], own_id: bytes = ident(0), **kwargs) -> Lookup:
+        """A Lookup over net with short time budgets suited to tests."""
+        kwargs.setdefault("timeout", 5)
+        kwargs.setdefault("poll_interval", 0.05)
+        return Lookup(key, start, net.query, own_id, **kwargs)
+
+
+class ConvergenceTest(LookupTestCase):
+    """Lookups over larger networks find the nodes closest to the key in few queries."""
+
+    def test_find_closest_converges_in_200_nodes(self):
+        net = self.network(200, seed=1)
+        rng = random.Random(2)
+        ids = list(net.nodes)
+        for _ in range(20):
+            key = rng.randbytes(ID_LENGTH)
+            before = len(net.queried)
+            result = self.lookup(net, key, rng.sample(ids, 3)).find_closest()
+            truth = net.true_closest(key)
+            self.assertEqual(result[:3], truth[:3])  # the beta closest are always exact
+            self.assertGreaterEqual(len(set(result) & set(truth)), 8)
+            self.assertEqual(result, sorted(result, key=lambda n: distance(n, key)))
+            self.assertLess(len(net.queried) - before, 60)
+
+    def test_converges_with_alpha_1(self):
+        net = self.network(100, seed=3)
+        key = random.Random(4).randbytes(ID_LENGTH)
+        result = self.lookup(net, key, list(net.nodes)[:1], alpha=1).find_closest()
+        self.assertEqual(result[:3], net.true_closest(key, 3))
+
+    def test_publish_then_find_providers(self):
+        net = self.network(150, seed=5)
+        rng = random.Random(6)
+        ids = list(net.nodes)
+        key, publisher = rng.randbytes(ID_LENGTH), rng.randbytes(ID_LENGTH)
+        closest = self.lookup(net, key, rng.sample(ids, 2), own_id=publisher).find_closest()
+        for n in closest:
+            net.nodes[n].store.store(key, publisher)
+
+        found = []
+        result = self.lookup(net, key, rng.sample(ids, 2)).find_providers(found.append)
+        self.assertEqual(found, [publisher])
+        self.assertEqual(result, [publisher])
+
+    def test_bootstrap_join_fills_routing_table(self):
+        net = self.network(100, seed=7)
+        own = random.Random(8).randbytes(ID_LENGTH)
+        table = RoutingTable(own, CONFIG, clock=net.clock)
+        bootstrap = list(net.nodes)[:1]
+        self.lookup(net, own, bootstrap, own_id=own, on_answer=table.heard, on_failure=table.failed).find_closest()
+        # Only nodes that answered are added: at least the beta closest, which are exactly the true ones
+        self.assertGreaterEqual(table.node_count(), 3)
+        for n in net.true_closest(own, 3):
+            self.assertIn(n, table.nodes())
+
+
+class TerminationTest(LookupTestCase):
+    """beta termination, and termination when nothing new turns up."""
+
+    def test_complete_once_beta_closest_answered(self):
+        net = self.network()
+        key = ident(0x1000)
+        near = [ident(0x1001), ident(0x1002), ident(0x1003)]
+        far = [ident(0x8000 + i) for i in range(20)]
+        for n in near:
+            net.add(n, knows=far)  # they only point further away
+        for n in far:
+            net.add(n)
+        result = self.lookup(net, key, near).find_closest()
+        self.assertEqual(sorted(net.queried), near)  # far nodes never queried
+        self.assertEqual(result[:3], near)
+
+    def test_closer_node_found_later_must_answer(self):
+        net = self.network()
+        key = ident(0x1000)
+        start = [ident(0x1100), ident(0x1200), ident(0x1300)]
+        closer = ident(0x1001)
+        net.add(start[0], knows=[closer])
+        net.add(start[1])
+        net.add(start[2])
+        net.add(closer)
+        result = self.lookup(net, key, start).find_closest()
+        self.assertIn(closer, net.queried)
+        self.assertEqual(result[0], closer)
+
+    def test_ends_when_every_known_node_queried(self):
+        net = self.network()
+        a, b = ident(1), ident(2)
+        net.add(a, knows=[b])
+        net.add(b, knows=[a])
+        result = self.lookup(net, ident(100), [a]).find_closest()
+        self.assertEqual(sorted(result), [a, b])
+        self.assertEqual(sorted(net.queried), [a, b])  # each queried once
+
+    def test_no_start_nodes(self):
+        net = self.network()
+        self.assertEqual(self.lookup(net, ident(5), []).find_closest(), [])
+        self.assertEqual(self.lookup(net, ident(5), []).find_providers(lambda p: None), [])
+
+    def test_never_queries_itself(self):
+        net = self.network()
+        own, other = ident(7), ident(1)
+        net.add(other, knows=[own])
+        net.add(own)
+        self.lookup(net, ident(100), [other, own], own_id=own).find_closest()
+        self.assertNotIn(own, net.queried)
+
+    def test_slow_far_node_does_not_delay_completion(self):
+        net = self.network()
+        key = ident(0x1000)
+        near = [ident(0x1001), ident(0x1002), ident(0x1003)]
+        slow = ident(0x9000)
+        for n in near:
+            net.add(n)
+        net.add(slow)
+        net.hang.add(slow)
+        started = time.monotonic()
+        # alpha 4 so the slow node is queried in the first round alongside the near ones
+        result = self.lookup(net, key, near + [slow], alpha=4, timeout=30).find_closest()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(result, near)
+
+
+class FailureTest(LookupTestCase):
+    """Nodes that don't answer are dropped from the lookup and reported."""
+
+    def test_unreachable_dropped_and_reported(self):
+        net = self.network()
+        alive, dead = ident(1), ident(2)
+        net.add(alive, knows=[dead])
+        answered, failed = [], []
+        result = self.lookup(net, ident(3), [alive], on_answer=answered.append,
+                             on_failure=failed.append).find_closest()
+        self.assertEqual(result, [alive])
+        self.assertEqual(answered, [alive])
+        self.assertEqual(failed, [dead])
+
+    def test_exceptions_and_malformed_replies_count_as_failures(self):
+        good, broken, garbage = ident(1), ident(2), ident(3)
+
+        def query(n, key):
+            """broken raises, garbage replies with something that isn't a /find reply."""
+            if n == broken:
+                raise RuntimeError("boom")
+            if n == garbage:
+                return "nonsense"
+            return [b"bad id", ident(50)], [b"x" * 3, ident(1)]
+
+        failed, found = [], []
+        lookup = Lookup(ident(9), [good, broken, garbage], query, ident(0), on_failure=failed.append,
+                        poll_interval=0.05)
+        self.assertEqual(lookup.find_providers(found.append), [ident(50)])
+        self.assertEqual(sorted(failed), [broken, garbage])
+        self.assertEqual(lookup.closest_answered(), [good])
+
+    def test_failures_drop_nodes_from_routing_table(self):
+        net = self.network()
+        own = ident(0)
+        table = RoutingTable(own, Config(max_failures=1), clock=net.clock)
+        dead = ident(5)
+        table.heard(dead)
+        self.lookup(net, ident(6), table.closest(ident(6)), own_id=own, on_failure=table.failed).find_closest()
+        # Reported from the worker thread; it has finished by the time the lookup saw the failure
+        self.assertFalse(table.contains(dead))
+
+    def test_excluded_nodes_not_queried(self):
+        net = self.network()
+        a, banned = ident(1), ident(2)
+        net.add(a, knows=[banned])
+        net.add(banned)
+        self.lookup(net, ident(3), [a], exclude=lambda n: n == banned).find_closest()
+        self.assertEqual(net.queried, [a])
+
+
+class UnknownIdTest(LookupTestCase):
+    """IDs whose identity isn't known cost a path request: at most alpha are tried per lookup."""
+
+    def test_at_most_alpha_unknown_ids_tried(self):
+        net = self.network()
+        honest = ident(1)
+        fakes = [ident(0x100 + i) for i in range(20)]  # mentioned in a reply, never announced
+        net.add(honest, knows=[])
+
+        def query(n, key):
+            """honest lists 10 fake IDs; fakes are unreachable."""
+            net.queried.append(n)
+            return ([], fakes[:K]) if n == honest else None
+
+        lookup = Lookup(ident(0x100), [honest], query, ident(0), alpha=3,
+                        is_known=lambda n: n not in fakes, poll_interval=0.05)
+        lookup.find_closest()
+        tried = [n for n in net.queried if n in fakes]
+        self.assertEqual(len(tried), 3)
+
+    def test_budget_shared_with_providers(self):
+        lookup = Lookup(ident(1), [], lambda n, k: None, ident(0), alpha=2, is_known=lambda n: n == ident(9))
+        self.assertTrue(lookup.allow_unknown(ident(9)))  # known: free
+        self.assertTrue(lookup.allow_unknown(ident(5)))
+        self.assertTrue(lookup.allow_unknown(ident(5)))  # charged once
+        self.assertTrue(lookup.allow_unknown(ident(6)))
+        self.assertFalse(lookup.allow_unknown(ident(7)))
+        self.assertTrue(lookup.allow_unknown(ident(9)))
+
+
+class TimeoutTest(LookupTestCase):
+    """The time budget bounds a lookup even when every query hangs."""
+
+    def test_hung_queries_do_not_block_past_deadline(self):
+        net = self.network()
+        nodes = [ident(i) for i in range(1, 6)]
+        for n in nodes:
+            net.add(n)
+            net.hang.add(n)
+        started = time.monotonic()
+        result = self.lookup(net, ident(100), nodes, timeout=0.2).find_closest()
+        self.assertLess(time.monotonic() - started, 1)
+        # Queried nodes that never answered are left out; the rest are known but untried
+        self.assertEqual(len(net.queried), 3)
+        self.assertEqual(result, [n for n in nodes if n not in net.queried])
+
+    def test_partial_result_at_timeout(self):
+        net = self.network()
+        answering, hung = ident(1), ident(0x10)
+        net.add(answering, knows=[hung])
+        net.add(hung)
+        net.hang.add(hung)
+        result = self.lookup(net, ident(0x10), [answering], timeout=0.2).find_closest()
+        self.assertEqual(result, [answering])
+
+    def test_rerun_shares_the_deadline(self):
+        clock = [0.0]
+        lookup = Lookup(ident(1), [ident(2)], lambda n, k: ([], []), ident(0), timeout=10,
+                        clock=lambda: clock[0])
+        self.assertEqual(lookup.find_closest(), [ident(2)])
+        self.assertEqual(lookup.remaining(), 10)
+        clock[0] = 11
+        calls = []
+        lookup.query = lambda n, k: calls.append(n)
+        lookup.find_providers(lambda p: None)
+        self.assertEqual(calls, [])  # budget spent: nothing sent
+        self.assertEqual(lookup.remaining(), 0)
+
+
+class FindProvidersTest(LookupTestCase):
+    """Provider search: reports as found, doesn't stop early, resists hiding, stops when told."""
+
+    def setUp(self):
+        """A 100-node network and a key."""
+        super().setUp()
+        self.net = self.network(100, seed=11)
+        self.key = random.Random(12).randbytes(ID_LENGTH)
+        self.closest = self.net.true_closest(self.key)
+        self.start = [n for n in self.net.nodes if n not in self.closest][:3]
+
+    def test_does_not_stop_at_first_reply_listing_providers(self):
+        # Each provider is recorded at a different near node, so no single reply lists them all
+        providers = [ident(0x500 + i) for i in range(3)]
+        for node, provider in zip(self.closest[:3], providers):
+            self.net.nodes[node].store.store(self.key, provider)
+        found = []
+        self.lookup(self.net, self.key, self.start).find_providers(found.append)
+        self.assertEqual(sorted(found), providers)
+
+    def test_on_provider_called_as_soon_as_found(self):
+        provider = ident(0x500)
+        self.net.publish(self.key, provider)
+        events = []
+        lookup = self.lookup(self.net, self.key, self.start)
+        lookup.find_providers(lambda p: events.append(("provider", len(self.net.queried))))
+        self.assertEqual(len(events), 1)
+        self.assertLess(events[0][1], len(self.net.queried))  # reported before the lookup finished
+
+    def test_closest_node_hiding_content_does_not_stop_search(self):
+        provider = ident(0x500)
+        self.net.publish(self.key, provider)
+        liar = self.closest[0]
+        self.net.liars.add(liar)
+        self.net.nodes[liar].store.withdraw(self.key, provider)
+        found = []
+        self.lookup(self.net, self.key, self.start).find_providers(found.append)
+        self.assertIn(liar, self.net.queried)
+        self.assertEqual(found, [provider])
+
+    def test_several_liars_near_key_do_not_hide_content(self):
+        provider = ident(0x500)
+        self.net.publish(self.key, provider)
+        for liar in self.closest[:2]:  # fewer than beta
+            self.net.liars.add(liar)
+            self.net.nodes[liar].store.withdraw(self.key, provider)
+        found = []
+        self.lookup(self.net, self.key, self.start).find_providers(found.append)
+        self.assertEqual(found, [provider])
+
+    def test_should_stop_ends_search(self):
+        for i in range(3):
+            self.net.publish(self.key, ident(0x500 + i))
+        found = []
+        self.lookup(self.net, self.key, self.start).find_providers(found.append, should_stop=lambda: len(found) >= 1)
+        self.assertGreaterEqual(len(found), 1)
+        queries = len(self.net.queried)
+        full = []
+        self.lookup(self.net, self.key, self.start).find_providers(full.append)
+        self.assertLess(queries, len(self.net.queried) - queries)  # stopped earlier than a full search
+
+    def test_stop_wakes_a_waiting_search(self):
+        hung = ident(0x7)
+        self.net.add(hung)
+        self.net.hang.add(hung)
+        done = threading.Event()
+        lookup = Lookup(self.key, [hung], self.net.query, ident(0), timeout=30, poll_interval=30)
+        started = time.monotonic()
+
+        def stop_soon():
+            """Flip should_stop from another thread, as the fetcher does when the root arrives."""
+            time.sleep(0.05)
+            done.set()
+            lookup.stop()
+
+        threading.Thread(target=stop_soon).start()
+        lookup.find_providers(lambda p: None, should_stop=done.is_set)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_excluded_providers_not_reported(self):
+        good, banned = ident(0x500), ident(0x501)
+        self.net.publish(self.key, good)
+        self.net.publish(self.key, banned)
+        found = []
+        self.lookup(self.net, self.key, self.start, exclude=lambda n: n == banned).find_providers(found.append)
+        self.assertEqual(found, [good])
+
+    def test_rerun_gives_fresh_random_half(self):
+        many = [ident(0x1000 + i) for i in range(40)]
+        holder = self.closest[0]
+        for i, provider in enumerate(many):
+            self.net.nodes[holder].store.store(self.key, provider)
+            self.net.now += 1  # distinct first-stored times
+        lookup = self.lookup(self.net, self.key, self.start)
+        first = lookup.find_providers(lambda p: None)
+        self.assertEqual(len(first), K)
+        second = lookup.find_providers(lambda p: None)
+        self.assertTrue(second)  # new providers from the random half
+        self.assertFalse(set(first) & set(second))  # already reported ones aren't reported again
+        self.assertIn(holder, self.net.queried[len(self.net.queried) - 20:])  # re-queried
+
+
+if __name__ == "__main__":
+    unittest.main()
