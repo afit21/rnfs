@@ -1,4 +1,4 @@
-# rnfs
+# RNFS - Reticulum Network File System
 
 Content-addressed file sharing over [Reticulum](https://reticulum.network) (RNS), with the functional
 features of IPFS: content IDs, chunked files and directories, a provider DHT, verified multi-source
