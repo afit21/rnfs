@@ -56,6 +56,12 @@ It supports byte ranges and directory listings, and serves a directory's `index.
 Pages are sandboxed by a Content-Security-Policy. Content fetched for the gateway is cached but never
 provided.
 
+## Sample Files
+
+Some files that I host as examples for everyone to download :)
+
+The Communist Manifesto - bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya
+
 ## Settings
 
 `<rnfs dir>/rnfs.toml` sets any local setting from specification section 12 (times in seconds, sizes in
