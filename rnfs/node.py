@@ -53,6 +53,15 @@ def _rns_is_known(node_id: bytes) -> bool:
     return RNS.Identity.recall(node_id) is not None
 
 
+def _warn_unused_reticulum_config(config: Config):
+    """Warn about a Reticulum config left in the rnfs dir by earlier versions, which used it as RNS's configdir."""
+    leftover = os.path.join(config.root, "config")
+    in_use = os.path.realpath(RNS.Reticulum.configdir) == os.path.realpath(config.root)
+    if os.path.isfile(leftover) and not in_use:
+        log(f"ignoring the Reticulum config in {leftover}: Reticulum now uses {RNS.Reticulum.configdir}. "
+            f"Set reticulum_dir (or --rnsconfig) to {config.root} to keep using it, or delete it", LOG_WARNING)
+
+
 class _NamePins:
     """The pins NameManager uses: storage pins that also update what the node provides."""
 
@@ -126,8 +135,12 @@ class RnfsNode:
         # Refuse compressed Resources and stop compressing ours (section 3); the server sets it too
         RNS.Resource.AUTO_COMPRESS_MAX_SIZE = 0
         guards.install()  # reject oversized Resource advertisements before RNS allocates for them
-        # configdir is the rnfs dir; RNS attaches to a shared instance (rnsd) if the config shares one
-        self.reticulum = RNS.Reticulum(configdir=config.root, verbosity=config.verbosity or None)
+        # By default this is RNS's own config directory, the one rnsd uses: attaching to a shared instance needs
+        # its RPC key, which RNS derives from the transport identity stored in that directory (section 3)
+        self.reticulum = RNS.Reticulum(configdir=config.reticulum_root, verbosity=config.verbosity or None)
+        log(f"Reticulum config in {RNS.Reticulum.configdir}"
+            + (", attached to a shared instance" if self.reticulum.is_connected_to_shared_instance else ""))
+        _warn_unused_reticulum_config(config)
         self.identity = load_or_create_identity(config.identity_path)
         self.destination = RNS.Destination(self.identity, RNS.Destination.IN, RNS.Destination.SINGLE,
                                            APP_NAME, DHT_ASPECT)

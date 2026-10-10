@@ -1,0 +1,27 @@
+# systemd user unit for the rnfs daemon.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/rnfs.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rnfs
+#   journalctl --user -u rnfs -f          # logs
+#
+# To keep it running while you're logged out: loginctl enable-linger $USER
+# ExecStart assumes `pipx install` (which puts rnfs in ~/.local/bin); adjust the path otherwise.
+
+[Unit]
+Description=rnfs: content-addressed file sharing over Reticulum
+# Start after rnsd if it also runs as a user service, so rnfs attaches to it rather than starting its own instance
+After=rnsd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rnfs daemon
+Restart=on-failure
+RestartSec=10
+# The daemon shuts down cleanly on SIGTERM, saving provider records and RNS state
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

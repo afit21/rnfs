@@ -19,7 +19,10 @@ SETTINGS_FILE = "rnfs.toml"
 class Config:
     """Settings for an RnfsNode."""
 
-    rnfs_dir: str = "~/.rnfs/"  # Reticulum config, identity, blocks, pins, names and shared folder live here
+    rnfs_dir: str = "~/.rnfs/"  # identity, blocks, pins, names and shared folder live here
+    # Reticulum config directory. None uses RNS's own default (/etc/reticulum, ~/.config/reticulum or
+    # ~/.reticulum), which is the one rnsd uses, so rnfs attaches to the shared instance with its RPC key
+    reticulum_dir: str | None = None
     api_port: int = DEFAULT_API_PORT
     gateway_port: int = DEFAULT_GATEWAY_PORT
     bootstrap_nodes: list[str] = field(default_factory=list)  # node IDs (hex) queried at startup
@@ -68,6 +71,11 @@ class Config:
     def root(self) -> str:
         """rnfs_dir with ~ expanded."""
         return os.path.expanduser(self.rnfs_dir)
+
+    @property
+    def reticulum_root(self) -> str | None:
+        """reticulum_dir with ~ expanded, or None for RNS's default config directory."""
+        return os.path.expanduser(self.reticulum_dir) if self.reticulum_dir else None
 
     @property
     def identity_path(self) -> str:

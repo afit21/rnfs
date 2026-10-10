@@ -161,7 +161,8 @@ def run_daemon(args):
     from rnfs.node import RnfsNode
 
     try:
-        config = Config.load(args.dir, api_port=args.api_port, gateway_port=args.gateway_port,
+        config = Config.load(args.dir, reticulum_dir=args.rnsconfig,
+                             api_port=args.api_port, gateway_port=args.gateway_port,
                              bootstrap_nodes=args.bootstrap, verbosity=args.verbose or None,
                              dht_mode=args.dht_mode, slow=args.slow, private=args.private,
                              provide_strategy=args.provide_strategy,
@@ -472,6 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--bootstrap", nargs="+", action="extend", metavar="NODE_ID",
                         help="node IDs (hex) to join the DHT through")
     daemon.add_argument("--gateway-port", type=int, help="gateway port (default 8789)")
+    daemon.add_argument("--rnsconfig", metavar="DIR",
+                        help="Reticulum config directory (default: RNS's own, the one rnsd uses)")
     daemon.add_argument("--dht-mode", choices=["server", "client"])
     daemon.add_argument("--slow", choices=["yes", "no", "auto"])
     daemon.add_argument("--private", action="store_true", default=None, help="private mode: members only")

@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MAIN = os.path.join(ROOT, "main.py")
+MAIN = os.path.join(ROOT, "rnfs.py")
 MISSING_CID = "bafkreidhtnhwyqkmbhxvp2mrery66f4kpdsfbxew3qrfqrbtwbs6zb5zce"  # content no node has
 
 HUB_CONFIG = """
@@ -109,7 +109,7 @@ class Daemon:
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 [sys.executable, MAIN, "--dir", self.dir, "--api-port", str(self.api_port), "daemon",
-                 "--gateway-port", str(self.gateway_port), *extra],
+                 "--rnsconfig", self.dir, "--gateway-port", str(self.gateway_port), *extra],
                 stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "PYTHONUNBUFFERED": "1"})
         self.node_id = wait_for(self.status, 30, f"{name} daemon to start")["node_id"]
 

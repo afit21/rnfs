@@ -6,20 +6,44 @@ transfer, pinning, mutable names and a local HTTP gateway. It is built to work o
 such as LoRa as well as over TCP. [specification.md](specification.md) describes the protocol and
 [design.md](design.md) describes the code layout.
 
-## Setup
+## Install
 
-Requires Python 3.11+ and RNS 1.5.6:
+Requires Python 3.11+. Install with [pipx](https://pipx.pypa.io), which puts an `rnfs` command on your PATH
+and installs RNS alongside it:
 
 ```
+pipx install git+https://github.com/afit21/rnfs
+rnfs daemon
+```
+
+To upgrade later: `pipx upgrade rnfs`. Plain `pip install git+https://github.com/afit21/rnfs` works too.
+
+**From a checkout**, without installing:
+
+```
+git clone https://github.com/afit21/rnfs && cd rnfs
 pip install -r requirements.txt
-python3 main.py daemon            # or: python3 -m rnfs daemon
+python3 rnfs.py daemon            # or: python3 -m rnfs daemon
 ```
 
-The daemon keeps everything in its rnfs directory (`--dir`, default `~/.rnfs/`):
+`pip install -e .` in a checkout installs the `rnfs` command and runs your working copy.
+
+**As a background service** (Linux, systemd): see [contrib/rnfs.service](contrib/rnfs.service), a user unit
+that starts `rnfs daemon` at login, after `rnsd` if that is a user service too.
+
+The examples below use `rnfs`; from a checkout, use `python3 rnfs.py` instead.
+
+## Reticulum and data directories
+
+rnfs uses Reticulum's own config directory, the one `rnsd` and other RNS programs use (`/etc/reticulum`,
+`~/.config/reticulum` or `~/.reticulum`, whichever exists first). If `rnsd` is running, rnfs attaches to it
+as a shared instance; otherwise it starts Reticulum itself from that config. To use a different Reticulum
+config, pass `daemon --rnsconfig DIR` or set `reticulum_dir` in `rnfs.toml`.
+
+Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`):
 
 | Path | Contents |
 |---|---|
-| `config` | Reticulum config. RNS writes a default config on first start. If `share_instance` is on and `rnsd` is running, rnfs attaches to it |
 | `rnfs.toml` | rnfs settings (see below) |
 | `storage/identity` | the node's RNS identity; the node ID is derived from it |
 | `blocks/`, `state/` | block store; pins, cache records, provider records, publish state, names' sequences |
@@ -32,8 +56,8 @@ Every command except `daemon` talks to a running daemon through its local API (`
 Paths are resolved by the CLI and read or written by the daemon.
 
 ```
-rnfs daemon [--bootstrap NODE_ID…] [--gateway-port N] [--dht-mode server|client] [--slow yes|no|auto]
-            [--private] [--provide-strategy pinned|roots] [--no-gateway-scripts] [-v|-vv]
+rnfs daemon [--bootstrap NODE_ID…] [--rnsconfig DIR] [--gateway-port N] [--dht-mode server|client]
+            [--slow yes|no|auto] [--private] [--provide-strategy pinned|roots] [--no-gateway-scripts] [-v|-vv]
 rnfs add PATH|- [--wrap] [--only-hash] [--name NAME]   # import and pin; prints the CID
 rnfs get CID[/PATH] [-o OUT] [--from NODE_ID]          # fetch and write out a file or directory
 rnfs cat CID[/PATH] [--offset N] [--length N]          # fetch (only the chunks needed) to stdout
@@ -58,10 +82,15 @@ provided.
 
 ## Sample Files
 
-Some files that I host as examples for everyone to download :)
+Some files that I host as examples for everyone to download
 
 The Communist Manifesto - bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya
+
 The OG SCP-106 Image - bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a
+
+The Amity Afflication Born to die MP3 - bagaibqabciqcuiju6b2uajh4cwzbgnpzoa42j2ptl27fg2a6gqft6ejq4weftfi
+
+rockyou.txt in a .zip file - bagaibqabciqp26agunewwmavivqgwv3c53xvnxdn7vpz4rdknjlfai72zszhdza
 
 ## Settings
 
@@ -84,15 +113,15 @@ republish_interval = 86400        # must be < PROVIDER_TTL / 2 (3.5 days)
 
 ## Running several nodes on one machine
 
-Give each daemon its own `--dir`, `--api-port` and `--gateway-port`, and connect their Reticulum instances.
-For example, start one daemon whose `config` has a `TCPServerInterface` with `enable_transport = Yes`. Start
+Give each daemon its own `--dir`, `--api-port`, `--gateway-port` and Reticulum config (`--rnsconfig`), and
+connect their Reticulum instances. For example, start one daemon whose Reticulum `config` has a `TCPServerInterface` with `enable_transport = Yes`. Start
 the others with a `TCPClientInterface` to it, `share_instance = No`, and `--bootstrap <first node ID>`
 (`status` prints a node ID). Then pass `--api-port` to target a particular daemon:
 
 ```
-python3 main.py --dir /tmp/a --api-port 9001 daemon --gateway-port 9101 --bootstrap <hub id>
-python3 main.py --dir /tmp/a --api-port 9001 add somefile
-python3 main.py --dir /tmp/b --api-port 9002 get <cid> -o out
+rnfs --dir /tmp/a --api-port 9001 daemon --rnsconfig /tmp/a --gateway-port 9101 --bootstrap <hub id>
+rnfs --dir /tmp/a --api-port 9001 add somefile
+rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
 `tests/test_e2e.py` sets up exactly this, with short intervals in each node's `rnfs.toml`.

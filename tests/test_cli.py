@@ -123,7 +123,7 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "False", result.stderr)
 
     def test_entry_points(self):
-        for argv in ([sys.executable, "main.py", "--help"], [sys.executable, "-m", "rnfs", "--help"]):
+        for argv in ([sys.executable, "rnfs.py", "--help"], [sys.executable, "-m", "rnfs", "--help"]):
             result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("daemon", result.stdout)

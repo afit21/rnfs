@@ -8,7 +8,8 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 - `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes.
 - `rnfs/config.py` — `Config`: every local setting (section 12), paths under `<rnfs dir>`, and the
   `effective_*` helpers for settings that depend on slow nodes or links. Loaded from
-  `<rnfs dir>/rnfs.toml` plus command-line overrides.
+  `<rnfs dir>/rnfs.toml` plus command-line overrides. Reticulum is started from `reticulum_dir`, by default
+  RNS's own config directory, so the node attaches to `rnsd` with the matching RPC key.
 - `rnfs/errors.py` — `RnfsError` and subclasses `InvalidDag`, `NotFound`, `TooLarge`, `StorageFull`, `Busy`.
 - `rnfs/content/cid.py` — `Cid` (binary form `.binary`, `.codec` `RAW`/`DAG`, `.key` DHT key, `.verify(block)`,
   `str()` written form, `Cid.parse`, `Cid.from_bytes`, `Cid.for_block`). Code passes `Cid` objects everywhere;
