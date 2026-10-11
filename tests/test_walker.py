@@ -5,12 +5,13 @@ import tempfile
 import unittest
 from unittest import mock
 
-from rnfs import constants
+from rnfs import constants, fsutil
 from rnfs.content import builder, dag, walker
 from rnfs.content.cid import DAG, EMPTY_DIRECTORY, RAW, Cid
 from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, IndexNode
 from rnfs.content.walker import Expect, root_expect
 from rnfs.errors import InvalidDag, NotFound, TooLarge
+from tests.support import POSIX_MODES
 
 
 class Blocks(dict):
@@ -269,6 +270,27 @@ class WalkTest(unittest.TestCase):
         parts = walker.range_children(root_expect(node), blocks[node], 3, 5)
         self.assertEqual([(e.cid, o, n) for e, o, n in parts], [(a, 3, 1), (b, 0, 2), (a, 0, 2)])
 
+    def test_range_children_skip_empty_children(self):
+        blocks = Blocks()
+        a, empty = blocks.raw(b"aaaa"), blocks.raw(b"")
+        node = blocks.node(FileNode([Child(a, 4), Child(empty, 0), Child(empty, 0), Child(a, 4)]))
+        parts = walker.range_children(root_expect(node), blocks[node], 0, 8)
+        self.assertEqual([(e.cid, o, n) for e, o, n in parts], [(a, 0, 4), (a, 0, 4)])
+
+    def test_small_chunks_count_against_max_entries(self):
+        # A file of 256 × 256 one-byte chunks: tiny on disk, but each byte costs a whole chunk's work
+        blocks = Blocks()
+        cid, size = blocks.raw(b"x"), 1
+        for _ in range(2):
+            cid, size = blocks.node(FileNode([Child(cid, size)] * 256)), size * 256
+        with self.assertRaises(TooLarge):
+            b"".join(walker.read_range(root_expect(cid), blocks.get, small=walker.SmallLeaves(1000)))
+        # Full chunks are free, and a range has at most two short pieces at its ends
+        built = builder.build_bytes(os.urandom(5 * constants.CHUNK_SIZE), blocks.put)
+        data = b"".join(walker.read_range(root_expect(built.cid), blocks.get, 10, 3 * constants.CHUNK_SIZE,
+                                          small=walker.SmallLeaves(0)))
+        self.assertEqual(len(data), 3 * constants.CHUNK_SIZE)
+
     def test_resolve_through_index(self):
         with small_tree():
             blocks = Blocks()
@@ -374,8 +396,9 @@ class WriteOutTest(unittest.TestCase):
             with open(os.path.join(dest, name), "rb") as f:
                 self.assertEqual(f.read(), data)
         self.assertTrue(os.path.isdir(os.path.join(dest, "sub", "empty")))
-        self.assertTrue(os.stat(os.path.join(dest, "run")).st_mode & stat.S_IXUSR)
-        self.assertFalse(os.stat(os.path.join(dest, "a.txt")).st_mode & stat.S_IXUSR)
+        if POSIX_MODES:  # Windows has no execute bit to keep
+            self.assertTrue(os.stat(os.path.join(dest, "run")).st_mode & stat.S_IXUSR)
+            self.assertFalse(os.stat(os.path.join(dest, "a.txt")).st_mode & stat.S_IXUSR)
         self.assertEqual(builder.add_path(dest, builder.NO_PUT)[0].cid, built.cid)
 
     def test_write_file_and_executable_target(self):
@@ -383,9 +406,21 @@ class WriteOutTest(unittest.TestCase):
         wrapped = builder.wrap("x", built, self.blocks.put)
         target = walker.resolve(wrapped.cid, ["x"], self.blocks.get)
         walker.write_out(target, self.blocks.get, self.path("x"), 10)
-        self.assertTrue(os.stat(self.path("x")).st_mode & stat.S_IXUSR)
+        if POSIX_MODES:
+            self.assertTrue(os.stat(self.path("x")).st_mode & stat.S_IXUSR)
         walker.write_out(root_expect(built.cid), self.blocks.get, self.path("plain"), 10)
         with open(self.path("plain"), "rb") as f:
+            self.assertEqual(f.read(), b"#!")
+
+    def test_windows_writes_executables_without_chmod(self):
+        # os.chmod on Windows only sets or clears read-only; write_out mustn't rely on it there
+        built = builder.build_bytes(b"#!", self.blocks.put, kind=dag.KIND_EXECUTABLE)
+        wrapped = builder.wrap("x", built, self.blocks.put)
+        target = walker.resolve(wrapped.cid, ["x"], self.blocks.get)
+        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod:
+            walker.write_out(target, self.blocks.get, self.path("x"), 10)
+        chmod.assert_not_called()
+        with open(self.path("x"), "rb") as f:
             self.assertEqual(f.read(), b"#!")
 
     def test_refuses_existing_destination(self):
@@ -406,6 +441,18 @@ class WriteOutTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(self.path("ok", "d9", "d9", "d9")))
         self.assertEqual(list(self.blocks.reads.values()), [1, 1, 1, 1])  # each block read once
 
+    def test_small_chunk_bomb_stops_write(self):
+        cid, size = self.blocks.raw(b"x"), 1
+        for _ in range(2):
+            cid, size = self.blocks.node(FileNode([Child(cid, size)] * 256)), size * 256
+        root = self.blocks.node(DirectoryNode([Entry("bomb", cid, size, 0)]))
+        with self.assertRaises(TooLarge):
+            walker.write_out(root_expect(root), self.blocks.get, self.path("out"), 1000)
+        # Many small honest files are fine: each has one short chunk, and entries are within max_entries
+        small = [Entry(f"f{i}", self.blocks.raw(b"%d" % i), len(b"%d" % i), 0) for i in range(50)]
+        honest = builder.build_directory(small, self.blocks.put)
+        self.assertEqual(walker.write_out(root_expect(honest.cid), self.blocks.get, self.path("ok"), 50), [])
+
     def test_skips_names_the_filesystem_would_misread(self):
         a = builder.build_bytes(b"a", self.blocks.put)
         root = builder.build_directory([Entry("bad", a.cid, 1, 0), Entry("good", a.cid, 1, 0)], self.blocks.put)
@@ -422,6 +469,15 @@ class WriteOutTest(unittest.TestCase):
             self.assertIsNotNone(walker.unsafe_name_reason(name))
         with mock.patch.object(os, "altsep", "\\"):
             self.assertIsNotNone(walker.unsafe_name_reason("a\\b"))
+        windows_only = ("a:b", "con", "NUL.txt", "lpt1.tar.gz", "com\u00b9", "trailing.", "trailing ", "a?b", "a\\b")
+        with mock.patch.object(fsutil, "IS_WINDOWS", True):
+            self.assertIsNone(walker.unsafe_name_reason("fine name.txt"))
+            self.assertIsNone(walker.unsafe_name_reason("console.log"))
+            for name in windows_only:
+                self.assertIsNotNone(walker.unsafe_name_reason(name), name)
+        if not fsutil.IS_WINDOWS and os.sep == "/":
+            for name in windows_only:
+                self.assertIsNone(walker.unsafe_name_reason(name), name)
 
     def test_invalid_dag_stops_write(self):
         chunk = self.blocks.raw(b"abcd")

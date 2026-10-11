@@ -28,6 +28,7 @@ from rnfs.content.cid import Cid
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
 from rnfs.network.identity import node_id_for_identity
+from rnfs import mesh
 
 SLOW_POOL = "slow"
 FAST_POOL = "fast"
@@ -109,6 +110,8 @@ class Response:
         self.untracked = False  # RNS internals unavailable: can only be cancelled by closing the link
         self.concluded = False  # its Resource's conclusion has been handled
         self.finished = False
+        self.charged = 0  # bytes of upload_budget charged and not yet settled (refunded, or kept once sent)
+        self.requester: bytes | None = None  # identity hash (else link ID) whose budget share it counts against
 
     def throughput(self, now: float) -> float:
         """Bytes per second sent so far."""
@@ -169,13 +172,14 @@ class ResponsePools:
 class _LinkState:
     """Requests in progress on one incoming link."""
 
-    __slots__ = ("requests", "blocks", "last_active")
+    __slots__ = ("requests", "blocks", "last_active", "waiting")
 
     def __init__(self, now: float):
         """A link with nothing in progress, active now."""
         self.requests = 0
         self.blocks = 0
         self.last_active = now
+        self.waiting = False  # a /blocks request is waiting for the previous response's proof
 
 
 class IncomingLinks:
@@ -232,6 +236,22 @@ class IncomingLinks:
                 state.blocks += 1
             state.last_active = self.clock()
             return True
+
+    def start_waiting(self, link_id: bytes) -> bool:
+        """Let one /blocks request on link_id wait for the previous response to conclude. False if one already is."""
+        with self.lock:
+            state = self.links.get(link_id)
+            if state is None or state.waiting:
+                return False
+            state.waiting = True
+            return True
+
+    def stop_waiting(self, link_id: bytes):
+        """The waiting /blocks request on link_id has stopped waiting."""
+        with self.lock:
+            state = self.links.get(link_id)
+            if state is not None:
+                state.waiting = False
 
     def finish_request(self, link_id: bytes, blocks: bool):
         """A request (for /blocks: its response) on link_id has finished."""
@@ -296,7 +316,8 @@ class RequestServer:
     """Registers rnfs.dht's request handlers and answers them within every section 3 limit."""
 
     def __init__(self, destination: RNS.Destination, config: Config, backend: Backend,
-                 clock: Callable[[], float] = time.monotonic, start_monitor: bool = True):
+                 clock: Callable[[], float] = time.monotonic, start_monitor: bool = True,
+                 traffic: mesh.Traffic | None = None):
         """Start answering requests to destination from backend."""
         self.destination = destination
         self.config = config
@@ -305,6 +326,12 @@ class RequestServer:
         self.pools = ResponsePools(config.max_blocks_responses, config.deadline_slack, clock)
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
+        # mesh: airtime controls on /blocks and the traffic counters (shared with the client by the node)
+        self.airtime = mesh.AirtimePolicy(config, clock)
+        self.traffic = traffic if traffic is not None else mesh.Traffic()
+        warning = mesh.shared_instance_warning(config, RNS.Reticulum.get_instance())
+        if warning:
+            log(warning, LOG_WARNING)
         self.rates = rates.RateEstimates(config.min_rate_sample)
         self.links: dict[bytes, RNS.Link] = {}
         self.watched: set[bytes] = set()  # links whose outgoing Resource registrations we see
@@ -326,6 +353,10 @@ class RequestServer:
             BLOCKS_PATH: self._handle_blocks,
             PIN_PATH: self._handle_pin,
         }
+        # Paths added by features (rnfs.features: Feature.requests), within the same per-link limit
+        for path, handler in getattr(backend, "feature_requests", dict)().items():
+            if path not in handlers:
+                handlers[path] = self._feature_handler(handler)
         for path, handler in handlers.items():
             # ALLOW_ALL: private mode is checked inside the handler, since ALLOW_LIST drops refusals silently
             destination.register_request_handler(path, response_generator=self._guarded(handler),
@@ -445,6 +476,19 @@ class RequestServer:
         finally:
             self.incoming.finish_request(link_id, blocks=False)
 
+    def _feature_handler(self, handler):
+        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, and never answering None."""
+        def handle(path, data, request_id, link_id, remote_identity):
+            """Run the feature's handler(data, remote_identity) inside the per-link request limit."""
+            if not self.incoming.start_request(link_id, blocks=False):
+                return False
+            try:
+                response = handler(data, remote_identity)
+                return False if response is None else response
+            finally:
+                self.incoming.finish_request(link_id, blocks=False)
+        return handle
+
     def _handle_pin(self, path, data, request_id, link_id, remote_identity):
         """Pass a /pin from an identity on the remote-pin list to the backend."""
         if remote_identity is None or remote_identity.hash.hex() not in self.pin_identities:
@@ -464,8 +508,14 @@ class RequestServer:
         link = self._find_link(link_id)
         if parsed is None or link is None:
             return False
+        # mesh airtime controls: refused (False) at once, so the requester tries another provider
+        refusal = self.airtime.refusal(mesh.interface_names(getattr(link, "attached_interface", None)))
+        if refusal is not None:
+            self.traffic.refused(refusal)
+            log(f"refused /blocks: {refusal.replace('_', ' ')}", LOG_VERBOSE)
+            return False
         max_bytes, cids = parsed
-        if not self._previous_done(link, link_id) or not self.incoming.start_request(link_id, blocks=True):
+        if not self.incoming.start_request(link_id, blocks=True) and not self._after_previous(link, link_id):
             log("refused /blocks: a response is still in progress on that link", LOG_VERBOSE)
             return False
 
@@ -490,19 +540,40 @@ class RequestServer:
 
             # The upload cap applies once the link has a rate estimate (section 3)
             cap = self.config.effective_max_upload_rate(slow, rate) if rate is not None else None
-            limit = blocks_budget(max_bytes, rate, cap, self.config.response_target)
+            limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target))
+            response.requester = bytes(remote_identity.hash) if remote_identity is not None else link_id
+            share = self._budget_share_left(response)
+            if share is not None:
+                if share <= 0:
+                    self.traffic.refused(mesh.REFUSED_BUDGET)
+                    log("refused /blocks: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
+                    return False
+                limit = min(limit, max(0, share - RESPONSE_OVERHEAD))
             entries = select_blocks(cids, self.backend.served_block, limit)
             body = protocol.encode_blocks_response(entries)
             packed = protocol.packed_response_size(request_id, body)
+            # The upload budget is charged for responses carrying blocks; answers of only None are tiny
+            charged = packed if any(entry is not None for entry in entries) else 0
+            if charged and not self.airtime.spend(charged):
+                self.traffic.refused(mesh.REFUSED_BUDGET)
+                log(f"refused /blocks: {size(charged)} is over what is left of upload_budget", LOG_VERBOSE)
+                return False
+            with self.lock:
+                response.charged = charged  # settled when it concludes: what wasn't sent is refunded
             self.pacer.started(link_id, packed, cap)
             served = sum(1 for entry in entries if entry is not None)
             log(f"/blocks: sending {plural(served, 'block')} of {len(cids)} requested ({size(packed)})", LOG_VERBOSE)
 
             if response.finished:
+                self._refund(response)  # unless finishing it (displacement) refunded it already
                 return False  # displaced while it was being built
+            self.traffic.sent(node_id_for_identity(remote_identity) if remote_identity is not None else None,
+                              mesh.interface_label(getattr(link, "attached_interface", None)), packed)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
             if packed <= mdu:
-                return body  # sent as a single packet as soon as we return: nothing to track
+                with self.lock:
+                    response.charged = 0  # sent as a single packet once we return: the charge stands
+                return body  # nothing to track
             response.size = packed
             response.deadline = response.started + rates.response_deadline(packed, rate, self.config)
             response.find_until = self.clock() + REGISTER_WINDOW
@@ -526,6 +597,20 @@ class RequestServer:
         factor = getattr(link, "traffic_timeout_factor", RNS.Link.TRAFFIC_TIMEOUT_FACTOR)
         return (rtt * factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125) / 2
 
+    def _after_previous(self, link, link_id: bytes) -> bool:
+        """Take the link's /blocks slot once its previous response has concluded. False if refused.
+
+        The per-link limit is checked first, so only the request that found the slot taken gets here, and
+        only one request per link at a time may wait for a proof: any other is refused at once, so a
+        requester withholding proofs can't hold many handler threads in the grace wait.
+        """
+        if not self.incoming.start_waiting(link_id):
+            return False
+        try:
+            return self._previous_done(link, link_id) and self.incoming.start_request(link_id, blocks=True)
+        finally:
+            self.incoming.stop_waiting(link_id)
+
     def _previous_done(self, link, link_id: bytes) -> bool:
         """Whether the link's previous /blocks response, if any, has finished, so a new one may start.
 
@@ -541,6 +626,8 @@ class RequestServer:
             if response.untracked:
                 # Without RNS internals, the requester asking again is the only sign the response arrived
                 self.rates.record(link_id, response.size, self._expected_rate(link))
+                with self.lock:
+                    response.charged = 0
                 self._finish(response)
                 continue
             resource = response.resource
@@ -593,13 +680,49 @@ class RequestServer:
                 return
 
     def _finish(self, response: Response):
-        """Free a response's pool slot and its link's /blocks slot, once."""
+        """Free a response's pool slot and its link's /blocks slot, and settle its budget charge, once."""
         with self.lock:
             if response.finished:
                 return
             response.finished = True
+        self._refund(response)
         self.pools.release(response)
         self.incoming.finish_request(response.link_id, blocks=True)
+
+    def _refund(self, response: Response):
+        """Give upload_budget back what a response that didn't complete was charged but didn't send.
+
+        Without this, a requester that rejects (or never fetches) its responses' Resources would drain the
+        node-wide budget while receiving nothing. A completed one keeps its charge, and so does one we can't
+        follow (untracked): whether it arrived is unknown.
+        """
+        with self.lock:
+            charged, response.charged = response.charged, 0
+        resource = response.resource
+        if not charged or response.untracked or getattr(resource, "status", None) == RNS.Resource.COMPLETE:
+            return
+        sent = response.sent
+        if resource is not None:
+            try:
+                sent = resource.get_progress() * (response.size or 0)
+            except Exception:
+                pass  # the last progress the monitor saw
+        self.airtime.refund(int(charged - min(charged, max(0.0, sent))))
+
+    def _budget_share_left(self, response: Response) -> int | None:
+        """Budget bytes response's requester may still have in flight (None without upload_budget).
+
+        One requester's responses in flight may hold at most half the bucket's capacity, so withholding
+        proofs on several links can't hold the whole budget until their deadlines pass.
+        """
+        bucket = self.airtime.bucket
+        if bucket is None:
+            return None
+        responses = self.pools.responses()
+        with self.lock:
+            in_flight = sum(other.charged for other in responses
+                            if other is not response and other.requester == response.requester and not other.finished)
+        return int(bucket.capacity // 2) - in_flight
 
     def _concluded(self, response: Response, link, resource):
         """The response's Resource concluded: record the rate if it completed, and free the slots."""
@@ -608,7 +731,7 @@ class RequestServer:
             first, response.concluded = not response.concluded, True
         if first and getattr(resource, "status", None) == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
-        self._finish(response)
+        self._finish(response)  # refunds what a failed or cancelled Resource didn't send
 
     def _cancel(self, response: Response, reason: str):
         """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""

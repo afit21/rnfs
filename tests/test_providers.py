@@ -7,7 +7,7 @@ import threading
 import unittest
 
 from rnfs.constants import DAY, ID_LENGTH, K, PROVIDER_TTL
-from rnfs.dht.providers import ProviderStore
+from rnfs.dht.providers import MIN_PER_PUBLISHER, ProviderStore
 
 
 def ident(n: int) -> bytes:
@@ -219,6 +219,70 @@ class EvictionTest(StoreTestCase):
         self.assertEqual(self.store.record_count(), 1)
 
 
+class PublisherLimitTest(StoreTestCase):
+    """One publisher can't take over the store; one key can't gather unbounded publishers."""
+
+    max_records = 100
+
+    def test_default_share(self):
+        self.assertEqual(ProviderStore(100_000, None).max_per_publisher, 1000)
+        self.assertEqual(ProviderStore(10, None).max_per_publisher, MIN_PER_PUBLISHER)
+
+    def test_aged_publisher_cannot_take_over_the_store(self):
+        attacker = ident(1)
+        self.store.store(ident(100), attacker)  # seen first, so it outranks everyone in eviction
+        self.clock.now += DAY
+        honest = [ident(10 + n) for n in range(5)]
+        for n, publisher in enumerate(honest):
+            for i in range(self.store.max_per_publisher):
+                self.store.store(ident(200 + 100 * n + i), publisher)
+        # Before: each of these evicted a record of the newest publisher, until the attacker held all 100
+        accepted = sum(self.store.store(ident(10_000 + i), attacker) for i in range(1000))
+        self.assertEqual(accepted, self.store.max_per_publisher - 1)
+        for n, publisher in enumerate(honest):
+            held = sum(len(self.store.providers(ident(200 + 100 * n + i))) for i in range(self.store.max_per_publisher))
+            self.assertEqual(held, self.store.max_per_publisher)
+        # Room is left for others
+        self.assertTrue(self.store.store(KEY, ident(3)))
+
+    def test_refresh_at_the_limit(self):
+        for i in range(self.store.max_per_publisher):
+            self.assertTrue(self.store.store(ident(100 + i), ident(1)))
+        self.assertFalse(self.store.store(KEY, ident(1)))
+        self.clock.now += DAY
+        self.assertTrue(self.store.store(ident(100), ident(1)))  # republishing is never refused
+
+    def test_expired_records_do_not_count_toward_the_limit(self):
+        for i in range(self.store.max_per_publisher):
+            self.store.store(ident(100 + i), ident(1))
+        self.clock.now += PROVIDER_TTL
+        self.assertTrue(self.store.store(KEY, ident(1)))
+        self.assertEqual(self.store.record_count(), 1)
+
+    def test_publishers_per_key_limited_earliest_kept(self):
+        store = ProviderStore(1000, None, clock=self.clock, rng=random.Random(1), max_per_key=20)
+        accepted = [store.store(KEY, ident(i)) for i in range(1, 31)]
+        self.assertEqual(accepted, [True] * 20 + [False] * 10)
+        self.assertEqual(store.providers(KEY), [ident(i) for i in range(1, 21)])
+        self.assertTrue(store.store(KEY, ident(5)))  # a recorded publisher may still republish
+        self.clock.now += PROVIDER_TTL
+        self.assertTrue(store.store(KEY, ident(30)))  # expired records make room
+        self.assertEqual(store.providers(KEY), [ident(30)])
+
+    def test_reply_asks_exclude_only_about_chosen_candidates(self):
+        store = ProviderStore(10_000, None, clock=self.clock, rng=random.Random(1))
+        for i in range(store.max_per_key + 500):
+            store.store(KEY, ident(i))
+        self.assertEqual(len(store.providers(KEY)), store.max_per_key)
+        asked = []
+        banned = {ident(i) for i in range(0, store.max_per_key, 2)}  # every other one, oldest included
+        reply = store.for_reply(KEY, exclude=lambda p: asked.append(p) or p in banned)
+        self.assertEqual(len(reply), K)
+        self.assertFalse(banned & set(reply))
+        self.assertEqual(reply[:K // 2], [ident(i) for i in range(1, K, 2)])
+        self.assertLess(len(asked), 100)
+
+
 class PersistenceTest(unittest.TestCase):
     """Records and first-seen times survive a restart; the file is replaced atomically."""
 
@@ -264,6 +328,16 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(loaded.record_count(), 3)
         self.assertEqual(len(loaded.providers(ident(101)) + loaded.providers(ident(102))), 1)
 
+    def test_limits_applied_on_load_keeping_oldest(self):
+        store = ProviderStore(100, self.path, clock=self.clock, max_per_publisher=100)
+        for i in range(30):
+            store.store(ident(100 + i), ident(1))
+            self.clock.now += 1
+        store.save()
+        loaded = ProviderStore(100, self.path, clock=self.clock, max_per_publisher=10)
+        self.assertEqual(loaded.record_count(), 10)
+        self.assertEqual([len(loaded.providers(ident(100 + i))) for i in range(30)], [1] * 10 + [0] * 20)
+
     def test_expired_records_dropped_on_load(self):
         store = self.open()
         store.store(KEY, ident(1))
@@ -275,7 +349,7 @@ class PersistenceTest(unittest.TestCase):
 
     def test_corrupt_file_starts_empty(self):
         os.makedirs(os.path.dirname(self.path))
-        with open(self.path, "w") as f:
+        with open(self.path, "w", encoding="utf-8") as f:
             f.write("{not json")
         self.assertEqual(self.open().record_count(), 0)
 
@@ -285,7 +359,7 @@ class PersistenceTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path))
         store.store(KEY, ident(1))
         store.save()
-        with open(self.path) as f:
+        with open(self.path, encoding="utf-8") as f:
             self.assertEqual(len(json.load(f)["records"]), 1)
 
 

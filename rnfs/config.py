@@ -61,9 +61,34 @@ class Config:
     members: list[str] = field(default_factory=list)  # private mode's member identity hashes (hex)
     private: bool = False  # private mode (section 3)
     scan_interval: float = 60
-    provide_strategy: str = "pinned"  # "pinned" or "roots"
+    provide_strategy: str = "roots"  # "roots" (pins and complete cached downloads) or "pinned" (pins only)
     gateway_scripts: bool = True
     gateway_fetches: int = 2
+
+    # Feature settings. Each feature adds its settings under its own marker (keep this order)
+    # --- transfers (rnfs/features/jobs.py) ---
+    max_jobs: int | None = None  # background jobs (get, pin, export) running at once: 2; 1 on slow nodes
+    max_finished_jobs: int = 100  # finished jobs kept for `rnfs jobs`; the oldest beyond this are forgotten
+    # --- mesh (provider choice, airtime, peers) ---
+    upload_budget: int | None = None  # bytes per hour of /blocks responses, node-wide; None: unlimited
+    serve_interfaces: list[str] = field(default_factory=list)  # serve /blocks only on these (names or prefixes)
+    no_serve_interfaces: list[str] = field(default_factory=list)  # never serve /blocks on these
+    quiet_hours: str = ""  # local time, e.g. "22:00-06:00": /blocks is refused then; "" for none
+    # --- names (keepers, follow, contacts) ---
+    # Names kept (keep and follow) for others; this node's own names don't count. Each is a DHT key republished
+    # (at least every 3 days) and, if followed, a pin: 100 keeps a slow channel's republish airtime small
+    keep_max_names: int = 100
+    keeper_query: str = "fallback"  # "fallback": ask keepers when a path request heard nothing; "always"
+    # --- content (pin=false, sealing, chunker, gateway formats) ---
+    # --- lxmf (rnfs/features/lxmf.py) ---
+    lxmf_enabled: bool | None = None  # None: on if the LXMF package is installed
+    lxmf_display_name: str | None = None  # announced name; None: "rnfs node" (nothing linking it to the node ID)
+    lxmf_propagation_node: str | None = None  # LXMF propagation node (hex); None: none for automatic use
+    lxmf_send_from_hint: bool = True  # sent links carry from=<node ID>: links the LXMF address to the node ID
+    lxmf_sync_interval: float = 3600  # seconds between downloads from the propagation node; 0: never
+    lxmf_accept_from: list[str] = field(default_factory=list)  # LXMF addresses (hex); empty: everyone
+    lxmf_auto_fetch_from: list[str] = field(default_factory=list)  # senders whose links are fetched and pinned
+    lxmf_auto_fetch_quota: int = 1 * GIB  # per sender in lxmf_auto_fetch_from
 
     # Paths
 
@@ -135,6 +160,24 @@ class Config:
             raise ValueError("provide_strategy must be pinned or roots")
         if self.max_blocks_responses < 2:
             raise ValueError("max_blocks_responses must be at least 2")
+        # transfers
+        # type() rather than isinstance(): true is an int to Python, but not a count anyone means
+        if self.max_jobs is not None and (type(self.max_jobs) is not int or self.max_jobs < 1):
+            raise ValueError("max_jobs must be a whole number of at least 1")
+        if type(self.max_finished_jobs) is not int or self.max_finished_jobs < 1:
+            raise ValueError("max_finished_jobs must be a whole number of at least 1")
+        # mesh
+        from rnfs import mesh  # here: rnfs.mesh is only needed once settings are checked
+        mesh.validate(self)
+        # names
+        # type(): bool is an int subclass, and keep_max_names = true must not mean 1
+        if type(self.keep_max_names) is not int or self.keep_max_names < 0:
+            raise ValueError("keep_max_names must be a whole number, not negative")
+        if self.keeper_query not in ("fallback", "always"):
+            raise ValueError("keeper_query must be fallback or always")
+        # lxmf
+        from rnfs.features import lxmf  # here, like mesh: only needed once settings are checked
+        lxmf.validate_settings(self)
         for slow_node in (False, True):
             if self.effective_republish_interval(slow_node) >= PROVIDER_TTL / 2:
                 raise ValueError("republish_interval must be less than PROVIDER_TTL / 2")
@@ -151,6 +194,9 @@ class Config:
         unknown = values.keys() - known
         if unknown:
             raise ValueError(f"unknown settings in {path}: {', '.join(sorted(unknown))}")
+        if "rnfs_dir" in values:
+            # The file lives in the rnfs dir, so it can't move it; --dir does
+            raise ValueError(f"rnfs_dir can't be set in {path}; use --dir")
         values.update({k: v for k, v in overrides.items() if v is not None})
         values["rnfs_dir"] = rnfs_dir
         config = cls(**values)

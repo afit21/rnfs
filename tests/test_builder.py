@@ -2,17 +2,58 @@
 import io
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
-from rnfs import constants
+from rnfs import constants, fsutil
 from rnfs.content import builder, dag
 from rnfs.content.builder import NO_PUT
 from rnfs.content.cid import DAG, EMPTY_DIRECTORY, EMPTY_FILE, RAW, Cid
 from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, IndexNode
 from rnfs.errors import TooLarge
+from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES
 
 HELLO_WORLD = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
+# What add records for a file with the execute bit: Windows has none, so there every file is kind 0
+EXEC_KIND = dag.KIND_EXECUTABLE if POSIX_MODES else dag.KIND_FILE
+
+
+def within(seconds: float, function, *args):
+    """function(*args)'s result, or what it raised; fails the test if it doesn't return within seconds."""
+    outcome: list = []
+
+    def run():
+        """Call function, keeping its result or exception."""
+        try:
+            outcome.append(("result", function(*args)))
+        except BaseException as e:  # noqa: B902 - handed back to the test
+            outcome.append(("error", e))
+
+    thread = threading.Thread(target=run, daemon=True)  # a hung call mustn't keep the test run alive
+    thread.start()
+    thread.join(seconds)
+    if not outcome:
+        raise AssertionError(f"still running after {seconds} s (blocked?)")
+    kind, value = outcome[0]
+    if kind == "error":
+        raise value
+    return value
+
+
+def swap_on_open(name: str, swap):
+    """Patch os.open so that swap() runs just before name is first opened: a race between listing and opening."""
+    real_open = os.open
+    swapped = []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        """os.open, swapping the entry first."""
+        if not swapped and os.path.basename(os.fsdecode(path)) == name:
+            swapped.append(True)
+            swap()
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    return mock.patch("os.open", side_effect=fake_open)
 
 
 class Blocks(dict):
@@ -263,7 +304,7 @@ class PathTest(unittest.TestCase):
             Entry(".hidden", Cid.for_block(RAW, b"h"), 1, dag.KIND_FILE),
             Entry("a.txt", Cid.for_block(RAW, b"a"), 1, dag.KIND_FILE),
             Entry("empty", EMPTY_DIRECTORY, 0, dag.KIND_DIRECTORY),
-            Entry("run.sh", Cid.for_block(RAW, b"#!"), 2, dag.KIND_EXECUTABLE),
+            Entry("run.sh", Cid.for_block(RAW, b"#!"), 2, EXEC_KIND),
             Entry("sub", sub.cid, 2, dag.KIND_DIRECTORY),
         ))
         self.assertEqual(built.size, 6)
@@ -276,6 +317,7 @@ class PathTest(unittest.TestCase):
         os.chmod(os.path.join(self.root, "a"), 0o600)
         self.assertEqual(builder.add_path(self.root, NO_PUT)[0], first)
 
+    @unittest.skipUnless(HAS_FIFO and CAN_SYMLINK and POSIX_MODES, "FIFOs, symlinks and non-UTF-8 names (POSIX)")
     def test_skips_symlinks_specials_and_bad_names(self):
         self.write("real", b"r")
         os.symlink("real", os.path.join(self.root, "link"))
@@ -295,11 +337,52 @@ class PathTest(unittest.TestCase):
         path = self.write("f.bin", b"content", mode=0o700)
         built, _ = builder.add_path(path, NO_PUT)
         self.assertEqual(built.cid, Cid.for_block(RAW, b"content"))
-        self.assertEqual(built.kind, dag.KIND_EXECUTABLE)
+        self.assertEqual(built.kind, EXEC_KIND)
         blocks = Blocks()
         wrapped, _ = builder.add_path(path, blocks.put, wrap_it=True)
-        self.assertEqual(dag.decode(blocks[wrapped.cid]).entries,
-                         (Entry("f.bin", built.cid, 7, dag.KIND_EXECUTABLE),))
+        self.assertEqual(dag.decode(blocks[wrapped.cid]).entries, (Entry("f.bin", built.cid, 7, EXEC_KIND),))
+
+    def test_windows_records_every_file_as_kind_0(self):
+        # Windows' stat reports an execute bit for .exe, .bat, .cmd and .com files, which add must ignore
+        self.write("run.sh", b"#!", mode=0o755)
+        self.write("tool.exe", b"MZ")
+        with mock.patch.object(fsutil, "IS_WINDOWS", True):
+            self.assertFalse(builder.is_executable(0o100755))
+            built, _ = builder.add_path(self.root, NO_PUT)
+        plain = builder.build_directory([Entry("run.sh", Cid.for_block(RAW, b"#!"), 2, dag.KIND_FILE),
+                                         Entry("tool.exe", Cid.for_block(RAW, b"MZ"), 2, dag.KIND_FILE)], NO_PUT)
+        self.assertEqual(built.cid, plain.cid)
+        self.assertEqual(builder.is_executable(0o100755), POSIX_MODES)
+
+    def test_walk_by_path_without_fd_walk(self):
+        # How Windows walks: directories by path, each entry checked by stat, a symlinked root followed
+        self.write("a", b"a")
+        self.write("sub/b", b"b")
+        expected = builder.add_path(self.root, NO_PUT)[0]
+        link = os.path.join(self.tmp.name, "root-link")
+        with mock.patch.object(builder, "FD_WALK", False):
+            self.assertEqual(builder.add_path(self.root, NO_PUT)[0], expected)
+            if CAN_SYMLINK:
+                os.symlink(self.root, link, target_is_directory=True)
+                self.assertEqual(builder.add_path(link, NO_PUT)[0], expected)
+
+    def test_listed_stat_fills_in_windows_inode(self):
+        path = self.write("a", b"a")
+        real = os.stat(path, follow_symlinks=False)
+        # On Windows a DirEntry's stat has st_ino and st_dev zero; opening compares them, so stat the path
+        zeroed = os.stat_result((real.st_mode, 0, 0) + tuple(real)[3:])
+        entry = mock.Mock(**{"stat.return_value": zeroed})
+        self.assertEqual((builder.listed_stat(entry, path).st_ino, builder.listed_stat(entry, path).st_dev),
+                         (real.st_ino, real.st_dev))
+        entry.stat.return_value = real
+        with mock.patch("os.stat", side_effect=AssertionError("stat by path")):
+            self.assertIs(builder.listed_stat(entry, path), real)
+
+    def test_junction_is_a_link(self):
+        st = os.stat(self.root)
+        self.assertFalse(builder.is_link(st))
+        junction = mock.Mock(st_mode=st.st_mode, st_reparse_tag=0xA0000003)  # IO_REPARSE_TAG_MOUNT_POINT
+        self.assertTrue(builder.is_link(junction))
 
     def test_large_file_from_path_streams(self):
         data = os.urandom(5 * constants.CHUNK_SIZE + 1)
@@ -325,11 +408,99 @@ class PathTest(unittest.TestCase):
                 builder.add_path(self.root, NO_PUT, wrap_it=True)
             self.assertEqual(builder.add_path(self.root, NO_PUT)[0].height, 2)
 
+    @unittest.skipUnless(HAS_FIFO, "FIFOs (POSIX)")
     def test_not_a_file_or_directory(self):
         fifo = os.path.join(self.root, "fifo")
         os.mkfifo(fifo)
         with self.assertRaises(ValueError):
             builder.add_path(fifo, NO_PUT)
+
+
+    @unittest.skipUnless(HAS_FIFO, "FIFOs (POSIX)")
+    def test_fifo_named_directly_never_blocks(self):
+        fifo = os.path.join(self.root, "fifo")
+        os.mkfifo(fifo)
+        with self.assertRaises(ValueError):
+            within(5, builder.add_path, fifo, NO_PUT)
+        # Swapped in after the type check: opened without blocking, then refused
+        regular = self.write("regular", b"r")
+        real_stat = os.stat
+        with mock.patch("os.stat", side_effect=lambda path, **kw: real_stat(regular if path == fifo else path, **kw)):
+            with self.assertRaises(builder.Changed):
+                within(5, builder.add_path, fifo, NO_PUT)
+
+    @unittest.skipUnless(CAN_SYMLINK, "creating symlinks isn't allowed here")
+    def test_symlink_named_directly_is_followed(self):
+        path = self.write("sub/f", b"content")
+        os.symlink(path, os.path.join(self.tmp.name, "file-link"))
+        os.symlink(os.path.dirname(path), os.path.join(self.tmp.name, "dir-link"), target_is_directory=True)
+        self.assertEqual(builder.add_path(os.path.join(self.tmp.name, "file-link"), NO_PUT)[0].cid,
+                         Cid.for_block(RAW, b"content"))
+        self.assertEqual(builder.add_path(os.path.join(self.tmp.name, "dir-link"), NO_PUT)[0].cid,
+                         builder.add_path(os.path.dirname(path), NO_PUT)[0].cid)
+
+    def secret(self) -> tuple[str, bytes]:
+        """A file outside the tree being added, which no swap may get into it."""
+        data = b"private key"
+        path = os.path.join(self.tmp.name, "secret")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path, data
+
+    @unittest.skipUnless(CAN_SYMLINK, "creating symlinks isn't allowed here")
+    def test_file_swapped_for_symlink_during_walk_is_skipped(self):
+        secret, data = self.secret()
+        victim = self.write("sub/victim", b"harmless")
+        self.write("sub/other", b"o")
+
+        def swap():
+            """Replace the file with a symlink to the secret."""
+            os.remove(victim)
+            os.symlink(secret, victim)
+
+        blocks = Blocks()
+        with swap_on_open("victim", swap):
+            built, warnings = builder.add_path(self.root, blocks.put)
+        self.assertNotIn(Cid.for_block(RAW, data), blocks)
+        self.assertTrue(any("victim" in w and "changed" in w for w in warnings))
+        sub = dag.decode(blocks[dag.decode(blocks[built.cid]).entries[0].cid])
+        self.assertEqual([e.name for e in sub.entries], ["other"])
+
+    @unittest.skipUnless(CAN_SYMLINK and builder.FD_WALK, "directories opened by descriptor (POSIX), symlinks")
+    def test_directory_swapped_for_symlink_during_walk_is_skipped(self):
+        secret, data = self.secret()
+        outside = os.path.join(self.tmp.name, "outside")
+        os.mkdir(outside)
+        os.symlink(secret, os.path.join(outside, "key"))
+        os.link(secret, os.path.join(outside, "key-copy"))
+        victim = os.path.join(self.root, "victim")
+        os.mkdir(victim)
+
+        def swap():
+            """Replace the directory with a symlink to one outside the tree."""
+            os.rmdir(victim)
+            os.symlink(outside, victim)
+
+        blocks = Blocks()
+        with swap_on_open("victim", swap):
+            built, warnings = builder.add_path(self.root, blocks.put)
+        self.assertNotIn(Cid.for_block(RAW, data), blocks)
+        self.assertEqual(dag.decode(blocks[built.cid]).entries, ())
+        self.assertTrue(any("victim" in w and "changed" in w for w in warnings))
+
+    @unittest.skipUnless(HAS_FIFO, "FIFOs (POSIX)")
+    def test_fifo_swapped_in_during_walk_never_blocks(self):
+        victim = self.write("victim", b"harmless")
+
+        def swap():
+            """Replace the file with a FIFO nobody writes to."""
+            os.remove(victim)
+            os.mkfifo(victim)
+
+        with swap_on_open("victim", swap):
+            built, warnings = within(5, builder.add_path, self.root, NO_PUT)
+        self.assertEqual(built.cid, builder.build_directory([], NO_PUT).cid)
+        self.assertTrue(any("victim" in w and "changed" in w for w in warnings))
 
 
 if __name__ == "__main__":

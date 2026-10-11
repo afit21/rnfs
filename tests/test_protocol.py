@@ -156,7 +156,9 @@ class BlocksTest(unittest.TestCase):
 
     def test_response(self):
         self.assertEqual(protocol.parse_blocks_response([b"a", None], 2), [b"a", None])
-        self.assertEqual(protocol.parse_blocks_response([], 2), [])
+        self.assertEqual(protocol.parse_blocks_response([None, b"a"], 3), [None, b"a"])  # cut by the budget
+        self.assertEqual(protocol.parse_blocks_response([None, None], 2), [None, None])
+        self.assertEqual(protocol.parse_blocks_response([], 0), [])
 
     def test_response_rejects_malformed(self):
         bad = {
@@ -165,6 +167,10 @@ class BlocksTest(unittest.TestCase):
             "entry not bytes": (["a"], 1),
             "entry a list": ([[b"a"]], 1),
             "oversized block": ([bytes(MAX_BLOCK_SIZE + 1)], 1),
+            # An honest response always includes the first served block, so it is never empty or a short
+            # run of None: answering that would make the requester ask the same node again forever
+            "empty": ([], 2),
+            "short without a block": ([None], 2),
         }
         for reason, (data, requested) in bad.items():
             with self.subTest(reason):

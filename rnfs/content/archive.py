@@ -13,9 +13,11 @@ from rnfs.constants import ARCHIVE_MAGIC, ARCHIVE_VERSION, MAX_BLOCK_SIZE
 from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER, Storage
+from rnfs.errors import InvalidDag, NotFound
 from rnfs.log import LOG_WARNING, log
 
 _MAX_CID_LENGTH = 64  # longer than any valid binary CID; read no further before rejecting one
+MAX_ROOTS = 1024  # roots an archive may list; checked before any is read, so a header can't exhaust memory
 
 
 def export_archive(roots: list, get: walker.Get, out: BinaryIO, max_entries: int | None = None) -> dict:
@@ -24,6 +26,8 @@ def export_archive(roots: list, get: walker.Get, out: BinaryIO, max_entries: int
     Every block comes from get and is checked as the DAG is walked; with max_entries, the DAGs are first
     checked against max_output_entries, counting every occurrence (TooLarge).
     """
+    if len(roots) > MAX_ROOTS:
+        raise ValueError(f"an archive holds at most {MAX_ROOTS} roots")  # import would refuse it
     expects = [root if isinstance(root, walker.Expect) else walker.root_expect(root) for root in roots]
     if max_entries is not None:
         for expect in expects:
@@ -36,6 +40,19 @@ def export_archive(roots: list, get: walker.Get, out: BinaryIO, max_entries: int
                 written.add(block_expect.cid)
                 out.write(umsgpack.packb([block_expect.cid.binary, block]))
     return {"roots": [expect.cid for expect in expects], "blocks": len(written)}
+
+
+def archive_size(roots: list[Cid], blocks) -> int:
+    """The exact bytes export_archive writes for roots whose DAGs hold blocks, (CID, block length) pairs
+    each listed once (the gateway's ?format=archive sends it as Content-Length before writing)."""
+
+    def bin_size(length: int) -> int:
+        """A msgpack bin of length bytes, header included."""
+        return length + (2 if length < 1 << 8 else 3 if length < 1 << 16 else 5)
+
+    total = len(umsgpack.packb([ARCHIVE_MAGIC, ARCHIVE_VERSION, [cid.binary for cid in roots]]))
+    # Each entry is a fixarray of 2 (one byte), the binary CID and the block
+    return total + sum(1 + bin_size(len(cid.binary)) + bin_size(length) for cid, length in blocks)
 
 
 class _StreamReader:
@@ -130,7 +147,8 @@ class _StreamReader:
 def read_archive(stream: BinaryIO):
     """The archive's roots, and an iterator of its (cid, block) records as read, unverified.
 
-    Raises ValueError if the stream isn't an rnfs archive or is malformed (the iterator raises it when reached).
+    Raises ValueError if the stream isn't an rnfs archive, is malformed (the iterator raises it when reached) or
+    lists more than MAX_ROOTS roots.
     """
     reader = _StreamReader(stream)
     if reader.array() != 3 or reader.text(len(ARCHIVE_MAGIC)) != ARCHIVE_MAGIC:
@@ -138,7 +156,10 @@ def read_archive(stream: BinaryIO):
     version = reader.uint()
     if version != ARCHIVE_VERSION:
         raise ValueError(f"unsupported archive version {version}")
-    roots = [reader.cid() for _ in range(reader.array())]
+    count = reader.array()
+    if count > MAX_ROOTS:
+        raise ValueError(f"archive lists {count} roots, more than {MAX_ROOTS}")
+    roots = [reader.cid() for _ in range(count)]
 
     def records():
         """Each [cid, block] record until the end of the stream."""
@@ -152,13 +173,18 @@ def read_archive(stream: BinaryIO):
 
 
 def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = USER) -> dict:
-    """Import an archive into storage, verifying every block, and pin each complete root with pin_source.
+    """Import an archive into storage, verifying every block, and pin each root it supplies with pin_source.
 
-    Returns {"roots": [Cid], "complete": [Cid], "incomplete": [Cid], "blocks": stored count, "bad": count of
-    blocks that didn't match their CID (skipped)}. Raises ValueError for a stream that isn't an archive; blocks
-    read before a malformed record are kept as cache.
+    A root is supplied, and pinned, only if every block of its DAG was in this archive and matched its CID; a
+    root whose DAG is only complete thanks to blocks already stored here is not, so a header-only archive can't
+    turn cached downloads into pins (which would provide them, revealing what was downloaded). Returns
+    {"roots": [Cid], "complete": [Cid] supplied roots, "incomplete": [Cid] the other roots, "blocks": stored
+    count, "bad": count of blocks that didn't match their CID (skipped)}. Raises ValueError for a stream that
+    isn't an archive or lists more than MAX_ROOTS roots; blocks read before a malformed record are kept as cache.
     """
     roots, records = read_archive(stream)
+    # Every verified CID in the archive; no larger than the storage's own index of the same blocks
+    supplied: set[Cid] = set()
     stored = bad = 0
     with storage.protect() as session:
         for root in roots:
@@ -169,17 +195,28 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
             except ValueError:
                 bad += 1
                 continue
+            supplied.add(cid)
             stored += 1
         complete, incomplete = [], []
+        held: set[Cid] = set()  # complete roots the archive didn't wholly supply
         for root in roots:
-            if storage.is_complete(root):
+            try:
+                blocks = storage.dag_blocks(root)
+            except (NotFound, InvalidDag):
+                incomplete.append(root)
+                continue
+            if blocks <= supplied:
                 complete.append(root)
                 if pin_source is not None:
                     storage.pin(root, pin_source)
             else:
                 incomplete.append(root)
+                held.add(root)
     if bad:
         log(f"import: skipped {bad} blocks that didn't match their CIDs", LOG_WARNING)
     for root in incomplete:
-        log(f"import: {root} is not complete in the archive", LOG_WARNING)
+        if root in held:
+            log(f"import: {root} is stored here but not wholly in the archive, so it wasn't pinned", LOG_WARNING)
+        else:
+            log(f"import: {root} is not complete in the archive", LOG_WARNING)
     return {"roots": roots, "complete": complete, "incomplete": incomplete, "blocks": stored, "bad": bad}

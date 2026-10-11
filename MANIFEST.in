@@ -1,0 +1,5 @@
+# sdist contents beyond the package itself (README and any LICENSE* file are included automatically)
+prune tests
+prune packaging
+# ...except the dependency lock, which install.sh uses when installing from an sdist
+include packaging/requirements.lock

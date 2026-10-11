@@ -1,10 +1,13 @@
 """Tests for RnfsNode's facade and backend (rnfs/node.py), on offline nodes with a fake network client."""
 import io
 import os
+import shutil
 import stat
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -12,9 +15,12 @@ from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, remote_source
-from rnfs.errors import InvalidDag, NotFound
+from rnfs import fetcher
+from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.network.client import OK, BlocksResult
+from rnfs import fsutil, node as node_module
 from rnfs.node import RnfsNode
+from tests.support import POSIX_MODES
 
 try:
     from tests.test_names import FakeNetwork
@@ -67,7 +73,7 @@ class NetClient:
         node = self.nodes.get(node_id)
         return node is not None and node.backend.provide(self.sender, keys, withdrawn)
 
-    def blocks(self, node_id, cids):
+    def blocks(self, node_id, cids, on_progress=None):
         """Serve from a node's backend: blocks it serves, None for the rest."""
         node = self.nodes.get(node_id)
         if node is None:
@@ -121,11 +127,11 @@ class NodeTest(unittest.TestCase):
         with open(os.path.join(root, "big.bin"), "wb") as f:
             f.write(self.big)
         script = os.path.join(root, "sub", "run.sh")
-        with open(script, "w") as f:
-            f.write("#!/bin/sh\necho hi\n")
+        with open(script, "wb") as f:
+            f.write(b"#!/bin/sh\necho hi\n")
         os.chmod(script, 0o755)
-        with open(os.path.join(root, "sub", "deeper", "note.txt"), "w") as f:
-            f.write("deep")
+        with open(os.path.join(root, "sub", "deeper", "note.txt"), "wb") as f:
+            f.write(b"deep")
         return root
 
     def advertise(self, cid: str):
@@ -142,17 +148,22 @@ class LocalFacadeTest(NodeTest):
         self.assertEqual(added["warnings"], [])
         self.assertEqual(self.a.info(cid)["type"], "directory")
         info = self.a.info(f"{cid}/sub/run.sh")
-        self.assertEqual((info["type"], info["executable"]), ("file", True))
+        self.assertEqual((info["type"], info["executable"]), ("file", POSIX_MODES))  # Windows: always kind 0
         names = [(e["name"], e["kind"]) for e in self.a.ls(cid)]
         self.assertEqual(names, [("big.bin", "file"), ("sub", "directory")])
         self.assertEqual(b"".join(self.a.read(f"{cid}/big.bin", offset=70000, length=1000)),
                          self.big[70000:71000])
         self.assertTrue(self.a.is_local(cid))
         self.assertFalse(self.a.is_local(str(Cid.for_block(RAW, b"elsewhere"))))
-        self.assertEqual(self.a.pin_ls(), [{"cid": cid, "sources": ["user"], "complete": True}])
+        self.assertEqual(self.a.pin_ls(), [{"cid": cid, "sources": ["user"], "complete": True, "type": "directory",
+                                            "name": os.path.abspath(os.path.join(self.tmp.name, "tree"))}])
         self.assertEqual(self.a.stat(cid)["blocks"], self.a.stat(cid)["local_blocks"])
         self.assertIn(Cid.parse(cid), self.a.publisher.provided())
         self.assertEqual(self.a.status()["pins"], 1)
+        # members and remote_pin_identities take the identity hash, so status shows it
+        self.assertIsNone(self.a.status()["identity_hash"])  # offline test nodes have no identity
+        self.a.identity = mock.Mock(hash=bytes(range(16)))
+        self.assertEqual(self.a.status()["identity_hash"], bytes(range(16)).hex())
 
     def test_add_stream_and_only_hash(self):
         result = self.a.add_stream(io.BytesIO(b"hello"), size=5, name="hello.txt")
@@ -222,13 +233,19 @@ class NetworkFacadeTest(NodeTest):
         self.assertEqual(result["cid"], cid)
         with open(os.path.join(out, "big.bin"), "rb") as f:
             self.assertEqual(f.read(), self.big)
-        self.assertTrue(os.stat(os.path.join(out, "sub", "run.sh")).st_mode & stat.S_IXUSR)
+        if POSIX_MODES:  # Windows has no execute bit
+            self.assertTrue(os.stat(os.path.join(out, "sub", "run.sh")).st_mode & stat.S_IXUSR)
         single = os.path.join(self.tmp.name, "note.txt")
         self.b.get(f"{cid}/sub/deeper/note.txt", single)
-        with open(single) as f:
-            self.assertEqual(f.read(), "deep")
+        with open(single, "rb") as f:
+            self.assertEqual(f.read(), b"deep")
         self.assertEqual(self.b.storage.cached_targets() >= {Cid.parse(cid)}, True)
-        # With the pinned strategy, B doesn't provide or serve what it downloaded
+        # With the default roots strategy, B re-shares what it downloaded completely, while it is cached
+        self.assertIn(Cid.parse(cid), self.b.publisher.provided())
+        self.assertIsNotNone(self.b.backend.served_block(Cid.parse(cid)))
+        # With pinned, B doesn't provide or serve what it downloaded
+        self.b.config.provide_strategy = "pinned"
+        self.b.publisher.refresh()
         self.assertEqual(self.b.publisher.provided(), set())
         self.assertIsNone(self.b.backend.served_block(Cid.parse(cid)))
 
@@ -354,6 +371,153 @@ class BackendTest(NodeTest):
     def test_pin_remote_sends_request(self):
         self.assertTrue(self.b.pin_remote(A_ID, str(Cid.for_block(RAW, b"x")), True))
         self.assertEqual(self.net.pins[0][0], A_ID)
+
+
+class SecurityTest(NodeTest):
+    """Regression tests for the node's part of security findings B3-B6, B8, B11 and B12."""
+
+    def wait_for(self, condition, timeout: float = 5.0) -> bool:
+        """Poll until condition() is true."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def empty_files(self, count: int) -> str:
+        """A directory on disk of count empty files with long names: size 0, but kilobytes of directory nodes."""
+        root = os.path.join(self.tmp.name, "empties")
+        os.mkdir(root)
+        for i in range(count):
+            # Names short enough that the paths stay within Windows' 260-character limit
+            open(os.path.join(root, f"{i:04d}" + "n" * 120), "wb").close()
+        return root
+
+    @unittest.skipUnless(POSIX_MODES, "Unix permission bits")
+    def test_rnfs_dir_is_private(self):
+        loose = os.path.join(self.tmp.name, "loose")
+        os.mkdir(loose)
+        os.chmod(loose, 0o775)
+        node = self.make_node("loose", N1)
+        for directory in (node.config.root, node.config.state_dir, node.config.blocks_dir,
+                          os.path.dirname(node.config.identity_path), node.config.names_dir):
+            self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700, directory)
+        self.assertEqual(stat.S_IMODE(os.stat(self.b.config.root).st_mode), 0o700)
+
+    def test_no_permission_fix_on_windows(self):
+        # Windows' st_mode always shows others allowed: no chmod and no notice at every start
+        loose = os.path.join(self.tmp.name, "loose")
+        os.mkdir(loose)
+        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod, \
+                mock.patch.object(node_module, "log") as log, \
+                mock.patch("os.stat", return_value=mock.Mock(st_mode=0o40777)):
+            node_module._make_private_dirs(Config(rnfs_dir=loose))
+        chmod.assert_not_called()
+        log.assert_not_called()
+
+    def test_fetch_succeeds_when_pins_fill_max_storage(self):
+        small = self.make_node("small", N1, max_storage=256 * 1024)
+        small.routing.heard(A_ID)
+        mine = small.add_stream(io.BytesIO(os.urandom(300 * 1024)))["cid"]  # pins alone fill max_storage
+        cached = self.a.add_stream(io.BytesIO(os.urandom(100 * 1024)))["cid"]
+        big = self.a.add_stream(io.BytesIO(os.urandom(1024 * 1024)))["cid"]
+        for cid in (cached, big):
+            self.advertise(cid)
+        b"".join(small.read(cached, for_gateway=True))
+        data = b"".join(small.read(big))
+        self.assertEqual(len(data), 1024 * 1024)
+        out = os.path.join(self.tmp.name, "got")
+        small.get(big, out)
+        self.assertEqual(os.path.getsize(out), 1024 * 1024)
+        # Once the fetches ended, eviction brought storage back down: cache gone, the pin kept
+        self.assertTrue(small.storage.is_complete(Cid.parse(mine)))
+        self.assertEqual(small.storage.cached_fetches(), [])
+        self.assertLessEqual(small.storage.used_bytes(), small.storage.pinned_bytes())
+
+    def test_fetch_too_big_for_the_disk_is_refused(self):
+        big = self.a.add_stream(io.BytesIO(os.urandom(4 * CHUNK_SIZE)))["cid"]
+        self.advertise(big)
+        usage = shutil.disk_usage(self.tmp.name)._replace(total=1024 ** 3, free=256 * 1024 * 1024 + CHUNK_SIZE)
+        with mock.patch("shutil.disk_usage", return_value=usage), self.assertRaises(StorageFull) as caught:
+            b"".join(self.b.read(big, for_gateway=True))
+        self.assertIn("not enough free disk space", str(caught.exception))
+
+    def test_cache_records_saved_at_stop(self):
+        cid = self.a.add_stream(io.BytesIO(b"cached"))["cid"]
+        self.advertise(cid)
+        b"".join(self.b.read(cid))
+        path = os.path.join(self.b.config.state_dir, "cache.json")
+        self.assertFalse(os.path.exists(path))  # not rewritten on every fetch
+        self.b.stop()
+        with open(path, encoding="utf-8") as f:
+            self.assertIn(cid, f.read())
+
+    def test_remote_pin_quota_counts_dag_blocks(self):
+        self.a.config.remote_pin_quota = 50_000
+        cid = self.b.add_path(self.empty_files(400))["cid"]
+        self.assertEqual(self.b.info(cid)["size"], 0)
+        self.b.records.store(Cid.parse(cid).key, B_ID)
+        self.a.routing.heard(B_ID)
+        self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), True)
+        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
+        self.assertEqual(self.a.storage.pins(), {})
+
+    def test_remote_pin_released_while_fetching_isnt_pinned(self):
+        cid = self.b.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"]
+        self.b.records.store(Cid.parse(cid).key, B_ID)
+        self.a.routing.heard(B_ID)
+        asked, go = threading.Event(), threading.Event()
+        real = self.net.blocks
+
+        def held(node_id, cids, on_progress=None):
+            """Hold every request until the test lets it go."""
+            asked.set()
+            go.wait(5)
+            return real(node_id, cids, on_progress)
+
+        self.net.blocks = held
+        self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), True)
+        self.assertTrue(asked.wait(5))
+        self.assertTrue(self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), False))
+        go.set()
+        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
+        self.assertEqual(self.a.storage.pins(), {})
+
+    def test_get_refuses_what_wont_fit_on_disk(self):
+        cid = self.a.add_stream(io.BytesIO(os.urandom(3 * CHUNK_SIZE)))["cid"]
+        self.advertise(cid)
+        out = os.path.join(self.tmp.name, "out")
+        real = shutil.disk_usage
+
+        def destination_full(path):
+            """Little free space where the output goes; the blocks' filesystem is untouched."""
+            usage = real(path)
+            return usage._replace(free=CHUNK_SIZE) if os.path.abspath(path) == self.tmp.name else usage
+
+        with mock.patch("shutil.disk_usage", destination_full):
+            with self.assertRaises(TooLarge):
+                self.b.get(cid, out)
+            with self.assertRaises(TooLarge):
+                self.a.export(cid, out)
+        self.assertFalse(os.path.lexists(out))
+        self.assertEqual(self.b.storage.block_count(), 1)  # refused before fetching below the root
+
+    def test_export_keeps_a_file_created_during_the_fetch(self):
+        cid = self.a.add_stream(io.BytesIO(b"data"))["cid"]
+        out = os.path.join(self.tmp.name, "precious")
+        real = fetcher.Fetch.fetch_dag
+
+        def racing(fetch, *args, **kwargs):
+            """Someone else creates the output while the fetch runs."""
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("someone else's file")
+            return real(fetch, *args, **kwargs)
+
+        with mock.patch.object(fetcher.Fetch, "fetch_dag", racing), self.assertRaises(ValueError):
+            self.a.export(cid, out)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "someone else's file")
 
 
 if __name__ == "__main__":

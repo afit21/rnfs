@@ -1,4 +1,5 @@
 """Tests for the gateway (rnfs/gateway.py), run against the in-memory FakeNode with no RNS."""
+import socket
 import threading
 import time
 import unittest
@@ -10,9 +11,9 @@ from rnfs.gateway import (CSP_NO_SCRIPTS, CSP_SCRIPTS, IMMUTABLE, GatewayServer,
                           parse_range, sniff)
 
 try:
-    from tests.test_api import FakeNode, raw_request
+    from tests.test_api import FakeNode, held_connections, raw_request, read_until_closed
 except ImportError:  # run from inside tests/
-    from test_api import FakeNode, raw_request
+    from test_api import FakeNode, held_connections, raw_request, read_until_closed
 
 SPEC_CSP = ("sandbox allow-scripts allow-forms allow-popups; default-src 'self' 'unsafe-inline' 'unsafe-eval' "
             "data: blob:; form-action 'self'")
@@ -329,6 +330,77 @@ class FetchLimitTest(GatewayTestCase):
         for thread in threads:
             thread.join(5)
         self.assertEqual(self.get(f"/name/{name}/", cross)[0], 200)
+
+
+class ConnectionTest(GatewayTestCase):
+    """Time limits and the connection cap, with short limits so the tests are quick."""
+
+    def setUp(self):
+        patcher = mock.patch.multiple(GatewayServer, request_timeout=0.5, response_timeout=0.5, max_connections=2)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def hold(self, count: int) -> list[socket.socket]:
+        """count connections with unfinished requests, closed at cleanup."""
+        held = held_connections(self.port, count, b"GET /rnfs/")
+        for sock in held:
+            self.addCleanup(sock.close)
+        time.sleep(0.1)  # let the server accept them
+        return held
+
+    def test_idle_connection_is_closed(self):
+        sock, = held_connections(self.port, 1, b"")
+        self.addCleanup(sock.close)
+        data, elapsed = read_until_closed(sock)
+        self.assertEqual(data, b"")
+        self.assertGreater(elapsed, 0.3)
+        self.assertLess(elapsed, 3)
+
+    def test_connection_cap(self):
+        held = self.hold(2)
+        for scripts, csp in ((True, SPEC_CSP), (False, CSP_NO_SCRIPTS)):
+            self.config.gateway_scripts = scripts
+            status, headers, data = self.get(f"/rnfs/{self.text}")
+            self.assertEqual(status, 503)
+            self.assertIn(b"too many", data)
+            self.assertEqual(headers["Retry-After"], "10")
+            self.assert_common_headers(headers, csp)
+        self.assertEqual(self.node.called("info"), [])
+        for sock in held:
+            read_until_closed(sock)
+        time.sleep(0.1)
+        self.assertEqual(self.get(f"/rnfs/{self.text}")[0], 200)
+
+    def test_clients_that_stop_reading_are_dropped(self):
+        self.node.piece = 1024 * 1024
+        big = self.node.put_file(bytes(64 * 1024 * 1024))
+        for _ in range(2):  # fill the server with responses nobody reads
+            sock = socket.socket()
+            self.addCleanup(sock.close)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.connect(("127.0.0.1", self.port))
+            sock.sendall(f"GET /rnfs/{big} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+        time.sleep(0.2)
+        self.assertEqual(self.get(f"/rnfs/{self.text}")[0], 503)
+        # Writing to the stalled clients times out, which frees their slots
+        deadline = time.monotonic() + 5
+        while self.get(f"/rnfs/{self.text}")[0] != 200:
+            self.assertLess(time.monotonic(), deadline, "the stalled responses kept their slots")
+            time.sleep(0.1)
+
+    def test_log_escapes_the_path(self):
+        with mock.patch.object(self.node, "info", side_effect=RuntimeError("boom")), \
+                mock.patch("rnfs.gateway.log") as log:
+            sock = socket.create_connection(("127.0.0.1", self.port))
+            self.addCleanup(sock.close)
+            sock.sendall(f"GET /rnfs/{self.root}/a\x1b[2Jb HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n"
+                         .encode("latin-1"))
+            data, _ = read_until_closed(sock)
+        self.assertTrue(data.startswith(b"HTTP/1.0 500"), data)
+        (message, _), = [call.args for call in log.call_args_list]
+        self.assertIn("/a\\x1b[2Jb", message)
+        self.assertNotIn("\x1b", message)
 
 
 class HelperTest(unittest.TestCase):

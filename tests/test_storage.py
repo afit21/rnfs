@@ -1,10 +1,13 @@
 """Tests for Storage (specification section 8): pins and sources, cached fetches, protection, eviction, GC."""
 import os
+import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
-from rnfs.content import builder, dag, walker
+from rnfs import fsutil
+from rnfs.content import builder, dag, storage as storage_module, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content.storage import FOLDER, USER, Storage, check_source, name_source, remote_source
@@ -121,10 +124,19 @@ class PinTest(StorageTest):
         self.assertEqual(self.open().pins(), {cid: {"folder", "user"}})
 
     def test_damaged_state_is_moved_aside(self):
-        with open(os.path.join(self.tmp.name, "state", "pins.json"), "w") as f:
+        with open(os.path.join(self.tmp.name, "state", "pins.json"), "w", encoding="utf-8") as f:
             f.write("{not json")
         self.assertEqual(self.open().pins(), {})
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "state", "pins.json.damaged")))
+
+    def test_unmovable_damaged_state_doesnt_stop_startup(self):
+        state = os.path.join(self.tmp.name, "state")
+        os.mkdir(os.path.join(state, "pins.json"))  # unreadable as a file
+        os.makedirs(os.path.join(state, "pins.json.damaged", "in-the-way"))  # and it can't be moved aside
+        self.assertEqual(self.open().pins(), {})
+
+    def test_state_dir_is_private(self):
+        self.assertEqual(os.stat(os.path.join(self.tmp.name, "state")).st_mode & 0o777, 0o700)
 
     def test_is_complete(self):
         root, a, _ = self.tree()
@@ -202,7 +214,8 @@ class EvictionTest(StorageTest):
         self.assertEqual(lost, {second.cid})
         self.assertEqual(self.storage.cached_targets(), {first.cid, third.cid})
         self.assertFalse(self.storage.has(second.cid))
-        # The LRU order is persisted
+        # The LRU order is persisted by save()
+        self.storage.save()
         self.assertEqual([t for _, _, t in self.open().cached_fetches()], [third.cid, first.cid])
 
     def test_under_max_storage_evicts_nothing(self):
@@ -240,16 +253,77 @@ class EvictionTest(StorageTest):
         self.assertFalse(self.storage.has(built.cid))
         self.assertEqual(stats["incomplete"], set())  # no longer a pin, so not reported: unpinning withdraws it
 
-    def test_check_space(self):
+    def test_check_disk_keeps_a_reserve_free(self):
         pinned = self.add(b"P" * 2000)
         self.storage.pin(pinned.cid, USER)
-        self.storage.max_storage = 3000
-        self.storage.check_space(pinned=False)
-        self.storage.max_storage = 2000
-        with self.assertRaises(StorageFull):
-            self.storage.check_space(pinned=False)
-        self.storage.check_space(pinned=True)
         self.assertEqual(self.storage.pinned_bytes(), 2000)
+        self.storage.max_storage = 1000  # max_storage doesn't matter here
+        gib = 1024 ** 3
+        usage = shutil.disk_usage(self.tmp.name)._replace(total=100 * gib, free=3 * gib)
+        with mock.patch("shutil.disk_usage", return_value=usage):
+            self.storage.check_disk(gib - 1)  # leaves more than the 2 GiB (2%) reserve
+            with self.assertRaises(StorageFull) as caught:
+                self.storage.check_disk(gib + 1)
+            self.assertIn("not enough free disk space", str(caught.exception))
+        small = usage._replace(total=gib, free=300 * 1024 * 1024)  # 2% is below DISK_RESERVE_MIN (256 MiB)
+        with mock.patch("shutil.disk_usage", return_value=small):
+            self.storage.check_disk(40 * 1024 * 1024)
+            with self.assertRaises(StorageFull):
+                self.storage.check_disk(50 * 1024 * 1024)
+
+    def test_evict_leaves_room_for_what_a_fetch_needs(self):
+        old = self.add(b"O" * 1000)
+        new = self.add(b"N" * 1000)
+        self.storage.record_fetch(old.cid, [], old.cid)
+        self.storage.record_fetch(new.cid, [], new.cid)
+        self.storage.max_storage = 2500
+        self.assertEqual(self.storage.evict(400), set())  # 2000 stored + 400 fit
+        self.assertEqual(self.storage.evict(1000), {old.cid})  # least recently used first
+        self.assertTrue(self.storage.has(new.cid))
+        self.assertLessEqual(self.storage.used_bytes() + 1000, self.storage.max_storage)
+
+    def test_eviction_walks_once_however_many_records_go(self):
+        files = [self.add(b"pinned %d" % i) for i in range(500)]
+        pinned = builder.build_directory([Entry(f"{i:03d}", f.cid, f.size, 0) for i, f in enumerate(files)],
+                                         self.storage.put)  # hundreds of blocks
+        self.storage.pin(pinned.cid, USER)
+        for i in range(200):
+            built = self.add(b"%d." % i * 100)
+            self.storage.record_fetch(built.cid, [], built.cid)
+        self.storage.max_storage = self.storage.used_bytes() - 10_000  # about half the records must go
+        visits = []
+        real = Storage._children
+        with mock.patch.object(Storage, "_children", lambda s, cid: (visits.append(cid), real(s, cid))[1]):
+            self.storage.evict()
+        self.assertLess(len(visits), 2000)  # once per block, not once per block per evicted record
+        self.assertLessEqual(self.storage.used_bytes(), self.storage.max_storage)
+        self.assertTrue(self.storage.is_complete(pinned.cid))
+        self.assertGreater(len(self.storage.cached_fetches()), 50)
+
+    def test_eviction_with_nothing_evictable_doesnt_walk_again(self):
+        self.storage.max_storage = 1
+        with self.storage.protect() as session:
+            builder.build_bytes(os.urandom(200 * 1000), session.put)
+            self.storage.evict()
+            with mock.patch.object(Storage, "_reach", side_effect=AssertionError("walked")):
+                self.assertEqual(self.storage.evict(), set())
+                builder.build_bytes(b"more", session.put)
+                self.assertEqual(self.storage.evict(), set())
+        self.storage.evict()  # the session ended: its blocks are garbage now
+        self.assertEqual(self.storage.used_bytes(), 0)
+
+    def test_cache_records_saved_in_batches_and_capped(self):
+        path = os.path.join(self.tmp.name, "state", "cache.json")
+        with mock.patch.object(storage_module, "MAX_CACHE_RECORDS", 3):
+            built = [self.add(b"%d" % i) for i in range(5)]
+            dropped = set()
+            for b in built:
+                dropped |= self.storage.record_fetch(b.cid, [], b.cid)
+            self.storage.touch(built[2].cid, [])
+            self.assertFalse(os.path.exists(path))  # not rewritten on every fetch
+            self.assertEqual(dropped, {built[0].cid, built[1].cid})
+            self.storage.save()
+            self.assertEqual([t for _, _, t in self.open().cached_fetches()], [built[3].cid, built[4].cid, built[2].cid])
 
     def test_verify(self):
         root, a, b = self.tree()
@@ -262,6 +336,48 @@ class EvictionTest(StorageTest):
         self.assertEqual(stats["bad"], [b.cid])
         self.assertEqual(stats["incomplete"], {root.cid})
         self.assertFalse(self.storage.is_complete(root.cid))  # the memo was invalidated
+
+    def test_block_in_use_on_windows_is_collected_later(self):
+        # On Windows a block a reader holds open can't be deleted: gc keeps it, indexed and counted, for next time
+        kept = self.add(b"K" * 10)
+        busy = self.add(b"B" * 10)
+        self.storage.pin(kept.cid, USER)
+        busy_path = self.storage.blocks.path(busy.cid)
+        real_remove = os.remove
+
+        def remove(path):
+            """os.remove, failing as Windows does for a file another handle has open."""
+            if path == busy_path:
+                raise PermissionError(13, "The process cannot access the file", path)
+            real_remove(path)
+
+        used = self.storage.used_bytes()
+        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch.object(fsutil, "RETRY_DELAYS", (0, 0)), \
+                mock.patch("os.remove", side_effect=remove) as patched:
+            stats = self.storage.gc()
+            self.assertEqual(patched.call_count, 3)  # tried, retried twice, then deferred
+        self.assertEqual((stats["removed_blocks"], stats["freed_bytes"]), (0, 0))
+        self.assertTrue(self.storage.has(busy.cid))
+        self.assertEqual(self.storage.used_bytes(), used)
+        self.assertEqual(self.storage.used_bytes(), sum(size for _, size in self.storage.blocks.scan()))
+        self.assertEqual(self.storage.evict(), set())
+        # Once the reader has closed it, the next pass collects it
+        stats = self.storage.gc()
+        self.assertEqual((stats["removed_blocks"], stats["freed_bytes"]), (1, 10))
+        self.assertFalse(self.storage.has(busy.cid))
+        self.assertFalse(os.path.exists(busy_path))
+        self.assertEqual(self.storage.used_bytes(), used - 10)
+        self.assertTrue(self.storage.is_complete(kept.cid))
+
+    def test_eviction_retries_a_deferred_delete(self):
+        busy = self.add(b"B" * 10)
+        with mock.patch.object(self.storage.blocks, "delete", return_value=None):
+            self.storage.gc()
+        self.assertTrue(self.storage._maybe_garbage)  # still garbage, so eviction won't skip the walk
+        self.storage.max_storage = 1
+        self.storage.evict()
+        self.assertFalse(self.storage.has(busy.cid))
+        self.assertEqual(self.storage.used_bytes(), 0)
 
 
 class SizeTest(StorageTest):
@@ -276,7 +392,19 @@ class SizeTest(StorageTest):
         self.storage.pin(root.cid, source)
         self.storage.pin(a.cid, source)
         self.storage.pin(Cid.for_block(RAW, b"not yet fetched"), source)
-        self.assertEqual(self.storage.source_usage(source), 210000)
+        # The bytes of each DAG's blocks: content plus DAG nodes
+        usage = sum(sum(map(self.storage.block_size, self.blocks_of(cid))) for cid in (root.cid, a.cid))
+        self.assertGreater(usage, 210000)
+        self.assertEqual(self.storage.source_usage(source), usage)
+
+    def test_usage_counts_blocks_of_zero_size_dags(self):
+        empty = self.add(b"")
+        names = [f"{i:04d}" + "n" * 200 for i in range(300)]
+        root = builder.build_directory([Entry(n, empty.cid, 0, 0) for n in names], self.storage.put)
+        self.assertEqual(root.size, 0)
+        source = remote_source(IDENTITY)
+        self.storage.pin(root.cid, source)
+        self.assertGreater(self.storage.source_usage(source), 300 * 200)
 
     def test_stat(self):
         root, a, b = self.tree()

@@ -14,14 +14,15 @@ directory is [2, []].
 Builders hand every block to a `put(cid, block)` callback, so they don't depend on Storage; a no-op
 callback (NO_PUT) gives only-hash mode. Files are streamed, one chunk in memory at a time.
 """
+import errno
 import io
 import os
 import stat
 from dataclasses import dataclass
 from typing import BinaryIO, Callable, Iterable
 
-from rnfs import constants
-from rnfs.content import dag
+from rnfs import constants, fsutil
+from rnfs.content import chunker, dag
 from rnfs.content.cid import DAG, EMPTY_FILE, RAW, Cid
 from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, IndexNode
 from rnfs.errors import TooLarge
@@ -125,7 +126,6 @@ def _read_full(stream: BinaryIO, want: int) -> bytes:
 
 def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = dag.KIND_FILE) -> Built:
     """Build a file from everything read from stream, or exactly size bytes of it (ValueError if it ends early)."""
-    chunk_size = constants.CHUNK_SIZE
 
     def make_group(level: int, pairs: list[tuple]) -> tuple:
         """A type 1 node over a group of chunks or file nodes."""
@@ -133,21 +133,11 @@ def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = 
         return Child(_put_node(node, put), node.size), _height(pairs)
 
     levels = _Levels(make_group, constants.MAX_CHILDREN)
-    remaining = size
-    while remaining is None or remaining > 0:
-        want = chunk_size if remaining is None else min(chunk_size, remaining)
-        chunk = _read_full(stream, want)
-        if remaining is not None:
-            if len(chunk) < want:
-                raise ValueError(f"stream ended {remaining - len(chunk)} bytes early")
-            remaining -= len(chunk)
-        if not chunk:
-            break
+    # Fixed CHUNK_SIZE pieces unless `add --chunker fastcdc` selected content-defined chunks (chunker.using)
+    for chunk in chunker.chunks(stream, size):
         cid = Cid.for_block(RAW, chunk)
         put(cid, chunk)
         levels.add(Child(cid, len(chunk)), 0)
-        if len(chunk) < want:
-            break  # end of stream
 
     level, pairs = levels.finish()
     if level == 0 and not pairs:
@@ -223,9 +213,114 @@ def display_path(path: str) -> str:
     return path.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
-def _is_executable(mode: int) -> bool:
-    """True if a file mode has the owner's execute bit, as git records it."""
-    return bool(mode & stat.S_IXUSR)
+def is_executable(mode: int) -> bool:
+    """True if a file mode has the owner's execute bit, as git records it; always False on Windows.
+
+    Windows has no execute bit, but Python's stat reports one for .exe, .bat, .cmd and .com files, so taking
+    it would give the same tree a different CID there than elsewhere.
+    """
+    return not fsutil.IS_WINDOWS and bool(mode & stat.S_IXUSR)
+
+
+# Opening paths. A directory being added may change underneath the walk (the shared folder is writable by
+# whatever puts files there), so every entry is opened relative to its parent's descriptor without following
+# a symlink or blocking on a FIFO, and the opened object must be the regular file or directory that was listed.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)  # opening a FIFO for reading would otherwise wait for a writer
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+# Platforms without these (not Linux or macOS) walk directories by path, checking each entry before using it
+FD_WALK = (os.open in os.supports_dir_fd and os.scandir in os.supports_fd
+           and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
+# What open(O_NOFOLLOW | O_NONBLOCK [| O_DIRECTORY]) reports for a symlink, socket or non-directory
+_SWAPPED_ERRNOS = {errno.ELOOP, errno.EMLINK, errno.ENOTDIR, errno.ENXIO}
+
+Handle = int | str  # an open file's descriptor; an open directory's descriptor, or its path without FD_WALK
+
+
+class Changed(OSError):
+    """An entry changed type or identity between being listed and being opened."""
+
+
+def _check_opened(path: str, expected: os.stat_result, handle: Handle, follow: bool = False):
+    """Raise Changed unless handle is the regular file or directory that was listed as expected.
+
+    follow says whether a path handle (a directory without FD_WALK) was named through a symlink to it.
+    """
+    st = os.fstat(handle) if isinstance(handle, int) else os.stat(handle, follow_symlinks=follow)
+    same_type = stat.S_IFMT(st.st_mode) == stat.S_IFMT(expected.st_mode)
+    if not (same_type and (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode))
+            and (st.st_dev, st.st_ino) == (expected.st_dev, expected.st_ino)):
+        raise Changed(errno.ESTALE, "changed while being read", display_path(path))
+
+
+def _open(target: str, dir_fd: int | None, path: str, expected: os.stat_result, follow: bool) -> Handle:
+    """Open target (a name in dir_fd, or a path) as the regular file or directory expected, never blocking."""
+    is_dir = stat.S_ISDIR(expected.st_mode)
+    if is_dir and not FD_WALK:
+        handle: Handle = path  # can't open directories here; checked by path instead
+    else:
+        flags = os.O_RDONLY | fsutil.O_BINARY | _O_NONBLOCK | _O_CLOEXEC | (_O_DIRECTORY if is_dir else 0)
+        if not follow:
+            flags |= _O_NOFOLLOW
+        try:
+            handle = os.open(target, flags, dir_fd=dir_fd) if dir_fd is not None else os.open(target, flags)
+        except OSError as e:
+            if e.errno in _SWAPPED_ERRNOS:
+                raise Changed(e.errno, "changed while being read", display_path(path)) from e
+            raise
+    try:
+        _check_opened(path, expected, handle, follow)
+    except BaseException:
+        close(handle)
+        raise
+    return handle
+
+
+def open_path(path: str, follow_symlinks: bool = True) -> tuple[Handle, os.stat_result]:
+    """Open the regular file or directory at path without blocking, with its stat.
+
+    With follow_symlinks, a symlink at path is followed (the user named it). Raises ValueError for anything
+    else, such as a FIFO or device (which is never opened), Changed if it is swapped while being opened.
+    """
+    st = os.stat(path, follow_symlinks=follow_symlinks)
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+        raise ValueError(f"{display_path(path)} is not a regular file or directory")
+    return _open(path, None, path, st, follow_symlinks), st
+
+
+def open_child(parent: Handle, name: str, path: str, expected: os.stat_result) -> Handle:
+    """Open entry name of the open directory parent (at path), which was listed as expected, not following it.
+
+    Raises Changed if it is no longer that regular file or directory.
+    """
+    if isinstance(parent, int):
+        return _open(name, parent, path, expected, False)
+    return _open(path, None, path, expected, False)
+
+
+def listed_stat(item: os.DirEntry, path: str) -> os.stat_result:
+    """The stat of a listed entry (at path), not following a symlink.
+
+    On Windows a DirEntry's stat has st_ino and st_dev zero, but opening checks them, so there it comes from
+    the path instead (one more system call per entry).
+    """
+    st = item.stat(follow_symlinks=False)
+    if st.st_ino == 0 and st.st_dev == 0:
+        st = os.stat(path, follow_symlinks=False)
+    return st
+
+
+def is_link(st: os.stat_result) -> bool:
+    """True for a symlink, or a Windows directory junction (which stat reports as a directory, yet it links)."""
+    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) == _REPARSE_JUNCTION
+
+
+def close(handle: Handle):
+    """Close a handle from open_path or open_child."""
+    if isinstance(handle, int):
+        os.close(handle)
 
 
 def build_path(path: str, put: Put, warnings: list[str]) -> Built:
@@ -235,45 +330,58 @@ def build_path(path: str, put: Put, warnings: list[str]) -> Built:
     are included and symlinks, devices, sockets, FIFOs and invalid names are skipped with a warning.
     Raises TooLarge for a tree deeper than MAX_DEPTH, ValueError if path is neither file nor directory.
     """
-    st = os.stat(path)
+    handle, st = open_path(path)
+    try:
+        return build_open(handle, st, path, put, warnings)
+    finally:
+        close(handle)
+
+
+def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings: list[str],
+               depth: int = 1) -> Built:
+    """Build the regular file or directory open as handle (from open_path or open_child), whose stat is st.
+
+    path is only for messages (and for directories without FD_WALK); depth as for _build_tree.
+    """
     if stat.S_ISDIR(st.st_mode):
-        return _build_tree(path, put, warnings, 1)
-    if stat.S_ISREG(st.st_mode):
-        kind = dag.KIND_EXECUTABLE if _is_executable(st.st_mode) else dag.KIND_FILE
-        with open(path, "rb") as f:
-            return build_file(f, put, kind=kind)
-    raise ValueError(f"{display_path(path)} is not a regular file or directory")
+        return _build_tree(handle, path, put, warnings, depth)
+    kind = dag.KIND_EXECUTABLE if is_executable(st.st_mode) else dag.KIND_FILE
+    # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
+    with os.fdopen(handle, "rb", closefd=False) as f:
+        return build_file(f, put, kind=kind)
 
 
-def _build_tree(path: str, put: Put, warnings: list[str], depth: int) -> Built:
-    """Build the directory at path, which sits depth directories from the root (1 for the root)."""
+def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int) -> Built:
+    """Build the open directory at path, which sits depth directories from the root (1 for the root)."""
     # Every directory level adds at least one DAG node, so this bounds the recursion before it gets deep
     if depth > constants.MAX_DEPTH:
         raise TooLarge(f"{display_path(path)} is nested deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     entries = []
     child_height = 0
-    with os.scandir(path) as listing:
+    with os.scandir(directory) as listing:
         children = sorted(listing, key=lambda entry: entry.name)
     for item in children:
-        shown = display_path(item.path)
+        child_path = os.path.join(path, item.name)
+        shown = display_path(child_path)
         if not dag.is_valid_name(item.name):
             warnings.append(f"skipped {shown}: name is not valid UTF-8 or breaks the name rules")
             continue
-        if item.is_symlink():
+        st = listed_stat(item, child_path)
+        if is_link(st):
             warnings.append(f"skipped symlink {shown}")
             continue
-        if item.is_dir(follow_symlinks=False):
-            child = _build_tree(item.path, put, warnings, depth + 1)
-        elif item.is_file(follow_symlinks=False):
-            mode = item.stat(follow_symlinks=False).st_mode
-            kind = dag.KIND_EXECUTABLE if _is_executable(mode) else dag.KIND_FILE
-            # O_NOFOLLOW: it was a regular file a moment ago; don't follow it if swapped for a symlink since
-            fd = os.open(item.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            with os.fdopen(fd, "rb") as f:
-                child = build_file(f, put, kind=kind)
-        else:
+        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
             warnings.append(f"skipped {shown}: not a regular file or directory")
             continue
+        try:
+            handle = open_child(directory, item.name, child_path, st)
+        except Changed:
+            warnings.append(f"skipped {shown}: it changed while being added")
+            continue
+        try:
+            child = build_open(handle, st, child_path, put, warnings, depth + 1)
+        finally:
+            close(handle)
         entries.append(Entry(item.name, child.cid, child.size, child.kind))
         child_height = max(child_height, child.height)
     return build_directory(entries, put, child_height)

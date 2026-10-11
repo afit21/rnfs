@@ -121,11 +121,16 @@ def parse_provide_request(data) -> tuple[list[bytes], list[bytes]] | None:
 
 
 def provide_batches(keys: list[bytes], withdrawn: list[bytes], mdu: int | None) -> list[tuple[list, list]]:
-    """Split keys and withdrawn keys into as few /provide requests as fit one packet each, in order."""
+    """Split keys and withdrawn keys into as few /provide requests as fit one packet each, in order.
+
+    Withdrawals go first: a batch withdraws before it stores, so a later batch's withdrawal would delete a
+    record an earlier one stored. A key in both lists is only stored.
+    """
     batches = []
     current_keys: list[bytes] = []
     current_withdrawn: list[bytes] = []
-    items = [(key, False) for key in keys] + [(key, True) for key in withdrawn]
+    stored = set(keys)
+    items = [(key, True) for key in withdrawn if key not in stored] + [(key, False) for key in keys]
     for key, is_withdrawal in items:
         trial_keys = current_keys + ([] if is_withdrawal else [key])
         trial_withdrawn = current_withdrawn + ([key] if is_withdrawal else [])
@@ -179,15 +184,22 @@ def parse_blocks_response(data, requested: int) -> list[bytes | None] | None:
     """Entries of a /blocks response to a request for `requested` CIDs, or None if malformed.
 
     Each entry is a block (bytes, at most MAX_BLOCK_SIZE) or None, and there are no more entries than CIDs
-    requested. Blocks still have to be verified against their CIDs.
+    requested. A response cut short by the budget holds at least one block, since the first served block is
+    always included (section 7): so an empty answer to a non-empty request, or a short one of only None, is
+    malformed (otherwise a responder could answer every request with nothing and be asked again forever).
+    Blocks still have to be verified against their CIDs.
     """
     if type(data) is not list or len(data) > requested:
         return None
+    served = False
     for entry in data:
         if entry is None:
             continue
         if type(entry) is not bytes or len(entry) > MAX_BLOCK_SIZE:
             return None
+        served = True
+    if len(data) < requested and not served:
+        return None
     return data
 
 
@@ -223,3 +235,12 @@ def is_accepted(data) -> bool:
 def packed_response_size(request_id: bytes, response) -> int:
     """Bytes RNS packs for a response, which decides whether it goes as a packet or a Resource."""
     return len(umsgpack.packb([request_id, response]))
+
+
+# Largest honest responses, as RNS packs them, for the max_response_size requesters pass. RNS checks it
+# against a response Resource's advertised size before accepting it, and these all fit one packet, so a node
+# trying to send a /find, /provide or /pin answer as a slow Resource is refused at the advertisement.
+REQUEST_ID_LENGTH = RNS.Identity.TRUNCATED_HASHLENGTH // 8
+MAX_FIND_RESPONSE_SIZE = packed_response_size(bytes(REQUEST_ID_LENGTH),
+                                              encode_find_response([bytes(ID_LENGTH)] * K, [bytes(ID_LENGTH)] * K))
+MAX_ACCEPT_RESPONSE_SIZE = packed_response_size(bytes(REQUEST_ID_LENGTH), True)  # /provide, /pin: True or False

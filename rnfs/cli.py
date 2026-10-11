@@ -3,27 +3,32 @@
 `daemon` runs a node with its API and gateway; every other command is one request to a running daemon's
 local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
 are resolved to absolute paths here, since the daemon reads and writes them itself.
+
+Client commands authenticate with the token the daemon writes to <rnfs dir>/api_token at each start
+(specification section 11), so only users who can read the rnfs directory can use the daemon.
 """
 import argparse
+import contextlib
+import errno
 import http.client
 import json
 import os
+import secrets
 import stat
 import sys
 from urllib.parse import urlencode
 
+from rnfs import __version__, fsutil
 from rnfs.config import DEFAULT_API_PORT, Config
 
 DEFAULT_DIR = Config.rnfs_dir
 COPY_SIZE = 64 * 1024
+TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every other command
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # Windows lacks it
 
 
-def printable(text) -> str:
-    """text with control characters escaped, so names from other people's DAGs can't drive the terminal."""
-    text = str(text)
-    if text.isprintable():
-        return text
-    return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii") for c in text)
+# text with control characters escaped, so names from other people's DAGs can't drive the terminal
+printable = fsutil.printable
 
 
 def warn(message: str):
@@ -36,11 +41,70 @@ def fail(message: str):
     sys.exit(f"rnfs: {printable(message)}")
 
 
-class ApiClient:
-    """Talks to the daemon's API on 127.0.0.1:port, exiting with a friendly message on any error."""
+def token_path(rnfs_dir: str) -> str:
+    """Where the daemon using rnfs_dir keeps its API token."""
+    return os.path.join(os.path.expanduser(rnfs_dir), TOKEN_FILE)
 
-    def __init__(self, port: int):
+
+def write_token(path: str, token: str):
+    """Write the API token to path atomically, created with mode 0600 so other users can't read it."""
+    # A new file (O_EXCL) in the same directory, then a rename: the token is never readable with wider
+    # permissions, nor half-written, and an existing file or symlink at path is replaced, not written through
+    temp = os.path.join(os.path.dirname(path), f".{TOKEN_FILE}.{os.getpid()}.{secrets.token_hex(4)}")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | fsutil.O_BINARY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(token + "\n")
+        fsutil.replace(temp, path)  # retried on Windows while a client command is reading the old token
+    except BaseException:
+        with contextlib.suppress(OSError):
+            fsutil.remove(temp)
+        raise
+
+
+def remove_token(path: str, token: str):
+    """Delete the token file at path if it still holds token (another daemon may have replaced it)."""
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            if f.read().strip() != token:
+                return
+        fsutil.remove(path)  # on Windows, one a client still holds open is left, and replaced at the next start
+    except OSError:
+        pass  # already gone, or unreadable: nothing of ours to clean up
+
+
+def read_token(path: str) -> str:
+    """The daemon's API token from path; exits with an explanation if it can't be used."""
+    try:
+        fd = os.open(path, os.O_RDONLY | NOFOLLOW | fsutil.O_BINARY)
+    except FileNotFoundError:
+        fail(f"no API token at {path}: is the daemon running, with this --dir?")
+    except PermissionError:
+        fail(f"can't read the API token at {path}: permission denied. Is the daemon running as another user?")
+    except OSError as e:
+        fail(f"can't read the API token at {path}: {e}")
+    with os.fdopen(fd, "rb") as f:
+        mode = stat.S_IMODE(os.fstat(f.fileno()).st_mode)
+        # Windows has no Unix permission bits to check
+        if not fsutil.IS_WINDOWS and mode & 0o077:
+            fail(f"{path} is accessible to other users (mode {mode:04o}), so its token can't be trusted; "
+                 f"restart the daemon to make a new one")
+        token = f.read(1024).decode("ascii", "replace").strip()
+    if not token:
+        fail(f"the API token file {path} is empty; restart the daemon")
+    return token
+
+
+class ApiClient:
+    """Talks to the daemon's API on 127.0.0.1:port, exiting with a friendly message on any error.
+
+    token_file is read on the first request that needs it: status needs no token, for health checks.
+    """
+
+    def __init__(self, port: int, token_file: str):
         self.port = port
+        self.token_file = token_file
+        self.token: str | None = None
 
     def request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
                 body=None, length: int | None = None) -> http.client.HTTPResponse:
@@ -50,7 +114,11 @@ class ApiClient:
         """
         url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
         # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
-        headers = {"Host": f"127.0.0.1:{self.port}", "X-Rnfs-Api": "1"}
+        headers = {"Host": f"127.0.0.1:{self.port}"}
+        if (method, path) != ("GET", "/api/status"):
+            if self.token is None:
+                self.token = read_token(self.token_file)
+            headers["X-Rnfs-Api"] = self.token
         if json_body is not None:
             body = json.dumps(json_body).encode()
             headers["Content-Type"] = "application/json"
@@ -104,8 +172,11 @@ def read_all(response: http.client.HTTPResponse) -> bytes:
     return data
 
 
-def copy_response(response: http.client.HTTPResponse, out):
-    """Copy a response body to out, failing if it ends before its Content-Length."""
+def copy_response(response: http.client.HTTPResponse, out, progress=None):
+    """Copy a response body to out, failing if it ends before its Content-Length.
+
+    progress (jobs.StreamProgress) is called with the bytes copied so far and Content-Length, and closed at the end.
+    """
     expected = response.getheader("Content-Length")
     copied = 0
     while True:
@@ -117,20 +188,24 @@ def copy_response(response: http.client.HTTPResponse, out):
             break
         out.write(chunk)
         copied += len(chunk)
+        if progress is not None:
+            progress(copied, expected)
+    if progress is not None:
+        progress.close()
     out.flush()
     if expected is not None and copied != int(expected):
         fail(f"the transfer stopped after {copied} of {expected} bytes; see the daemon's log")
 
 
 def client(args) -> ApiClient:
-    """An ApiClient for --api-port, or the api_port in <dir>/rnfs.toml, or the default port."""
+    """An ApiClient for --api-port, or the api_port in <dir>/rnfs.toml, or the default port; token from <dir>."""
     port = args.api_port
     if port is None:
         try:
             port = Config.load(args.dir).api_port
         except (ValueError, OSError) as e:
             fail(f"can't read the settings in {args.dir}: {e}")
-    return ApiClient(port if port is not None else DEFAULT_API_PORT)
+    return ApiClient(port if port is not None else DEFAULT_API_PORT, token_path(args.dir))
 
 
 def absolute(path: str) -> str:
@@ -148,7 +223,7 @@ def print_warnings(result: dict):
 
 
 def run_daemon(args):
-    """Run a node with its API and gateway until SIGINT or SIGTERM, then shut everything down cleanly."""
+    """Run a node with its API and gateway until SIGINT, SIGTERM or SIGBREAK, then shut everything down cleanly."""
     # Imported here so client commands don't pay for loading RNS
     import faulthandler
     import signal
@@ -172,32 +247,49 @@ def run_daemon(args):
 
     node = RnfsNode(config)
     servers = []
+
+    def abort(message: str):
+        """Shut down what has started and exit with status 1 and message."""
+        for server in servers:
+            server.stop()
+        node.stop()
+        print(f"rnfs: {printable(message)}", file=sys.stderr, flush=True)
+        RNS.exit(1)  # ends with os._exit, so the message is printed first
+
     try:
         servers.append(ApiServer(node, config.api_port))
         servers.append(GatewayServer(node, config, config.gateway_port))
     except OSError as e:
-        for server in servers:
-            server.stop()
-        node.stop()
-        RNS.exit()
-        fail(f"can't listen on 127.0.0.1: {e}. Is another daemon running? (--api-port, --gateway-port)")
+        abort(f"can't listen on 127.0.0.1: {e}. Is another daemon running? (--api-port, --gateway-port)")
+    api, gateway = servers
+    # A new token each start, so one copied while an old daemon ran is useless now
+    token_file = token_path(config.root)
+    try:
+        write_token(token_file, api.token)
+    except OSError as e:
+        abort(f"can't write the API token {token_file}: {e}")
     for server in servers:
         server.start()
-    api, gateway = servers
     print(f"rnfs node {node.node_id.hex()}, API on http://127.0.0.1:{api.port}, "
           f"gateway on http://127.0.0.1:{gateway.port}", flush=True)
-    # `kill -USR1 <pid>` prints every thread's stack, for debugging hangs
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # `kill -USR1 <pid>` prints every thread's stack, for debugging hangs. Windows has no SIGUSR1
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
 
-    # Replace RNS's handlers, which exit immediately, so the node shuts down first
+    # Replace RNS's handlers, which exit immediately, so the node shuts down first. On Windows, Ctrl+C is
+    # SIGINT and Ctrl+Break (or CTRL_BREAK_EVENT sent to the daemon's process group) is SIGBREAK, whose
+    # default would end the process at once; SIGTERM never comes from another process there
     stopping = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stopping.set())
-    signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: stopping.set())
+    # Python runs handlers in the main thread, and on Windows a wait isn't interrupted for them: wake each second
     while not stopping.wait(1):
         pass
 
     for server in servers:
         server.stop()
+    remove_token(token_file, api.token)
     node.stop()
     # RNS.exit() ends with os._exit, which would lose log lines still buffered when stdout is a file
     sys.stdout.flush()
@@ -206,6 +298,46 @@ def run_daemon(args):
 
 
 # Content
+
+
+def add_options(args, query: bool = False) -> dict:
+    """add's --no-pin, --to, --to-self, --no-sealed-name and --chunker as API parameters (only those given);
+    query: for the stream endpoint's query string."""
+    options: dict = {}
+    if getattr(args, "no_pin", False):
+        options["pin"] = 0 if query else False
+    if getattr(args, "to", None):
+        options["to"] = ",".join(args.to) if query else args.to
+    if getattr(args, "to_self", False):
+        options["to_self"] = 1 if query else True
+    if getattr(args, "chunker", None):
+        options["chunker"] = args.chunker
+    if options.get("to") or options.get("to_self"):
+        if query and args.name:
+            options["seal_name"] = args.name
+        elif not query and getattr(args, "no_sealed_name", False):
+            options["seal_name"] = False
+    return options
+
+
+def wants_sealed_name(args) -> bool:
+    """True if get, without -o, should write a sealed file it opens under its sealed name: a bare CID's
+    output name would be the CID, while a path's last name is already a name."""
+    return not args.output and not getattr(args, "raw", False) and "/" not in args.target.strip("/")
+
+
+def sealed_output(args, output: str) -> str:
+    """get's default output for a sealed file this node can open: its sealed name, if it has one.
+
+    Only for a daemon without the job manager: a get job picks the sealed name itself (sealed_name), which
+    doesn't cost a separate fetch of the root before the job, ignoring --from.
+    """
+    if not wants_sealed_name(args):
+        return output
+    info = client(args).get("/api/info", target=args.target, **{"from": getattr(args, "from_node", None)})
+    name = info.get("name") if info.get("sealed") else None
+    # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
+    return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
 
 
 def run_add(args):
@@ -220,7 +352,10 @@ def run_add(args):
             length = info.st_size if stat.S_ISREG(info.st_mode) else None  # else sent chunked
         except (OSError, ValueError, AttributeError):
             length = None
-        result = api.call("POST", "/api/add/stream", params={"name": args.name, "only_hash": int(args.only_hash)},
+        options = add_options(args, query=True)
+        # Sealing stdin: --name is sealed inside, and is a visible wrapper entry too only with --wrap
+        name = args.name if args.wrap or not (options.get("to") or options.get("to_self")) else None
+        result = api.call("POST", "/api/add/stream", params={"name": name, "only_hash": int(args.only_hash), **options},
                           body=stream, length=length)
     else:
         if args.name:
@@ -228,36 +363,65 @@ def run_add(args):
         path = absolute(args.path)
         if not os.path.lexists(path):
             fail(f"no such file or directory: {args.path}")
-        result = api.post("/api/add", path=path, wrap=args.wrap, only_hash=args.only_hash)
+        result = api.post("/api/add", path=path, wrap=args.wrap, only_hash=args.only_hash, **add_options(args))
     print_warnings(result)
     print(result["cid"])
 
 
 def default_output(target: str) -> str:
     """Where `get` writes without -o: the target's last path name, else its CID, in the current directory."""
-    name = target.rstrip("/").rsplit("/", 1)[-1]
-    if name in ("", ".", "..") or "\x00" in name:
-        name = target.split("/", 1)[0]
-    return name
+    root = target.split("/", 1)[0]
+    # The last name is whoever made the DAG's choice: falls back to the CID if it is hidden (.bash_login),
+    # unprintable (terminal escapes) or not one plain path component here (fsutil.safe_default_name)
+    return fsutil.safe_default_name(target.rstrip("/").rsplit("/", 1)[-1], root)
 
 
 def run_get(args):
-    """Fetch a file or directory and have the daemon write it out."""
+    """Fetch a file or directory and have the daemon write it out, as a job (rnfs/features/jobs.py)."""
     output = absolute(args.output or default_output(args.target))
     if os.path.lexists(output):
         fail(f"{output} already exists; remove it or choose another with -o")
-    result = client(args).post("/api/get", target=args.target, output=output, **{"from": args.from_node})
-    print_warnings(result)
-    print(output)
+    from rnfs.features.contacts import node_arg  # a node contact's nick works for --from
+    args.from_node = node_arg(args, args.from_node)
+    if getattr(args, "raw", False):  # a sealed file's ciphertext: one request (jobs decrypt as plain get does)
+        result = client(args).post("/api/get", target=args.target, output=output, raw=True, **{"from": args.from_node})
+        print_warnings(result)
+        print(printable(output))
+        return
+
+    def without_jobs(api) -> dict:
+        """The get in one request, for a daemon without the job manager (asking for a sealed name first)."""
+        final = sealed_output(args, output)
+        if final != output and os.path.lexists(final):
+            fail(f"{final} already exists; remove it or choose another with -o")
+        return {"output": final, **api.post("/api/get", target=args.target, output=final, **{"from": args.from_node})}
+
+    from rnfs.features import jobs
+    fields = {"kind": "get", "target": args.target, "output": output, "from": args.from_node}
+    if wants_sealed_name(args):
+        fields["sealed_name"] = True  # the job renames a sealed file it opens to its sealed name
+    result = jobs.run_transfer(args, fields, without_jobs)
+    if result is not None:  # None: started in the background, its job ID printed
+        print_warnings(result)
+        print(printable(result.get("output") or output))
 
 
 def run_cat(args):
     """Write a file, or part of one, to stdout."""
     response = client(args).request("GET", "/api/cat", params={"target": args.target, "offset": args.offset,
-                                                                "length": args.length})
+                                                                "length": args.length,
+                                                                "raw": 1 if getattr(args, "raw", False) else None,
+                                                                "block": 1 if getattr(args, "block", False) else None})
+    progress = None
+    if sys.stderr.isatty() and not sys.stdout.isatty():  # into a file or pipe, watched from a terminal
+        from rnfs.features import jobs
+        progress = jobs.StreamProgress(sys.stderr)
     try:
-        copy_response(response, sys.stdout.buffer)
-    except BrokenPipeError:
+        copy_response(response, sys.stdout.buffer, progress)
+    except OSError as e:
+        # Windows reports a pipe whose reader has gone as EINVAL rather than EPIPE
+        if not (isinstance(e, BrokenPipeError) or (fsutil.IS_WINDOWS and e.errno == errno.EINVAL)):
+            raise
         # The reader (e.g. `head`) has gone; exit quietly without a second error at interpreter shutdown
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(1)
@@ -298,8 +462,12 @@ def run_dir_rm(args):
 
 
 def run_pin_add(args):
-    """Fetch and pin a target; print its CID once complete."""
-    print(client(args).post("/api/pin/add", target=args.target)["cid"])
+    """Fetch and pin a target, as a job; print its CID once complete."""
+    from rnfs.features import jobs
+    result = jobs.run_transfer(args, {"kind": "pin", "target": args.target},
+                               lambda api: api.post("/api/pin/add", target=args.target))
+    if result is not None:
+        print(result["cid"])
 
 
 def run_pin_rm(args):
@@ -307,15 +475,30 @@ def run_pin_rm(args):
     client(args).post("/api/pin/rm", cid=args.cid)
 
 
+def display_name(name: str) -> str:
+    """A pin's local name for printing: the home directory shortened to ~, non-printables escaped."""
+    home = os.path.expanduser("~")
+    if home not in ("", "~", os.sep) and (name == home or name.startswith(home + os.sep)):
+        name = "~" + name[len(home):]
+    return printable(name)
+
+
 def run_pin_ls(args):
-    """List pins with their sources."""
-    for pin in client(args).get("/api/pin/ls", cid=args.cid)["pins"]:
+    """List pins with their sources and, when known, where each came from (or what it holds)."""
+    pins = client(args).get("/api/pin/ls", cid=args.cid)["pins"]
+    if args.json:
+        print(json.dumps(pins, indent=2))
+        return
+    for pin in pins:
         state = "" if pin["complete"] else " (incomplete)"
-        print(f"{pin['cid']} {','.join(printable(s) for s in pin['sources'])}{state}")
+        name = f"  {display_name(pin['name'])}" if pin.get("name") else ""
+        print(f"{pin['cid']} {','.join(printable(s) for s in pin['sources'])}{state}{name}")
 
 
 def run_pin_remote(args):
     """Ask a node to pin or release a CID."""
+    from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
+    args.node = node_arg(args, args.node)
     result = client(args).post("/api/pin/remote", node=args.node, cid=args.cid, pin=args.action == "add")
     if not result["accepted"]:
         fail(f"{args.node} refused the request")
@@ -351,6 +534,8 @@ def run_providers(args):
 
 def run_ping(args):
     """Print the round-trip time to a node."""
+    from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
+    args.node = node_arg(args, args.node)
     rtt = client(args).get("/api/ping", node=args.node)["rtt"]
     if rtt is None:
         fail(f"no answer from {args.node}")
@@ -378,7 +563,7 @@ def run_name_export(args):
     key = read_all(response)
     if args.output:
         try:
-            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | fsutil.O_BINARY, 0o600)
         except FileExistsError:
             fail(f"{args.output} already exists")
         except OSError as e:
@@ -425,10 +610,13 @@ def run_name_resolve(args):
 
 
 def run_export(args):
-    """Write a target and its DAG to an archive file."""
+    """Write a target and its DAG to an archive file, as a job."""
     output = absolute(args.output)
-    result = client(args).post("/api/export", target=args.target, output=output)
-    print(f"exported {result['blocks']} blocks of {', '.join(result['roots'])} to {output}")
+    from rnfs.features import jobs
+    result = jobs.run_transfer(args, {"kind": "export", "target": args.target, "output": output},
+                               lambda api: api.post("/api/export", target=args.target, output=output))
+    if result is not None:
+        print(printable(f"exported {result['blocks']} blocks of {', '.join(result['roots'])} to {output}"))
 
 
 def run_import(args):
@@ -454,6 +642,7 @@ def run_status(args):
 def build_parser() -> argparse.ArgumentParser:
     """The argument parser for every command."""
     parser = argparse.ArgumentParser(prog="rnfs", description="Content-addressed file sharing over Reticulum")
+    parser.add_argument("--version", action="version", version=f"rnfs {__version__}")
     parser.add_argument("--api-port", type=int, default=None, help=f"daemon's API port (default {DEFAULT_API_PORT})")
     parser.add_argument("--dir", default=DEFAULT_DIR, help="rnfs directory (settings, identity, storage)")
     # Repeated on every subcommand so they can also go after the command name. SUPPRESS keeps a
@@ -488,16 +677,29 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--wrap", action="store_true", help="put it in a directory")
     add.add_argument("--only-hash", action="store_true", help="just print the CID; store nothing")
     add.add_argument("--name", help="with stdin: wrap it in a directory as this entry")
+    # --- content: unpinned adds, sealed files, chunkers ---
+    add.add_argument("--no-pin", action="store_true", help="keep it as evictable cache instead of pinning it")
+    add.add_argument("--to", nargs="+", action="extend", metavar="RECIPIENT",
+                     help="seal it so only these can read it: rnfs node IDs, LXMF addresses or identity hashes "
+                          "RNS has heard, 128-hex public keys, or contact nicks")
+    add.add_argument("--to-self", action="store_true", help="seal it for this node's identity too")
+    add.add_argument("--no-sealed-name", action="store_true", help="with --to: don't seal the file name inside")
+    add.add_argument("--chunker", choices=["fixed", "fastcdc"], help="fixed 64 KiB chunks (default) or FastCDC "
+                     "content-defined chunks, which keep most chunks of an edited file unchanged")
 
     get = command(commands, "get", run_get, "fetch and write out a file or directory")
     get.add_argument("target", metavar="CID[/PATH]")
     get.add_argument("-o", "--output", help="where to write (default: the last path name or the CID, here)")
     get.add_argument("--from", dest="from_node", metavar="NODE_ID", help="fetch from this node, bypassing the DHT")
+    get.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
+    get.add_argument("--raw", action="store_true", help="a sealed file as stored (its ciphertext), not decrypted")
 
     cat = command(commands, "cat", run_cat, "write a file, or part of one, to stdout")
     cat.add_argument("target", metavar="CID[/PATH]")
     cat.add_argument("--offset", type=int, default=None, help="first byte to write")
     cat.add_argument("--length", type=int, default=None, help="number of bytes to write")
+    cat.add_argument("--raw", action="store_true", help="a sealed file as stored (its ciphertext), not decrypted")
+    cat.add_argument("--block", action="store_true", help="the CID's own block (a bare CID), verified")
 
     ls = command(commands, "ls", run_ls, "list a directory: kind, size, CID, name")
     ls.add_argument("target", metavar="CID[/PATH]")
@@ -519,10 +721,12 @@ def build_parser() -> argparse.ArgumentParser:
                                                                         metavar="command")
     pin_add = command(pin, "add", run_pin_add, "fetch and pin")
     pin_add.add_argument("target", metavar="CID[/PATH]")
+    pin_add.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
     pin_rm = command(pin, "rm", run_pin_rm, "remove the user pin")
     pin_rm.add_argument("cid")
-    pin_ls = command(pin, "ls", run_pin_ls, "list pins and their sources")
+    pin_ls = command(pin, "ls", run_pin_ls, "list pins, their sources and where each came from")
     pin_ls.add_argument("cid", nargs="?")
+    pin_ls.add_argument("--json", action="store_true", help="print the full listing as JSON")
     remote = pin.add_parser("remote", help="remote pinning").add_subparsers(dest="action", required=True,
                                                                             metavar="command")
     for action in ("add", "rm"):
@@ -554,20 +758,30 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("alias")
     publish.add_argument("target", metavar="CID[/PATH]")
     resolve = command(name, "resolve", run_name_resolve, "print the CID a name points at")
-    resolve.add_argument("name")
+    resolve.add_argument("name", help="the name (32 hex characters) or a name contact's nick")
 
     export = command(commands, "export", run_export, "write an archive of a target")
     export.add_argument("target", metavar="CID[/PATH]")
     export.add_argument("-o", "--output", required=True, help="archive file to write")
+    export.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
     import_ = command(commands, "import", run_import, "import an archive, pinning its roots")
     import_.add_argument("file")
 
     command(commands, "status", run_status, "node ID, known nodes, records held, storage use")
+
+    from rnfs import features
+    for feature in features.feature_classes():
+        feature.cli_commands(commands, command)
     return parser
 
 
 def main(argv: list[str] | None = None):
     """Parse the command line and run the chosen command."""
+    # Redirected output on Windows uses the ANSI code page, which can't encode every name: escape what it
+    # can't rather than fail part-way through a listing
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     args = build_parser().parse_args(argv)
     args.run(args)
 

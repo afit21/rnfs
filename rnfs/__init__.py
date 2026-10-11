@@ -10,3 +10,5 @@ node.py      RnfsNode, which ties the above together into a running node and off
 api.py       local HTTP API; gateway.py the HTTP gateway
 cli.py       command line: run a daemon, or talk to one through its API
 """
+
+__version__ = "0.1.0"

@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rnfs"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Content-addressed file sharing over Reticulum, with the functional features of IPFS"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["rns>=1.5.6"]
+dependencies = ["rns>=1.5.6", "lxmf>=1.2.0"]
 keywords = ["reticulum", "rns", "ipfs", "mesh", "lora", "content-addressed", "file-sharing"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Communications :: File Sharing",
     "Topic :: System :: Networking",
 ]
@@ -25,3 +27,6 @@ rnfs = "rnfs.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["rnfs*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "rnfs.__init__.__version__"}  # not "rnfs": setuptools would find rnfs.py

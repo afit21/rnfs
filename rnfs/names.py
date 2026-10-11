@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import RNS
 from RNS.vendor import umsgpack
 
+from rnfs import fsutil
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, ID_LENGTH, NAME_ASPECT
 from rnfs.content.cid import Cid
@@ -92,6 +93,10 @@ def check_alias(alias) -> str:
     if not isinstance(alias, str) or not _ALIAS.fullmatch(alias):
         raise ValueError(f"invalid alias {alias!r}: use 1-64 letters, digits, '.', '_' or '-', "
                          "starting with a letter or digit")
+    # On Windows "con" or "nul.txt" would open a device, and "site." would be the file "site"
+    reason = fsutil.windows_name_reason(alias) if fsutil.IS_WINDOWS else None
+    if reason is not None:
+        raise ValueError(f"invalid alias {alias!r}: {reason}")
     return alias
 
 
@@ -185,9 +190,14 @@ class NameAnnounceHandler:
         self.receive_path_responses = True
         self._on_announce = on_announce
 
-    def received_announce(self, destination_hash, announced_identity, app_data):
-        """RNS calls this on its own new thread per announce; the work done is bounded and cheap."""
-        self._on_announce(destination_hash, app_data)
+    def received_announce(self, destination_hash, announced_identity, app_data, announce_packet_hash=None,
+                          is_path_response=False):
+        """RNS calls this on its own new thread per announce; the work done is bounded and cheap.
+
+        Five parameters, so RNS also passes the announce's packet hash: keepers use it to find the signed
+        announce in RNS's packet cache (rnfs.features.keepers).
+        """
+        self._on_announce(destination_hash, app_data, announce_packet_hash)
 
 
 # Names
@@ -226,6 +236,9 @@ class NameManager:
         self._waiters: dict[bytes, list[threading.Event]] = {}
         self._handler = NameAnnounceHandler(self._heard)
         self._started = False
+        # The keepers feature (rnfs.features.keepers), if loaded: told of heard and published records, and asked
+        # for signed records when the network has none. Never called with self._lock held
+        self.keepers = None
 
         self._load_keys()
         self._load_state()
@@ -280,10 +293,11 @@ class NameManager:
             del self._keys[alias]
             # State first: a crash before the key file is gone leaves an unpublished name, not a lost pin
             self._save()
-            try:
-                os.remove(self._key_path(alias))
-            except FileNotFoundError:
-                pass
+            key_path = self._key_path(alias)
+            if not fsutil.remove(key_path):
+                # Windows, with something holding the key open: the name would come back at the next start
+                log(f"couldn't delete {key_path}, which is in use; delete it, or {alias} returns at the next start",
+                    LOG_WARNING)
         log(f"removed name {name.hex()} ({alias})", LOG_NOTICE)
 
     def name(self, alias: str) -> bytes:
@@ -336,7 +350,11 @@ class NameManager:
             self._held[name] = Record(sequence, cid, self._clock())
             self._save()
             self._announce(alias)
+            identity = self._keys[alias]
         log(f"published {name.hex()} ({alias}) -> {cid}, sequence {sequence}", LOG_NOTICE)
+        if self.keepers is not None:
+            # This node keeps its own names, so they resolve through it while the owner's announce is gone
+            self.keepers.published(name, identity, encode_record(sequence, cid))
         return {"name": name.hex(), "cid": str(cid), "sequence": sequence}
 
     def start(self):
@@ -402,13 +420,25 @@ class NameManager:
         skipped for this node's own names and when the held record was heard less than max_age seconds ago.
         """
         name = _check_name(name)
+        self._offer_kept(name)
         with self._lock:
             held = self._record(name, touch=False)
             fresh = held is not None and max_age > 0 and self._clock() - held.heard < max_age
             local = name in self._aliases
         if not local and not fresh:
+            started = self._clock()
             self._refresh(name)
+            if self.keepers is not None:
+                with self._lock:
+                    self._absorb_recalled(name)
+                    record = self._record(name, touch=False)
+                # Nothing heard during the refresh: the owner and the paths may be gone, so ask keepers
+                if record is None or record.heard < started or self.keepers.always_ask():
+                    for sequence, cid, heard in self.keepers.query(name):
+                        self.offer(name, sequence, cid, heard)
 
+        # Again: the bounded table may have evicted it meanwhile, letting a replayed announce in
+        self._offer_kept(name)
         with self._lock:
             self._absorb_recalled(name)
             record = self._record(name, touch=True)
@@ -420,6 +450,18 @@ class NameManager:
                 self._save()
             return {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
                     "age": max(0.0, self._clock() - record.heard)}
+
+    def _offer_kept(self, name: bytes):
+        """Offer the signed record keepers hold for name, so it is a floor no replayed announce gets under.
+
+        Keepers persist the newest record of every kept name, but this node only persists names resolved
+        through the CLI or API; without this, a restart or table eviction would let an older one back in.
+        """
+        if self.keepers is None:
+            return
+        kept = self.keepers.local_record(name)
+        if kept is not None:
+            self.offer(name, *kept)
 
     def _refresh(self, name: bytes):
         """Request a path to name and wait, up to path_timeout, for an answer to reach RNS."""
@@ -469,7 +511,7 @@ class NameManager:
             heard = held.heard if same else self._clock()
         self._offer(name, sequence, cid, heard)
 
-    def _heard(self, name: bytes, app_data):
+    def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
         parsed = parse_record(app_data)
         with self._lock:
@@ -479,6 +521,25 @@ class NameManager:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):
                 event.set()
+        if parsed is not None and self.keepers is not None:
+            self.keepers.heard(bytes(name), parsed[0], parsed[1], packet_hash)
+
+    def offer(self, name: bytes, sequence: int, cid: Cid, heard: float) -> bool:
+        """Apply a record whose signature the caller verified (a keeper's answer), under the sequence rules.
+
+        True if it replaced the record held. Wakes resolves waiting for name.
+        """
+        name = _check_name(name)
+        with self._lock:
+            replaced = self._offer(name, sequence, cid, min(heard, self._clock()))
+            for event in self._waiters.get(name, ()):
+                event.set()
+        return replaced
+
+    def record(self, name: bytes) -> Record | None:
+        """The record held for name, without any network refresh (None if none)."""
+        with self._lock:
+            return self._record(_check_name(name), touch=False)
 
     # Sequence rules; callers hold the lock
 
@@ -661,16 +722,16 @@ class NameManager:
 def _write_atomic(path: str, data: bytes, mode: int = 0o644, temp: str | None = None):
     """Replace path with data via a synced temp file, so a crash leaves the old or the new file whole."""
     temp = temp or path + ".tmp"
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | fsutil.O_BINARY, mode)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp, path)
+        fsutil.replace(temp, path)
     except BaseException:
         try:
-            os.remove(temp)
+            fsutil.remove(temp)
         except OSError:
             pass
         raise

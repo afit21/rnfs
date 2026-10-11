@@ -4,15 +4,17 @@ import stat
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import RNS
 from RNS.vendor import umsgpack
 
-from rnfs import names
+from rnfs import fsutil, names
 from rnfs.config import Config
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import NotFound
 from rnfs.names import NameManager, encode_record, parse_record
+from tests.support import POSIX_MODES
 
 _saved_loglevel = RNS.loglevel
 
@@ -221,11 +223,33 @@ class KeyTest(NamesTestCase):
                 self.manager.create(bad)
         self.manager.create("my-site_1.0")
 
+    def test_windows_alias_rules(self):
+        """On Windows, aliases that are device names or lose a trailing dot are refused too."""
+        with mock.patch.object(fsutil, "IS_WINDOWS", True):
+            for bad in ["con", "NUL.txt", "com1", "site."]:
+                with self.subTest(alias=bad), self.assertRaises(ValueError):
+                    names.check_alias(bad)
+            self.assertEqual(names.check_alias("console"), "console")
+        if not fsutil.IS_WINDOWS:
+            self.assertEqual(names.check_alias("con"), "con")
+
+    def test_key_file_in_use_on_windows_is_kept_with_a_warning(self):
+        """rm still forgets the name when Windows won't delete its key file yet."""
+        self.manager.create("site")
+        with mock.patch.object(fsutil, "remove", return_value=False), \
+                mock.patch.object(names, "log") as log:
+            self.manager.remove("site")
+        self.assertEqual(self.manager.list(), [])
+        self.assertTrue(any("in use" in call.args[0] for call in log.call_args_list))
+
     def test_create_stores_private_key_file(self):
         """create writes the identity at names_dir/alias, readable only by the owner, and lists it."""
         name = self.manager.create("site")
         path = os.path.join(self.config.names_dir, "site")
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        if POSIX_MODES:  # Windows has no Unix permission bits
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        with open(path, "rb") as f:
+            self.assertEqual(len(f.read()), 64)  # RNS's raw private key, unchanged by newline translation
         self.assertEqual(len(name), 16)
         self.assertEqual(self.manager.list(), [{"alias": "site", "name": name.hex(), "cid": None, "sequence": 0}])
         with self.assertRaises(ValueError):

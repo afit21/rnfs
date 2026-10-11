@@ -3,11 +3,15 @@
 A block is verified against its CID before it's stored, and written to a temporary file that is then
 renamed, so a file under a CID name is never half-written. Partial files left by a crash are deleted
 when the store is opened. Not locked: Storage serialises access.
+
+On Windows a file can't be deleted or replaced while a reader has it open, so a block already stored is
+never rewritten (its content can't differ), and a delete that keeps meeting an open handle is deferred.
 """
 import os
 import tempfile
 from typing import Iterator
 
+from rnfs import fsutil
 from rnfs.constants import MAX_BLOCK_SIZE
 from rnfs.content.cid import Cid
 
@@ -23,10 +27,7 @@ class BlockStore:
         os.makedirs(self.directory, exist_ok=True)
         for name in os.listdir(self.directory):
             if name.startswith(PARTIAL_PREFIX):
-                try:
-                    os.remove(os.path.join(self.directory, name))
-                except FileNotFoundError:
-                    pass
+                fsutil.remove(os.path.join(self.directory, name))  # one still in use is tried at the next start
 
     def path(self, cid: Cid) -> str:
         """Where the block for cid is (or would be) stored."""
@@ -52,33 +53,41 @@ class BlockStore:
             return None
 
     def put(self, cid: Cid, block: bytes):
-        """Store block under cid. Raises ValueError, storing nothing, if it doesn't match or is too large."""
+        """Store block under cid unless already stored. Raises ValueError, storing nothing, if it doesn't match."""
         if len(block) > MAX_BLOCK_SIZE:
             raise ValueError(f"block for {cid} exceeds MAX_BLOCK_SIZE")
         if not cid.verify(block):
             raise ValueError(f"block does not match {cid}")
+        path = self.path(cid)
+        if os.path.isfile(path):
+            return  # content-addressed, so the same bytes; replacing them would fail on Windows while read
         fd, partial_path = tempfile.mkstemp(prefix=PARTIAL_PREFIX, dir=self.directory)
         try:
             with os.fdopen(fd, "wb") as out:
                 out.write(block)
             # Atomic, so readers never see a half-written block under a CID name
-            os.replace(partial_path, self.path(cid))
+            try:
+                fsutil.replace(partial_path, path)
+            except PermissionError:
+                # On Windows: a concurrent put stored it first and a reader holds it open. That one is as good
+                if not os.path.isfile(path):
+                    raise
+                fsutil.remove(partial_path)
         except BaseException:
             try:
-                os.remove(partial_path)
-            except FileNotFoundError:
+                fsutil.remove(partial_path)
+            except OSError:
                 pass
             raise
 
-    def delete(self, cid: Cid) -> int:
-        """Delete the block; returns the bytes freed (0 if it wasn't stored)."""
+    def delete(self, cid: Cid) -> int | None:
+        """Delete the block; returns the bytes freed (0 if not stored), or None if Windows kept it in use."""
         path = self.path(cid)
         try:
             freed = os.path.getsize(path)
-            os.remove(path)
-            return freed
         except FileNotFoundError:
             return 0
+        return freed if fsutil.remove(path) else None
 
     def verify(self, cid: Cid) -> bool:
         """True if the stored block exists and matches its CID."""

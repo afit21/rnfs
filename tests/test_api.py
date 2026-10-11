@@ -9,10 +9,12 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
-from rnfs.api import ApiServer, BodyReader, LocalServer
+from rnfs import fsutil
+from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 
@@ -137,7 +139,7 @@ class FakeNode:
         if os.path.isdir(path):
             return self.put_dir({name: self._add_tree(os.path.join(path, name)) for name in os.listdir(path)})
         with open(path, "rb") as f:
-            return self.put_file(f.read(), executable=os.access(path, os.X_OK))
+            return self.put_file(f.read(), executable=os.name != "nt" and os.access(path, os.X_OK))  # as add does
 
     # Facade
 
@@ -383,10 +385,10 @@ class ApiTestCase(unittest.TestCase):
         self.port = self.server.port
 
     def call(self, method, path, body=None, headers=None, api=True, host="default"):
-        """(status, headers, body) of a request, with X-Rnfs-Api: 1 unless api is False."""
+        """(status, headers, body) of a request, with the server's token in X-Rnfs-Api unless api is False."""
         headers = dict(headers or {})
         if api:
-            headers["X-Rnfs-Api"] = "1"
+            headers["X-Rnfs-Api"] = self.server.token
         if isinstance(body, dict):
             body = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
@@ -413,20 +415,46 @@ class SecurityTest(ApiTestCase):
         self.assertEqual(self.call("POST", "/api/gc", {}, host="evil.example")[0], 403)
         self.assertEqual(self.node.called("gc"), [])
 
-    def test_api_header_required(self):
+    def test_token_required(self):
+        # Every route but status, with valid parameters, so only the token can be what refuses them
         file_cid = self.node.put_file(b"x")
-        for method, path, body in (("POST", "/api/pin/add", {"target": file_cid}), ("POST", "/api/gc", {}),
-                                   ("POST", "/api/name/create", {"alias": "a"}),
-                                   ("POST", "/api/add/stream", b"data"),
-                                   ("GET", f"/api/ls?target={file_cid}", None)):
-            status, _, data = self.call(method, path, body, api=False)
-            self.assertEqual(status, 403, path)
-            self.assertIn("X-Rnfs-Api", json.loads(data)["error"])
-            self.assertEqual(self.call(method, path, body, headers={"X-Rnfs-Api": "0"}, api=False)[0], 403)
-        self.assertEqual(self.node.pins, {})
-        self.assertEqual(self.node.keys, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = os.path.join(tmp, "secret")
+            with open(secret, "wb") as f:
+                f.write(b"private key")
+            self.node.keys["k"] = b"key"
+            parameters = {"target": file_cid, "cid": file_cid, "node": "00" * 16, "name": "00" * 16,
+                          "path": secret, "output": os.path.join(tmp, "out"), "alias": "k", "pin": True}
+            query = "&".join(f"{name}={value}" for name, value in parameters.items() if name != "pin")
+            wrong = ["1", "0", "", self.server.token[:-1], self.server.token + "x", "é" + self.server.token[1:]]
+            for (method, path) in ApiHandler.ROUTES:
+                if path == "/api/status":
+                    continue
+                body = parameters if method == "POST" else None
+                status, _, data = self.call(method, f"{path}?{query}", body, api=False)
+                self.assertEqual(status, 403, path)
+                self.assertIn("X-Rnfs-Api", json.loads(data)["error"])
+                for token in wrong:
+                    self.assertEqual(self.call(method, f"{path}?{query}", body, {"X-Rnfs-Api": token},
+                                               api=False)[0], 403, (path, token))
+            self.assertEqual(self.node.calls, [])
+            self.assertFalse(os.path.exists(parameters["output"]))
+            # The right token works, with surrounding whitespace too
+            self.assertEqual(self.call("GET", f"/api/cat?target={file_cid}", None,
+                                       {"X-Rnfs-Api": f" {self.server.token} "}, api=False)[2], b"x")
         # Status stays open for health checks
         self.assertEqual(self.call("GET", "/api/status", api=False)[0], 200)
+
+    def test_tokens(self):
+        self.assertGreaterEqual(len(self.server.token), 43)  # 32 random bytes
+        other = ApiServer(self.node, 0)
+        self.addCleanup(other.stop)
+        self.assertNotEqual(other.token, self.server.token)
+        chosen = ApiServer(self.node, 0, token="chosen")
+        self.addCleanup(chosen.stop)
+        self.assertEqual(chosen.token, "chosen")
+        with self.assertRaises(ValueError):
+            ApiServer(self.node, 0, token="")
 
     def test_no_cors_headers(self):
         file_cid = self.node.put_file(b"x")
@@ -483,7 +511,7 @@ class EndpointTest(ApiTestCase):
         self.addCleanup(connection.close)
         connection.putrequest("POST", "/api/add/stream")
         connection.putheader("Content-Length", "10")
-        connection.putheader("X-Rnfs-Api", "1")
+        connection.putheader("X-Rnfs-Api", self.server.token)
         connection.endheaders(b"abc")
         connection.sock.shutdown(socket.SHUT_WR)  # end the body early
         self.assertEqual(connection.getresponse().status, 400)
@@ -519,7 +547,7 @@ class EndpointTest(ApiTestCase):
         self.addCleanup(logged.stop)
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         self.addCleanup(connection.close)
-        connection.request("GET", f"/api/cat?target={cid}", headers={"X-Rnfs-Api": "1"})
+        connection.request("GET", f"/api/cat?target={cid}", headers={"X-Rnfs-Api": self.server.token})
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
         with self.assertRaises(http.client.IncompleteRead):
@@ -612,6 +640,149 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(len(self.ok("GET", "/api/name/list")["names"]), 2)
         self.assertEqual(self.ok("POST", "/api/name/rm", {"alias": "copy"}), {})
         self.assertEqual(self.call("POST", "/api/name/export", {"alias": "copy"})[0], 404)
+
+
+def read_until_closed(sock: socket.socket, limit: float = 5.0) -> tuple[bytes, float]:
+    """(everything sock receives until the server closes it, seconds that took). Fails after limit."""
+    sock.settimeout(limit)
+    start = time.monotonic()
+    data = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except ConnectionResetError:
+            chunk = b""
+        if not chunk:
+            return data, time.monotonic() - start
+        data += chunk
+
+
+def held_connections(port: int, count: int, data: bytes = b"GET /") -> list[socket.socket]:
+    """count connections that have sent data (an unfinished request) and wait; closed at cleanup."""
+    connections = [socket.create_connection(("127.0.0.1", port)) for _ in range(count)]
+    for connection in connections:
+        connection.sendall(data)
+    return connections
+
+
+class ConnectionTest(ApiTestCase):
+    """Time limits and the connection cap, with short limits so the tests are quick."""
+
+    LIMITS = {"request_timeout": 0.5, "body_timeout": 0.5, "max_connections": 3}
+
+    def setUp(self):
+        patcher = mock.patch.multiple(ApiServer, **self.LIMITS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def connect(self) -> socket.socket:
+        """A raw connection to the API, closed at cleanup."""
+        sock = socket.create_connection(("127.0.0.1", self.port))
+        self.addCleanup(sock.close)
+        return sock
+
+    def request_head(self, method: str, path: str, **headers) -> bytes:
+        """A request line and headers carrying the token and a valid Host."""
+        lines = [f"{method} {path} HTTP/1.1", f"Host: 127.0.0.1:{self.port}", f"X-Rnfs-Api: {self.server.token}",
+                 *(f"{name.replace('_', '-')}: {value}" for name, value in headers.items())]
+        return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+    def test_idle_connection_is_closed(self):
+        data, elapsed = read_until_closed(self.connect())
+        self.assertEqual(data, b"")
+        self.assertGreater(elapsed, 0.3)
+        self.assertLess(elapsed, 3)
+
+    def test_slow_headers_hit_the_deadline(self):
+        # Trickling bytes doesn't extend the time allowed: the whole request has one deadline
+        sock = self.connect()
+        start = time.monotonic()
+        with self.assertRaises(OSError):
+            for _ in range(50):
+                sock.sendall(b"G")
+                time.sleep(0.1)
+        self.assertLess(time.monotonic() - start, 3)
+
+    def test_short_json_body(self):
+        sock = self.connect()
+        sock.sendall(self.request_head("POST", "/api/gc", Content_Length=10) + b"{}")
+        data, elapsed = read_until_closed(sock)
+        self.assertTrue(data.startswith(b"HTTP/1.0 408"), data)
+        self.assertLess(elapsed, 3)
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_short_upload(self):
+        sock = self.connect()
+        sock.sendall(self.request_head("POST", "/api/add/stream", Content_Length=10) + b"abc")
+        data, elapsed = read_until_closed(sock)
+        self.assertTrue(data.startswith(b"HTTP/1.0 408"), data)
+        self.assertLess(elapsed, 3)
+        self.assertEqual(self.node.objects, {})
+
+    def test_slow_upload_within_body_timeout(self):
+        # Each pause is under body_timeout, and together they exceed request_timeout
+        sock = self.connect()
+        sock.sendall(self.request_head("POST", "/api/add/stream", Content_Length=6))
+        for piece in (b"ab", b"cd", b"ef"):
+            time.sleep(0.3)
+            sock.sendall(piece)
+        data, _ = read_until_closed(sock)
+        self.assertTrue(data.startswith(b"HTTP/1.0 200"), data)
+        self.assertEqual(self.node.called("add_stream")[0][0], (b"abcdef",))
+
+    def test_node_work_is_not_timed(self):
+        # A fetch longer than every limit still gets its answer
+        cid = self.node.put_file(b"remote", remote=True)
+        self.node.gate = threading.Event()
+        threading.Timer(1.2, self.node.gate.set).start()
+        self.assertEqual(self.ok("POST", "/api/pin/add", {"target": cid})["cid"], cid)
+        self.assertEqual(self.call("GET", f"/api/cat?target={cid}")[2], b"remote")
+
+    def test_connection_cap(self):
+        held = held_connections(self.port, 3)
+        for sock in held:
+            self.addCleanup(sock.close)
+        time.sleep(0.1)  # let the server accept them
+        status, headers, data = self.call("GET", "/api/status")
+        self.assertEqual(status, 503)
+        self.assertIn("too many", json.loads(data)["error"])
+        self.assertEqual(headers["Retry-After"], "10")
+        self.assertEqual(self.node.called("status"), [])
+        # The held connections time out, freeing their slots
+        for sock in held:
+            read_until_closed(sock)
+        time.sleep(0.1)
+        self.assertEqual(self.call("GET", "/api/status")[0], 200)
+
+    def test_log_escapes_the_target(self):
+        def failing(*args, **kwargs):
+            yield b"x"
+            raise RuntimeError("boom")
+        cid = self.node.put_file(b"0123456789")
+        with mock.patch.object(self.node, "info", return_value={"type": "file", "size": 10, "cid": cid}), \
+                mock.patch.object(self.node, "read", failing), mock.patch("rnfs.api.log") as log:
+            with self.assertRaises(http.client.IncompleteRead):  # cut short, as the failure happened mid-stream
+                self.call("GET", f"/api/cat?target={cid}/%1b%5b2J%0a")
+        (message, _), = [call.args for call in log.call_args_list]
+        self.assertIn(f"{cid}/\\x1b[2J\\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class BindTest(unittest.TestCase):
+    """The listening socket."""
+
+    def test_windows_binds_exclusively(self):
+        # On Windows SO_REUSEADDR would let another socket bind the API's port while the daemon listens on it
+        with mock.patch.object(fsutil, "IS_WINDOWS", True):
+            server = ApiServer(FakeNode(), 0)
+        self.addCleanup(server.stop)
+        self.assertFalse(server.server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR))
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.assertTrue(server.server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE))
+        with self.assertRaises(OSError):
+            ApiServer(FakeNode(), server.port)  # a second daemon can't share the port
 
 
 class BodyReaderTest(unittest.TestCase):

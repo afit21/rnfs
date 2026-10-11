@@ -6,7 +6,9 @@ GET/HEAD /name/<name>[/path]  content a name points at, resolved with for_gatewa
 Behaviour:
 - Path segments are percent-decoded one by one; a decoded segment can't contain "/" or NUL, so every
   segment is exactly one name.
-- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes.
+- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. A
+  HEAD, or a range not starting at byte 0, uses the first bytes only if they are stored (else the name, or
+  application/octet-stream), so it never fetches what it doesn't send.
   Single byte ranges (206, 416, Accept-Ranges; If-Range honoured); several ranges get the whole file.
 - Directories: without a trailing slash, 301 to the slash form; with one, index.html if present, else
   an HTML-escaped listing with percent-encoded links.
@@ -26,6 +28,9 @@ Behaviour:
 - Everything is requested with for_gateway=True: fetched content is cache, never provided, and names go
   only into the capped table. Name resolutions are reused for NAME_CACHE_TIME, so a page's many
   subresources don't each start a resolution against gateway_fetches.
+- Connections are limited as for the API (rnfs/api.py): the request must arrive within request_timeout, at
+  most max_connections are served at once (more get a 503 carrying the headers above), and a response write
+  may block response_timeout, so clients that stop reading can't hold every slot for ever.
 """
 import codecs
 import html
@@ -33,11 +38,12 @@ import mimetypes
 import threading
 import time
 from collections import OrderedDict
-from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from rnfs.api import LocalServer, error_status, host_allowed, parse_hex_id
+from rnfs.api import LocalServer, TimedHandler, error_status, host_allowed, loggable, parse_hex_id, raw_response
+from rnfs import gateway_formats  # --- content ---
 from rnfs.content.cid import Cid
+from rnfs.content.seal import is_sealed  # --- content ---
 from rnfs.log import LOG_ERROR, log
 
 CSP_SCRIPTS = ("sandbox allow-scripts allow-forms allow-popups; "
@@ -51,8 +57,10 @@ NAME_CACHE_TIME = 60.0
 NAME_CACHE_SIZE = 1000
 INDEX = "index.html"
 
-# Types some platforms' mimetypes tables lack or get wrong
-EXTRA_TYPES = {".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm",
+# Types some platforms' mimetypes tables lack or get wrong (on Windows, mimetypes also reads the registry,
+# which installed software edits), so the commonest web types are fixed here too
+EXTRA_TYPES = {".html": "text/html", ".htm": "text/html", ".css": "text/css", ".txt": "text/plain",
+               ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm",
                ".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml", ".json": "application/json",
                ".md": "text/markdown", ".webm": "video/webm", ".opus": "audio/ogg", ".woff2": "font/woff2"}
 
@@ -236,13 +244,17 @@ class NameCache:
 class GatewayServer(LocalServer):
     """The gateway for node (an RnfsNode, or anything with its facade methods), using config's gateway settings."""
 
+    max_connections = 64  # a page's subresources come in parallel; browsers open about 6 per host anyway
+    # A paused video stops reading, so this is generous; it only stops a client holding a slot for ever
+    response_timeout = 300.0
+
     def __init__(self, node, config, port: int):
         """Bind to 127.0.0.1:port; requests are served once start() is called."""
         super().__init__(GatewayHandler, port, node=node, config=config, limiter=FetchLimiter(config.gateway_fetches),
                          names=NameCache())
 
 
-class GatewayHandler(BaseHTTPRequestHandler):
+class GatewayHandler(TimedHandler):
     """Handles one gateway request; node, config, limiter and names are set on the subclass GatewayServer creates."""
 
     node = None
@@ -254,6 +266,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
+
+    @classmethod
+    def busy_response(cls) -> bytes:
+        """503 for a connection over max_connections, with the headers every gateway response carries."""
+        return raw_response("503 Service Unavailable", {
+            "Content-Type": "text/plain; charset=utf-8", "Retry-After": RETRY_AFTER,
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": CSP_SCRIPTS if cls.config.gateway_scripts else CSP_NO_SCRIPTS,
+        }, b"too many gateway connections; try again shortly\n")
 
     # Responses
 
@@ -340,13 +361,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise GatewayError(403, "Host header must be 127.0.0.1:<port> or localhost:<port>")
             if self.command not in ("GET", "HEAD"):
                 raise GatewayError(405, "the gateway only answers GET and HEAD", {"Allow": "GET, HEAD"})
+            self.request_read()  # GET and HEAD have no body
             self.serve()
         except GatewayError as e:
             self.respond_error(e.status, str(e), e.headers)
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             if status == 500:
-                log(f"gateway {self.command} {self.path} failed: {e!r}", LOG_ERROR)
+                log(f"gateway {self.command} {loggable(self.path)} failed: {e!r}", LOG_ERROR)
             self.respond_error(status, str(e) or type(e).__name__, {"Retry-After": RETRY_AFTER} if status == 503 else {})
         finally:
             if self.slot:
@@ -388,6 +410,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             raise GatewayError(404, "gateway paths are /rnfs/<cid>[/path] and /name/<name>[/path]")
         slash = len(segments) > 3 and segments[-1] == ""
         names = [self.decode_segment(segment) for segment in (segments[3:-1] if slash else segments[3:])]
+        if self.param("format") is not None:  # --- content: trustless ?format=raw|archive ---
+            return gateway_formats.serve_format(self, segments, names)
 
         if segments[1] == "rnfs":
             try:
@@ -473,20 +497,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def serve_file(self, target: str, size: int, filename: str | None, cache: dict):
         """Serve a file, or the requested byte range of it."""
-        content_type = type_from_name(filename)
-        if content_type is None:
-            content_type = sniff(b"".join(self.node.read(target, offset=0, length=min(size, SNIFF_SIZE),
-                                                         for_gateway=True)))
-        headers = {"Accept-Ranges": "bytes", **cache}
-        if self.param("filename"):
-            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
-
         byte_range = parse_range(self.headers.get("Range"), size)
         if_range = self.headers.get("If-Range")
         if if_range is not None and if_range.strip() != cache.get("ETag"):
             byte_range = None  # the client's partial copy may be of something else: send it all
         if byte_range == "unsatisfiable":
             raise GatewayError(416, "range not satisfiable", {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+        content_type = self.file_type(target, size, filename, self.command != "HEAD" and
+                                      (byte_range is None or byte_range[0] == 0))
+        headers = {"Accept-Ranges": "bytes", **cache}
+        if self.param("filename"):
+            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
+
         if byte_range is None:
             status, start, length = 200, 0, size
         else:
@@ -497,6 +519,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self.send_stream(status, content_type, length, headers, iter(()))
         chunks = iter(self.node.read(target, offset=start, length=length, for_gateway=True))
         self.send_stream(status, content_type, length, headers, chunks)
+
+    def file_type(self, target: str, size: int, filename: str | None, sends_start: bool) -> str:
+        """A file's Content-Type: octet-stream for a sealed file (never decrypted here), else by name or sniffed.
+
+        The first bytes are fetched only when the response sends them anyway; for a HEAD or a range starting
+        later they are used only if already stored, so such a request fetches nothing it doesn't send.
+        """
+        length = min(size, SNIFF_SIZE)
+        if sends_start:
+            head = b"".join(self.node.read(target, offset=0, length=length, for_gateway=True))
+        else:
+            stored_head = getattr(self.node, "stored_head", None)  # facades without it: only complete targets
+            if stored_head is not None:
+                head = stored_head(target, length)
+            elif self.node.is_local(target):
+                head = b"".join(self.node.read(target, offset=0, length=length, for_gateway=True))
+            else:
+                head = None
+            if head is None:
+                return type_from_name(filename) or "application/octet-stream"
+        return "application/octet-stream" if is_sealed(head) else type_from_name(filename) or sniff(head)
 
     def send_stream(self, status: int, content_type: str, length: int, headers: dict, chunks):
         """Send length bytes from chunks. The first chunk is read before the status, so early errors show."""
@@ -518,7 +561,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise
             # Too late for an error status; the short body (Content-Length) tells the client
             if not isinstance(e, OSError):
-                log(f"gateway {self.path} failed mid-stream: {e!r}", LOG_ERROR)
+                log(f"gateway {loggable(self.path)} failed mid-stream: {e!r}", LOG_ERROR)
         finally:
             close = getattr(chunks, "close", None)
             if close:

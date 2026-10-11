@@ -23,25 +23,49 @@ STATE_FILE = "shared_folder.json"
 
 
 def signature(path: str) -> str:
-    """A digest of what decides path's content: names, types, sizes, mtimes and execute bits, recursively.
+    """A digest of what decides the content of the entry at path (not following a symlink there).
 
-    Raises OSError if path can't be read.
+    Raises OSError if path can't be read, ValueError if it is neither a regular file nor a directory.
+    """
+    handle, st = builder.open_path(path, follow_symlinks=False)
+    try:
+        return open_signature(handle, st, path)
+    finally:
+        builder.close(handle)
+
+
+def open_signature(handle: builder.Handle, st: os.stat_result, path: str) -> str:
+    """A digest of names, types, sizes, mtimes and execute bits, recursively, of the entry open as handle.
+
+    handle and st come from builder.open_path or open_child; directories are walked as builder walks them, so
+    nothing outside the entry is read. Raises OSError if something can't be read or changes while it is.
     """
     digest = hashlib.sha256()
 
-    def add(item_path: str, relative: str, st: os.stat_result, depth: int):
-        """Fold one item (and, for a directory, everything in it) into the digest."""
+    def add(item: builder.Handle | None, item_path: str, relative: str, st: os.stat_result, depth: int):
+        """Fold one item (and, for a directory, open as item, everything in it) into the digest."""
         mode = st.st_mode
         digest.update(json.dumps([relative.encode("utf-8", "surrogateescape").hex(), stat.S_IFMT(mode),
-                                  st.st_size, st.st_mtime_ns, bool(mode & stat.S_IXUSR)]).encode())
+                                  st.st_size, st.st_mtime_ns, builder.is_executable(mode)]).encode())
         # Deeper than MAX_DEPTH can't be added anyway; don't recurse without bound
-        if stat.S_ISDIR(mode) and depth <= constants.MAX_DEPTH + 1:
-            with os.scandir(item_path) as listing:
-                children = sorted(listing, key=lambda entry: entry.name)
-            for child in children:
-                add(child.path, relative + "/" + child.name, child.stat(follow_symlinks=False), depth + 1)
+        if item is None or not stat.S_ISDIR(mode) or depth > constants.MAX_DEPTH + 1:
+            return
+        with os.scandir(item) as listing:
+            children = sorted(listing, key=lambda entry: entry.name)
+        for child in children:
+            child_path = os.path.join(item_path, child.name)
+            child_st = builder.listed_stat(child, child_path)
+            # A Windows junction stats as a directory, but add skips it like a symlink: don't walk into it
+            if not stat.S_ISDIR(child_st.st_mode) or builder.is_link(child_st):
+                add(None, child_path, relative + "/" + child.name, child_st, depth + 1)  # its stat is enough
+                continue
+            child_handle = builder.open_child(item, child.name, child_path, child_st)
+            try:
+                add(child_handle, child_path, relative + "/" + child.name, child_st, depth + 1)
+            finally:
+                builder.close(child_handle)
 
-    add(path, "", os.stat(path, follow_symlinks=False), 1)
+    add(handle, path, "", st, 1)
     return digest.hexdigest()
 
 
@@ -70,6 +94,11 @@ class SharedFolder:
             except (ValueError, TypeError, IndexError):
                 continue
 
+    def names(self) -> dict[Cid, str]:
+        """CID → the shared-folder entry name it was imported from, for `pin ls`."""
+        with self._lock:
+            return {cid: name for name, (_, cid) in self._known.items()}
+
     def _save(self):
         """Persist the signature cache."""
         if self._state_path is None:
@@ -82,12 +111,19 @@ class SharedFolder:
         with self._lock:
             os.makedirs(self.directory, exist_ok=True)
             current: dict[str, tuple[str, Cid]] = {}
-            with os.scandir(self.directory) as listing:
-                items = sorted(listing, key=lambda entry: entry.name)
-            for item in items:
-                result = self._scan_item(item)
-                if result is not None:
-                    current[item.name] = result
+            # The folder itself is the owner's setting, so a symlink to it is followed; nothing inside it is
+            folder, st = builder.open_path(self.directory)
+            try:
+                if not stat.S_ISDIR(st.st_mode):
+                    raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
+                with os.scandir(folder) as listing:
+                    items = sorted(listing, key=lambda entry: entry.name)
+                for item in items:
+                    result = self._scan_item(folder, item)
+                    if result is not None:
+                        current[item.name] = result
+            finally:
+                builder.close(folder)
             pins = {cid for _, cid in current.values()}
             for cid in self.storage.pinned_by(FOLDER) - pins:
                 self.storage.unpin(cid, FOLDER)
@@ -104,31 +140,48 @@ class SharedFolder:
             self._warned.add(key)
             log(f"shared folder: {message}", LOG_WARNING)
 
-    def _scan_item(self, item: os.DirEntry) -> tuple[str, Cid] | None:
+    def _scan_item(self, folder: builder.Handle, item: os.DirEntry) -> tuple[str, Cid] | None:
         """(signature, CID) of a top-level entry, importing and pinning it if new or changed; None if skipped."""
-        shown = display_path(item.path)
+        path = os.path.join(self.directory, item.name)
+        shown = display_path(path)
         try:
-            if item.is_symlink():
+            st = builder.listed_stat(item, path)
+            if builder.is_link(st):
                 self._warn_once(f"symlink:{item.name}", f"skipped symlink {shown}")
                 return None
-            if not (item.is_dir(follow_symlinks=False) or item.is_file(follow_symlinks=False)):
+            if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
                 self._warn_once(f"special:{item.name}", f"skipped {shown}: not a regular file or directory")
                 return None
-            sig = signature(item.path)
+            # Signature and import both read this one open entry, so a swap after the check above can't
+            # make either follow a symlink out of the folder or block on a FIFO
+            handle = builder.open_child(folder, item.name, path, st)
         except OSError:
-            return None  # deleted or unreadable mid-scan; it'll be picked up next time if it comes back
-        known = self._known.get(item.name)
+            return None  # deleted, swapped or unreadable mid-scan; it'll be picked up next time if it comes back
+        try:
+            return self._import(item.name, handle, st, path)
+        finally:
+            builder.close(handle)
+
+    def _import(self, name: str, handle: builder.Handle, st: os.stat_result, path: str) -> tuple[str, Cid] | None:
+        """_scan_item for an entry open as handle."""
+        shown = display_path(path)
+        try:
+            sig = open_signature(handle, st, path)
+        except OSError:
+            return None
+        known = self._known.get(name)
         if known is not None and known[0] == sig and self.storage.is_complete(known[1]):
             self.storage.pin(known[1], FOLDER)  # no-op if already pinned
             return known
-        if self._failed.get(item.name) == sig:
+        if self._failed.get(name) == sig:
             return None
+        warnings: list[str] = []
         try:
             with self.storage.protect() as session:
-                built, warnings = builder.add_path(item.path, session.put)
+                built = builder.build_open(handle, st, path, session.put, warnings)
                 self.storage.pin(built.cid, FOLDER)
         except (OSError, ValueError, RnfsError) as e:
-            self._failed[item.name] = sig
+            self._failed[name] = sig
             log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
             return None
         for warning in warnings:

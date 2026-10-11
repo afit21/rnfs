@@ -16,7 +16,7 @@ import stat
 from dataclasses import dataclass, replace
 from typing import Callable, Iterator
 
-from rnfs import constants
+from rnfs import constants, fsutil
 from rnfs.content import dag
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, Entry, FileNode, IndexNode
@@ -177,11 +177,32 @@ def range_children(expect: Expect, block: bytes, offset: int, length: int) -> li
         if start >= end:
             break
         child_end = start + child.size
-        if child_end > offset:
-            low, high = max(offset, start), min(end, child_end)
+        low, high = max(offset, start), min(end, child_end)
+        # Empty children hold none of the range: skipping them keeps a range walk proportional to its bytes
+        if high > low:
             result.append((child, low - start, high - low))
         start = child_end
     return result
+
+
+class SmallLeaves:
+    """Counts the small leaves a read meets, so a DAG of tiny chunks can't make one read endless.
+
+    Honest files have CHUNK_SIZE chunks, so a read meets at most two shorter pieces (where its range starts
+    and ends), plus one per file written out. Pieces shorter than CHUNK_SIZE / 16 count against
+    max_output_entries; larger ones cost little per byte and are free.
+    """
+
+    def __init__(self, max_entries: int):
+        """Allow max_entries small leaves, plus the two at a range's ends."""
+        self.left = max_entries + 2
+
+    def meet(self, length: int):
+        """Count a leaf piece of length bytes. Raises TooLarge once too many were small."""
+        if length < constants.CHUNK_SIZE // 16:
+            self.left -= 1
+            if self.left < 0:
+                raise TooLarge("file has more small chunks than max_output_entries allows")
 
 
 def parse_target(text: str) -> tuple[Cid, list[str]]:
@@ -259,10 +280,11 @@ def iter_dag(expect: Expect, get: Get) -> Iterator[tuple[Expect, bytes]]:
         stack.extend(reversed(child_expects))
 
 
-def read_range(expect: Expect, get: Get, offset: int = 0, length: int | None = None) -> Iterator[bytes]:
+def read_range(expect: Expect, get: Get, offset: int = 0, length: int | None = None,
+               small: SmallLeaves | None = None) -> Iterator[bytes]:
     """The bytes of a file in [offset, offset + length) (to the end if length is None), in order.
 
-    Raises ValueError if the target is a directory.
+    Raises ValueError if the target is a directory, TooLarge if small (if given) runs out.
     """
     if offset < 0 or (length is not None and length < 0):
         raise ValueError("offset and length must be non-negative")
@@ -271,6 +293,8 @@ def read_range(expect: Expect, get: Get, offset: int = 0, length: int | None = N
     if node is None:
         end = len(block) if length is None else min(len(block), offset + length)
         if offset < end:
+            if small is not None:
+                small.meet(end - offset)
             yield block[offset:end]
         return
     if not isinstance(node, FileNode):
@@ -286,6 +310,8 @@ def read_range(expect: Expect, get: Get, offset: int = 0, length: int | None = N
             current_block = get(current)
         if current.cid.is_raw:
             check_raw(current, len(current_block))
+            if small is not None:
+                small.meet(child_length)
             yield current_block[child_offset:child_offset + child_length]
             continue
         parts = range_children(current, current_block, child_offset, child_length)
@@ -388,27 +414,9 @@ def height(expect: Expect, get: Get, limit: int | None = None) -> int:
 # Writing out
 
 
-_WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-
-
 def unsafe_name_reason(name: str) -> str | None:
     """Why the local filesystem can't take name as a plain file name (it would be read as a path), or None."""
-    if name in (".", "..") or "/" in name or "\0" in name:
-        return "it would be interpreted as a path"
-    if os.sep in name or (os.altsep and os.altsep in name):
-        return "it contains a path separator"
-    if os.name == "nt":
-        if ":" in name:
-            return "it contains ':' (a drive or stream on Windows)"
-        if any(c in '<>"|?*' or ord(c) < 32 for c in name) or name[-1] in ". ":
-            return "Windows can't represent it"
-        if name.split(".")[0].upper() in _WINDOWS_RESERVED:
-            return "it is a reserved device name on Windows"
-    try:
-        os.fsencode(name)
-    except UnicodeEncodeError:
-        return "the filesystem encoding can't represent it"
-    return None
+    return fsutil.unsafe_name_reason(name)  # in fsutil so the CLI can check names without loading RNS
 
 
 def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str]:
@@ -416,17 +424,19 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
 
     Entries whose names the local filesystem would read as a path, or can't represent, are skipped and
     reported, as are names that collide on this filesystem (e.g. case-insensitive ones). Kind 1 entries
-    get the execute bit. Raises TooLarge after max_entries entries, counting every occurrence.
+    get the execute bit, except on Windows, which has none. Raises TooLarge after max_entries entries,
+    counting every occurrence, or after max_entries small chunks (SmallLeaves).
     """
     if os.path.lexists(dest):
         raise ValueError(f"{dest} already exists")
     warnings: list[str] = []
     memo: dict[Expect, dag.Node] = {}  # directory and index nodes, so repeated subtrees aren't reread
     count = 0
+    small = SmallLeaves(max_entries)  # shared by every file written
     block = get(expect)
     node = decode_checked(expect, block)
     if not isinstance(node, (DirectoryNode, IndexNode)):
-        _write_file(expect, get, dest, block)
+        _write_file(expect, get, dest, small, block)
         return warnings
 
     memo[expect] = node
@@ -453,23 +463,25 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
                 os.mkdir(path)
                 subdirectories.append((child, path, entry_shown))
             else:
-                _write_file(child, get, path)
+                _write_file(child, get, path, small)
         stack.extend(reversed(subdirectories))
     for warning in warnings:
         log(f"get: {warning}", LOG_WARNING)
     return warnings
 
 
-def _write_file(expect: Expect, get: Get, path: str, block: bytes | None = None):
+def _write_file(expect: Expect, get: Get, path: str, small: SmallLeaves, block: bytes | None = None):
     """Write the file expect names to path (exclusively created), with the execute bit for kind 1."""
     with open(path, "xb") as out:
         if block is not None and expect.cid.is_raw:
             check_raw(expect, len(block))
+            small.meet(len(block))
             out.write(block)
         else:
-            for data in read_range(expect, get):
+            for data in read_range(expect, get, small=small):
                 out.write(data)
-    if expect.kind == dag.KIND_EXECUTABLE:
+    # Windows has no execute bit (os.chmod there only sets or clears read-only), so kind 1 writes a plain file
+    if expect.kind == dag.KIND_EXECUTABLE and not fsutil.IS_WINDOWS:
         mode = os.stat(path).st_mode
         # Execute wherever read is allowed, as the umask already decided read permissions
         os.chmod(path, stat.S_IMODE(mode) | ((mode & 0o444) >> 2))

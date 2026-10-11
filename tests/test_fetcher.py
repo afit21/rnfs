@@ -1,8 +1,11 @@
 """Tests for fetching targets (rnfs/fetcher.py; specification sections 6 and 7) over a fake client and lookup."""
 import os
+import shutil
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -11,9 +14,11 @@ from rnfs.constants import CHUNK_SIZE
 from rnfs.content import builder, dag, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
+from rnfs.content import storage as storage_module
 from rnfs.content.storage import Storage
 from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
+from rnfs import fetcher as fetcher_module
 from rnfs.fetcher import Fetcher
 from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
 
@@ -54,10 +59,11 @@ class FakeClient:
         """The same estimate for every link."""
         return self.rate
 
-    def blocks(self, node_id: bytes, cids: list[Cid]) -> BlocksResult:
+    def blocks(self, node_id: bytes, cids: list[Cid], on_progress=None) -> BlocksResult:
         """Serve what node_id holds, BATCH CIDs per request."""
         with self.lock:
             self.requests.append((node_id, list(cids)))
+        self.on_progress = on_progress
         behaviour = self.behaviour.get(node_id)
         if behaviour is not None:
             result = behaviour(cids)
@@ -322,7 +328,9 @@ class ValidityTest(FetcherTest):
         self.assertFalse(self.routing.is_banned(P1))  # the author's fault, not the provider's
         with self.assertRaises(InvalidDag):
             self.fetcher.open(root)
-        # Remembered across restarts
+        # Remembered across restarts, once saved (the node saves periodically and at shutdown)
+        self.assertFalse(self.make_fetcher().is_invalid(root))
+        self.fetcher.save()
         self.assertTrue(self.make_fetcher().is_invalid(root))
 
     def test_max_download_size_checked_before_fetching_below(self):
@@ -334,17 +342,16 @@ class ValidityTest(FetcherTest):
             self.fetch_all(built.cid)
         self.assertEqual(self.client.asked(P1), [built.cid])  # only the root block
 
-    def test_storage_full_refuses_unpinned_fetch(self):
+    def test_pins_filling_max_storage_dont_refuse_a_fetch(self):
         self.storage.max_storage = 10
         pinned = builder.build_bytes(b"p" * 100, self.storage.put)
         self.storage.pin(pinned.cid, "user")
         built = self.file(b"q" * 100)
         self.hold(P1)
         self.runs.append([P1])
-        with self.assertRaises(StorageFull):
-            self.fetch_all(built.cid)
-        self.fetch_all(built.cid, pinned=True)  # a pinned fetch is allowed
+        self.fetch_all(built.cid)  # max_storage is soft: storage goes over it while nothing is evictable
         self.assertTrue(self.storage.has(built.cid))
+        self.assertTrue(self.storage.is_complete(pinned.cid))
 
 
 class TransferTest(FetcherTest):
@@ -448,6 +455,202 @@ class TransferTest(FetcherTest):
         built = builder.build_bytes(os.urandom(3 * CHUNK_SIZE), self.storage.put)
         self.fetch_all(built.cid)
         self.assertEqual(self.client.requests, [])
+
+
+class LimitTest(FetcherTest):
+    """Bounds on what a hostile DAG or provider can make a fetch cost (security findings B1-B3, B5, B7, B9)."""
+
+    def bomb(self, levels: int) -> tuple[Cid, int]:
+        """A file of 256^levels one-byte chunks, made of levels + 1 blocks on the network."""
+        leaf = b"x"
+        cid, size = Cid.for_block(RAW, leaf), 1
+        self.network[cid] = leaf
+        for _ in range(levels):
+            block = dag.encode(FileNode([Child(cid, size)] * 256))
+            cid, size = Cid.for_block(DAG, block), size * 256
+            self.network[cid] = block
+        return cid, size
+
+    def test_range_read_is_lazy_and_small_chunks_are_bounded(self):
+        self.config.max_output_entries = 1000
+        root, size = self.bomb(2)
+        self.hold(P1)
+        self.runs.append([P1])
+        expanded = []
+        real = walker.range_children
+
+        def counting(*args):
+            """range_children, counted."""
+            expanded.append(args[0].cid)
+            return real(*args)
+
+        with mock.patch.object(walker, "range_children", counting), self.fetcher.open(root) as fetch:
+            pieces = fetch.read_range(fetch.resolve())
+            self.assertEqual(next(pieces), b"x")
+            self.assertLessEqual(len(expanded), 3)  # one node per level, not all 257 before the first byte
+            with self.assertRaises(TooLarge):
+                for _ in pieces:
+                    pass
+
+    def test_honest_large_range_isnt_limited_by_max_output_entries(self):
+        self.config.max_output_entries = 0
+        data = os.urandom(40 * CHUNK_SIZE + 7)
+        built = self.file(data)
+        self.hold(P1)
+        self.runs.append([P1])
+        with self.fetcher.open(built.cid) as fetch:
+            self.assertEqual(b"".join(fetch.read_range(fetch.resolve(), 5)), data[5:])
+
+    def test_hung_request_ends_the_fetch(self):
+        self.config.lookup_timeout, self.config.stall_timeout = 0.3, 0.2
+        built = self.file(b"never arrives")
+        self.hold(P1)
+        self.client.behaviour[P1] = lambda cids: (time.sleep(5), BlocksResult(FAILED, unsent=list(cids)))[1]
+        self.runs.append([P1])
+        start = time.monotonic()
+        with self.assertRaises(NotFound):
+            self.fetch_all(built.cid)
+        self.assertLess(time.monotonic() - start, 3)
+
+    def test_response_progress_keeps_a_slow_fetch_alive(self):
+        self.config.lookup_timeout, self.config.stall_timeout = 0.2, 0.2
+        built = self.file(b"slowly")
+        self.hold(P1)
+
+        def slow(cids):
+            """Report progress for a while, then answer normally."""
+            for _ in range(10):
+                self.client.on_progress(0.5)
+                time.sleep(0.1)
+            return None
+
+        self.client.behaviour[P1] = slow
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.has(built.cid))
+
+    def test_unpinned_fetch_evicts_cache_rather_than_overshooting(self):
+        cached = builder.build_bytes(os.urandom(3 * CHUNK_SIZE), self.storage.put)
+        self.storage.record_fetch(cached.cid, [], cached.cid)
+        self.storage.max_storage = 5 * CHUNK_SIZE
+        built = self.file(os.urandom(4 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertFalse(self.storage.has(cached.cid))
+        self.assertLessEqual(self.storage.used_bytes(), self.storage.max_storage)
+
+    def disk(self, free: int):
+        """A mock disk_usage reporting free bytes on a 1 GiB filesystem (reserve: DISK_RESERVE_MIN)."""
+        usage = shutil.disk_usage(self.tmp.name)._replace(total=1024 ** 3, free=free)
+        return mock.patch("shutil.disk_usage", return_value=usage)
+
+    def test_fetch_bigger_than_free_disk_is_refused(self):
+        built = self.file(os.urandom(8 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        reserve = storage_module.DISK_RESERVE_MIN
+        for pinned in (False, True):
+            with self.subTest(pinned=pinned), self.disk(reserve + 4 * CHUNK_SIZE):
+                with self.assertRaises(StorageFull):  # its verified size shows it can't fit
+                    self.fetch_all(built.cid, pinned=pinned)
+                with self.assertRaises(StorageFull), self.fetcher.open(built.cid) as fetch:
+                    b"".join(fetch.read_range(fetch.resolve(), 0, 6 * CHUNK_SIZE))
+                with self.fetcher.open(built.cid) as fetch:  # a range that fits is fine
+                    b"".join(fetch.read_range(fetch.resolve(), 0, 2 * CHUNK_SIZE))
+        self.assertEqual(len(self.client.asked(P1)), 3)  # the root and two chunks, nothing more
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+
+    def test_large_dag_nodes_stop_at_the_disk_reserve(self):
+        root = self.empty_files(600)
+        self.hold(P1)
+        self.runs.append([P1])
+        with self.disk(storage_module.DISK_RESERVE_MIN + 30_000), self.assertRaises(StorageFull):
+            self.fetch_all(root.cid)  # its size is 0, but its directory nodes are not
+
+    def empty_files(self, count: int, length: int = 200) -> builder.Built:
+        """A directory of count empty files with long names: size 0, but kilobytes of directory nodes."""
+        empty = self.file(b"")
+        return builder.build_directory([Entry(f"{i:05d}" + "n" * length, empty.cid, 0, 0) for i in range(count)],
+                                       self.put)
+
+    def test_dag_nodes_count_against_max_download_size(self):
+        root = self.empty_files(600)
+        self.assertEqual(root.size, 0)
+        self.config.max_download_size = 50_000
+        self.hold(P1)
+        self.runs.append([P1])
+        with self.assertRaises(TooLarge):
+            self.fetch_all(root.cid)
+        self.assertFalse(self.fetcher.is_invalid(root.cid))
+        self.config.max_download_size = None
+        self.fetch_all(root.cid)
+
+    def test_listing_and_write_out_fetches_stop_at_max_output_entries(self):
+        with mock.patch("rnfs.constants.MAX_CHILDREN", 4):
+            root = self.empty_files(200, 10)
+        self.assertIsInstance(dag.decode(self.network[root.cid]), dag.IndexNode)
+        self.config.max_output_entries = 20
+        self.hold(P1)
+        self.runs.append([P1])
+        with self.assertRaises(TooLarge), self.fetcher.open(root.cid) as fetch:
+            fetch.fetch_listing(fetch.resolve())
+        asked = len(self.client.asked(P1))
+        self.assertLess(asked, len(self.network) // 2)
+        with self.assertRaises(TooLarge), self.fetcher.open(root.cid) as fetch:
+            fetch.fetch_dag(fetch.resolve(), max_entries=20)
+        with self.fetcher.open(root.cid) as fetch:
+            fetch.fetch_listing(fetch.resolve(), max_entries=200)
+            fetch.fetch_dag(fetch.resolve(), max_entries=200)
+        self.assertTrue(self.storage.is_complete(root.cid))
+
+    def test_max_dag_bytes(self):
+        root = self.empty_files(600)
+        self.hold(P1)
+        self.runs.append([P1])
+        with self.assertRaises(TooLarge), self.fetcher.open(root.cid, pinned=True) as fetch:
+            fetch.max_dag_bytes = 50_000
+            fetch.fetch_dag(fetch.resolve())
+        self.assertLess(self.storage.used_bytes(), 50_000 + 2 * MAX_BATCH_BYTES)
+
+    def test_nested_fetch_marks_only_its_own_root_invalid(self):
+        own = builder.build_bytes(b"mine", self.storage.put)
+        bad_block = b"\x93\x01\x02\x03"  # correctly hashed, not a valid DAG node
+        bad = Cid.for_block(DAG, bad_block)
+        self.network[bad] = bad_block
+        self.hold(P1)
+        self.runs.append([P1])
+        with self.assertRaises(InvalidDag):
+            with self.fetcher.open(own.cid, pinned=True) as fetch, self.fetcher.open(bad, pinned=True) as inner:
+                fetch.fetch_dag(fetch.resolve())
+                inner.fetch_dag(inner.resolve())
+        self.assertTrue(self.fetcher.is_invalid(bad))
+        self.assertFalse(self.fetcher.is_invalid(own.cid))
+        # Nor does opening an invalid root inside another fetch mark the outer one
+        with self.assertRaises(InvalidDag):
+            with self.fetcher.open(own.cid) as fetch, self.fetcher.open(bad):
+                fetch.resolve()
+        self.assertFalse(self.fetcher.is_invalid(own.cid))
+
+    def test_invalid_roots_are_capped_and_saved_in_batches(self):
+        writes = []
+        real = fetcher_module.write_json
+        with mock.patch.object(fetcher_module, "MAX_INVALID", 3), \
+                mock.patch.object(fetcher_module, "write_json", lambda *a: (writes.append(a), real(*a))):
+            roots = [Cid.for_block(RAW, b"%d" % i) for i in range(5)]
+            for root in roots:
+                self.fetcher.mark_invalid(root)
+            self.assertEqual(writes, [])
+            self.fetcher.save()
+            self.fetcher.save()
+            self.assertEqual(len(writes), 1)
+            self.assertEqual([self.fetcher.is_invalid(r) for r in roots], [False, False, True, True, True])
+            self.assertEqual([self.make_fetcher().is_invalid(r) for r in roots], [False, False, True, True, True])
+
+
+MAX_BATCH_BYTES = BATCH * 80 * 1024  # what one fake response can hold at most
 
 
 if __name__ == "__main__":

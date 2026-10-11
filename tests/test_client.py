@@ -21,9 +21,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from rnfs.config import Config  # noqa: E402
-from rnfs.constants import BLOCKS_PATH, CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, PIN_PATH, PROVIDE_PATH  # noqa: E402
+from rnfs.constants import BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, KIB, MAX_BLOCK_SIZE, PIN_PATH, PROVIDE_PATH  # noqa: E402
 from rnfs.content.cid import RAW, Cid  # noqa: E402
-from rnfs.network import client, links  # noqa: E402
+from rnfs.network import client, links, protocol  # noqa: E402
 
 import tests.test_links as fakes  # noqa: E402  (a module, so its test cases don't run twice)
 
@@ -75,6 +75,41 @@ class PeerClientTest(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.respond(lambda link, path, data: answer)
                 self.assertIsNone(self.call(lambda: self.client.find(NODE, KEY)))
+
+    def test_small_requests_cap_their_response_size(self):
+        self.respond(lambda link, path, data: [[KEY] * 10, [NODE] * 10] if path == FIND_PATH else True)
+        self.call(lambda: self.client.find(NODE, KEY))
+        self.call(lambda: self.client.provide(NODE, [KEY], []))
+        self.call(lambda: self.client.pin(NODE, block_of(10, 1)[0], True))
+        sizes = {path: max_size for link in fakes.FakeLink.created for path, _, max_size in link.requests}
+        self.assertEqual(sizes, {FIND_PATH: protocol.MAX_FIND_RESPONSE_SIZE,
+                                 PROVIDE_PATH: protocol.MAX_ACCEPT_RESPONSE_SIZE,
+                                 PIN_PATH: protocol.MAX_ACCEPT_RESPONSE_SIZE})
+        # Exactly the largest honest answers, which fit one packet
+        self.assertEqual(protocol.MAX_FIND_RESPONSE_SIZE,
+                         protocol.packed_response_size(bytes(16), [[KEY] * 10, [NODE] * 10]))
+        self.assertLessEqual(protocol.MAX_FIND_RESPONSE_SIZE, protocol.DEFAULT_MDU)
+
+    def test_trickled_answers_give_up_at_the_deadline(self):
+        # A response Resource that starts and never finishes stops RNS's own timeout; the request must
+        # still give up and free its slot
+        self.respond(lambda link, path, data: fakes.Stall(300))
+        with mock.patch.object(links, "RESPONSE_GRACE", 0.1):
+            self.assertIsNone(self.call(lambda: self.client.find(NODE, KEY)))
+            peer = self.call(lambda: self.pool.get(NODE))
+            self.assertEqual(peer.requests, 0)
+            self.assertFalse(self.call(lambda: self.client.provide(NODE, [KEY], [])))
+            self.assertFalse(self.call(lambda: self.client.pin(NODE, block_of(10, 1)[0], True)))
+
+    def test_find_waits_for_a_slot_no_longer_than_the_deadline(self):
+        self.respond(lambda link, path, data: [[KEY], [NODE]])
+        peer = self.call(lambda: self.pool.get(NODE))
+        self.assertTrue(peer.acquire(False) and peer.acquire(False))  # both slots held, e.g. by trickled answers
+        with mock.patch.object(links, "RESPONSE_GRACE", 0.1):
+            self.assertIsNone(self.call(lambda: self.client.find(NODE, KEY)))
+        self.assertEqual(peer.link.requests, [])
+        peer.release(False)
+        self.assertEqual(self.call(lambda: self.client.find(NODE, KEY)), ([KEY], [NODE]))
 
     def test_find_unreachable(self):
         links.RNS.Transport.await_path = lambda node_id, timeout: False
@@ -167,10 +202,20 @@ class PeerClientTest(unittest.TestCase):
 
     def test_blocks_malformed_or_unanswered(self):
         cid = block_of(10, 1)[0]
-        for answer in ([b"a", b"b"], "x", fakes.FAIL):
+        for answer in ([b"a", b"b"], "x", fakes.FAIL, []):
             with self.subTest(answer=answer):
                 self.respond(lambda link, path, data: answer)
                 self.assertEqual(self.call(lambda: self.client.blocks(NODE, [cid])).status, client.FAILED)
+
+    def test_blocks_empty_answer_is_a_failure(self):
+        # An honest node always answers at least the first CID, so an empty answer is malformed: as OK it
+        # would put every CID back as unsent, and the fetcher would ask the same node again forever
+        cids = [block_of(10, i)[0] for i in range(3)]
+        for answer in ([], [None]):
+            with self.subTest(answer=answer):
+                self.respond(lambda link, path, data: answer)
+                result = self.call(lambda: self.client.blocks(NODE, cids))
+                self.assertEqual((result.status, result.unsent), (client.FAILED, cids))
 
     def test_blocks_stall_closes_link(self):
         self.respond(lambda link, path, data: fakes.Stall(10_000))
@@ -399,20 +444,21 @@ class TwoNodeTest(unittest.TestCase):
         proc.stdout.close()
 
     def test_find_provide_blocks(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # A server killed on Windows may not have released its files yet: don't fail the test over cleanup
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             port = free_port()
             dirs = {}
             for name, template in (("server", SERVER_CONFIG), ("client", CLIENT_CONFIG)):
                 dirs[name] = os.path.join(tmp, name)
                 os.makedirs(dirs[name])
-                with open(os.path.join(dirs[name], "config"), "w") as f:
+                with open(os.path.join(dirs[name], "config"), "w", encoding="utf-8") as f:
                     f.write(template.format(port=port))
 
             script = os.path.abspath(__file__)
             env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": ROOT}
             server_proc = subprocess.Popen([sys.executable, script, "--e2e-server", dirs["server"]],
-                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT, text=True, env=env)
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           encoding="utf-8", errors="replace", env=env)
             self.addCleanup(self.stop, server_proc)
             server_id = None
             server_output = []
@@ -427,7 +473,8 @@ class TwoNodeTest(unittest.TestCase):
             self.assertIsNotNone(server_id, "".join(server_output))
 
             client_proc = subprocess.run([sys.executable, script, "--e2e-client", dirs["client"], server_id],
-                                         capture_output=True, text=True, timeout=180, env=env)
+                                         capture_output=True, encoding="utf-8", errors="replace", timeout=180,
+                                         env=env)
             lines = [line for line in client_proc.stdout.splitlines() if line.startswith("RESULT ")]
             self.assertTrue(lines, client_proc.stdout + client_proc.stderr)
             results = json.loads(lines[0][len("RESULT "):])

@@ -2,6 +2,7 @@
 incoming-link eviction, upload pacing, and every handler's refusals. RNS objects are faked."""
 import random
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -475,6 +476,32 @@ class RequestServerTest(unittest.TestCase):
         threading.Timer(0.1, resource.complete).start()
         self.assertNotEqual(self.blocks(link, request_id=b"s" * 16), False)
 
+    def test_only_one_request_per_link_waits_for_a_withheld_proof(self):
+        link = self.connect(b"a")
+        self.blocks(link)
+        self.send(link).status = RNS.Resource.AWAITING_PROOF  # all parts sent, proof withheld
+        # A flood of /blocks on that link: one waits out the grace, the rest are refused at once
+        finished, results = [], []
+
+        def ask(i):
+            """One /blocks request, noting when it was answered."""
+            results.append(self.blocks(link, request_id=bytes([i]) * 16))
+            finished.append(time.monotonic())
+
+        start = time.monotonic()
+        threads = [threading.Thread(target=ask, args=(i,)) for i in range(1, 9)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(results, [False] * 8)
+        quick = sum(1 for t in finished if t - start < 0.5)  # the grace here is 2 × RTT + 1 s
+        self.assertEqual(quick, 7)
+        self.assertEqual(len(self.server.pools.responses()), 1)
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (1, 1))
+        # The waiter's mark is cleared, so the next request may wait for the proof again
+        self.assertTrue(self.server.incoming.start_waiting(link.link_id))
+
     def test_deadline_cancels_response(self):
         link = self.connect(b"a")
         self.blocks(link)
@@ -562,6 +589,76 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(self.server.pools.responses(), [])
         self.assertEqual(self.server.incoming.in_progress(link.link_id), (0, 0))
 
+    def budget_server(self, budget: int):
+        """A server with an upload_budget of budget bytes per hour (and response slots to spare)."""
+        self.make_server(Config(upload_budget=budget, max_blocks_responses=20))
+        return self.server.airtime
+
+    def test_failed_responses_refund_what_they_did_not_send(self):
+        """A Resource cancelled (the requester rejected it, or never fetched its parts), or a link closed
+        mid-transfer, gives the budget back what wasn't sent, so one requester can't drain it for nothing."""
+        airtime = self.budget_server(1000 * KIB)
+        capacity = airtime.remaining()
+        cids = [cid for cid, _ in self.big]
+        link = self.connect(b"a")
+        self.assertIsNot(self.blocks(link, cids), False)
+        response = self.server.pools.responses()[0]
+        charged = capacity - airtime.remaining()
+        self.assertGreater(charged, 300 * KIB)
+        resource = self.send(link)
+        resource.progress = 0.25
+        resource.cancel()  # RNS: rejected or timed out, then the callback
+        self.assertAlmostEqual(capacity - airtime.remaining(), 0.25 * response.size, delta=2)
+        # A link closed mid-transfer refunds the rest too
+        before = airtime.remaining()
+        other = self.connect(b"b")
+        self.assertIsNot(self.blocks(other, cids[:2]), False)
+        self.send(other).progress = 0.5
+        packed = before - airtime.remaining()
+        other.teardown()
+        self.assertAlmostEqual(before - airtime.remaining(), packed / 2, delta=2)
+        # A response cancelled before its Resource started (missed deadline) is refunded whole
+        before = airtime.remaining()
+        late = self.connect(b"c")
+        self.assertIsNot(self.blocks(late, cids[:1]), False)
+        self.server._cancel(self.server.pools.responses()[0], "test")
+        self.assertAlmostEqual(airtime.remaining(), before, delta=1)
+
+    def test_completed_responses_keep_their_charge(self):
+        airtime = self.budget_server(1000 * KIB)
+        capacity = airtime.remaining()
+        link = self.connect(b"a")
+        self.assertIsNot(self.blocks(link), False)
+        charged = capacity - airtime.remaining()
+        resource = self.send(link)
+        resource.progress = 1.0
+        resource.complete()
+        link.teardown()
+        self.assertEqual(capacity - airtime.remaining(), charged)
+        self.assertEqual(self.server.pools.responses(), [])
+
+    def test_one_requester_holds_at_most_half_the_budget_in_flight(self):
+        """Withholding proofs on several links, one identity's responses in flight hold at most about half
+        the bucket; another requester is still served."""
+        airtime = self.budget_server(800 * KIB)
+        cids = [cid for cid, _ in self.big]
+        greedy = RNS.Identity()
+        answers = []
+        for i in range(3):
+            link = self.connect(bytes([0x10 + i]))
+            answers.append(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, cids), link, greedy,
+                                    request_id=bytes([i]) * 16))
+        self.assertIsNot(answers[0], False)
+        served = [entry for entry in protocol.parse_blocks_response(answers[0], 4) if entry is not None]
+        self.assertEqual(len(served), 3)  # cut to half the bucket
+        self.assertIs(answers[2], False)
+        self.assertEqual(self.server.traffic.snapshot()["refused"]["budget"], 1)
+        in_flight = sum(response.charged for response in self.server.pools.responses())
+        self.assertLessEqual(in_flight, 400 * KIB + 2 * 64 * KIB)
+        self.assertIsNot(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, cids[:1]),
+                                  self.connect(b"z"), RNS.Identity()), False)
+        self.assertGreater(airtime.remaining(), 0)
+
     def test_link_close_releases_responses(self):
         link = self.connect(b"a")
         self.blocks(link, [self.big[0][0]])
@@ -609,12 +706,13 @@ class ResourceGuardTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     @staticmethod
-    def advertisement(transfer: int, data: int, request: bool = False, response: bool = True, link=None):
+    def advertisement(transfer: int, data: int, request: bool = False, response: bool = True, link=None,
+                      segment: int = 1, segments: int = 1):
         """A packet carrying a crafted, packed ResourceAdvertisement."""
-        flags = 0x01 | (int(request) << 3) | (int(response) << 4)
+        flags = 0x01 | (int(request) << 3) | (int(response) << 4) | (int(segments > 1) << 2)
         packed = umsgpack.packb({"t": transfer, "d": data, "n": 1, "h": bytes(32), "r": bytes(4), "o": bytes(32),
-                                 "i": 1, "l": 1, "q": b"q" * 16 if request or response else None, "f": flags,
-                                 "m": bytes(4)})
+                                 "i": segment, "l": segments, "q": b"q" * 16 if request or response else None,
+                                 "f": flags, "m": bytes(4)})
         return types.SimpleNamespace(plaintext=packed, link=link)
 
     def test_installed_once(self):
@@ -644,6 +742,36 @@ class ResourceGuardTest(unittest.TestCase):
         packet = self.advertisement(600, 600, request=True, response=False)
         self.assertIsNone(RNS.Resource.accept(packet))
         self.assertEqual(self.rejected, [packet])
+
+    def test_rejects_multi_segment_resources_on_rnfs_links_only(self):
+        """Each segment passes the size checks, so a 500 MiB response would be accepted segment by segment:
+        on rnfs.dht links (every rnfs response is one segment) multi-segment Resources are refused, while
+        other destinations' (LXMF's) are left alone."""
+        identity = RNS.Identity()
+        names = {}
+        for app, aspect in (("rnfs", "dht"), ("lxmf", "delivery"), ("lxmf", "propagation")):
+            names[app, aspect] = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app,
+                                                 aspect).name
+        outgoing = types.SimpleNamespace(destination=types.SimpleNamespace(name=names["rnfs", "dht"]),
+                                         pending_requests=[])
+        incoming = types.SimpleNamespace(destination=None, owner=types.SimpleNamespace(name=names["rnfs", "dht"]))
+        lxmf = [types.SimpleNamespace(destination=types.SimpleNamespace(name=names[key]))
+                for key in (("lxmf", "delivery"), ("lxmf", "propagation"))]
+        self.assertTrue(guards.is_dht_link(outgoing) and guards.is_dht_link(incoming))
+        self.assertFalse(any(guards.is_dht_link(link) for link in lxmf))
+        size_ = 1_000_000
+        for link in (outgoing, incoming):
+            for segment, segments in ((1, 500), (2, 500), (2, 2)):
+                packet = self.advertisement(size_ + 52, 500 * size_, link=link, segment=segment, segments=segments)
+                self.assertIsNone(RNS.Resource.accept(packet))
+                self.assertIn(packet, self.rejected)
+            packet = self.advertisement(size_ + 52, size_, link=link)  # one segment: fine
+            self.assertEqual(RNS.Resource.accept(packet), "resource")
+        for link in lxmf:
+            packet = self.advertisement(size_ + 52, 500 * size_, link=link, segment=3, segments=500)
+            self.assertEqual(RNS.Resource.accept(packet), "resource")
+        self.assertIn("one segment", guards.refusal(RNS.ResourceAdvertisement.unpack(
+            self.advertisement(100, 200, segments=2).plaintext), outgoing))
 
     def test_unreadable_advertisement_left_to_rns(self):
         packet = types.SimpleNamespace(plaintext=b"\xc1", link=None)

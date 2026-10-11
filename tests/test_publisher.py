@@ -99,7 +99,12 @@ class PublisherTest(unittest.TestCase):
         self.storage.pin(built.cid, USER)
         return built.cid
 
+    def test_roots_is_the_default(self):
+        from rnfs.config import Config
+        self.assertEqual(Config().provide_strategy, "roots")
+
     def test_pinned_strategy(self):
+        self.config.provide_strategy = "pinned"
         complete = self.pinned(b"complete" * 10000)
         missing = Cid.for_block(RAW, b"not stored")
         self.storage.pin(missing, USER)

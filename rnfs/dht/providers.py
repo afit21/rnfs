@@ -3,6 +3,11 @@
 A record says "publisher provides key". Records expire PROVIDER_TTL after they were last stored and keep
 their first-stored time across republishes. At most max_records are kept: when full, records of the
 publisher first seen most recently go first, so a flood of new identities displaces only itself.
+
+Two local limits, not part of the protocol, bound what one identity can take: a publisher holds at most
+max_records // PUBLISHER_SHARE records (so one long-lived identity can't fill the store and lock everyone
+else out), and a key has at most MAX_PUBLISHERS_PER_KEY publishers, the earliest kept (so /find replies stay
+cheap however many identities advertise one key).
 """
 import json
 import os
@@ -12,11 +17,15 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 
+from rnfs import fsutil
 from rnfs.constants import ID_LENGTH, K, PROVIDER_TTL
 from rnfs.dht.routing import check_id
 
 _STATE_VERSION = 1
 _EXPIRE_INTERVAL = 60  # when full, scan for expired records at most this often (seconds), not on every store
+PUBLISHER_SHARE = 100  # a publisher may hold at most max_records // PUBLISHER_SHARE records ...
+MIN_PER_PUBLISHER = 10  # ... but at least this many, so small stores still work
+MAX_PUBLISHERS_PER_KEY = 1000  # publishers recorded per key; later ones are refused, as seniority favours the first
 
 
 def _never(node_id: bytes) -> bool:
@@ -55,9 +64,16 @@ class ProviderStore:
     """
 
     def __init__(self, max_records: int, state_path: str | None, ttl: float = PROVIDER_TTL,
-                 clock: Callable[[], float] = time.time, rng: random.Random = random):
-        """Store of at most max_records records, loaded from state_path if it exists."""
+                 clock: Callable[[], float] = time.time, rng: random.Random = random,
+                 max_per_publisher: int | None = None, max_per_key: int = MAX_PUBLISHERS_PER_KEY):
+        """Store of at most max_records records, loaded from state_path if it exists.
+
+        max_per_publisher defaults to max(MIN_PER_PUBLISHER, max_records // PUBLISHER_SHARE).
+        """
         self.max_records = max_records
+        self.max_per_publisher = (max_per_publisher if max_per_publisher is not None
+                                  else max(MIN_PER_PUBLISHER, max_records // PUBLISHER_SHARE))
+        self.max_per_key = max_per_key
         self.state_path = state_path
         self.ttl = ttl
         self.clock = clock
@@ -75,11 +91,13 @@ class ProviderStore:
     # Storing and withdrawing
 
     def store(self, key: bytes, publisher: bytes) -> bool:
-        """Record that publisher provides key, or refresh its record. False if refused because full.
+        """Record that publisher provides key, or refresh its record. False if refused.
 
-        A full store evicts a record of the publisher first seen most recently, unless that is the
-        newcomer itself (or the newcomer is a new publisher, hence the newest): then it is refused,
-        so new identities can neither displace older publishers nor churn their own records.
+        Refused if the publisher already holds max_per_publisher records or the key has max_per_key
+        publishers (expired records don't count). Otherwise a full store evicts a record of the publisher
+        first seen most recently, unless that is the newcomer itself (or the newcomer is a new publisher,
+        hence the newest): then it is refused, so new identities can neither displace older publishers nor
+        churn their own records.
         """
         check_id(key)
         check_id(publisher)
@@ -92,6 +110,8 @@ class ProviderStore:
                 return True
             # An expired record still counted is replaced, starting a new first-stored time
             self._remove(key, publisher)
+            if not self._within_limits(key, publisher, now):
+                return False
 
             if self._count >= self.max_records and now - self._last_expire >= _EXPIRE_INTERVAL:
                 self._expire(now)
@@ -118,7 +138,7 @@ class ProviderStore:
     def provide(self, publisher: bytes, keys: Iterable[bytes], withdrawn: Iterable[bytes] = ()) -> int:
         """Apply one /provide batch from publisher: withdraw `withdrawn`, then store `keys`.
 
-        Returns how many of `keys` were recorded (the rest were refused because the store is full).
+        Returns how many of `keys` were recorded (the rest were refused: the store is full or a limit applied).
         """
         check_id(publisher)
         keys, withdrawn = list(keys), list(withdrawn)
@@ -128,6 +148,31 @@ class ProviderStore:
             for key in withdrawn:
                 self.withdraw(key, publisher)
             return sum(self.store(key, publisher) for key in keys)
+
+    def _within_limits(self, key: bytes, publisher: bytes, now: float) -> bool:
+        """True if publisher may add a record for key under the per-publisher and per-key limits.
+
+        Expired records are dropped first where a limit is reached, so they don't count. Caller holds the lock.
+        """
+        entry = self._publishers.get(publisher)
+        if entry is not None and len(entry.keys) >= self.max_per_publisher:
+            self._drop_expired([(owned, publisher) for owned in entry.keys], now)
+            if publisher in self._publishers and len(self._publishers[publisher].keys) >= self.max_per_publisher:
+                return False
+        records = self._records.get(key)
+        if records is not None and len(records) >= self.max_per_key:
+            self._drop_expired([(key, other) for other in records], now)
+            if len(self._records.get(key, ())) >= self.max_per_key:
+                return False
+        return True
+
+    def _drop_expired(self, pairs: list[tuple[bytes, bytes]], now: float):
+        """Remove those of the (key, publisher) records given that have expired by now. Caller holds the lock."""
+        for key, publisher in pairs:
+            record = self._records.get(key, {}).get(publisher)
+            if record is not None and now - record.last_stored >= self.ttl:
+                self._remove(key, publisher)
+                self._dirty = True
 
     def _evict_for(self, publisher: bytes) -> bool:
         """Make room for a record of publisher by evicting one of the newest publisher's. False if refused."""
@@ -184,15 +229,36 @@ class ProviderStore:
         """Up to K providers of key for a /find reply, leaving out expired and excluded (banned) ones.
 
         The K/2 with the oldest records come first, favouring long-standing providers; then providers
-        chosen at random from the rest, so early squatters can't hold every slot.
+        chosen at random from the rest, so early squatters can't hold every slot. exclude is only asked
+        about candidates as they are chosen, not about every provider of the key.
         """
-        live = self._live(key, exclude)
-        oldest, rest = live[:K // 2], live[K // 2:]
-        return oldest + self.rng.sample(rest, min(K - len(oldest), len(rest)))
+        candidates = self._live_unsorted(key)  # first-stored order: records are kept in insertion order
+        reply = []
+        index = 0
+        while len(reply) < K // 2 and index < len(candidates):
+            if not exclude(candidates[index]):
+                reply.append(candidates[index])
+            index += 1
+        rest = candidates[index:]
+        while len(reply) < K and rest:
+            # Pick one at random and remove it by swapping in the last, so each is considered once
+            pick = self.rng.randrange(len(rest))
+            rest[pick], rest[-1] = rest[-1], rest[pick]
+            candidate = rest.pop()
+            if not exclude(candidate):
+                reply.append(candidate)
+        return reply
 
     def providers(self, key: bytes, exclude: Callable[[bytes], bool] = _never) -> list[bytes]:
         """Every unexpired, non-excluded provider recorded here for key, oldest record first."""
         return self._live(key, exclude)
+
+    def _live_unsorted(self, key: bytes) -> list[bytes]:
+        """Unexpired providers of key in the order their records were stored (at most max_per_key)."""
+        with self._lock:
+            now = self.clock()
+            return [publisher for publisher, record in self._records.get(key, {}).items()
+                    if now - record.last_stored < self.ttl]
 
     def _live(self, key: bytes, exclude: Callable[[bytes], bool]) -> list[bytes]:
         """Unexpired, non-excluded providers of key, oldest record first."""
@@ -243,16 +309,16 @@ class ProviderStore:
         os.makedirs(directory, exist_ok=True)
         fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".providers-", suffix=".tmp")
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(state, f, separators=(",", ":"))
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(temp_path, self.state_path)
+            fsutil.replace(temp_path, self.state_path)
         except BaseException:
             with self._lock:
                 self._dirty = True  # try again next time
             try:
-                os.unlink(temp_path)
+                fsutil.remove(temp_path)
             except OSError:
                 pass
             raise
@@ -260,7 +326,7 @@ class ProviderStore:
     def _load(self):
         """Load state_path if it exists. A missing or unreadable file starts empty: records get republished."""
         try:
-            with open(self.state_path) as f:
+            with open(self.state_path, encoding="utf-8") as f:
                 state = json.load(f)
             if state.get("version") != _STATE_VERSION:
                 return
@@ -274,9 +340,12 @@ class ProviderStore:
         for publisher, seen in sorted(first_seen.items(), key=lambda item: item[1]):
             if len(publisher) == ID_LENGTH:
                 self._publishers[publisher] = _Publisher(seen)
-        for key, publisher, first, last in records:
+        # Oldest records first, so each key's records are in first-stored order and the limits keep the oldest
+        for key, publisher, first, last in sorted(records, key=lambda record: record[2]):
             if (len(key) != ID_LENGTH or publisher not in self._publishers or now - last >= self.ttl
-                    or self._count >= self.max_records or publisher in self._records.get(key, {})):
+                    or self._count >= self.max_records or publisher in self._records.get(key, {})
+                    or len(self._publishers[publisher].keys) >= self.max_per_publisher
+                    or len(self._records.get(key, ())) >= self.max_per_key):
                 continue
             self._records.setdefault(key, {})[publisher] = _Record(first, last)
             self._publishers[publisher].keys.add(key)

@@ -8,7 +8,7 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 |---|---|---|---|
 | GET  | /api/status | | `status()` |
 | GET  | /api/info | `target` | `info(target)` |
-| GET  | /api/cat | `target`, `offset`, `length` | the bytes of a file (`read`), Content-Length set |
+| GET  | /api/cat | `target`, `offset`, `length`, `raw`, `block` | the bytes of a file (`read`; sealed files decrypted unless `raw`), Content-Length set; `block=1`: the CID's own block |
 | GET  | /api/ls | `target` | `{"entries": ls(target)}` |
 | GET  | /api/stat | `target` | `stat(target)` |
 | GET  | /api/pin/ls | `cid` (optional) | `{"pins": pin_ls(cid)}` |
@@ -16,9 +16,9 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/ping | `node` | `{"rtt": seconds or null}` |
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
-| POST | /api/add | JSON `path`, `wrap`, `only_hash` | `add_path(...)` |
-| POST | /api/add/stream | query `name`, `only_hash`; body is the data | `add_stream(...)` |
-| POST | /api/get | JSON `target`, `output`, `from` | `get(...)` |
+| POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name`, `chunker` | `add_path(...)` |
+| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name`, `chunker`; body is the data | `add_stream(...)` |
+| POST | /api/get | JSON `target`, `output`, `from`, `raw` | `get(...)` |
 | POST | /api/dir/set | JSON `target`, `name`, `cid`, `executable` | `dir_set(...)` |
 | POST | /api/dir/rm | JSON `target` | `dir_rm(target)` |
 | POST | /api/pin/add | JSON `target` | `pin_add(target)` |
@@ -37,20 +37,36 @@ GET parameters are in the query string. Request bodies may use Content-Length or
 
 Security:
 - The Host header must be `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding.
-- Every request except `GET /api/status` must carry `X-Rnfs-Api: 1`. The spec requires it for requests
-  that change state; here even reads need it, since they can fetch from the network, fill the cache,
-  persist name sequences or export a key. A custom header forces a CORS preflight, which fails because
-  the API never sends CORS headers, so web pages can't make the API do anything. Status stays open for
+- Every request except `GET /api/status` must carry `X-Rnfs-Api: <token>`, the random token the daemon
+  writes to `<rnfs dir>/api_token` (mode 0600) at each start. Every local process, of every user, can
+  connect to 127.0.0.1, and the API reads and writes files as the daemon's user, so only those who can
+  read the rnfs directory may use it. A custom header also forces a CORS preflight, which fails because
+  the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
   health checks.
 - Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, InvalidDag 422,
   Busy 503, StorageFull 507, other errors 500.
+
+Connections (both this API and the gateway, through LocalServer):
+- The request line, headers and any JSON body must arrive within request_timeout of connecting, else the
+  connection is dropped (408 if the headers were complete); a streamed upload may pause up to body_timeout
+  between reads. Node work has no time limit: socket timeouts only apply while the socket is used, and
+  writing a response may block for response_timeout (None: forever, for `cat | less`).
+- At most max_connections are served at once; more get an immediate 503 and are closed, so held-open
+  connections can't exhaust threads or file descriptors.
 """
+import hmac
+import io
 import json
 import os
+import secrets
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from rnfs import fsutil
+from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.content.cid import Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.log import LOG_ERROR, log
@@ -64,12 +80,36 @@ ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (InvalidD
                   (StorageFull, 507)]
 
 
+_feature_routes: dict | None = None
+
+
+def feature_routes() -> dict:
+    """The features' API routes (rnfs.features), loaded once."""
+    global _feature_routes
+    if _feature_routes is None:
+        from rnfs import features
+        _feature_routes = features.api_routes()
+    return _feature_routes
+
+
 def error_status(error: Exception) -> int:
     """The HTTP status for an exception raised by the node."""
     for error_class, status in ERROR_STATUSES:
         if isinstance(error, error_class):
             return status
     return 500
+
+
+# text with non-printable characters escaped; rnfs.log.log escapes every message too, so this is kept for
+# callers and tests that escape a value on its own
+loggable = fsutil.printable
+
+
+def raw_response(status: str, headers: dict, body: bytes) -> bytes:
+    """A complete HTTP/1.1 response that closes the connection, for answering without a handler."""
+    lines = [f"HTTP/1.1 {status}", f"Content-Length: {len(body)}", "Connection: close",
+             *(f"{name}: {value}" for name, value in headers.items())]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
 def host_allowed(host: str | None, port: int) -> bool:
@@ -83,7 +123,9 @@ def parse_target(text) -> str:
     """text if it looks like `<cid>[/name…]`; the node checks the path. Raises ValueError."""
     if not isinstance(text, str) or not text:
         raise ValueError("a target <cid>[/path] is required")
-    Cid.parse(text.split("/", 1)[0])
+    from rnfs.features.contacts import is_nick  # a name contact's nick, which the node resolves to its CID
+    if not is_nick(text.split("/", 1)[0]):
+        Cid.parse(text.split("/", 1)[0])
     return text
 
 
@@ -203,16 +245,146 @@ class BodyReader:
         return True
 
 
+class RequestTimeout(TimeoutError):
+    """The client took too long sending its request (a TimeoutError, so http.server drops the connection)."""
+
+
+class TimedReader(io.RawIOBase):
+    """A connection's raw input that applies the handler's current read time limit before every recv."""
+
+    def __init__(self, sock: socket.socket, handler: "TimedHandler"):
+        """Read from sock, with time limits from handler.read_timeout()."""
+        self.sock = sock
+        self.handler = handler
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        """Receive into buffer, raising RequestTimeout if the client is too slow."""
+        self.sock.settimeout(self.handler.read_timeout())
+        try:
+            return self.sock.recv_into(buffer)
+        except TimeoutError:
+            raise RequestTimeout("timed out reading the request") from None
+
+
+class TimedHandler(BaseHTTPRequestHandler):
+    """A request handler whose reads are time-limited: the whole request by a deadline, then per phase.
+
+    LocalServer sets the three limits from its own attributes. Subclasses call reading_body() before
+    streaming an upload and request_read() once the request is read, before node work and the response.
+    """
+
+    request_timeout: float = 15.0
+    body_timeout: float = 60.0
+    response_timeout: float | None = None
+
+    def setup(self):
+        """Set up the connection, replacing rfile with one that enforces the time limits."""
+        super().setup()
+        self.deadline = time.monotonic() + self.request_timeout  # for the request line, headers and small bodies
+        self.phase = "request"
+        # Closed at once: the socket only really closes once every file made from it is closed
+        self.rfile.close()
+        self.rfile = io.BufferedReader(TimedReader(self.connection, self), io.DEFAULT_BUFFER_SIZE)
+
+    def read_timeout(self) -> float | None:
+        """The time limit for the next recv in the current phase. Raises RequestTimeout past the deadline."""
+        if self.phase == "body":
+            return self.body_timeout
+        if self.phase == "done":
+            return self.response_timeout
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RequestTimeout("timed out reading the request")
+        return remaining
+
+    def reading_body(self):
+        """Allow body_timeout between reads from now on: an upload may be large, so no overall deadline."""
+        self.phase = "body"
+
+    def request_read(self):
+        """The request is fully read: from now on only writing the response is time-limited."""
+        self.phase = "done"
+        self.connection.settimeout(self.response_timeout)
+
+    @classmethod
+    def busy_response(cls) -> bytes:
+        """The 503 sent to a connection refused because the server is full."""
+        raise NotImplementedError
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """A ThreadingHTTPServer that serves at most max_connections at once and refuses the rest with a 503."""
+
+    daemon_threads = True  # long fetches mustn't keep the process alive on shutdown
+
+    def __init__(self, address, handler_class, max_connections: int):
+        """Bind to address; handler_class.busy_response() is sent to connections over max_connections."""
+        self.slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler_class)
+
+    def server_bind(self):
+        """Bind the listening socket, exclusively on Windows."""
+        if fsutil.IS_WINDOWS:
+            # There SO_REUSEADDR (HTTPServer's default) lets another socket bind a port already listening, so a
+            # second daemon, or another local program listening in on API tokens, could share it
+            self.allow_reuse_address = False
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def process_request(self, request, client_address):
+        """Serve the connection on a new thread if a slot is free, else refuse it at once."""
+        if not self.slots.acquire(blocking=False):
+            return self.refuse(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()  # the thread never started
+            raise
+
+    def process_request_thread(self, request, client_address):
+        """Serve the connection, then free its slot."""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def refuse(self, request):
+        """Send the 503 and close, without blocking: this runs on the thread that accepts connections."""
+        try:
+            request.setblocking(False)
+            try:
+                # Read what has arrived: closing with unread input sends a reset, which can lose the 503
+                request.recv(65536)
+            except OSError:
+                pass
+            request.sendall(self.RequestHandlerClass.busy_response())
+        except OSError:
+            pass  # the client has gone, or isn't reading; it is closed either way
+        self.shutdown_request(request)
+
+
 class LocalServer:
-    """A ThreadingHTTPServer on 127.0.0.1 run on a daemon thread. Port 0 picks a free port."""
+    """A BoundedHTTPServer on 127.0.0.1 run on a daemon thread. Port 0 picks a free port.
+
+    The connection limits are class attributes (see the module docstring), read when the server is made.
+    """
 
     poll_interval = 0.5  # how often serve_forever checks for stop(); tests lower it to stop quickly
+    request_timeout = 15.0  # seconds for the request line, headers and a JSON body to arrive
+    body_timeout = 60.0  # seconds a streamed upload may pause between reads
+    response_timeout: float | None = None  # seconds a response write may block; None: forever
+    max_connections = 32
 
     def __init__(self, handler_class, port: int, **attributes):
         """Bind to 127.0.0.1:port with handler_class; attributes are set on a subclass of it."""
+        attributes.update(request_timeout=self.request_timeout, body_timeout=self.body_timeout,
+                          response_timeout=self.response_timeout)
         handler = type(handler_class.__name__, (handler_class,), attributes)
-        self.server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-        self.server.daemon_threads = True  # long fetches mustn't keep the process alive on shutdown
+        self.server = BoundedHTTPServer(("127.0.0.1", port), handler, self.max_connections)
         self.thread = threading.Thread(target=lambda: self.server.serve_forever(self.poll_interval), daemon=True)
 
     @property
@@ -232,11 +404,19 @@ class LocalServer:
 
 
 class ApiServer(LocalServer):
-    """The local API for node (an RnfsNode, or anything with its facade methods)."""
+    """The local API for node (an RnfsNode, or anything with its facade methods).
 
-    def __init__(self, node, port: int):
-        """Bind to 127.0.0.1:port; requests are served once start() is called."""
-        super().__init__(ApiHandler, port, node=node)
+    Every request but status must carry token (self.token); the daemon writes it to <rnfs dir>/api_token.
+    """
+
+    max_connections = 32  # the CLI makes one connection per command; this is plenty for scripts too
+
+    def __init__(self, node, port: int, token: str | None = None):
+        """Bind to 127.0.0.1:port, requiring token (a new random one if None); serves once start() is called."""
+        self.token = token if token is not None else secrets.token_urlsafe(32)
+        if not self.token:
+            raise ValueError("the API token must not be empty")
+        super().__init__(ApiHandler, port, node=node, token=self.token)
 
 
 class ApiRequestError(Exception):
@@ -247,10 +427,11 @@ class ApiRequestError(Exception):
         self.status = status
 
 
-class ApiHandler(BaseHTTPRequestHandler):
-    """Handles one API request using node, which is set on the subclass ApiServer creates."""
+class ApiHandler(TimedHandler):
+    """Handles one API request using node and token, which are set on the subclass ApiServer creates."""
 
     node = None
+    token: str | None = None
     server_version = "rnfs"
     sys_version = ""
 
@@ -284,10 +465,26 @@ class ApiHandler(BaseHTTPRequestHandler):
         ("POST", "/api/export"): "api_export",
         ("POST", "/api/import"): "api_import",
     }
-    OPEN_ROUTES = {("GET", "/api/status")}  # allowed without X-Rnfs-Api
+    OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
+
+    @classmethod
+    def busy_response(cls) -> bytes:
+        """503 for a connection over max_connections."""
+        body = json.dumps({"error": "too many API connections; try again shortly"}).encode()
+        return raw_response("503 Service Unavailable", {"Content-Type": "application/json", "Retry-After": "10",
+                                                        "Cache-Control": "no-store",
+                                                        "X-Content-Type-Options": "nosniff"}, body)
+
+    def token_valid(self) -> bool:
+        """True if the request carries this server's token in X-Rnfs-Api (compared in constant time)."""
+        value = self.headers.get(API_HEADER)
+        if value is None:
+            return False
+        # Bytes, since compare_digest refuses non-ASCII str and a header may hold any Latin-1 text
+        return hmac.compare_digest(value.strip().encode("utf-8", "replace"), self.token.encode())
 
     # Responses
 
@@ -350,7 +547,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.dispatch()
 
     def dispatch(self):
-        """Check Host and X-Rnfs-Api, route the request, and map exceptions to error responses."""
+        """Check Host and the token, route the request, and map exceptions to error responses."""
         self.close_connection = True  # one request per connection keeps body handling simple
         url = urlsplit(self.path)
         self.query = parse_qs(url.query, keep_blank_values=True)
@@ -360,20 +557,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 raise ApiRequestError(403, "Host header must be 127.0.0.1:<port> or localhost:<port>")
             route = (self.command, url.path)
             name = self.ROUTES.get(route)
-            if name is None:
-                allowed = sorted(method for method, path in self.ROUTES if path == url.path)
+            feature_route = None if name is not None else feature_routes().get(route)
+            if name is None and feature_route is None:
+                allowed = sorted(method for method, path in (*self.ROUTES, *feature_routes()) if path == url.path)
                 if allowed:
                     return self.send_error_json(405, f"use {' or '.join(allowed)}", {"Allow": ", ".join(allowed)})
                 raise ApiRequestError(404, f"no such API endpoint: {url.path}")
-            if route not in self.OPEN_ROUTES and self.headers.get(API_HEADER) != "1":
-                raise ApiRequestError(403, f"API requests must carry the header {API_HEADER}: 1")
-            getattr(self, name)()
+            if route not in self.OPEN_ROUTES and not self.token_valid():
+                raise ApiRequestError(403, f"API requests must carry the header {API_HEADER}: <token>, with the "
+                                           f"token the daemon wrote to <rnfs dir>/api_token")
+            if self.command != "POST":
+                self.request_read()  # no body; POST endpoints call it once they have read theirs
+            if feature_route is not None:
+                feature_route(self)
+            else:
+                getattr(self, name)()
         except ApiRequestError as e:
             self.respond_error(e.status, str(e))
+        except RequestTimeout as e:
+            self.respond_error(408, str(e))
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             if status == 500:
-                log(f"API {self.command} {url.path} failed: {e!r}", LOG_ERROR)
+                log(f"API {self.command} {loggable(url.path)} failed: {e!r}", LOG_ERROR)
             message = str(e) or type(e).__name__
             self.respond_error(status, message, {"Retry-After": "10"} if status == 503 else None)
 
@@ -417,13 +623,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiRequestError(400, "invalid Content-Length")
         return BodyReader(self.rfile, size, chunked=False)
 
+    def stream_reader(self) -> BodyReader:
+        """A reader for an upload of any size: reads may pause body_timeout, with no overall deadline."""
+        reader = self.body_reader()
+        self.reading_body()
+        return reader
+
     def read_body(self, limit: int) -> bytes:
-        """The whole request body, at most limit bytes (413 beyond that). An absent body is empty."""
+        """The whole request body, at most limit bytes (413 beyond that). An absent body is empty.
+
+        The body must arrive within the request's deadline: these bodies are small.
+        """
         if "Content-Length" not in self.headers and "Transfer-Encoding" not in self.headers:
+            self.request_read()
             return b""
         data = self.body_reader().read(limit + 1)
         if len(data) > limit:
             raise ApiRequestError(413, "request body too large")
+        self.request_read()
         return data
 
     def json_body(self) -> dict:
@@ -446,21 +663,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_json(200, self.node.status())
 
     def api_info(self):
-        """GET /api/info?target=: type, size and CID of a target."""
-        self.send_json(200, self.node.info(parse_target(self.param("target"))))
+        """GET /api/info?target=&from=: type, size and CID of a target (fetched from that node, if given)."""
+        from_node = parse_hex_id(self.param("from", False)) if self.param("from", False) else None
+        self.send_json(200, self.node.info(parse_target(self.param("target")), from_node=from_node))
 
     def api_cat(self):
         """GET /api/cat?target=&offset=&length=: stream a file's bytes, fetched as needed."""
         target = parse_target(self.param("target"))
         offset = parse_int(self.param("offset", False), "offset", 0)
         length = parse_int(self.param("length", False), "length", None)
-        info = self.node.info(target)
+        if parse_bool(self.param("block", False) or ""):
+            return self.send_bytes(self.node.block(parse_cid(target)))  # cat --block: the CID's own block
+        raw = {"raw": True} if parse_bool(self.param("raw", False) or "") else {}  # sealed files: the ciphertext
+        info = self.node.info(target, **raw)
         if info["type"] != "file":
             raise ValueError(f"{target} is a directory")
         # Content-Length is known up front, so a client sees a fetch failing mid-stream as a short body
         available = max(info["size"] - offset, 0)
         length = available if length is None else min(length, available)
-        chunks = iter(self.node.read(target, offset=offset, length=length))
+        chunks = iter(self.node.read(target, offset=offset, length=length, **raw))
         try:
             # The first chunk is fetched before the status line, so early errors still get an error status
             first = next(chunks, b"")
@@ -476,7 +697,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if self.headers_sent:
                 # Too late for an error status; Content-Length tells the client the body was cut short
                 if not isinstance(e, OSError):
-                    log(f"API cat {target} failed mid-stream: {e!r}", LOG_ERROR)
+                    log(f"API cat {loggable(target)} failed mid-stream: {e!r}", LOG_ERROR)
                 return
             raise
         finally:
@@ -511,10 +732,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"names": self.node.name_list()})
 
     def api_name_resolve(self):
-        """GET /api/name/resolve?name=: the record a name points at (persisting its sequence)."""
-        name = self.param("name")
-        parse_hex_id(name, "name")
-        self.send_json(200, self.node.name_resolve(name))
+        """GET /api/name/resolve?name=: the record a name (or a name contact's nick) points at, persisted."""
+        from rnfs.features.keepers import parse_name_arg  # names as keep and follow take them
+        self.send_json(200, self.node.name_resolve(parse_name_arg(self.node, self.param("name")).hex()))
 
     # POST endpoints
 
@@ -522,22 +742,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         """POST /api/add {"path", "wrap", "only_hash"}: import a file or directory on this machine."""
         body = self.json_body()
         self.send_json(200, self.node.add_path(parse_path(body.get("path")), wrap=parse_bool(body.get("wrap")),
-                                               only_hash=parse_bool(body.get("only_hash"))))
+                                               only_hash=parse_bool(body.get("only_hash")),
+                                               **node_content.add_options(body.get)))  # pin, to, chunker…
 
     def api_add_stream(self):
         """POST /api/add/stream?name=&only_hash=: import the request body, wrapped as name if given."""
-        reader = self.body_reader()
+        reader = self.stream_reader()
         size = None if reader.chunked else reader.remaining
         name = self.param("name", False) or None
         only_hash = parse_bool(self.param("only_hash", False) or "")
-        self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash))
+        options = node_content.add_options(lambda key: self.param(key, False))  # pin, to, seal_name, chunker…
+        self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
 
     def api_get(self):
         """POST /api/get {"target", "output", "from"}: fetch and write out to a path on this machine."""
         body = self.json_body()
         from_node = parse_hex_id(body["from"]) if body.get("from") else None
+        raw = {"raw": True} if parse_bool(body.get("raw")) else {}  # sealed files: the ciphertext
         self.send_json(200, self.node.get(parse_target(body.get("target")), parse_path(body.get("output")),
-                                          from_node=from_node))
+                                          from_node=from_node, **raw))
 
     def api_dir_set(self):
         """POST /api/dir/set {"target", "name", "cid", "executable"}: a new directory with an entry set."""

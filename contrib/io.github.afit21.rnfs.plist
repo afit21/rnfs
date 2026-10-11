@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for the rnfs daemon on macOS.
+
+    cp contrib/io.github.afit21.rnfs.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist
+    tail -f ~/.rnfs/daemon.log                     # logs
+
+  Stop it with `launchctl unload ~/Library/LaunchAgents/io.github.afit21.rnfs.plist`; launchd sends SIGTERM,
+  which the daemon handles by shutting down cleanly. It assumes `pipx install`, which puts rnfs in
+  ~/.local/bin; adjust the path below otherwise. launchd doesn't expand ~, hence the sh -c.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.afit21.rnfs</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>mkdir -p "$HOME/.rnfs" &amp;&amp; exec "$HOME/.local/bin/rnfs" daemon &gt;&gt; "$HOME/.rnfs/daemon.log" 2&gt;&amp;1</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart if it exits with an error, but not after a clean stop -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

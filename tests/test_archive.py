@@ -119,6 +119,41 @@ class ArchiveTest(unittest.TestCase):
         out = io.BytesIO()
         self.assertEqual(archive.export_archive([cid], self.source.getter(), out, max_entries=1110)["blocks"], 4)
 
+    def test_header_only_archive_does_not_pin_cached_content(self):
+        cached = builder.build_bytes(b"downloaded earlier", self.destination.put)  # cache, not pinned
+        header = umsgpack.packb(["rnfs-archive", 1, [cached.cid.binary]])
+        result = archive.import_archive(io.BytesIO(header), self.destination)
+        self.assertEqual(result["complete"], [])
+        self.assertEqual(result["incomplete"], [cached.cid])
+        self.assertEqual(self.destination.pins(), {})
+
+    def test_partial_archive_does_not_pin_cached_dag(self):
+        # The destination holds the whole tree as cache; an archive with only its root block mustn't pin it
+        for expect, block in walker.iter_dag(walker.root_expect(self.root.cid), self.source.getter()):
+            self.destination.put(expect.cid, block)
+        records = self.records(self.export([self.root.cid]))
+        data = b"".join(umsgpack.packb(r) for r in records[:2])
+        self.assertEqual(Cid.from_bytes(records[1][0]), self.root.cid)
+        result = archive.import_archive(io.BytesIO(data), self.destination)
+        self.assertEqual(result["incomplete"], [self.root.cid])
+        self.assertEqual(self.destination.pins(), {})
+        # The whole DAG in the archive pins it, though every block was already stored
+        result = archive.import_archive(io.BytesIO(self.export([self.root.cid])), self.destination)
+        self.assertEqual(result["complete"], [self.root.cid])
+        self.assertEqual(self.destination.pins(), {self.root.cid: {USER}})
+
+    def test_root_count_is_capped_before_reading_roots(self):
+        # An array header claiming MAX_ROOTS + 1 roots, with none following: refused without reading them
+        header = umsgpack.packb("rnfs-archive")
+        data = b"\x93" + header + b"\x01\xdc" + (archive.MAX_ROOTS + 1).to_bytes(2, "big")
+        with self.assertRaisesRegex(ValueError, "roots"):
+            archive.import_archive(io.BytesIO(data), self.destination)
+        with self.assertRaises(ValueError):
+            archive.export_archive([self.other.cid] * (archive.MAX_ROOTS + 1), self.source.getter(), io.BytesIO())
+        data = self.export([self.other.cid] * archive.MAX_ROOTS)
+        self.assertEqual(len(archive.import_archive(io.BytesIO(data), self.destination)["complete"]),
+                         archive.MAX_ROOTS)
+
     def test_empty_file_root(self):
         empty = builder.build_bytes(b"", self.source.put)
         data = self.export([empty.cid])

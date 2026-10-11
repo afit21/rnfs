@@ -7,20 +7,26 @@
   max_storage, and gc() evicts them all.
 - Blocks of fetches, adds and imports in progress are protected as if pinned, by a protection session.
 - A block is deleted only if no pin, session or remaining cached fetch reaches it.
+- max_storage is soft: no fetch is refused for it, and storage may exceed it while fetches run or when
+  pins alone fill it. The hard bound is the disk: check_disk() refuses blocks that would leave less than
+  DISK_RESERVE free on the filesystem holding the blocks.
 
-Pins and cache records are persisted as JSON under state_dir. Thread-safe: one lock guards the indexes;
-long walks (completeness) run outside it and are discarded if blocks were deleted meanwhile.
+Pins and cache records are persisted as JSON under state_dir: pins at once, cache records (which change on
+every fetch) by save(), which the node calls periodically and at shutdown. Thread-safe: one lock guards the
+indexes; long walks (completeness) run outside it and are discarded if blocks were deleted meanwhile.
 """
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Iterator
 
-from rnfs.constants import MAX_BLOCK_SIZE
+from rnfs import fsutil
+from rnfs.constants import MAX_BLOCK_SIZE, MIB
 from rnfs.content import dag, walker
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
@@ -30,8 +36,13 @@ from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
 
 USER, FOLDER = "user", "folder"
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
+LXMF_PREFIX = "lxmf:"
 PINS_FILE = "pins.json"
 CACHE_FILE = "cache.json"
+MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
+EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
+DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
+DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
 
 _IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
 
@@ -44,6 +55,12 @@ def check_source(source: str):
         return
     if isinstance(source, str) and source.startswith(REMOTE_PREFIX) \
             and _IDENTITY_HASH.fullmatch(source[len(REMOTE_PREFIX):]):
+        return
+    # follow:<name>: the latest target of a followed name (rnfs/features/follow.py)
+    if isinstance(source, str) and source.startswith("follow:") and _IDENTITY_HASH.fullmatch(source[len("follow:"):]):
+        return
+    # lxmf:<LXMF address>: links auto-fetched from that sender (rnfs/features/lxmf.py)
+    if isinstance(source, str) and source.startswith(LXMF_PREFIX) and _IDENTITY_HASH.fullmatch(source[len(LXMF_PREFIX):]):
         return
     raise ValueError(f"invalid pin source {source!r}")
 
@@ -64,13 +81,13 @@ def write_json(path: str, value):
     directory = os.path.dirname(path)
     fd, partial = tempfile.mkstemp(prefix=".partial-", dir=directory)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f)
-        os.replace(partial, path)
+        fsutil.replace(partial, path)  # retried on Windows while read_json has path open
     except BaseException:
         try:
-            os.remove(partial)
-        except FileNotFoundError:
+            fsutil.remove(partial)
+        except OSError:
             pass
         raise
 
@@ -78,13 +95,19 @@ def write_json(path: str, value):
 def read_json(path: str):
     """The JSON value in path, or None if it doesn't exist. A damaged file is moved aside, not lost."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return None
     except (ValueError, OSError) as e:
         aside = path + ".damaged"
-        os.replace(path, aside)
+        try:
+            fsutil.replace(path, aside)
+        except OSError as moving:
+            # A directory in the way, or a read-only state dir: start without it rather than not at all
+            log(f"storage: {path} is unreadable ({e}) and couldn't be moved aside ({moving}); starting without it",
+                LOG_ERROR)
+            return None
         log(f"storage: {path} is damaged ({e}); moved to {aside} and starting without it", LOG_ERROR)
         return None
 
@@ -108,7 +131,7 @@ class Session:
     def put(self, cid: Cid, block: bytes):
         """Store a block and protect it. Raises ValueError if it doesn't match its CID."""
         self.add(cid)  # first, so an eviction between storing and protecting can't take it
-        self._storage.put(cid, block)
+        self._storage._put(cid, block, protected=True)
 
 
 class Storage:
@@ -119,8 +142,9 @@ class Storage:
         self._lock = threading.RLock()
         self.blocks = BlockStore(blocks_dir)
         self.state_dir = os.path.expanduser(state_dir)
-        os.makedirs(self.state_dir, exist_ok=True)
+        os.makedirs(self.state_dir, mode=0o700, exist_ok=True)
         self.max_storage = max_storage
+        self._save_lock = threading.Lock()  # keeps cache saves in order without holding _lock while writing
 
         self._sizes: dict[Cid, int] = dict(self.blocks.scan())
         self._used = sum(self._sizes.values())
@@ -130,6 +154,10 @@ class Storage:
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
         self._generation = 0  # incremented whenever blocks are deleted, invalidating walks in progress
+        self._cache_dirty = False  # cache records changed since the last save()
+        # False only when nothing has happened since the last collection that could leave a block unreached,
+        # so eviction over max_storage with nothing to evict needn't walk everything again
+        self._maybe_garbage = True
         self._load()
 
     # Persistence
@@ -155,16 +183,28 @@ class Storage:
                 self._cache[(Cid.parse(root), tuple(names))] = Cid.parse(target)
             except (ValueError, TypeError):
                 log(f"storage: ignoring invalid cache record {record!r}", LOG_ERROR)
+        self._cap_cache()
 
     def _save_pins(self):
         """Persist pins (called with the lock held)."""
         value = {"pins": {str(cid): sorted(sources) for cid, sources in self._pins.items()}}
         write_json(os.path.join(self.state_dir, PINS_FILE), value)
 
-    def _save_cache(self):
-        """Persist cache records, least recently used first (called with the lock held)."""
-        value = {"fetches": [[str(root), list(names), str(target)] for (root, names), target in self._cache.items()]}
-        write_json(os.path.join(self.state_dir, CACHE_FILE), value)
+    def save(self):
+        """Persist cache records, least recently used first, if they changed since the last save."""
+        with self._save_lock:
+            with self._lock:
+                if not self._cache_dirty:
+                    return
+                value = {"fetches": [[str(root), list(names), str(target)]
+                                     for (root, names), target in self._cache.items()]}
+                self._cache_dirty = False
+            try:
+                write_json(os.path.join(self.state_dir, CACHE_FILE), value)
+            except BaseException:
+                with self._lock:
+                    self._cache_dirty = True
+                raise
 
     # Blocks
 
@@ -183,7 +223,7 @@ class Storage:
             with self._lock:
                 if cid in self._sizes and not self.blocks.verify(cid):
                     log(f"storage: block {cid} is damaged or missing; removing it", LOG_ERROR)
-                    self._delete({cid})
+                    self._delete({cid})  # if Windows defers it, verify() or the next read tries again
             return None
         return block
 
@@ -197,6 +237,10 @@ class Storage:
 
         A block stored outside a protection session is cache that no record reaches: the first to go.
         """
+        self._put(cid, block, protected=False)
+
+    def _put(self, cid: Cid, block: bytes, protected: bool):
+        """Store a block; protected if a session already lists it, so it can't be garbage."""
         with self._lock:
             if cid in self._sizes:
                 return
@@ -205,6 +249,8 @@ class Storage:
             if cid not in self._sizes:
                 self._sizes[cid] = len(block)
                 self._used += len(block)
+                if not protected:
+                    self._maybe_garbage = True
 
     def used_bytes(self) -> int:
         """Bytes of every stored block."""
@@ -248,6 +294,7 @@ class Storage:
             sources.discard(source)
             if not sources:
                 del self._pins[cid]
+                self._maybe_garbage = True
             self._save_pins()
             return True
 
@@ -268,13 +315,31 @@ class Storage:
 
     # Cache
 
-    def record_fetch(self, root: Cid, names: list[str] | tuple[str, ...], target: Cid):
-        """Record (or touch, as most recently used) a cached fetch of <root>/<names> leading to target."""
+    def record_fetch(self, root: Cid, names: list[str] | tuple[str, ...], target: Cid) -> set[Cid]:
+        """Record (or touch, as most recently used) a cached fetch of <root>/<names> leading to target.
+
+        Returns the targets of records dropped to stay within MAX_CACHE_RECORDS, no longer cached.
+        """
         key = (root, tuple(names))
         with self._lock:
+            previous = self._cache.get(key)
+            if previous is not None and previous != target:
+                self._maybe_garbage = True
             self._cache[key] = target
             self._cache.move_to_end(key)
-            self._save_cache()
+            self._cache_dirty = True
+            dropped = self._cap_cache()
+            return dropped - set(self._cache.values())
+
+    def _cap_cache(self) -> set[Cid]:
+        """Drop the least recently used records past MAX_CACHE_RECORDS; their targets (lock held)."""
+        dropped = set()
+        while len(self._cache) > MAX_CACHE_RECORDS:
+            dropped.add(self._cache.popitem(last=False)[1])
+        if dropped:
+            self._maybe_garbage = True
+            self._cache_dirty = True
+        return dropped
 
     def touch(self, root: Cid, names: list[str] | tuple[str, ...]) -> bool:
         """Mark a cached fetch as used now; False if there is no such record."""
@@ -283,7 +348,7 @@ class Storage:
             if key not in self._cache:
                 return False
             self._cache.move_to_end(key)
-            self._save_cache()
+            self._cache_dirty = True
             return True
 
     def cached_fetches(self) -> list[tuple[Cid, tuple[str, ...], Cid]]:
@@ -309,6 +374,8 @@ class Storage:
         finally:
             with self._lock:
                 self._sessions.remove(session)
+                if session.cids:
+                    self._maybe_garbage = True
 
     # Reachability
 
@@ -331,16 +398,17 @@ class Storage:
             self._links[cid] = listed
         return self._links[cid]
 
-    def _reach(self, roots) -> set[Cid]:
-        """Stored blocks reachable from roots through stored DAG nodes (lock held)."""
+    def _reach(self, roots, known: set[Cid] | frozenset[Cid] = frozenset()) -> set[Cid]:
+        """Stored blocks reachable from roots through stored DAG nodes, not passing through known (lock held)."""
         reached: set[Cid] = set()
-        stack = [cid for cid in roots if cid in self._sizes]
+        stack = [cid for cid in roots if cid in self._sizes and cid not in known]
         while stack:
             cid = stack.pop()
             if cid in reached:
                 continue
             reached.add(cid)
-            stack.extend(child for child in self._children(cid) if child in self._sizes and child not in reached)
+            stack.extend(child for child in self._children(cid)
+                         if child in self._sizes and child not in reached and child not in known)
         return reached
 
     def _path_cids(self, root: Cid, names: tuple[str, ...]) -> set[Cid]:
@@ -382,25 +450,74 @@ class Storage:
             live |= self._path_cids(root, names)
         return live
 
-    def _delete(self, cids: set[Cid]) -> int:
-        """Delete stored blocks; returns bytes freed (lock held). Invalidates completeness memos."""
+    def _delete(self, cids: set[Cid]) -> tuple[set[Cid], int]:
+        """Delete stored blocks; returns (deleted, bytes freed) (lock held). Invalidates completeness memos.
+
+        A block Windows keeps in use (a reader has it open) stays stored and indexed, so the index always
+        matches the disk; it is left out of deleted, and the next collection tries again.
+        """
+        deleted: set[Cid] = set()
         freed = 0
+        deferred = False
         for cid in cids:
             if cid in self._sizes:
-                self.blocks.delete(cid)
+                if self.blocks.delete(cid) is None:
+                    log(f"storage: block {cid} is in use; deleting it later", LOG_VERBOSE)
+                    deferred = True
+                    continue
+                deleted.add(cid)
                 freed += self._sizes.pop(cid)
                 self._links.pop(cid, None)
-        if cids:
+        if deleted:
             self._used -= freed
             self._generation += 1
-            self._complete = {root: blocks for root, blocks in self._complete.items() if not blocks & cids}
-        return freed
+            self._complete = {root: blocks for root, blocks in self._complete.items() if not blocks & deleted}
+        if deleted or deferred:
+            # A deleted DAG node no longer reaches its children; a deferred block is still garbage
+            self._maybe_garbage = True
+        return deleted, freed
 
     def _collect(self) -> tuple[set[Cid], int]:
         """Delete every stored block nothing reaches; returns (deleted, bytes freed) (lock held)."""
         live = self._live()
         dead = {cid for cid in self._sizes if cid not in live}
-        return dead, self._delete(dead)
+        deleted, freed = self._delete(dead)
+        self._maybe_garbage = deleted != dead  # anything deferred is collected on a later pass
+        return deleted, freed
+
+    def _evict_to(self, limit: int) -> tuple[set[Cid], int, int]:
+        """Delete unreached blocks, then cached fetches least recently used first, until at most limit bytes
+        are stored or nothing evictable is left; returns (deleted, bytes freed, records evicted) (lock held).
+
+        One walk: what pins and sessions reach, then each record's own blocks from the most recently used
+        down, keeping records while everything kept fits; the older ones are evicted.
+        """
+        if not self._cache and not self._maybe_garbage:
+            return set(), 0, 0  # only pins and sessions hold blocks: there is nothing to evict
+        roots = set(self._pins)
+        for session in self._sessions:
+            roots |= session.cids
+        live = self._reach(roots)
+        kept = sum(self._sizes[cid] for cid in live)
+        records = list(self._cache.items())  # oldest first
+        keep = 0
+        for (root, names), target in reversed(records):
+            more = self._reach({target}, live) | (self._path_cids(root, names) - live)
+            more_bytes = sum(self._sizes[cid] for cid in more)
+            if kept + more_bytes > limit:
+                break
+            live |= more
+            kept += more_bytes
+            keep += 1
+        evicted = len(records) - keep
+        for _ in range(evicted):
+            self._cache.popitem(last=False)
+        if evicted:
+            self._cache_dirty = True
+        dead = {cid for cid in self._sizes if cid not in live}
+        deleted, freed = self._delete(dead)
+        self._maybe_garbage = deleted != dead  # anything deferred is collected on a later pass
+        return deleted, freed, evicted
 
     # Completeness
 
@@ -470,33 +587,37 @@ class Storage:
         with self._lock:
             return sum(self._sizes[cid] for cid in self._reach(self._pins))
 
-    def check_space(self, pinned: bool):
-        """Raise StorageFull if pins alone fill max_storage and this fetch isn't being pinned."""
-        if pinned:
-            return
-        used = self.pinned_bytes()
-        if used >= self.max_storage:
-            raise StorageFull(f"pins alone use {size(used)} of max_storage ({size(self.max_storage)})")
+    def check_disk(self, nbytes: int):
+        """Raise StorageFull if storing nbytes more would leave less than the disk reserve free on the
+        filesystem holding the blocks: max(DISK_RESERVE_MIN, DISK_RESERVE_FRACTION of it).
 
-    def evict(self) -> set[Cid]:
-        """Enforce max_storage: delete unreached blocks, then cached fetches least recently used first.
+        This, not max_storage, is what bounds a fetch: a full disk breaks every write, not just rnfs's.
+        """
+        if nbytes <= 0:
+            return
+        try:
+            usage = shutil.disk_usage(self.blocks.directory)
+        except OSError:
+            return  # can't tell; writing the blocks reports a real failure
+        reserve = max(DISK_RESERVE_MIN, int(usage.total * DISK_RESERVE_FRACTION))
+        if nbytes > usage.free - reserve:
+            raise StorageFull(f"not enough free disk space: {size(nbytes)} more would leave less than "
+                              f"{size(reserve)} free in {self.blocks.directory} ({size(usage.free)} free)")
+
+    def evict(self, needed: int = 0) -> set[Cid]:
+        """Enforce max_storage, leaving room for needed more bytes: delete unreached blocks, then cached
+        fetches least recently used first. Evicts a margin more, so it needn't run again at once.
 
         Returns pins and cached targets that were complete and no longer are, for withdrawal.
         """
         with self._lock:
-            if self._used <= self.max_storage:
+            if self._used + needed <= self.max_storage:
                 return set()
+            if not self._cache and not self._maybe_garbage:
+                return set()  # nothing is evictable: don't walk everything to find that out again
             before = self._complete_sets(self._targets())
-            deleted, freed = self._collect()
-            evicted = 0
-            while self._used > self.max_storage and self._cache:
-                self._cache.popitem(last=False)
-                evicted += 1
-                more, more_freed = self._collect()
-                deleted |= more
-                freed += more_freed
-            if evicted:
-                self._save_cache()
+            limit = self.max_storage - needed - self.max_storage // EVICT_MARGIN
+            deleted, freed, evicted = self._evict_to(max(0, limit))
             if deleted:
                 log(f"storage: evicted {plural(evicted, 'cached fetch')}, freeing {size(freed)} "
                     f"in {plural(len(deleted), 'block')}", LOG_VERBOSE)
@@ -513,7 +634,7 @@ class Storage:
             uncached = set(self._cache.values())
             if self._cache:
                 self._cache.clear()
-                self._save_cache()
+                self._cache_dirty = True
             deleted, freed = self._collect()
             incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
             return {"removed_blocks": len(deleted), "freed_bytes": freed, "incomplete": incomplete,
@@ -534,7 +655,7 @@ class Storage:
             with self._lock:
                 # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
                 if cid in self._sizes and not self.blocks.verify(cid):
-                    self._delete({cid})
+                    self._delete({cid})  # reported either way; one Windows defers stays until a later try
                     bad.append(cid)
         if bad:
             log(f"storage: verify removed {plural(len(bad), 'damaged block')}", LOG_ERROR)
@@ -557,9 +678,15 @@ class Storage:
         except InvalidDag:
             return None
 
+    def dag_bytes(self, cid: Cid) -> int:
+        """Bytes of the stored blocks of cid's DAG (each block once), as far as its stored nodes reach."""
+        with self._lock:
+            return sum(self._sizes[block] for block in self._reach({cid}))
+
     def source_usage(self, source: str) -> int:
-        """Total content size of every CID source pins, counting those whose size isn't known yet as 0."""
-        return sum(self.content_size(cid) or 0 for cid in self.pinned_by(source))
+        """What every CID source pins counts against its quota: the bytes of its DAG's blocks, or its content
+        size while that is larger (not fetched yet); 0 for those whose root isn't stored."""
+        return sum(max(self.content_size(cid) or 0, self.dag_bytes(cid)) for cid in self.pinned_by(source))
 
     def stat(self, cid: Cid) -> dict:
         """{"size", "blocks", "local_blocks", "local_bytes"} for cid's DAG, as far as its stored nodes show it.

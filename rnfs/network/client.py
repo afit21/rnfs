@@ -13,6 +13,7 @@ from rnfs.content.cid import Cid
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import protocol, rates
 from rnfs.network.links import Exchange, LinkPool
+from rnfs import mesh
 
 # BlocksResult statuses
 OK = "ok"  # the node answered; see blocks, missing, unsent and bad
@@ -41,6 +42,7 @@ class PeerClient:
         """Client sending over links."""
         self.links = links
         self.config = config
+        self.traffic = mesh.Traffic()  # requests and bytes per peer (mesh); the node shares it with the server
 
     # Links
 
@@ -72,16 +74,23 @@ class PeerClient:
         """
         peer = self.links.get(node_id)
         if peer is None:
+            self.traffic.request(node_id, mesh.FAILED)
             return None
-        exchange = self.links.call(peer, FIND_PATH, protocol.encode_find(key))
+        # Honest answers fit one packet; a larger one is refused at its advertisement (and links.py gives up
+        # on one that is trickled)
+        exchange = self.links.call(peer, FIND_PATH, protocol.encode_find(key),
+                                   max_response_size=protocol.MAX_FIND_RESPONSE_SIZE)
         if not exchange.answered:
             log(f"no answer from {node_name(node_id)} to /find", LOG_VERBOSE)
+            self.traffic.request(node_id, mesh.FAILED)
             return None
         result = protocol.parse_find_response(exchange.response)
         if result is None:
             outcome = "refused" if exchange.response is False else "sent a malformed answer to"
             log(f"{node_name(node_id)} {outcome} /find for {key.hex()}", LOG_VERBOSE)
+            self.traffic.request(node_id, mesh.REFUSED if exchange.response is False else mesh.FAILED)
             return None
+        self.traffic.request(node_id, mesh.ANSWERED)
         providers, nodes = result
         log(f"asked {node_name(node_id)} about {key.hex()}: {plural(len(providers), 'provider')}, "
             f"{plural(len(nodes), 'node')}", LOG_VERBOSE)
@@ -103,7 +112,8 @@ class PeerClient:
         try:
             batches = protocol.provide_batches(keys, withdrawn, peer.mdu())
             for batch_keys, batch_withdrawn in batches:
-                exchange = self.links.call(peer, PROVIDE_PATH, protocol.encode_provide(batch_keys, batch_withdrawn))
+                exchange = self.links.call(peer, PROVIDE_PATH, protocol.encode_provide(batch_keys, batch_withdrawn),
+                                           max_response_size=protocol.MAX_ACCEPT_RESPONSE_SIZE)
                 if not (exchange.answered and protocol.is_accepted(exchange.response)):
                     outcome = "refused" if exchange.answered else "didn't answer"
                     log(f"{node_name(node_id)} {outcome} /provide of {plural(len(batch_keys), 'key')}", LOG_VERBOSE)
@@ -122,7 +132,8 @@ class PeerClient:
         if peer is None:
             return False
         try:
-            exchange = self.links.call(peer, PIN_PATH, protocol.encode_pin(cid, pin))
+            exchange = self.links.call(peer, PIN_PATH, protocol.encode_pin(cid, pin),
+                                       max_response_size=protocol.MAX_ACCEPT_RESPONSE_SIZE)
             return exchange.answered and protocol.is_accepted(exchange.response)
         finally:
             self.links.close_link(peer)
@@ -142,6 +153,21 @@ class PeerClient:
     # /blocks
 
     def blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None) -> BlocksResult:
+        """_blocks(), counted in traffic (mesh): the outcome, verified bytes received and bad blocks."""
+        result = self._blocks(node_id, cids, on_progress)
+        if result.status != OK or result.blocks or result.missing or result.bad:
+            outcome = {OK: mesh.ANSWERED, BUSY: mesh.REFUSED}.get(result.status, mesh.FAILED)
+            self.traffic.request(node_id, outcome, sum(len(block) for block in result.blocks.values()),
+                                 self._interface(node_id), len(result.bad))
+        return result
+
+    def _interface(self, node_id: bytes) -> str | None:
+        """The name of the interface the shared link to node_id runs over, or None."""
+        with self.links.lock:
+            peer = self.links.shared.get(node_id)
+        return mesh.interface_label(getattr(getattr(peer, "link", None), "attached_interface", None))
+
+    def _blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None) -> BlocksResult:
         """Ask node_id for blocks over its shared link, verifying each against its CID.
 
         Sends as many of cids (duplicates dropped) as fit one packet; the rest come back in .unsent.
@@ -182,6 +208,7 @@ class PeerClient:
             return BlocksResult(BUSY, unsent=wanted, reason="busy")
         entries = protocol.parse_blocks_response(exchange.response, len(batch))
         if entries is None:
+            # Including an empty answer: counted as a failure, so the fetcher doesn't ask again forever
             log(f"{name} sent a malformed /blocks response", LOG_WARNING)
             return BlocksResult(FAILED, unsent=wanted, reason="malformed response")
 

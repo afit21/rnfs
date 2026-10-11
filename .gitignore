@@ -5,3 +5,5 @@ dist/
 *.egg-info/
 .venv/
 venv/
+.flatpak-builder/
+build-dir/

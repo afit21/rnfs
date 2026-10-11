@@ -6,6 +6,9 @@
 - In private mode every link identifies.
 - Requesters stay within the per-link limits: at most MAX_REQUESTS_PER_LINK requests in progress on a link,
   at most one of them /blocks. A request waits for a free slot.
+- RNS stops a request's timeout once a response Resource starts arriving, so a node could trickle an answer
+  for hours while holding a slot. Requests other than /blocks therefore have a hard deadline from when they
+  were sent (and wait no longer than that for a slot); /blocks has the fetcher's stall detection instead.
 - A request answered False on an identified link is retried once after identifying again, since
   Link.identify() is unacknowledged.
 
@@ -25,6 +28,9 @@ from rnfs.network import guards, rates
 POLL_INTERVAL = 0.25  # how often a waiting request checks its link, progress and stall conditions
 CANCEL_GRACE = 2.0  # seconds a started response may be missing from the link's incoming Resources
 ESTABLISH_GRACE = 5  # seconds past RNS's own establishment timeout before giving up on a new link
+DEADLINE_FACTOR = 2  # a request other than /blocks may take this many times RNS's own request timeout
+# What RNS adds to rtt × traffic_timeout_factor for its request timeout (Link.request with timeout=None)
+RESPONSE_GRACE = RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125
 
 
 class Exchange:
@@ -390,10 +396,16 @@ class LinkPool:
         """Send one request on peer's link and wait for its outcome, within the per-link limits.
 
         watchdog(exchange, now) may return a reason to stop waiting (a stall). on_progress(fraction) is
-        called from this thread, never an RNS one.
+        called from this thread, never an RNS one. A request other than /blocks gives up (.stalled set) once
+        request_deadline has passed since it was sent, or if it waited that long for a slot.
         """
         exchange = Exchange(self.clock)
-        if not peer.acquire(blocks):
+        deadline = None if blocks else self.request_deadline(peer)
+        if not peer.acquire(blocks, timeout=deadline):
+            if deadline is not None and peer.is_active():
+                exchange.stalled = "no free request slot"
+                log(f"no free request slot for {path} to {node_name(peer.node_id)} within {deadline:.0f}s",
+                    LOG_VERBOSE)
             exchange.done.set()
             return exchange
         try:
@@ -435,11 +447,27 @@ class LinkPool:
                     if reason:
                         exchange.stalled = reason
                         break
+                if deadline is not None and self.clock() - exchange.sent_at > deadline:
+                    # Only reachable while RNS is receiving a response Resource: otherwise its own timeout
+                    # fails the request first. Honest answers to these requests fit one packet.
+                    exchange.stalled = f"no answer within {deadline:.0f}s"
+                    log(f"{node_name(peer.node_id)} took over {deadline:.0f}s to answer {path}; giving up",
+                        LOG_VERBOSE)
+                    break
             if exchange.answered and on_progress is not None and reported < 1.0:
                 on_progress(1.0)
             return exchange
         finally:
             peer.release(blocks)
+
+    @staticmethod
+    def request_deadline(peer: PeerLink) -> float:
+        """Seconds a request other than /blocks may take from being sent: DEADLINE_FACTOR × RNS's own
+        RTT-based request timeout for peer's link."""
+        link = peer.link
+        rtt = getattr(link, "rtt", None) or 0
+        factor = getattr(link, "traffic_timeout_factor", None) or RNS.Link.TRAFFIC_TIMEOUT_FACTOR
+        return DEADLINE_FACTOR * (rtt * factor + RESPONSE_GRACE)
 
     @staticmethod
     def _receiving(link, request_id) -> bool:

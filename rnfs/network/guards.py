@@ -7,13 +7,17 @@ response could still cost ~3 MiB per link. rnfs runs in its own process (section
 RNS.Resource.accept once to reject, before anything is allocated:
 - every request sent as a Resource: rnfs requests always fit in one packet;
 - any advertisement whose transfer size exceeds its data size plus encryption overhead, or exceeds
-  MAX_RESPONSE_SIZE plus that overhead (the largest response rnfs accepts is one Resource segment).
+  MAX_RESPONSE_SIZE plus that overhead (the largest response rnfs accepts is one Resource segment);
+- on rnfs.dht links, any multi-segment Resource: the checks above see one segment at a time, so a
+  response of many segments (hundreds of MiB, later read wholly into memory) would pass them, while every
+  legitimate rnfs response fits one. Other destinations' Resources (LXMF's, whose messages may span
+  segments) are told apart by the link's destination name, which this node chose itself.
 """
 import threading
 
 import RNS
 
-from rnfs.constants import MAX_RESPONSE_SIZE
+from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_RESPONSE_SIZE
 from rnfs.log import LOG_WARNING, log
 
 # Resource data is a 4-byte random hash plus the payload, encrypted as an RNS Token: 16-byte IV, 32-byte HMAC
@@ -25,8 +29,20 @@ _lock = threading.Lock()
 _original_accept = None
 
 
-def refusal(adv) -> str | None:
-    """Why an unpacked ResourceAdvertisement must be rejected, or None if it may be accepted."""
+DHT_NAME = f"{APP_NAME}.{DHT_ASPECT}"
+
+
+def is_dht_link(link) -> bool:
+    """True if link (an RNS.Link, either end) belongs to rnfs.dht: its destination's name is "rnfs.dht"
+    plus the identity's hex hash, as RNS.Destination.expand_name builds it."""
+    # An outgoing link has the remote destination; an incoming one has none, and our own as its owner
+    destination = getattr(link, "destination", None) or getattr(link, "owner", None)
+    name = getattr(destination, "name", None)
+    return isinstance(name, str) and (name == DHT_NAME or name.startswith(DHT_NAME + "."))
+
+
+def refusal(adv, link=None) -> str | None:
+    """Why an unpacked ResourceAdvertisement arriving on link must be rejected, or None if it may be accepted."""
     transfer, data = getattr(adv, "t", None), getattr(adv, "d", None)
     if type(transfer) is not int or type(data) is not int or transfer < 0 or data < 0:
         return "malformed sizes"
@@ -36,6 +52,8 @@ def refusal(adv) -> str | None:
         return f"transfer size {transfer} exceeds data size {data}"
     if transfer > MAX_TRANSFER_SIZE:
         return f"transfer size {transfer} exceeds the largest response"
+    if link is not None and is_dht_link(link) and (getattr(adv, "l", 1) != 1 or getattr(adv, "i", 1) != 1):
+        return f"rnfs responses are one segment, not {getattr(adv, 'l', '?')}"
     return None
 
 
@@ -59,7 +77,7 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
         adv = RNS.ResourceAdvertisement.unpack(advertisement_packet.plaintext)
     except Exception:
         adv = None  # let RNS handle an advertisement it can't read, as it always has
-    reason = refusal(adv) if adv is not None else None
+    reason = refusal(adv, getattr(advertisement_packet, "link", None)) if adv is not None else None
     if reason is not None:
         log(f"rejected an incoming Resource: {reason}", LOG_WARNING)
         RNS.Resource.reject(advertisement_packet)

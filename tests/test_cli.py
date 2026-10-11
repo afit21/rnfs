@@ -3,15 +3,17 @@ import contextlib
 import io
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from rnfs import cli
+from rnfs import cli, fsutil
 from rnfs.api import ApiServer
 from rnfs.content.cid import RAW, Cid
+from tests.support import CAN_SYMLINK, POSIX_MODES
 
 try:
     from tests.test_api import FakeNode
@@ -29,7 +31,7 @@ def free_port() -> int:
 
 
 class CliTestCase(unittest.TestCase):
-    """Base: a FakeNode behind an ApiServer, and run() to call cli.main capturing output."""
+    """Base: a FakeNode behind an ApiServer whose token is in <tmp>/api_token, and run_cli() to call cli.main."""
 
     def setUp(self):
         self.node = FakeNode()
@@ -39,9 +41,11 @@ class CliTestCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = tmp.name
+        self.token_file = os.path.join(self.tmp, "api_token")
+        cli.write_token(self.token_file, self.server.token)
 
     def run_cli(self, *argv, stdin: bytes = b"", port=None, tty=False):
-        """Run cli.main(argv) with --api-port; returns (exit code, stdout bytes, stderr text)."""
+        """Run cli.main(argv) with --api-port and --dir tmp; returns (exit code, stdout bytes, stderr text)."""
         stdout_bytes = io.BytesIO()
         stdout = io.TextIOWrapper(stdout_bytes, encoding="utf-8", write_through=True)
         stdout.isatty = lambda: tty
@@ -51,7 +55,7 @@ class CliTestCase(unittest.TestCase):
         with mock.patch("sys.stdout", stdout), mock.patch("sys.stdin", stdin_stream), \
                 contextlib.redirect_stderr(stderr):
             try:
-                cli.main([*argv, "--api-port", str(port or self.server.port)])
+                cli.main([*argv, "--api-port", str(port or self.server.port), "--dir", self.tmp])
             except SystemExit as e:
                 if isinstance(e.code, str):
                     print(e.code, file=sys.stderr)
@@ -111,6 +115,29 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(cli.default_output(cid), cid)
         self.assertEqual(cli.default_output(f"{cid}/dir/file.txt"), "file.txt")
         self.assertEqual(cli.default_output(f"{cid}/dir/"), "dir")
+        # On Windows a name with "\\" would write outside the current directory, and ":" to a stream
+        with mock.patch.object(fsutil, "IS_WINDOWS", True):
+            for name in ("..\\..\\evil.txt", "a:b", "con"):
+                self.assertEqual(cli.default_output(f"{cid}/{name}"), cid, name)
+            self.assertEqual(cli.default_output(f"{cid}/file.txt"), "file.txt")
+        # Names are the DAG maker's choice: no dotfiles in the current directory, no terminal escapes
+        for name in (".bash_login", ".npmrc", "\x1b]0;title\x07", "a\x1b[2Jb", "..", "a\\b"):
+            self.assertEqual(cli.default_output(f"{cid}/{name}"), cid, repr(name))
+        self.assertEqual(cli.default_output(f"{cid}/dir/rapport été.pdf"), "rapport été.pdf")
+
+    def test_sealed_output_without_job_manager(self):
+        base = tempfile.gettempdir()  # nothing is written: the daemon is a mock
+        output = os.path.join(base, "CID")
+        args = cli.build_parser().parse_args(["get", "CID", "--from", "ab" * 16])
+        args.from_node = "ab" * 16
+        api = mock.Mock()
+        with mock.patch.object(cli, "client", return_value=api):
+            for name, expected in (("report.pdf", "report.pdf"), (".bashrc", "CID"), ("\x1b[31mred", "CID"),
+                                   (None, "CID")):
+                api.get.return_value = {"sealed": True, "name": name}
+                self.assertEqual(cli.sealed_output(args, output), os.path.join(base, expected), name)
+        # --from reaches the info request: without it the daemon would look the root up in the DHT first
+        self.assertEqual(api.get.call_args, mock.call("/api/info", target="CID", **{"from": "ab" * 16}))
 
     def test_printable(self):
         self.assertEqual(cli.printable("ok name"), "ok name")
@@ -119,12 +146,13 @@ class ParsingTest(unittest.TestCase):
     def test_client_commands_do_not_import_rns(self):
         code = ("import sys; from rnfs import cli; cli.build_parser().parse_args(['status']); "
                 "print('RNS' in sys.modules)")
-        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60)
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, timeout=60,
+                                encoding="utf-8", errors="replace")
         self.assertEqual(result.stdout.strip(), "False", result.stderr)
 
     def test_entry_points(self):
         for argv in ([sys.executable, "rnfs.py", "--help"], [sys.executable, "-m", "rnfs", "--help"]):
-            result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=60, encoding="utf-8", errors="replace")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("daemon", result.stdout)
 
@@ -238,7 +266,10 @@ class OtherCommandTest(CliTestCase):
         self.assertEqual(key, self.node.keys["site"])
         key_file = os.path.join(self.tmp, "key")
         self.ok("name", "export", "site", "-o", key_file)
-        self.assertEqual(os.stat(key_file).st_mode & 0o777, 0o600)
+        if POSIX_MODES:
+            self.assertEqual(os.stat(key_file).st_mode & 0o777, 0o600)
+        with open(key_file, "rb") as f:
+            self.assertEqual(f.read(), self.node.keys["site"])  # written in binary, also on Windows
         self.assertEqual(self.run_cli("name", "export", "site", "-o", key_file)[0], 1)  # never overwrites
         self.assertEqual(self.ok("name", "import", "copy", key_file).strip(), name)
         self.assertEqual(self.ok("name", "import", "copy2", stdin=key).strip(), name)
@@ -272,7 +303,82 @@ class OtherCommandTest(CliTestCase):
             original(handler)
         with mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy):
             self.ok("gc")
-        self.assertEqual(seen, [(f"127.0.0.1:{self.server.port}", "1")])
+            self.ok("status")
+        self.assertEqual(seen, [(f"127.0.0.1:{self.server.port}", self.server.token),
+                                (f"127.0.0.1:{self.server.port}", None)])  # status needs no token
+
+
+class TokenTest(CliTestCase):
+
+    @unittest.skipUnless(POSIX_MODES and CAN_SYMLINK, "Unix permissions, symlinks")
+    def test_write_token(self):
+        path = os.path.join(self.tmp, "t")
+        os.symlink(os.path.join(self.tmp, "elsewhere"), path)  # replaced, never written through
+        umask = os.umask(0)  # the file is 0600 whatever the umask
+        try:
+            cli.write_token(path, "first")
+        finally:
+            os.umask(umask)
+        cli.write_token(path, "second")
+        self.assertFalse(os.path.islink(path))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "elsewhere")))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        with open(path, encoding="ascii") as f:
+            self.assertEqual(f.read(), "second\n")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["api_token", "t"])  # no temporary files left
+
+    def test_write_token_replaces(self):
+        path = os.path.join(self.tmp, "t")
+        cli.write_token(path, "first")
+        cli.write_token(path, "second")
+        with open(path, encoding="ascii") as f:
+            self.assertEqual(f.read().strip(), "second")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["api_token", "t"])  # no temporary files left
+
+    def test_token_mode_not_checked_on_windows(self):
+        # Windows' st_mode always shows others allowed, so the check would refuse every token there
+        os.chmod(self.token_file, 0o644)
+        with mock.patch.object(fsutil, "IS_WINDOWS", True):
+            code, _, err = self.run_cli("gc")
+        self.assertEqual(code, 0, err)
+
+    def test_remove_token_only_if_ours(self):
+        cli.remove_token(self.token_file, "another daemon's")
+        self.assertTrue(os.path.exists(self.token_file))
+        cli.remove_token(self.token_file, self.server.token)
+        self.assertFalse(os.path.exists(self.token_file))
+        cli.remove_token(self.token_file, self.server.token)  # already gone: no error
+
+    def test_missing_token(self):
+        os.unlink(self.token_file)
+        code, _, err = self.run_cli("gc")
+        self.assertEqual(code, 1)
+        self.assertIn("no API token", err)
+        self.assertEqual(self.node.called("gc"), [])
+        self.assertEqual(self.run_cli("status")[0], 0)  # health checks still work
+
+    @unittest.skipUnless(POSIX_MODES, "Unix permissions")
+    def test_unreadable_token(self):
+        os.chmod(self.token_file, 0)
+        if os.access(self.token_file, os.R_OK):
+            self.skipTest("running as root")
+        code, _, err = self.run_cli("gc")
+        self.assertEqual(code, 1)
+        self.assertIn("another user", err)
+
+    @unittest.skipUnless(POSIX_MODES, "Unix permissions")
+    def test_token_readable_by_others_is_refused(self):
+        os.chmod(self.token_file, 0o644)
+        code, _, err = self.run_cli("gc")
+        self.assertEqual(code, 1)
+        self.assertIn("accessible to other users", err)
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_stale_token_is_refused_by_the_daemon(self):
+        cli.write_token(self.token_file, "an old daemon's token")
+        code, _, err = self.run_cli("gc")
+        self.assertEqual(code, 1)
+        self.assertIn("X-Rnfs-Api", err)
 
 
 if __name__ == "__main__":
