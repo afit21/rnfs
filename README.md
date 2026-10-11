@@ -1,47 +1,211 @@
 # RNFS - Reticulum Network File System
 
-rnfs is content-addressed file sharing over [Reticulum](https://reticulum.network) (RNS). It brings the
-useful parts of IPFS (content IDs, chunked files and directories, a provider DHT, verified downloads from
-several sources, pinning, mutable names and a local web gateway) to Reticulum networks. It works over slow,
-shared links such as LoRa as well as over TCP and the Internet.
+Share files over [Reticulum](https://reticulum.network) networks: LoRa radio, Wi-Fi, local networks or the
+Internet. Add a file and rnfs gives you a short code for it, a **CID**. Anyone on the network can download
+the file with that code, from any node that has it, and rnfs checks that every byte is exactly what you
+shared.
 
-You add a file and get a **CID**, a short ID made from the file's hash. Anyone on the network can fetch the
-file by its CID from whichever nodes hold it, and every block is checked against the CID. Nobody can swap
-in different content.
+## Quick start
 
-[specification.md](specification.md) describes the protocol and [design.md](design.md) the code.
+**1. Install.** Download the file for your system from the
+[latest release](https://github.com/afit21/rnfs/releases/latest):
 
-> **What you share is public.** Anyone who knows a CID can fetch it from your node once you provide it, and
-> the nodes you ask learn which CIDs are looked up (though not by whom). Don't add anything private as a plain
-> file. To share privately:
-> - seal the file for chosen people (`rnfs add file --to <their node ID>`, see
->   [Example use cases](#private-group)); or
-> - run a closed group in private mode (`private = true` with a `members` list, see [Settings](#privacy)).
->
-> Downloads are re-shared by default (`provide_strategy = "roots"`): once a download is complete, your node
-> offers it to others for as long as it stays in your cache (up to `max_storage`). This helps content spread,
-> but means other nodes can see what you have downloaded. Set `provide_strategy = "pinned"` to share only what
-> you add or pin. Content fetched through the gateway is never re-shared.
+- **Windows:** [`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe), saved as `rnfs.exe`
+  somewhere on your PATH ([how](#windows)).
+- **Debian, Ubuntu, Raspberry Pi OS (64-bit):** the `.deb`, then
+  `sudo apt install ./rnfs_0.1.0_amd64.deb` (or `_arm64`) ([details](#debian-and-ubuntu)).
+- **macOS:** `pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl` ([details](#macos)).
+- **Other Linux:** the [Flatpak](#other-linux-flatpak), or the [install script](#install-script).
+
+**2. Start rnfs** and leave it running in its own terminal:
+
+```sh
+rnfs daemon
+```
+
+**3. Connect to other nodes.** Computers on the same local network or Wi-Fi find each other automatically.
+To reach nodes further away, see [Connect to a network](#2-connect-to-a-network).
+
+**4. Download a file**, for example one of the [sample files](#sample-files):
+
+```sh
+rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o manifesto.pdf
+```
+
+Or open it in your browser:
+<http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=manifesto.pdf>
+
+**5. Share your own file:**
+
+```sh
+rnfs add holiday.jpg        # prints its CID: give that to anyone who should have the file
+```
+
+That's all you need for the basics. [Getting started](#getting-started) goes a step further (folders,
+links that can change, sharing in the background), and [Commands](#commands) lists everything.
+
+> **Good to know**
+> - **What you share is public.** Anyone with a CID can download it from your node. To share privately,
+>   [seal the file](#private-group) for chosen people (`rnfs add file --to <their node ID>`) or use
+>   [private mode](#privacy).
+> - **Your downloads are shared too,** while they stay in your cache, which helps files spread. To share
+>   only what you add yourself, set `provide_strategy = "pinned"` ([Settings](#settings)).
+> - **To stop sharing a file:** `rnfs pin rm <cid>`. Anything you put in `~/.rnfs/files/` is shared
+>   automatically.
 
 **Contents:** [Install](#install) · [Sample files](#sample-files) · [Getting started](#getting-started) ·
 [How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
 [Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
-[Tests](#tests) · [Known limitations](#known-limitations)
+[Tests](#tests) · [Known limitations](#known-limitations) ·
+[specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
 
 ## Install
 
-rnfs runs on Linux, macOS and Windows. Each install method below gives you one `rnfs` command and keeps
-your data in the same places. Prebuilt packages come from
-[GitHub Releases](https://github.com/afit21/rnfs/releases): the `.deb`, the Flatpak, the Windows `.exe` and
-the wheel. Each release has a `SHA256SUMS` file; check your download with
-`sha256sum -c SHA256SUMS --ignore-missing`. In the commands below, replace `X.Y.Z` with the release version.
+rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file from the
+[latest release](https://github.com/afit21/rnfs/releases/latest):
 
-> *Placeholder: no release has been published yet. Until the first one (0.1.0) is, use the install script
-> (Linux), pipx (any OS) or a source checkout.*
+| System | Download | Install |
+|---|---|---|
+| Windows (64-bit) | [`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe) | [Windows](#windows) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.0_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs_0.1.0_amd64.deb) or [`rnfs_0.1.0_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs_0.1.0_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
+| Other Linux (x86_64) | [`rnfs-0.1.0-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.0-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl) | [macOS](#macos) |
 
-### Linux
+Every package includes Reticulum and LXMF, gives you one `rnfs` command, and keeps your data in the same
+places. The release also has the source archive (`rnfs-0.1.0.tar.gz`) and `SHA256SUMS`, to
+[check your download](#checking-a-download). These links are for 0.1.0; for a newer version, take the
+same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
 
-**Install script (recommended, any distribution).** You need Python 3.11 or newer with venv:
+### Windows
+
+Download [`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe). It is a single file that
+includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
+folder, put it on your PATH as `rnfs`:
+
+```powershell
+$bin = "$env:USERPROFILE\.local\bin"
+New-Item -ItemType Directory -Force $bin | Out-Null
+Move-Item .\rnfs-0.1.0-windows-x64.exe "$bin\rnfs.exe" -Force
+Unblock-File "$bin\rnfs.exe"
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
+# open a new terminal, then:
+rnfs daemon
+```
+
+- **SmartScreen:** the exe isn't code-signed, so Windows may warn you the first time. Choose
+  "More info", then "Run anyway".
+- **Update:** stop the daemon and replace `rnfs.exe` with the newer release's exe.
+- **Uninstall:** delete `rnfs.exe`. Your data in `%USERPROFILE%\.rnfs` stays.
+- **Start at logon:** the Task Scheduler script
+  [contrib/install-windows-task.ps1](contrib/install-windows-task.ps1) runs the daemon at logon. It
+  expects `rnfs.exe` in `%USERPROFILE%\.local\bin`, as above, and logs to
+  `%USERPROFILE%\.rnfs\daemon.log`. Add `-Uninstall` to remove the task:
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File install-windows-task.ps1
+  ```
+
+Windows Firewall may ask about network access the first time Reticulum opens an interface. rnfs's own API
+and gateway listen only on 127.0.0.1. Windows has no execute bit, so a directory containing executable
+scripts gets a different CID when added on Windows than on Linux or macOS. Windows support is newer than
+Linux and macOS support, so please report problems.
+
+### Debian and Ubuntu
+
+For Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) and other Debian-based systems with Python 3.11
+or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [install script](#install-script)
+there instead. Pick `amd64` or `arm64` to match `dpkg --print-architecture`:
+
+```sh
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs_0.1.0_amd64.deb
+sudo apt install ./rnfs_0.1.0_amd64.deb
+rnfs daemon                             # or run it in the background:
+systemctl --user enable --now rnfs      # a systemd user service; logs: journalctl --user -u rnfs -f
+```
+
+The package bundles Reticulum and LXMF (the tested versions, pinned in `packaging/requirements.lock`) in
+`/opt/rnfs`, and installs the `/usr/bin/rnfs` command and a systemd user unit. To keep the service running
+while you're logged out: `loginctl enable-linger $USER`.
+
+- **Update:** install the newer release's `.deb` the same way, then `systemctl --user restart rnfs`.
+- **Uninstall:** `systemctl --user disable --now rnfs`, then `sudo apt remove rnfs`. Your data in
+  `~/.rnfs` stays.
+
+### Other Linux (Flatpak)
+
+For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flathub
+`org.freedesktop.Platform` runtime:
+
+```sh
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-x86_64.flatpak
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user rnfs-0.1.0-x86_64.flatpak
+flatpak run io.github.afit21.rnfs daemon
+alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
+```
+
+The app has these permissions:
+
+- network access;
+- your home folder, for the files you add or get, plus `~/.rnfs` and `~/.reticulum`;
+- all devices, for RNode and other serial interfaces. If you don't use serial interfaces, remove this
+  with `flatpak override --user --nodevice=all io.github.afit21.rnfs`.
+
+To reach files outside your home folder, run
+`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`.
+
+- **Update:** install the newer release's `.flatpak` the same way.
+- **Uninstall:** `flatpak uninstall --user io.github.afit21.rnfs`.
+
+On other architectures (e.g. a 32-bit Raspberry Pi), use the [install script](#install-script).
+
+### macOS
+
+Install the wheel from the release with [pipx](https://pipx.pypa.io), which gives rnfs its own environment
+and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python:
+
+```sh
+brew install pipx
+pipx ensurepath                 # then open a new terminal
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl     # includes Reticulum and LXMF
+rnfs daemon
+```
+
+The same command works on any system with Python 3.11+, including Linux and Windows.
+
+- **Update:** `pipx install --force <the newer release's .whl URL>`.
+- **Uninstall:** `pipx uninstall rnfs`. Your data in `~/.rnfs` stays.
+- **Start at login:** install the launchd agent. It runs `~/.local/bin/rnfs daemon` and logs to
+  `~/.rnfs/daemon.log`:
+  ```sh
+  curl -fsSL -o ~/Library/LaunchAgents/io.github.afit21.rnfs.plist \
+    https://raw.githubusercontent.com/afit21/rnfs/main/contrib/io.github.afit21.rnfs.plist
+  launchctl load -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist
+  ```
+  To remove it: `launchctl unload -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist`.
+
+pipx installs Reticulum and LXMF at the newest versions rnfs allows, not the exact tested versions the
+other packages bundle.
+
+### Checking a download
+
+Each release's `SHA256SUMS` lists the checksum of every file. Download it next to your file, then:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing          # Linux
+shasum -a 256 rnfs-0.1.0-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
+```
+
+```powershell
+Get-FileHash .\rnfs-0.1.0-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
+```
+
+### Other ways to install
+
+These install the latest code from the main branch, which may be newer than the latest release.
+
+#### Install script
+
+Installs from the main branch (newer than the latest release) on any Linux distribution. You need Python 3.11 or newer with venv:
 
 - Debian/Ubuntu: `sudo apt install python3 python3-venv`
 - Fedora: `sudo dnf install python3`
@@ -78,122 +242,16 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   `.whl` or other pip requirement has no lock file, so its dependencies are installed unpinned (newest),
   with a warning.
 
-**Debian and Ubuntu (.deb, from Releases).** For Debian 12+, Ubuntu 24.04+ and other Debian-based
-systems with Python 3.11+. Ubuntu 22.04 ships Python 3.10, so it isn't supported. Pick `amd64` or `arm64`
-to match `dpkg --print-architecture`:
+#### pipx from GitHub
 
 ```sh
-sudo apt install ./rnfs_X.Y.Z_amd64.deb
-systemctl --user enable --now rnfs      # optional: run the daemon as a user service
+pipx install git+https://github.com/afit21/rnfs                                  # Linux, macOS
+pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip          # Windows (no git needed)
 ```
 
-The package bundles Reticulum and LXMF (the versions pinned in `packaging/requirements.lock`) in
-`/opt/rnfs` and installs `/usr/bin/rnfs` and a systemd user unit.
-To update, install the newer `.deb` the same way, then run `systemctl --user restart rnfs`. To uninstall,
-run `systemctl --user disable --now rnfs`, then `sudo apt remove rnfs`.
+Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too.
 
-**Flatpak (x86_64, from Releases).** The Flatpak uses the Flathub `org.freedesktop.Platform` runtime:
-
-```sh
-flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-X.Y.Z-x86_64.flatpak
-flatpak run io.github.afit21.rnfs daemon
-alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
-```
-
-The app has these permissions:
-
-- network access;
-- your home folder, for the files you add or get, plus `~/.rnfs` and `~/.reticulum`;
-- all devices, for RNode and other serial interfaces. If you don't use serial interfaces, remove this
-  with `flatpak override --user --nodevice=all io.github.afit21.rnfs`.
-
-To reach files outside your home folder, run
-`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`. To uninstall:
-`flatpak uninstall --user io.github.afit21.rnfs`.
-
-**pipx or pip.** See [pipx (any OS)](#pipx-any-os).
-
-### macOS
-
-Install with [pipx](https://pipx.pypa.io). Homebrew also installs a recent Python:
-
-```sh
-brew install pipx
-pipx ensurepath                 # then open a new terminal
-pipx install git+https://github.com/afit21/rnfs     # includes Reticulum and LXMF
-rnfs daemon
-```
-
-To start the daemon at login, install the launchd agent. It runs `~/.local/bin/rnfs daemon` and logs to
-`~/.rnfs/daemon.log`:
-
-```sh
-curl -fsSL -o ~/Library/LaunchAgents/io.github.afit21.rnfs.plist \
-  https://raw.githubusercontent.com/afit21/rnfs/main/contrib/io.github.afit21.rnfs.plist
-launchctl load -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist
-```
-
-To remove it: `launchctl unload -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist`.
-
-### Windows
-
-Windows support is new and is tested by CI rather than daily use, so please report problems.
-
-**Single-file exe (from Releases).** Download `rnfs-X.Y.Z-windows-x64.exe`. It includes Python,
-Reticulum and LXMF. In PowerShell, from your download folder:
-
-```powershell
-$bin = "$env:USERPROFILE\.local\bin"
-New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-X.Y.Z-windows-x64.exe "$bin\rnfs.exe" -Force
-Unblock-File "$bin\rnfs.exe"
-[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
-# open a new terminal, then:
-rnfs daemon
-```
-
-The exe isn't code-signed, so SmartScreen may warn you the first time ("More info" → "Run anyway"). It
-starts a second or two slower than a pip install. To update, stop the daemon and replace `rnfs.exe`.
-
-**pipx.** Install Python 3.11+ from [python.org](https://www.python.org/downloads/windows/) (tick
-"Add python.exe to PATH"), or run `winget install Python.Python.3.12`. Then:
-
-```powershell
-py -m pip install --user pipx
-py -m pipx ensurepath           # then open a new terminal
-pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip
-rnfs daemon
-```
-
-**Start at logon.** The Task Scheduler script
-[contrib/install-windows-task.ps1](contrib/install-windows-task.ps1) runs the daemon at logon. It expects
-`rnfs.exe` in `%USERPROFILE%\.local\bin`, which is where both methods above put it, and logs to
-`%USERPROFILE%\.rnfs\daemon.log`. Add `-Uninstall` to remove the task:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File contrib\install-windows-task.ps1
-```
-
-Windows Firewall may ask about network access the first time Reticulum opens an interface. rnfs's own API
-and gateway listen only on 127.0.0.1. Windows has no execute bit, so a directory containing executable
-scripts gets a different CID when added on Windows than on Linux or macOS.
-
-### pipx (any OS)
-
-```sh
-pipx install git+https://github.com/afit21/rnfs        # latest main branch
-pipx install rnfs-X.Y.Z-py3-none-any.whl                # or a wheel from Releases
-```
-
-Both include Reticulum and LXMF (`rns` and `lxmf` are regular dependencies), at the newest versions
-`pyproject.toml` allows. For the tested, hash-checked versions use the install script, or in a source
-checkout's venv run `pip install --require-hashes -r packaging/requirements.lock` before installing rnfs. To
-update:
-`pipx upgrade rnfs`, or `pipx install --force <source>`. To uninstall: `pipx uninstall rnfs`. Plain
-`pip install git+https://github.com/afit21/rnfs` works too.
-
-### From source
+#### From source
 
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
