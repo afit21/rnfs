@@ -802,3 +802,28 @@ class BodyReaderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EarlyResponseTest(ApiTestCase):
+    """A response sent before the request body is read still reaches the client (no connection reset)."""
+
+    def test_refusal_before_reading_the_body_is_received(self):
+        # Without the token the request is refused before its body is read. Closing the socket with that body
+        # unread would make the kernel send a reset, and the client (on Windows always) would lose the 403
+        body = b"x" * 128 * 1024
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        self.addCleanup(sock.close)
+        sock.sendall(f"POST /api/add/stream HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+                     f"Content-Length: {len(body)}\r\n\r\n".encode() + body[:16384])
+        time.sleep(0.3)  # the server answers and closes its side meanwhile
+        try:
+            sock.sendall(body[16384:])  # the rest of the body arrives after the response was sent
+        except OSError:
+            pass  # a reset here already means the response may be lost; the read below decides
+        response = b""
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            response += data
+        self.assertTrue(response.startswith(b"HTTP/1.0 403") or response.startswith(b"HTTP/1.1 403"), response[:80])

@@ -12,6 +12,7 @@ from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content.storage import FOLDER, USER, Storage, check_source, name_source, remote_source
 from rnfs.errors import NotFound, StorageFull
+from tests.support import POSIX_MODES
 
 IDENTITY = "0123456789abcdef0123456789abcdef"
 
@@ -135,6 +136,7 @@ class PinTest(StorageTest):
         os.makedirs(os.path.join(state, "pins.json.damaged", "in-the-way"))  # and it can't be moved aside
         self.assertEqual(self.open().pins(), {})
 
+    @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX permission bits")
     def test_state_dir_is_private(self):
         self.assertEqual(os.stat(os.path.join(self.tmp.name, "state")).st_mode & 0o777, 0o700)
 

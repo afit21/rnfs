@@ -323,8 +323,11 @@ class PathTest(unittest.TestCase):
         os.symlink("real", os.path.join(self.root, "link"))
         os.symlink(self.tmp.name, os.path.join(self.root, "dirlink"))
         os.mkfifo(os.path.join(self.root, "fifo"))
-        with open(os.path.join(os.fsencode(self.root), b"bad\xff"), "wb") as f:
-            f.write(b"x")
+        try:
+            with open(os.path.join(os.fsencode(self.root), b"bad\xff"), "wb") as f:
+                f.write(b"x")
+        except OSError:
+            pass  # macOS (APFS) refuses names that aren't UTF-8 itself, so there is nothing to skip
         blocks = Blocks()
         built, warnings = builder.add_path(self.root, blocks.put)
         self.assertEqual([e.name for e in dag.decode(blocks[built.cid]).entries], ["real"])

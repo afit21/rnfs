@@ -319,10 +319,14 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     """A ThreadingHTTPServer that serves at most max_connections at once and refuses the rest with a 503."""
 
     daemon_threads = True  # long fetches mustn't keep the process alive on shutdown
+    LINGER_SECONDS = 1.0  # longest a closing connection is drained (see shutdown_request)
+    LINGER_BYTES = 256 * 1024  # most a closing connection drains before closing anyway
+    MAX_CLOSERS = 16  # refused connections closed gently at once
 
     def __init__(self, address, handler_class, max_connections: int):
         """Bind to address; handler_class.busy_response() is sent to connections over max_connections."""
         self.slots = threading.BoundedSemaphore(max_connections)
+        self.closers = threading.BoundedSemaphore(self.MAX_CLOSERS)
         super().__init__(address, handler_class)
 
     def server_bind(self):
@@ -346,25 +350,72 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             raise
 
     def process_request_thread(self, request, client_address):
-        """Serve the connection, then free its slot."""
+        """Serve the connection, free its slot, then close it (gently, if a closer slot is free)."""
         try:
-            super().process_request_thread(request, client_address)
+            self.finish_request(request, client_address)
+        except Exception:  # noqa: BLE001 - as socketserver does: report, then close the connection
+            self.handle_error(request, client_address)
         finally:
+            # Freed before the lingering close, so a client slow to close doesn't hold a connection slot
             self.slots.release()
+            if self.closers.acquire(blocking=False):
+                try:
+                    self.shutdown_request(request)
+                finally:
+                    self.closers.release()
+            else:
+                self.close_request(request)
 
     def refuse(self, request):
-        """Send the 503 and close, without blocking: this runs on the thread that accepts connections."""
+        """Send the 503 and close, without blocking: this runs on the thread that accepts connections.
+
+        The lingering close (see shutdown_request) runs on a short-lived thread, at most MAX_CLOSERS at once;
+        beyond that the connection is closed at once, and the client may see a reset instead of the 503.
+        """
         try:
             request.setblocking(False)
-            try:
-                # Read what has arrived: closing with unread input sends a reset, which can lose the 503
-                request.recv(65536)
-            except OSError:
-                pass
             request.sendall(self.RequestHandlerClass.busy_response())
         except OSError:
             pass  # the client has gone, or isn't reading; it is closed either way
-        self.shutdown_request(request)
+        if self.closers.acquire(blocking=False):
+            def close():
+                """Close request gently, then free the closer slot."""
+                try:
+                    self.shutdown_request(request)
+                finally:
+                    self.closers.release()
+            threading.Thread(target=close, name="rnfs-http-close", daemon=True).start()
+        else:
+            self.close_request(request)
+
+    def shutdown_request(self, request):
+        """Close a connection without losing the response: stop sending, drain what the client still sends,
+        then close.
+
+        Closing a socket with unread input makes the kernel send a reset, and on Windows a reset makes the
+        client discard a response it hasn't read yet (e.g. a 403 sent before reading the request body).
+        Draining is bounded by LINGER_BYTES and LINGER_SECONDS.
+        """
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            request.setblocking(True)
+            deadline = time.monotonic() + self.LINGER_SECONDS
+            drained = 0
+            while drained < self.LINGER_BYTES:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                request.settimeout(left)
+                data = request.recv(65536)
+                if not data:
+                    break  # the client closed its side: nothing unread is left
+                drained += len(data)
+        except OSError:
+            pass
+        self.close_request(request)
 
 
 class LocalServer:

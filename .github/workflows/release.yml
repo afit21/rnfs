@@ -209,9 +209,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
-        run: >
-          gh release create "$GITHUB_REF_NAME" artifacts/*
-          --repo "$GITHUB_REPOSITORY"
-          --title "rnfs $VERSION"
-          --generate-notes
-          --verify-tag
+        # A release already made for this tag on GitHub's release page gets the files attached (replacing any
+        # with the same names) rather than failing; otherwise the release is created here
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "rnfs $VERSION" \
+              --generate-notes \
+              --verify-tag
+          fi

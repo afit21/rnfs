@@ -21,6 +21,7 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.features import jobs
 from rnfs.node import RnfsNode
+from tests.support import real
 
 try:
     from tests.test_node import A_ID, B_ID, NetClient
@@ -561,7 +562,7 @@ class CliTest(ApiBase):
         with contextlib.chdir(self.tmp.name):
             with mock.patch.object(self.b, "get", JobsTest.sealed_get(self, "\x1b[31mevil")):
                 code, out, err = self.run_cli("get", cid)
-            self.assertEqual((code, out.strip()), (0, os.path.join(os.path.realpath(self.tmp.name), cid)), err)
+            self.assertEqual((code, real(out.strip())), (0, real(os.path.join(self.tmp.name, cid))), err)
             os.remove(cid)
             with mock.patch.object(self.b, "get", JobsTest.sealed_get(self, "report.pdf")):
                 code, out, err = self.run_cli("get", cid)

@@ -13,7 +13,7 @@ from unittest import mock
 from rnfs import cli, fsutil
 from rnfs.api import ApiServer
 from rnfs.content.cid import RAW, Cid
-from tests.support import CAN_SYMLINK, POSIX_MODES
+from tests.support import CAN_SYMLINK, POSIX_MODES, real
 
 try:
     from tests.test_api import FakeNode
@@ -47,7 +47,8 @@ class CliTestCase(unittest.TestCase):
     def run_cli(self, *argv, stdin: bytes = b"", port=None, tty=False):
         """Run cli.main(argv) with --api-port and --dir tmp; returns (exit code, stdout bytes, stderr text)."""
         stdout_bytes = io.BytesIO()
-        stdout = io.TextIOWrapper(stdout_bytes, encoding="utf-8", write_through=True)
+        # newline="\n": compare output the same way on every OS (Windows would write \r\n)
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="utf-8", newline="\n", write_through=True)
         stdout.isatty = lambda: tty
         stdin_stream = io.TextIOWrapper(io.BytesIO(stdin), encoding="utf-8")
         stderr = io.StringIO()
@@ -164,7 +165,8 @@ class ContentCommandTest(CliTestCase):
         cid = str(Cid.for_block(RAW, b"hello"))
         with contextlib.chdir(self.tmp):
             self.assertEqual(self.ok("add", "f.txt"), cid + "\n")
-        self.assertEqual(self.node.called("add_path")[0], ((path,), {"wrap": False, "only_hash": False}))
+        (added,), options = self.node.called("add_path")[0]
+        self.assertEqual((real(added), options), (real(path), {"wrap": False, "only_hash": False}))
         code, out, err = self.run_cli("add", path, "--wrap", "--only-hash")
         self.assertEqual(code, 0)
         self.assertIn("warning: skipped a symlink", err)
@@ -192,8 +194,9 @@ class ContentCommandTest(CliTestCase):
         with open(os.path.join(self.tmp, "file.txt"), "rb") as f:
             self.assertEqual(f.read(), b"content")
         self.assertTrue(os.path.isfile(os.path.join(self.tmp, directory, "file.txt")))
-        self.assertEqual(self.node.called("get")[1], ((directory, os.path.join(os.path.realpath(self.tmp), directory)),
-                                                      {"from_node": bytes.fromhex("ab" * 16)}))
+        (target, output), options = self.node.called("get")[1]
+        self.assertEqual((target, real(output), options),
+                         (directory, real(os.path.join(self.tmp, directory)), {"from_node": bytes.fromhex("ab" * 16)}))
         self.assertEqual(code, 1)
         self.assertIn("already exists", err)
         out = os.path.join(self.tmp, "chosen")
@@ -283,8 +286,8 @@ class OtherCommandTest(CliTestCase):
         cid = self.node.put_file(b"abc")
         with contextlib.chdir(self.tmp):
             self.assertIn("exported 1 blocks", self.ok("export", cid, "-o", "a.rnfs"))
-            self.assertEqual(self.node.called("export")[0][0], (cid, os.path.join(os.path.realpath(self.tmp),
-                                                                                  "a.rnfs")))
+            exported, output = self.node.called("export")[0][0]
+            self.assertEqual((exported, real(output)), (cid, real(os.path.join(self.tmp, "a.rnfs"))))
             self.assertEqual(len(self.ok("import", "a.rnfs").split()), 1)
         self.assertEqual(self.run_cli("import", os.path.join(self.tmp, "missing"))[0], 1)
 

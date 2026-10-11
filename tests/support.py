@@ -20,3 +20,12 @@ def _can_symlink() -> bool:
 
 
 CAN_SYMLINK = _can_symlink()
+
+
+def real(path: str) -> str:
+    """path in one canonical form, for comparing paths the CLI resolved with paths a test built.
+
+    macOS reaches the temp directory through a symlink (/var is /private/var), and Windows may name it by its
+    8.3 short name (RUNNER~1), so the same directory can be spelled differently by the CLI and the test.
+    """
+    return os.path.normcase(os.path.realpath(path))
