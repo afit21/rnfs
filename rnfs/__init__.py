@@ -11,4 +11,4 @@ api.py       local HTTP API; gateway.py the HTTP gateway
 cli.py       command line: run a daemon, or talk to one through its API
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

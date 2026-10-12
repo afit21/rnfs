@@ -2,7 +2,101 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## 0.1.0 (unreleased)
+## 0.1.1
+
+Fixes from the third audit.
+
+### Security fixes
+
+Changed behaviour:
+- Settings are type- and range-checked: `private = "no"` or `gateway_scripts = "false"` are errors (they
+  used to mean on), as are counts given as strings, negative counts and out-of-range ports. Invalid settings
+  stop the daemon and client commands with a message, not a traceback.
+- The daemon refuses to start if its rnfs dir belongs to another user or can't be made 0700 (a warning
+  before), and if a state file can't be read (permissions, I/O errors) instead of setting it aside and
+  starting without it. Unparsable or wrongly shaped state files are still set aside, as `.damaged`,
+  `.damaged.1`, … so earlier copies are kept.
+- The CLI makes the daemon prove it knows the API token (`X-Rnfs-Challenge` / `X-Rnfs-Proof`) before sending
+  it, so a program listening on the API port while the daemon is down gets neither the token nor an imported
+  name key. Restart a running daemon after upgrading.
+
+Network and names:
+- On slow links, single-provider downloads no longer fail because of the responder's upload pacing: the
+  requester waits as long again as a `/blocks` took before asking again, and a refusal soon after a served
+  response isn't counted as a failure. The responder's pacing wait no longer depends on the link's RTT
+  (which the requester can inflate) and ends when the link closes or the response is displaced.
+- In private mode, outsiders' incoming links are evicted before members'. Outgoing links check that the
+  destination hash is the node ID asked for.
+- A key full of publishers evicts a random non-senior one instead of refusing newcomers, so early identities
+  can't lock later providers out. A node's own records aren't limited per publisher, and keys of partly
+  recorded `/provide` batches are withdrawn later. Withdrawals also go to earlier rounds' nodes; a stopped
+  publish round no longer marks unsent CIDs as published; withdrawals queued during lookups go in the same
+  round.
+- The first publish of an imported key, or of one found without state, asks the keepers for the highest
+  sequence. A keeper's record below the sequence the node knows isn't kept. Restarting after deleting a name
+  key file works.
+- A source's remote pins are fetched one at a time (at most 64 waiting or in progress), so they can't exceed its quota.
+- Wall-clock times in the future (e.g. after a clock that ran ahead is corrected) are clamped.
+- Cancelled or failed fetches close the links of their in-flight `/blocks`.
+
+Storage:
+- Archive import verifies every block, including ones already stored (junk could pin a cached download), and
+  keeps the disk reserve free.
+- Blocks and state files are fsynced, and block names are synced before pins and cache records are saved.
+- A stored DAG node that no longer matches its CID stops collection below it (nothing is deleted until
+  `rnfs verify` removes it), and a damaged stored block is fetched again instead of marking the root invalid.
+- `get` skips and reports names the destination filesystem refuses (FAT, eCryptfs) instead of failing.
+  Export holds much less memory per block. Default output names never start with `-`; output renames never
+  replace a file created meanwhile.
+
+LXMF and features:
+- Auto-fetches still queued when the node stops are queued again at the next start; removing the message or
+  stopping the node cancels an auto-fetch in progress.
+- With `lxmf_accept_from` set, messages from unknown senders outside it and `lxmf_auto_fetch_from` aren't
+  held. Messages arriving while held ones are retried count against the limit.
+- Links read from message text: a link on a line of its own is read whole (a last name ending in `.` was
+  cut), links past the 4000 characters kept are found, and query values may contain `=`.
+- `inbox get` checks every output before starting any, and reports later failures per link.
+- Follow keeps checking a name after an unexpected error. Inbox, outbox and provider records are saved under
+  a lock, so an older snapshot can't be written last.
+
+Local API and gateway:
+- Every field the CLI and feature commands print is escaped.
+- The gateway ignores malformed `Range` headers, puts no error details in 500 bodies, doesn't log aborted
+  archive downloads as errors, and watches for disconnects with `poll` (fds over 1024). Both servers refuse
+  HTTP/0.9 with the usual headers; chunked request bodies need plain hex sizes and at most 32 trailer lines.
+- The node identity file is created without racing a second instance.
+
+### Packaging and CI hardening
+
+- The build backend is locked: `packaging/build-backend.lock` pins setuptools with hashes, and `install.sh`,
+  `build-deb.sh` and the workflows build rnfs with it without pip's build isolation (which fetched the
+  newest setuptools from PyPI, as root with `install.sh --system`). `pyproject.toml` bounds setuptools
+  (`<85`), and the sdist includes the backend lock.
+- The release toolchain is locked: `packaging/build-tools.lock` (build, twine, PyInstaller, setuptools and
+  their dependencies, for Linux and Windows) is installed with `--require-hashes`; `update-lock.py --build`
+  regenerates both build locks. The tests install the hash-locked dependencies too (they used `pip install .`).
+- `install.sh` installs dependencies as wheels only (`RNFS_ALLOW_SOURCE_BUILDS=1` builds them from their
+  hash-checked source where PyPI has no wheel, e.g. cffi on 32-bit ARM), runs `pip check`, uses umask 022
+  and no pip cache in system mode, never replaces or removes a systemd unit it didn't write (`--force`
+  replaces one), tells system-mode users to restart running daemons after an update, and on a system-mode
+  uninstall removes users' `default.target.wants` links to the unit.
+- `build-deb.sh` fails instead of silently leaving out a Python version's cffi backend (a .deb without it
+  can't import Reticulum's crypto), checks every bundled backend is present, limits `Depends` to the
+  bundled Pythons (`python3 (<< 3.15)`), and writes `DEBIAN/md5sums` and a DEP-5 copyright file.
+- The systemd units get `NoNewPrivileges`, `RestrictAddressFamilies` (Unix, IP and netlink sockets),
+  `LockPersonality`, `RestrictRealtime` and `RestrictSUIDSGID`, and stop retrying after 5 failed starts in
+  10 minutes; the launchd agent doesn't restart when `rnfs` is missing.
+- Windows task script: stopping or uninstalling now also ends the daemon (not just the hidden PowerShell),
+  a crashed daemon is restarted (Task Scheduler's restart settings never did that), the log is written as
+  UTF-8 bytes rather than UTF-16 with wrapped stderr, and paths with `[` `]` work. New `-Stop` switch.
+- Release workflow: a manual run never publishes, even on a tag; files already attached to a release are
+  never replaced (no `--clobber`); every file gets a signed build provenance attestation
+  (`gh attestation verify`). Checkouts don't keep the token (`persist-credentials: false`).
+- README: the Python badge says 3.11+; the Windows PATH snippet adds the folder once and keeps the PATH
+  value's registry type.
+
+## 0.1.0
 
 First release.
 
@@ -141,103 +235,13 @@ Packaging:
 - New hash-locked `packaging/requirements.lock` (regenerated by `packaging/update-lock.py`), used with
   `pip --require-hashes` by `install.sh`, the `.deb` build, the Windows exe and the tests; the Flatpak's
   wheels are generated from it, and release packages bundle rns 1.5.6. It covers the runtime dependencies
-  only: the build backend and the release tools were locked later (see "Packaging and CI hardening").
+  only: the build backend and the release tools were locked later (in 0.1.1).
 - `install.sh` runs Python with `-I` from `/` (a planted `venv.py` or `pip/` in the current directory was
   imported, as root with `--system`), installs the locked versions, no longer upgrades pip from PyPI, and
   quotes the systemd unit's `ExecStart` (homes with spaces or `%` work). `contrib/rnfs.service` is quoted too,
   and the Windows task script handles apostrophes in paths.
 - CI: read-only token permissions for tests, actions pinned to commit SHAs, the Flatpak container pinned by
   digest, and workflow values passed to scripts only through `env:`.
-
-### Security hardening (third audit)
-
-Changed behaviour:
-- Settings are type- and range-checked: `private = "no"` or `gateway_scripts = "false"` are errors (they
-  used to mean on), as are counts given as strings, negative counts and out-of-range ports. Invalid settings
-  stop the daemon and client commands with a message, not a traceback.
-- The daemon refuses to start if its rnfs dir belongs to another user or can't be made 0700 (a warning
-  before), and if a state file can't be read (permissions, I/O errors) instead of setting it aside and
-  starting without it. Unparsable or wrongly shaped state files are still set aside, as `.damaged`,
-  `.damaged.1`, … so earlier copies are kept.
-- The CLI makes the daemon prove it knows the API token (`X-Rnfs-Challenge` / `X-Rnfs-Proof`) before sending
-  it, so a program listening on the API port while the daemon is down gets neither the token nor an imported
-  name key. Restart a running daemon after upgrading.
-
-Network and names:
-- On slow links, single-provider downloads no longer fail because of the responder's upload pacing: the
-  requester waits as long again as a `/blocks` took before asking again, and a refusal soon after a served
-  response isn't counted as a failure. The responder's pacing wait no longer depends on the link's RTT
-  (which the requester can inflate) and ends when the link closes or the response is displaced.
-- In private mode, outsiders' incoming links are evicted before members'. Outgoing links check that the
-  destination hash is the node ID asked for.
-- A key full of publishers evicts a random non-senior one instead of refusing newcomers, so early identities
-  can't lock later providers out. A node's own records aren't limited per publisher, and keys of partly
-  recorded `/provide` batches are withdrawn later. Withdrawals also go to earlier rounds' nodes; a stopped
-  publish round no longer marks unsent CIDs as published; withdrawals queued during lookups go in the same
-  round.
-- The first publish of an imported key, or of one found without state, asks the keepers for the highest
-  sequence. A keeper's record below the sequence the node knows isn't kept. Restarting after deleting a name
-  key file works.
-- A source's remote pins are fetched one at a time (at most 64 waiting or in progress), so they can't exceed its quota.
-- Wall-clock times in the future (e.g. after a clock that ran ahead is corrected) are clamped.
-- Cancelled or failed fetches close the links of their in-flight `/blocks`.
-
-Storage:
-- Archive import verifies every block, including ones already stored (junk could pin a cached download), and
-  keeps the disk reserve free.
-- Blocks and state files are fsynced, and block names are synced before pins and cache records are saved.
-- A stored DAG node that no longer matches its CID stops collection below it (nothing is deleted until
-  `rnfs verify` removes it), and a damaged stored block is fetched again instead of marking the root invalid.
-- `get` skips and reports names the destination filesystem refuses (FAT, eCryptfs) instead of failing.
-  Export holds much less memory per block. Default output names never start with `-`; output renames never
-  replace a file created meanwhile.
-
-LXMF and features:
-- Auto-fetches still queued when the node stops are queued again at the next start; removing the message or
-  stopping the node cancels an auto-fetch in progress.
-- With `lxmf_accept_from` set, messages from unknown senders outside it and `lxmf_auto_fetch_from` aren't
-  held. Messages arriving while held ones are retried count against the limit.
-- Links read from message text: a link on a line of its own is read whole (a last name ending in `.` was
-  cut), links past the 4000 characters kept are found, and query values may contain `=`.
-- `inbox get` checks every output before starting any, and reports later failures per link.
-- Follow keeps checking a name after an unexpected error. Inbox, outbox and provider records are saved under
-  a lock, so an older snapshot can't be written last.
-
-Local API and gateway:
-- Every field the CLI and feature commands print is escaped.
-- The gateway ignores malformed `Range` headers, puts no error details in 500 bodies, doesn't log aborted
-  archive downloads as errors, and watches for disconnects with `poll` (fds over 1024). Both servers refuse
-  HTTP/0.9 with the usual headers; chunked request bodies need plain hex sizes and at most 32 trailer lines.
-- The node identity file is created without racing a second instance.
-
-### Packaging and CI hardening (third audit)
-
-- The build backend is locked: `packaging/build-backend.lock` pins setuptools with hashes, and `install.sh`,
-  `build-deb.sh` and the workflows build rnfs with it without pip's build isolation (which fetched the
-  newest setuptools from PyPI, as root with `install.sh --system`). `pyproject.toml` bounds setuptools
-  (`<85`), and the sdist includes the backend lock.
-- The release toolchain is locked: `packaging/build-tools.lock` (build, twine, PyInstaller, setuptools and
-  their dependencies, for Linux and Windows) is installed with `--require-hashes`; `update-lock.py --build`
-  regenerates both build locks. The tests install the hash-locked dependencies too (they used `pip install .`).
-- `install.sh` installs dependencies as wheels only (`RNFS_ALLOW_SOURCE_BUILDS=1` builds them from their
-  hash-checked source where PyPI has no wheel, e.g. cffi on 32-bit ARM), runs `pip check`, uses umask 022
-  and no pip cache in system mode, never replaces or removes a systemd unit it didn't write (`--force`
-  replaces one), tells system-mode users to restart running daemons after an update, and on a system-mode
-  uninstall removes users' `default.target.wants` links to the unit.
-- `build-deb.sh` fails instead of silently leaving out a Python version's cffi backend (a .deb without it
-  can't import Reticulum's crypto), checks every bundled backend is present, limits `Depends` to the
-  bundled Pythons (`python3 (<< 3.15)`), and writes `DEBIAN/md5sums` and a DEP-5 copyright file.
-- The systemd units get `NoNewPrivileges`, `RestrictAddressFamilies` (Unix, IP and netlink sockets),
-  `LockPersonality`, `RestrictRealtime` and `RestrictSUIDSGID`, and stop retrying after 5 failed starts in
-  10 minutes; the launchd agent doesn't restart when `rnfs` is missing.
-- Windows task script: stopping or uninstalling now also ends the daemon (not just the hidden PowerShell),
-  a crashed daemon is restarted (Task Scheduler's restart settings never did that), the log is written as
-  UTF-8 bytes rather than UTF-16 with wrapped stderr, and paths with `[` `]` work. New `-Stop` switch.
-- Release workflow: a manual run never publishes, even on a tag; files already attached to a release are
-  never replaced (no `--clobber`); every file gets a signed build provenance attestation
-  (`gh attestation verify`). Checkouts don't keep the token (`persist-credentials: false`).
-- README: the Python badge says 3.11+; the Windows PATH snippet adds the folder once and keeps the PATH
-  value's registry type.
 
 ### Packaging
 

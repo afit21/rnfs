@@ -102,26 +102,26 @@ rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file f
 
 | System | Download | Install |
 |---|---|---|
-| Windows (64-bit) | [`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe) | [Windows](#windows) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.0_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs_0.1.0_amd64.deb) or [`rnfs_0.1.0_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs_0.1.0_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
-| Other Linux (x86_64) | [`rnfs-0.1.0-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.1.0-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl) | [macOS](#macos) |
+| Windows (64-bit) | [`rnfs-0.1.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-windows-x64.exe) | [Windows](#windows) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.1_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs_0.1.1_amd64.deb) or [`rnfs_0.1.1_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs_0.1.1_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
+| Other Linux (x86_64) | [`rnfs-0.1.1-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.1-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-py3-none-any.whl) | [macOS](#macos) |
 
 Every package includes Reticulum and LXMF, gives you one `rnfs` command, and keeps your data in the same
-places. The release also has the source archive (`rnfs-0.1.0.tar.gz`) and `SHA256SUMS`, to
-[check your download](#checking-a-download). These links are for 0.1.0; for a newer version, take the
+places. The release also has the source archive (`rnfs-0.1.1.tar.gz`) and `SHA256SUMS`, to
+[check your download](#checking-a-download). These links are for 0.1.1; for a newer version, take the
 same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
 
 ### Windows
 
-Download [`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe). It is a single file that
+Download [`rnfs-0.1.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-windows-x64.exe). It is a single file that
 includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
 folder, put it on your PATH as `rnfs`:
 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.1.0-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.1.1-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -152,8 +152,8 @@ or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [instal
 there instead. Pick `amd64` or `arm64` to match `dpkg --print-architecture`:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs_0.1.0_amd64.deb
-sudo apt install ./rnfs_0.1.0_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs_0.1.1_amd64.deb
+sudo apt install ./rnfs_0.1.1_amd64.deb
 rnfs daemon                             # or run it in the background:
 systemctl --user enable --now rnfs      # a systemd user service; logs: journalctl --user -u rnfs -f
 ```
@@ -172,9 +172,9 @@ For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flat
 `org.freedesktop.Platform` runtime:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.1.0-x86_64.flatpak
+flatpak install --user rnfs-0.1.1-x86_64.flatpak
 flatpak run io.github.afit21.rnfs daemon
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
 ```
@@ -202,7 +202,7 @@ and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python
 ```sh
 brew install pipx
 pipx ensurepath                 # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl     # includes Reticulum and LXMF
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-py3-none-any.whl     # includes Reticulum and LXMF
 rnfs daemon
 ```
 
@@ -228,11 +228,11 @@ Each release's `SHA256SUMS` lists the checksum of every file. Download it next t
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing          # Linux
-shasum -a 256 rnfs-0.1.0-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
+shasum -a 256 rnfs-0.1.1-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
 ```
 
 ```powershell
-Get-FileHash .\rnfs-0.1.0-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
+Get-FileHash .\rnfs-0.1.1-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
 ```
 
 ### Other ways to install
