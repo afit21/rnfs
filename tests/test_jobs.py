@@ -583,7 +583,7 @@ class CliTest(ApiBase):
             os.remove(cid)
             with mock.patch.object(self.b, "get", JobsTest.sealed_get(self, "report.pdf")):
                 code, out, err = self.run_cli("get", cid)
-        self.assertEqual((code, out.strip()), (0, os.path.join(os.path.realpath(self.tmp.name), "report.pdf")), err)
+        self.assertEqual((code, real(out.strip())), (0, real(os.path.join(self.tmp.name, "report.pdf"))), err)
         self.assertTrue(self.jobs.list()[-1]["sealed_name"])
 
     def test_background_get_from_asks_nothing_first(self):
