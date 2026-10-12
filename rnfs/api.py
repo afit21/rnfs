@@ -16,8 +16,8 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/ping | `node` | `{"rtt": seconds or null}` |
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
-| POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name`, `chunker` | `add_path(...)` |
-| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name`, `chunker`; body is the data | `add_stream(...)` |
+| POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker` | `add_path(...)` |
+| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`; body is the data | `add_stream(...)` |
 | POST | /api/get | JSON `target`, `output`, `from`, `raw` | `get(...)` |
 | POST | /api/dir/set | JSON `target`, `name`, `cid`, `executable` | `dir_set(...)` |
 | POST | /api/dir/rm | JSON `target` | `dir_rm(target)` |
@@ -831,7 +831,7 @@ class ApiHandler(TimedHandler):
         size = None if reader.chunked else reader.remaining
         name = self.param("name", False) or None
         only_hash = parse_bool(self.param("only_hash", False) or "")
-        options = node_content.add_options(lambda key: self.param(key, False))  # pin, to, seal_name, chunker…
+        options = node_content.add_options(lambda key: self.param(key, False), stream=True)  # pin, to, seal_name…
         self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
 
     def api_get(self):

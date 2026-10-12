@@ -211,9 +211,13 @@ def export_stream(node, target: str, start: Callable[[int], BinaryIO | None], fo
 # API parameters
 
 
-def add_options(value: Callable[[str], object]) -> dict:
+def add_options(value: Callable[[str], object], stream: bool = False) -> dict:
     """The add options this feature adds (pin, to, to_self, seal_name, chunker), from a JSON body's or a query
-    string's value(name) (None when absent); only those set, so the facade's defaults apply otherwise."""
+    string's value(name) (None when absent); only those set, so the facade's defaults apply otherwise.
+
+    seal_name means two things: for POST /api/add (JSON) whether to seal the file's name, which must be a JSON
+    boolean (ValueError otherwise); for POST /api/add/stream (stream, a query string) the name to seal inside.
+    """
     from rnfs.api import parse_bool
 
     options: dict = {}
@@ -228,9 +232,12 @@ def add_options(value: Callable[[str], object]) -> dict:
         options["to"] = to
     if value("to_self") is not None and parse_bool(value("to_self")):
         options["to_self"] = True
-    if value("seal_name") is not None:
-        seal_name = value("seal_name")
-        options["seal_name"] = parse_bool(seal_name) if isinstance(seal_name, bool) else seal_name
+    seal_name = value("seal_name")
+    if seal_name is not None:
+        # isinstance, not ==: True == 1, and a string like "false" would count as true
+        if not stream and not isinstance(seal_name, bool):
+            raise ValueError("seal_name must be true or false")
+        options["seal_name"] = seal_name
     if value("chunker"):
         from rnfs.content import chunker
         options["chunker"] = chunker.check(str(value("chunker")))

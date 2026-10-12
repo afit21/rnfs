@@ -506,6 +506,32 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.call("POST", "/api/add", b"not json")[0], 400)
         self.assertEqual(self.call("POST", "/api/add", b"[1]")[0], 400)
 
+    def test_add_seal_name_must_be_a_boolean(self):
+        """For /api/add seal_name says whether to seal the name: only JSON true and false are accepted, since a
+        string like "false" would count as true, and 1 == True in Python. Absent or null: the facade's default."""
+        self.node.add_path = mock.Mock(return_value={"cid": "x", "size": 0, "warnings": []})
+        path = os.path.join(tempfile.gettempdir(), "f.txt")
+        for value in (True, False):
+            self.node.add_path.reset_mock()
+            self.ok("POST", "/api/add", {"path": path, "to_self": True, "seal_name": value})
+            self.assertIs(self.node.add_path.call_args.kwargs["seal_name"], value)
+        for body in ({"path": path, "to_self": True}, {"path": path, "to_self": True, "seal_name": None}):
+            self.node.add_path.reset_mock()
+            self.ok("POST", "/api/add", body)
+            self.assertNotIn("seal_name", self.node.add_path.call_args.kwargs)
+        self.node.add_path.reset_mock()
+        for value in ("false", 1, 0, "true", [], {}):
+            status, _, data = self.call("POST", "/api/add", {"path": path, "to_self": True, "seal_name": value})
+            self.assertEqual(status, 400, value)
+            self.assertEqual(json.loads(data)["error"], "seal_name must be true or false")
+        self.node.add_path.assert_not_called()
+
+    def test_add_stream_seal_name_is_the_name(self):
+        """For /api/add/stream seal_name is the name sealed inside, a string, as before."""
+        self.node.add_stream = mock.Mock(return_value={"cid": "x", "size": 0, "warnings": []})
+        self.ok("POST", "/api/add/stream?to_self=1&seal_name=false", b"hello")
+        self.assertEqual(self.node.add_stream.call_args.kwargs["seal_name"], "false")
+
     def test_add_stream_content_length(self):
         result = self.ok("POST", "/api/add/stream?name=a.txt&only_hash=1", b"hello world")
         (data,), kwargs = self.node.called("add_stream")[0]
