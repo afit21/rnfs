@@ -4,6 +4,7 @@ FakeNode is shared with test_gateway.py and test_cli.py.
 """
 import hashlib
 import http.client
+import inspect
 import json
 import os
 import socket
@@ -51,6 +52,11 @@ class FakeNode:
     def called(self, method) -> list[tuple]:
         """The (args, kwargs) of every call to method."""
         return [(args, kwargs) for name, args, kwargs in self.calls if name == method]
+
+    def _given(self, method: str, **options) -> dict:
+        """The options not at the facade method's defaults: recorded only when a caller sets them."""
+        parameters = inspect.signature(getattr(FakeNode, method)).parameters
+        return {name: value for name, value in options.items() if value != parameters[name].default}
 
     # Building content
 
@@ -143,8 +149,10 @@ class FakeNode:
 
     # Facade
 
-    def add_path(self, path, wrap=False, only_hash=False):
-        self.record("add_path", path, wrap=wrap, only_hash=only_hash)
+    def add_path(self, path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True,
+                 chunker=None):
+        self.record("add_path", path, wrap=wrap, only_hash=only_hash,
+                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
         if not os.path.isabs(path):
             raise ValueError("path must be absolute")
         if not os.path.exists(path):
@@ -152,24 +160,26 @@ class FakeNode:
         cid = self._add_tree(path)
         if wrap:
             cid = self.put_dir({os.path.basename(path): cid})
-        if not only_hash:
+        if pin and not only_hash:
             self.pins.setdefault(cid, set()).add("user")
         return {"cid": cid, "size": self._size(cid), "warnings": ["skipped a symlink"] if wrap else []}
 
-    def add_stream(self, stream, size=None, name=None, only_hash=False):
+    def add_stream(self, stream, size=None, name=None, only_hash=False, pin=True, to=None, to_self=False,
+                   seal_name=None, chunker=None):
         data = stream.read()
-        self.record("add_stream", data, size=size, name=name, only_hash=only_hash)
+        self.record("add_stream", data, size=size, name=name, only_hash=only_hash,
+                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
         if size is not None and len(data) != size:
             raise ValueError("stream shorter than its size")
         cid = self.put_file(data)
         if name:
             cid = self.put_dir({name: cid})
-        if not only_hash:
+        if pin and not only_hash:
             self.pins.setdefault(cid, set()).add("user")
         return {"cid": cid, "size": len(data), "warnings": []}
 
-    def get(self, target, output, from_node=None):
-        self.record("get", target, output, from_node=from_node)
+    def get(self, target, output, from_node=None, raw=False):  # nothing is sealed here, so raw changes nothing
+        self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw))
         cid = self._resolve(target)
 
         def write(cid, dest):
@@ -184,15 +194,16 @@ class FakeNode:
         write(cid, output)
         return {"cid": cid, "warnings": []}
 
-    def info(self, target, for_gateway=False, from_node=None):
-        self.record("info", target, for_gateway=for_gateway, from_node=from_node)
+    def info(self, target, for_gateway=False, from_node=None, raw=False):
+        self.record("info", target, for_gateway=for_gateway, from_node=from_node, **self._given("info", raw=raw))
         cid = self._resolve(target)
         obj = self.objects[cid]
         return {"cid": cid, "type": "file" if obj[0] == "file" else "directory", "size": self._size(cid),
                 "executable": obj[0] == "file" and obj[2]}
 
-    def read(self, target, offset=0, length=None, for_gateway=False, from_node=None):
-        self.record("read", target, offset=offset, length=length, for_gateway=for_gateway, from_node=from_node)
+    def read(self, target, offset=0, length=None, for_gateway=False, from_node=None, raw=False):
+        self.record("read", target, offset=offset, length=length, for_gateway=for_gateway, from_node=from_node,
+                    **self._given("read", raw=raw))
         cid = self._resolve(target)
         obj = self.objects[cid]
         if obj[0] != "file":
