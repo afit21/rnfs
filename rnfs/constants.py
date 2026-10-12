@@ -25,6 +25,9 @@ BUCKET_COUNT = 128
 RESPONSE_OVERHEAD = 1 * KIB  # room left for msgpack framing in a /blocks response (section 7)
 REQUEST_FRAMING = 28  # approximate bytes RNS adds around a request's data (section 3)
 
+# Local, not protocol: a file being written out (.rnfs-get-<random>.partial, .rnfs-job-<id>.partial), then renamed
+PARTIAL_SUFFIX = ".partial"
+
 APP_NAME = "rnfs"
 DHT_ASPECT = "dht"  # rnfs.dht: every node's request destination. A breaking change uses a new aspect
 NAME_ASPECT = "name"  # rnfs.name: a name's announce destination

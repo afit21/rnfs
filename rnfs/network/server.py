@@ -39,7 +39,7 @@ MONITOR_FAST_TICK = 0.02  # monitor interval while a response's Resource hasn't 
 MONITOR_TICK = 0.25
 # Longest a /blocks response is held back for upload pacing: half of RNS's request timeout with no RTT, so the
 # requester doesn't give up meanwhile. Not RTT-based: the requester can inflate the link's RTT
-MAX_PACING_WAIT = RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125 / 2
+MAX_PACING_WAIT = protocol.REQUEST_TIMEOUT_WITHOUT_RTT / 2
 CLOSED_MEMORY = 1024  # closed incoming links remembered, so a late request can't track them again
 
 

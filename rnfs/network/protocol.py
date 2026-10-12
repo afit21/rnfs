@@ -25,6 +25,9 @@ from rnfs.content.cid import Cid
 __all__ = ["FIND_PATH", "PROVIDE_PATH", "BLOCKS_PATH", "PIN_PATH"]
 
 DEFAULT_MDU = RNS.Link.MDU  # packet MDU of a link at the default 500-byte MTU (431 bytes)
+# RNS's request timeout without RTT (11.25 s): what it adds to rtt × traffic_timeout_factor (Link.request with
+# timeout=None). Upload pacing holds a /blocks response back at most half of it, 5.625 s (section 3)
+REQUEST_TIMEOUT_WITHOUT_RTT = RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125
 
 
 # Request sizes and batching

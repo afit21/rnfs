@@ -21,6 +21,7 @@ import os
 import threading
 import time
 
+from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError
 from rnfs.features import Feature, _common
@@ -90,7 +91,7 @@ class FollowFeature(Feature):
                 pinned = Cid.parse(entry["pinned"]) if entry.get("pinned") is not None else None
             except (AttributeError, KeyError, TypeError, ValueError):
                 continue
-            if len(name) == 16:
+            if len(name) == ID_LENGTH:
                 self._pinned[name] = pinned
 
     def _save(self):

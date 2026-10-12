@@ -26,14 +26,14 @@ import RNS
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_REQUESTS_PER_LINK
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name
-from rnfs.network import guards, rates
+from rnfs.network import guards, protocol, rates
 
 POLL_INTERVAL = 0.25  # how often a waiting request checks its link, progress and stall conditions
 CANCEL_GRACE = 2.0  # seconds a started response may be missing from the link's incoming Resources
 ESTABLISH_GRACE = 5  # seconds past RNS's own establishment timeout before giving up on a new link
 DEADLINE_FACTOR = 2  # a request other than /blocks may take this many times RNS's own request timeout
 # What RNS adds to rtt × traffic_timeout_factor for its request timeout (Link.request with timeout=None)
-RESPONSE_GRACE = RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125
+RESPONSE_GRACE = protocol.REQUEST_TIMEOUT_WITHOUT_RTT
 
 
 class Exchange:

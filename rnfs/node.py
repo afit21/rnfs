@@ -23,7 +23,7 @@ import RNS
 
 from rnfs import __version__, features, fsutil
 from rnfs.config import Config
-from rnfs.constants import APP_NAME, DHT_ASPECT, MODE_SERVER
+from rnfs.constants import APP_NAME, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
@@ -95,9 +95,6 @@ def _check_free_space(path: str, needed: int):
         return  # a missing or unusable directory is reported by the write itself
     if needed > free:
         raise TooLarge(f"{size(needed)} won't fit in the {size(free)} free in {directory}")
-
-
-PARTIAL_SUFFIX = ".partial"  # get writes out under .rnfs-get-<random>.partial, then renames it
 
 
 def _remove_partial(path: str):
