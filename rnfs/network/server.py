@@ -618,12 +618,11 @@ class RequestServer:
             self.wake.set()
             return body
         finally:
-            if handed_over:
-                pass
-            elif response is not None:
-                self._finish(response)  # frees the pool slot and the link's /blocks slot exactly once
-            else:
-                self.incoming.finish_request(link_id, blocks=True)
+            if not handed_over:
+                if response is not None:
+                    self._finish(response)  # frees the pool slot and the link's /blocks slot exactly once
+                else:
+                    self.incoming.finish_request(link_id, blocks=True)
 
     @staticmethod
     def _pace(response: Response, wait: float):

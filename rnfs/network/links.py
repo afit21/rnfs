@@ -118,13 +118,6 @@ class PeerLink:
         except Exception:
             return None
 
-    def mtu(self) -> int | None:
-        """The link's MTU, which classifies it as slow before it has a rate estimate."""
-        try:
-            return self.link.get_mtu()
-        except Exception:
-            return None
-
     def acquire(self, blocks: bool, timeout: float | None = None) -> bool:
         """Wait for a request slot (and the /blocks slot if blocks). False if the link closed or timeout passed."""
         deadline = None if timeout is None else time.monotonic() + timeout

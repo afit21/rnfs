@@ -177,7 +177,7 @@ class FollowFeature(Feature):
         with self._lock:
             if name not in self._pinned:
                 return
-            when, network = self._due.get(name, (FAR_FUTURE, False))
+            _, network = self._due.get(name, (FAR_FUTURE, False))
             self._due[name] = (time.monotonic(), network)
         self._wake.set()
 
