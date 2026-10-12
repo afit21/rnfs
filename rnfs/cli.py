@@ -10,7 +10,6 @@ only once the program on the API port has proved it knows it (api_proof), since 
 any local user could listen there.
 """
 import argparse
-import contextlib
 import errno
 import hashlib
 import hmac
@@ -28,7 +27,6 @@ from rnfs.config import DEFAULT_API_PORT, Config
 DEFAULT_DIR = Config.rnfs_dir
 COPY_SIZE = 64 * 1024
 TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every other command
-NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # Windows lacks it
 # Before sending the token, the CLI makes whatever listens on the API port prove it knows it (api_proof)
 CHALLENGE_HEADER = "X-Rnfs-Challenge"
 PROOF_HEADER = "X-Rnfs-Proof"
@@ -55,18 +53,10 @@ def token_path(rnfs_dir: str) -> str:
 
 def write_token(path: str, token: str):
     """Write the API token to path atomically, created with mode 0600 so other users can't read it."""
-    # A new file (O_EXCL) in the same directory, then a rename: the token is never readable with wider
-    # permissions, nor half-written, and an existing file or symlink at path is replaced, not written through
-    temp = os.path.join(os.path.dirname(path), f".{TOKEN_FILE}.{os.getpid()}.{secrets.token_hex(4)}")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | fsutil.O_BINARY, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="ascii") as f:
-            f.write(token + "\n")
-        fsutil.replace(temp, path)  # retried on Windows while a client command is reading the old token
-    except BaseException:
-        with contextlib.suppress(OSError):
-            fsutil.remove(temp)
-        raise
+    # A new file (O_EXCL, O_NOFOLLOW) in the same directory, then a rename: the token is never readable with
+    # wider permissions, nor half-written, and an existing file or symlink at path is replaced, not written
+    # through. Ended with os.linesep, as the text-mode write before 0.1.2 did, so the file is unchanged
+    fsutil.write_atomic(path, (token + os.linesep).encode("ascii"), mode=0o600)
 
 
 def remove_token(path: str, token: str):
@@ -89,7 +79,7 @@ def api_proof(token: str, port: int, challenge: str) -> str:
 def read_token(path: str) -> str:
     """The daemon's API token from path; exits with an explanation if it can't be used."""
     try:
-        fd = os.open(path, os.O_RDONLY | NOFOLLOW | fsutil.O_BINARY)
+        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | fsutil.O_BINARY)
     except FileNotFoundError:
         fail(f"no API token at {path}: is the daemon running, with this --dir?")
     except PermissionError:

@@ -7,6 +7,7 @@ from unittest import mock
 
 from rnfs.config import Config
 from rnfs.network import links
+from tests.support import wait_for
 
 NODE = bytes(16)
 OTHER = bytes([1]) * 16
@@ -361,8 +362,9 @@ class PeerLinkSlotsTest(unittest.TestCase):
         self.peer.acquire(True)
         got = []
         thread = threading.Thread(target=lambda: got.append(self.peer.acquire(True, timeout=5)))
-        thread.start()
-        time.sleep(0.1)
+        with mock.patch.object(self.peer.cond, "wait", wraps=self.peer.cond.wait) as wait:
+            thread.start()
+            self.assertTrue(wait_for(lambda: wait.called))  # it waits for the slot
         self.peer.release(True)
         thread.join(5)
         self.assertEqual(got, [True])
@@ -371,8 +373,9 @@ class PeerLinkSlotsTest(unittest.TestCase):
         self.peer.acquire(True)
         got = []
         thread = threading.Thread(target=lambda: got.append(self.peer.acquire(True)))
-        thread.start()
-        time.sleep(0.1)
+        with mock.patch.object(self.peer.cond, "wait", wraps=self.peer.cond.wait) as wait:
+            thread.start()
+            self.assertTrue(wait_for(lambda: wait.called))  # it waits for the slot
         self.peer.mark_closed()
         thread.join(5)
         self.assertEqual(got, [False])

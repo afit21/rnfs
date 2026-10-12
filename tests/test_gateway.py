@@ -10,10 +10,8 @@ from rnfs.errors import NotFound
 from rnfs.gateway import (CSP_NO_SCRIPTS, CSP_SCRIPTS, IMMUTABLE, GatewayServer, etag_matches, listing_html,
                           parse_range, sniff)
 
-try:
-    from tests.test_api import FakeNode, held_connections, raw_request, read_until_closed
-except ImportError:  # run from inside tests/
-    from test_api import FakeNode, held_connections, raw_request, read_until_closed
+from tests.support import wait_for
+from tests.test_api import FakeNode, free_slots, held_connections, raw_request, read_until_closed
 
 SPEC_CSP = ("sandbox allow-scripts allow-forms allow-popups; default-src 'self' 'unsafe-inline' 'unsafe-eval' "
             "data: blob:; form-action 'self'")
@@ -375,7 +373,7 @@ class ConnectionTest(GatewayTestCase):
         held = held_connections(self.port, count, b"GET /rnfs/")
         for sock in held:
             self.addCleanup(sock.close)
-        time.sleep(0.1)  # let the server accept them
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == 0))  # the server has accepted them
         return held
 
     def test_idle_connection_is_closed(self):
@@ -398,7 +396,7 @@ class ConnectionTest(GatewayTestCase):
         self.assertEqual(self.node.called("info"), [])
         for sock in held:
             read_until_closed(sock)
-        time.sleep(0.1)
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == 2))
         self.assertEqual(self.get(f"/rnfs/{self.text}")[0], 200)
 
     def test_clients_that_stop_reading_are_dropped(self):
@@ -410,7 +408,7 @@ class ConnectionTest(GatewayTestCase):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             sock.connect(("127.0.0.1", self.port))
             sock.sendall(f"GET /rnfs/{big} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
-        time.sleep(0.2)
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == 0))
         self.assertEqual(self.get(f"/rnfs/{self.text}")[0], 503)
         # Writing to the stalled clients times out, which frees their slots
         deadline = time.monotonic() + 5

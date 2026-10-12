@@ -16,13 +16,10 @@ from rnfs.features import peers as peers_feature
 from rnfs.network import protocol, server
 from rnfs.network.client import BUSY, FAILED, OK, BlocksResult, PeerClient
 from rnfs.node import RnfsNode
+from tests.support import FakeClock
 from tests.test_fetcher import OWN, FakeClient, FetcherTest
-from tests.test_server import Clock, FakeBackend, FakeDestination, FakeLink, FakeResource, block_of
-
-try:
-    from tests.test_names import FakeNetwork
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
+from tests.test_names import FakeNetwork
+from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource, block_of
 
 P1, P2, P3, P4 = (bytes([i]) * 16 for i in (1, 2, 3, 4))
 
@@ -121,7 +118,7 @@ class TokenBucketTest(unittest.TestCase):
     """Continuous refill; a response goes if the bucket holds its size or is full."""
 
     def test_spend_and_refill(self):
-        clock = Clock()
+        clock = FakeClock()
         bucket = mesh.TokenBucket(3600, 3600, clock)  # 1 byte/s
         self.assertTrue(bucket.take(3000))
         self.assertFalse(bucket.take(1000))  # 600 left
@@ -132,7 +129,7 @@ class TokenBucketTest(unittest.TestCase):
         self.assertEqual(bucket.available(), 3600)  # never above capacity
 
     def test_large_response_allowed_when_full(self):
-        clock = Clock()
+        clock = FakeClock()
         bucket = mesh.TokenBucket(1000, 3600, clock)
         self.assertTrue(bucket.take(5000))  # bigger than the whole budget, but the bucket was full
         self.assertLess(bucket.available(), 0)
@@ -143,7 +140,7 @@ class TokenBucketTest(unittest.TestCase):
         self.assertTrue(bucket.take(5000))  # full again
 
     def test_give_back(self):
-        clock = Clock()
+        clock = FakeClock()
         bucket = mesh.TokenBucket(1000, 3600, clock)
         bucket.take(800)
         bucket.give_back(800)
@@ -238,7 +235,7 @@ class AirtimePolicyTest(unittest.TestCase):
         self.assertIsNone(policy.refusal(["any"]))
 
     def test_budget_limit(self):
-        clock = Clock()
+        clock = FakeClock()
         policy = mesh.AirtimePolicy(Config(upload_budget=100 * KIB), clock)
         self.assertEqual(policy.limit(500 * KIB), 500 * KIB)  # full: any one response may go
         self.assertTrue(policy.spend(60 * KIB))
@@ -269,7 +266,7 @@ class ServerAirtimeTest(unittest.TestCase):
         """A server over fake RNS objects serving four 100 KiB blocks."""
         saved = RNS.Resource.AUTO_COMPRESS_MAX_SIZE
         self.addCleanup(setattr, RNS.Resource, "AUTO_COMPRESS_MAX_SIZE", saved)
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.big = [block_of(100 * KIB, i) for i in range(4)]
         self.backend = FakeBackend(blocks=dict(self.big))
         self.links = 0

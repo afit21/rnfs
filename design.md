@@ -46,7 +46,7 @@ rnfs.py, rnfs/__main__.py   entry points (python3 rnfs.py, python3 -m rnfs); the
 rnfs/
   constants.py config.py errors.py log.py          shared foundation
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
-  content/            no RNS dependency
+  content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
     dag.py            DAG node encoding, strict decoding, names (section 5)
     chunker.py        fixed and FastCDC chunkers; chunker.using(name) picks one per context (section 5)
@@ -89,7 +89,8 @@ rnfs/
     follow.py         followed names (section 9)
     contacts.py       address book (section 11)
     lxmf.py           rnfs: URIs, LXMF send/inbox/outbox/auto-fetch (section 13)
-install.sh            Linux installer: venv, command, optional systemd user unit; --update, --uninstall
+install.sh            Linux installer of the latest release (or --main): venv, command, optional systemd user
+                      unit; --update, --uninstall
 contrib/              rnfs.service (systemd user), io.github.afit21.rnfs.plist (launchd), install-windows-task.ps1
 packaging/            requirements.lock (hash-pinned runtime dependencies), update-lock.py (regenerates it),
                       build-deb.sh, flatpak/ (manifest, wheels generated from the lock), pyinstaller/ (one-file exe),
@@ -204,7 +205,7 @@ out within `link_idle_timeout`.
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
-| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool}]` |
+| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names), its shared-folder entry, or a directory's single entry or entry count |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
@@ -371,6 +372,20 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 
 The API and gateway run one thread per connection, capped (32 and 64).
 
+Locks are taken in this order, never the reverse: `names._lock` → `publisher._lock` → `node._lock` →
+`storage._lock`. `NameManager.publish`, `remove` and `release_gone` pin and unpin, and so call
+`publisher.refresh()`, while holding the names lock; `Publisher.refresh` recomputes what is provided under its
+own lock, reading the node's fetched targets (`node._lock`) and walking the pins' DAGs (`storage._lock`); the
+node reads storage under its lock (`_prune_fetched`). This is how the code behaves today, not a design goal.
+Slow work that runs while a lock is held:
+
+- `Publisher.refresh` walks every pin's DAG (memoised) under the publisher lock, behind the names lock when a
+  name changes, so an RNS thread delivering a name announce can wait behind a full recompute.
+- `Storage.evict`, `gc` and `verify` check every pin and cached target for completeness (`dag_blocks`,
+  memoised, reading blocks from disk) under the storage lock; `evict` and `gc` also delete blocks under it.
+  `verify` re-reads the blocks themselves outside it.
+- `RnfsNode._note_fetched` and `_prune_fetched` write `fetched.json`, synced to disk, under the node lock.
+
 ## State files
 
 Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to disk: `pins.json`, `cache.json`
@@ -390,12 +405,11 @@ and a resumed job removes one left by a crash.
 
 ## Tests
 
-`python3 -m unittest discover tests` runs unit tests with no network. `RNFS_E2E=1 python3 -m unittest tests.test_e2e`
-starts real daemons over local TCP. Debugging: `kill -USR1 <daemon pid>` prints every thread's stack.
-Feature tests live in their own files (`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`,
-`test_seal.py`, `test_chunker.py`, `test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and
-`test_e2e.py` has a marked block per feature. CI (`.github/workflows/tests.yml`) runs them on Linux, macOS and
-Windows; `packaging/smoke_test.py` checks a built package (`--version`, `--help`, daemon and status).
+How to run the tests is in [README.md, Tests](README.md#tests). Feature tests live in their own files
+(`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`, `test_seal.py`, `test_chunker.py`,
+`test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and `test_e2e.py` has a marked block per
+feature. CI (`.github/workflows/tests.yml`) runs them on Linux, macOS and Windows; `packaging/smoke_test.py`
+checks a built package (`--version`, `--help`, daemon and status).
 
 ## Status
 
@@ -492,11 +506,12 @@ Everything in the specification is implemented, with these simplifications and a
   propagation node is used unless configured (or asked for with `--nearest`).
 - **Packaging.** Release artifacts (`.deb` for amd64/arm64, x86_64 Flatpak, Windows x64 exe, wheel and sdist)
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
-  `__version__` publishes them, with `SHA256SUMS` and signed build provenance (`gh attestation verify`), never
-  replacing files already attached; a manual run only builds. The Windows exe isn't code-signed, and unpacks
-  itself on each start.
-  - `lxmf>=1.2.0` is a regular dependency next to `rns>=1.5.6` (`pyproject.toml`, `requirements.txt`), so
-    every install includes LXMF; the PyInstaller spec fails the build without it.
+  `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
+  `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
+  a manual run only builds. The Windows exe isn't code-signed, and unpacks itself on each start.
+  - `lxmf>=1.2.0,<1.3` is a regular dependency next to `rns>=1.5.6,<1.6` (`pyproject.toml`), so every
+    install includes LXMF; the PyInstaller spec fails the build without it. The upper bounds keep unpinned
+    installs off RNS and LXMF releases rnfs hasn't been tested with, since it relies on some of their internals.
   - `packaging/requirements.lock` pins the tested versions (rns 1.5.6, lxmf 1.2.0, cryptography 50.0.2,
     cffi 2.1.1, pycparser 3.0, pyserial 3.5) with the sha256 of every file PyPI has for each.
     `python3 -I packaging/update-lock.py [pkg==ver …]` regenerates it (no arguments: the newest versions
@@ -506,12 +521,16 @@ Everything in the specification is implemented, with these simplifications and a
     release's flatpak-sources step fails if regenerating changes the committed files. The sdist includes the
     lock.
   - `update-lock.py --build pyinstaller==<ver>` writes `build-backend.lock` (setuptools, within
-    `pyproject.toml`'s `<85` bound) and `build-tools.lock` (build, twine, PyInstaller, setuptools and their
-    dependencies), hashed the same way. Every build installs these with `--require-hashes` and builds without
-    build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
+    `pyproject.toml`'s `<85` bound) and `build-tools.lock` (build, twine, PyInstaller, setuptools, ruff and
+    their dependencies), hashed the same way. Every build installs these with `--require-hashes` and builds
+    without build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
     `build-backend.lock`. `build-deb.sh` fails if a supported Python has no cffi backend, caps `python3` below
     3.15, and writes a DEP-5 `copyright` and `md5sums`.
-  - `install.sh` unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
+  - `install.sh` installs the latest release's source archive (`archive/refs/tags/<tag>.zip`, the tag taken
+    from where `releases/latest` redirects, so no GitHub API), the main branch's with `--main`, or
+    `RNFS_SOURCE`. Since the script on `main` installs older release trees, it must keep working with every
+    release's layout from 0.1.1 on (`packaging/requirements.lock`, `packaging/build-backend.lock`).
+    It unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
     locks; a `.whl` or other requirement has none, so it warns and installs dependencies unpinned. It installs
     wheels only (`RNFS_ALLOW_SOURCE_BUILDS=1` builds missing ones from hashed sources with unpinned build
     tools), builds rnfs in a separate venv with the locked setuptools, sets `umask 022` in system mode, and

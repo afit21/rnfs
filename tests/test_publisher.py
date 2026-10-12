@@ -13,6 +13,7 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.dht.providers import ProviderStore
 from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, STATE_FILE, Publisher
+from tests.support import FakeClock
 
 OWN = bytes(16)
 N1, N2, N3 = (bytes([i]) * 16 for i in (1, 2, 3))
@@ -59,18 +60,6 @@ class FakeLookup:
         return list(self.nodes)
 
 
-class Clock:
-    """A settable wall clock."""
-
-    def __init__(self):
-        """Start at an arbitrary time."""
-        self.now = 1_000_000.0
-
-    def __call__(self):
-        """The current time."""
-        return self.now
-
-
 class PublisherTest(unittest.TestCase):
     """A Publisher over temporary storage with fakes for the network."""
 
@@ -83,7 +72,7 @@ class PublisherTest(unittest.TestCase):
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), self.state, 10**9)
         self.records = ProviderStore(1000, None)
         self.client = FakeClient()
-        self.clock = Clock()
+        self.clock = FakeClock(1_000_000.0)
         self.nodes = [N1, N2]
         self.eligible: set[Cid] = set()
         self.lookups: list[bytes] = []

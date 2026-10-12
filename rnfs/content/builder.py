@@ -111,19 +111,6 @@ def _put_node(node: dag.Node, put: Put) -> Cid:
     return cid
 
 
-def _read_full(stream: BinaryIO, want: int) -> bytes:
-    """Up to want bytes from stream, fewer only at end of stream (pipes and sockets return short reads)."""
-    parts = []
-    got = 0
-    while got < want:
-        data = stream.read(want - got)
-        if not data:
-            break
-        parts.append(data)
-        got += len(data)
-    return b"".join(parts)
-
-
 def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = dag.KIND_FILE) -> Built:
     """Build a file from everything read from stream, or exactly size bytes of it (ValueError if it ends early)."""
 

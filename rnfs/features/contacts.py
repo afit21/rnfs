@@ -20,7 +20,9 @@ import time
 
 from rnfs.content.cid import is_valid as is_valid_cid
 from rnfs.errors import NotFound
-from rnfs.features import Feature
+from rnfs.features import Feature, _common
+from rnfs.features._common import LOG_INFO, LOG_WARNING
+from rnfs.fsutil import printable
 
 NAME = "contacts"
 CONTACTS_FILE = "contacts.json"
@@ -97,7 +99,7 @@ class ContactsFeature(Feature):
                 check_nick(nick)
                 self._contacts[nick] = (check_kind(entry["kind"]), parse_hex(entry["id"]))
             except (KeyError, TypeError, ValueError):
-                self._log(f"ignoring malformed contact {nick!r} in {self._path}", "LOG_WARNING")
+                self._log(f"ignoring malformed contact {nick!r} in {self._path}", LOG_WARNING)
             if len(self._contacts) >= MAX_CONTACTS:
                 break
 
@@ -109,10 +111,9 @@ class ContactsFeature(Feature):
                                              for nick, (kind, ident) in sorted(self._contacts.items())}})
 
     @staticmethod
-    def _log(message: str, level: str = "LOG_INFO"):
-        """Log through rnfs.log (imported here: it loads RNS)."""
-        from rnfs import log
-        log.log(f"contacts: {message}", getattr(log, level))
+    def _log(message: str, level: int = LOG_INFO):
+        """Log with this feature's prefix."""
+        _common.log(f"contacts: {message}", level)
 
     # The address book
 
@@ -286,10 +287,7 @@ FEATURE = ContactsFeature
 
 def _feature(handler) -> ContactsFeature:
     """The node's address book. Raises NotFound if the daemon has none."""
-    try:
-        return handler.node.feature(NAME)
-    except (AttributeError, KeyError):
-        raise NotFound("this daemon has no address book") from None
+    return _common.feature(handler, NAME, "this daemon has no address book")
 
 
 def _api_list(handler):
@@ -319,16 +317,11 @@ def _api_rm(handler):
 # CLI (no RNS here)
 
 
-def _printable(text) -> str:
-    """Escape control characters in text the daemon sent."""
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in str(text))
-
-
 def run_add(args):
     """Add a contact; print it."""
     import rnfs.cli
     contact = rnfs.cli.client(args).post("/api/contacts/add", nick=args.nick, id=args.id, kind=args.kind)
-    print(f"{_printable(contact['nick'])} {_printable(contact['kind'])} {_printable(contact['id'])}")
+    print(f"{printable(contact['nick'])} {printable(contact['kind'])} {printable(contact['id'])}")
 
 
 def run_rm(args):
@@ -341,7 +334,7 @@ def run_ls(args):
     """Print every contact: nick, kind, hash."""
     import rnfs.cli
     for contact in rnfs.cli.client(args).get("/api/contacts")["contacts"]:
-        print(f"{_printable(contact['nick'])} {_printable(contact['kind'])} {_printable(contact['id'])}")
+        print(f"{printable(contact['nick'])} {printable(contact['kind'])} {printable(contact['id'])}")
 
 
 def node_arg(args, text: str | None) -> str | None:
@@ -354,5 +347,5 @@ def node_arg(args, text: str | None) -> str | None:
     import rnfs.cli
     contact = rnfs.cli.client(args).get("/api/contacts/get", nick=text)  # exits with "no contact <nick>"
     if contact.get("kind") != "node":
-        rnfs.cli.fail(f"contact {text} is a {_printable(contact.get('kind'))}, not a node")
+        rnfs.cli.fail(f"contact {text} is a {printable(contact.get('kind'))}, not a node")
     return contact["id"]

@@ -39,7 +39,8 @@ from dataclasses import dataclass
 from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound
-from rnfs.features import Feature
+from rnfs.features import Feature, _common
+from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE
 
 NAME = "keepers"
 NAME_PATH = "/name"
@@ -69,10 +70,9 @@ def name_key(name: bytes) -> bytes:
     return hashlib.sha256(KEY_DOMAIN + name).digest()[:ID_LENGTH]
 
 
-def _log(message: str, level: str = "LOG_VERBOSE"):
-    """Log through rnfs.log (imported here: it loads RNS)."""
-    from rnfs import log
-    log.log(f"keepers: {message}", getattr(log, level))
+def _log(message: str, level: int = LOG_VERBOSE):
+    """Log with this feature's prefix."""
+    _common.log(f"keepers: {message}", level)
 
 
 # Signed records
@@ -420,7 +420,7 @@ class KeepersFeature(Feature):
             try:
                 listener(name)
             except Exception as e:  # noqa: BLE001 - one listener mustn't break the others
-                _log(f"listener failed: {e!r}", "LOG_ERROR")
+                _log(f"listener failed: {e!r}", LOG_ERROR)
 
     # Keeping
 
@@ -432,7 +432,7 @@ class KeepersFeature(Feature):
         """Keep name, and fetch its record in the background if none is held. ValueError if full."""
         if self.store.keep(name, reason):
             self.store.save()
-            _log(f"keeping name {name.hex()} ({reason})", "LOG_NOTICE")
+            _log(f"keeping name {name.hex()} ({reason})", LOG_NOTICE)
         if self.store.get(name) is None:
             # NameManager may hold its app_data, but only a keeper's answer (or a cached announce) carries
             # the signature others need to check it
@@ -445,7 +445,7 @@ class KeepersFeature(Feature):
             raise NotFound(f"name {name.hex()} is not kept" + ("" if reason == USER else f" for {reason}"))
         self.store.save()
         self.node.publisher.refresh()
-        _log(f"no longer keeping name {name.hex()} for {reason}", "LOG_NOTICE")
+        _log(f"no longer keeping name {name.hex()} for {reason}", LOG_NOTICE)
 
     def kept(self) -> list[dict]:
         """Every kept name: reasons, and the record held if any."""
@@ -578,7 +578,7 @@ class KeepersFeature(Feature):
                 self.sync_own()
                 self.save()
             except Exception as e:  # noqa: BLE001 - keep the thread alive
-                _log(f"background work failed: {e!r}", "LOG_ERROR")
+                _log(f"background work failed: {e!r}", LOG_ERROR)
 
     def retry_missing(self) -> list[bytes]:
         """Queue kept names still without a record, round robin from the cursor; the names queued."""
@@ -728,10 +728,7 @@ def parse_name_arg(node, text) -> bytes:
 
 def _feature(handler) -> KeepersFeature:
     """The node's keepers feature. NotFound if the daemon has none."""
-    try:
-        return handler.node.feature(NAME)
-    except (AttributeError, KeyError):
-        raise NotFound("this daemon doesn't keep names") from None
+    return _common.feature(handler, NAME, "this daemon doesn't keep names")
 
 
 def _api_keep(handler):

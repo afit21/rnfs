@@ -15,7 +15,8 @@ from rnfs.dht.routing import RoutingTable
 from rnfs.fetcher import Fetcher
 from rnfs.network import protocol, rates, server
 from rnfs.network.client import BUSY, OK, BlocksResult
-from tests.test_server import Clock, FakeBackend, FakeDestination, FakeLink, FakeResource
+from tests.support import FakeClock
+from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource
 
 OWN, PROVIDER = bytes(16), bytes([1]) * 16
 _saved_loglevel = RNS.loglevel
@@ -49,7 +50,7 @@ class PacingTest(unittest.TestCase):
         The responder measures server_measures × the rate (RNS's sender-side span includes a round trip).
         Returns (refusals, virtual seconds taken); fails the test if the provider is dropped.
         """
-        clock = Clock()
+        clock = FakeClock()
         start = clock.now
         network = {}
         built = builder.build_bytes(os.urandom(chunks * CHUNK_SIZE), network.__setitem__)

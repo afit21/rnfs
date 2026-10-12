@@ -32,7 +32,6 @@ import os
 import re
 import signal
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -40,7 +39,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
 
-from rnfs import features
+from rnfs import features, fsutil
+from rnfs.features import _common
+from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
 from rnfs.content.cid import Cid
 
@@ -100,18 +101,9 @@ FINAL_STATES = {"delivered", "rejected", "cancelled", "failed"}  # and "sent" fo
 METHOD_NAMES = {0x01: "opportunistic", 0x02: "direct", 0x03: "propagated", 0x05: "paper"}
 
 
-def _log(message: str, level: str = "info"):
-    """Log through rnfs.log, imported here because it loads RNS."""
-    from rnfs import log as rnfs_log
-    rnfs_log.log(f"lxmf: {message}", {"error": rnfs_log.LOG_ERROR, "warning": rnfs_log.LOG_WARNING,
-                                      "notice": rnfs_log.LOG_NOTICE, "info": rnfs_log.LOG_INFO,
-                                      "verbose": rnfs_log.LOG_VERBOSE}[level])
-
-
-def _printable(text) -> str:
-    """Untrusted text (names, errors) with non-printable characters escaped, for logs and terminals."""
-    from rnfs import fsutil
-    return fsutil.printable(text)
+def _log(message: str, level: int = LOG_INFO):
+    """Log with this feature's prefix."""
+    _common.log(f"lxmf: {message}", level)
 
 
 _NO_PN_HELP = ("no LXMF propagation node is set: set lxmf_propagation_node, or use --nearest for the nearest "
@@ -424,37 +416,8 @@ def _json_bytes(value) -> int:
 def _write_json(path: str, value):
     """Write value as UTF-8 JSON (non-ASCII as is, not as 6-byte escapes) to path atomically and durably: a
     power loss leaves the old or the new file whole (an emptied inbox would leave lxmf: pins nothing releases)."""
-    from rnfs import fsutil
-    directory = os.path.dirname(path)
-    fd, partial = tempfile.mkstemp(prefix=".partial-", dir=directory)
-    try:
-        # backslashreplace: a lone surrogate (e.g. in an error text) is written as its JSON escape
-        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
-            json.dump(value, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        fsutil.replace(partial, path)
-    except BaseException:
-        try:
-            fsutil.remove(partial)
-        except OSError:
-            pass
-        raise
-    _sync_directory(directory)
-
-
-def _sync_directory(directory: str):
-    """fsync a directory so a rename in it is durable; best effort (Windows can't open a directory)."""
-    try:
-        fd = os.open(directory or ".", os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    from rnfs.content.storage import write_json
+    write_json(path, value, ensure_ascii=False)
 
 
 class MessageLog:
@@ -490,7 +453,7 @@ class MessageLog:
                 else:
                     bad += 1
             if bad:
-                _log(f"dropped {bad} malformed record(s) from {path}", "warning")
+                _log(f"dropped {bad} malformed record(s) from {path}", LOG_WARNING)
             self._entries = self._entries[-limit:]
             self._sizes = {e["id"]: _json_bytes(e) for e in self._entries}
             while self.max_bytes is not None and len(self._entries) > 1 and sum(self._sizes.values()) > max_bytes:
@@ -730,18 +693,18 @@ class LxmfFeature(features.Feature):
         """Start LXMF (if enabled and installed), the announce/sync loop and the auto-fetch worker."""
         if self.config.lxmf_enabled is False:
             self.off_reason = "LXMF is off (lxmf_enabled = false)"
-            _log("off: lxmf_enabled is false", "verbose")
+            _log("off: lxmf_enabled is false", LOG_VERBOSE)
             return
         try:
             network = LxmfNetwork(self, self.config, self.node.node_id)
         except ImportError as e:
             self.off_reason = "LXMF is off: the LXMF package is not installed (pip install lxmf)"
             _log(f"the LXMF package can't be imported ({e}), so LXMF messaging is off. Install it with "
-                 f"`pip install lxmf`", "warning" if self.config.lxmf_enabled else "notice")
+                 f"`pip install lxmf`", LOG_WARNING if self.config.lxmf_enabled else LOG_NOTICE)
             return
         except Exception as e:  # noqa: BLE001 - LXMF failing must not stop the node
             self.off_reason = f"LXMF failed to start: {e}"
-            _log(f"failed to start: {e!r}", "error")
+            _log(f"failed to start: {e!r}", LOG_ERROR)
             return
         self.attach(network)
         self._requeue_auto_fetches()
@@ -749,7 +712,7 @@ class LxmfFeature(features.Feature):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
-        _log(f"LXMF address {network.address.hex()} ({network.display_name})", "notice")
+        _log(f"LXMF address {network.address.hex()} ({network.display_name})", LOG_NOTICE)
 
     def attach(self, network):
         """Use network (LxmfNetwork, or a stand-in in tests) for sending and receiving."""
@@ -767,7 +730,7 @@ class LxmfFeature(features.Feature):
             try:
                 self.network.stop()
             except Exception as e:  # noqa: BLE001
-                _log(f"stopping LXMF failed: {e!r}", "error")
+                _log(f"stopping LXMF failed: {e!r}", LOG_ERROR)
         self.save()
 
     def save(self):
@@ -810,7 +773,7 @@ class LxmfFeature(features.Feature):
                 for message_hash, state, progress in network.poll():
                     self.outbound_changed(message_hash, state, progress)
             except Exception as e:  # noqa: BLE001 - keep the loop alive
-                _log(f"loop failed: {e!r}", "error")
+                _log(f"loop failed: {e!r}", LOG_ERROR)
             self._wake.wait(TICK)
             self._wake.clear()
 
@@ -824,7 +787,7 @@ class LxmfFeature(features.Feature):
         _log(f"no propagation node is set (lxmf_propagation_node), so {consequence} and failed direct messages "
              f"aren't sent through one.{heard} To use one, set lxmf_propagation_node = \"<32 hex digits>\" to a "
              f"node you trust to hold your messages, or use `rnfs lxmf sync --nearest` / "
-             f"`rnfs send --propagate --nearest` to use the nearest one heard, once", "notice")
+             f"`rnfs send --propagate --nearest` to use the nearest one heard, once", LOG_NOTICE)
 
     # Sending
 
@@ -912,7 +875,7 @@ class LxmfFeature(features.Feature):
         if not propagate:
             with self._lock:
                 self._resend[message_hash.hex()] = (address, content, fields, nearest)
-        _log(f"queued {method} message {message_hash.hex()} to {address.hex()} with {link.uri()}", "info")
+        _log(f"queued {method} message {message_hash.hex()} to {address.hex()} with {link.uri()}", LOG_INFO)
         return {"id": entry_id, "hash": message_hash.hex(), "to": address.hex(), "method": method}
 
     def outbound_changed(self, message_hash: bytes, state: str, progress: float | None):
@@ -937,10 +900,10 @@ class LxmfFeature(features.Feature):
                                            state="outbound", progress=0.0, direct_hash=message_hash.hex(),
                                            fallback=True)
                     _log(f"direct delivery of {message_hash.hex()} failed; sending it through the propagation "
-                         f"node as {new_hash.hex()}", "notice")
+                         f"node as {new_hash.hex()}", LOG_NOTICE)
                     return
                 except Exception as e:  # noqa: BLE001
-                    values["error"] = f"propagation fallback failed: {_printable(e)}"
+                    values["error"] = f"propagation fallback failed: {fsutil.printable(e)}"
         if entry is not None:
             self.outbox.update(entry["id"], **values)
 
@@ -953,7 +916,7 @@ class LxmfFeature(features.Feature):
         if self.network is not None and message.source == self.network.address:
             return None
         if not self.accepts(message.source):
-            _log(f"ignored a message from {sender}: not in lxmf_accept_from", "verbose")
+            _log(f"ignored a message from {sender}: not in lxmf_accept_from", LOG_VERBOSE)
             return None
         message_hash = message.hash.hex()
         if self.inbox.find("hash", message_hash) is not None:
@@ -962,14 +925,14 @@ class LxmfFeature(features.Feature):
         try:
             links = decode_field(message.fields)
         except ValueError as e:
-            _log(f"ignored the malformed rnfs field of message {message_hash} from {sender}: {_printable(e)}",
-                 "verbose")
+            _log(f"ignored the malformed rnfs field of message {message_hash} from {sender}: {fsutil.printable(e)}",
+                 LOG_VERBOSE)
             links = None
         if links is None:
             # Links past the text kept count too: up to MAX_SCAN_CHARS are searched
             links = find_links(_text(message.content, MAX_SCAN_CHARS))
         if not links:
-            _log(f"message {message_hash} from {sender} has no rnfs links; not kept", "verbose")
+            _log(f"message {message_hash} from {sender} has no rnfs links; not kept", LOG_VERBOSE)
             return None
         display_name = message.display_name if isinstance(message.display_name, str) else None
         entry = {"hash": message_hash, "from": sender,
@@ -988,10 +951,10 @@ class LxmfFeature(features.Feature):
             self._release(dropped)
         if entry_id is None:
             _log(f"message {message_hash} from {sender} not kept: the inbox is full of messages holding "
-                 f"auto-fetched pins (rnfs inbox rm)", "notice")
+                 f"auto-fetched pins (rnfs inbox rm)", LOG_NOTICE)
             return None
         _log(f"message {message_hash} from {sender} with {len(entry['links'])} rnfs link(s), inbox #{entry_id}",
-             "notice")
+             LOG_NOTICE)
         if auto:
             for index in range(len(entry["links"])):
                 self._queue_auto_fetch(entry_id, index)
@@ -1060,7 +1023,7 @@ class LxmfFeature(features.Feature):
         except NotFound:
             if link.cid is None:
                 raise
-            _log(f"name {link.name.hex()} could not be resolved; using the CID it was sent with", "notice")
+            _log(f"name {link.name.hex()} could not be resolved; using the CID it was sent with", LOG_NOTICE)
             return link.cid, list(link.path)
 
     def _hints(self, link: Link) -> list[bytes | None]:
@@ -1099,10 +1062,10 @@ class LxmfFeature(features.Feature):
                 from rnfs import fsutil
                 path = os.path.join(directory, fsutil.safe_default_name(names[-1] if names else None, str(root)))
             if os.path.lexists(path):
-                raise ValueError(f"{_printable(path)} already exists; remove it or choose another with -o")
+                raise ValueError(f"{fsutil.printable(path)} already exists; remove it or choose another with -o")
             same = next((i for i, (_, other, _) in enumerate(planned) if other == path), None)
             if same is not None:
-                raise ValueError(f"links {same + 1} and {number} would both be written to {_printable(path)}: "
+                raise ValueError(f"links {same + 1} and {number} would both be written to {fsutil.printable(path)}: "
                                  f"get them one at a time with --link and -o")
             planned.append((link, path, target))
         results = []
@@ -1132,8 +1095,8 @@ class LxmfFeature(features.Feature):
             except RnfsError as e:
                 if attempt == len(hints) - 1 or os.path.lexists(path):
                     raise
-                _log(f"{from_node.hex()} could not supply {_printable(target)} ({_printable(e)}); trying "
-                     f"the DHT", "notice")
+                _log(f"{from_node.hex()} could not supply {fsutil.printable(target)} ({fsutil.printable(e)}); trying "
+                     f"the DHT", LOG_NOTICE)
         return {"target": target, "output": path, "cid": result["cid"], "warnings": result.get("warnings", [])}
 
     def _start_job(self, target: str, output: str, link: Link):
@@ -1227,22 +1190,23 @@ class LxmfFeature(features.Feature):
                 except RnfsError as e:
                     if attempt == len(hints) - 1:
                         raise
-                    _log(f"{from_node.hex()} could not supply {root} ({_printable(e)}); trying the DHT", "verbose")
+                    _log(f"{from_node.hex()} could not supply {root} ({fsutil.printable(e)}); trying the DHT",
+                         LOG_VERBOSE)
             if cid is not None:
-                _log(f"auto-fetched and pinned {cid} from inbox #{entry_id}", "notice")
+                _log(f"auto-fetched and pinned {cid} from inbox #{entry_id}", LOG_NOTICE)
             return  # pinned and recorded by _fetch_and_pin, or the message was removed meanwhile
         except fetcher.Cancelled:
-            _log(f"auto-fetch of inbox #{entry_id} link {index + 1} stopped", "verbose")
+            _log(f"auto-fetch of inbox #{entry_id} link {index + 1} stopped", LOG_VERBOSE)
             return  # still "queued" if the node is stopping: fetched at the next start
         except TooLarge as e:
             result = {"state": "refused", "error": str(e)}
         except (RnfsError, ValueError, KeyError, IndexError, TypeError) as e:
             result = {"state": "failed", "error": str(e) or type(e).__name__}
         except Exception as e:  # noqa: BLE001
-            _log(f"auto-fetch of inbox #{entry_id} failed: {e!r}", "error")
+            _log(f"auto-fetch of inbox #{entry_id} failed: {e!r}", LOG_ERROR)
             result = {"state": "failed", "error": repr(e)}
-        _log(f"auto-fetch of inbox #{entry_id} link {index + 1}: {result['state']}: {_printable(result['error'])}",
-             "notice")
+        _log(f"auto-fetch of inbox #{entry_id} link {index + 1}: {result['state']}: "
+             f"{fsutil.printable(result['error'])}", LOG_NOTICE)
         self._set_auto(entry_id, index, result)
 
     def _pin_recorded(self, entry_id: int, index: int, cid: Cid, source: str) -> bool:
@@ -1330,8 +1294,8 @@ FEATURE = LxmfFeature
 
 
 def _feature(handler) -> LxmfFeature:
-    """The lxmf feature of the handler's node."""
-    return handler.node.feature(NAME)
+    """The lxmf feature of the handler's node. NotFound if the daemon has none."""
+    return _common.feature(handler, NAME)
 
 
 def _api_address(handler):
@@ -1645,7 +1609,7 @@ class LxmfNetwork:
     def announce(self):
         """Announce the delivery destination (with the display name)."""
         self.router.announce(self.destination.hash)
-        _log(f"announced {self.address.hex()}", "verbose")
+        _log(f"announced {self.address.hex()}", LOG_VERBOSE)
 
     def stop(self):
         """Persist LXMF's state and stop listening for propagation node announces."""
@@ -1700,7 +1664,7 @@ class LxmfNetwork:
         if destination_hash != self._current_pn:
             self.router.set_outbound_propagation_node(destination_hash)
             self._current_pn = destination_hash
-            _log(f"using propagation node {destination_hash.hex()}", "info")
+            _log(f"using propagation node {destination_hash.hex()}", LOG_INFO)
 
     def sync(self, nearest: bool = False) -> bool:
         """Start downloading waiting messages from the propagation node (propagation_node(nearest)); False if
@@ -1786,7 +1750,7 @@ class LxmfNetwork:
         sizes = (resource.get_data_size(), resource.get_transfer_size())
         if resource.get_segments() != 1 or any(not isinstance(n, int) or n > MAX_PN_RESOURCE for n in sizes):
             _log(f"the propagation node sent a {sizes[0]}-byte response in {resource.get_segments()} segment(s), "
-                 f"over the {MAX_PN_RESOURCE}-byte bound; download stopped", "warning")
+                 f"over the {MAX_PN_RESOURCE}-byte bound; download stopped", LOG_WARNING)
             resource.cancel()
             resource.link.teardown()
 
@@ -1815,7 +1779,7 @@ class LxmfNetwork:
                 if not self.feature.accepts(source):
                     # received() would ignore it: holding it would only let forged sources fill the queue
                     _log(f"dropped a message from unknown sender {source.hex()}: not in lxmf_accept_from",
-                         "verbose")
+                         LOG_VERBOSE)
                     return
                 with self._lock:
                     queued = len(self._held) < HOLD_LIMIT and all(p != packed for _, p, _ in self._held)
@@ -1823,15 +1787,15 @@ class LxmfNetwork:
                         self._held.append((time.monotonic() + HOLD_TIME, packed, message.method))
                 if not queued:
                     _log(f"dropped a message from unknown sender {source.hex()}: already held, or "
-                         f"{HOLD_LIMIT} are held", "verbose")
+                         f"{HOLD_LIMIT} are held", LOG_VERBOSE)
                     return
                 self._request_path(source)
-                _log(f"holding a message from {source.hex()} until its identity is known", "verbose")
+                _log(f"holding a message from {source.hex()} until its identity is known", LOG_VERBOSE)
             else:
                 _log(f"dropped a message with an invalid signature from {bytes(message.source_hash).hex()}",
-                     "notice")
+                     LOG_NOTICE)
         except Exception as e:  # noqa: BLE001
-            _log(f"handling a received message failed: {e!r}", "error")
+            _log(f"handling a received message failed: {e!r}", LOG_ERROR)
 
     def _request_path(self, destination: bytes) -> bool:
         """Request a path to a held message's sender, at most once per HOLD_TIME per sender and within the
@@ -1870,16 +1834,16 @@ class LxmfNetwork:
                 continue
             try:
                 if not known:
-                    _log(f"dropped a message from {source.hex()}: its identity never became known", "notice")
+                    _log(f"dropped a message from {source.hex()}: its identity never became known", LOG_NOTICE)
                     continue
                 message = self.LXMF.LXMessage.unpack_from_bytes(packed)
                 message.method = method
                 if message.signature_validated:
                     self.feature.received(self._incoming(message))
                 else:
-                    _log(f"dropped a message with an invalid signature from {source.hex()}", "notice")
+                    _log(f"dropped a message with an invalid signature from {source.hex()}", LOG_NOTICE)
             except Exception as e:  # noqa: BLE001
-                _log(f"a held message could not be read: {e!r}", "verbose")
+                _log(f"a held message could not be read: {e!r}", LOG_VERBOSE)
             finally:
                 with self._lock:
                     self._held = [other for other in self._held if other is not item]

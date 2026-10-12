@@ -23,14 +23,10 @@ from rnfs.network import server
 from rnfs.node import RnfsNode
 from rnfs.publisher import DhtKey
 
-try:
-    from tests.test_names import FakeNetwork
-    from tests.test_node import NetClient
-    from tests.test_server import Clock, FakeBackend, FakeDestination, FakeLink
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
-    from test_node import NetClient
-    from test_server import Clock, FakeBackend, FakeDestination, FakeLink
+from tests.support import FakeClock
+from tests.test_names import FakeNetwork
+from tests.test_node import NetClient
+from tests.test_server import FakeBackend, FakeDestination, FakeLink
 
 A_ID, B_ID, C_ID = bytes([0xA] * 16), bytes([0xB] * 16), bytes([0xC] * 16)
 CID1 = Cid.for_block(RAW, b"one")
@@ -475,7 +471,7 @@ class NameRequestServerTest(unittest.TestCase):
         backend = FakeBackend(members={b"m" * 16})
         backend.feature_requests = lambda: {NAME_PATH: handler}
         destination = FakeDestination()
-        server.RequestServer(destination, config, backend, clock=Clock(), start_monitor=False)
+        server.RequestServer(destination, config, backend, clock=FakeClock(), start_monitor=False)
         link = FakeLink(b"l" * 16)
         destination.links.append(link)
         destination.established(link)

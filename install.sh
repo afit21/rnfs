@@ -1,23 +1,26 @@
 #!/bin/sh
-# Install, update or uninstall rnfs from the main branch on GitHub, in its own Python virtual environment.
+# Install, update or uninstall rnfs's latest release (or its main branch) from GitHub, in its own Python
+# virtual environment.
 #
 #   curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --service
-#   sh install.sh [--system] [--service] [--update | --uninstall]
+#   sh install.sh [--system] [--service] [--main] [--update | --uninstall]
 #
 # Per user (the default):   venv ~/.local/share/rnfs/venv, command ~/.local/bin/rnfs
 # --system (or as root):    venv /opt/rnfs/venv,           command /usr/local/bin/rnfs
 #
 #   --service     also install the systemd user unit and start it (system mode: install it for all users,
 #                 each then runs `systemctl --user enable --now rnfs`)
-#   --update      re-install from the latest main branch (running the installer again does the same)
+#   --main        install the main branch, which may be newer than the latest release, instead of the release
+#   --update      re-install from the latest release, or the main branch with --main (running the installer
+#                 again does the same)
 #   --uninstall   remove the venv, the command and the unit (keeps your data in ~/.rnfs)
 #   --python P    use this Python (3.11 or newer) for the venv
 #   --force       replace an existing rnfs command or systemd unit that this installer didn't make
 #                 (e.g. a pipx one)
 #
-# Environment: RNFS_SOURCE  what to install instead of the main branch: a local source directory, a
-#                           .zip/.tar.gz/.whl path or URL, or another pip requirement
+# Environment: RNFS_SOURCE  what to install instead of the latest release (overrides --main too): a local
+#                           source directory, a .zip/.tar.gz/.whl path or URL, or another pip requirement
 #              RNFS_PYTHON  same as --python
 #              RNFS_ALLOW_SOURCE_BUILDS=1  build dependencies PyPI has no wheel of for this platform (e.g.
 #                           cffi on 32-bit ARM) from their pinned, hash-checked source; the tools that build
@@ -32,8 +35,12 @@
 # are never touched.
 set -eu
 
-DEFAULT_SOURCE="https://github.com/afit21/rnfs/archive/refs/heads/main.zip"
-SOURCE=${RNFS_SOURCE:-$DEFAULT_SOURCE}
+REPO_URL="https://github.com/afit21/rnfs"
+# Without RNFS_SOURCE, this script (as served from the main branch) installs the latest release's source tree,
+# which may be older than the script. It must keep working with the layout of every release from 0.1.1 on:
+# packaging/requirements.lock and packaging/build-backend.lock, which fetch_source looks for.
+SOURCE=${RNFS_SOURCE:-}  # empty: chosen by choose_source once Python is found
+MAIN=no
 PYTHON=${RNFS_PYTHON:-}
 PYTHON_GIVEN=no
 MODE=user
@@ -50,6 +57,7 @@ while [ $# -gt 0 ]; do
         --system) MODE=system ;;
         --service) SERVICE=yes ;;
         --update) ACTION=install ;;
+        --main) MAIN=yes ;;
         --uninstall) ACTION=uninstall ;;
         --force) FORCE=yes ;;
         --python) [ $# -ge 2 ] || die "--python needs a path"; PYTHON=$2; shift ;;
@@ -253,6 +261,37 @@ WantedBy=default.target
 EOF
 }
 
+latest_release() {  # the tag of the latest release on GitHub: where releases/latest redirects (no API, no rate limit)
+    "$PYTHON" -I - "$REPO_URL" <<'EOF'
+import re, sys, urllib.parse, urllib.request
+
+repo = sys.argv[1]
+try:
+    with urllib.request.urlopen(repo + "/releases/latest", timeout=60) as response:
+        final = response.geturl()
+except OSError as e:
+    sys.exit(f"couldn't reach {repo}/releases/latest: {e}")
+prefix = repo + "/releases/tag/"
+tag = urllib.parse.unquote(final[len(prefix):]) if final.startswith(prefix) else ""
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", tag):
+    sys.exit(f"{repo}/releases/latest doesn't lead to a release (it led to {final})")
+print(tag)
+EOF
+}
+
+choose_source() {  # without RNFS_SOURCE: the latest release's source archive, or the main branch's with --main
+    [ -z "$SOURCE" ] || return 0
+    if [ "$MAIN" = yes ]; then
+        SOURCE=$REPO_URL/archive/refs/heads/main.zip
+        say "Installing the main branch, which may be newer than the latest release"
+    else
+        tag=$(latest_release) || die "couldn't find rnfs's latest release on GitHub. Check your connection, or install
+the main branch instead with --main."
+        SOURCE=$REPO_URL/archive/refs/tags/$tag.zip
+        say "Installing rnfs $tag, the latest release"
+    fi
+}
+
 # The source: a local tree, or an archive downloaded and unpacked here (by Python, so no curl/unzip needed),
 # so its packaging/requirements.lock and packaging/build-backend.lock can be used. A wheel or other pip requirement goes to pip as it is.
 
@@ -374,6 +413,7 @@ do_install() {
     find_python
     check_launcher
     check_unit
+    choose_source
     updating=no
     if venv_ok; then
         say "Updating rnfs in $VENV"
@@ -391,7 +431,8 @@ do_install() {
     # pip isn't upgraded from PyPI (that would be an unpinned download); the venv's own pip does --require-hashes
 
     # Build the wheel once, then install it: the dependencies at the versions the source's lock pins, and rnfs
-    # itself with a forced reinstall, since the main branch can change without its version number changing
+    # itself with a forced reinstall, since the main branch (or a local source) can change without its version
+    # number changing
     wheels=$(mktemp -d "${TMPDIR:-/tmp}/rnfs-install.XXXXXX")
     trap 'rm -rf "$wheels"' EXIT INT TERM
     say "Fetching and building rnfs from $SOURCE"

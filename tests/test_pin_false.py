@@ -11,10 +11,7 @@ from rnfs.content.cid import Cid
 from rnfs.content.storage import USER
 from rnfs.node import RnfsNode
 
-try:
-    from tests.test_names import FakeNetwork
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
+from tests.test_names import FakeNetwork
 
 
 class PinFalseTest(unittest.TestCase):

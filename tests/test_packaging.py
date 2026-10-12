@@ -59,6 +59,16 @@ class InstallScriptTest(unittest.TestCase):
         self.assertRegex(text, r'(?m)^if \[ -e "\$SOURCE" \]; then SOURCE=\$\(abs_path "\$SOURCE"\)')
         self.assertLess(text.index("\ncd /\n"), text.index("\ndo_install() {"))
 
+    def test_installs_the_latest_release_by_default(self):
+        """Without RNFS_SOURCE it installs the latest release's tag, or the main branch with --main."""
+        choose = shell_function("choose_source")
+        self.assertEqual(choose.splitlines()[1].strip(), '[ -z "$SOURCE" ] || return 0')  # RNFS_SOURCE wins
+        self.assertIn("SOURCE=$REPO_URL/archive/refs/tags/$tag.zip", choose)
+        self.assertIn("SOURCE=$REPO_URL/archive/refs/heads/main.zip", choose)
+        self.assertIn('"/releases/latest"', shell_function("latest_release"))
+        self.assertIn("    choose_source\n", shell_function("do_install"))
+        self.assertIn("--main) MAIN=yes ;;", read(INSTALL_SH))
+
     @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
     def test_systemd_quote(self):
         """The launcher path is one double-quoted ExecStart word with % doubled (LP-L5)."""
@@ -138,6 +148,15 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertFalse([line for line in uploads if "--clobber" in line])
         self.assertRegex(text, r"actions/attest-build-provenance@[0-9a-f]{40}")
 
+    def test_release_waits_for_the_tests(self):
+        """The release job needs the whole tests workflow, called from release.yml."""
+        release = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertRegex(release, r"(?m)^  tests:\n    uses: \./\.github/workflows/tests\.yml$")
+        needs = re.search(r"(?m)^  release:\n(?:    .*\n)*?    needs: \[(.*)\]$", release)
+        self.assertTrue(needs)
+        self.assertIn("tests", [n.strip() for n in needs.group(1).split(",")])
+        self.assertRegex(read(os.path.join(WORKFLOWS, "tests.yml")), r"(?m)^  workflow_call:")
+
 
 class DependencyLockTest(unittest.TestCase):
     """packaging/requirements.lock pins every dependency, with hashes, and the Flatpak uses only those."""
@@ -159,7 +178,7 @@ class DependencyLockTest(unittest.TestCase):
         """The build locks are hashed, agree with each other and with requirements.lock, and fit pyproject.toml."""
         backend, tools, runtime = read_lock(BACKEND_LOCK), read_lock(TOOLS_LOCK), read_lock()
         self.assertEqual(list(backend), ["setuptools"])
-        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib"):
+        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib", "ruff"):
             self.assertIn(name, tools)
         self.assertEqual(backend["setuptools"], tools["setuptools"])
         for name, (version, hashes) in [*backend.items(), *tools.items()]:
@@ -189,6 +208,21 @@ class DependencyLockTest(unittest.TestCase):
             self.assertIn(name, lock, filename)
             self.assertEqual(version, lock[name][0], filename)
             self.assertIn(source["sha256"], lock[name][1], filename)
+
+
+class ReadmeTest(unittest.TestCase):
+    """README.md's release links and file names are for the current version, so a version bump updates them."""
+
+    def test_release_links_match_version(self):
+        """Every releases/download/vX.Y.Z/ link and rnfs-X.Y.Z / rnfs_X.Y.Z file name is __version__."""
+        from rnfs import __version__
+        text = read(os.path.join(REPO, "README.md"))
+        version = r"(\d+\.\d+\.\d+[\w.]*?)"
+        found = (re.findall(r"releases/download/v%s/" % version, text)
+                 + re.findall(r"\brnfs[-_]%s(?:[-_]|\.tar\.gz)" % version, text)
+                 + re.findall(r"These links are for %s;" % version, text))
+        self.assertGreaterEqual(len(found), 10)
+        self.assertEqual(sorted(set(found)), [__version__])
 
 
 if __name__ == "__main__":

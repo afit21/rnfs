@@ -27,16 +27,10 @@ from rnfs.network import protocol
 from rnfs.node import RnfsNode
 from rnfs.publisher import KEY_MIN_INTERVAL, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher, key_interval
 
-try:
-    from tests.test_names import FakeNetwork
-    from tests.test_names_keep import KeeperNet
-    from tests.test_node import NetClient
-    from tests.test_publisher import Clock, FakeClient, FakeLookup
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
-    from test_names_keep import KeeperNet
-    from test_node import NetClient
-    from test_publisher import Clock, FakeClient, FakeLookup
+from tests.support import FakeClock
+from tests.test_names import FakeNetwork
+from tests.test_names_keep import KeeperNet
+from tests.test_publisher import FakeClient, FakeLookup
 
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)
 N1, N2 = bytes([1]) * 16, bytes([2]) * 16
@@ -184,7 +178,7 @@ class KeyCadenceTest(unittest.TestCase):
         from rnfs.content.storage import Storage
         config = Config(rnfs_dir=self.tmp.name, **settings)
         storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
-        self.clock = Clock()
+        self.clock = FakeClock(1_000_000.0)
         self.client = FakeClient()
         publisher = Publisher(bytes(16), config, storage, ProviderStore(10_000, None), self.client,
                               lambda key: FakeLookup([N1, N2]), slow_node=slow, clock=self.clock)

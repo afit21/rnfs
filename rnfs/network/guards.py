@@ -17,8 +17,9 @@ import threading
 
 import RNS
 
+from rnfs import __version__
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_RESPONSE_SIZE
-from rnfs.log import LOG_WARNING, log
+from rnfs.log import LOG_ERROR, LOG_WARNING, log
 
 # Resource data is a 4-byte random hash plus the payload, encrypted as an RNS Token: 16-byte IV, 32-byte HMAC
 # and up to 16 bytes of PKCS7 padding. 128 bytes leaves room without letting the transfer outgrow the data.
@@ -27,6 +28,8 @@ MAX_TRANSFER_SIZE = MAX_RESPONSE_SIZE + TRANSFER_OVERHEAD
 
 _lock = threading.Lock()
 _original_accept = None
+_unsupported_reported = False  # the error for an RNS whose advertisements lack t and d, logged once per process
+_ABSENT = object()
 
 
 DHT_NAME = f"{APP_NAME}.{DHT_ASPECT}"
@@ -41,9 +44,25 @@ def is_dht_link(link) -> bool:
     return isinstance(name, str) and (name == DHT_NAME or name.startswith(DHT_NAME + "."))
 
 
+def _report_unsupported():
+    """Log, once per process, that RNS's advertisements no longer have the fields the guard reads."""
+    global _unsupported_reported
+    with _lock:
+        if _unsupported_reported:
+            return
+        _unsupported_reported = True
+    log(f"this RNS version ({getattr(RNS, '__version__', 'unknown')}) isn't supported by rnfs {__version__}: "
+        f"incoming Resources are being refused", LOG_ERROR)
+
+
 def refusal(adv, link=None) -> str | None:
     """Why an unpacked ResourceAdvertisement arriving on link must be rejected, or None if it may be accepted."""
-    transfer, data = getattr(adv, "t", None), getattr(adv, "d", None)
+    transfer, data = getattr(adv, "t", _ABSENT), getattr(adv, "d", _ABSENT)
+    if transfer is _ABSENT or data is _ABSENT:
+        # Not a malformed advertisement but an RNS that renamed the fields: every Resource is refused (failing
+        # open would undo the guard), so say why, loudly
+        _report_unsupported()
+        return "malformed sizes"
     if type(transfer) is not int or type(data) is not int or transfer < 0 or data < 0:
         return "malformed sizes"
     if getattr(adv, "u", False):

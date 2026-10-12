@@ -21,10 +21,13 @@ import os
 import threading
 import time
 
+from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError
-from rnfs.features import Feature
+from rnfs.features import Feature, _common
+from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.features.keepers import FOLLOW, name_subcommands, parse_name_arg
+from rnfs.fsutil import printable
 
 NAME = "follow"
 FOLLOW_FILE = "follow.json"
@@ -46,10 +49,9 @@ def follow_source(name: bytes) -> str:
     return SOURCE_PREFIX + name.hex()
 
 
-def _log(message: str, level: str = "LOG_VERBOSE"):
-    """Log through rnfs.log (imported here: it loads RNS)."""
-    from rnfs import log
-    log.log(f"follow: {message}", getattr(log, level))
+def _log(message: str, level: int = LOG_VERBOSE):
+    """Log with this feature's prefix."""
+    _common.log(f"follow: {message}", level)
 
 
 class FollowFeature(Feature):
@@ -89,7 +91,7 @@ class FollowFeature(Feature):
                 pinned = Cid.parse(entry["pinned"]) if entry.get("pinned") is not None else None
             except (AttributeError, KeyError, TypeError, ValueError):
                 continue
-            if len(name) == 16:
+            if len(name) == ID_LENGTH:
                 self._pinned[name] = pinned
 
     def _save(self):
@@ -129,7 +131,7 @@ class FollowFeature(Feature):
             if name not in self._pinned:
                 self._pinned[name] = None
                 self._save()
-                _log(f"following name {name.hex()}", "LOG_NOTICE")
+                _log(f"following name {name.hex()}", LOG_NOTICE)
             self._failures.pop(name, None)  # asked again by the user: start the backoff afresh
             self._due[name] = (time.monotonic(), True)
         self._wake.set()
@@ -152,7 +154,7 @@ class FollowFeature(Feature):
             self._keepers.unkeep(name, FOLLOW)
         except NotFound:
             self.node.publisher.refresh()
-        _log(f"no longer following name {name.hex()}", "LOG_NOTICE")
+        _log(f"no longer following name {name.hex()}", LOG_NOTICE)
 
     def following(self) -> list[dict]:
         """Every followed name: the target pinned for it and what the last check did."""
@@ -175,7 +177,7 @@ class FollowFeature(Feature):
         with self._lock:
             if name not in self._pinned:
                 return
-            when, network = self._due.get(name, (FAR_FUTURE, False))
+            _, network = self._due.get(name, (FAR_FUTURE, False))
             self._due[name] = (time.monotonic(), network)
         self._wake.set()
 
@@ -223,10 +225,10 @@ class FollowFeature(Feature):
                         try:
                             self._save()
                         except OSError as e:  # the pins are right; follow.json catches up with the next save
-                            _log(f"saving {FOLLOW_FILE} failed: {e}", "LOG_ERROR")
+                            _log(f"saving {FOLLOW_FILE} failed: {e}", LOG_ERROR)
         except RnfsError as e:
             self._set_state(name, f"fetch of {target} failed: {e}")
-            _log(f"fetching {target} for name {name.hex()} failed: {e}", "LOG_WARNING")
+            _log(f"fetching {target} for name {name.hex()} failed: {e}", LOG_WARNING)
             return False
         if not followed:
             return True  # unfollowed while fetching: nothing was pinned
@@ -235,7 +237,7 @@ class FollowFeature(Feature):
             self.node.storage.unpin(previous, source)
         self.node.publisher.refresh()
         self._set_state(name, "current")
-        _log(f"name {name.hex()} now pinned at {target}", "LOG_NOTICE")
+        _log(f"name {name.hex()} now pinned at {target}", LOG_NOTICE)
         return True
 
     def _set_state(self, name: bytes, state: str):
@@ -259,7 +261,7 @@ class FollowFeature(Feature):
             try:
                 ok = self.check(name, network)
             except Exception as e:  # noqa: BLE001 - e.g. disk full saving: a failed check, tried again later
-                _log(f"checking name {name.hex()} failed: {e!r}", "LOG_ERROR")
+                _log(f"checking name {name.hex()} failed: {e!r}", LOG_ERROR)
                 self._set_state(name, f"check failed: {e}")
                 ok = False
             with self._lock:
@@ -283,7 +285,7 @@ class FollowFeature(Feature):
             try:
                 delay = self.run_due()
             except Exception as e:  # noqa: BLE001 - keep following
-                _log(f"checking followed names failed: {e!r}", "LOG_ERROR")
+                _log(f"checking followed names failed: {e!r}", LOG_ERROR)
                 delay = RETRY_INTERVAL
             self._wake.wait(min(delay, 60.0))
             self._wake.clear()
@@ -312,10 +314,7 @@ FEATURE = FollowFeature
 
 def _feature(handler) -> FollowFeature:
     """The node's follow feature. NotFound if the daemon has none."""
-    try:
-        return handler.node.feature(NAME)
-    except (AttributeError, KeyError):
-        raise NotFound("this daemon can't follow names") from None
+    return _common.feature(handler, NAME, "this daemon can't follow names")
 
 
 def _api_follow(handler):
@@ -336,16 +335,11 @@ def _api_following(handler):
     handler.send_json(200, {"following": _feature(handler).following()})
 
 
-def _printable(text) -> str:
-    """Escape control characters in text the daemon sent."""
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in str(text))
-
-
 def run_follow(args):
     """Follow a name."""
     import rnfs.cli
     entry = rnfs.cli.client(args).post("/api/name/follow", name=args.name)
-    print(f"following {_printable(entry['name'])}; its target is fetched and pinned in the background")
+    print(f"following {printable(entry['name'])}; its target is fetched and pinned in the background")
 
 
 def run_unfollow(args):
@@ -358,5 +352,5 @@ def run_following(args):
     """List followed names."""
     import rnfs.cli
     for entry in rnfs.cli.client(args).get("/api/name/following")["following"]:
-        print(f"{_printable(entry['name'])} {_printable(entry['pinned'] or '-')} {_printable(entry['latest'] or '-')} "
-              f"{_printable(entry['state'])}")
+        print(f"{printable(entry['name'])} {printable(entry['pinned'] or '-')} {printable(entry['latest'] or '-')} "
+              f"{printable(entry['state'])}")

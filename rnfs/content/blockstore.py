@@ -18,7 +18,7 @@ from rnfs import fsutil
 from rnfs.constants import MAX_BLOCK_SIZE
 from rnfs.content.cid import Cid
 
-PARTIAL_PREFIX = ".partial-"
+PARTIAL_PREFIX = fsutil.PARTIAL_PREFIX  # also the prefix of every other atomic write's temporary file
 
 
 class BlockStore:

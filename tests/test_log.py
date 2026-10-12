@@ -23,6 +23,12 @@ class LogTest(unittest.TestCase):
         self.assertIs(api.loggable, fsutil.printable)
         self.assertIs(cli.printable, fsutil.printable)
 
+    def test_feature_log_levels_are_rns_levels(self):
+        """rnfs.features._common names RNS's loglevels without importing RNS: they must stay the same."""
+        from rnfs.features import _common
+        for level in ("LOG_ERROR", "LOG_WARNING", "LOG_NOTICE", "LOG_INFO", "LOG_VERBOSE"):
+            self.assertEqual(getattr(_common, level), getattr(log, level), level)
+
     def test_cap_warnings(self):
         self.assertEqual(log.cap_warnings(["a", "b"]), {"warnings": ["a", "b"]})
         capped = log.cap_warnings([str(i) for i in range(log.MAX_WARNINGS + 1)])

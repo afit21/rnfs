@@ -48,35 +48,35 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 
 ### 1 - Install
 
-Different package options availible at [latest release](https://github.com/afit21/rnfs/releases/latest)
+Different package options available at [latest release](https://github.com/afit21/rnfs/releases/latest)
 
 **Windows:**
 
-[`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.1.2-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
 
 One liner for install script:
 
-```curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh```
+`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh`
 
 Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-linux-flatpak)
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-py3-none-any.whl` ([details](#macos)).
 
-### 2 - Start rnfs** and leave it running in its own terminal:
+### 2 - Start rnfs and leave it running in its own terminal:
 
 ```sh
 rnfs daemon
 ```
 
-### 3 - Connect to other nodes.** Computers on the same local network or Wi-Fi find each other automatically.
+### 3 - Connect to other nodes. Computers on the same local network or Wi-Fi find each other automatically.
 To reach nodes further away, see [Connect to a network](#2-connect-to-a-network).
 
-### 4 - Download a file**, for example one of the [sample files](#sample-files):
+### 4 - Download a file, for example one of the [sample files](#sample-files):
 
 ```sh
 rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o manifesto.pdf
@@ -85,7 +85,7 @@ rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o man
 Or open it in your browser:
 <http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=manifesto.pdf>
 
-### 5 - Share your own file:**
+### 5 - Share your own file:
 
 ```sh
 rnfs add holiday.jpg        # prints its CID: give that to anyone who should have the file
@@ -102,26 +102,26 @@ rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file f
 
 | System | Download | Install |
 |---|---|---|
-| Windows (64-bit) | [`rnfs-0.1.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-windows-x64.exe) | [Windows](#windows) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.1_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs_0.1.1_amd64.deb) or [`rnfs_0.1.1_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs_0.1.1_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
-| Other Linux (x86_64) | [`rnfs-0.1.1-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.1.1-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-py3-none-any.whl) | [macOS](#macos) |
+| Windows (64-bit) | [`rnfs-0.1.2-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-windows-x64.exe) | [Windows](#windows) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.2_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs_0.1.2_amd64.deb) or [`rnfs_0.1.2_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs_0.1.2_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
+| Other Linux (x86_64) | [`rnfs-0.1.2-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.2-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-py3-none-any.whl) | [macOS](#macos) |
 
 Every package includes Reticulum and LXMF, gives you one `rnfs` command, and keeps your data in the same
-places. The release also has the source archive (`rnfs-0.1.1.tar.gz`) and `SHA256SUMS`, to
-[check your download](#checking-a-download). These links are for 0.1.1; for a newer version, take the
+places. The release also has the source archive (`rnfs-0.1.2.tar.gz`) and `SHA256SUMS`, to
+[check your download](#checking-a-download). These links are for 0.1.2; for a newer version, take the
 same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
 
 ### Windows
 
-Download [`rnfs-0.1.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-windows-x64.exe). It is a single file that
+Download [`rnfs-0.1.2-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-windows-x64.exe). It is a single file that
 includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
 folder, put it on your PATH as `rnfs`:
 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.1.1-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.1.2-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -152,8 +152,8 @@ or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [instal
 there instead. Pick `amd64` or `arm64` to match `dpkg --print-architecture`:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs_0.1.1_amd64.deb
-sudo apt install ./rnfs_0.1.1_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs_0.1.2_amd64.deb
+sudo apt install ./rnfs_0.1.2_amd64.deb
 rnfs daemon                             # or run it in the background:
 systemctl --user enable --now rnfs      # a systemd user service; logs: journalctl --user -u rnfs -f
 ```
@@ -172,9 +172,9 @@ For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flat
 `org.freedesktop.Platform` runtime:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.1.1-x86_64.flatpak
+flatpak install --user rnfs-0.1.2-x86_64.flatpak
 flatpak run io.github.afit21.rnfs daemon
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
 ```
@@ -202,7 +202,7 @@ and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python
 ```sh
 brew install pipx
 pipx ensurepath                 # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-py3-none-any.whl     # includes Reticulum and LXMF
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-py3-none-any.whl     # includes Reticulum and LXMF
 rnfs daemon
 ```
 
@@ -228,20 +228,21 @@ Each release's `SHA256SUMS` lists the checksum of every file. Download it next t
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing          # Linux
-shasum -a 256 rnfs-0.1.1-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
+shasum -a 256 rnfs-0.1.2-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
 ```
 
 ```powershell
-Get-FileHash .\rnfs-0.1.1-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
+Get-FileHash .\rnfs-0.1.2-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
 ```
 
 ### Other ways to install
 
-These install the latest code from the main branch, which may be newer than the latest release.
+The install script installs the latest release; pipx from GitHub and a source checkout install the latest
+code from the main branch, which may be newer than the latest release.
 
 #### Install script
 
-Installs from the main branch (newer than the latest release) on any Linux distribution. You need Python 3.11 or newer with venv:
+Installs the latest release on any Linux distribution. You need Python 3.11 or newer with venv:
 
 - Debian/Ubuntu: `sudo apt install python3 python3-venv`
 - Fedora: `sudo dnf install python3`
@@ -253,19 +254,23 @@ Git isn't needed.
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 ```
 
-This installs rnfs from the main branch, with Reticulum and LXMF, into its own virtual environment at
+This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
 `~/.local/share/rnfs/venv`. Dependencies are installed at the versions pinned in the source's
 `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
 `~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --service    # also run the daemon as a systemd user service
-curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --update     # update to the latest main branch
+curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --update     # update to the latest release
+curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --main       # install the main branch instead
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --uninstall  # remove it (keeps ~/.rnfs)
 ```
 
-- **Update:** run the script again, with or without `--update`. It re-installs rnfs from the latest main
-  branch, with the dependency versions pinned there. If you installed the service, it restarts.
+- **Update:** run the script again, with or without `--update`. It re-installs rnfs from the latest
+  release (or with `--main`, the main branch), with the dependency versions pinned there. If you installed
+  the service, it restarts.
+- **Main branch:** `--main` installs the latest code from the main branch, which may be newer than the
+  latest release. Give it again each time you update, or the next update goes back to the latest release.
 - **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
   `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
   `loginctl enable-linger $USER`.
@@ -274,9 +279,9 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   This installs to `/opt/rnfs` and `/usr/local/bin/rnfs`.
 - `--python /usr/bin/python3.12` chooses the Python to use.
 - `--force` replaces an existing `~/.local/bin/rnfs`, for example one installed by pipx.
-- `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the main branch. A
-  `.whl` or other pip requirement has no lock file, so its dependencies are installed unpinned (newest),
-  with a warning.
+- `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the latest release (it
+  overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
+  installed unpinned (newest), with a warning.
 
 #### pipx from GitHub
 
@@ -291,13 +296,13 @@ Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pi
 
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
-pip install -r requirements.txt     # Reticulum and LXMF; or the pinned, hash-checked versions:
-                                    # pip install --require-hashes -r packaging/requirements.lock
-python3 rnfs.py daemon              # or python3 -m rnfs daemon; on Windows: py rnfs.py daemon
+pip install -e .                    # the rnfs command, running your working copy, with Reticulum and LXMF
+rnfs daemon
 ```
 
-`pip install -e .` installs the `rnfs` command and runs your working copy. Without it, use
-`python3 rnfs.py` wherever this README says `rnfs`.
+To get the tested, hash-checked versions of Reticulum and LXMF, run
+`pip install --require-hashes -r packaging/requirements.lock` first. Without `pip install -e .`, install them
+that way and use `python3 rnfs.py` (on Windows, `py rnfs.py`) wherever this README says `rnfs`.
 
 **Building the packages yourself.** `.github/workflows/release.yml` does this for releases. By hand:
 
@@ -866,15 +871,13 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
 `tests/test_e2e.py` sets up exactly this, with short intervals in each node's `rnfs.toml`.
-<<<<<<< HEAD
-=======
 
 ## Tests
 
 ```sh
-python3 -m unittest discover tests                  # unit tests, no network
-RNFS_E2E=1 python3 -m unittest tests.test_e2e       # real daemons over local TCP
-python3 packaging/smoke_test.py dist/rnfs           # smoke-test a built package
+python3 -m unittest discover tests                               # unit tests, no network
+RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client  # real daemons over local TCP
+python3 packaging/smoke_test.py dist/rnfs                        # smoke-test a built package
 ```
 
 To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack.
@@ -892,4 +895,3 @@ To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack
 - Windows support is new.
 
 The full list is in [design.md, Status](design.md#status).
->>>>>>> 3003517 (Add comprehensive tests for packaging, pinning, and sealing functionality)

@@ -16,20 +16,9 @@ from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUE
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
+from tests.support import FakeClock
 
 KEY = bytes(range(ID_LENGTH))
-
-
-class Clock:
-    """A clock tests move by hand."""
-
-    def __init__(self):
-        """Start at 1000 s."""
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        """The current time."""
-        return self.now
 
 
 def block_of(size: int, seed: int = 0) -> tuple[Cid, bytes]:
@@ -77,7 +66,7 @@ class ResponsePoolsTest(unittest.TestCase):
 
     def setUp(self):
         """Pools of 4 slots (2 slow, 2 fast) with 30 s slack."""
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.pools = server.ResponsePools(4, 30, self.clock)
 
     def take(self, pool, name: bytes):
@@ -133,7 +122,7 @@ class IncomingLinksTest(unittest.TestCase):
 
     def setUp(self):
         """Room for 3 links."""
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.links = server.IncomingLinks(3, self.clock, random.Random(1))
 
     def test_per_link_limits(self):
@@ -190,7 +179,7 @@ class UploadPacerTest(unittest.TestCase):
     """The next response on a link waits bytes × 8 / cap after the previous one started."""
 
     def test_wait(self):
-        clock = Clock()
+        clock = FakeClock()
         pacer = server.UploadPacer(clock)
         pacer.started(b"a", 1000, 800)  # 10 s at 800 bit/s
         clock.now += 4
@@ -199,7 +188,7 @@ class UploadPacerTest(unittest.TestCase):
         self.assertEqual(pacer.wait_time(b"a"), 0)
 
     def test_no_cap(self):
-        pacer = server.UploadPacer(Clock())
+        pacer = server.UploadPacer(FakeClock())
         pacer.started(b"a", 1000, None)
         self.assertEqual(pacer.wait_time(b"a"), 0)
 
@@ -361,7 +350,7 @@ class RequestServerTest(unittest.TestCase):
         saved = RNS.Resource.AUTO_COMPRESS_MAX_SIZE
         self.addCleanup(setattr, RNS.Resource, "AUTO_COMPRESS_MAX_SIZE", saved)
         self.identity = RNS.Identity()
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.big = [block_of(100 * KIB, i) for i in range(4)]
         self.backend = FakeBackend(blocks=dict(self.big))
         self.make_server(Config(remote_pin_identities=[self.identity.hash.hex()]))
@@ -880,6 +869,37 @@ class ResourceGuardTest(unittest.TestCase):
         packet = types.SimpleNamespace(plaintext=b"\xc1", link=None)
         RNS.Resource.accept(packet)
         self.assertEqual(self.accepted, [packet])
+
+    def test_unsupported_rns_refused_with_one_error(self):
+        """An RNS whose unpacked advertisements have no t and d (renamed fields) is still refused, failing
+        closed, and says so once per process at LOG_ERROR rather than refusing every Resource silently."""
+        import rnfs
+        lines = []
+        for patcher in (mock.patch.object(guards, "_unsupported_reported", False),
+                        mock.patch.object(guards, "log", lambda message, level: lines.append((message, level))),
+                        mock.patch.object(RNS.ResourceAdvertisement, "unpack",
+                                          lambda data: types.SimpleNamespace(transfer_size=100, data_size=100))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        packets = [self.advertisement(100, 100) for _ in range(3)]
+        for packet in packets:
+            self.assertIsNone(RNS.Resource.accept(packet))
+        self.assertEqual(guards.refusal(types.SimpleNamespace(d=100)), "malformed sizes")
+        self.assertEqual((self.accepted, self.rejected), ([], packets))
+        errors = [message for message, level in lines if level == RNS.LOG_ERROR]
+        self.assertEqual(errors, [f"this RNS version ({RNS.__version__}) isn't supported by rnfs "
+                                  f"{rnfs.__version__}: incoming Resources are being refused"])
+        self.assertEqual(len(lines), 4)  # and the usual warning per refused Resource
+
+    def test_invalid_sizes_are_not_an_unsupported_rns(self):
+        lines = []
+        for patcher in (mock.patch.object(guards, "_unsupported_reported", False),
+                        mock.patch.object(guards, "log", lambda message, level: lines.append((message, level)))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for transfer, data in ((None, 100), ("100", 100), (-1, 100), (100, True)):
+            self.assertEqual(guards.refusal(types.SimpleNamespace(t=transfer, d=data)), "malformed sizes")
+        self.assertEqual(lines, [])
 
 
 class CompressionSettingTest(unittest.TestCase):

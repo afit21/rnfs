@@ -14,7 +14,7 @@ import RNS
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
-from rnfs.content.storage import USER, remote_source
+from rnfs.content.storage import remote_source
 from rnfs import fetcher
 from rnfs.errors import InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.features.keepers import name_key
@@ -22,11 +22,7 @@ from rnfs.network.client import OK, BlocksResult
 from rnfs import fsutil, node as node_module
 from rnfs.node import RnfsNode
 from tests.support import POSIX_MODES
-
-try:
-    from tests.test_names import FakeNetwork
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
+from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
 PROVIDE_BATCH = 22  # keys per /provide at the default MDU (section 3)

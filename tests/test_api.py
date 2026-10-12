@@ -4,8 +4,10 @@ FakeNode is shared with test_gateway.py and test_cli.py.
 """
 import hashlib
 import http.client
+import inspect
 import json
 import os
+import select
 import socket
 import tempfile
 import threading
@@ -17,6 +19,7 @@ from rnfs import cli, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
+from tests.support import wait_for
 
 LocalServer.poll_interval = 0.01  # so each test's server stops at once
 
@@ -51,6 +54,11 @@ class FakeNode:
     def called(self, method) -> list[tuple]:
         """The (args, kwargs) of every call to method."""
         return [(args, kwargs) for name, args, kwargs in self.calls if name == method]
+
+    def _given(self, method: str, **options) -> dict:
+        """The options not at the facade method's defaults: recorded only when a caller sets them."""
+        parameters = inspect.signature(getattr(FakeNode, method)).parameters
+        return {name: value for name, value in options.items() if value != parameters[name].default}
 
     # Building content
 
@@ -143,8 +151,10 @@ class FakeNode:
 
     # Facade
 
-    def add_path(self, path, wrap=False, only_hash=False):
-        self.record("add_path", path, wrap=wrap, only_hash=only_hash)
+    def add_path(self, path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True,
+                 chunker=None):
+        self.record("add_path", path, wrap=wrap, only_hash=only_hash,
+                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
         if not os.path.isabs(path):
             raise ValueError("path must be absolute")
         if not os.path.exists(path):
@@ -152,24 +162,26 @@ class FakeNode:
         cid = self._add_tree(path)
         if wrap:
             cid = self.put_dir({os.path.basename(path): cid})
-        if not only_hash:
+        if pin and not only_hash:
             self.pins.setdefault(cid, set()).add("user")
         return {"cid": cid, "size": self._size(cid), "warnings": ["skipped a symlink"] if wrap else []}
 
-    def add_stream(self, stream, size=None, name=None, only_hash=False):
+    def add_stream(self, stream, size=None, name=None, only_hash=False, pin=True, to=None, to_self=False,
+                   seal_name=None, chunker=None):
         data = stream.read()
-        self.record("add_stream", data, size=size, name=name, only_hash=only_hash)
+        self.record("add_stream", data, size=size, name=name, only_hash=only_hash,
+                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
         if size is not None and len(data) != size:
             raise ValueError("stream shorter than its size")
         cid = self.put_file(data)
         if name:
             cid = self.put_dir({name: cid})
-        if not only_hash:
+        if pin and not only_hash:
             self.pins.setdefault(cid, set()).add("user")
         return {"cid": cid, "size": len(data), "warnings": []}
 
-    def get(self, target, output, from_node=None):
-        self.record("get", target, output, from_node=from_node)
+    def get(self, target, output, from_node=None, raw=False):  # nothing is sealed here, so raw changes nothing
+        self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw))
         cid = self._resolve(target)
 
         def write(cid, dest):
@@ -184,15 +196,16 @@ class FakeNode:
         write(cid, output)
         return {"cid": cid, "warnings": []}
 
-    def info(self, target, for_gateway=False, from_node=None):
-        self.record("info", target, for_gateway=for_gateway, from_node=from_node)
+    def info(self, target, for_gateway=False, from_node=None, raw=False):
+        self.record("info", target, for_gateway=for_gateway, from_node=from_node, **self._given("info", raw=raw))
         cid = self._resolve(target)
         obj = self.objects[cid]
         return {"cid": cid, "type": "file" if obj[0] == "file" else "directory", "size": self._size(cid),
                 "executable": obj[0] == "file" and obj[2]}
 
-    def read(self, target, offset=0, length=None, for_gateway=False, from_node=None):
-        self.record("read", target, offset=offset, length=length, for_gateway=for_gateway, from_node=from_node)
+    def read(self, target, offset=0, length=None, for_gateway=False, from_node=None, raw=False):
+        self.record("read", target, offset=offset, length=length, for_gateway=for_gateway, from_node=from_node,
+                    **self._given("read", raw=raw))
         cid = self._resolve(target)
         obj = self.objects[cid]
         if obj[0] != "file":
@@ -506,6 +519,32 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.call("POST", "/api/add", b"not json")[0], 400)
         self.assertEqual(self.call("POST", "/api/add", b"[1]")[0], 400)
 
+    def test_add_seal_name_must_be_a_boolean(self):
+        """For /api/add seal_name says whether to seal the name: only JSON true and false are accepted, since a
+        string like "false" would count as true, and 1 == True in Python. Absent or null: the facade's default."""
+        self.node.add_path = mock.Mock(return_value={"cid": "x", "size": 0, "warnings": []})
+        path = os.path.join(tempfile.gettempdir(), "f.txt")
+        for value in (True, False):
+            self.node.add_path.reset_mock()
+            self.ok("POST", "/api/add", {"path": path, "to_self": True, "seal_name": value})
+            self.assertIs(self.node.add_path.call_args.kwargs["seal_name"], value)
+        for body in ({"path": path, "to_self": True}, {"path": path, "to_self": True, "seal_name": None}):
+            self.node.add_path.reset_mock()
+            self.ok("POST", "/api/add", body)
+            self.assertNotIn("seal_name", self.node.add_path.call_args.kwargs)
+        self.node.add_path.reset_mock()
+        for value in ("false", 1, 0, "true", [], {}):
+            status, _, data = self.call("POST", "/api/add", {"path": path, "to_self": True, "seal_name": value})
+            self.assertEqual(status, 400, value)
+            self.assertEqual(json.loads(data)["error"], "seal_name must be true or false")
+        self.node.add_path.assert_not_called()
+
+    def test_add_stream_seal_name_is_the_name(self):
+        """For /api/add/stream seal_name is the name sealed inside, a string, as before."""
+        self.node.add_stream = mock.Mock(return_value={"cid": "x", "size": 0, "warnings": []})
+        self.ok("POST", "/api/add/stream?to_self=1&seal_name=false", b"hello")
+        self.assertEqual(self.node.add_stream.call_args.kwargs["seal_name"], "false")
+
     def test_add_stream_content_length(self):
         result = self.ok("POST", "/api/add/stream?name=a.txt&only_hash=1", b"hello world")
         (data,), kwargs = self.node.called("add_stream")[0]
@@ -684,6 +723,11 @@ def held_connections(port: int, count: int, data: bytes = b"GET /") -> list[sock
     return connections
 
 
+def free_slots(server: LocalServer) -> int:
+    """How many more connections server would serve now (its slots semaphore's count)."""
+    return server.server.slots._value
+
+
 class ConnectionTest(ApiTestCase):
     """Time limits and the connection cap, with short limits so the tests are quick."""
 
@@ -762,7 +806,7 @@ class ConnectionTest(ApiTestCase):
         held = held_connections(self.port, 3)
         for sock in held:
             self.addCleanup(sock.close)
-        time.sleep(0.1)  # let the server accept them
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == 0))  # the server has accepted them
         status, headers, data = self.call("GET", "/api/status")
         self.assertEqual(status, 503)
         self.assertIn("too many", json.loads(data)["error"])
@@ -771,7 +815,7 @@ class ConnectionTest(ApiTestCase):
         # The held connections time out, freeing their slots
         for sock in held:
             read_until_closed(sock)
-        time.sleep(0.1)
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == self.LIMITS["max_connections"]))
         self.assertEqual(self.call("GET", "/api/status")[0], 200)
 
     def test_log_escapes_the_target(self):
@@ -849,7 +893,8 @@ class EarlyResponseTest(ApiTestCase):
         self.addCleanup(sock.close)
         sock.sendall(f"POST /api/add/stream HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
                      f"Content-Length: {len(body)}\r\n\r\n".encode() + body[:16384])
-        time.sleep(0.3)  # the server answers and closes its side meanwhile
+        # The server answers, and closes its side, before reading the body
+        self.assertTrue(select.select([sock], [], [], 10)[0], "no response")
         try:
             sock.sendall(body[16384:])  # the rest of the body arrives after the response was sent
         except OSError:

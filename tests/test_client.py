@@ -7,7 +7,6 @@ The integration test runs this file as a script in two subprocesses, each with i
 import json
 import os
 import random
-import socket
 import subprocess
 import sys
 import tempfile
@@ -26,6 +25,7 @@ from rnfs.content.cid import RAW, Cid  # noqa: E402
 from rnfs.network import client, links, protocol  # noqa: E402
 
 import tests.test_links as fakes  # noqa: E402  (a module, so its test cases don't run twice)
+from tests.support import free_port  # noqa: E402
 
 NODE = bytes(16)
 KEY = bytes(range(16))
@@ -314,13 +314,6 @@ CLIENT_CONFIG = """
 
 E2E_BLOCKS = [(60_000, seed) for seed in range(4)] + [(500, 99)]  # sizes and seeds of the served blocks
 E2E_MISSING = 1234  # seed of a block nobody serves
-
-
-def free_port() -> int:
-    """A local TCP port that is currently free."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def start_reticulum(configdir: str):

@@ -2,6 +2,33 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.2
+
+Maintenance release from the fourth audit: fixes, release guardrails and internal consolidation. No format,
+protocol, CLI or config changes.
+
+Fixes:
+- `POST /api/add` refuses a `seal_name` that isn't `true` or `false` (a string like `"false"` used to seal the
+  name anyway). `/api/add/stream`, where `seal_name` is the name, is unchanged.
+- `names.json`, name keys and the API token are written durably (file and directory synced, unique temp
+  file), like the other state files.
+- The README's Tests and Known limitations sections are restored (0.1.1 shipped them inside a merge
+  conflict), and its download links point at the current release.
+
+Dependencies and install:
+- rns is limited to <1.6 and lxmf to <1.3; a test checks every RNS/LXMF internal rnfs relies on, and the
+  daemon logs an error if incoming Resource advertisements no longer look as rnfs expects.
+- install.sh installs the latest release instead of the main branch (`--main` for the old behaviour).
+- requirements.txt is gone: install from source with `pip install -e .`, or hash-checked from
+  packaging/requirements.lock.
+- Python 3.14 is tested in CI and covered by the build locks.
+
+Development:
+- CI lints with ruff and rejects merge-conflict markers; releases run the full test matrix before
+  publishing.
+- Shared test fakes live in tests/support.py; a contract test keeps the API tests' fake node in step with
+  RnfsNode.
+
 ## 0.1.1
 
 Fixes from the third audit.

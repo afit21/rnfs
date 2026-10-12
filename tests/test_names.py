@@ -14,7 +14,7 @@ from rnfs.config import Config
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import NotFound
 from rnfs.names import NameManager, encode_record, parse_record
-from tests.support import POSIX_MODES
+from tests.support import POSIX_MODES, FakeClock
 
 _saved_loglevel = RNS.loglevel
 
@@ -133,18 +133,6 @@ class FakeNetwork:
             handler.received_announce(destination_hash=name, announced_identity=None, app_data=app_data)
 
 
-class Clock:
-    """A settable clock, used for both wall and monotonic time."""
-
-    def __init__(self, now=1_000_000.0):
-        """Start at now."""
-        self.now = now
-
-    def __call__(self) -> float:
-        """The current time."""
-        return self.now
-
-
 def other_name(i: int) -> bytes:
     """A name that isn't local."""
     return bytes([i]) * 16
@@ -190,7 +178,7 @@ class NamesTestCase(unittest.TestCase):
                              announce_interval=3600, startup_announce_delay=30)
         self.pins = FakePins()
         self.network = FakeNetwork()
-        self.clock = Clock()
+        self.clock = FakeClock(1_000_000.0)
         self.manager = self.make_manager()
 
     def make_manager(self) -> NameManager:
@@ -288,6 +276,18 @@ class KeyTest(NamesTestCase):
         """A new manager over the same directory loads the same names."""
         name = self.manager.create("site")
         self.assertEqual(self.make_manager().name("site"), name)
+
+    def test_old_temp_files_removed_at_start(self):
+        """Temp files 0.1.1's interrupted writes left under fixed names are deleted; nothing else is."""
+        self.manager.create("site")
+        old = [os.path.join(self.config.state_dir, "names.json.tmp"), os.path.join(self.config.names_dir, ".gone.tmp")]
+        kept = [os.path.join(self.config.names_dir, name) for name in (".notes", "x.tmp")]
+        for path in old + kept:
+            with open(path, "wb") as f:
+                f.write(b"partial")
+        self.assertEqual(self.make_manager().list()[0]["alias"], "site")
+        self.assertEqual([os.path.exists(path) for path in old + kept], [False, False, True, True])
+        self.assertEqual(sorted(os.listdir(self.config.state_dir)), ["names.json"])  # no temp file of its own
 
     def test_export_import_round_trip(self):
         """An exported key imported elsewhere gives the same name."""

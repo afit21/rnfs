@@ -17,7 +17,6 @@ clamped to now on load and at each expire(); otherwise such records would outliv
 import json
 import os
 import random
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -343,20 +342,11 @@ class ProviderStore:
                 self._dirty = False
             directory = os.path.dirname(os.path.abspath(self.state_path))
             os.makedirs(directory, exist_ok=True)
-            fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".providers-", suffix=".tmp")
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(state, f, separators=(",", ":"))
-                    f.flush()
-                    os.fsync(f.fileno())
-                fsutil.replace(temp_path, self.state_path)
+                fsutil.write_atomic(self.state_path, json.dumps(state, separators=(",", ":")).encode(), mode=0o600)
             except BaseException:
                 with self._lock:
                     self._dirty = True  # try again next time
-                try:
-                    fsutil.remove(temp_path)
-                except OSError:
-                    pass
                 raise
 
     def _load(self):
