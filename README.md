@@ -291,13 +291,13 @@ Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pi
 
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
-pip install -r requirements.txt     # Reticulum and LXMF; or the pinned, hash-checked versions:
-                                    # pip install --require-hashes -r packaging/requirements.lock
-python3 rnfs.py daemon              # or python3 -m rnfs daemon; on Windows: py rnfs.py daemon
+pip install -e .                    # the rnfs command, running your working copy, with Reticulum and LXMF
+rnfs daemon
 ```
 
-`pip install -e .` installs the `rnfs` command and runs your working copy. Without it, use
-`python3 rnfs.py` wherever this README says `rnfs`.
+To get the tested, hash-checked versions of Reticulum and LXMF, run
+`pip install --require-hashes -r packaging/requirements.lock` first. Without `pip install -e .`, install them
+that way and use `python3 rnfs.py` (on Windows, `py rnfs.py`) wherever this README says `rnfs`.
 
 **Building the packages yourself.** `.github/workflows/release.yml` does this for releases. By hand:
 

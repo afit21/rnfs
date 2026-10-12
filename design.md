@@ -508,8 +508,9 @@ Everything in the specification is implemented, with these simplifications and a
   `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
   `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
   a manual run only builds. The Windows exe isn't code-signed, and unpacks itself on each start.
-  - `lxmf>=1.2.0` is a regular dependency next to `rns>=1.5.6` (`pyproject.toml`, `requirements.txt`), so
-    every install includes LXMF; the PyInstaller spec fails the build without it.
+  - `lxmf>=1.2.0,<1.3` is a regular dependency next to `rns>=1.5.6,<1.6` (`pyproject.toml`), so every
+    install includes LXMF; the PyInstaller spec fails the build without it. The upper bounds keep unpinned
+    installs off RNS and LXMF releases rnfs hasn't been tested with, since it relies on some of their internals.
   - `packaging/requirements.lock` pins the tested versions (rns 1.5.6, lxmf 1.2.0, cryptography 50.0.2,
     cffi 2.1.1, pycparser 3.0, pyserial 3.5) with the sha256 of every file PyPI has for each.
     `python3 -I packaging/update-lock.py [pkg==ver …]` regenerates it (no arguments: the newest versions
