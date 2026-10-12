@@ -20,12 +20,8 @@ from rnfs.features import contacts
 from rnfs.features.contacts import check_nick, is_nick, node_arg
 from rnfs.node import RnfsNode
 
-try:
-    from tests.test_names import FakeNetwork
-    from tests.test_node import NetClient
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
-    from test_node import NetClient
+from tests.test_names import FakeNetwork
+from tests.test_node import NetClient
 
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)
 

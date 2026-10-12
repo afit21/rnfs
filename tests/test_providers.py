@@ -10,6 +10,7 @@ from unittest import mock
 from rnfs import fsutil
 from rnfs.constants import DAY, ID_LENGTH, K, PROVIDER_TTL
 from rnfs.dht.providers import MIN_PER_PUBLISHER, ProviderStore
+from tests.support import FakeClock
 
 
 def ident(n: int) -> bytes:
@@ -20,18 +21,6 @@ def ident(n: int) -> bytes:
 KEY = ident(0xABC)
 
 
-class FakeClock:
-    """A manually advanced wall clock."""
-
-    def __init__(self):
-        """Clock at an arbitrary start time; tests advance it by setting now."""
-        self.now = 1_700_000_000.0
-
-    def __call__(self) -> float:
-        """The current fake time."""
-        return self.now
-
-
 class StoreTestCase(unittest.TestCase):
     """Base: an in-memory store with a fake clock and seeded rng."""
 
@@ -39,7 +28,7 @@ class StoreTestCase(unittest.TestCase):
 
     def setUp(self):
         """Create the store."""
-        self.clock = FakeClock()
+        self.clock = FakeClock(1_700_000_000.0)
         self.store = ProviderStore(self.max_records, None, clock=self.clock, rng=random.Random(1))
 
 
@@ -329,7 +318,7 @@ class PersistenceTest(unittest.TestCase):
         """A temporary state directory."""
         self.directory = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.directory.name, "state", "providers.json")
-        self.clock = FakeClock()
+        self.clock = FakeClock(1_700_000_000.0)
 
     def tearDown(self):
         """Remove the state directory."""

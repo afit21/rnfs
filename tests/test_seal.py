@@ -14,12 +14,8 @@ from rnfs.content.seal import SEGMENT_SIZE, NotRecipient, SealError
 from rnfs.errors import TooLarge
 from rnfs.node import RnfsNode
 
-try:
-    from tests.test_names import FakeNetwork
-    from tests.test_node import NetClient
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
-    from test_node import NetClient
+from tests.test_names import FakeNetwork
+from tests.test_node import NetClient
 
 ALICE, BOB, CAROL = RNS.Identity(), RNS.Identity(), RNS.Identity()
 

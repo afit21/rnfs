@@ -10,10 +10,7 @@ from rnfs.errors import NotFound
 from rnfs.gateway import (CSP_NO_SCRIPTS, CSP_SCRIPTS, IMMUTABLE, GatewayServer, etag_matches, listing_html,
                           parse_range, sniff)
 
-try:
-    from tests.test_api import FakeNode, held_connections, raw_request, read_until_closed
-except ImportError:  # run from inside tests/
-    from test_api import FakeNode, held_connections, raw_request, read_until_closed
+from tests.test_api import FakeNode, held_connections, raw_request, read_until_closed
 
 SPEC_CSP = ("sandbox allow-scripts allow-forms allow-popups; default-src 'self' 'unsafe-inline' 'unsafe-eval' "
             "data: blob:; form-action 'self'")

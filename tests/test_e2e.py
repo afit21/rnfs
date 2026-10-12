@@ -4,17 +4,19 @@ A hub with transport enabled and three nodes connected to it: A and B (DHT serve
 Each has its own --dir, API port and gateway port, and short intervals in its rnfs.toml. Takes about a minute.
 """
 import filecmp
+import functools
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 import urllib.error
 import urllib.request
+
+from tests import support
+from tests.support import free_port
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN = os.path.join(ROOT, "rnfs.py")
@@ -64,22 +66,8 @@ lookup_timeout = 30
 """
 
 
-def free_port() -> int:
-    """A local TCP port that is currently free."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def wait_for(condition, timeout: float, what: str):
-    """Poll condition until it returns something truthy and return that; fail after timeout seconds."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = condition()
-        if result:
-            return result
-        time.sleep(0.5)
-    raise AssertionError(f"timed out waiting for {what}")
+# Every poll here runs the CLI or calls a daemon's API, so poll every half second
+wait_for = functools.partial(support.wait_for, interval=0.5)
 
 
 def same_tree(a: str, b: str) -> bool:

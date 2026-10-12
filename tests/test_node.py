@@ -22,11 +22,7 @@ from rnfs.network.client import OK, BlocksResult
 from rnfs import fsutil, node as node_module
 from rnfs.node import RnfsNode
 from tests.support import POSIX_MODES
-
-try:
-    from tests.test_names import FakeNetwork
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
+from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
 PROVIDE_BATCH = 22  # keys per /provide at the default MDU (section 3)

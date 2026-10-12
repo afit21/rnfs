@@ -3,7 +3,6 @@ import contextlib
 import http.server
 import io
 import os
-import socket
 import stat
 import subprocess
 import sys
@@ -15,21 +14,10 @@ from unittest import mock
 from rnfs import cli, fsutil
 from rnfs.api import ApiServer
 from rnfs.content.cid import RAW, Cid
-from tests.support import CAN_SYMLINK, POSIX_MODES, real
-
-try:
-    from tests.test_api import FakeNode
-except ImportError:  # run from inside tests/
-    from test_api import FakeNode
+from tests.support import CAN_SYMLINK, POSIX_MODES, free_port, real
+from tests.test_api import FakeNode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def free_port() -> int:
-    """A local port nothing is listening on."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class CliTestCase(unittest.TestCase):

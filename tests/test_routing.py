@@ -6,6 +6,7 @@ import unittest
 from rnfs.config import Config
 from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
 from rnfs.dht.routing import RoutingTable, distance
+from tests.support import FakeClock
 
 OWN_ID = bytes(ID_LENGTH)
 ANNOUNCE = 6 * 3600
@@ -14,18 +15,6 @@ ANNOUNCE = 6 * 3600
 def node_id(n: int) -> bytes:
     """The node ID whose big-endian value is n."""
     return n.to_bytes(ID_LENGTH, "big")
-
-
-class FakeClock:
-    """A manually advanced clock."""
-
-    def __init__(self):
-        """Clock at an arbitrary start time; tests advance it by setting now."""
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        """The current fake time."""
-        return self.now
 
 
 def bucket_ids(bucket: int, count: int) -> list[bytes]:

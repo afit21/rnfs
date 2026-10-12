@@ -15,10 +15,7 @@ from rnfs.content import builder, chunker, dag, walker
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
 
-try:
-    from tests.test_names import FakeNetwork
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
+from tests.test_names import FakeNetwork
 
 # Fixed by the specification text: every implementation must produce these
 VECTOR_LENGTHS = [68012, 67020, 76641, 76118, 65772, 99649, 18749, 68089, 81228, 74064, 66952, 86699, 75467,

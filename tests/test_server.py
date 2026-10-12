@@ -16,20 +16,9 @@ from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUE
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
+from tests.support import FakeClock
 
 KEY = bytes(range(ID_LENGTH))
-
-
-class Clock:
-    """A clock tests move by hand."""
-
-    def __init__(self):
-        """Start at 1000 s."""
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        """The current time."""
-        return self.now
 
 
 def block_of(size: int, seed: int = 0) -> tuple[Cid, bytes]:
@@ -77,7 +66,7 @@ class ResponsePoolsTest(unittest.TestCase):
 
     def setUp(self):
         """Pools of 4 slots (2 slow, 2 fast) with 30 s slack."""
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.pools = server.ResponsePools(4, 30, self.clock)
 
     def take(self, pool, name: bytes):
@@ -133,7 +122,7 @@ class IncomingLinksTest(unittest.TestCase):
 
     def setUp(self):
         """Room for 3 links."""
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.links = server.IncomingLinks(3, self.clock, random.Random(1))
 
     def test_per_link_limits(self):
@@ -190,7 +179,7 @@ class UploadPacerTest(unittest.TestCase):
     """The next response on a link waits bytes × 8 / cap after the previous one started."""
 
     def test_wait(self):
-        clock = Clock()
+        clock = FakeClock()
         pacer = server.UploadPacer(clock)
         pacer.started(b"a", 1000, 800)  # 10 s at 800 bit/s
         clock.now += 4
@@ -199,7 +188,7 @@ class UploadPacerTest(unittest.TestCase):
         self.assertEqual(pacer.wait_time(b"a"), 0)
 
     def test_no_cap(self):
-        pacer = server.UploadPacer(Clock())
+        pacer = server.UploadPacer(FakeClock())
         pacer.started(b"a", 1000, None)
         self.assertEqual(pacer.wait_time(b"a"), 0)
 
@@ -361,7 +350,7 @@ class RequestServerTest(unittest.TestCase):
         saved = RNS.Resource.AUTO_COMPRESS_MAX_SIZE
         self.addCleanup(setattr, RNS.Resource, "AUTO_COMPRESS_MAX_SIZE", saved)
         self.identity = RNS.Identity()
-        self.clock = Clock()
+        self.clock = FakeClock()
         self.big = [block_of(100 * KIB, i) for i in range(4)]
         self.backend = FakeBackend(blocks=dict(self.big))
         self.make_server(Config(remote_pin_identities=[self.identity.hash.hex()]))

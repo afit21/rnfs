@@ -21,16 +21,10 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.features import jobs
 from rnfs.node import RnfsNode
-from tests.support import real
-
-try:
-    from tests.test_node import A_ID, B_ID, NetClient
-    from tests.test_names import FakeNetwork
-    from tests.test_api import FakeNode
-except ImportError:  # run from inside tests/
-    from test_node import A_ID, B_ID, NetClient
-    from test_names import FakeNetwork
-    from test_api import FakeNode
+from tests.support import real, wait_for
+from tests.test_api import FakeNode
+from tests.test_names import FakeNetwork
+from tests.test_node import A_ID, B_ID, NetClient
 
 _saved_loglevel = RNS.loglevel
 
@@ -43,16 +37,6 @@ def setUpModule():
 def tearDownModule():
     """Restore RNS's loglevel."""
     RNS.loglevel = _saved_loglevel
-
-
-def wait_for(condition, timeout: float = 10.0) -> bool:
-    """Poll condition until true or timeout; its last value."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(0.02)
-    return bool(condition())
 
 
 class GatedClient(NetClient):

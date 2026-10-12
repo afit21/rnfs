@@ -22,12 +22,8 @@ from rnfs.features import lxmf
 from rnfs.features.lxmf import FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE, Incoming, Link, MessageLog
 from rnfs.node import RnfsNode
 
-try:
-    from tests.test_names import FakeNetwork
-    from tests.test_node import NetClient
-except ImportError:  # run from inside tests/
-    from test_names import FakeNetwork
-    from test_node import NetClient
+from tests.test_names import FakeNetwork
+from tests.test_node import NetClient
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)

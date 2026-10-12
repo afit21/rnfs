@@ -17,12 +17,8 @@ from rnfs.errors import NotFound
 from rnfs.gateway import CSP_SCRIPTS, GatewayServer
 from rnfs.node import RnfsNode
 
-try:
-    from tests.test_api import raw_request, read_until_closed
-    from tests.test_names import FakeNetwork
-except ImportError:  # run from inside tests/
-    from test_api import raw_request, read_until_closed
-    from test_names import FakeNetwork
+from tests.test_api import raw_request, read_until_closed
+from tests.test_names import FakeNetwork
 
 
 class FormatTest(unittest.TestCase):
