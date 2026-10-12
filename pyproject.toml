@@ -32,3 +32,10 @@ include = ["rnfs*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "rnfs.__init__.__version__"}  # not "rnfs": setuptools would find rnfs.py
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["packaging/flatpak"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "B006", "B008", "B904"]  # pyflakes, syntax errors, mutable/call defaults, raise-from

@@ -519,9 +519,9 @@ Everything in the specification is implemented, with these simplifications and a
     release's flatpak-sources step fails if regenerating changes the committed files. The sdist includes the
     lock.
   - `update-lock.py --build pyinstaller==<ver>` writes `build-backend.lock` (setuptools, within
-    `pyproject.toml`'s `<85` bound) and `build-tools.lock` (build, twine, PyInstaller, setuptools and their
-    dependencies), hashed the same way. Every build installs these with `--require-hashes` and builds without
-    build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
+    `pyproject.toml`'s `<85` bound) and `build-tools.lock` (build, twine, PyInstaller, setuptools, ruff and
+    their dependencies), hashed the same way. Every build installs these with `--require-hashes` and builds
+    without build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
     `build-backend.lock`. `build-deb.sh` fails if a supported Python has no cffi backend, caps `python3` below
     3.15, and writes a DEP-5 `copyright` and `md5sums`.
   - `install.sh` unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
