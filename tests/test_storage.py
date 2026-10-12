@@ -224,6 +224,19 @@ class PinTest(StorageTest):
             storage_module.write_json(os.path.join(self.tmp.name, "state", "x.json"), {"a": 1})
         self.assertEqual(events, ["fsync", "rename", "fsync"])
 
+    def test_state_file_format(self):
+        path = os.path.join(self.tmp.name, "state", "x.json")
+        value = {"é": ["\ud800", 1]}  # a lone surrogate is written as its escape either way
+        for ensure_ascii, expected in ((True, b'{"\\u00e9": ["\\ud800", 1]}'),
+                                       (False, b'{"\xc3\xa9": ["\\ud800", 1]}')):
+            with self.subTest(ensure_ascii=ensure_ascii):
+                storage_module.write_json(path, value, ensure_ascii=ensure_ascii)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), expected)
+                if POSIX_MODES:
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["x.json"])  # no temporary file left
+
     @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX permission bits")
     def test_state_dir_is_private(self):
         self.assertEqual(os.stat(os.path.join(self.tmp.name, "state")).st_mode & 0o777, 0o700)

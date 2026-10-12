@@ -32,7 +32,6 @@ import os
 import re
 import signal
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -417,37 +416,8 @@ def _json_bytes(value) -> int:
 def _write_json(path: str, value):
     """Write value as UTF-8 JSON (non-ASCII as is, not as 6-byte escapes) to path atomically and durably: a
     power loss leaves the old or the new file whole (an emptied inbox would leave lxmf: pins nothing releases)."""
-    from rnfs import fsutil
-    directory = os.path.dirname(path)
-    fd, partial = tempfile.mkstemp(prefix=".partial-", dir=directory)
-    try:
-        # backslashreplace: a lone surrogate (e.g. in an error text) is written as its JSON escape
-        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
-            json.dump(value, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        fsutil.replace(partial, path)
-    except BaseException:
-        try:
-            fsutil.remove(partial)
-        except OSError:
-            pass
-        raise
-    _sync_directory(directory)
-
-
-def _sync_directory(directory: str):
-    """fsync a directory so a rename in it is durable; best effort (Windows can't open a directory)."""
-    try:
-        fd = os.open(directory or ".", os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    from rnfs.content.storage import write_json
+    write_json(path, value, ensure_ascii=False)
 
 
 class MessageLog:

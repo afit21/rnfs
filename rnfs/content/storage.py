@@ -19,7 +19,6 @@ import json
 import os
 import re
 import shutil
-import tempfile
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -78,23 +77,12 @@ def remote_source(identity_hash: bytes | str) -> str:
     return REMOTE_PREFIX + text
 
 
-def write_json(path: str, value):
-    """Write value as JSON to path atomically and durably (temporary file synced to disk, then renamed)."""
-    directory = os.path.dirname(path)
-    fd, partial = tempfile.mkstemp(prefix=".partial-", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(value, f)
-            f.flush()
-            os.fsync(f.fileno())  # else a power loss can leave path empty once renamed
-        fsutil.replace(partial, path)  # retried on Windows while read_json has path open
-    except BaseException:
-        try:
-            fsutil.remove(partial)
-        except OSError:
-            pass
-        raise
-    fsutil.sync_directory(directory or ".")
+def write_json(path: str, value, ensure_ascii: bool = True):
+    """Write value as JSON to path atomically and durably (temporary file synced to disk, then renamed), readable
+    by its owner only. With ensure_ascii False, non-ASCII characters are written as UTF-8 rather than escaped."""
+    # backslashreplace: a lone surrogate, which ensure_ascii False leaves as is, is written as its JSON escape
+    data = json.dumps(value, ensure_ascii=ensure_ascii).encode("utf-8", "backslashreplace")
+    fsutil.write_atomic(path, data, mode=0o600)  # the rename is retried on Windows while read_json has path open
 
 
 def read_json(path: str, shape: Callable[[object], bool] | None = None):
