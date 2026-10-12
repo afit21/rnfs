@@ -237,11 +237,12 @@ Get-FileHash .\rnfs-0.1.1-windows-x64.exe          # Windows: compare with the l
 
 ### Other ways to install
 
-These install the latest code from the main branch, which may be newer than the latest release.
+The install script installs the latest release; pipx from GitHub and a source checkout install the latest
+code from the main branch, which may be newer than the latest release.
 
 #### Install script
 
-Installs from the main branch (newer than the latest release) on any Linux distribution. You need Python 3.11 or newer with venv:
+Installs the latest release on any Linux distribution. You need Python 3.11 or newer with venv:
 
 - Debian/Ubuntu: `sudo apt install python3 python3-venv`
 - Fedora: `sudo dnf install python3`
@@ -253,19 +254,23 @@ Git isn't needed.
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 ```
 
-This installs rnfs from the main branch, with Reticulum and LXMF, into its own virtual environment at
+This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
 `~/.local/share/rnfs/venv`. Dependencies are installed at the versions pinned in the source's
 `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
 `~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --service    # also run the daemon as a systemd user service
-curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --update     # update to the latest main branch
+curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --update     # update to the latest release
+curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --main       # install the main branch instead
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --uninstall  # remove it (keeps ~/.rnfs)
 ```
 
-- **Update:** run the script again, with or without `--update`. It re-installs rnfs from the latest main
-  branch, with the dependency versions pinned there. If you installed the service, it restarts.
+- **Update:** run the script again, with or without `--update`. It re-installs rnfs from the latest
+  release (or with `--main`, the main branch), with the dependency versions pinned there. If you installed
+  the service, it restarts.
+- **Main branch:** `--main` installs the latest code from the main branch, which may be newer than the
+  latest release. Give it again each time you update, or the next update goes back to the latest release.
 - **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
   `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
   `loginctl enable-linger $USER`.
@@ -274,9 +279,9 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   This installs to `/opt/rnfs` and `/usr/local/bin/rnfs`.
 - `--python /usr/bin/python3.12` chooses the Python to use.
 - `--force` replaces an existing `~/.local/bin/rnfs`, for example one installed by pipx.
-- `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the main branch. A
-  `.whl` or other pip requirement has no lock file, so its dependencies are installed unpinned (newest),
-  with a warning.
+- `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the latest release (it
+  overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
+  installed unpinned (newest), with a warning.
 
 #### pipx from GitHub
 

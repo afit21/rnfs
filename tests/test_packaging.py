@@ -59,6 +59,16 @@ class InstallScriptTest(unittest.TestCase):
         self.assertRegex(text, r'(?m)^if \[ -e "\$SOURCE" \]; then SOURCE=\$\(abs_path "\$SOURCE"\)')
         self.assertLess(text.index("\ncd /\n"), text.index("\ndo_install() {"))
 
+    def test_installs_the_latest_release_by_default(self):
+        """Without RNFS_SOURCE it installs the latest release's tag, or the main branch with --main."""
+        choose = shell_function("choose_source")
+        self.assertEqual(choose.splitlines()[1].strip(), '[ -z "$SOURCE" ] || return 0')  # RNFS_SOURCE wins
+        self.assertIn("SOURCE=$REPO_URL/archive/refs/tags/$tag.zip", choose)
+        self.assertIn("SOURCE=$REPO_URL/archive/refs/heads/main.zip", choose)
+        self.assertIn('"/releases/latest"', shell_function("latest_release"))
+        self.assertIn("    choose_source\n", shell_function("do_install"))
+        self.assertIn("--main) MAIN=yes ;;", read(INSTALL_SH))
+
     @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
     def test_systemd_quote(self):
         """The launcher path is one double-quoted ExecStart word with % doubled (LP-L5)."""

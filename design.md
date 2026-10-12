@@ -89,7 +89,8 @@ rnfs/
     follow.py         followed names (section 9)
     contacts.py       address book (section 11)
     lxmf.py           rnfs: URIs, LXMF send/inbox/outbox/auto-fetch (section 13)
-install.sh            Linux installer: venv, command, optional systemd user unit; --update, --uninstall
+install.sh            Linux installer of the latest release (or --main): venv, command, optional systemd user
+                      unit; --update, --uninstall
 contrib/              rnfs.service (systemd user), io.github.afit21.rnfs.plist (launchd), install-windows-task.ps1
 packaging/            requirements.lock (hash-pinned runtime dependencies), update-lock.py (regenerates it),
                       build-deb.sh, flatpak/ (manifest, wheels generated from the lock), pyinstaller/ (one-file exe),
@@ -525,7 +526,11 @@ Everything in the specification is implemented, with these simplifications and a
     without build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
     `build-backend.lock`. `build-deb.sh` fails if a supported Python has no cffi backend, caps `python3` below
     3.15, and writes a DEP-5 `copyright` and `md5sums`.
-  - `install.sh` unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
+  - `install.sh` installs the latest release's source archive (`archive/refs/tags/<tag>.zip`, the tag taken
+    from where `releases/latest` redirects, so no GitHub API), the main branch's with `--main`, or
+    `RNFS_SOURCE`. Since the script on `main` installs older release trees, it must keep working with every
+    release's layout from 0.1.1 on (`packaging/requirements.lock`, `packaging/build-backend.lock`).
+    It unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
     locks; a `.whl` or other requirement has none, so it warns and installs dependencies unpinned. It installs
     wheels only (`RNFS_ALLOW_SOURCE_BUILDS=1` builds missing ones from hashed sources with unpinned build
     tools), builds rnfs in a separate venv with the locked setuptools, sets `umask 022` in system mode, and
