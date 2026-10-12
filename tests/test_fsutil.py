@@ -206,7 +206,8 @@ class WriteAtomicTest(unittest.TestCase):
         self.assertFalse(os.path.islink(self.path))
         self.assert_only_file(b"new")
 
-    @unittest.skipUnless(CAN_SYMLINK, "symlinks")
+    # Windows has no O_NOFOLLOW, and O_EXCL there creates a dangling symlink's target (as mkstemp would)
+    @unittest.skipUnless(CAN_SYMLINK and fsutil.O_NOFOLLOW, "symlinks and O_NOFOLLOW")
     def test_refuses_a_symlink_at_the_temporary_name(self):
         # Someone able to guess the name plants a symlink there: it is neither followed nor removed
         temp = os.path.join(self.tmp.name, fsutil.PARTIAL_PREFIX + "planted")

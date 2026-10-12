@@ -353,7 +353,8 @@ class BackendTest(NodeTest):
         self.assertTrue(self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), True))
         source = remote_source(IDENTITY)
         self.assertTrue(self.wait_for(lambda: source in self.a.storage.pins().get(Cid.parse(cid), set())))
-        self.assertIn(Cid.parse(cid), self.a.publisher.provided())
+        # The worker refreshes the publisher just after pinning
+        self.assertTrue(self.wait_for(lambda: Cid.parse(cid) in self.a.publisher.provided()))
         self.assertTrue(self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), False))
         self.assertEqual(self.a.storage.pins(), {})
 

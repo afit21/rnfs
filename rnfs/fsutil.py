@@ -132,9 +132,10 @@ def _temp_path(directory: str) -> str:
 def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = True, exclusive: bool = False):
     """Replace path with data, so a crash or power loss leaves the old or the new file whole. Raises OSError.
 
-    data goes to a new temporary file in path's directory (O_EXCL and O_NOFOLLOW: never an existing file or
-    symlink, created with mode, which the umask can only narrow), synced to disk and renamed over path (retried
-    on Windows while path is in use); a symlink at path is replaced, not written through. If durable, the
+    data goes to a new temporary file in path's directory (O_EXCL, plus O_NOFOLLOW where it exists, i.e. not on
+    Windows: never an existing file or symlink; created with mode, which the umask can only narrow), synced to
+    disk and renamed over path (retried on Windows while path is in use); a symlink at path is replaced, not
+    written through. If durable, the
     directory is then synced so the rename survives a power loss too. With exclusive, an existing path is kept
     and FileExistsError raised instead. On any failure before the rename the temporary file is removed and path
     is left as it was.
