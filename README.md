@@ -1,9 +1,38 @@
-# RNFS - Reticulum Network File System
+# 🌍 RNFS - Reticulum Network File System
 
-Share files over [Reticulum](https://reticulum.network) networks: LoRa radio, Wi-Fi, local networks or the
-Internet. Add a file and rnfs gives you a short code for it, a **CID**. Anyone on the network can download
-the file with that code, from any node that has it, and rnfs checks that every byte is exactly what you
-shared.
+**A decentralized file system built over [Reticulum](https://reticulum.network). Based on IPFS (InterPlanetary File System).**
+
+Share files over LoRa radio, Wi-Fi, local networks or the internet without relying on a an authorative server for file hosting or lookups.
+Access any file on RNFS by it's **'CID'**. CID's are a base32 encoded hash of the file.
+
+***Example:*** The communist Manifesto PDF - ```bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya```
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
+[![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
+
+## Why Use RNFS?
+
+RNFS provides a number of benefits compared to other 'torrenting for RNS' or file hosting projects.
+
+### Distributed Hash Table (Kademlia) 🗺️
+
+The Kademlia algorithm is used to build a distributed dictionary of who has which files. This means you only need to know the CID of a file to download it. Because the global 'phone book' is decentralized, there is zero reliance on trackers, or for the torrent file to be up to date as long as at least one other node has pinned (is seeding) the file.
+
+The other benefit here is that there's no need for announces after the initial announce. Even when publishing files.
+
+### Only a file or folder's unique CID is required for download 📂
+
+Instead of a torrent file or similar, a CID is all that's needed to retrieve or share a file. The CID never changes.
+
+Every file in a folder has it's own CID which can be pinned (seeded) independently of the whole folder.
+
+File duplication on the file system is not an issue by design because CIDs are hashes, not random tokens. Two people publishing the same file would produce the same CID.
+
+***Other (less exciting) features:***
+
+* ***🌐Nodes automatically split up lookup data between themselves -*** Lookup 'Kademlia' for more in depth information, however all nodes on the RNFS network will take responsibility for remembering a part of the overall 'address book' of nodes and a list of which files they host. Assignment of the information is automatic.
+* ***🌱 Automatically find seeders -*** No file of known seeders is needed, RNFS will automatically ask it's peers "who has this file". Kademlia is very efficient at doing this. In a 1 million node network, this would only take 6 hops to find a seeder.
 
 ## Quick start
 
