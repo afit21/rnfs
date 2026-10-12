@@ -30,7 +30,6 @@ from rnfs.publisher import KEY_MIN_INTERVAL, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUP
 from tests.support import FakeClock
 from tests.test_names import FakeNetwork
 from tests.test_names_keep import KeeperNet
-from tests.test_node import NetClient
 from tests.test_publisher import FakeClient, FakeLookup
 
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)

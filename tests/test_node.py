@@ -14,7 +14,7 @@ import RNS
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
-from rnfs.content.storage import USER, remote_source
+from rnfs.content.storage import remote_source
 from rnfs import fetcher
 from rnfs.errors import InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.features.keepers import name_key
