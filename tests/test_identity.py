@@ -38,7 +38,7 @@ class IdentityFileTest(unittest.TestCase):
         self.assertEqual(os.listdir(self.directory), ["identity"])  # no temp file left behind
 
     def test_saved_without_fchmod(self):
-        # os.fchmod doesn't exist on Windows before Python 3.13; mkstemp's 0600 needs no chmod anyway
+        # os.fchmod doesn't exist on Windows before Python 3.13; creating the file 0600 needs no chmod anyway
         with mock.patch("os.fchmod", create=True, side_effect=AssertionError("fchmod called")):
             created = load_or_create_identity(self.path)
         self.assertEqual(load_or_create_identity(self.path).hash, created.hash)

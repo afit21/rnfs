@@ -1,7 +1,6 @@
 """Node identities: the RNS key pair a node keeps across restarts, and the node IDs derived from it."""
 import os
 import stat
-import tempfile
 
 import RNS
 
@@ -38,31 +37,17 @@ def save_identity(identity: RNS.Identity, path: str, replace: bool = True) -> bo
     meanwhile. Not Identity.to_file, which creates the file with the process umask (often group- or
     world-readable) and could leave a truncated key behind if interrupted.
     """
-    directory = os.path.dirname(os.path.abspath(path))
-    # mkstemp creates the file with O_CREAT | O_EXCL and mode 0600 (IDENTITY_MODE), which a umask can only
-    # narrow, so no chmod is needed (and os.fchmod doesn't exist on Windows before Python 3.13). On Windows
-    # the file inherits the rnfs dir's ACL instead: under the user's profile, only them, admins and SYSTEM
-    fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".identity-", suffix=".tmp")
+    # The file is created with O_CREAT | O_EXCL and mode 0600 (IDENTITY_MODE), which a umask can only narrow,
+    # so no chmod is needed (and os.fchmod doesn't exist on Windows before Python 3.13). On Windows the file
+    # inherits the rnfs dir's ACL instead: under the user's profile, only them, admins and SYSTEM. Without
+    # replace, rename_new keeps an existing file atomically where the platform allows (hard link,
+    # RENAME_NOREPLACE)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(identity.get_private_key())
-            f.flush()
-            os.fsync(f.fileno())
+        fsutil.write_atomic(path, identity.get_private_key(), mode=IDENTITY_MODE, exclusive=not replace)
+    except FileExistsError:
         if replace:
-            fsutil.replace(temp_path, path)
-        else:
-            try:
-                fsutil.rename_new(temp_path, path)  # atomic where the platform allows (hard link, RENAME_NOREPLACE)
-            except FileExistsError:
-                fsutil.remove(temp_path)
-                return False
-        fsutil.sync_directory(directory)  # the new name survives a power cut, not just the key's bytes
-    except BaseException:
-        try:
-            fsutil.remove(temp_path)
-        except OSError:
-            pass
-        raise
+            raise
+        return False
     return True
 
 
