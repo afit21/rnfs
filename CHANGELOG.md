@@ -2,7 +2,7 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## Unreleased (0.1.2)
+## 0.1.2
 
 Maintenance release from the fourth audit: fixes, release guardrails and internal consolidation. No format,
 protocol, CLI or config changes.
