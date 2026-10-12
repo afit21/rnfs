@@ -48,35 +48,35 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 
 ### 1 - Install
 
-Different package options availible at [latest release](https://github.com/afit21/rnfs/releases/latest)
+Different package options available at [latest release](https://github.com/afit21/rnfs/releases/latest)
 
 **Windows:**
 
-[`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.1.1-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
 
 One liner for install script:
 
-```curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh```
+`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh`
 
 Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-linux-flatpak)
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.1/rnfs-0.1.1-py3-none-any.whl` ([details](#macos)).
 
-### 2 - Start rnfs** and leave it running in its own terminal:
+### 2 - Start rnfs and leave it running in its own terminal:
 
 ```sh
 rnfs daemon
 ```
 
-### 3 - Connect to other nodes.** Computers on the same local network or Wi-Fi find each other automatically.
+### 3 - Connect to other nodes. Computers on the same local network or Wi-Fi find each other automatically.
 To reach nodes further away, see [Connect to a network](#2-connect-to-a-network).
 
-### 4 - Download a file**, for example one of the [sample files](#sample-files):
+### 4 - Download a file, for example one of the [sample files](#sample-files):
 
 ```sh
 rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o manifesto.pdf
@@ -85,7 +85,7 @@ rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o man
 Or open it in your browser:
 <http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=manifesto.pdf>
 
-### 5 - Share your own file:**
+### 5 - Share your own file:
 
 ```sh
 rnfs add holiday.jpg        # prints its CID: give that to anyone who should have the file
@@ -866,15 +866,13 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
 `tests/test_e2e.py` sets up exactly this, with short intervals in each node's `rnfs.toml`.
-<<<<<<< HEAD
-=======
 
 ## Tests
 
 ```sh
-python3 -m unittest discover tests                  # unit tests, no network
-RNFS_E2E=1 python3 -m unittest tests.test_e2e       # real daemons over local TCP
-python3 packaging/smoke_test.py dist/rnfs           # smoke-test a built package
+python3 -m unittest discover tests                               # unit tests, no network
+RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client  # real daemons over local TCP
+python3 packaging/smoke_test.py dist/rnfs                        # smoke-test a built package
 ```
 
 To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack.
@@ -892,4 +890,3 @@ To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack
 - Windows support is new.
 
 The full list is in [design.md, Status](design.md#status).
->>>>>>> 3003517 (Add comprehensive tests for packaging, pinning, and sealing functionality)

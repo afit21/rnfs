@@ -46,7 +46,7 @@ rnfs.py, rnfs/__main__.py   entry points (python3 rnfs.py, python3 -m rnfs); the
 rnfs/
   constants.py config.py errors.py log.py          shared foundation
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
-  content/            no RNS dependency
+  content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
     dag.py            DAG node encoding, strict decoding, names (section 5)
     chunker.py        fixed and FastCDC chunkers; chunker.using(name) picks one per context (section 5)
@@ -204,7 +204,7 @@ out within `link_idle_timeout`.
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
-| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool}]` |
+| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names), its shared-folder entry, or a directory's single entry or entry count |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
@@ -371,6 +371,20 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 
 The API and gateway run one thread per connection, capped (32 and 64).
 
+Locks are taken in this order, never the reverse: `names._lock` → `publisher._lock` → `node._lock` →
+`storage._lock`. `NameManager.publish`, `remove` and `release_gone` pin and unpin, and so call
+`publisher.refresh()`, while holding the names lock; `Publisher.refresh` recomputes what is provided under its
+own lock, reading the node's fetched targets (`node._lock`) and walking the pins' DAGs (`storage._lock`); the
+node reads storage under its lock (`_prune_fetched`). This is how the code behaves today, not a design goal.
+Slow work that runs while a lock is held:
+
+- `Publisher.refresh` walks every pin's DAG (memoised) under the publisher lock, behind the names lock when a
+  name changes, so an RNS thread delivering a name announce can wait behind a full recompute.
+- `Storage.evict`, `gc` and `verify` check every pin and cached target for completeness (`dag_blocks`,
+  memoised, reading blocks from disk) under the storage lock; `evict` and `gc` also delete blocks under it.
+  `verify` re-reads the blocks themselves outside it.
+- `RnfsNode._note_fetched` and `_prune_fetched` write `fetched.json`, synced to disk, under the node lock.
+
 ## State files
 
 Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to disk: `pins.json`, `cache.json`
@@ -390,12 +404,11 @@ and a resumed job removes one left by a crash.
 
 ## Tests
 
-`python3 -m unittest discover tests` runs unit tests with no network. `RNFS_E2E=1 python3 -m unittest tests.test_e2e`
-starts real daemons over local TCP. Debugging: `kill -USR1 <daemon pid>` prints every thread's stack.
-Feature tests live in their own files (`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`,
-`test_seal.py`, `test_chunker.py`, `test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and
-`test_e2e.py` has a marked block per feature. CI (`.github/workflows/tests.yml`) runs them on Linux, macOS and
-Windows; `packaging/smoke_test.py` checks a built package (`--version`, `--help`, daemon and status).
+How to run the tests is in [README.md, Tests](README.md#tests). Feature tests live in their own files
+(`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`, `test_seal.py`, `test_chunker.py`,
+`test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and `test_e2e.py` has a marked block per
+feature. CI (`.github/workflows/tests.yml`) runs them on Linux, macOS and Windows; `packaging/smoke_test.py`
+checks a built package (`--version`, `--help`, daemon and status).
 
 ## Status
 

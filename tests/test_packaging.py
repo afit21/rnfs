@@ -191,5 +191,20 @@ class DependencyLockTest(unittest.TestCase):
             self.assertIn(source["sha256"], lock[name][1], filename)
 
 
+class ReadmeTest(unittest.TestCase):
+    """README.md's release links and file names are for the current version, so a version bump updates them."""
+
+    def test_release_links_match_version(self):
+        """Every releases/download/vX.Y.Z/ link and rnfs-X.Y.Z / rnfs_X.Y.Z file name is __version__."""
+        from rnfs import __version__
+        text = read(os.path.join(REPO, "README.md"))
+        version = r"(\d+\.\d+\.\d+[\w.]*?)"
+        found = (re.findall(r"releases/download/v%s/" % version, text)
+                 + re.findall(r"\brnfs[-_]%s(?:[-_]|\.tar\.gz)" % version, text)
+                 + re.findall(r"These links are for %s;" % version, text))
+        self.assertGreaterEqual(len(found), 10)
+        self.assertEqual(sorted(set(found)), [__version__])
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
