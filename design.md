@@ -505,9 +505,9 @@ Everything in the specification is implemented, with these simplifications and a
   propagation node is used unless configured (or asked for with `--nearest`).
 - **Packaging.** Release artifacts (`.deb` for amd64/arm64, x86_64 Flatpak, Windows x64 exe, wheel and sdist)
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
-  `__version__` publishes them, with `SHA256SUMS` and signed build provenance (`gh attestation verify`), never
-  replacing files already attached; a manual run only builds. The Windows exe isn't code-signed, and unpacks
-  itself on each start.
+  `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
+  `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
+  a manual run only builds. The Windows exe isn't code-signed, and unpacks itself on each start.
   - `lxmf>=1.2.0` is a regular dependency next to `rns>=1.5.6` (`pyproject.toml`, `requirements.txt`), so
     every install includes LXMF; the PyInstaller spec fails the build without it.
   - `packaging/requirements.lock` pins the tested versions (rns 1.5.6, lxmf 1.2.0, cryptography 50.0.2,

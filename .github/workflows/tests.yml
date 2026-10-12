@@ -2,7 +2,9 @@ name: tests
 
 on:
   push:
+    branches: ["**"]  # not tags: the release workflow runs these jobs itself before publishing
   pull_request:
+  workflow_call:  # from release.yml, which grants no more than contents: read
 
 # Read-only token: these jobs only check out and test the code
 permissions:
@@ -16,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:

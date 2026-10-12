@@ -138,6 +138,15 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertFalse([line for line in uploads if "--clobber" in line])
         self.assertRegex(text, r"actions/attest-build-provenance@[0-9a-f]{40}")
 
+    def test_release_waits_for_the_tests(self):
+        """The release job needs the whole tests workflow, called from release.yml."""
+        release = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertRegex(release, r"(?m)^  tests:\n    uses: \./\.github/workflows/tests\.yml$")
+        needs = re.search(r"(?m)^  release:\n(?:    .*\n)*?    needs: \[(.*)\]$", release)
+        self.assertTrue(needs)
+        self.assertIn("tests", [n.strip() for n in needs.group(1).split(",")])
+        self.assertRegex(read(os.path.join(WORKFLOWS, "tests.yml")), r"(?m)^  workflow_call:")
+
 
 class DependencyLockTest(unittest.TestCase):
     """packaging/requirements.lock pins every dependency, with hashes, and the Flatpak uses only those."""

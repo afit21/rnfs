@@ -16,6 +16,11 @@ permissions:
 # Build tools come from packaging/build-tools.lock and the build backend from it (or build-backend.lock) with
 # --require-hashes, and builds run without build isolation, so nothing unpinned is fetched for a build.
 jobs:
+  # The whole tests workflow (unit and end-to-end tests on every OS and Python, lint, packaging smoke tests);
+  # the release waits for it
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   version:
     runs-on: ubuntu-latest
     outputs:
@@ -49,12 +54,8 @@ jobs:
       - name: Install the build tools (packaging/build-tools.lock, hash-checked)
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock
+      # twine check and the sdist's contents are checked in the tests job (tests.yml's packaging job)
       - run: python -m build --no-isolation
-      - run: twine check dist/*
-      - name: Check the sdist leaves out the tests, but has the dependency lock (install.sh uses it)
-        run: |
-          ! tar tzf dist/rnfs-*.tar.gz | grep -q '/tests/'
-          tar tzf dist/rnfs-*.tar.gz | grep -q '/packaging/requirements.lock$'
       - name: Smoke test the wheel (with the locked dependencies)
         run: |
           python -m venv /tmp/wheel-venv
@@ -212,7 +213,7 @@ jobs:
   release:
     # Only for a pushed tag: a manual run builds the artifacts without publishing, even when started on a tag
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, python, deb, flatpak, windows]
+    needs: [tests, version, python, deb, flatpak, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release

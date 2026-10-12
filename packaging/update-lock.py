@@ -57,7 +57,7 @@ BUILD_PLATFORMS = {  # sys_platform: (marker values, wheel platform tags accepte
               ("manylinux", "linux_x86_64")),
     "win32": ({"os_name": "nt", "platform_system": "Windows", "platform_machine": "AMD64"}, ("win_amd64",)),
 }
-BUILD_PYTHONS = ["3.11", "3.12", "3.13"]
+BUILD_PYTHONS = ["3.11", "3.12", "3.13", "3.14"]
 BUILD_RESOLVE_ARGS = ["--only-binary=:all:", "--implementation", "cp", "--python-version", "3.12",
                       "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64",
                       "--platform", "manylinux2014_x86_64"]
