@@ -40,7 +40,8 @@ import time
 from collections import deque
 from contextlib import ExitStack
 
-from rnfs.features import Feature
+from rnfs.features import Feature, _common
+from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 
 NAME = "jobs"
 JOBS_FILE = "jobs.json"
@@ -62,10 +63,9 @@ _JOB_ID = re.compile(r"[0-9a-f]{8}")
 _NODE_ID = re.compile(r"[0-9a-f]{32}")
 
 
-def _log(message: str, level: str = "LOG_INFO"):
-    """Log through rnfs.log, imported here since it loads RNS."""
-    from rnfs import log
-    log.log(f"jobs: {message}", getattr(log, level))
+def _log(message: str, level: int = LOG_INFO):
+    """Log with this feature's prefix."""
+    _common.log(f"jobs: {message}", level)
 
 
 class Job:
@@ -293,7 +293,7 @@ class JobsFeature(Feature):
             try:
                 job = Job.from_record(record)
             except (ValueError, TypeError, OverflowError) as e:
-                _log(f"ignoring a saved job ({e})", "LOG_WARNING")
+                _log(f"ignoring a saved job ({e})", LOG_WARNING)
                 continue
             if job.id in self._jobs:
                 continue
@@ -333,7 +333,7 @@ class JobsFeature(Feature):
         try:
             self.save()
         except OSError as e:
-            _log(f"saving {self._path} failed: {e!r}", "LOG_ERROR")
+            _log(f"saving {self._path} failed: {e!r}", LOG_ERROR)
 
     def _cap_finished(self):
         """Forget the oldest finished jobs beyond max_finished_jobs (lock held, or before any thread runs).
@@ -387,7 +387,7 @@ class JobsFeature(Feature):
         try:
             self.save()  # only if something changed: offline test nodes with no jobs write nothing
         except OSError as e:
-            _log(f"saving {self._path} failed: {e!r}", "LOG_ERROR")
+            _log(f"saving {self._path} failed: {e!r}", LOG_ERROR)
 
     def status(self) -> dict:
         """Running and queued job counts for `rnfs status`."""
@@ -433,7 +433,7 @@ class JobsFeature(Feature):
             error = str(e) or type(e).__name__
         except Exception as e:  # noqa: BLE001 - a job's failure mustn't take its thread's bookkeeping with it
             error = str(e) or type(e).__name__
-            _log(f"job {job.id} ({job.kind} {job.target}) failed: {e!r}", "LOG_ERROR")
+            _log(f"job {job.id} ({job.kind} {job.target}) failed: {e!r}", LOG_ERROR)
         self._finish(job, state, error, result)
 
     def _execute(self, job: Job) -> dict:
@@ -467,7 +467,7 @@ class JobsFeature(Feature):
             try:
                 remove_partial(partial)  # stored blocks stay, so a retry or resume writes it out again quickly
             except OSError as e:  # the job's own error matters more; the next run tries again
-                _log(f"job {job.id}: removing {partial} failed: {e!r}", "LOG_WARNING")
+                _log(f"job {job.id}: removing {partial} failed: {e!r}", LOG_WARNING)
             raise
         with self._lock:
             job.output = output
@@ -485,7 +485,7 @@ class JobsFeature(Feature):
             if from_node is None or not job.fallback_dht or isinstance(e, (fetcher.Cancelled, TooLarge, StorageFull)):
                 raise
             _log(f"job {job.id}: getting {job.target} from {job.from_node} failed ({e}); trying the DHT",
-                 "LOG_NOTICE")
+                 LOG_NOTICE)
         remove_partial(path)
         return self.node.get(job.target, path)
 
@@ -656,11 +656,7 @@ def remove_partial(path: str):
 
 def _feature(handler) -> JobsFeature:
     """The node's job manager. Raises NotFound if the node has none (clients then fall back)."""
-    try:
-        return handler.node.feature(NAME)
-    except (AttributeError, KeyError):
-        from rnfs.errors import NotFound
-        raise NotFound("this daemon has no job manager") from None
+    return _common.feature(handler, NAME, "this daemon has no job manager")
 
 
 def api_start(handler):

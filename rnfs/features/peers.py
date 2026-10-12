@@ -12,7 +12,8 @@ import math
 import time
 
 from rnfs import mesh
-from rnfs.features import Feature
+from rnfs.features import Feature, _common
+from rnfs.fsutil import printable
 
 NAME = "peers"
 
@@ -156,12 +157,12 @@ class PeersFeature(Feature):
 
 def _api_peers(handler):
     """GET /api/peers: {"peers": [...]}."""
-    handler.send_json(200, {"peers": handler.node.feature(NAME).peers()})
+    handler.send_json(200, {"peers": _common.feature(handler, NAME).peers()})
 
 
 def _api_stats(handler):
     """GET /api/stats: traffic totals, refusals and per-interface bytes."""
-    handler.send_json(200, handler.node.feature(NAME).stats())
+    handler.send_json(200, _common.feature(handler, NAME).stats())
 
 
 # Output (no RNS here: the CLI must not load it)
@@ -209,8 +210,8 @@ def format_peers(peers: list[dict], now: float) -> list[str]:
         rate = human_rate(peer["rate"]) if peer["link"] else "-"
         interface = (peer.get("interface") or "-")[:20]
         flags = (" banned" if peer["banned"] else "") + (f" bad:{peer['bad']}" if peer.get("bad") else "")
-        lines.append(f"{_printable(peer['node_id']):<32} {_printable(peer['mode'] or '?'):<7} {table:>6} "
-                     f"{peer['hops'] if peer['hops'] is not None else '?':>4} {_printable(interface):<20} "
+        lines.append(f"{printable(peer['node_id']):<32} {printable(peer['mode'] or '?'):<7} {table:>6} "
+                     f"{peer['hops'] if peer['hops'] is not None else '?':>4} {printable(interface):<20} "
                      f"{rate:>10} {heard:>6} {human_size(peer['sent']):>9} {human_size(peer['received']):>9} "
                      f"{peer['failed']:>5}{flags}")
     return lines
@@ -229,14 +230,9 @@ def format_stats(stats: dict) -> list[str]:
         lines.append(f"upload budget: {human_size(stats.get('upload_budget_left'))} left of "
                      f"{human_size(stats['upload_budget'])} per hour")
     for name, counters in sorted(stats["interfaces"].items()):
-        lines.append(f"interface {_printable(name)}: sent {human_size(counters['sent'])}, "
+        lines.append(f"interface {printable(name)}: sent {human_size(counters['sent'])}, "
                      f"received {human_size(counters['received'])}")
     return lines
-
-
-def _printable(text: str) -> str:
-    """Interface names come from config files and remote-chosen spawned names: escape control characters."""
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in str(text))
 
 
 def run_peers(args):

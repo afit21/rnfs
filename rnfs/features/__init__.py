@@ -9,7 +9,7 @@ Rules for feature modules:
   its parser, and client commands must not pay for loading RNS. Import it inside functions.
 - The constructor must be cheap and must not need Reticulum, so tests can build an offline node.
 - API handlers take the ApiHandler and use its helpers (param, json_body, send_json); they reach the
-  feature through `handler.node.feature(NAME)`. Every feature route requires the API token.
+  feature through `_common.feature(handler, NAME)`. Every feature route requires the API token.
 - CLI commands are added with the `command(subparsers, name, run, help)` helper the CLI passes in, and run
   functions talk to the daemon with `rnfs.cli.client(args)` (import rnfs.cli inside the function).
 """
