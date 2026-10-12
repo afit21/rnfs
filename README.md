@@ -15,14 +15,28 @@ Access any file on RNFS by it's **'CID'**.
 [![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
 
+**Contents**
+
+[Install](#install) · [Sample files](#sample-files) · [Getting started](#getting-started) ·
+[How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
+[Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
+[Tests](#tests) · [Known limitations](#known-limitations) ·
+[specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
+
 </div>
 
 ## Why Use RNFS?
 
 RNFS provides a number of benefits compared to other 'torrenting for RNS' or file hosting projects.
 
-***Key Features:***
-* ***📃 Share File With A Single Line (CID) -*** To fetch a file, all someone needs it's a 'CID'. For example; The communist Manifesto PDF - ```bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya```
+### Key Features
+
+***📃 Share File With A Single Line (CID) -*** To fetch a file, all someone needs it's a 'CID'. For example: The communist Manifesto PDF - ```bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya```
+
+<p align="center">
+<img width="500" alt="rnfs-cid" src="https://github.com/user-attachments/assets/01a4b717-9647-4df1-a924-254f92031141" />
+</p>
+
 * ***🔖 Names (links that can change) -*** A CID is permanent, but a name can point to a new version. Others can follow a name to keep the latest version pinned, and keepers keep it resolvable while you're offline.
 * ***⚡ Multi-source, resumable downloads -*** Pulls pieces from several seeders at once, preferring nearby, fast and long-standing nodes, and picks up where it left off after an interruption.
 * ***🌐 Global Namespace -*** CIDs are deterministic hashes of the actual files. No tracker is required like in traditional torrents
@@ -32,26 +46,37 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 
 ## Quick start
 
-**1. Install.** Download the file for your system from the
-[latest release](https://github.com/afit21/rnfs/releases/latest):
+### 1 - Install
 
-- **Windows:** [`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe), saved as `rnfs.exe`
+Different package options availible at [latest release](https://github.com/afit21/rnfs/releases/latest)
+
+**Windows:**
+
+[`rnfs-0.1.0-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
-- **Debian, Ubuntu, Raspberry Pi OS (64-bit):** the `.deb`, then
-  `sudo apt install ./rnfs_0.1.0_amd64.deb` (or `_arm64`) ([details](#debian-and-ubuntu)).
-- **macOS:** `pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl` ([details](#macos)).
-- **Other Linux:** the [Flatpak](#other-linux-flatpak), or the [install script](#install-script).
 
-**2. Start rnfs** and leave it running in its own terminal:
+**Linux:**
+
+One liner for install script:
+
+```curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh```
+
+Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-linux-flatpak)
+
+**macOS:**
+
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.0/rnfs-0.1.0-py3-none-any.whl` ([details](#macos)).
+
+### 2 - Start rnfs** and leave it running in its own terminal:
 
 ```sh
 rnfs daemon
 ```
 
-**3. Connect to other nodes.** Computers on the same local network or Wi-Fi find each other automatically.
+### 3 - Connect to other nodes.** Computers on the same local network or Wi-Fi find each other automatically.
 To reach nodes further away, see [Connect to a network](#2-connect-to-a-network).
 
-**4. Download a file**, for example one of the [sample files](#sample-files):
+### 4 - Download a file**, for example one of the [sample files](#sample-files):
 
 ```sh
 rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o manifesto.pdf
@@ -60,7 +85,7 @@ rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o man
 Or open it in your browser:
 <http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=manifesto.pdf>
 
-**5. Share your own file:**
+### 5 - Share your own file:**
 
 ```sh
 rnfs add holiday.jpg        # prints its CID: give that to anyone who should have the file
@@ -69,20 +94,6 @@ rnfs add holiday.jpg        # prints its CID: give that to anyone who should hav
 That's all you need for the basics. [Getting started](#getting-started) goes a step further (folders,
 links that can change, sharing in the background), and [Commands](#commands) lists everything.
 
-> **Good to know**
-> - **What you share is public.** Anyone with a CID can download it from your node. To share privately,
->   [seal the file](#private-group) for chosen people (`rnfs add file --to <their node ID>`) or use
->   [private mode](#privacy).
-> - **Your downloads are shared too,** while they stay in your cache, which helps files spread. To share
->   only what you add yourself, set `provide_strategy = "pinned"` ([Settings](#settings)).
-> - **To stop sharing a file:** `rnfs pin rm <cid>`. Anything you put in `~/.rnfs/files/` is shared
->   automatically.
-
-**Contents:** [Install](#install) · [Sample files](#sample-files) · [Getting started](#getting-started) ·
-[How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
-[Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
-[Tests](#tests) · [Known limitations](#known-limitations) ·
-[specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
 
 ## Install
 
