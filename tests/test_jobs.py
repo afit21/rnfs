@@ -197,7 +197,7 @@ class JobsTest(JobsBase):
         self.net.gate.clear()
         submitted = [self.jobs.submit("get", cid, self.out(f"q{i}"))["id"] for i, cid in enumerate(cids)]
         self.assertTrue(wait_for(lambda: self.net.waiting == 1))
-        time.sleep(0.2)
+        time.sleep(0.2)  # time for a second job to start, were the limit not kept
         self.assertEqual(self.jobs.status(), {"jobs_running": 1, "jobs_queued": 2})
         self.assertEqual(self.net.waiting, 1)  # only one job fetches
         self.assertEqual(self.jobs.cancel(submitted[2])["state"], "cancelled")

@@ -7,6 +7,7 @@ import http.client
 import inspect
 import json
 import os
+import select
 import socket
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from rnfs import cli, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
+from tests.support import wait_for
 
 LocalServer.poll_interval = 0.01  # so each test's server stops at once
 
@@ -721,6 +723,11 @@ def held_connections(port: int, count: int, data: bytes = b"GET /") -> list[sock
     return connections
 
 
+def free_slots(server: LocalServer) -> int:
+    """How many more connections server would serve now (its slots semaphore's count)."""
+    return server.server.slots._value
+
+
 class ConnectionTest(ApiTestCase):
     """Time limits and the connection cap, with short limits so the tests are quick."""
 
@@ -799,7 +806,7 @@ class ConnectionTest(ApiTestCase):
         held = held_connections(self.port, 3)
         for sock in held:
             self.addCleanup(sock.close)
-        time.sleep(0.1)  # let the server accept them
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == 0))  # the server has accepted them
         status, headers, data = self.call("GET", "/api/status")
         self.assertEqual(status, 503)
         self.assertIn("too many", json.loads(data)["error"])
@@ -808,7 +815,7 @@ class ConnectionTest(ApiTestCase):
         # The held connections time out, freeing their slots
         for sock in held:
             read_until_closed(sock)
-        time.sleep(0.1)
+        self.assertTrue(wait_for(lambda: free_slots(self.server) == self.LIMITS["max_connections"]))
         self.assertEqual(self.call("GET", "/api/status")[0], 200)
 
     def test_log_escapes_the_target(self):
@@ -886,7 +893,8 @@ class EarlyResponseTest(ApiTestCase):
         self.addCleanup(sock.close)
         sock.sendall(f"POST /api/add/stream HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
                      f"Content-Length: {len(body)}\r\n\r\n".encode() + body[:16384])
-        time.sleep(0.3)  # the server answers and closes its side meanwhile
+        # The server answers, and closes its side, before reading the body
+        self.assertTrue(select.select([sock], [], [], 10)[0], "no response")
         try:
             sock.sendall(body[16384:])  # the rest of the body arrives after the response was sent
         except OSError:
