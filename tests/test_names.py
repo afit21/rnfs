@@ -289,6 +289,18 @@ class KeyTest(NamesTestCase):
         name = self.manager.create("site")
         self.assertEqual(self.make_manager().name("site"), name)
 
+    def test_old_temp_files_removed_at_start(self):
+        """Temp files 0.1.1's interrupted writes left under fixed names are deleted; nothing else is."""
+        self.manager.create("site")
+        old = [os.path.join(self.config.state_dir, "names.json.tmp"), os.path.join(self.config.names_dir, ".gone.tmp")]
+        kept = [os.path.join(self.config.names_dir, name) for name in (".notes", "x.tmp")]
+        for path in old + kept:
+            with open(path, "wb") as f:
+                f.write(b"partial")
+        self.assertEqual(self.make_manager().list()[0]["alias"], "site")
+        self.assertEqual([os.path.exists(path) for path in old + kept], [False, False, True, True])
+        self.assertEqual(sorted(os.listdir(self.config.state_dir)), ["names.json"])  # no temp file of its own
+
     def test_export_import_round_trip(self):
         """An exported key imported elsewhere gives the same name."""
         name = self.manager.create("site")

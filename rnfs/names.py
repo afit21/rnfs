@@ -242,6 +242,7 @@ class NameManager:
         # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
         self._gone: list[tuple[str, Cid]] = []
 
+        self._remove_old_temps()
         self._load_keys()
         self._load_state()
 
@@ -665,9 +666,8 @@ class NameManager:
         """Save identity as alias's key, track it, and open its destination if running."""
         os.makedirs(self.config.names_dir, mode=0o700, exist_ok=True)
         # Written atomically and private: RNS's Identity.to_file does neither. The temp name starts with "."
-        # so it can never be an alias
-        _write_atomic(self._key_path(alias), identity.get_private_key(), mode=0o600,
-                      temp=os.path.join(self.config.names_dir, f".{alias}.tmp"))
+        # (fsutil.PARTIAL_PREFIX) so it can never be an alias
+        fsutil.write_atomic(self._key_path(alias), identity.get_private_key(), mode=0o600)
         name = name_for_identity(identity)
         self._keys[alias] = identity
         self._names[alias] = name
@@ -676,6 +676,21 @@ class NameManager:
         self._save()
         if self._started:
             self._open_destination(alias)
+
+    def _remove_old_temps(self):
+        """Delete the temp files an interrupted write of rnfs 0.1.1 or earlier left (names.json.tmp and
+        .<alias>.tmp): it reused those names, but writes now take new ones each time."""
+        try:
+            entries = os.listdir(self.config.names_dir)
+        except OSError:
+            entries = []
+        old = [os.path.join(self.config.names_dir, entry) for entry in entries
+               if entry.startswith(".") and entry.endswith(".tmp") and _ALIAS.fullmatch(entry[1:-4])]
+        for path in (self._state_path + ".tmp", *old):
+            try:
+                fsutil.remove(path)
+            except OSError:
+                pass
 
     def _load_keys(self):
         """Read every key file in names_dir."""
@@ -740,23 +755,5 @@ class NameManager:
                      for name, r in sorted(self._held.items())},
         }
         os.makedirs(self.config.state_dir, exist_ok=True)
-        _write_atomic(self._state_path, json.dumps(state, indent=1).encode())
+        fsutil.write_atomic(self._state_path, json.dumps(state, indent=1).encode())
         self._held_dirty = False
-
-
-def _write_atomic(path: str, data: bytes, mode: int = 0o644, temp: str | None = None):
-    """Replace path with data via a synced temp file, so a crash leaves the old or the new file whole."""
-    temp = temp or path + ".tmp"
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | fsutil.O_BINARY, mode)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        fsutil.replace(temp, path)
-    except BaseException:
-        try:
-            fsutil.remove(temp)
-        except OSError:
-            pass
-        raise
