@@ -6,6 +6,7 @@ remove() retry for about a second while the file is in use; elsewhere they are p
 """
 import errno
 import os
+import secrets
 import sys
 import time
 
@@ -15,6 +16,11 @@ IS_WINDOWS = os.name == "nt"
 # Opening with os.open on Windows gives a text-mode descriptor (CRLF translation, Ctrl-Z as end of file)
 # unless O_BINARY is set; elsewhere the flag doesn't exist and isn't needed
 O_BINARY = getattr(os, "O_BINARY", 0)
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # Windows lacks it
+
+# Temporary files of atomic writes start with this, so they can't be taken for what they replace (the
+# blockstore deletes its own when opened)
+PARTIAL_PREFIX = ".partial-"
 
 # Seconds slept between attempts while Windows reports a file in use: about 1 s in all
 RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25)
@@ -116,6 +122,44 @@ def sync_directory(directory: str):
             raise
     finally:
         os.close(fd)
+
+
+def _temp_path(directory: str) -> str:
+    """A new, unpredictable name for a temporary file in directory."""
+    return os.path.join(directory, PARTIAL_PREFIX + secrets.token_hex(8))
+
+
+def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = True, exclusive: bool = False):
+    """Replace path with data, so a crash or power loss leaves the old or the new file whole. Raises OSError.
+
+    data goes to a new temporary file in path's directory (O_EXCL and O_NOFOLLOW: never an existing file or
+    symlink, created with mode, which the umask can only narrow), synced to disk and renamed over path (retried
+    on Windows while path is in use); a symlink at path is replaced, not written through. If durable, the
+    directory is then synced so the rename survives a power loss too. With exclusive, an existing path is kept
+    and FileExistsError raised instead. On any failure before the rename the temporary file is removed and path
+    is left as it was.
+    """
+    directory = os.path.dirname(path) or "."
+    temp = _temp_path(directory)
+    # Outside the try: if this fails, whatever is at temp isn't ours to remove
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_BINARY, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())  # else a power loss can leave path empty once renamed
+        if exclusive:
+            rename_new(temp, path)
+        else:
+            replace(temp, path)
+    except BaseException:
+        try:
+            remove(temp)
+        except OSError:
+            pass
+        raise
+    if durable:
+        sync_directory(directory)
 
 
 def remove(path: str) -> bool:
