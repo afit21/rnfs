@@ -192,6 +192,11 @@ class FileTest(GatewayTestCase):
             self.assertEqual(self.get(path)[0], 400, path)
         self.assertEqual(self.get(f"/rnfs/{self.root}/javascript%3Ax")[2], b"hello gateway")
 
+    def test_malformed_range_is_ignored(self):
+        for value in ("bytes=¹²³-", "bytes=0-" + "9" * 5000):
+            status, _, body = self.get(f"/rnfs/{self.text}", {"Range": value.encode("utf-8").decode("latin-1")})
+            self.assertEqual((status, body), (200, b"hello gateway"), value[:20])
+
     def test_errors(self):
         self.assertEqual(self.get("/rnfs/")[0], 404)
         self.assertEqual(self.get(f"/rnfs/{self.text.upper()}")[0], 400)
@@ -200,6 +205,30 @@ class FileTest(GatewayTestCase):
         self.assertEqual(status, 500)
         self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
         self.assertNotIn("ETag", headers)
+
+    def test_500_body_names_no_local_path(self):
+        # A gateway page may read error responses (the CORS rule): the detail goes only to the log
+        error = OSError(28, "No space left on device", "/home/alice/.rnfs/blocks/abc")
+        referer = {"Referer": f"http://127.0.0.1:{self.port}/rnfs/{self.root}/"}
+        with mock.patch.object(self.node, "info", side_effect=error), mock.patch("rnfs.gateway.log") as log:
+            status, headers, body = self.get(f"/rnfs/{self.text}", referer)
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (500, "*"))
+        self.assertNotIn(b"alice", body)
+        self.assertIn("No space left on device", log.call_args.args[0])
+        with mock.patch.object(self.node, "info", side_effect=ValueError("bad target")):
+            self.assertEqual(self.get(f"/rnfs/{self.text}")[2], b"bad target\n")  # other errors still explain
+
+    def test_http_0_9_gets_headers(self):
+        # A bare body for an HTTP/0.9 request would have no CSP: it is refused, with the usual headers
+        for line in (f"GET /rnfs/{self.page}\r\n", f"GET /rnfs/{self.page} HTTP/0.9\r\n", "GARBAGE\r\n"):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+                sock.sendall(f"{line}Host: 127.0.0.1:{self.port}\r\n\r\n".encode())
+                data, _ = read_until_closed(sock)
+            head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+            self.assertTrue(head.startswith("HTTP/1.0 400 "), (line, head))
+            self.assertIn(f"Content-Security-Policy: {SPEC_CSP}", head)
+            self.assertIn("X-Content-Type-Options: nosniff", head)
+            self.assertNotIn(b"<p>index</p>", data)
 
     def test_always_for_gateway(self):
         self.get(f"/rnfs/{self.root}/")
@@ -429,6 +458,11 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(parse_range("bytes=-5", 0), "unsatisfiable")
         self.assertIsNone(parse_range(None, 10))
         self.assertIsNone(parse_range("bytes=-", 10))
+        # Malformed numbers are ignored like any malformed header: non-ASCII digits, too many digits
+        for header in ("bytes=¹²³-", "bytes=-²", "bytes=0-١", "bytes=0-" + "9" * 5000, "bytes=" + "1" * 19 + "-",
+                       "bytes=+1-2", "bytes=1_0-"):
+            self.assertIsNone(parse_range(header, 10), header)
+        self.assertEqual(parse_range("bytes=0-" + "9" * 18, 10), (0, 9))
 
     def test_etag_matches(self):
         self.assertTrue(etag_matches('W/"a", "b"', '"a"'))

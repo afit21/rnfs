@@ -33,13 +33,11 @@ def export_archive(roots: list, get: walker.Get, out: BinaryIO, max_entries: int
         for expect in expects:
             walker.count_entries(expect, get, max_entries)
     out.write(umsgpack.packb([ARCHIVE_MAGIC, ARCHIVE_VERSION, [expect.cid.binary for expect in expects]]))
-    written: set[Cid] = set()
-    for expect in expects:
-        for block_expect, block in walker.iter_dag(expect, get):
-            if block_expect.cid not in written:
-                written.add(block_expect.cid)
-                out.write(umsgpack.packb([block_expect.cid.binary, block]))
-    return {"roots": [expect.cid for expect in expects], "blocks": len(written)}
+    written = 0
+    for block_expect, block in walker.iter_dags(expects, get):  # each block once over every root
+        out.write(umsgpack.packb([block_expect.cid.binary, block]))
+        written += 1
+    return {"roots": [expect.cid for expect in expects], "blocks": written}
 
 
 def archive_size(roots: list[Cid], blocks) -> int:
@@ -180,7 +178,8 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
     turn cached downloads into pins (which would provide them, revealing what was downloaded). Returns
     {"roots": [Cid], "complete": [Cid] supplied roots, "incomplete": [Cid] the other roots, "blocks": stored
     count, "bad": count of blocks that didn't match their CID (skipped)}. Raises ValueError for a stream that
-    isn't an archive or lists more than MAX_ROOTS roots; blocks read before a malformed record are kept as cache.
+    isn't an archive or lists more than MAX_ROOTS roots, StorageFull for a block that would leave less than the
+    disk reserve free (Storage.check_disk); blocks read before a malformed record or a full disk are kept as cache.
     """
     roots, records = read_archive(stream)
     # Every verified CID in the archive; no larger than the storage's own index of the same blocks
@@ -190,8 +189,10 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
         for root in roots:
             session.add(root)  # keeps blocks already stored below the roots until they're pinned
         for cid, block in records:
+            if not storage.has(cid):
+                storage.check_disk(len(block))  # the same reserve fetches leave free (StorageFull)
             try:
-                session.put(cid, block)  # verifies
+                session.put(cid, block)  # verifies, even a block already stored
             except ValueError:
                 bad += 1
                 continue

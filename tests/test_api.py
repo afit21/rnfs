@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from rnfs import fsutil
+from rnfs import cli, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
@@ -456,6 +456,25 @@ class SecurityTest(ApiTestCase):
         with self.assertRaises(ValueError):
             ApiServer(self.node, 0, token="")
 
+    def test_proof_of_the_token(self):
+        # A challenge is answered with the proof the CLI checks before it sends the token (rnfs.cli.api_proof)
+        challenge = "0123456789abcdef" * 2
+        status, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge}, api=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(self.server.token, self.port, challenge))
+        for bad in ("short", "zz" * 16, challenge + "00"):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: bad}, api=False)
+            self.assertIsNone(headers[cli.PROOF_HEADER], bad)
+        self.assertIsNone(self.call("GET", "/api/status", api=False)[1][cli.PROOF_HEADER])
+
+    def test_http_0_9_is_refused_with_headers(self):
+        # http.server would answer HTTP/0.9 with a bare body; every answer here has a status line and headers
+        for line in (b"GET /api/status\r\n", b"GET /api/status HTTP/0.9\r\n", b"GARBAGE\r\n"):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+                sock.sendall(line + f"Host: 127.0.0.1:{self.port}\r\n\r\n".encode())
+                data, _ = read_until_closed(sock)
+            self.assertTrue(data.startswith(b"HTTP/1.0 400 "), (line, data[:80]))
+
     def test_no_cors_headers(self):
         file_cid = self.node.put_file(b"x")
         headers = {"Origin": "http://evil.example", "Access-Control-Request-Method": "POST"}
@@ -798,6 +817,21 @@ class BodyReaderTest(unittest.TestCase):
         self.assertEqual(reader.read(3) + reader.read(3) + reader.read(), b"abcd")
         with self.assertRaises(ValueError):
             BodyReader(io.BytesIO(b"ab"), 4, chunked=False).read()
+
+    def test_chunk_sizes_are_plain_hex(self):
+        import io
+        self.assertEqual(BodyReader(io.BytesIO(b"A;ext=1\r\n" + b"x" * 10 + b"\r\n0\r\n\r\n"), 0, True).read(),
+                         b"x" * 10)
+        for size in (b"0x3", b"+3", b"0_3", b"-3", b"3 3", b"", b"1" * 17):
+            with self.assertRaises(ValueError, msg=size):
+                BodyReader(io.BytesIO(size + b"\r\nabc\r\n0\r\n\r\n"), 0, chunked=True).read()
+
+    def test_trailers_are_capped(self):
+        import io
+        trailers = b"".join(b"X-T: %d\r\n" % i for i in range(32))
+        self.assertEqual(BodyReader(io.BytesIO(b"1\r\na\r\n0\r\n" + trailers + b"\r\n"), 0, True).read(), b"a")
+        with self.assertRaises(ValueError):
+            BodyReader(io.BytesIO(b"1\r\na\r\n0\r\n" + trailers * 2 + b"\r\n"), 0, chunked=True).read()
 
 
 if __name__ == "__main__":

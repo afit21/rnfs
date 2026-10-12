@@ -14,6 +14,9 @@
 Description=rnfs: content-addressed file sharing over Reticulum
 # Start after rnsd if it also runs as a user service, so rnfs attaches to it rather than starting its own instance
 After=rnsd.service
+# Give up after 5 failed starts in 10 minutes (e.g. the command is missing) instead of retrying forever
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -23,6 +26,14 @@ RestartSec=10
 # The daemon shuts down cleanly on SIGTERM, saving provider records and RNS state
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# Sandboxing that works in a user unit too. Serial devices (RNode, KISS) are unaffected; Bluetooth RNodes are
+# reached through BlueZ's D-Bus (AF_UNIX). An interface program run by a PipeInterface inherits these limits:
+# if it needs another socket family (e.g. AF_PACKET), add it with systemctl --user edit rnfs.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=default.target

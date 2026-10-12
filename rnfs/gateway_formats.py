@@ -86,12 +86,24 @@ def serve_format(handler, segments: list[str], names: list[str]):
             handler.node.export_stream(target, start, for_gateway=True)
     except Cancelled:
         handler.close_connection = True  # nobody to answer
+    except OSError as e:
+        # Once the headers are out, a write failing or timing out means the client went away or stopped reading
+        # (a web page can make that happen at will, so it isn't an error to log); a read error here is one
+        if not handler.headers_sent or not (isinstance(e, TimeoutError) or client_gone(handler.connection)):
+            raise
+        handler.close_connection = True
 
 
 def client_gone(connection) -> bool:
     """True if the client closed its connection (or it failed): readable with nothing left to read."""
     try:
-        readable, _, _ = select.select([connection], [], [], 0)
+        if hasattr(select, "poll"):
+            # Not select.select, which can't take a file descriptor of 1024 or more
+            poller = select.poll()
+            poller.register(connection, select.POLLIN)
+            readable = poller.poll(0)
+        else:  # Windows, whose select() takes any socket
+            readable, _, _ = select.select([connection], [], [], 0)
         if not readable:
             return False
         # A GET has no body, so anything readable is end of stream or a pipelined request (still there)

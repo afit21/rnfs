@@ -107,6 +107,23 @@ class UriTest(unittest.TestCase):
         many = " ".join(Link(CID, path=(f"f{i}",)).uri() for i in range(20))
         self.assertEqual(len(lxmf.find_links(many)), lxmf.MAX_LINKS)
 
+    def test_query_values_may_hold_equals(self):
+        self.assertEqual(lxmf.parse_uri(f"rnfs:{CID}?x=a=b&from={A_ID.hex()}"), Link(CID, from_node=A_ID))
+        with self.assertRaises(ValueError):
+            lxmf.parse_uri(f"rnfs:{CID}?from={A_ID.hex()}=x")
+
+    def test_links_on_lines_of_their_own_are_read_whole(self):
+        # A trailing "." is written unencoded (and "." or "..." is a valid name): only a link sharing its line
+        # loses trailing punctuation
+        for name in ("file.", "...", "a!"):
+            link = Link(CID, path=("dir", name), from_node=A_ID)
+            self.assertEqual(lxmf.find_links(lxmf.message_text("look", [link])), [link], name)
+            self.assertEqual(lxmf.find_links(f"look:\r\n  {link.uri()}  \nbye"), [link], name)
+        self.assertEqual(lxmf.find_links(f"rnfs:{CID}/dir/it's"), [Link(CID, path=("dir", "it's"))])
+        self.assertEqual(lxmf.find_links(f"see rnfs:{CID}/a.txt."), [Link(CID, path=("a.txt",))])
+        self.assertEqual(lxmf.find_links(f"rnfs:{CID}/a.txt. and more"), [Link(CID, path=("a.txt",))])
+        self.assertEqual(lxmf.find_links(f"rnfs:{CID}/a b."), [Link(CID, path=("a",))])
+
     def test_message_text(self):
         link = Link(CID, from_node=A_ID)
         self.assertEqual(lxmf.message_text("  hi there ", [link]), f"hi there\n\n{link.uri()}")
@@ -214,6 +231,40 @@ class MessageLogTest(unittest.TestCase):
         self.assertIsNone(log.find("hash", "cc"))
         self.assertEqual(len(log.remove(None)), 2)
         self.assertEqual(len(log), 0)
+
+    def test_saves_never_land_out_of_order(self):
+        # L13: a save that took its snapshot first can't be written after a later one
+        import threading
+        log = MessageLog(self.path, 10)
+        log.add({"n": 1})
+        write = lxmf._write_json
+        entered, gate = threading.Event(), threading.Event()
+
+        def slow(path, value):
+            """The first save stalls in its write until released."""
+            if threading.current_thread().name == "first":
+                entered.set()
+                gate.wait(5)
+            write(path, value)
+
+        with mock.patch.object(lxmf, "_write_json", side_effect=slow):
+            first = threading.Thread(target=log.save, name="first")
+            first.start()
+            entered.wait(5)
+            log.add({"n": 2})
+            threading.Timer(0.2, gate.set).start()
+            log.save()  # waits for the first save, then writes the newer records
+            first.join(5)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual([e["n"] for e in json.load(f)["messages"]], [1, 2])
+
+    def test_writes_are_synced(self):
+        # L18: the file is fsynced before it replaces the old one (and its directory after, where possible)
+        log = MessageLog(self.path, 10)
+        log.add({"n": 1})
+        with mock.patch.object(lxmf.os, "fsync", wraps=os.fsync) as fsync:
+            log.save()
+        self.assertGreaterEqual(fsync.call_count, 1 if os.name == "nt" else 2)
 
     def test_damaged_and_malformed(self):
         with open(self.path, "w", encoding="utf-8") as f:
@@ -945,6 +996,132 @@ class AuditFixesTest(FeatureTestCase):
         self.assertEqual(lxmf.DEFAULT_DISPLAY_NAME, "rnfs node")
 
 
+class RestartAndCancelTest(FeatureTestCase):
+    """Auto-fetches across restarts and cancels, `inbox get` on several links, outbox records dropped early."""
+
+    def restarted(self) -> lxmf.LxmfFeature:
+        """B's lxmf feature saved, then loaded again and started on a stand-in network (no threads run)."""
+        self.feature.save()
+        again = lxmf.LxmfFeature(self.b)
+        with mock.patch.object(lxmf, "LxmfNetwork", return_value=FakeLxmf()), \
+                mock.patch.object(again, "_run"), mock.patch.object(again, "_run_auto_fetch"):
+            again.start()
+        self.addCleanup(again.stop)
+        return again
+
+    def test_queued_auto_fetches_survive_a_restart(self):
+        # M3: the queue isn't saved; start() queues what the inbox still has as queued, within the limit
+        feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
+        ids = [feature.received(self.link_message(number=i)) for i in range(1, 4)]
+        with mock.patch.object(lxmf, "AUTO_QUEUE_LIMIT", 2):
+            again = self.restarted()
+        self.assertEqual(list(again._auto_queue), [(ids[0], 0), (ids[1], 0)])
+        self.assertEqual(again.inbox.get(ids[2])["auto"][0]["state"], "skipped")
+        again.process_auto_fetches()
+        self.assertEqual([again.inbox.get(i)["auto"][0]["state"] for i in ids], ["pinned", "pinned", "skipped"])
+        self.assertIn(Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"]), self.b.storage.pins())
+
+    def test_stopping_cancels_an_auto_fetch_and_leaves_it_queued(self):
+        # L27 + M3: the fetch running at shutdown stops at once, and runs again after the restart
+        feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
+        entry_id = feature.received(self.link_message())
+        opened = []
+        original = self.b.fetcher.open
+
+        def open_(*args, **kwargs):
+            """The node stops as the fetch starts."""
+            opened.append(args)
+            feature._stop.set()
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.b.fetcher, "open", side_effect=open_):
+            feature.process_auto_fetches()
+        self.assertEqual(len(opened), 1)  # no fallback to the DHT after the cancel
+        target = Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"])
+        self.assertFalse(self.b.storage.is_complete(target))
+        self.assertEqual(feature.inbox.get(entry_id)["auto"], [{"state": "queued"}])
+        again = self.restarted()
+        again.process_auto_fetches()
+        self.assertEqual(again.inbox.get(entry_id)["auto"][0]["state"], "pinned")
+
+    def test_removing_the_message_cancels_its_auto_fetch(self):
+        # L27: inbox rm stops the fetch instead of letting it download everything first
+        feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
+        entry_id = feature.received(self.link_message())
+        original = self.b.fetcher.open
+
+        def open_(*args, **kwargs):
+            """The message is removed as the fetch starts."""
+            feature.inbox_rm(entry_id)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.b.fetcher, "open", side_effect=open_):
+            feature.process_auto_fetches()
+        self.assertFalse(self.b.storage.is_complete(Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"])))
+        self.assertEqual(self.b.storage.pins(), {})
+
+    def test_links_past_the_text_kept_are_found(self):
+        feature = self.feature_node()
+        entry_id = feature.received(message(content=b"x" * 5000 + b" " + self.link.uri().encode()))
+        entry = feature.inbox.get(entry_id)
+        self.assertEqual([Link.from_json(l) for l in entry["links"]], [self.link])
+        self.assertEqual(len(entry["text"]), lxmf.MAX_TEXT_CHARS)
+
+    def test_inbox_get_checks_every_output_first(self):
+        # L29: two links with the same last name fail before anything starts
+        feature = self.feature_node()
+        jobs = mock.Mock()
+        jobs.submit.return_value = {"id": "0123abcd"}
+        self.b.features["jobs"] = jobs
+        other = Cid.parse(self.a.add_stream(io.BytesIO(b"other"), name="file.txt")["cid"])
+        both = f"{self.link.uri()}\n{Link(other, path=('file.txt',), from_node=A_ID).uri()}"
+        entry_id = feature.received(message(content=both.encode()))
+        with self.assertRaisesRegex(ValueError, "links 1 and 2"):
+            feature.inbox_get(entry_id, directory=self.tmp.name)
+        jobs.submit.assert_not_called()
+        # Once one has started, a later failure is reported with it rather than raised
+        jobs.submit.side_effect = [{"id": "0123abcd"}, ValueError("too many jobs")]
+        third = Cid.parse(self.a.add_stream(io.BytesIO(b"third"), name="b.txt")["cid"])
+        two = f"{self.link.uri()}\n{Link(third, path=('b.txt',), from_node=A_ID).uri()}"
+        results = feature.inbox_get(feature.received(message(content=two.encode(), number=2)),
+                                    directory=self.tmp.name)
+        self.assertEqual(results[0]["job"], {"id": "0123abcd"})
+        self.assertEqual((results[1]["output"], results[1]["error"]),
+                         (os.path.join(self.tmp.name, "b.txt"), "too many jobs"))
+
+    def test_inbox_get_prints_errors_after_the_jobs(self):
+        from types import SimpleNamespace
+        results = {"results": [{"output": "/x/a", "job": {"id": "0123abcd"}},
+                               {"output": "/x/b", "error": "too many jobs\x1b[2J"}]}
+        client = mock.Mock()
+        client.post.return_value = results
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("rnfs.cli.client", return_value=client), mock.patch("sys.stdout", out), \
+                mock.patch("sys.stderr", err), self.assertRaises(SystemExit):
+            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None))
+        self.assertIn("job 0123abcd: /x/a", out.getvalue())
+        self.assertIn("/x/b: too many jobs", err.getvalue())
+        self.assertNotIn("\x1b", err.getvalue())
+
+    def test_send_prints_escaped(self):
+        from types import SimpleNamespace
+        client = mock.Mock()
+        client.post.return_value = {"hash": "ab\x1b[2J"}
+        out = io.StringIO()
+        with mock.patch("rnfs.cli.client", return_value=client), mock.patch("sys.stdout", out):
+            lxmf._run_send(SimpleNamespace(to="x", target="y", message=None, propagate=False, nearest=False))
+        self.assertNotIn("\x1b", out.getvalue())
+
+    def test_fallback_after_the_outbox_record_was_dropped(self):
+        feature = self.feature_node(FakeLxmf(propagation_node=OTHER))
+        result = feature.send(SENDER.hex(), str(self.cid))
+        feature.outbox.remove(result["id"])
+        feature.outbound_changed(bytes.fromhex(result["hash"]), "failed", 0.0)
+        self.assertEqual(len(self.network.sent), 2)
+        self.assertTrue(self.network.sent[1][3])
+        self.assertEqual(feature._resend, {})
+
+
 class MessageLogBoundsTest(unittest.TestCase):
     """MessageLog's protection of pin holders and its byte bound."""
 
@@ -1030,6 +1207,49 @@ class NetworkBoundsTest(unittest.TestCase):
             network._retry_held()
         self.assertEqual(len(calls), lxmf.PATH_REQUEST_BURST + 1)
         self.assertTrue(network._held[0][1].endswith(b"LEGIT"))
+
+    def test_senders_outside_accept_from_are_not_held(self):
+        # L25: with lxmf_accept_from set, forged sources can't fill the queue ahead of an allowed sender
+        network = self.network()
+        self.network_lxmf = network.LXMF
+        allowed = os.urandom(16)
+        network.feature.accepts.side_effect = lambda source: source == allowed
+        calls = []
+        with mock.patch.object(RNS.Transport, "request_path", side_effect=calls.append):
+            for _ in range(lxmf.HOLD_LIMIT + 5):
+                network._delivered(self.forged(os.urandom(16), b"junk"))
+            network._delivered(self.forged(allowed, b"LEGIT"))
+        self.assertEqual([p[-5:] for _, p, _ in network._held], [b"LEGIT"])
+        self.assertEqual(calls, [allowed])
+
+    def test_messages_arriving_during_a_retry_count_against_the_limit(self):
+        # Info: the queue isn't emptied while held messages are retried, so none is accepted, then cut silently
+        network = self.network()
+        self.network_lxmf = network.LXMF
+        network._delivered(self.forged(os.urandom(16), b"FIRST"))
+        arrivals = []
+
+        def recall(source):
+            """LXMF delivers many messages while the retry runs."""
+            if not arrivals:
+                for i in range(lxmf.HOLD_LIMIT + 8):
+                    arrivals.append(i)
+                    network._delivered(self.forged(os.urandom(16), b"new%02d" % i))
+            return None
+
+        with mock.patch.object(network, "_request_path") as request_path, \
+                mock.patch.object(RNS.Identity, "recall", side_effect=recall):
+            network._retry_held()
+        tags = [p[-5:] for _, p, _ in network._held]
+        self.assertEqual(tags, [b"FIRST"] + [b"new%02d" % i for i in range(lxmf.HOLD_LIMIT - 1)])
+        # Every message accepted (its sender's path asked for) is still held
+        self.assertEqual({call.args[0] for call in request_path.call_args_list},
+                         {p[lxmf.ID_LENGTH:2 * lxmf.ID_LENGTH] for _, p, _ in network._held})
+        # A held message is dropped from the queue once done with: here, when it waited too long
+        with mock.patch.object(RNS.Identity, "recall", return_value=None), \
+                mock.patch.object(lxmf.time, "monotonic", return_value=float("inf")):
+            network._retry_held()
+        self.assertEqual(network._held, [])
 
     def test_propagation_node_resources_are_bounded(self):
         # RM-ML4: a response too large, or of several segments, stops the download

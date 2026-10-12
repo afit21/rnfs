@@ -15,20 +15,25 @@
 # version, so they coexist). Because of those compiled wheels the package is per architecture (amd64, arm64),
 # not "all". It's built with wheels downloaded for the target platform, so an arm64 package can be built on
 # an amd64 machine. The dependencies are the exact versions and files pinned in packaging/requirements.lock
-# (pip --require-hashes).
+# (pip --require-hashes), and the rnfs wheel is built with the setuptools pinned in
+# packaging/build-backend.lock, in a build venv without pip's build isolation (which would fetch the newest).
 #
-# Needs: python3 with pip (or a venv's python, via $PYTHON), dpkg-deb, network access to PyPI.
+# Needs: python3 with venv and pip (or another Python, via $PYTHON), dpkg-deb, network access to PyPI.
 set -eu
 umask 022
 
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 LOCK="$REPO/packaging/requirements.lock"
+BACKEND_LOCK="$REPO/packaging/build-backend.lock"
 PYTHON=${PYTHON:-python3}
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 WHEEL=""
 OUT="$REPO/dist"
 MAINTAINER=${DEB_MAINTAINER:-"rnfs developers <rnfs@users.noreply.github.com>"}
 EXTRA_PYTHONS="3.12 3.13 3.14"  # besides 3.11, the Pythons whose cffi backend is bundled
+# The newest of those, plus one: the package's python3 dependency stays below it, since a newer Python would
+# have no cffi backend here (and the crypto Reticulum uses would fail to import)
+PYTHON_BELOW=3.15
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,7 +71,13 @@ if [ -z "$WHEEL" ]; then
         if [ -f "$license" ]; then cp "$license" "$WORK/src/"; fi
     done
     find "$WORK/src" -name __pycache__ -type d -prune -exec rm -rf {} +
-    "$PYTHON" -I -m pip wheel --quiet --no-deps --disable-pip-version-check --wheel-dir "$WORK/wheel" "$WORK/src"
+    # With the pinned, hash-checked setuptools in a venv of its own, and no build isolation (which would fetch
+    # the newest setuptools from PyPI)
+    "$PYTHON" -I -m venv "$WORK/build-venv"
+    "$WORK/build-venv/bin/python" -I -m pip install --quiet --disable-pip-version-check --require-hashes \
+        --only-binary=:all: -r "$BACKEND_LOCK"
+    "$WORK/build-venv/bin/python" -I -m pip wheel --quiet --no-deps --no-build-isolation \
+        --disable-pip-version-check --wheel-dir "$WORK/wheel" "$WORK/src"
     WHEEL=$(ls "$WORK"/wheel/rnfs-*.whl)
 fi
 
@@ -75,9 +86,11 @@ ROOT="$WORK/root"
 LIB="$ROOT/opt/rnfs/lib"
 
 echo "Installing rnfs $VERSION and its dependencies (from packaging/requirements.lock) for $ARCH into /opt/rnfs/lib"
-# The lock plus the rnfs wheel with its own hash: pip's hash-checking mode then installs nothing unpinned
+# The lock plus the rnfs wheel with its own hash: pip's hash-checking mode then installs no runtime package
+# unpinned (and, being wheels only, runs no build backend)
 cp "$LOCK" "$WORK/requirements.txt"
-echo "rnfs @ file://$WHEEL --hash=sha256:$(sha256sum "$WHEEL" | cut -d' ' -f1)" >> "$WORK/requirements.txt"
+WHEEL_URL=$("$PYTHON" -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).as_uri())' "$WHEEL")
+echo "rnfs @ $WHEEL_URL --hash=sha256:$(sha256sum "$WHEEL" | cut -d' ' -f1)" >> "$WORK/requirements.txt"
 # shellcheck disable=SC2086
 "$PYTHON" -I -m pip install --quiet --no-compile --disable-pip-version-check --target "$LIB" \
     --only-binary=:all: --implementation cp --python-version 3.11 $PLATFORMS --require-hashes -r "$WORK/requirements.txt"
@@ -91,7 +104,7 @@ for version in $EXTRA_PYTHONS; do
     # shellcheck disable=SC2086
     if "$PYTHON" -I -m pip download --quiet --no-deps --disable-pip-version-check --dest "$WORK/cffi$nodot" \
             --only-binary=:all: --implementation cp --python-version "$version" $PLATFORMS \
-            --require-hashes -r "$WORK/cffi.lock" 2>/dev/null; then
+            --require-hashes -r "$WORK/cffi.lock" 2>"$WORK/pip-errors"; then
         "$PYTHON" -I - "$WORK/cffi$nodot" "$LIB" <<'EOF'
 import glob, sys, zipfile
 wheel, = glob.glob(sys.argv[1] + "/cffi-*.whl")
@@ -101,10 +114,30 @@ with zipfile.ZipFile(wheel) as z:
             z.extract(name, sys.argv[2])
             print("  added", name)
 EOF
+    elif grep -q 'No matching distribution' "$WORK/pip-errors"; then
+        echo "  no cffi wheel for Python $version on $ARCH"  # the check below fails the build
     else
-        echo "  no cffi wheel for Python $version on $ARCH; skipped"
+        # A network or PyPI error: never ship a package that's missing a backend because of one
+        cat "$WORK/pip-errors" >&2
+        echo "build-deb.sh: downloading cffi for Python $version ($ARCH) failed" >&2
+        exit 1
     fi
 done
+
+# Every supported Python needs its cffi backend, or importing Reticulum's crypto fails on it
+missing=""
+for version in 3.11 $EXTRA_PYTHONS; do
+    nodot=$(echo "$version" | tr -d .)
+    found=no
+    for backend in "$LIB"/_cffi_backend.cpython-"$nodot"-*.so; do
+        if [ -f "$backend" ]; then found=yes; fi
+    done
+    if [ "$found" = no ]; then missing="$missing $version"; fi
+done
+if [ -n "$missing" ]; then
+    echo "build-deb.sh: no cffi backend for Python$missing on $ARCH; drop those from EXTRA_PYTHONS (and lower PYTHON_BELOW) if cffi has no wheel for them" >&2
+    exit 1
+fi
 
 # Console scripts pip made for the build machine's Python (rnsd, lxmd, ...): not part of this package
 rm -rf "${LIB:?}/bin"
@@ -134,21 +167,29 @@ sed -e 's|^ExecStart=.*|ExecStart=/usr/bin/rnfs daemon|' \
     "$REPO/contrib/rnfs.service" > "$ROOT/usr/lib/systemd/user/rnfs.service"
 chmod 0644 "$ROOT/usr/lib/systemd/user/rnfs.service"
 
+# Machine-readable debian/copyright (DEP-5): a header, then rnfs's Files paragraph with its license text
+LICENSE_FILE=""
+for license in "$REPO"/LICENSE "$REPO"/LICENSE.* "$REPO"/LICENCE "$REPO"/COPYING; do
+    if [ -f "$license" ]; then LICENSE_FILE=$license; break; fi
+done
+[ -n "$LICENSE_FILE" ] || { echo "build-deb.sh: no LICENSE file in $REPO" >&2; exit 1; }
+COPYRIGHT=$(sed -n 's/^Copyright *\(([cC])\)\{0,1\} *//p' "$LICENSE_FILE" | head -n 1)
+LICENSE_NAME=other
+if head -n 1 "$LICENSE_FILE" | grep -q '^MIT License'; then LICENSE_NAME=Expat; fi  # Debian's name for MIT
 {
     echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/"
     echo "Upstream-Name: rnfs"
+    echo "Upstream-Contact: https://github.com/afit21/rnfs/issues"
     echo "Source: https://github.com/afit21/rnfs"
+    echo "Comment: The third-party packages bundled in /opt/rnfs/lib (RNS, LXMF, pyserial,"
+    echo " cryptography, cffi, pycparser) carry their own licenses in their *.dist-info"
+    echo " directories there."
     echo
     echo "Files: *"
-    echo "Comment: rnfs (its license text follows, if the source tree has one). The bundled third-party"
-    echo " packages in /opt/rnfs/lib (RNS, LXMF, pyserial, cryptography, cffi, pycparser) carry their own licenses in their *.dist-info directories there."
-    for license in "$REPO"/LICENSE "$REPO"/LICENSE.* "$REPO"/LICENCE "$REPO"/COPYING; do
-        if [ -f "$license" ]; then
-            echo "License: other"
-            sed 's/^$/./; s/^/ /' "$license"
-            break
-        fi
-    done
+    echo "Copyright: ${COPYRIGHT:-rnfs developers}"
+    echo "License: $LICENSE_NAME"
+    # The license text, without its title and copyright lines (they're in the fields above)
+    sed -e '/^MIT License$/d' -e '/^Copyright /d' "$LICENSE_FILE" | sed -e '/./,$!d' | sed 's/^$/./; s/^/ /'
 } > "$ROOT/usr/share/doc/rnfs/copyright"
 
 cat > "$ROOT/DEBIAN/postinst" <<'EOF'
@@ -176,7 +217,7 @@ Version: $VERSION
 Architecture: $ARCH
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_SIZE
-Depends: python3 (>= 3.11), libc6 (>= 2.28)
+Depends: python3 (>= 3.11), python3 (<< $PYTHON_BELOW), libc6 (>= 2.28)
 Section: net
 Priority: optional
 Homepage: https://github.com/afit21/rnfs
@@ -189,6 +230,11 @@ Description: content-addressed file sharing over Reticulum
  Reticulum, LXMF and their Python dependencies are bundled in /opt/rnfs.
  A systemd user unit is included: systemctl --user enable --now rnfs
 EOF
+
+# dpkg --verify (and debsums) check the installed files against these
+(cd "$ROOT" && find . -path ./DEBIAN -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort |
+    while IFS= read -r file; do md5sum -- "$file"; done) > "$ROOT/DEBIAN/md5sums"
+chmod 0644 "$ROOT/DEBIAN/md5sums"
 
 mkdir -p "$OUT"
 DEB="$OUT/rnfs_${VERSION}_${ARCH}.deb"

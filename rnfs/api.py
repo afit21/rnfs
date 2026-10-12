@@ -43,6 +43,10 @@ Security:
   read the rnfs directory may use it. A custom header also forces a CORS preflight, which fails because
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
   health checks.
+- A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.cli.api_proof>` in its
+  response, which only a server knowing the token can make. Before it first sends the token, the CLI makes
+  whatever listens on the port prove this (with a status request), so another local user listening there
+  while the daemon is down learns neither the token nor a name key being imported.
 - Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, InvalidDag 422,
   Busy 503, StorageFull 507, other errors 500.
 
@@ -58,6 +62,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import socket
 import threading
@@ -67,6 +72,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from rnfs import fsutil
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
+from rnfs.cli import CHALLENGE_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.log import LOG_ERROR, log
@@ -74,6 +80,9 @@ from rnfs.log import LOG_ERROR, log
 API_HEADER = "X-Rnfs-Api"
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
+CHALLENGE = re.compile(r"[0-9a-f]{32}")  # what the CLI sends in X-Rnfs-Challenge
+CHUNK_SIZE_LINE = re.compile(rb"[0-9A-Fa-f]{1,16}")  # a chunk size: hex digits only (no 0x, +, _ or spaces)
+MAX_TRAILER_LINES = 32
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500
 ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (InvalidDag, 422), (Busy, 503),
@@ -200,15 +209,16 @@ class BodyReader:
         line = self.rfile.readline(1024)
         if not line.endswith(b"\n"):
             raise ValueError("request body ended early")
-        try:
-            size = int(line.split(b";", 1)[0].strip(), 16)
-        except ValueError:
-            raise ValueError("invalid chunked request body") from None
-        if size < 0:
+        digits = line.split(b";", 1)[0].strip(b" \t\r\n")
+        if not CHUNK_SIZE_LINE.fullmatch(digits):
             raise ValueError("invalid chunked request body")
+        size = int(digits, 16)
         if size == 0:
-            while self.rfile.readline(1024).strip():  # trailers, up to the blank line
-                pass
+            for _ in range(MAX_TRAILER_LINES + 1):  # trailers, up to the blank line
+                if not self.rfile.readline(1024).strip():
+                    break
+            else:
+                raise ValueError("too many trailer lines in a chunked request body")
             self.done = True
         self.remaining = size
 
@@ -279,6 +289,22 @@ class TimedHandler(BaseHTTPRequestHandler):
     request_timeout: float = 15.0
     body_timeout: float = 60.0
     response_timeout: float | None = None
+    # Not http.server's HTTP/0.9: responses to it have no status line or headers (no CSP, no nosniff), and that
+    # includes the error sent for a malformed request line
+    default_request_version = "HTTP/1.0"
+
+    def parse_request(self) -> bool:
+        """Parse the request line and headers, refusing HTTP/0.9 (a request line without a version, or with
+        HTTP/0.9), so every response here is HTTP/1.x with its headers. False if refused or malformed."""
+        words = str(self.raw_requestline, "iso-8859-1").split()
+        if len(words) == 2 or (len(words) == 3 and words[2] == "HTTP/0.9"):
+            self.command = None
+            self.requestline = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n")
+            self.request_version = self.default_request_version
+            self.close_connection = True
+            self.send_error(400, "HTTP/0.9 is not supported")
+            return False
+        return super().parse_request()
 
     def setup(self):
         """Set up the connection, replacing rfile with one that enforces the time limits."""
@@ -543,6 +569,9 @@ class ApiHandler(TimedHandler):
         """Headers on every API response. Deliberately no Access-Control-* headers (section 11)."""
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        challenge = (self.headers.get(CHALLENGE_HEADER) or "").strip()
+        if CHALLENGE.fullmatch(challenge):
+            self.send_header(PROOF_HEADER, api_proof(self.token, self.server.server_address[1], challenge))
 
     def send_json(self, status: int, body):
         """Send body as a JSON response with the given status."""

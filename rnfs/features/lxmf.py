@@ -31,6 +31,7 @@ import math
 import os
 import re
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -88,7 +89,7 @@ SYNC_TIMEOUT = 900.0  # a propagation node download still unfinished after this 
 
 _HEX32 = re.compile(r"[0-9a-fA-F]{32}")
 _SEGMENT = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+")
-_QUERY_VALUE = re.compile(r"(?:[A-Za-z0-9\-._~!$'()*+,;:@/]|%[0-9A-Fa-f]{2})*")
+_QUERY_VALUE = re.compile(r"(?:[A-Za-z0-9\-._~!$'()*+,;=:@/]|%[0-9A-Fa-f]{2})*")  # "&" separates parameters
 # An rnfs: link in free text: not glued to a preceding word, ending at whitespace or a character URIs never hold
 _TEXT_LINK = re.compile(r"(?<![A-Za-z0-9+.\-])[Rr][Nn][Ff][Ss]:[^\s<>\"'`{}|\\^\[\]]+")
 _TRAILING = ".,;:!?)]}'\""
@@ -298,15 +299,29 @@ def parse_target(text) -> Link:
 
 
 def find_links(text) -> list[Link]:
-    """The distinct rnfs: links in a message's text, in order (at most MAX_LINKS); malformed ones are skipped."""
+    """The distinct rnfs: links in a message's text, in order (at most MAX_LINKS); malformed ones are skipped.
+
+    A link filling a line of its own (as message_text writes them) is read whole; elsewhere trailing
+    punctuation (".,;:!?)]}'\\"") is taken as the sentence's, not the link's.
+    """
     if not isinstance(text, str):
         return []
+    text = text[:MAX_SCAN_CHARS]
     found: list[Link] = []
-    for match in _TEXT_LINK.finditer(text[:MAX_SCAN_CHARS]):
-        candidate = match.group(0).rstrip(_TRAILING)
-        try:
-            link = parse_uri(candidate)
-        except ValueError:
+    for match in _TEXT_LINK.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        candidates = [match.group(0).rstrip(_TRAILING)]
+        if not text[line_start:match.start()].strip():
+            candidates.insert(0, text[match.start():len(text) if line_end < 0 else line_end].strip())
+        link = None
+        for candidate in candidates:
+            try:
+                link = parse_uri(candidate)
+                break
+            except ValueError:
+                continue
+        if link is None:
             continue
         if link not in found:
             found.append(link)
@@ -407,13 +422,17 @@ def _json_bytes(value) -> int:
 
 
 def _write_json(path: str, value):
-    """Write value as UTF-8 JSON (non-ASCII as is, not as 6-byte escapes) to path atomically."""
+    """Write value as UTF-8 JSON (non-ASCII as is, not as 6-byte escapes) to path atomically and durably: a
+    power loss leaves the old or the new file whole (an emptied inbox would leave lxmf: pins nothing releases)."""
     from rnfs import fsutil
-    fd, partial = tempfile.mkstemp(prefix=".partial-", dir=os.path.dirname(path))
+    directory = os.path.dirname(path)
+    fd, partial = tempfile.mkstemp(prefix=".partial-", dir=directory)
     try:
         # backslashreplace: a lone surrogate (e.g. in an error text) is written as its JSON escape
         with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
             json.dump(value, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         fsutil.replace(partial, path)
     except BaseException:
         try:
@@ -421,6 +440,21 @@ def _write_json(path: str, value):
         except OSError:
             pass
         raise
+    _sync_directory(directory)
+
+
+def _sync_directory(directory: str):
+    """fsync a directory so a rename in it is durable; best effort (Windows can't open a directory)."""
+    try:
+        fd = os.open(directory or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 class MessageLog:
@@ -438,6 +472,7 @@ class MessageLog:
         self.max_bytes = max_bytes
         self.protect = protect or (lambda entry: False)
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._dirty = False
         self._next_id = 1
         self._entries: list[dict] = []
@@ -559,17 +594,18 @@ class MessageLog:
 
     def save(self):
         """Write the log if it changed (atomic; raises OSError)."""
-        with self._lock:
-            if not self._dirty:
-                return
-            snapshot = {"next_id": self._next_id, "messages": [dict(e) for e in self._entries]}
-            self._dirty = False
-        try:
-            _write_json(self.path, snapshot)
-        except OSError:
+        with self._save_lock:
             with self._lock:
-                self._dirty = True
-            raise
+                if not self._dirty:
+                    return
+                snapshot = {"next_id": self._next_id, "messages": [dict(e) for e in self._entries]}
+                self._dirty = False
+            try:
+                _write_json(self.path, snapshot)
+            except OSError:
+                with self._lock:
+                    self._dirty = True
+                raise
 
 
 def _str_or_none(value) -> bool:
@@ -708,6 +744,7 @@ class LxmfFeature(features.Feature):
             _log(f"failed to start: {e!r}", "error")
             return
         self.attach(network)
+        self._requeue_auto_fetches()
         for name, target in (("rnfs-lxmf", self._run), ("rnfs-lxmf-fetch", self._run_auto_fetch)):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
@@ -879,16 +916,15 @@ class LxmfFeature(features.Feature):
         return {"id": entry_id, "hash": message_hash.hex(), "to": address.hex(), "method": method}
 
     def outbound_changed(self, message_hash: bytes, state: str, progress: float | None):
-        """Record a sent message's new state; a failed direct message falls back to propagation."""
+        """Record a sent message's new state; a failed direct message falls back to propagation (also once its
+        outbox record was dropped to make room)."""
         entry = self.outbox.find("hash", message_hash.hex())
-        if entry is None:
-            return
         values = {"state": state}
         if isinstance(progress, (int, float)) and not isinstance(progress, bool):
             values["progress"] = round(float(progress), 3)
         with self._lock:
             resend = self._resend.pop(message_hash.hex(), None) if state in FINAL_STATES else None
-        if state == "failed" and resend is not None and entry.get("method") == "direct":
+        if state == "failed" and resend is not None and (entry is None or entry.get("method") == "direct"):
             network = self.network
             nearest = resend[3]
             if network is not None and network.propagation_node(nearest) is None:
@@ -896,14 +932,17 @@ class LxmfFeature(features.Feature):
             elif network is not None:
                 try:
                     new_hash = network.send(resend[0], resend[1], resend[2], True, nearest)
-                    self.outbox.update(entry["id"], hash=new_hash.hex(), method="propagated", state="outbound",
-                                       progress=0.0, direct_hash=message_hash.hex(), fallback=True)
+                    if entry is not None:
+                        self.outbox.update(entry["id"], hash=new_hash.hex(), method="propagated",
+                                           state="outbound", progress=0.0, direct_hash=message_hash.hex(),
+                                           fallback=True)
                     _log(f"direct delivery of {message_hash.hex()} failed; sending it through the propagation "
                          f"node as {new_hash.hex()}", "notice")
                     return
                 except Exception as e:  # noqa: BLE001
                     values["error"] = f"propagation fallback failed: {_printable(e)}"
-        self.outbox.update(entry["id"], **values)
+        if entry is not None:
+            self.outbox.update(entry["id"], **values)
 
     # Receiving
 
@@ -913,7 +952,7 @@ class LxmfFeature(features.Feature):
         sender = message.source.hex()
         if self.network is not None and message.source == self.network.address:
             return None
-        if self.accept_from and sender not in self.accept_from and sender not in self.auto_fetch_from:
+        if not self.accepts(message.source):
             _log(f"ignored a message from {sender}: not in lxmf_accept_from", "verbose")
             return None
         message_hash = message.hash.hex()
@@ -927,7 +966,8 @@ class LxmfFeature(features.Feature):
                  "verbose")
             links = None
         if links is None:
-            links = find_links(text)
+            # Links past the text kept count too: up to MAX_SCAN_CHARS are searched
+            links = find_links(_text(message.content, MAX_SCAN_CHARS))
         if not links:
             _log(f"message {message_hash} from {sender} has no rnfs links; not kept", "verbose")
             return None
@@ -956,6 +996,12 @@ class LxmfFeature(features.Feature):
             for index in range(len(entry["links"])):
                 self._queue_auto_fetch(entry_id, index)
         return entry_id
+
+    def accepts(self, source: bytes) -> bool:
+        """Whether messages from LXMF address source are kept: lxmf_accept_from (empty: everyone), and
+        lxmf_auto_fetch_from."""
+        sender = source.hex()
+        return not self.accept_from or sender in self.accept_from or sender in self.auto_fetch_from
 
     def inbox_list(self) -> list[dict]:
         """Inbox messages, oldest first."""
@@ -1028,11 +1074,10 @@ class LxmfFeature(features.Feature):
         """Fetch the links of inbox message entry_id (only link index, 1-based, if given) and write each out:
         to output, or into directory under its last path name (the root CID if that name is hidden,
         non-printable or not a plain file name here: the sender chose it). Tries the sender's node first, then
-        the DHT."""
-        from rnfs.errors import InvalidDag, RnfsError, StorageFull, TooLarge
+        the DHT. Once one link has started, a later one's failure is a result with "error", not raised."""
+        from rnfs.errors import NotFound
         entry = self.inbox.get(entry_id)
         if entry is None:
-            from rnfs.errors import NotFound
             raise NotFound(f"no inbox message #{entry_id}")
         links = [Link.from_json(value) for value in entry.get("links") or []]
         if index is not None:
@@ -1043,8 +1088,9 @@ class LxmfFeature(features.Feature):
             raise ValueError("-o needs a single link: choose one with --link")
         if output is None and directory is None:
             raise ValueError("an output path or directory is required")
-        results = []
-        for link in links:
+        # Every output is checked before anything starts, so a clash can't stop the fetches halfway
+        planned = []
+        for number, link in enumerate(links, 1):
             root, names = self._resolve(link)
             target = "/".join([str(root), *names])
             if output is not None:
@@ -1054,25 +1100,41 @@ class LxmfFeature(features.Feature):
                 path = os.path.join(directory, fsutil.safe_default_name(names[-1] if names else None, str(root)))
             if os.path.lexists(path):
                 raise ValueError(f"{_printable(path)} already exists; remove it or choose another with -o")
-            job = self._start_job(target, path, link)
-            if job is not None:
-                results.append({"target": target, "output": path, "job": job})
-                continue
-            hints = self._hints(link)
-            for attempt, from_node in enumerate(hints):
-                try:
-                    result = self.node.get(target, path, from_node=from_node)
-                    break
-                except (TooLarge, InvalidDag, StorageFull):
+            same = next((i for i, (_, other, _) in enumerate(planned) if other == path), None)
+            if same is not None:
+                raise ValueError(f"links {same + 1} and {number} would both be written to {_printable(path)}: "
+                                 f"get them one at a time with --link and -o")
+            planned.append((link, path, target))
+        results = []
+        for link, path, target in planned:
+            try:
+                results.append(self._get_link(link, path, target))
+            except Exception as e:  # noqa: BLE001 - raised as is when nothing has started
+                if not results:
                     raise
-                except RnfsError as e:
-                    if attempt == len(hints) - 1 or os.path.lexists(path):
-                        raise
-                    _log(f"{from_node.hex()} could not supply {_printable(target)} ({_printable(e)}); trying "
-                         f"the DHT", "notice")
-            results.append({"target": target, "output": path, "cid": result["cid"],
-                            "warnings": result.get("warnings", [])})
+                # Something has started already: report it, and this failure with it
+                results.append({"target": target, "output": path, "error": str(e) or type(e).__name__})
         return results
+
+    def _get_link(self, link: Link, path: str, target: str) -> dict:
+        """Fetch one link of `inbox get` to path: as a job if the jobs feature is loaded, else here and now."""
+        from rnfs.errors import InvalidDag, RnfsError, StorageFull, TooLarge
+        job = self._start_job(target, path, link)
+        if job is not None:
+            return {"target": target, "output": path, "job": job}
+        hints = self._hints(link)
+        for attempt, from_node in enumerate(hints):
+            try:
+                result = self.node.get(target, path, from_node=from_node)
+                break
+            except (TooLarge, InvalidDag, StorageFull):
+                raise
+            except RnfsError as e:
+                if attempt == len(hints) - 1 or os.path.lexists(path):
+                    raise
+                _log(f"{from_node.hex()} could not supply {_printable(target)} ({_printable(e)}); trying "
+                     f"the DHT", "notice")
+        return {"target": target, "output": path, "cid": result["cid"], "warnings": result.get("warnings", [])}
 
     def _start_job(self, target: str, output: str, link: Link):
         """Start the fetch as a background job when rnfs/features/jobs.py is loaded; the job's dict, or None
@@ -1098,6 +1160,14 @@ class LxmfFeature(features.Feature):
                 return
             self._auto_queue.append((entry_id, index))
             self._auto_wanted.notify()
+
+    def _requeue_auto_fetches(self):
+        """Queue again, oldest first, the auto-fetches still "queued" when the daemon stopped (also one that
+        was running then): the queue itself isn't saved, and a queued record is never dropped for others."""
+        for entry in self.inbox.entries():
+            for index, result in enumerate(entry.get("auto") or []):
+                if isinstance(result, dict) and result.get("state") == "queued":
+                    self._queue_auto_fetch(entry["id"], index)
 
     def _run_auto_fetch(self):
         """The auto-fetch worker: one fetch at a time, so quotas are checked against settled usage."""
@@ -1130,12 +1200,18 @@ class LxmfFeature(features.Feature):
             self.inbox.update(entry_id, auto=auto)
 
     def auto_fetch(self, entry_id: int, index: int):
-        """Fetch one link of an inbox message and pin it with source lxmf:<sender>, within the sender's quota."""
+        """Fetch one link of an inbox message and pin it with source lxmf:<sender>, within the sender's quota.
+
+        The fetch stops (within fetcher.POLL) when the node stops, leaving the link queued for the next start,
+        or when the message is removed."""
+        from rnfs import fetcher
         from rnfs.content.storage import LXMF_PREFIX
         from rnfs.errors import InvalidDag, RnfsError, StorageFull, TooLarge
         entry = self.inbox.get(entry_id)
         if entry is None:
             return
+        observer = fetcher.Observer()
+        observer.cancelled = lambda: self._stop.is_set() or self.inbox.get(entry_id) is None
         try:
             link = Link.from_json(entry["links"][index])
             source = LXMF_PREFIX + entry["from"]
@@ -1143,9 +1219,10 @@ class LxmfFeature(features.Feature):
             hints = self._hints(link)
             for attempt, from_node in enumerate(hints):
                 try:
-                    cid = self._fetch_and_pin(entry_id, index, root, names, from_node, source)
+                    with fetcher.observing(observer):
+                        cid = self._fetch_and_pin(entry_id, index, root, names, from_node, source)
                     break
-                except (TooLarge, InvalidDag, StorageFull):
+                except (TooLarge, InvalidDag, StorageFull, fetcher.Cancelled):
                     raise
                 except RnfsError as e:
                     if attempt == len(hints) - 1:
@@ -1154,6 +1231,9 @@ class LxmfFeature(features.Feature):
             if cid is not None:
                 _log(f"auto-fetched and pinned {cid} from inbox #{entry_id}", "notice")
             return  # pinned and recorded by _fetch_and_pin, or the message was removed meanwhile
+        except fetcher.Cancelled:
+            _log(f"auto-fetch of inbox #{entry_id} link {index + 1} stopped", "verbose")
+            return  # still "queued" if the node is stopping: fetched at the next start
         except TooLarge as e:
             result = {"state": "refused", "error": str(e)}
         except (RnfsError, ValueError, KeyError, IndexError, TypeError) as e:
@@ -1357,7 +1437,7 @@ def _run_send(args):
     from rnfs import cli
     result = cli.client(args).post("/api/lxmf/send", to=args.to, target=args.target, message=args.message,
                                    propagate=args.propagate, nearest=args.nearest)
-    print(result["hash"])
+    print(cli.printable(result["hash"]))
 
 
 def _run_inbox(args):
@@ -1370,7 +1450,8 @@ def _run_inbox(args):
         sender = entry.get("from") or "?"
         name = entry.get("display_name")
         who = f"{cli.printable(name)} <{cli.printable(sender)}>" if name else f"<{cli.printable(sender)}>"
-        print(f"#{entry.get('id')}  {_when(entry.get('received'))}  {who}  {cli.printable(entry.get('method') or '')}")
+        print(f"#{cli.printable(entry.get('id'))}  {_when(entry.get('received'))}  {who}  "
+              f"{cli.printable(entry.get('method') or '')}")
         _print_links(entry, cli.printable)
         _print_text(_strip_links(entry), cli.printable)
 
@@ -1390,13 +1471,19 @@ def _run_inbox_get(args):
         cli.fail(f"{output} already exists; remove it or choose another with -o")
     result = cli.client(args).post("/api/lxmf/inbox/get", id=args.n, link=args.link, output=output,
                                    directory=os.getcwd())
+    failed = False
     for item in result["results"]:
         cli.print_warnings(item)
         job = item.get("job")
-        if isinstance(job, dict):
+        if item.get("error") is not None:
+            failed = True
+            print(f"rnfs: {cli.printable(item['output'])}: {cli.printable(item['error'])}", file=sys.stderr)
+        elif isinstance(job, dict):
             print(f"job {cli.printable(job.get('id'))}: {cli.printable(item['output'])} (rnfs jobs shows its progress)")
         else:
             print(cli.printable(item["output"]))
+    if failed:
+        sys.exit(1)
 
 
 def _run_inbox_rm(args):
@@ -1405,7 +1492,7 @@ def _run_inbox_rm(args):
     if args.all == (args.n is not None):
         cli.fail("give a message number or --all")
     result = cli.client(args).post("/api/lxmf/inbox/rm", **({"all": True} if args.all else {"id": args.n}))
-    print(f"removed {result['removed']} message(s)")
+    print(f"removed {cli.printable(result['removed'])} message(s)")
 
 
 def _run_outbox(args):
@@ -1420,7 +1507,7 @@ def _run_outbox(args):
             state = "sent to the propagation node"
         elif state not in FINAL_STATES and isinstance(entry.get("progress"), (int, float)):
             state = f"{state} {round(entry['progress'] * 100)}%"
-        print(f"#{entry.get('id')}  {_when(entry.get('time'))}  to <{cli.printable(entry.get('to'))}>  "
+        print(f"#{cli.printable(entry.get('id'))}  {_when(entry.get('time'))}  to <{cli.printable(entry.get('to'))}>  "
               f"{cli.printable(entry.get('method'))}  {cli.printable(state)}  {cli.printable(entry.get('hash'))}")
         if entry.get("error"):
             print(f"    error: {cli.printable(entry['error'])}")
@@ -1432,8 +1519,8 @@ def _run_address(args):
     """Print this node's LXMF address, then a line to share it with."""
     from rnfs import cli
     result = cli.client(args).get("/api/lxmf/address")
-    print(result["address"])
-    print(f"Send me rnfs links over LXMF (Sideband, NomadNet, MeshChat): {result['address']} "
+    print(cli.printable(result["address"]))
+    print(f"Send me rnfs links over LXMF (Sideband, NomadNet, MeshChat): {cli.printable(result['address'])} "
           f"\"{cli.printable(result['display_name'])}\"")
 
 
@@ -1725,6 +1812,11 @@ class LxmfNetwork:
                 # Unsigned as far as we can tell: anyone can send these claiming any source, so the queue
                 # keeps what it holds (the newest is dropped) and path requests are rate limited
                 source, packed = bytes(message.source_hash), bytes(message.packed)
+                if not self.feature.accepts(source):
+                    # received() would ignore it: holding it would only let forged sources fill the queue
+                    _log(f"dropped a message from unknown sender {source.hex()}: not in lxmf_accept_from",
+                         "verbose")
+                    return
                 with self._lock:
                     queued = len(self._held) < HOLD_LIMIT and all(p != packed for _, p, _ in self._held)
                     if queued:
@@ -1762,22 +1854,24 @@ class LxmfNetwork:
         return True
 
     def _retry_held(self):
-        """Validate held messages whose sender's identity is now known; drop those that waited too long."""
+        """Validate held messages whose sender's identity is now known; drop those that waited too long.
+
+        Each stays in the queue until it is done with, so messages arriving meanwhile see it (as a duplicate,
+        and against HOLD_LIMIT)."""
         with self._lock:
             held = list(self._held)
-            self._held.clear()
-        keep = []
         now = time.monotonic()
-        for deadline, packed, method in held:
+        for item in held:
+            deadline, packed, method = item
             source = packed[ID_LENGTH:2 * ID_LENGTH]
-            if self.RNS.Identity.recall(source) is None:
-                if now < deadline:
-                    keep.append((deadline, packed, method))
-                    self._request_path(source)  # if the rate limit held it back before
-                else:
-                    _log(f"dropped a message from {source.hex()}: its identity never became known", "notice")
+            known = self.RNS.Identity.recall(source) is not None
+            if not known and now < deadline:
+                self._request_path(source)  # if the rate limit held it back before
                 continue
             try:
+                if not known:
+                    _log(f"dropped a message from {source.hex()}: its identity never became known", "notice")
+                    continue
                 message = self.LXMF.LXMessage.unpack_from_bytes(packed)
                 message.method = method
                 if message.signature_validated:
@@ -1786,6 +1880,6 @@ class LxmfNetwork:
                     _log(f"dropped a message with an invalid signature from {source.hex()}", "notice")
             except Exception as e:  # noqa: BLE001
                 _log(f"a held message could not be read: {e!r}", "verbose")
-        with self._lock:
-            self._held[:0] = keep  # before any that arrived meanwhile
-            del self._held[HOLD_LIMIT:]
+            finally:
+                with self._lock:
+                    self._held = [other for other in self._held if other is not item]

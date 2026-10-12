@@ -2,8 +2,10 @@
 served as opaque bytes, against an offline RnfsNode."""
 import io
 import os
+import socket
 import tempfile
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -16,10 +18,10 @@ from rnfs.gateway import CSP_SCRIPTS, GatewayServer
 from rnfs.node import RnfsNode
 
 try:
-    from tests.test_api import raw_request
+    from tests.test_api import raw_request, read_until_closed
     from tests.test_names import FakeNetwork
 except ImportError:  # run from inside tests/
-    from test_api import raw_request
+    from test_api import raw_request, read_until_closed
     from test_names import FakeNetwork
 
 
@@ -213,6 +215,48 @@ class FormatTest(unittest.TestCase):
         right.close()
         left.recv(1)
         self.assertTrue(watch.cancelled())
+
+    def test_client_leaving_mid_archive_is_not_an_error(self):
+        # A web page can abort archive downloads at will: a write failing once the headers are out isn't logged,
+        # unless the client is still there (then it is an error of the node's, e.g. reading a block)
+        def export_stream(target, start, for_gateway=False):
+            """Send the headers and part of the body, then fail as a write to a closed connection does."""
+            start(1000).write(b"x" * 10)
+            raise BrokenPipeError(32, "Broken pipe")
+
+        self.node.export_stream = export_stream
+        for gone, logged in ((True, False), (False, True)):
+            with mock.patch("rnfs.gateway_formats.client_gone", return_value=gone), \
+                    mock.patch("rnfs.gateway.log") as log:
+                with socket.create_connection(("127.0.0.1", self.server.port), timeout=10) as sock:
+                    sock.sendall(f"GET /rnfs/{self.root}?format=archive HTTP/1.1\r\n"
+                                 f"Host: 127.0.0.1:{self.server.port}\r\n\r\n".encode())
+                    data, _ = read_until_closed(sock)
+            self.assertTrue(data.startswith(b"HTTP/1.0 200 ") and b"Content-Length: 1000\r\n" in data, data[:200])
+            self.assertTrue(data.endswith(b"\r\n\r\n" + b"x" * 10))  # cut short, as nothing else can be said
+            self.assertEqual(log.called, logged, gone)
+
+    def test_client_watch_works_beyond_fd_1024(self):
+        # select.select() can't take a file descriptor of 1024 or more; poll() can
+        import resource
+        from rnfs.gateway_formats import client_gone
+        if not hasattr(os, "dup2") or not hasattr(resource, "RLIMIT_NOFILE"):
+            self.skipTest("no fd limits here")
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 1200:
+            self.skipTest("can't open a file descriptor over 1024")
+        if soft != resource.RLIM_INFINITY and soft < 1200:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1200, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        left, right = socket.socketpair()
+        self.addCleanup(right.close)
+        high = os.dup2(left.fileno(), 1100)
+        left.close()
+        sock = socket.socket(fileno=high)
+        self.addCleanup(sock.close)
+        self.assertFalse(client_gone(sock))
+        right.close()
+        self.assertTrue(client_gone(sock))
 
     def test_head_and_later_ranges_fetch_no_first_chunk(self):
         """A HEAD, or a range not covering byte 0, doesn't fetch the first chunk just to sniff or check for a

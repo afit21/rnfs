@@ -1,7 +1,10 @@
 """Outgoing RNS links to other nodes (specification section 3).
 
 - Requests to a node share one outgoing link, opened on demand and closed after link_idle_timeout without
-  traffic (Link.no_data_for()). These links don't identify, so lookups and downloads don't reveal who asks.
+  traffic (Link.no_data_for()) or being handed out by LinkPool.get(). These links don't identify, so lookups
+  and downloads don't reveal who asks.
+- A link goes only to a destination whose hash is the node ID asked for (rnfs.dht of the identity RNS
+  recalls for it), so one identity can't pose as many node IDs by announcing other destinations.
 - Publishing and /pin use a separate link that identifies, closed when done.
 - In private mode every link identifies.
 - Requesters stay within the per-link limits: at most MAX_REQUESTS_PER_LINK requests in progress on a link,
@@ -96,6 +99,7 @@ class PeerLink:
         self.requests = 0
         self.blocks = 0
         self.closed = False
+        self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.cond = threading.Condition()
 
     @property
@@ -195,6 +199,7 @@ class LinkPool:
         with self.lock:
             peer = self.shared.get(node_id)
             if peer is not None and peer.is_active():
+                peer.handed_out = self.clock()  # under the lock, so sweep() sees it before closing the link
                 return peer
             if peer is not None:
                 del self.shared[node_id]
@@ -208,7 +213,10 @@ class LinkPool:
             event.wait(self.config.path_timeout + 120)
             with self.lock:
                 peer = self.shared.get(node_id)
-            return peer if peer is not None and peer.is_active() else None
+                if peer is None or not peer.is_active():
+                    return None
+                peer.handed_out = self.clock()
+                return peer
 
         peer = PeerLink(node_id, identified=self.config.private, shared=True)
         opened = False
@@ -217,6 +225,7 @@ class LinkPool:
         finally:
             with self.lock:
                 if opened and peer.is_active():
+                    peer.handed_out = self.clock()
                     self.shared[node_id] = peer
                 self.connecting.pop(node_id, None)
             event.set()
@@ -256,6 +265,12 @@ class LinkPool:
             return False
 
         destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, DHT_ASPECT)
+        if destination.hash != node_id:
+            # node_id is another destination of that identity, not its rnfs.dht: whoever holds it could
+            # otherwise answer for many node IDs (ground near target keys) or dodge a ban on its real one
+            log(f"the identity known for {name} isn't that node's (its rnfs.dht is "
+                f"{node_name(destination.hash)}); not connecting", LOG_VERBOSE)
+            return False
         # Set on close too, so a failed link doesn't wait out the full timeout
         settled = threading.Event()
 
@@ -333,7 +348,9 @@ class LinkPool:
             self.close_link(peer)
 
     def sweep(self) -> int:
-        """Close shared links with no request in progress and no data for link_idle_timeout. Returns how many."""
+        """Close shared links with no request in progress, no data and not handed out by get() for
+        link_idle_timeout. Returns how many."""
+        timeout = self.config.link_idle_timeout
         with self.lock:
             peers = list(self.shared.values())
         idle = []
@@ -342,12 +359,22 @@ class LinkPool:
                 quiet = peer.link.no_data_for()
             except Exception:
                 continue
-            if not peer.busy() and quiet >= self.config.link_idle_timeout:
+            if not peer.busy() and quiet >= timeout:
                 idle.append(peer)
+        closing = []
         for peer in idle:
+            with self.lock:
+                # get() may have handed it out since (its caller is about to send a request): it marks the peer
+                # under this lock, and once the peer is out of the pool here no get() can return it
+                if peer.handed_out is not None and self.clock() - peer.handed_out < timeout:
+                    continue
+                if self.shared.get(peer.node_id) is peer:
+                    del self.shared[peer.node_id]
+            closing.append(peer)
+        for peer in closing:
             log(f"closing idle link to {node_name(peer.node_id)}", LOG_VERBOSE)
             self.close_link(peer)
-        return len(idle)
+        return len(closing)
 
     def _start_sweeper(self):
         """Start the thread closing idle links, once."""

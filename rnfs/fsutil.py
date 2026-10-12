@@ -4,7 +4,9 @@ Windows can't delete or replace a file while any process holds it open: Python o
 FILE_SHARE_DELETE, and virus scanners and search indexers briefly open new files too. There, replace() and
 remove() retry for about a second while the file is in use; elsewhere they are plain os.replace and os.remove.
 """
+import errno
 import os
+import sys
 import time
 
 # The one platform switch for rnfs's Windows behaviour; tests patch it to exercise that behaviour anywhere
@@ -42,12 +44,78 @@ def replace(src: str, dst: str):
 def rename_new(src: str, dst: str):
     """Rename src (a file or directory) to dst, which must not exist: FileExistsError if it does.
 
-    os.rename alone would replace an existing file (or empty directory) on POSIX. The check and the rename
-    aren't atomic, which is fine for outputs only this user's processes write to.
+    os.rename alone would replace an existing file (or empty directory) on POSIX. Atomic where the platform
+    allows: Windows' rename never replaces, Linux has renameat2(RENAME_NOREPLACE), and a file can be hard
+    linked then unlinked elsewhere. Only where none of these works (a directory outside Linux, a filesystem
+    without either) is it a check then a rename, which is fine for outputs only this user's processes write to.
     """
-    if os.path.lexists(dst):
-        raise FileExistsError(f"{dst} already exists")
-    _retrying(os.rename, src, dst)
+    try:
+        if not IS_WINDOWS:
+            if _rename_noreplace(src, dst):
+                return
+            if not os.path.isdir(src):
+                try:
+                    os.link(src, dst)  # fails if dst exists, atomically
+                except FileExistsError:
+                    raise
+                except OSError:
+                    pass  # no hard links here (e.g. FAT): check, then rename
+                else:
+                    os.remove(src)
+                    return
+        if os.path.lexists(dst):
+            raise FileExistsError
+        _retrying(os.rename, src, dst)
+    except FileExistsError:
+        raise FileExistsError(f"{dst} already exists") from None
+
+
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+_renameat2 = None  # libc's renameat2 once looked up, or False where there is none
+
+
+def _rename_noreplace(src: str, dst: str) -> bool:
+    """renameat2(src, dst, RENAME_NOREPLACE) on Linux; False if the kernel, filesystem or libc lacks it."""
+    global _renameat2
+    if _renameat2 is None:
+        _renameat2 = False
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+                function = ctypes.CDLL(None, use_errno=True).renameat2
+                function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+                function.restype = ctypes.c_int
+                _renameat2 = function
+            except (OSError, AttributeError):
+                pass  # glibc before 2.28, or a libc without it
+    if not _renameat2:
+        return False
+    import ctypes
+    if _renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+        return True
+    error = ctypes.get_errno()
+    if error in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+        return False  # this kernel or filesystem doesn't support the flag
+    raise OSError(error, os.strerror(error), src, None, dst)  # FileExistsError for EEXIST
+
+
+def sync_directory(directory: str):
+    """Make renames into directory durable (fsync it), where the filesystem allows. Nothing on Windows, which
+    can't open a directory. Raises OSError for a real failure (EIO), not for a filesystem that can't do it."""
+    if IS_WINDOWS:
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except PermissionError:
+        return  # a directory we may write to but not read: the rename stands, just less durably
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.EOPNOTSUPP, errno.EBADF):
+            raise
+    finally:
+        os.close(fd)
 
 
 def remove(path: str) -> bool:
@@ -108,9 +176,10 @@ def safe_default_name(name, fallback):
 
     The name comes from someone else (a DAG entry, a sealed name, an LXMF link), so beyond being one
     plain path component here it must be printable and not hidden: a dotfile such as .bash_login or
-    .npmrc written into the current directory unnoticed could change how other programs behave.
+    .npmrc written into the current directory unnoticed could change how other programs behave. Nor may
+    it start with "-", which a later shell command would read as an option.
     """
-    if (not isinstance(name, str) or not name or not name.isprintable() or name.startswith(".")
+    if (not isinstance(name, str) or not name or not name.isprintable() or name.startswith((".", "-"))
             or "\\" in name or unsafe_name_reason(name) is not None):
         return fallback
     return name

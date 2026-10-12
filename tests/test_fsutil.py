@@ -1,5 +1,6 @@
 """Tests for fsutil: replace and remove retried while Windows reports a file in use, Windows name rules."""
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -79,6 +80,77 @@ class RetryTest(unittest.TestCase):
             self.assertEqual(replace.call_count, 1)
 
 
+class RenameNewTest(unittest.TestCase):
+    """rename_new never replaces what is at the destination, by every route it may take."""
+
+    def setUp(self):
+        """A temporary directory with a file and a directory to rename."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.file = self.make("file", b"new")
+        self.directory = os.path.join(self.tmp.name, "dir")
+        os.mkdir(self.directory)
+
+    def make(self, name: str, data: bytes) -> str:
+        """A file in the temporary directory."""
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def routes(self):
+        """Each way rename_new can work here: renameat2, hard link (files) and check then rename."""
+        no_renameat2 = mock.patch.object(fsutil, "_rename_noreplace", return_value=False)
+        no_links = mock.patch("os.link", side_effect=PermissionError(1, "Operation not permitted"))
+        yield "default", []
+        yield "link", [no_renameat2]
+        yield "check", [no_renameat2, no_links]
+
+    def test_moves_files_and_directories(self):
+        for route, patches in self.routes():
+            with self.subTest(route):
+                for patch in patches:
+                    patch.start()
+                try:
+                    for src in (self.file, self.directory):
+                        fsutil.rename_new(src, src + "." + route)
+                        self.assertFalse(os.path.lexists(src))
+                        os.rename(src + "." + route, src)
+                finally:
+                    mock.patch.stopall()
+        with open(self.file, "rb") as f:
+            self.assertEqual(f.read(), b"new")
+
+    def test_never_replaces(self):
+        existing = self.make("existing", b"old")
+        for route, patches in self.routes():
+            with self.subTest(route):
+                for patch in patches:
+                    patch.start()
+                try:
+                    for src in (self.file, self.directory):
+                        with self.assertRaisesRegex(FileExistsError, "already exists"):
+                            fsutil.rename_new(src, existing)
+                        self.assertTrue(os.path.lexists(src))
+                finally:
+                    mock.patch.stopall()
+        with open(existing, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "renameat2 is Linux's")
+    def test_atomic_on_linux(self):
+        # Even a destination created after any check would have run isn't replaced
+        existing = self.make("existing", b"old")
+        if not fsutil._rename_noreplace(self.make("probe", b""), os.path.join(self.tmp.name, "probed")):
+            self.skipTest("no renameat2(RENAME_NOREPLACE) here")
+        with mock.patch("os.path.lexists", return_value=False), \
+                mock.patch("os.link", side_effect=AssertionError("not needed")):
+            with self.assertRaises(FileExistsError):
+                fsutil.rename_new(self.file, existing)
+        with open(existing, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+
+
 class WindowsNameTest(unittest.TestCase):
     """Names Windows can't take as file names, and the retry budget."""
 
@@ -105,7 +177,8 @@ class SafeDefaultNameTest(unittest.TestCase):
             self.assertEqual(fsutil.safe_default_name(name, "CID"), "CID", repr(name))
 
     def test_hidden_and_path_names_fall_back(self):
-        for name in (".bash_login", ".npmrc", ".", "..", "a/b", "../x", "a\\b", "", None, 42, b"bytes"):
+        for name in (".bash_login", ".npmrc", ".", "..", "a/b", "../x", "a\\b", "", None, 42, b"bytes",
+                     "-rf", "--help"):
             self.assertEqual(fsutil.safe_default_name(name, "CID"), "CID", repr(name))
 
     def test_windows_names_fall_back_on_windows(self):

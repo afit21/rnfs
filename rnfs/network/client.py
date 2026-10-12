@@ -98,29 +98,36 @@ class PeerClient:
 
     # /provide
 
-    def provide(self, node_id: bytes, keys: list[bytes], withdrawn: list[bytes]) -> bool:
+    def provide(self, node_id: bytes, keys: list[bytes], withdrawn: list[bytes]) -> set[bytes]:
         """Tell node_id we provide keys and no longer provide withdrawn, over one identified link.
 
-        Sent in as few requests as fit one packet each, one at a time. True if every batch was recorded;
-        stops at the first that isn't (section 6: not retried until the next republish).
+        Sent in as few requests as fit one packet each, one at a time; stops at the first batch that isn't
+        recorded (section 6: not retried until the next republish). Returns the keys node_id may hold a
+        record of: every key if each batch was recorded, else those of the batches sent, including the one
+        refused or unanswered (a responder can record some keys of a batch it refuses, e.g. up to a limit),
+        so they are withdrawn from it later. Empty if no identified link could be opened.
         """
         if not keys and not withdrawn:
-            return True
+            return set()
         peer = self.links.open_identified(node_id)
         if peer is None:
-            return False
+            return set()
         try:
             batches = protocol.provide_batches(keys, withdrawn, peer.mdu())
+            sent: set[bytes] = set()
             for batch_keys, batch_withdrawn in batches:
+                sent.update(batch_keys)
                 exchange = self.links.call(peer, PROVIDE_PATH, protocol.encode_provide(batch_keys, batch_withdrawn),
                                            max_response_size=protocol.MAX_ACCEPT_RESPONSE_SIZE)
                 if not (exchange.answered and protocol.is_accepted(exchange.response)):
                     outcome = "refused" if exchange.answered else "didn't answer"
-                    log(f"{node_name(node_id)} {outcome} /provide of {plural(len(batch_keys), 'key')}", LOG_VERBOSE)
-                    return False
+                    log(f"{node_name(node_id)} {outcome} /provide of {plural(len(batch_keys), 'key')}"
+                        + (f" ({plural(len(keys) - len(sent), 'key')} not sent)" if len(sent) < len(keys) else ""),
+                        LOG_VERBOSE)
+                    return sent
             log(f"{node_name(node_id)} recorded {plural(len(keys), 'key')}"
                 + (f", withdrew {len(withdrawn)}" if withdrawn else ""), LOG_VERBOSE)
-            return True
+            return set(keys)
         finally:
             self.links.close_link(peer)
 

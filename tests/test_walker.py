@@ -1,4 +1,5 @@
 """Tests for walking DAGs (specification sections 5 and 7): reader checks, paths, ranges, listing, writing out."""
+import errno
 import os
 import stat
 import tempfile
@@ -217,6 +218,31 @@ class WalkTest(unittest.TestCase):
         self.assertTrue(all(count == 1 for count in blocks.reads.values()))
         self.assertEqual(walked[0][1], blocks[root])
 
+    def test_iter_dag_rereads_a_node_met_under_another_expectation(self):
+        # Node bytes aren't kept for the whole walk, but every occurrence is still checked
+        blocks = Blocks()
+        chunk = blocks.raw(b"same")
+        sub = blocks.node(FileNode([Child(chunk, 4)]))
+        root = blocks.node(DirectoryNode([Entry("a", sub, 4, 0), Entry("b", sub, 4, 1)]))
+        walked = list(walker.iter_dag(root_expect(root), blocks.get))
+        self.assertEqual([e.cid for e, _ in walked], [root, sub, chunk])
+        self.assertEqual(blocks.reads[sub], 2)
+        bad = blocks.node(DirectoryNode([Entry("a", sub, 4, 0), Entry("b", sub, 5, 1)]))
+        with self.assertRaises(InvalidDag):
+            list(walker.iter_dag(root_expect(bad), blocks.get))
+        bad = blocks.node(DirectoryNode([Entry("a", sub, 4, 0), Entry("b", chunk, 4, 0), Entry("c", chunk, 3, 0)]))
+        with self.assertRaises(InvalidDag):  # a raw block met again is checked by its length
+            list(walker.iter_dag(root_expect(bad), blocks.get))
+
+    def test_iter_dags_yields_each_block_once_over_every_root(self):
+        blocks = Blocks()
+        chunk = blocks.raw(b"same")
+        sub = blocks.node(FileNode([Child(chunk, 4)]))
+        root = blocks.node(DirectoryNode([Entry("a", sub, 4, 0)]))
+        walked = [e.cid for e, _ in walker.iter_dags([root_expect(sub), root_expect(root), root_expect(chunk)],
+                                                        blocks.get)]
+        self.assertEqual(walked, [sub, chunk, root])
+
     def test_iter_dag_depth_first(self):
         with small_tree():
             blocks = Blocks()
@@ -417,9 +443,11 @@ class WriteOutTest(unittest.TestCase):
         built = builder.build_bytes(b"#!", self.blocks.put, kind=dag.KIND_EXECUTABLE)
         wrapped = builder.wrap("x", built, self.blocks.put)
         target = walker.resolve(wrapped.cid, ["x"], self.blocks.get)
-        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod:
+        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod, \
+                mock.patch("os.fchmod", create=True) as fchmod:
             walker.write_out(target, self.blocks.get, self.path("x"), 10)
         chmod.assert_not_called()
+        fchmod.assert_not_called()
         with open(self.path("x"), "rb") as f:
             self.assertEqual(f.read(), b"#!")
 
@@ -462,6 +490,47 @@ class WriteOutTest(unittest.TestCase):
         self.assertEqual(os.listdir(self.path("out")), ["good"])
         self.assertEqual(len(warnings), 1)
         self.assertIn("bad", warnings[0])
+
+    def test_skips_names_this_filesystem_refuses(self):
+        # Names ext4 takes but FAT or eCryptfs refuse: skipped and reported, the rest still written
+        a = builder.build_bytes(b"a", self.blocks.put)
+        sub = builder.build_directory([Entry("x", a.cid, 1, 0)], self.blocks.put)
+        root = builder.build_directory([Entry("a?b", a.cid, 1, 0), Entry("d?", sub.cid, 1, 2),
+                                        Entry("good", a.cid, 1, 0), Entry("long", a.cid, 1, 0)], self.blocks.put)
+
+        def refusing(real, *names_and_errors):
+            """real(path, ...), but OSError(error) for the names given."""
+            refused = dict(names_and_errors)
+
+            def operation(path, *args):
+                """Refuse some names as the filesystem would."""
+                error = refused.get(os.path.basename(path))
+                if error is not None:
+                    raise OSError(error, os.strerror(error), path)
+                return real(path, *args)
+
+            return operation
+
+        with mock.patch.object(walker, "open", refusing(open, ("a?b", errno.EINVAL), ("long", errno.ENAMETOOLONG)),
+                               create=True), \
+                mock.patch("os.mkdir", refusing(os.mkdir, ("d?", errno.EINVAL))):
+            warnings = walker.write_out(root_expect(root.cid), self.blocks.get, self.path("out"), 10)
+        self.assertEqual(os.listdir(self.path("out")), ["good"])
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(all("can't represent" in warning for warning in warnings))
+        # Any other error (a full disk) still fails the whole get
+        with mock.patch.object(walker, "open", refusing(open, ("good", errno.ENOSPC)), create=True), \
+                self.assertRaises(OSError):
+            walker.write_out(root_expect(root.cid), self.blocks.get, self.path("out2"), 10)
+
+    @unittest.skipUnless(POSIX_MODES, "Windows has no execute bit")
+    def test_execute_bit_is_set_through_the_descriptor(self):
+        # Not by path, which a symlink swapped in meanwhile could redirect
+        built = builder.build_bytes(b"#!", self.blocks.put, kind=dag.KIND_EXECUTABLE)
+        root = builder.build_directory([Entry("x", built.cid, 2, 1)], self.blocks.put)
+        with mock.patch("os.chmod", side_effect=AssertionError("by path")):
+            walker.write_out(root_expect(root.cid), self.blocks.get, self.path("out"), 10)
+        self.assertTrue(os.stat(self.path("out", "x")).st_mode & stat.S_IXUSR)
 
     def test_unsafe_name_reason(self):
         self.assertIsNone(walker.unsafe_name_reason("fine name.txt"))

@@ -131,12 +131,22 @@ class Stall:
         self.size = size
 
 
+class FakeDestination:
+    """Stands in for RNS.Destination: an identity's rnfs.dht hash is its .node_id (see fake_rns's recall)."""
+
+    OUT, SINGLE = 2, 0
+
+    def __init__(self, identity, direction, kind, app_name, *aspects):
+        """The destination of identity; its hash is the node ID recall() made it for, or identity.dht_hash."""
+        self.hash = getattr(identity, "dht_hash", identity.node_id)
+
+
 def fake_rns():
     """A stand-in for the RNS module where every node is reachable and links are FakeLinks."""
     return types.SimpleNamespace(
         Link=FakeLink,
-        Destination=mock.Mock(),
-        Identity=types.SimpleNamespace(recall=lambda node_id: object()),
+        Destination=FakeDestination,
+        Identity=types.SimpleNamespace(recall=lambda node_id: types.SimpleNamespace(node_id=node_id)),
         Transport=types.SimpleNamespace(await_path=lambda node_id, timeout: True, has_path=lambda node_id: True,
                                         request_path=lambda node_id: None),
         log=lambda *args: None, prettyhexrep=lambda b: b.hex(), LOG_INFO=4, LOG_VERBOSE=5,
@@ -166,7 +176,8 @@ class LinkPoolTest(unittest.TestCase):
         FakeLink.response_size = 10
         FakeLink.responder = staticmethod(lambda link, path, data: True)
         self.identity = object()
-        self.pool = links.LinkPool(self.identity, Config(link_idle_timeout=300))
+        self.now = [1000.0]  # the pool's clock, which sweep() compares with when get() last handed a link out
+        self.pool = links.LinkPool(self.identity, Config(link_idle_timeout=300), clock=lambda: self.now[0])
         self.addCleanup(self.pool.close_all)
 
     def test_reuses_shared_link(self):
@@ -223,10 +234,18 @@ class LinkPoolTest(unittest.TestCase):
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
 
+    def test_no_link_to_another_destination_of_the_identity(self):
+        # The identity recalled for NODE has another rnfs.dht hash: NODE is some other destination of it
+        links.RNS.Identity.recall = lambda node_id: types.SimpleNamespace(node_id=node_id, dht_hash=OTHER)
+        self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
+        self.assertIsNone(run(self, lambda: self.pool.open_identified(NODE)))
+        self.assertEqual(FakeLink.created, [])
+
     def test_sweep_closes_only_idle_links(self):
         idle = run(self, lambda: self.pool.get(NODE))
         busy = run(self, lambda: self.pool.get(OTHER))
         idle.link.idle = busy.link.idle = 301
+        self.now[0] += 301
         busy.acquire(blocks=False)
         self.assertEqual(self.pool.sweep(), 1)
         self.assertEqual(idle.link.status, FakeLink.CLOSED)
@@ -235,7 +254,36 @@ class LinkPoolTest(unittest.TestCase):
     def test_sweep_keeps_recent_links(self):
         peer = run(self, lambda: self.pool.get(NODE))
         peer.link.idle = 299
+        self.now[0] += 301
         self.assertEqual(self.pool.sweep(), 0)
+
+    def test_sweep_keeps_a_link_just_handed_out(self):
+        # A link quiet for link_idle_timeout that get() has just returned: its caller is about to use it
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.idle = 301
+        self.now[0] += 301
+        self.assertIs(run(self, lambda: self.pool.get(NODE)), peer)
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertEqual(peer.link.status, FakeLink.ACTIVE)
+        self.now[0] += 301  # not used after all
+        self.assertEqual(self.pool.sweep(), 1)
+
+    def test_sweep_rechecks_under_the_lock(self):
+        # get() hands the link out after sweep() found it idle but before it is closed
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.idle = 301
+        self.now[0] += 301
+        original = peer.busy
+
+        def busy_then_handed_out():
+            """Report not busy, then let get() hand the peer out, as another thread would."""
+            result = original()
+            peer.handed_out = self.now[0]
+            return result
+        peer.busy = busy_then_handed_out
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertEqual(peer.link.status, FakeLink.ACTIVE)
+        self.assertTrue(self.pool.has_link(NODE))
 
     def test_request_answers(self):
         FakeLink.responder = staticmethod(lambda link, path, data: [path, data])

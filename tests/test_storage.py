@@ -64,6 +64,17 @@ class BlockTest(StorageTest):
             self.storage.put(Cid.for_block(RAW, b"abc"), b"abd")
         self.assertEqual(self.storage.used_bytes(), 0)
 
+    def test_put_of_a_stored_block_still_verifies(self):
+        # Archive import counts what put accepts as supplied, so junk for a block already held must fail too
+        cid = Cid.for_block(RAW, b"abc")
+        self.storage.put(cid, b"abc")
+        with self.assertRaises(ValueError):
+            self.storage.put(cid, b"junk")
+        with self.storage.protect() as session, self.assertRaises(ValueError):
+            session.put(cid, b"junk")
+        self.assertEqual(self.storage.get(cid), b"abc")
+        self.assertEqual(self.storage.used_bytes(), 3)
+
     def test_getter(self):
         get = self.storage.getter()
         with self.assertRaises(NotFound):
@@ -130,11 +141,88 @@ class PinTest(StorageTest):
         self.assertEqual(self.open().pins(), {})
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "state", "pins.json.damaged")))
 
-    def test_unmovable_damaged_state_doesnt_stop_startup(self):
+    def test_empty_state_file_is_damaged(self):
+        # What a power loss can leave of a file written without fsync
+        open(os.path.join(self.tmp.name, "state", "pins.json"), "wb").close()
+        self.assertEqual(self.open().pins(), {})
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "state", "pins.json.damaged")))
+
+    def test_state_of_the_wrong_shape_is_moved_aside(self):
+        state = os.path.join(self.tmp.name, "state")
+        for name, content in (("pins.json", "[]"), ("pins.json", '{"pins": []}'), ("cache.json", '{"fetches": 5}'),
+                              ("cache.json", '"text"')):
+            with open(os.path.join(state, name), "w", encoding="utf-8") as f:
+                f.write(content)
+            storage = self.open()
+            self.assertEqual((storage.pins(), storage.cached_fetches()), ({}, []), content)
+            self.assertFalse(os.path.exists(os.path.join(state, name)), content)
+        # Wrongly shaped records within a well-shaped file are skipped one by one
+        cid = self.add(b"x").cid
+        with open(os.path.join(state, "pins.json"), "w", encoding="utf-8") as f:
+            f.write('{"pins": {"%s": "user"}}' % cid)
+        with open(os.path.join(state, "cache.json"), "w", encoding="utf-8") as f:
+            f.write('{"fetches": [["%s", "ab", "%s"], ["%s", [], "%s"]]}' % (cid, cid, cid, cid))
+        storage = self.open()
+        self.assertEqual(storage.pins(), {})
+        self.assertEqual(storage.cached_fetches(), [(cid, (), cid)])
+
+    def test_earlier_damaged_copies_are_kept(self):
+        state = os.path.join(self.tmp.name, "state")
+        for content in ("{first", "{second"):
+            with open(os.path.join(state, "pins.json"), "w", encoding="utf-8") as f:
+                f.write(content)
+            self.open()
+        with open(os.path.join(state, "pins.json.damaged"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{first")
+        with open(os.path.join(state, "pins.json.damaged.1"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{second")
+
+    def test_directory_in_place_of_state_is_moved_aside(self):
         state = os.path.join(self.tmp.name, "state")
         os.mkdir(os.path.join(state, "pins.json"))  # unreadable as a file
-        os.makedirs(os.path.join(state, "pins.json.damaged", "in-the-way"))  # and it can't be moved aside
+        os.makedirs(os.path.join(state, "pins.json.damaged", "in-the-way"))
         self.assertEqual(self.open().pins(), {})
+        self.assertTrue(os.path.isdir(os.path.join(state, "pins.json.damaged.1")))
+
+    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    def test_unmovable_damaged_state_doesnt_stop_startup(self):
+        state = os.path.join(self.tmp.name, "state")
+        with open(os.path.join(state, "pins.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        os.chmod(state, 0o500)  # read-only: it can't be moved aside
+        self.addCleanup(os.chmod, state, 0o700)
+        self.assertEqual(self.open().pins(), {})
+
+    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    def test_unreadable_state_stops_startup_rather_than_losing_pins(self):
+        cid = self.add(b"precious").cid
+        self.storage.pin(cid, USER)
+        path = os.path.join(self.tmp.name, "state", "pins.json")
+        os.chmod(path, 0)  # or EIO, EMFILE: not damage, and starting without pins would let gc delete them
+        self.addCleanup(os.chmod, path, 0o600)
+        with self.assertRaises(PermissionError):
+            self.open()
+        os.chmod(path, 0o600)
+        self.assertEqual(self.open().pins(), {cid: {"user"}})
+
+    def test_block_names_are_synced_before_pins_and_cache_records(self):
+        calls = []
+        with mock.patch.object(self.storage.blocks, "sync", lambda: calls.append("blocks")), \
+                mock.patch.object(storage_module, "write_json", lambda path, value: calls.append(os.path.basename(path))):
+            cid = self.add(b"x").cid
+            self.storage.pin(cid, USER)
+            self.storage.record_fetch(cid, [], cid)
+            self.storage.save()
+        self.assertEqual(calls, ["blocks", "pins.json", "blocks", "cache.json"])
+
+    @unittest.skipIf(fsutil.IS_WINDOWS, "Windows can't sync a directory")
+    def test_state_is_synced_before_and_after_the_rename(self):
+        events = []
+        real_fsync, real_replace = os.fsync, fsutil.replace
+        with mock.patch("os.fsync", side_effect=lambda fd: (events.append("fsync"), real_fsync(fd))[1]), \
+                mock.patch.object(fsutil, "replace", lambda *a: (events.append("rename"), real_replace(*a))[1]):
+            storage_module.write_json(os.path.join(self.tmp.name, "state", "x.json"), {"a": 1})
+        self.assertEqual(events, ["fsync", "rename", "fsync"])
 
     @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX permission bits")
     def test_state_dir_is_private(self):
@@ -338,6 +426,43 @@ class EvictionTest(StorageTest):
         self.assertEqual(stats["bad"], [b.cid])
         self.assertEqual(stats["incomplete"], {root.cid})
         self.assertFalse(self.storage.is_complete(root.cid))  # the memo was invalidated
+
+    def big_pinned_file(self) -> tuple[Cid, Cid]:
+        """A pinned file of 300 chunks (a root over two index nodes); returns (root, its last child node)."""
+        built = self.add(os.urandom(300 * 64 * 1024))
+        self.storage.pin(built.cid, USER)
+        return built.cid, dag.decode(self.storage.get(built.cid)).children[-1].cid
+
+    def test_damaged_interior_node_stops_collection(self):
+        # A node emptied by a power loss lists nothing readable: the pinned blocks below it aren't garbage
+        root, node = self.big_pinned_file()
+        garbage = self.add(b"garbage").cid
+        self.storage.record_fetch(garbage, [], garbage)
+        count = self.storage.block_count()
+        open(self.storage.blocks.path(node), "wb").close()
+        self.storage = self.open(max_storage=1)
+        self.assertEqual(self.storage.evict(), set())
+        self.assertEqual(self.storage.gc()["removed_blocks"], 0)
+        self.assertEqual(self.storage.block_count(), count)
+        self.assertTrue(self.storage.has(garbage))
+        # A node that matches its CID but isn't valid lists nothing, and doesn't stop collection
+        self.storage.verify()  # removes the damaged node
+        invalid = Cid.for_block(DAG, b"not a node")
+        self.storage.put(invalid, b"not a node")
+        self.storage.pin(invalid, USER)
+        self.storage.unpin(root, USER)
+        self.storage.gc()
+        self.assertEqual(self.storage.block_count(), 1)
+        self.assertTrue(self.storage.has(invalid))
+
+    def test_node_damaged_after_it_was_read_still_lists_its_children(self):
+        root, node = self.big_pinned_file()
+        count = self.storage.block_count()
+        self.storage.gc()  # reads every node's children
+        with open(self.storage.blocks.path(node), "wb") as f:
+            f.write(b"x")
+        self.storage.gc()
+        self.assertEqual(self.storage.block_count(), count)
 
     def test_block_in_use_on_windows_is_collected_later(self):
         # On Windows a block a reader holds open can't be deleted: gc keeps it, indexed and counted, for next time

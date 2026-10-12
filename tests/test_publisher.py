@@ -1,4 +1,5 @@
 """Tests for the provide strategy, batched publishing, republishing and withdrawal (rnfs/publisher.py)."""
+import json
 import os
 import tempfile
 import unittest
@@ -6,11 +7,12 @@ import unittest
 import RNS
 
 from rnfs.config import Config
+from rnfs.constants import PROVIDER_TTL
 from rnfs.content import builder
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.dht.providers import ProviderStore
-from rnfs.publisher import Publisher
+from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, STATE_FILE, Publisher
 
 OWN = bytes(16)
 N1, N2, N3 = (bytes([i]) * 16 for i in (1, 2, 3))
@@ -29,17 +31,20 @@ def tearDownModule():
 
 
 class FakeClient:
-    """Records /provide requests; nodes in refuse answer False."""
+    """Records /provide requests; nodes in refuse record nothing, a node in limit records only its first keys."""
 
     def __init__(self):
         """No requests yet."""
         self.calls: list[tuple[bytes, list[bytes], list[bytes]]] = []
         self.refuse: set[bytes] = set()
+        self.limit: dict[bytes, int] = {}
 
     def provide(self, node_id, keys, withdrawn):
-        """Record one batched /provide."""
+        """Record one batched /provide; the keys the node may have recorded, as PeerClient.provide returns."""
         self.calls.append((node_id, list(keys), list(withdrawn)))
-        return node_id not in self.refuse
+        if node_id in self.refuse:
+            return set()
+        return set(list(keys)[:self.limit.get(node_id, len(keys))])
 
 
 class FakeLookup:
@@ -82,16 +87,26 @@ class PublisherTest(unittest.TestCase):
         self.nodes = [N1, N2]
         self.eligible: set[Cid] = set()
         self.lookups: list[bytes] = []
+        self.on_lookup = lambda key: None
         self.publisher = self.make_publisher()
 
-    def make_publisher(self) -> Publisher:
+    def make_publisher(self, slow: bool = False) -> Publisher:
         """A publisher sharing this test's state directory."""
         def make_lookup(key):
             """Remember the key; find self.nodes."""
             self.lookups.append(key)
+            self.on_lookup(key)
             return FakeLookup(self.nodes)
-        return Publisher(OWN, self.config, self.storage, self.records, self.client, make_lookup, False, self.state,
+        return Publisher(OWN, self.config, self.storage, self.records, self.client, make_lookup, slow, self.state,
                          cached_eligible=lambda: self.eligible, clock=self.clock, retry_interval=30)
+
+    def withdrawn(self) -> dict[bytes, set[bytes]]:
+        """The keys withdrawn from each node by the calls made so far."""
+        result: dict[bytes, set[bytes]] = {}
+        for node_id, _, keys in self.client.calls:
+            if keys:
+                result.setdefault(node_id, set()).update(keys)
+        return result
 
     def pinned(self, data: bytes) -> Cid:
         """A complete pinned file."""
@@ -212,6 +227,138 @@ class PublisherTest(unittest.TestCase):
         self.clock.now += 10
         self.publisher.publish_due()
         self.assertEqual(self.client.calls, [])
+
+    def test_keys_a_node_recorded_before_refusing_are_withdrawn_later(self):
+        cids = [self.pinned(b"key %d" % i) for i in range(3)]
+        self.client.limit[N1] = 1  # e.g. N1's per-publisher limit was reached after one key
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        first = next(keys for node_id, keys, _ in self.client.calls if node_id == N1)[0]
+        self.client.calls.clear()
+        for cid in cids:
+            self.storage.unpin(cid, USER)
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.assertEqual(self.withdrawn(), {N1: {first}, N2: {cid.key for cid in cids}})
+
+    def test_round_stopped_midway_leaves_unsent_cids_due(self):
+        cid = self.pinned(b"interrupted")
+        self.publisher.refresh()
+        result = self.publisher.publish_due(should_stop=lambda: len(self.client.calls) >= 1)
+        self.assertEqual([node_id for node_id, _, _ in self.client.calls], [N1])  # N2 never sent
+        self.assertEqual(result["published"], [])
+        self.assertEqual(self.publisher.next_due(), 0)
+        # Still due after a restart; and N1, which recorded it, is withdrawn from on unpin
+        self.publisher = self.make_publisher()
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.next_due(), 0)
+        self.client.calls.clear()
+        self.storage.unpin(cid, USER)
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.assertEqual(self.withdrawn(), {N1: {cid.key}})
+
+    def test_unpin_withdraws_from_earlier_rounds_nodes(self):
+        cid = self.pinned(b"moving")
+        self.publisher.refresh()
+        self.publisher.publish_due()  # N1, N2
+        self.nodes = [N2, N3]  # N1 left the closest set; its record lives on for PROVIDER_TTL
+        self.clock.now += 1000
+        self.publisher.publish_due()
+        self.publisher = self.make_publisher()  # remembered across a restart
+        self.publisher.refresh()
+        self.client.calls.clear()
+        self.storage.unpin(cid, USER)
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.assertEqual(self.withdrawn(), {N1: {cid.key}, N2: {cid.key}, N3: {cid.key}})
+
+    def test_earlier_nodes_forgotten_once_their_record_expired(self):
+        cid = self.pinned(b"moved")
+        self.publisher.refresh()
+        self.publisher.publish_due()  # N1, N2
+        self.nodes = [N2, N3]
+        self.clock.now += 1000
+        self.publisher.publish_due()
+        self.clock.now += PROVIDER_TTL
+        self.publisher.publish_due()  # N1's record has expired by now
+        self.client.calls.clear()
+        self.storage.unpin(cid, USER)
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.assertEqual(self.withdrawn(), {N2: {cid.key}, N3: {cid.key}})
+
+    def test_withdrawals_queued_during_lookups_go_in_the_same_round(self):
+        old = self.pinned(b"old")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        new = self.pinned(b"new")
+        self.publisher.refresh()
+        self.client.calls.clear()
+
+        def unpin_old(key):
+            """Unpin old while new's lookup runs."""
+            if key == new.key:
+                self.storage.unpin(old, USER)
+                self.publisher.refresh()
+
+        self.on_lookup = unpin_old
+        self.publisher.publish_due()
+        self.assertEqual(sorted(self.client.calls), [(N1, [new.key], [old.key]), (N2, [new.key], [old.key])])
+
+    def test_cid_unpinned_during_its_lookup_isnt_stored(self):
+        cid = self.pinned(b"short-lived")
+        self.publisher.refresh()
+
+        def unpin(key):
+            """Unpin it while its lookup runs."""
+            self.storage.unpin(cid, USER)
+            self.publisher.refresh()
+
+        self.on_lookup = unpin
+        self.assertEqual(self.publisher.publish_due()["published"], [])
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.records.providers(cid.key), [])  # nor recorded locally
+
+    def test_times_in_the_future_are_clamped(self):
+        # Published while the clock ran ahead: once corrected, it's republished an interval from now
+        self.pinned(b"ahead")
+        self.publisher.refresh()
+        self.clock.now += 10**6
+        self.publisher.publish_due()
+        self.clock.now -= 10**6
+        self.assertAlmostEqual(self.publisher.next_due(), 1000)
+        self.publisher.save()
+        self.clock.now += 10**6
+        self.publisher.publish_due()
+        self.publisher.save()
+        self.clock.now -= 10**6
+        restarted = self.make_publisher()
+        restarted.refresh()
+        self.assertAlmostEqual(restarted.next_due(), 1000)
+
+    def test_slow_pacing_clamped_after_the_clock_goes_back(self):
+        publisher = self.make_publisher(slow=True)
+        self.pinned(b"paced")
+        publisher.refresh()
+        self.clock.now += 10**6
+        publisher.publish_due()
+        self.clock.now -= 10**6
+        self.pinned(b"new")  # due now, but lookups are paced
+        publisher.refresh()
+        self.assertEqual(publisher.next_due(), SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)  # at most a full round's wait
+
+    def test_state_of_the_wrong_shape_is_ignored(self):
+        cid = self.pinned(b"shape")
+        for value in ([], {"published": []}, {"published": {str(cid): 5}, "withdraw": []},
+                      {"published": {str(cid): [10**400, []]}}, {"published": {str(cid): [1, "0101"]}},
+                      {"earlier": {str(cid): []}, "withdraw": {N1.hex(): "ab"}}):
+            with self.subTest(value=value):
+                with open(os.path.join(self.state, STATE_FILE), "w", encoding="utf-8") as f:
+                    json.dump(value, f)
+                publisher = self.make_publisher()
+                publisher.refresh()
+                self.assertEqual(publisher.next_due(), 0)  # nothing loaded: due
 
     def test_served_blocks_are_the_provided_dags(self):
         cid = self.pinned(os.urandom(200_000))

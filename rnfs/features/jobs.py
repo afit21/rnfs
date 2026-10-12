@@ -202,8 +202,13 @@ class Job:
 
 def _number(value, default):
     """value if it is a finite non-negative number, else default."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < float("inf"):
-        return float(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            number = float(value)
+        except OverflowError:  # an int too large for a float
+            return default
+        if 0 <= number < float("inf"):
+            return number
     return default
 
 
@@ -282,13 +287,12 @@ class JobsFeature(Feature):
 
     def _load(self):
         """Read jobs.json, skipping malformed records."""
-        from rnfs.content.storage import read_json
-        value = read_json(self._path) or {}
-        records = value.get("jobs", []) if isinstance(value, dict) else []
-        for record in records if isinstance(records, list) else []:
+        from rnfs.content.storage import read_json, shaped
+        value = read_json(self._path, shaped("jobs", list)) or {}
+        for record in value.get("jobs", []):
             try:
                 job = Job.from_record(record)
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError, OverflowError) as e:
                 _log(f"ignoring a saved job ({e})", "LOG_WARNING")
                 continue
             if job.id in self._jobs:

@@ -49,6 +49,7 @@ class FakeClient:
         self.links: list[bytes] = []
         self.rate: float | None = None
         self.requests: list[tuple[bytes, list[Cid]]] = []
+        self.closed: list[bytes] = []
         self.lock = threading.Lock()
 
     def open_links(self) -> list[bytes]:
@@ -58,6 +59,11 @@ class FakeClient:
     def rate_estimate(self, node_id: bytes):
         """The same estimate for every link."""
         return self.rate
+
+    def close(self, node_id: bytes):
+        """Close the link to node_id (noted)."""
+        with self.lock:
+            self.closed.append(node_id)
 
     def blocks(self, node_id: bytes, cids: list[Cid], on_progress=None) -> BlocksResult:
         """Serve what node_id holds, BATCH CIDs per request."""
@@ -309,6 +315,67 @@ class FailureRuleTest(FetcherTest):
         self.assertEqual(self.client.asked(P1), [])
 
 
+class PacingTest(FetcherTest):
+    """Mirroring the responder's upload pacing (section 3), and refusals soon after serving not failing a provider."""
+
+    def setUp(self):
+        """A fetch of a three-chunk file with P1 as its provider, its results handled by hand."""
+        super().setUp()
+        self.now = 1000.0
+        self.fetcher.clock = lambda: self.now
+        self.fetcher.busy_delay = 2.0
+        self.built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.fetch = self.fetcher.open(self.built.cid).__enter__()
+        self.addCleanup(self.fetch.__exit__, None, None, None)
+        self.provider = self.fetch._new_provider(P1)
+
+    def result(self, status: str, reason: str = "", sent_at: float | None = None, rate: float | None = None):
+        """Handle P1's answer, now, to a request sent at sent_at with that rate estimate (blocks served if OK)."""
+        cid = self.built.cid
+        result = BlocksResult(status, reason=reason)
+        if status == OK:
+            result.blocks[cid] = self.network[cid]
+        self.fetch._handle(P1, [cid], result, False, {}, {}, set(), sent_at, rate)
+
+    def test_slow_link_waits_before_asking_again(self):
+        self.result(OK, sent_at=self.now - 40, rate=50_000)  # 40 s for that request
+        # At the default cap, half the rate estimate, the next response may start 2 × 40 s after the last one
+        self.assertEqual(self.provider.busy_until, self.now + 40)
+        self.assertGreaterEqual(self.fetch._progress_at, self.now + 40)  # waiting isn't counted as hanging
+
+    def test_fast_link_isnt_paced(self):
+        self.result(OK, sent_at=self.now - 40, rate=200_000)
+        self.assertEqual(self.provider.busy_until, 0)
+        self.result(OK, sent_at=self.now - 40, rate=None)
+        self.assertEqual(self.provider.busy_until, 0)
+
+    def test_refusals_soon_after_serving_are_not_failures(self):
+        self.result(OK, sent_at=self.now - 40, rate=50_000)
+        self.now += 40
+        for _ in range(2 * self.config.max_failures):
+            self.result(BUSY, "busy")
+            self.assertEqual(self.provider.busy_until, self.now + 5)  # an eighth of the 40 s it took
+            self.now = self.provider.busy_until
+        self.assertFalse(self.provider.failed)
+        self.assertEqual(self.provider.busy, 0)
+        # Past four times that since it was sent, refusals count as busy as usual
+        self.now = 1000 - 40 + 4 * 40 + 1
+        for _ in range(self.config.max_failures):
+            self.result(BUSY, "busy")
+        self.assertTrue(self.provider.failed)
+
+    def test_cancelled_responses_count_even_after_serving(self):
+        self.result(OK, sent_at=self.now - 40, rate=50_000)
+        for _ in range(self.config.max_failures):
+            self.result(BUSY, "cancelled")
+        self.assertTrue(self.provider.failed)
+
+    def test_paced_provider_isnt_dropped_meanwhile(self):
+        # Only provider, waiting out the pacing: the fetch neither gives up nor reruns the lookup
+        self.result(OK, sent_at=self.now - 40, rate=50_000)
+        self.assertTrue(self.fetch._waiting_for_busy())
+
+
 class ValidityTest(FetcherTest):
     """Reader checks, max_download_size, space."""
 
@@ -332,6 +399,44 @@ class ValidityTest(FetcherTest):
         self.assertFalse(self.make_fetcher().is_invalid(root))
         self.fetcher.save()
         self.assertTrue(self.make_fetcher().is_invalid(root))
+
+    def test_blocks_damaged_on_disk_are_fetched_again(self):
+        """A stored block no longer matching its CID (e.g. left empty by a power loss) is local damage: it is
+        deleted and fetched again, and the root isn't marked invalid."""
+        data = os.urandom(3 * CHUNK_SIZE)
+        built = builder.build_bytes(data, self.storage.put)
+        self.hold(P1, list(self.storage_cids()))
+        chunk = next(cid for cid in self.network if cid.is_raw)
+        for cid, damage in ((built.cid, b""), (chunk, b"junk")):
+            with open(self.storage.blocks.path(cid), "wb") as f:
+                f.write(damage)
+        # As after a restart, whose scan records the damaged files' lengths
+        self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.fetcher = self.make_fetcher()
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertFalse(self.fetcher.is_invalid(built.cid))
+        self.assertEqual(self.read(built.cid), data)
+        self.assertEqual(set(self.client.asked(P1)), {built.cid, chunk})
+
+    def test_chunk_damaged_during_a_session_is_fetched_again_when_read(self):
+        data = os.urandom(3 * CHUNK_SIZE)
+        built = builder.build_bytes(data, self.storage.put)
+        self.hold(P1, list(self.storage_cids()))
+        chunk = next(cid for cid in self.network if cid.is_raw)
+        with open(self.storage.blocks.path(chunk), "wb"):
+            pass  # empty, though storage still records its length
+        self.runs.append([P1])
+        with self.fetcher.open(built.cid) as fetch:
+            self.assertEqual(b"".join(fetch.read_range(fetch.resolve())), data)
+        self.assertFalse(self.fetcher.is_invalid(built.cid))
+        self.assertEqual(self.client.asked(P1), [chunk])
+
+    def storage_cids(self):
+        """Every stored block, also put on the network."""
+        for cid, _ in self.storage.blocks.scan():
+            self.network[cid] = self.storage.get(cid)
+            yield cid
 
     def test_max_download_size_checked_before_fetching_below(self):
         self.config.max_download_size = 2 * CHUNK_SIZE
@@ -500,6 +605,29 @@ class LimitTest(FetcherTest):
         self.runs.append([P1])
         with self.fetcher.open(built.cid) as fetch:
             self.assertEqual(b"".join(fetch.read_range(fetch.resolve(), 5)), data[5:])
+
+    def test_failed_fetch_closes_links_with_requests_in_flight(self):
+        self.config.max_parallel_providers = 2
+        bad_block = b"\x93\x01\x02\x03"  # correctly hashed, not a valid DAG node
+        bad = Cid.for_block(DAG, bad_block)
+        self.network[bad] = bad_block
+        self.hold(P1)
+        self.hold(P2)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.client.behaviour[P2] = lambda cids: (release.wait(5), None)[1]  # still sending when the fetch fails
+        self.client.links = [P1, P2]  # both asked for the root at once
+        with self.assertRaises(InvalidDag):
+            self.fetch_all(bad)
+        self.assertEqual(self.client.closed, [P2])
+        # A fetch that succeeds leaves links alone
+        self.client.closed.clear()
+        release.set()
+        fine = self.file(b"fine")
+        self.hold(P1)
+        self.hold(P2)
+        self.fetch_all(fine.cid)
+        self.assertEqual(self.client.closed, [])
 
     def test_hung_request_ends_the_fetch(self):
         self.config.lookup_timeout, self.config.stall_timeout = 0.3, 0.2

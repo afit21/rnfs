@@ -22,14 +22,13 @@ class PinNames:
         self.path = os.path.join(state_dir, NAMES_FILE)
         self._lock = threading.Lock()
         self._names: dict[Cid, str] = {}
-        value = read_json(self.path) or {}
-        if isinstance(value, dict):
-            for text, name in value.items():
-                try:
-                    if isinstance(name, str):
-                        self._names[Cid.parse(text)] = name[:MAX_NAME_LENGTH]
-                except (ValueError, TypeError):
-                    continue
+        value = read_json(self.path, shape=lambda value: isinstance(value, dict)) or {}
+        for text, name in value.items():
+            try:
+                if isinstance(name, str):
+                    self._names[Cid.parse(text)] = name[:MAX_NAME_LENGTH]
+            except (ValueError, TypeError):
+                continue
 
     def record(self, cid: Cid, name: str):
         """Record that cid was added from name; a later add of the same content replaces it."""
@@ -42,10 +41,11 @@ class PinNames:
 
     def record_if_unknown(self, cid: Cid, name: str):
         """Record name for cid unless it already has one (a pin add of something added here keeps its path)."""
-        with self._lock:
+        with self._lock:  # held throughout, so a concurrent record() isn't overwritten
             if cid in self._names:
                 return
-        self.record(cid, name)
+            self._names[cid] = name[:MAX_NAME_LENGTH]
+            self._save()
 
     def get(self, cid: Cid) -> str | None:
         """Where cid was added from, or None if unknown."""

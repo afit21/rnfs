@@ -1,6 +1,8 @@
 # PyInstaller spec for a single-file rnfs executable (console app).
 #
-#   pip install --require-hashes -r packaging/requirements.lock && pip install --no-deps . pyinstaller
+#   pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock      # PyInstaller, setuptools
+#   pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock
+#   pip install --no-deps --no-build-isolation .
 #                                        # rnfs and its dependencies (rns, lxmf, ...) must be installed
 #   pyinstaller --clean --noconfirm packaging/pyinstaller/rnfs.spec
 #   dist/rnfs(.exe) --version

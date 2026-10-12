@@ -421,6 +421,23 @@ class JobsTest(JobsBase):
         c = self.make_node("c", bytes([0xC] * 16))
         self.assertEqual([(j["id"], j["state"]) for j in c.feature("jobs").list()], [("0123abcd", "queued")])
 
+    def test_jobs_file_of_the_wrong_shape_is_moved_aside(self):
+        path = os.path.join(self.tmp.name, "c", "state", jobs.JOBS_FILE)
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"jobs": {"not": "a list"}}, f)
+        c = self.make_node("c", bytes([0xC] * 16))
+        self.assertEqual(c.feature("jobs").list(), [])
+        self.assertTrue(os.path.exists(path + ".damaged"))
+
+    def test_huge_numbers_in_a_record_are_ignored(self):
+        cid = str(Cid.for_block(RAW, b"c"))
+        record = {"id": "0123abcd", "kind": "pin", "target": cid, "state": "done", "created": 10**400,
+                  "started": 10**400, "finished": float("nan")}
+        job = jobs.Job.from_record(record)  # 10**400 is valid JSON, but too large for a float
+        self.assertEqual((job.started, job.finished), (None, None))
+        self.assertLess(job.created, 10**12)
+
     def test_stop_never_hangs(self):
         cid = self.share(os.urandom(CHUNK_SIZE))
         self.net.gate.clear()

@@ -17,6 +17,7 @@ cancelled with Resource.cancel(). A response keeps its slots until its Resource 
 import random
 import threading
 import time
+from collections import OrderedDict
 from typing import Callable, Protocol
 
 import RNS
@@ -36,6 +37,10 @@ REGISTER_WINDOW = 30.0  # seconds for RNS to build and register a response's Res
 PROOF_GRACE = 5.0  # longest a new /blocks waits for the previous response's proof to be processed
 MONITOR_FAST_TICK = 0.02  # monitor interval while a response's Resource hasn't been found yet
 MONITOR_TICK = 0.25
+# Longest a /blocks response is held back for upload pacing: half of RNS's request timeout with no RTT, so the
+# requester doesn't give up meanwhile. Not RTT-based: the requester can inflate the link's RTT
+MAX_PACING_WAIT = RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125 / 2
+CLOSED_MEMORY = 1024  # closed incoming links remembered, so a late request can't track them again
 
 
 class Backend(Protocol):
@@ -110,6 +115,7 @@ class Response:
         self.untracked = False  # RNS internals unavailable: can only be cancelled by closing the link
         self.concluded = False  # its Resource's conclusion has been handled
         self.finished = False
+        self.done = threading.Event()  # set once finished, to cut short a pacing wait
         self.charged = 0  # bytes of upload_budget charged and not yet settled (refunded, or kept once sent)
         self.requester: bytes | None = None  # identity hash (else link ID) whose budget share it counts against
 
@@ -194,37 +200,43 @@ class IncomingLinks:
         self.clock = clock
         self.rng = rng or random.Random()
         self.links: dict[bytes, _LinkState] = {}
+        self.closed: OrderedDict[bytes, None] = OrderedDict()  # recently closed links, oldest first
         self.lock = threading.Lock()
 
-    def admit(self, link_id: bytes) -> tuple[bool, bytes | None]:
+    def admit(self, link_id: bytes, keep: set[bytes] = frozenset()) -> tuple[bool, bytes | None]:
         """Add a new link: (admitted, ID of a link to close to make room, or None).
 
         When full, closes the link idle longest with no request in progress, or else a random one with no
-        /blocks response in progress; if there's neither, the new link isn't admitted.
+        /blocks response in progress; if there's neither, the new link isn't admitted. Links not in keep (in
+        private mode, those not identified as a member) are chosen first.
         """
         with self.lock:
             if link_id in self.links:
                 return True, None
             victim = None
             if len(self.links) >= self.max_links:
-                victim = self._choose_victim()
+                others = [lid for lid in self.links if lid not in keep]
+                victim = self._choose_victim(others) or self._choose_victim(list(self.links))
                 if victim is None:
                     return False, None
                 del self.links[victim]
             self.links[link_id] = _LinkState(self.clock())
             return True, victim
 
-    def _choose_victim(self) -> bytes | None:
-        """The link to close to make room, or None. Caller holds the lock."""
-        idle = [(state.last_active, link_id) for link_id, state in self.links.items() if state.requests == 0]
+    def _choose_victim(self, candidates: list[bytes]) -> bytes | None:
+        """The link among candidates to close to make room, or None. Caller holds the lock."""
+        states = [(link_id, self.links[link_id]) for link_id in candidates]
+        idle = [(state.last_active, link_id) for link_id, state in states if state.requests == 0]
         if idle:
             return min(idle)[1]
-        no_blocks = [link_id for link_id, state in self.links.items() if state.blocks == 0]
+        no_blocks = [link_id for link_id, state in states if state.blocks == 0]
         return self.rng.choice(no_blocks) if no_blocks else None
 
     def start_request(self, link_id: bytes, blocks: bool) -> bool:
-        """Count a new request on link_id. False if it would break the per-link limits."""
+        """Count a new request on link_id. False if it would break the per-link limits or the link has closed."""
         with self.lock:
+            if link_id in self.closed:
+                return False
             state = self.links.get(link_id)
             if state is None:
                 # A link established before we were tracking; count it from now
@@ -265,9 +277,12 @@ class IncomingLinks:
             state.last_active = self.clock()
 
     def remove(self, link_id: bytes):
-        """Forget a closed link."""
+        """Forget a closed link (a request arriving for it afterwards is refused)."""
         with self.lock:
             self.links.pop(link_id, None)
+            self.closed[link_id] = None
+            while len(self.closed) > CLOSED_MEMORY:
+                self.closed.popitem(last=False)
 
     def count(self) -> int:
         """Incoming links tracked."""
@@ -379,7 +394,9 @@ class RequestServer:
         RNS calls this on its packet-handling thread, so it only does quick work.
         """
         self._track(link)
-        admitted, victim = self.incoming.admit(link.link_id)
+        # Private mode: outsiders' links are closed first, so they can't push members' idle links out
+        keep = self._member_links() if self.config.private else frozenset()
+        admitted, victim = self.incoming.admit(link.link_id, keep)
         if victim is not None:
             with self.lock:
                 victim_link = self.links.get(victim)
@@ -390,6 +407,20 @@ class RequestServer:
         if not admitted:
             log("too many incoming links, all busy: refusing a new one", LOG_VERBOSE)
             link.teardown()
+
+    def _member_links(self) -> set[bytes]:
+        """IDs of the incoming links identified as a member (private mode)."""
+        with self.lock:
+            links = list(self.links.values())
+        members = set()
+        for link in links:
+            try:
+                identity = link.get_remote_identity()
+            except Exception:
+                identity = None
+            if self._is_member(identity):
+                members.add(link.link_id)
+        return members
 
     def _track(self, link):
         """Remember an incoming link and get told when it closes."""
@@ -418,7 +449,8 @@ class RequestServer:
         if link is not None:
             return link
         for candidate in list(getattr(self.destination, "links", [])):
-            if getattr(candidate, "link_id", None) == link_id:
+            # Not a closed one: its closed callback has already run, so it would stay tracked for good
+            if getattr(candidate, "link_id", None) == link_id and candidate.status != RNS.Link.CLOSED:
                 self._track(candidate)
                 return candidate
         return None
@@ -524,7 +556,7 @@ class RequestServer:
         try:
             # Refusals come first and at once: pacing, then the pools; only an accepted request waits
             wait = self.pacer.wait_time(link_id)
-            if wait > self._max_pacing_wait(link):
+            if wait > MAX_PACING_WAIT:
                 log(f"refused /blocks: the link's upload cap allows the next response in {wait:.0f}s", LOG_VERBOSE)
                 return False
             rate = self.rates.get(link_id)
@@ -536,7 +568,9 @@ class RequestServer:
                 log(f"refused /blocks: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
                 return False
             if wait > 0:
-                time.sleep(wait)
+                self._pace(response, wait)
+                if response.finished:
+                    return False  # displaced, or its link closed, while it waited
 
             # The upload cap applies once the link has a rate estimate (section 3)
             cap = self.config.effective_max_upload_rate(slow, rate) if rate is not None else None
@@ -560,13 +594,14 @@ class RequestServer:
                 return False
             with self.lock:
                 response.charged = charged  # settled when it concludes: what wasn't sent is refunded
-            self.pacer.started(link_id, packed, cap)
-            served = sum(1 for entry in entries if entry is not None)
-            log(f"/blocks: sending {plural(served, 'block')} of {len(cids)} requested ({size(packed)})", LOG_VERBOSE)
-
             if response.finished:
                 self._refund(response)  # unless finishing it (displacement) refunded it already
                 return False  # displaced while it was being built
+            with self.lock:
+                if link_id in self.links:  # a closed link's entry would never be forgotten
+                    self.pacer.started(link_id, packed, cap)
+            served = sum(1 for entry in entries if entry is not None)
+            log(f"/blocks: sending {plural(served, 'block')} of {len(cids)} requested ({size(packed)})", LOG_VERBOSE)
             self.traffic.sent(node_id_for_identity(remote_identity) if remote_identity is not None else None,
                               mesh.interface_label(getattr(link, "attached_interface", None)), packed)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
@@ -590,12 +625,11 @@ class RequestServer:
             else:
                 self.incoming.finish_request(link_id, blocks=True)
 
-    def _max_pacing_wait(self, link) -> float:
-        """Longest a response may be held back for pacing: half the requester's RTT-based request timeout,
-        so the request isn't abandoned meanwhile."""
-        rtt = getattr(link, "rtt", None) or 0
-        factor = getattr(link, "traffic_timeout_factor", RNS.Link.TRAFFIC_TIMEOUT_FACTOR)
-        return (rtt * factor + RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125) / 2
+    @staticmethod
+    def _pace(response: Response, wait: float):
+        """Hold an accepted response back wait seconds (at most MAX_PACING_WAIT) for upload pacing, or until
+        it finishes (displaced, or its link closed), so it doesn't keep its slot and thread for nothing."""
+        response.done.wait(wait)
 
     def _after_previous(self, link, link_id: bytes) -> bool:
         """Take the link's /blocks slot once its previous response has concluded. False if refused.
@@ -685,6 +719,7 @@ class RequestServer:
             if response.finished:
                 return
             response.finished = True
+        response.done.set()
         self._refund(response)
         self.pools.release(response)
         self.incoming.finish_request(response.link_id, blocks=True)
@@ -694,7 +729,7 @@ class RequestServer:
 
         Without this, a requester that rejects (or never fetches) its responses' Resources would drain the
         node-wide budget while receiving nothing. A completed one keeps its charge, and so does one we can't
-        follow (untracked): whether it arrived is unknown.
+        follow (untracked) or whose progress can't be read: how much was sent is unknown.
         """
         with self.lock:
             charged, response.charged = response.charged, 0
@@ -706,7 +741,7 @@ class RequestServer:
             try:
                 sent = resource.get_progress() * (response.size or 0)
             except Exception:
-                pass  # the last progress the monitor saw
+                return
         self.airtime.refund(int(charged - min(charged, max(0.0, sent))))
 
     def _budget_share_left(self, response: Response) -> int | None:

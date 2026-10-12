@@ -16,7 +16,8 @@ from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, remote_source
 from rnfs import fetcher
-from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
+from rnfs.errors import InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
+from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
 from rnfs import fsutil, node as node_module
 from rnfs.node import RnfsNode
@@ -28,6 +29,7 @@ except ImportError:  # run from inside tests/
     from test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
+PROVIDE_BATCH = 22  # keys per /provide at the default MDU (section 3)
 IDENTITY = bytes(range(16))
 
 _saved_loglevel = RNS.loglevel
@@ -68,10 +70,20 @@ class NetClient:
         return node.backend.find(key)
 
     def provide(self, node_id, keys, withdrawn):
-        """Record, and pass to the node's backend as /provide would (as the sender is unknown here, B)."""
+        """Record, and pass to the node's backend as /provide would (as the sender is unknown here, B).
+
+        Like PeerClient.provide, returns the keys sent up to and including the first batch refused."""
         self.provide_calls.append((node_id, list(keys), list(withdrawn)))
         node = self.nodes.get(node_id)
-        return node is not None and node.backend.provide(self.sender, keys, withdrawn)
+        if node is None:
+            return set()
+        sent = set()
+        for start in range(0, max(len(keys), 1), PROVIDE_BATCH):
+            batch = list(keys)[start:start + PROVIDE_BATCH]
+            sent.update(batch)
+            if not node.backend.provide(self.sender, batch, list(withdrawn) if start == 0 else []):
+                break
+        return sent
 
     def blocks(self, node_id, cids, on_progress=None):
         """Serve from a node's backend: blocks it serves, None for the rest."""
@@ -405,6 +417,24 @@ class SecurityTest(NodeTest):
             self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700, directory)
         self.assertEqual(stat.S_IMODE(os.stat(self.b.config.root).st_mode), 0o700)
 
+    @unittest.skipUnless(POSIX_MODES, "Unix owners")
+    def test_rnfs_dir_of_another_user_is_refused(self):
+        theirs = os.path.join(self.tmp.name, "theirs")
+        os.mkdir(theirs)
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(RnfsError, "belongs to another user"):
+                node_module._make_private_dirs(Config(rnfs_dir=theirs))
+        self.assertFalse(os.path.exists(os.path.join(theirs, "state")))  # nothing written there
+
+    @unittest.skipUnless(POSIX_MODES, "Unix permission bits")
+    def test_rnfs_dir_that_cant_be_made_private_is_refused(self):
+        loose = os.path.join(self.tmp.name, "loose")
+        os.mkdir(loose)
+        os.chmod(loose, 0o777)
+        with mock.patch("os.chmod", side_effect=PermissionError("not permitted")):
+            with self.assertRaisesRegex(RnfsError, "couldn't make .* private"):
+                node_module._make_private_dirs(Config(rnfs_dir=loose))
+
     def test_no_permission_fix_on_windows(self):
         # Windows' st_mode always shows others allowed: no chmod and no notice at every start
         loose = os.path.join(self.tmp.name, "loose")
@@ -463,6 +493,45 @@ class SecurityTest(NodeTest):
         self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
         self.assertEqual(self.a.storage.pins(), {})
 
+    def test_remote_pins_of_one_source_are_fetched_one_at_a_time(self):
+        # Two DAGs of empty files, each within the quota but not both: fetched at once, each was checked
+        # without the other's blocks and both were pinned
+        self.a.config.remote_pin_quota = 30_000
+        cids = []
+        for count in (120, 119):  # about 20 kB of blocks each
+            root = self.empty_files(count)
+            os.rename(root, root + str(count))
+            cids.append(Cid.parse(self.b.add_path(root + str(count))["cid"]))
+            self.b.records.store(cids[-1].key, B_ID)
+        self.a.routing.heard(B_ID)
+        running, most = [0], [0]
+        real = self.net.blocks
+
+        def counted(node_id, cids_, on_progress=None):
+            """Count /blocks requests in flight at once."""
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+            try:
+                time.sleep(0.01)
+                return real(node_id, cids_, on_progress)
+            finally:
+                running[0] -= 1
+
+        self.net.blocks = counted
+        for cid in cids:
+            self.assertTrue(self.a.backend.remote_pin(IDENTITY, cid, True))
+        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
+        self.assertEqual(most[0], 1)
+        self.assertLessEqual(self.a.storage.source_usage(remote_source(IDENTITY)), 30_000)
+        self.assertEqual(list(self.a.storage.pins()), cids[:1])
+
+    def test_remote_pins_waiting_are_capped(self):
+        self.net.blocks = lambda node_id, cids, on_progress=None: time.sleep(0.2) or BlocksResult("failed", unsent=cids)
+        with mock.patch.object(node_module, "REMOTE_PIN_QUEUE", 3):
+            accepted = [self.a.backend.remote_pin(IDENTITY, Cid.for_block(RAW, b"%d" % i), True) for i in range(5)]
+        self.assertEqual(accepted, [True, True, True, False, False])
+        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY)), 30))
+
     def test_remote_pin_released_while_fetching_isnt_pinned(self):
         cid = self.b.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"]
         self.b.records.store(Cid.parse(cid).key, B_ID)
@@ -518,6 +587,49 @@ class SecurityTest(NodeTest):
             self.a.export(cid, out)
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "someone else's file")
+
+
+
+class RestartTest(NodeTest):
+    """State a node finds at startup."""
+
+    def restart(self, node: RnfsNode, name: str, node_id: bytes, **settings) -> RnfsNode:
+        """Stop node and start another over its directory."""
+        node.stop()
+        return self.make_node(name, node_id, **settings)
+
+    def test_deleted_name_key_releases_its_pin_at_startup(self):
+        for strategy in ("roots", "pinned"):
+            with self.subTest(strategy=strategy):
+                node = self.make_node(strategy, N1, provide_strategy=strategy)
+                cid = node.add_stream(io.BytesIO(b"site " + strategy.encode()), pin=False)["cid"]
+                node.name_create("site")
+                node.name_publish("site", cid)
+                kept = bytes.fromhex(node.name_create("kept")["name"])
+                node.name_publish("kept", cid)
+                os.remove(os.path.join(node.config.names_dir, "site"))
+                node = self.restart(node, strategy, N1, provide_strategy=strategy)  # used to fail under roots
+                self.assertEqual(node.storage.pins(), {Cid.parse(cid): {"name:kept"}})
+                # Released after the features were set up: the name still kept isn't withdrawn
+                self.assertIn(name_key(kept), node.publisher.provided_keys())
+                self.assertFalse(any(name_key(kept) in keys for keys in node.publisher._withdrawals.values()))
+
+    def test_own_records_arent_limited_per_publisher(self):
+        self.assertEqual(self.a.records.own_id, A_ID)
+
+    def test_prune_reads_cached_targets_under_the_lock(self):
+        # Else a fetch recorded between the read and the prune is forgotten, and never provided under roots
+        held = []
+        real = self.a.storage.cached_targets
+
+        def cached_targets():
+            """Note whether the node's lock is held."""
+            held.append(self.a._lock.locked())
+            return real()
+
+        with mock.patch.object(self.a.storage, "cached_targets", cached_targets):
+            self.a._prune_fetched()
+        self.assertEqual(held, [True])
 
 
 if __name__ == "__main__":

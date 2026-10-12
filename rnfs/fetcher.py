@@ -20,8 +20,16 @@ A provider fails, and isn't used again during the fetch, when its link fails, it
 of the root it advertised, it is busy max_failures times in a row (each retried after BUSY_DELAY), or it
 stalls twice. When no providers are left, the lookup runs again for a fresh random half of providers,
 within the same lookup_timeout. A block not matching its CID bans the provider; a correctly hashed block
-that isn't a valid DAG node marks the root invalid locally and fails the fetch. A fetch that gets no
-verified block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
+that isn't a valid DAG node marks the root invalid locally and fails the fetch (a stored block that no
+longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
+block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
+
+Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
+the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
+would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
+asked again until as long as that request took has passed again. Refusals within four times that of a
+served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
+may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
 
 Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes
 a fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
@@ -106,7 +114,8 @@ def observing(observer: Observer):
 class _Provider:
     """What a fetch knows about one provider."""
 
-    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "failed", "path")
+    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "failed", "path", "pacing_until",
+                 "pacing_retry")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
         """A provider found order-th, path hops away (looked up once, when found)."""
@@ -117,6 +126,8 @@ class _Provider:
         self.busy_until = 0.0
         self.stalls = 0
         self.failed = False
+        self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
+        self.pacing_retry = 0.0  # ...and is retried after this many seconds
 
 
 class Fetcher:
@@ -241,6 +252,8 @@ class Fetch:
         self._lookup_running = False
         self._lookup_found = 0  # providers the last lookup run reported
         self._events: queue.Queue = queue.Queue()
+        # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
+        self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -254,10 +267,27 @@ class Fetch:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        """Stop the lookup and end the session; an InvalidDag raised by this fetch marks the root invalid."""
+        """Stop the lookup and end the session; an InvalidDag raised by this fetch marks the root invalid.
+
+        A fetch ended by an error (or cancelled) closes the links of its requests still in flight, so their
+        responses don't keep using the link and hold up the next /blocks to those nodes.
+        """
         self.closed = True
         if self._lookup is not None:
             self._lookup.stop()
+        if exc_type is not None:
+            while True:  # requests already answered aren't in flight any more
+                try:
+                    event = self._events.get_nowait()
+                except queue.Empty:
+                    break
+                if event[0] == "result":
+                    self._in_flight.pop(event[1], None)
+            for node_id in list(self._in_flight):
+                try:
+                    self.client.close(node_id)
+                except Exception as e:
+                    log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
         # Only this fetch's own error: one from another fetch nested in the same `with` is about another root
         if isinstance(exc, InvalidDag) and getattr(exc, "root", None) == self.root:
             self.fetcher.mark_invalid(self.root)
@@ -424,7 +454,16 @@ class Fetch:
         self.ensure([expect for expect, _, _ in window])
         for expect, child_offset, child_length in window:
             block = self.get(expect)
-            walker.check_raw(expect, len(block))
+            try:
+                walker.check_raw(expect, len(block))
+            except InvalidDag:
+                # Checked by its recorded length when ensured; a chunk damaged on disk since is fetched again
+                if self.storage.get(expect.cid, verify=True) is not None:
+                    raise
+                log(f"stored block {expect.cid} of {self.root} is damaged; fetching it again", LOG_WARNING)
+                self.ensure([expect])
+                block = self.get(expect)
+                walker.check_raw(expect, len(block))
             yield block[child_offset:child_offset + child_length]
 
     def _range_leaves(self, target: Expect, offset: int, length: int) -> Iterator[tuple[Expect, int, int]]:
@@ -471,18 +510,28 @@ class Fetch:
         return children
 
     def _check_stored(self, expect: Expect) -> list[Expect] | None:
-        """Children of a stored block after checking it against expect, or None if it isn't stored."""
-        if expect.cid.is_raw:
-            length = self.storage.block_size(expect.cid)
-            if length is None:
+        """Children of a stored block after checking it against expect, or None if it isn't stored.
+
+        A stored block failing the checks is verified against its CID: if it no longer matches (damaged on
+        disk), it is deleted and None returned, so it is fetched again rather than the root marked invalid.
+        """
+        try:
+            if expect.cid.is_raw:
+                length = self.storage.block_size(expect.cid)
+                if length is None:
+                    return None
+                walker.check_raw(expect, length)  # stored blocks were verified, so their length is enough
+                self._count_dag(expect.cid, length)
+                return []
+            block = self.storage.get(expect.cid)
+            if block is None:
                 return None
-            walker.check_raw(expect, length)  # stored blocks were verified, so their length is enough
-            self._count_dag(expect.cid, length)
-            return []
-        block = self.storage.get(expect.cid)
-        if block is None:
-            return None
-        result = walker.expand(expect, block)
+            result = walker.expand(expect, block)
+        except InvalidDag:
+            if self.storage.get(expect.cid, verify=True) is None:
+                log(f"stored block {expect.cid} of {self.root} is damaged; fetching it again", LOG_WARNING)
+                return None
+            raise
         self._count_dag(expect.cid, len(block))
         return result
 
@@ -523,8 +572,8 @@ class Fetch:
         """Fetch the wanted blocks from providers until all are stored. Raises NotFound if none can."""
         outstanding = set(wanted)
         pending = deque(wanted)
-        in_flight: dict[bytes, tuple[list[Cid], bool]] = {}  # provider -> (CIDs asked for, is a probe)
-        self._progress_at = self.fetcher.clock()
+        in_flight = self._in_flight
+        self._progress_at = max(self._progress_at, self.fetcher.clock())  # it may be after a pacing wait
         give_up = self.config.lookup_timeout + self.config.stall_timeout
         while outstanding:
             self._check_cancelled()  # each pass waits at most POLL, so a cancel takes effect promptly
@@ -559,9 +608,9 @@ class Fetch:
             self._lookup_running = False
             self._lookup_found = event[1]
         elif kind == "result":
-            _, provider, cids, result = event
+            _, provider, cids, result, sent_at, rate = event
             _, probe = in_flight.pop(provider, (cids, False))
-            self._handle(provider, cids, result, probe, wanted, children, outstanding)
+            self._handle(provider, cids, result, probe, wanted, children, outstanding, sent_at, rate)
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending
                        and not any(cid in asked for asked, _ in in_flight.values())]
             pending.extendleft(reversed(requeue))  # back at the front, keeping the walk's order
@@ -658,12 +707,16 @@ class Fetch:
             self._progress_at = self.fetcher.clock()
 
         def work():
-            """Run the blocking request and queue its result."""
+            """Run the blocking request and queue its result, with when it was sent and the rate estimate
+            it was sent with (the responder's upload cap derives from the same response)."""
+            sent_at = self.fetcher.clock()
+            rate = None
             try:
+                rate = self.client.rate_estimate(node_id)
                 result = self.client.blocks(node_id, cids, on_progress=progress)
             except Exception as e:
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
-            self._events.put(("result", node_id, cids, result))
+            self._events.put(("result", node_id, cids, result, sent_at, rate))
 
         threading.Thread(target=work, name="rnfs-fetch", daemon=True).start()
 
@@ -750,8 +803,11 @@ class Fetch:
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,
-                outstanding: set[Cid]):
-        """Store a response's blocks and apply the provider failure rules. Raises InvalidDag."""
+                outstanding: set[Cid], sent_at: float | None = None, rate: float | None = None):
+        """Store a response's blocks and apply the provider failure and pacing rules. Raises InvalidDag.
+
+        sent_at is when the request was sent and rate the link's rate estimate then (None: unknown).
+        """
         provider = self._providers.get(node_id)
         if result.bad:
             # Not a lossy link: the node sent something other than what was asked for (section 10)
@@ -769,27 +825,51 @@ class Fetch:
         if probe:
             # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised
             if result.blocks and provider is None:
-                self._new_provider(node_id)
+                provider = self._new_provider(node_id)
                 log(f"{node_name(node_id)} (open link) has {self.root}", LOG_VERBOSE)
+                self._pace(provider, sent_at, rate)
             return
         if provider is None or provider.failed:
             return
+        now = self.fetcher.clock()
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
                 self._fail(provider, f"doesn't have {plural(len(result.missing), 'block')} of the root it advertised")
+            elif result.blocks:
+                self._pace(provider, sent_at, rate)
+        elif result.status == peer_client.BUSY and result.reason != "cancelled" and now < provider.pacing_until:
+            # Refused soon after it served us: most likely its upload pacing, which isn't a failure (a response
+            # it cancelled, displaced or past its deadline, counts as busy as usual)
+            provider.busy_until = now + provider.pacing_retry
         elif result.status == peer_client.BUSY:
             provider.busy += 1
             if provider.busy >= self.config.max_failures:
                 self._fail(provider, f"busy {provider.busy} times in a row")
             else:
-                provider.busy_until = self.fetcher.clock() + self.fetcher.busy_delay
+                provider.busy_until = now + self.fetcher.busy_delay
         elif result.status == peer_client.STALLED:
             provider.stalls += 1
             if provider.stalls >= MAX_STALLS:
                 self._fail(provider, f"stalled {provider.stalls} times")
         else:
             self._fail(provider, result.reason or "request failed")
+
+    def _pace(self, provider: _Provider, sent_at: float | None, rate: float | None):
+        """After provider served a response to a request sent at sent_at: on a slow link (by the rate
+        estimate the request was sent with, as the responder judges it), wait before asking again, so the
+        responder's upload pacing doesn't refuse the next request; and take refusals for a while as pacing."""
+        if sent_at is None:
+            return
+        now = self.fetcher.clock()
+        took = max(0.0, now - sent_at)  # about the response's transfer time at the link's rate, plus its RTT
+        provider.pacing_until = sent_at + 4 * took
+        provider.pacing_retry = max(self.fetcher.busy_delay, took / 8)
+        if rate is not None and rate < self.config.slow_bitrate:
+            # At the default cap (half the rate estimate) the next response may start once the last one's
+            # transfer time has passed twice since it started
+            provider.busy_until = max(provider.busy_until, now + took)
+            self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
 
 
 def describe(fetch: Fetch) -> str:

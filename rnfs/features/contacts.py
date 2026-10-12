@@ -328,7 +328,7 @@ def run_add(args):
     """Add a contact; print it."""
     import rnfs.cli
     contact = rnfs.cli.client(args).post("/api/contacts/add", nick=args.nick, id=args.id, kind=args.kind)
-    print(f"{contact['nick']} {contact['kind']} {contact['id']}")
+    print(f"{_printable(contact['nick'])} {_printable(contact['kind'])} {_printable(contact['id'])}")
 
 
 def run_rm(args):

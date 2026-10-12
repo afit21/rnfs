@@ -5,7 +5,9 @@ import random
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
+from rnfs import fsutil
 from rnfs.constants import DAY, ID_LENGTH, K, PROVIDER_TTL
 from rnfs.dht.providers import MIN_PER_PUBLISHER, ProviderStore
 
@@ -55,6 +57,16 @@ class RecordTest(StoreTestCase):
             self.store.store(b"short", ident(1))
         with self.assertRaises(ValueError):
             self.store.store(KEY, b"short")
+
+    def test_future_times_clamped_at_expiry(self):
+        # Stored while the clock ran a day ahead: once corrected, the record lives a TTL from now, not a day more
+        self.clock.now += DAY
+        self.store.store(KEY, ident(1))
+        self.clock.now -= DAY
+        self.assertEqual(self.store.expire(), 0)
+        self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
+        self.clock.now += PROVIDER_TTL
+        self.assertEqual(self.store.expire(), 1)
 
     def test_expires_ttl_after_last_stored(self):
         self.store.store(KEY, ident(1))
@@ -252,6 +264,17 @@ class PublisherLimitTest(StoreTestCase):
         self.clock.now += DAY
         self.assertTrue(self.store.store(ident(100), ident(1)))  # republishing is never refused
 
+    def test_own_records_are_not_limited(self):
+        store = ProviderStore(self.max_records, None, clock=self.clock, own_id=ident(1))
+        for i in range(3 * store.max_per_publisher):
+            self.assertTrue(store.store(ident(100 + i), ident(1)))
+        self.assertTrue(store.store(KEY, ident(1)))
+        self.assertEqual(store.record_count(), 3 * store.max_per_publisher + 1)
+        # Others still are
+        for i in range(store.max_per_publisher):
+            store.store(ident(1000 + i), ident(2))
+        self.assertFalse(store.store(KEY, ident(2)))
+
     def test_expired_records_do_not_count_toward_the_limit(self):
         for i in range(self.store.max_per_publisher):
             self.store.store(ident(100 + i), ident(1))
@@ -259,19 +282,35 @@ class PublisherLimitTest(StoreTestCase):
         self.assertTrue(self.store.store(KEY, ident(1)))
         self.assertEqual(self.store.record_count(), 1)
 
-    def test_publishers_per_key_limited_earliest_kept(self):
+    def test_full_key_evicts_a_random_non_senior_publisher(self):
         store = ProviderStore(1000, None, clock=self.clock, rng=random.Random(1), max_per_key=20)
         accepted = [store.store(KEY, ident(i)) for i in range(1, 31)]
-        self.assertEqual(accepted, [True] * 20 + [False] * 10)
-        self.assertEqual(store.providers(KEY), [ident(i) for i in range(1, 21)])
-        self.assertTrue(store.store(KEY, ident(5)))  # a recorded publisher may still republish
+        self.assertEqual(accepted, [True] * 30)  # newcomers are never locked out
+        providers = store.providers(KEY)
+        self.assertEqual(len(providers), 20)
+        self.assertEqual(providers[:K // 2], [ident(i) for i in range(1, K // 2 + 1)])  # the oldest half stays
+        self.assertIn(ident(30), providers)
+        self.assertEqual(store.record_count(), 20)
+        self.assertTrue(store.store(KEY, providers[-1]))  # a recorded publisher may still republish
+        self.assertEqual(store.providers(KEY), providers)
         self.clock.now += PROVIDER_TTL
-        self.assertTrue(store.store(KEY, ident(30)))  # expired records make room
-        self.assertEqual(store.providers(KEY), [ident(30)])
+        self.assertTrue(store.store(KEY, ident(31)))  # expired records make room, evicting none
+        self.assertEqual(store.providers(KEY), [ident(31)])
+
+    def test_sybils_holding_a_key_cannot_lock_out_later_providers(self):
+        store = ProviderStore(100_000, None, clock=self.clock, rng=random.Random(1))
+        early = ident(1)
+        store.store(KEY, early)
+        for i in range(store.max_per_key - 1):
+            self.assertTrue(store.store(KEY, ident(1000 + i)))
+        late = ident(2)
+        self.assertTrue(store.store(KEY, late))
+        self.assertTrue(any(late in store.for_reply(KEY) for _ in range(1000)))  # in the random half
+        self.assertIn(early, store.for_reply(KEY)[:K // 2])  # long-standing providers are never evicted
 
     def test_reply_asks_exclude_only_about_chosen_candidates(self):
         store = ProviderStore(10_000, None, clock=self.clock, rng=random.Random(1))
-        for i in range(store.max_per_key + 500):
+        for i in range(store.max_per_key):
             store.store(KEY, ident(i))
         self.assertEqual(len(store.providers(KEY)), store.max_per_key)
         asked = []
@@ -346,6 +385,47 @@ class PersistenceTest(unittest.TestCase):
         loaded = self.open()
         self.assertEqual(loaded.record_count(), 0)
         self.assertIsNone(loaded.first_seen(ident(1)))
+
+    def test_future_times_clamped_on_load(self):
+        # Saved while the clock ran a year ahead; once corrected, records still expire a TTL from now
+        self.clock.now += 365 * DAY
+        store = self.open()
+        store.store(KEY, ident(1))
+        store.save()
+        self.clock.now -= 365 * DAY
+        loaded = self.open()
+        self.assertEqual(loaded.first_seen(ident(1)), self.clock.now)
+        self.assertEqual(loaded.providers(KEY), [ident(1)])
+        self.clock.now += PROVIDER_TTL
+        self.assertEqual(loaded.expire(), 1)
+
+    def test_out_of_range_numbers_start_empty(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "publishers": {ident(1).hex(): 10 ** 400}, "records": []}, f)
+        self.assertEqual(self.open().record_count(), 0)
+
+    def test_saves_never_land_out_of_order(self):
+        # A save that snapshots while another is still writing must not be overwritten by the older snapshot
+        store = self.open()
+        store.store(KEY, ident(1))
+        real_replace = fsutil.replace
+        second = []
+
+        def slow_replace(source, target):
+            """The first save's rename: meanwhile another thread stores and saves."""
+            if not second:
+                store.store(ident(7), ident(2))
+                second.append(threading.Thread(target=store.save))
+                second[0].start()
+                second[0].join(0.2)
+            real_replace(source, target)
+
+        with mock.patch.object(fsutil, "replace", slow_replace):
+            store.save()
+            second[0].join(5)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["records"]), 2)
 
     def test_corrupt_file_starts_empty(self):
         os.makedirs(os.path.dirname(self.path))

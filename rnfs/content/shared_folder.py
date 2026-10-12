@@ -15,7 +15,7 @@ from rnfs import constants
 from rnfs.content import builder
 from rnfs.content.builder import display_path
 from rnfs.content.cid import Cid
-from rnfs.content.storage import FOLDER, Storage, read_json, write_json
+from rnfs.content.storage import FOLDER, Storage, read_json, shaped, write_json
 from rnfs.errors import RnfsError
 from rnfs.log import LOG_INFO, LOG_WARNING, log
 
@@ -87,11 +87,11 @@ class SharedFolder:
         """Load the signature cache, ignoring anything that doesn't parse."""
         if self._state_path is None:
             return
-        value = read_json(self._state_path) or {}
+        value = read_json(self._state_path, shaped("entries", dict)) or {}
         for name, record in value.get("entries", {}).items():
             try:
                 self._known[name] = (str(record[0]), Cid.parse(record[1]))
-            except (ValueError, TypeError, IndexError):
+            except (ValueError, TypeError, LookupError):
                 continue
 
     def names(self) -> dict[Cid, str]:

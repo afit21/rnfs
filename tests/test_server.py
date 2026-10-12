@@ -168,6 +168,23 @@ class IncomingLinksTest(unittest.TestCase):
     def test_room_left(self):
         self.assertEqual(self.links.admit(b"a"), (True, None))
 
+    def test_links_not_kept_are_evicted_first(self):
+        # Private mode: a member's link idle longest stays; an outsider's goes, even busy with a /find
+        for name in (b"a", b"b", b"c"):
+            self.links.admit(name)
+            self.clock.now += 10
+        self.links.start_request(b"c", blocks=False)
+        self.assertEqual(self.links.admit(b"d", keep={b"a", b"b"}), (True, b"c"))
+        # With only kept links left to choose from, the usual rule applies among them
+        self.assertEqual(self.links.admit(b"e", keep={b"a", b"b", b"d"}), (True, b"a"))
+
+    def test_closed_link_is_not_counted_again(self):
+        self.links.admit(b"a")
+        self.links.remove(b"a")
+        self.assertFalse(self.links.start_request(b"a", blocks=True))
+        self.assertEqual(self.links.count(), 0)
+        self.assertTrue(self.links.start_request(b"b", blocks=False))  # an untracked open link still counts
+
 
 class UploadPacerTest(unittest.TestCase):
     """The next response on a link waits bytes × 8 / cap after the previous one started."""
@@ -238,6 +255,7 @@ class FakeLink:
         self.expected_rate = None
         self.outgoing_resources = []
         self.closed_callback = None
+        self.remote_identity = None
         if not watchable:
             self.register_outgoing_resource = None
 
@@ -256,6 +274,10 @@ class FakeLink:
     def get_expected_rate(self):
         """Rate set by tests."""
         return self.expected_rate
+
+    def get_remote_identity(self):
+        """The identity the requester identified as, or None."""
+        return self.remote_identity
 
     def set_link_closed_callback(self, callback):
         """Store the closed callback."""
@@ -562,9 +584,9 @@ class RequestServerTest(unittest.TestCase):
     def test_upload_pacing_between_responses(self):
         self.make_server(Config(max_upload_rate=80_000))
         link = self.connect(b"a", mtu=1500, mdu=1400)
-        bound = (0.05 * 6 + RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125) / 2
+        bound = server.MAX_PACING_WAIT
         sleeps = []
-        with mock.patch.object(server.time, "sleep", sleeps.append):
+        with mock.patch.object(self.server, "_pace", lambda response, wait: sleeps.append(wait)):
             self.blocks(link)  # no rate estimate yet: no cap, no pacing
             self.send(link).complete()
             self.assertEqual(self.server.pacer.wait_time(link.link_id), 0)
@@ -580,6 +602,59 @@ class RequestServerTest(unittest.TestCase):
             self.assertNotEqual(self.blocks(link, request_id=b"t" * 16), False)
         self.assertEqual(len(sleeps), 1)
         self.assertAlmostEqual(sleeps[0], wait)
+
+    def test_pacing_bound_ignores_the_link_rtt(self):
+        """The requester can inflate the RTT RNS reports, so it doesn't lengthen how long a response is held."""
+        link = self.connect(b"a")
+        link.rtt = 200.0
+        self.server.pacer.started(link.link_id, 2000, 1000)  # next response in 16 s
+        self.assertIs(self.blocks(link), False)
+        self.assertEqual(self.server.pools.responses(), [])
+
+    def test_pacing_wait_ends_when_its_link_closes(self):
+        link = self.connect(b"a")
+        self.server.pacer.started(link.link_id, 500, 1000)  # next response in 4 s
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.blocks(link)))
+        start = time.monotonic()
+        thread.start()
+        while not self.server.pools.responses() and time.monotonic() - start < 2:
+            time.sleep(0.01)
+        link.teardown()
+        thread.join(5)
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertEqual(results, [False])
+        self.assertEqual(self.server.pools.responses(), [])
+        # Nothing is tracked again for the closed link
+        self.assertNotIn(link.link_id, self.server.incoming.links)
+        self.assertNotIn(link.link_id, self.server.pacer.next_start)
+        self.assertIs(self.ask(FIND_PATH, KEY, link), False)
+        self.assertNotIn(link.link_id, self.server.incoming.links)
+
+    def test_pacing_wait_ends_when_displaced(self):
+        self.make_server(Config(max_blocks_responses=2))  # one slow-link slot
+        link, other = self.connect(b"a"), self.connect(b"b")
+        self.server.pacer.started(link.link_id, 500, 1000)
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.blocks(link)))
+        thread.start()
+        start = time.monotonic()
+        while not self.server.pools.responses() and time.monotonic() - start < 2:
+            time.sleep(0.01)
+        self.clock.now += 31  # older than deadline_slack: the next request displaces it
+        self.assertIsNot(self.blocks(other, request_id=b"s" * 16), False)
+        thread.join(5)
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertEqual(results, [False])
+        self.assertEqual([r.link_id for r in self.server.pools.responses()], [other.link_id])
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (0, 0))
+
+    def test_blocks_on_a_closed_link_tracks_nothing(self):
+        link = self.connect(b"a")
+        link.teardown()  # still listed by the destination, as RNS may for a moment
+        self.assertIs(self.blocks(link), False)
+        self.assertNotIn(link.link_id, self.server.links)
+        self.assertNotIn(link.link_id, self.server.incoming.links)
 
     def test_pacing_refusal_does_not_take_a_slot(self):
         self.make_server(Config(max_upload_rate=1000))
@@ -623,6 +698,22 @@ class RequestServerTest(unittest.TestCase):
         self.assertIsNot(self.blocks(late, cids[:1]), False)
         self.server._cancel(self.server.pools.responses()[0], "test")
         self.assertAlmostEqual(airtime.remaining(), before, delta=1)
+
+    def test_unreadable_progress_keeps_the_charge(self):
+        airtime = self.budget_server(1000 * KIB)
+        capacity = airtime.remaining()
+        link = self.connect(b"a")
+        self.assertIsNot(self.blocks(link), False)
+        charged = capacity - airtime.remaining()
+        resource = self.send(link)
+
+        def unreadable():
+            """RNS internals changed."""
+            raise AttributeError("no progress")
+        resource.get_progress = unreadable
+        resource.cancel()
+        self.assertEqual(self.server.pools.responses(), [])
+        self.assertEqual(capacity - airtime.remaining(), charged)
 
     def test_completed_responses_keep_their_charge(self):
         airtime = self.budget_server(1000 * KIB)
@@ -675,6 +766,18 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(second.status, RNS.Link.CLOSED)
         self.assertEqual(first.status, RNS.Link.ACTIVE)
         self.assertEqual(third.status, RNS.Link.ACTIVE)
+
+    def test_private_mode_evicts_outsiders_first(self):
+        member = RNS.Identity()
+        self.backend.members = {member.hash}
+        self.make_server(Config(private=True, max_incoming_links=2))
+        first = self.connect(b"a")
+        first.remote_identity = member
+        self.clock.now += 5
+        outsider = self.connect(b"b")  # unidentified, and more recently active than the member's link
+        self.connect(b"c")
+        self.assertEqual(first.status, RNS.Link.ACTIVE)
+        self.assertEqual(outsider.status, RNS.Link.CLOSED)
 
     def test_request_on_unknown_link(self):
         link = FakeLink(b"z" * 16)

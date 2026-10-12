@@ -127,8 +127,8 @@ class _Published:
 
     sequence: int
     cid: Cid | None
-    # A key imported from elsewhere may already have records on the network, so its first publish
-    # refreshes from the network before choosing a sequence
+    # A key imported from elsewhere (or found with no state: names.json was lost) may already have records on
+    # the network and at keepers, so its first publish asks both before choosing a sequence
     imported: bool = False
 
 
@@ -206,8 +206,8 @@ class NameAnnounceHandler:
 class NameManager:
     """This node's name keys and records, and the records it has heard. Thread-safe.
 
-    Lifecycle: construct (loads keys and state, no RNS needed), start() once Reticulum runs, run(stop_event) on a
-    thread for re-announces, stop() at shutdown.
+    Lifecycle: construct (loads keys and state, no RNS needed), release_gone() once the node and its features are
+    set up, start() once Reticulum runs, run(stop_event) on a thread for re-announces, stop() at shutdown.
     """
 
     def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic):
@@ -239,6 +239,8 @@ class NameManager:
         # The keepers feature (rnfs.features.keepers), if loaded: told of heard and published records, and asked
         # for signed records when the network has none. Never called with self._lock held
         self.keepers = None
+        # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
+        self._gone: list[tuple[str, Cid]] = []
 
         self._load_keys()
         self._load_state()
@@ -300,6 +302,20 @@ class NameManager:
                     LOG_WARNING)
         log(f"removed name {name.hex()} ({alias})", LOG_NOTICE)
 
+    def release_gone(self):
+        """Release the pins of names whose key file was deleted by hand (found by the constructor).
+
+        Not done while loading: releasing a pin recomputes what the node provides, which needs the rest of the
+        node, and the features' keys (kept names), set up first.
+        """
+        with self._lock:
+            gone, self._gone = self._gone, []
+            for alias, cid in gone:
+                log(f"name key {alias} is gone; releasing its pin", LOG_WARNING)
+                self._pins.unpin(cid, PIN_SOURCE_PREFIX + alias)
+            if gone:
+                self._save()  # its entry is dropped only once its pin is released
+
     def name(self, alias: str) -> bytes:
         """alias's name. NotFound if no such alias."""
         with self._lock:
@@ -327,8 +343,13 @@ class NameManager:
             name = self.name(alias)
             refresh = self._published[alias].imported and self._published[alias].cid is None
         if refresh:
-            # A freshly imported key: its previous home may have published sequences we've never heard
+            # A freshly imported key: its previous home may have published sequences we've never heard, which
+            # keepers may hold after its announces have expired (section 9: above the highest it can resolve)
+            self._offer_kept(name)
             self._refresh(name)
+            if self.keepers is not None:
+                for sequence, kept_cid, heard in self.keepers.query(name):
+                    self.offer(name, sequence, kept_cid, heard)
 
         with self._lock:
             self._identity(alias)  # removed while refreshing?
@@ -423,8 +444,11 @@ class NameManager:
         self._offer_kept(name)
         with self._lock:
             held = self._record(name, touch=False)
-            fresh = held is not None and max_age > 0 and self._clock() - held.heard < max_age
-            local = name in self._aliases
+            # A heard time in the future (the clock was corrected since) isn't fresh
+            fresh = held is not None and max_age > 0 and 0 <= self._clock() - held.heard < max_age
+            alias = self._aliases.get(name)
+            # This node's own names need no refresh, unless imported and not yet published here
+            local = alias is not None and not (self._published[alias].imported and self._published[alias].cid is None)
         if not local and not fresh:
             started = self._clock()
             self._refresh(name)
@@ -694,15 +718,16 @@ class NameManager:
                     self._published[alias] = published
                 elif cid is not None:
                     # Its key file was deleted by hand: nothing will republish it, so release its pin
-                    log(f"name key {alias} is gone; releasing its pin", LOG_WARNING)
-                    self._pins.unpin(cid, PIN_SOURCE_PREFIX + alias)
+                    self._gone.append((alias, cid))
             for name_hex, entry in state.get("held", {}).items():
                 self._held[parse_name(name_hex)] = Record(int(entry["sequence"]), Cid.parse(entry["cid"]),
                                                           float(entry["heard"]))
         except (AttributeError, KeyError, TypeError, ValueError) as e:
             raise RnfsError(f"malformed {self._state_path}: {e}") from None
         for alias in self._keys:
-            self._published.setdefault(alias, _Published(0, None))
+            # A key with no state entry (names.json lost, or the key copied in by hand) may have been published
+            # elsewhere: treated as imported, so its first publish looks for its records first
+            self._published.setdefault(alias, _Published(0, None, imported=True))
 
     def _save(self):
         """Write published and held records atomically."""

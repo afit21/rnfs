@@ -464,7 +464,15 @@ class KeepersFeature(Feature):
                 "emitted": record.emitted if record else None}
 
     def _store(self, record: SignedRecord) -> bool:
-        """Store a verified record; on a change, re-advertise, tell NameManager and listeners."""
+        """Store a verified record; on a change, re-advertise, tell NameManager and listeners.
+
+        A record below the sequence NameManager already holds is refused: a keeper could otherwise hand this
+        node an old, validly signed record to serve until a newer one is heard.
+        """
+        known = self.node.names.record(record.name)
+        if known is not None and record.sequence < known.sequence:
+            _log(f"refused record {record.sequence} of name {record.name.hex()}: sequence {known.sequence} is known")
+            return False
         first = self.store.get(record.name) is None
         if not self.store.offer(record):
             return False
@@ -748,8 +756,9 @@ def run_keep(args):
     """Keep a name."""
     import rnfs.cli
     entry = rnfs.cli.client(args).post("/api/name/keep", name=args.name)
-    print(f"keeping {entry['name']}" + (f" (sequence {entry['sequence']}, {entry['cid']})" if entry["cid"]
-                                       else ": no record held yet, asking keepers"))
+    detail = f" (sequence {entry['sequence']}, {entry['cid']})" if entry["cid"] else \
+        ": no record held yet, asking keepers"
+    print(rnfs.cli.printable(f"keeping {entry['name']}{detail}"))
 
 
 def run_unkeep(args):
@@ -763,4 +772,4 @@ def run_kept(args):
     import rnfs.cli
     for entry in rnfs.cli.client(args).get("/api/name/kept")["kept"]:
         record = f"{entry['sequence']} {entry['cid']}" if entry["cid"] else "- -"
-        print(f"{entry['name']} {record} {','.join(entry['reasons'])}")
+        print(rnfs.cli.printable(f"{entry['name']} {record} {','.join(entry['reasons'])}"))

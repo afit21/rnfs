@@ -23,7 +23,7 @@ import tempfile
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator
 
 from rnfs import fsutil
 from rnfs.constants import MAX_BLOCK_SIZE, MIB
@@ -43,6 +43,8 @@ MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least rec
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
 DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
 DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
+
+DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 
 _IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
 
@@ -77,12 +79,14 @@ def remote_source(identity_hash: bytes | str) -> str:
 
 
 def write_json(path: str, value):
-    """Write value as JSON to path atomically (temporary file, then rename)."""
+    """Write value as JSON to path atomically and durably (temporary file synced to disk, then renamed)."""
     directory = os.path.dirname(path)
     fd, partial = tempfile.mkstemp(prefix=".partial-", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f)
+            f.flush()
+            os.fsync(f.fileno())  # else a power loss can leave path empty once renamed
         fsutil.replace(partial, path)  # retried on Windows while read_json has path open
     except BaseException:
         try:
@@ -90,26 +94,54 @@ def write_json(path: str, value):
         except OSError:
             pass
         raise
+    fsutil.sync_directory(directory or ".")
 
 
-def read_json(path: str):
-    """The JSON value in path, or None if it doesn't exist. A damaged file is moved aside, not lost."""
+def read_json(path: str, shape: Callable[[object], bool] | None = None):
+    """The JSON value in path, or None if it doesn't exist. A damaged file (not JSON, failing shape if given,
+    or a directory) is moved aside, not lost, and gives None. Raises OSError if path can't be read: a transient
+    or permission error isn't damage, and starting without the file could lose what it records (pins)."""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            value = json.load(f)  # an empty file, as a crash can leave, is a ValueError too
     except FileNotFoundError:
         return None
-    except (ValueError, OSError) as e:
-        aside = path + ".damaged"
-        try:
-            fsutil.replace(path, aside)
-        except OSError as moving:
-            # A directory in the way, or a read-only state dir: start without it rather than not at all
-            log(f"storage: {path} is unreadable ({e}) and couldn't be moved aside ({moving}); starting without it",
-                LOG_ERROR)
-            return None
-        log(f"storage: {path} is damaged ({e}); moved to {aside} and starting without it", LOG_ERROR)
+    except ValueError as e:
+        problem = str(e)
+    except OSError:
+        if not os.path.isdir(path):  # Windows reports opening a directory as PermissionError
+            raise
+        problem = "it is a directory"
+    else:
+        if shape is None or shape(value):
+            return value
+        problem = "unexpected structure"
+    try:
+        aside = _move_aside(path)
+    except OSError as moving:
+        # A read-only state dir: start without it rather than not at all
+        log(f"storage: {path} is damaged ({problem}) and couldn't be moved aside ({moving}); starting without it",
+            LOG_ERROR)
         return None
+    log(f"storage: {path} is damaged ({problem}); moved to {aside} and starting without it", LOG_ERROR)
+    return None
+
+
+def _move_aside(path: str) -> str:
+    """Rename path to path.damaged, or path.damaged.<n> so an earlier damaged copy is kept; the new path."""
+    for n in range(1000):
+        aside = path + ".damaged" + (f".{n}" if n else "")
+        try:
+            fsutil.rename_new(path, aside)
+            return aside
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"too many damaged copies of {path}")
+
+
+def shaped(key: str, kind: type) -> Callable[[object], bool]:
+    """A read_json shape: an object whose key, if present, holds a kind."""
+    return lambda value: isinstance(value, dict) and isinstance(value.get(key, kind()), kind)
 
 
 class Session:
@@ -158,26 +190,31 @@ class Storage:
         # False only when nothing has happened since the last collection that could leave a block unreached,
         # so eviction over max_storage with nothing to evict needn't walk everything again
         self._maybe_garbage = True
+        self._reported_damaged: set[Cid] = set()  # damaged DAG nodes already logged as stopping collection
         self._load()
 
     # Persistence
 
     def _load(self):
         """Load pins and cache records, skipping entries that don't parse."""
-        pins = read_json(os.path.join(self.state_dir, PINS_FILE)) or {}
+        pins = read_json(os.path.join(self.state_dir, PINS_FILE), shaped("pins", dict)) or {}
         for text, sources in pins.get("pins", {}).items():
             try:
                 cid = Cid.parse(text)
+                if not isinstance(sources, list):
+                    raise TypeError("sources aren't a list")
                 for source in sources:
                     check_source(source)
                 if sources:
                     self._pins[cid] = set(sources)
             except (ValueError, TypeError):
                 log(f"storage: ignoring invalid pin record {text!r}", LOG_ERROR)
-        cache = read_json(os.path.join(self.state_dir, CACHE_FILE)) or {}
+        cache = read_json(os.path.join(self.state_dir, CACHE_FILE), shaped("fetches", list)) or {}
         for record in cache.get("fetches", []):
             try:
                 root, names, target = record
+                if not isinstance(names, list):
+                    raise TypeError("names aren't a list")
                 for name in names:
                     dag.check_name(name)
                 self._cache[(Cid.parse(root), tuple(names))] = Cid.parse(target)
@@ -188,6 +225,7 @@ class Storage:
     def _save_pins(self):
         """Persist pins (called with the lock held)."""
         value = {"pins": {str(cid): sorted(sources) for cid, sources in self._pins.items()}}
+        self.blocks.sync()  # so pins saved never outlast the blocks they keep
         write_json(os.path.join(self.state_dir, PINS_FILE), value)
 
     def save(self):
@@ -200,6 +238,7 @@ class Storage:
                                      for (root, names), target in self._cache.items()]}
                 self._cache_dirty = False
             try:
+                self.blocks.sync()
                 write_json(os.path.join(self.state_dir, CACHE_FILE), value)
             except BaseException:
                 with self._lock:
@@ -233,7 +272,8 @@ class Storage:
             return self._sizes.get(cid)
 
     def put(self, cid: Cid, block: bytes):
-        """Store a block after verifying it (atomic). Raises ValueError if it doesn't match or is too large.
+        """Store a block after verifying it (atomic, durable). Raises ValueError if it doesn't match or is too
+        large, even when the block is already stored.
 
         A block stored outside a protection session is cache that no record reaches: the first to go.
         """
@@ -242,8 +282,12 @@ class Storage:
     def _put(self, cid: Cid, block: bytes, protected: bool):
         """Store a block; protected if a session already lists it, so it can't be garbage."""
         with self._lock:
-            if cid in self._sizes:
-                return
+            stored = cid in self._sizes
+        if stored:
+            # Verified all the same, so callers (archive import) never count unchecked bytes as supplied
+            if len(block) > MAX_BLOCK_SIZE or not cid.verify(block):
+                raise ValueError(f"block does not match {cid}")
+            return
         self.blocks.put(cid, block)  # verifies; outside the lock, since it writes to disk
         with self._lock:
             if cid not in self._sizes:
@@ -379,16 +423,31 @@ class Storage:
 
     # Reachability
 
-    def _children(self, cid: Cid) -> tuple[Cid, ...]:
-        """CIDs listed by a stored DAG node; none for raw, missing or undecodable blocks (lock held)."""
+    def _node(self, cid: Cid):
+        """The stored DAG node cid (lock held): None if it's missing or raw, or invalid (it matches its CID but
+        doesn't decode, so it lists nothing); DAMAGED if it's unreadable or no longer matches its CID, after
+        a power loss or a disk error, so what it lists is unknown. Checked against the CID, since a node's
+        children decide what collection keeps."""
         if cid.is_raw or cid not in self._sizes:
-            return ()
-        if cid not in self._links:
+            return None
+        try:
             block = self.blocks.get(cid)
-            try:
-                node = dag.decode(block) if block is not None else None
-            except InvalidDag:
-                node = None
+        except OSError:
+            block = None
+        if block is None or len(block) > MAX_BLOCK_SIZE or not cid.verify(block):
+            return DAMAGED
+        try:
+            return dag.decode(block)
+        except InvalidDag:
+            return None
+
+    def _children(self, cid: Cid) -> tuple[Cid, ...] | None:
+        """CIDs listed by a stored DAG node; none for raw, missing or invalid blocks; None if the node is
+        damaged, as its children are unknown (lock held)."""
+        if cid not in self._links:
+            node = self._node(cid)
+            if node is DAMAGED:
+                return None  # not memoised: verify() removes it, or a fetch replaces it
             if node is None:
                 listed: tuple[Cid, ...] = ()
             elif isinstance(node, DirectoryNode):
@@ -398,8 +457,10 @@ class Storage:
             self._links[cid] = listed
         return self._links[cid]
 
-    def _reach(self, roots, known: set[Cid] | frozenset[Cid] = frozenset()) -> set[Cid]:
-        """Stored blocks reachable from roots through stored DAG nodes, not passing through known (lock held)."""
+    def _reach(self, roots, known: set[Cid] | frozenset[Cid] = frozenset(),
+               damaged: set[Cid] | None = None) -> set[Cid]:
+        """Stored blocks reachable from roots through stored DAG nodes, not passing through known; damaged
+        nodes reached are added to damaged (lock held)."""
         reached: set[Cid] = set()
         stack = [cid for cid in roots if cid in self._sizes and cid not in known]
         while stack:
@@ -407,12 +468,18 @@ class Storage:
             if cid in reached:
                 continue
             reached.add(cid)
-            stack.extend(child for child in self._children(cid)
+            listed = self._children(cid)
+            if listed is None:
+                if damaged is not None:
+                    damaged.add(cid)
+                continue
+            stack.extend(child for child in listed
                          if child in self._sizes and child not in reached and child not in known)
         return reached
 
-    def _path_cids(self, root: Cid, names: tuple[str, ...]) -> set[Cid]:
-        """The stored nodes along <root>/<names> (not their other children), as far as they're stored (lock held)."""
+    def _path_cids(self, root: Cid, names: tuple[str, ...], damaged: set[Cid] | None = None) -> set[Cid]:
+        """The stored nodes along <root>/<names> (not their other children), as far as they're stored; damaged
+        nodes met are added to damaged (lock held)."""
         found: set[Cid] = set()
         current = root
         for name in names:
@@ -420,10 +487,9 @@ class Storage:
                 if current.is_raw or current not in self._sizes:
                     return found
                 found.add(current)
-                try:
-                    node = dag.decode(self.blocks.get(current) or b"")
-                except InvalidDag:
-                    return found
+                node = self._node(current)
+                if node is DAMAGED and damaged is not None:
+                    damaged.add(current)
                 if isinstance(node, DirectoryNode):
                     entry = next((e for e in node.entries if e.name == name), None)
                     if entry is None:
@@ -439,16 +505,31 @@ class Storage:
                 return found
         return found
 
-    def _live(self) -> set[Cid]:
+    def _live(self, damaged: set[Cid] | None = None) -> set[Cid]:
         """Every stored block a pin, a session or a cached fetch reaches (lock held)."""
         roots = set(self._pins)
         for session in self._sessions:
             roots |= session.cids
         roots |= set(self._cache.values())
-        live = self._reach(roots)
+        live = self._reach(roots, damaged=damaged)
         for root, names in self._cache:
-            live |= self._path_cids(root, names)
+            live |= self._path_cids(root, names, damaged)
         return live
+
+    def _held_back(self, damaged: set[Cid]) -> bool:
+        """True, after reporting it, if damaged nodes that something reaches stop a collection (lock held).
+
+        Blocks below a damaged node can't be told from garbage, so nothing is deleted while one is reached:
+        the next collection tries again once verify() has removed it or a fetch has replaced it.
+        """
+        if not damaged:
+            return False
+        self._maybe_garbage = True
+        for cid in damaged - self._reported_damaged:
+            log(f"storage: DAG node {cid} is damaged, so the blocks below it are unknown; deleting nothing until "
+                f"`rnfs verify` removes it", LOG_ERROR)
+        self._reported_damaged |= damaged
+        return True
 
     def _delete(self, cids: set[Cid]) -> tuple[set[Cid], int]:
         """Delete stored blocks; returns (deleted, bytes freed) (lock held). Invalidates completeness memos.
@@ -468,6 +549,7 @@ class Storage:
                 deleted.add(cid)
                 freed += self._sizes.pop(cid)
                 self._links.pop(cid, None)
+                self._reported_damaged.discard(cid)
         if deleted:
             self._used -= freed
             self._generation += 1
@@ -479,7 +561,10 @@ class Storage:
 
     def _collect(self) -> tuple[set[Cid], int]:
         """Delete every stored block nothing reaches; returns (deleted, bytes freed) (lock held)."""
-        live = self._live()
+        damaged: set[Cid] = set()
+        live = self._live(damaged)
+        if self._held_back(damaged):
+            return set(), 0
         dead = {cid for cid in self._sizes if cid not in live}
         deleted, freed = self._delete(dead)
         self._maybe_garbage = deleted != dead  # anything deferred is collected on a later pass
@@ -497,18 +582,21 @@ class Storage:
         roots = set(self._pins)
         for session in self._sessions:
             roots |= session.cids
-        live = self._reach(roots)
+        damaged: set[Cid] = set()
+        live = self._reach(roots, damaged=damaged)
         kept = sum(self._sizes[cid] for cid in live)
         records = list(self._cache.items())  # oldest first
         keep = 0
         for (root, names), target in reversed(records):
-            more = self._reach({target}, live) | (self._path_cids(root, names) - live)
+            more = self._reach({target}, live, damaged) | (self._path_cids(root, names, damaged) - live)
             more_bytes = sum(self._sizes[cid] for cid in more)
             if kept + more_bytes > limit:
                 break
             live |= more
             kept += more_bytes
             keep += 1
+        if self._held_back(damaged):
+            return set(), 0, 0
         evicted = len(records) - keep
         for _ in range(evicted):
             self._cache.popitem(last=False)
@@ -698,7 +786,7 @@ class Storage:
             known = {cid}
             stack = [cid]
             while stack:
-                for child in self._children(stack.pop()):
+                for child in self._children(stack.pop()) or ():
                     if child not in known:
                         known.add(child)
                         stack.append(child)

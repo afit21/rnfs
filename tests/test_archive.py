@@ -3,6 +3,7 @@ import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from RNS.vendor import umsgpack
 
@@ -10,7 +11,7 @@ from rnfs.content import archive, builder, dag, walker
 from rnfs.content.cid import EMPTY_DIRECTORY, RAW, Cid
 from rnfs.content.dag import DirectoryNode, Entry
 from rnfs.content.storage import USER, Storage
-from rnfs.errors import TooLarge
+from rnfs.errors import StorageFull, TooLarge
 
 
 class ArchiveTest(unittest.TestCase):
@@ -141,6 +142,33 @@ class ArchiveTest(unittest.TestCase):
         result = archive.import_archive(io.BytesIO(self.export([self.root.cid])), self.destination)
         self.assertEqual(result["complete"], [self.root.cid])
         self.assertEqual(self.destination.pins(), {self.root.cid: {USER}})
+
+    def test_junk_for_stored_blocks_does_not_pin_cached_dag(self):
+        # Blocks already held must be verified like any other, or junk would count as supplying them
+        for expect, block in walker.iter_dag(walker.root_expect(self.root.cid), self.source.getter()):
+            self.destination.put(expect.cid, block)
+        records = self.records(self.export([self.root.cid]))
+        data = umsgpack.packb(records[0]) + b"".join(umsgpack.packb([cid, b"junk"]) for cid, _ in records[1:])
+        result = archive.import_archive(io.BytesIO(data), self.destination)
+        self.assertEqual((result["complete"], result["blocks"], result["bad"]), ([], 0, len(records) - 1))
+        self.assertEqual(self.destination.pins(), {})
+        self.assertTrue(self.destination.is_complete(self.root.cid))  # the stored blocks are untouched
+
+    def test_import_keeps_the_disk_reserve_free(self):
+        data = self.export([self.root.cid])
+        with mock.patch.object(self.destination, "check_disk", side_effect=StorageFull("full")) as check:
+            with self.assertRaises(StorageFull):
+                archive.import_archive(io.BytesIO(data), self.destination)
+        check.assert_called_once()
+        self.assertEqual(self.destination.block_count(), 0)
+        self.assertEqual(self.destination.pins(), {})
+
+    def test_export_of_several_roots_writes_each_block_once(self):
+        data = self.export([self.root.cid, self.shared.cid, self.other.cid])
+        cids = [Cid.from_bytes(cid) for cid, _ in self.records(data)[1:]]
+        self.assertEqual(len(cids), len(set(cids)))
+        self.assertEqual(set(cids), {e.cid for e, _ in walker.iter_dag(walker.root_expect(self.root.cid),
+                                                                       self.source.getter())})
 
     def test_root_count_is_capped_before_reading_roots(self):
         # An array header claiming MAX_ROOTS + 1 roots, with none following: refused without reading them

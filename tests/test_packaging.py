@@ -11,6 +11,11 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALL_SH = os.path.join(REPO, "install.sh")
 LOCK = os.path.join(REPO, "packaging", "requirements.lock")
+BACKEND_LOCK = os.path.join(REPO, "packaging", "build-backend.lock")
+TOOLS_LOCK = os.path.join(REPO, "packaging", "build-tools.lock")
+BUILD_DEB = os.path.join(REPO, "packaging", "build-deb.sh")
+WORKFLOWS = os.path.join(REPO, ".github", "workflows")
+UNIT = os.path.join(REPO, "contrib", "rnfs.service")
 FLATPAK_DEPS = os.path.join(REPO, "packaging", "flatpak", "python3-deps.json")
 
 
@@ -20,10 +25,10 @@ def read(path: str) -> str:
         return f.read()
 
 
-def read_lock() -> dict[str, tuple[str, set[str]]]:
-    """{name: (version, {sha256, ...})} from packaging/requirements.lock."""
+def read_lock(path: str = LOCK) -> dict[str, tuple[str, set[str]]]:
+    """{name: (version, {sha256, ...})} from a hash lock (packaging/requirements.lock by default)."""
     lock = {}
-    for line in read(LOCK).replace("\\\n", " ").splitlines():
+    for line in read(path).replace("\\\n", " ").splitlines():
         words = line.split("#", 1)[0].split()
         if words:
             name, _, version = words[0].partition("==")
@@ -43,7 +48,7 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_every_python_call_is_isolated(self):
         """Every interpreter call uses -I, so a venv.py or pip/ in the current directory isn't imported (LP-M1)."""
-        calls = re.findall(r'("\$PYTHON"|"\$1"|python3|"\$VENV/bin/python")( -[A-Za-z]+)', read(INSTALL_SH))
+        calls = re.findall(r'("\$PYTHON"|"\$1"|"\$py"|python3|"\$VENV/bin/python")( -[A-Za-z]+)', read(INSTALL_SH))
         self.assertTrue(calls)
         for interpreter, flag in calls:
             self.assertEqual(flag, " -I", f"{interpreter}{flag} in install.sh isn't isolated")
@@ -67,6 +72,73 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn('ExecStart=$(systemd_quote "$LAUNCHER") daemon', read(INSTALL_SH))
 
 
+    def test_builds_with_the_locked_backend(self):
+        """rnfs is built with build-backend.lock's setuptools, without build isolation; dependencies are wheels."""
+        build = shell_function("build_wheel")
+        self.assertIn('--require-hashes --only-binary=:all: -r "$backend_lock"', build)
+        self.assertIn("--no-build-isolation", build)
+        self.assertIn("--require-hashes --only-binary=", shell_function("install_locked"))
+        install = shell_function("do_install")
+        self.assertIn("vpip check", install)
+
+    def test_system_mode_umask(self):
+        """System mode makes everything world-readable whatever root's umask is."""
+        text = read(INSTALL_SH)
+        system = text[text.index('if [ "$MODE" = system ]; then\n    [ "$(id -u)" = 0 ]'):]
+        self.assertIn("umask 022", system[:system.index("\nelse\n")])
+
+    def test_only_its_own_unit_is_replaced_or_removed(self):
+        """The unit is rewritten or deleted only if this installer wrote it (or with --force)."""
+        self.assertIn('if [ "$SERVICE" = yes ] || unit_ours; then', shell_function("do_install"))
+        uninstall = shell_function("do_uninstall")
+        self.assertLess(uninstall.index("if unit_ours; then"), uninstall.index('rm -f "$UNIT"'))
+        write = shell_function("write_unit")
+        self.assertIn('$UNIT_MARK', write)
+
+    def test_unit_matches_contrib(self):
+        """install.sh's unit has the same [Unit] limits and [Service] settings as contrib/rnfs.service."""
+        def settings(text):
+            return [line for line in text.splitlines()
+                    if re.match(r"(StartLimit|Restart|NoNewPrivileges|Restrict|LockPersonality|KillSignal)", line)]
+        contrib = settings(read(UNIT))
+        self.assertIn("StartLimitBurst=5", contrib)
+        self.assertIn("NoNewPrivileges=yes", contrib)
+        self.assertEqual(settings(shell_function("write_unit")), contrib)
+
+
+class BuildScriptsTest(unittest.TestCase):
+    """build-deb.sh and the workflows install nothing unhashed and fail on a missing cffi backend."""
+
+    def test_deb_cffi_download_errors_are_fatal(self):
+        """A failed cffi download stops the build unless pip found no wheel; every backend is checked."""
+        text = read(BUILD_DEB)
+        self.assertNotIn("2>/dev/null; then", text)
+        self.assertIn("No matching distribution", text)
+        self.assertIn('_cffi_backend.cpython-"$nodot"-*.so', text)
+        self.assertIn("--no-build-isolation", text)
+        self.assertIn('python3 (<< $PYTHON_BELOW)', text)
+
+    def test_workflow_pip_installs_are_hashed(self):
+        """Every pip install in the workflows uses a hash lock or --no-deps (with no build isolation)."""
+        for name in os.listdir(WORKFLOWS):
+            for line in read(os.path.join(WORKFLOWS, name)).splitlines():
+                if re.search(r"\bpip install\b", line) and not line.lstrip().startswith("#"):
+                    self.assertTrue("--require-hashes" in line or "--no-deps" in line, f"{name}: {line.strip()}")
+                    if "--no-deps ." in line:
+                        self.assertIn("--no-build-isolation", line, f"{name}: {line.strip()}")
+                if "python -m build" in line:
+                    self.assertIn("--no-isolation", line, f"{name}: {line.strip()}")
+
+    def test_release_publishes_only_on_a_pushed_tag(self):
+        """A manual run doesn't publish, and existing release files aren't replaced."""
+        text = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertIn("if: github.event_name == 'push' && github.ref_type == 'tag'", text)
+        uploads = [line for line in text.splitlines() if "gh release upload" in line]
+        self.assertTrue(uploads)
+        self.assertFalse([line for line in uploads if "--clobber" in line])
+        self.assertRegex(text, r"actions/attest-build-provenance@[0-9a-f]{40}")
+
+
 class DependencyLockTest(unittest.TestCase):
     """packaging/requirements.lock pins every dependency, with hashes, and the Flatpak uses only those."""
 
@@ -82,6 +154,27 @@ class DependencyLockTest(unittest.TestCase):
         for name, (version, hashes) in lock.items():
             self.assertRegex(version, r"^\d[\w.]*$", name)
             self.assertTrue(hashes and all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes), name)
+
+    def test_build_locks(self):
+        """The build locks are hashed, agree with each other and with requirements.lock, and fit pyproject.toml."""
+        backend, tools, runtime = read_lock(BACKEND_LOCK), read_lock(TOOLS_LOCK), read_lock()
+        self.assertEqual(list(backend), ["setuptools"])
+        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib"):
+            self.assertIn(name, tools)
+        self.assertEqual(backend["setuptools"], tools["setuptools"])
+        for name, (version, hashes) in [*backend.items(), *tools.items()]:
+            self.assertRegex(version, r"^\d[\w.]*$", name)
+            self.assertTrue(hashes and all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes), name)
+        for name in set(tools) & set(runtime):
+            self.assertEqual(tools[name][0], runtime[name][0], name)
+        with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
+            requires = tomllib.load(f)["build-system"]["requires"]
+        bounds = re.fullmatch(r"setuptools>=([\d.]+),<([\d.]+)", requires[0].replace(" ", ""))
+        self.assertTrue(bounds, requires)
+
+        def version(text):
+            return tuple(int(part) for part in text.split("."))
+        self.assertTrue(version(bounds.group(1)) <= version(backend["setuptools"][0]) < version(bounds.group(2)))
 
     def test_flatpak_wheels_are_locked(self):
         """Every wheel in the Flatpak's python3-deps.json is a version and file the lock pins."""

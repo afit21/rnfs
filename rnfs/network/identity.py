@@ -14,28 +14,29 @@ IDENTITY_MODE = 0o600  # the file holds the private key: readable by its owner o
 
 def load_or_create_identity(path: str) -> RNS.Identity:
     """The identity saved at path, or a new one saved there. Raises RuntimeError if it can't be read or written."""
-    if os.path.isfile(path):
-        _restrict_permissions(path)
-        identity = RNS.Identity.from_file(path)
-        if identity is None:
-            # Don't overwrite: a new identity would mean a new node ID
-            raise RuntimeError(f"Could not load identity from {path}")
-        return identity
-
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    identity = RNS.Identity()
-    try:
-        save_identity(identity, path)
-    except OSError as e:
-        raise RuntimeError(f"Could not save identity to {path}: {e}") from e
+    if not os.path.isfile(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        identity = RNS.Identity()
+        try:
+            if save_identity(identity, path, replace=False):
+                return identity
+        except OSError as e:
+            raise RuntimeError(f"Could not save identity to {path}: {e}") from e
+        # Another process starting on the same directory saved its identity first: use that one
+    _restrict_permissions(path)
+    identity = RNS.Identity.from_file(path)
+    if identity is None:
+        # Don't overwrite: a new identity would mean a new node ID
+        raise RuntimeError(f"Could not load identity from {path}")
     return identity
 
 
-def save_identity(identity: RNS.Identity, path: str):
+def save_identity(identity: RNS.Identity, path: str, replace: bool = True) -> bool:
     """Write identity's private key to path in RNS's raw format, owner-only and atomically. Raises OSError.
 
-    Not Identity.to_file, which creates the file with the process umask (often group- or world-readable)
-    and could leave a truncated key behind if interrupted.
+    With replace False, an existing file at path is kept (False is returned), even one another process creates
+    meanwhile. Not Identity.to_file, which creates the file with the process umask (often group- or
+    world-readable) and could leave a truncated key behind if interrupted.
     """
     directory = os.path.dirname(os.path.abspath(path))
     # mkstemp creates the file with O_CREAT | O_EXCL and mode 0600 (IDENTITY_MODE), which a umask can only
@@ -47,13 +48,22 @@ def save_identity(identity: RNS.Identity, path: str):
             f.write(identity.get_private_key())
             f.flush()
             os.fsync(f.fileno())
-        fsutil.replace(temp_path, path)
+        if replace:
+            fsutil.replace(temp_path, path)
+        else:
+            try:
+                fsutil.rename_new(temp_path, path)  # atomic where the platform allows (hard link, RENAME_NOREPLACE)
+            except FileExistsError:
+                fsutil.remove(temp_path)
+                return False
+        fsutil.sync_directory(directory)  # the new name survives a power cut, not just the key's bytes
     except BaseException:
         try:
             fsutil.remove(temp_path)
         except OSError:
             pass
         raise
+    return True
 
 
 def _restrict_permissions(path: str):

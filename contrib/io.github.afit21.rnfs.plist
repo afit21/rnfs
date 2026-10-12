@@ -8,7 +8,9 @@
 
   Stop it with `launchctl unload ~/Library/LaunchAgents/io.github.afit21.rnfs.plist`; launchd sends SIGTERM,
   which the daemon handles by shutting down cleanly. It assumes `pipx install`, which puts rnfs in
-  ~/.local/bin; adjust the path below otherwise. launchd doesn't expand ~, hence the sh -c.
+  ~/.local/bin; adjust the path below (both places) otherwise. launchd doesn't expand ~, hence the sh -c.
+  If rnfs isn't there (e.g. uninstalled), the job logs that and exits successfully, so launchd doesn't keep
+  restarting it. daemon.log isn't rotated: empty it now and then with `: > ~/.rnfs/daemon.log`.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -19,11 +21,11 @@
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>mkdir -p "$HOME/.rnfs" &amp;&amp; exec "$HOME/.local/bin/rnfs" daemon &gt;&gt; "$HOME/.rnfs/daemon.log" 2&gt;&amp;1</string>
+        <string>mkdir -p "$HOME/.rnfs" || exit 1; if [ ! -x "$HOME/.local/bin/rnfs" ]; then echo "$(date): $HOME/.local/bin/rnfs not found, not starting rnfs" &gt;&gt; "$HOME/.rnfs/daemon.log"; exit 0; fi; exec "$HOME/.local/bin/rnfs" daemon &gt;&gt; "$HOME/.rnfs/daemon.log" 2&gt;&amp;1</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <!-- Restart if it exits with an error, but not after a clean stop -->
+    <!-- Restart if it exits with an error (at most every ThrottleInterval seconds), but not after a clean stop -->
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>

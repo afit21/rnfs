@@ -4,7 +4,9 @@ Each node may change these, in `<rnfs dir>/rnfs.toml` or on the command line. Ti
 sizes in bytes and rates in bits/s. A setting left as None takes a default that depends on whether
 the node (or link) is slow; use the `effective_*` helpers rather than reading those fields directly.
 """
+import math
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field, fields
 
@@ -13,6 +15,32 @@ from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
 DEFAULT_API_PORT = 8788
 DEFAULT_GATEWAY_PORT = 8789
 SETTINGS_FILE = "rnfs.toml"
+
+# Core settings' types and ranges, checked by Config.validate (feature settings are checked by their features)
+WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free port (printed at start)
+    "api_port": (1, 65535), "gateway_port": (0, 65535), "verbosity": (0, None), "min_rate_sample": (1, None),
+    "beta": (1, None), "max_failures": (1, None), "max_incoming_links": (1, None), "max_blocks_responses": (2, None),
+    "max_records": (0, None), "max_storage": (0, None), "max_output_entries": (0, None),
+    "name_table_size": (0, None), "remote_pin_quota": (0, None), "gateway_fetches": (0, None),
+}
+OPTIONAL_WHOLE_NUMBERS = {"alpha": 1, "max_parallel_providers": 1, "max_download_size": 0}  # name: minimum
+RATES = ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate")  # bits/s, above 0
+DURATIONS = {  # seconds: name → True if it must be above 0 (else 0 is allowed too)
+    "republish_interval": True, "announce_interval": True, "startup_announce_delay": False,
+    "provider_seniority": False, "response_target": True, "deadline_slack": False, "stall_timeout": True,
+    "lookup_timeout": True, "path_timeout": True, "link_idle_timeout": True, "ban_time": False, "scan_interval": True,
+}
+OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset (None)
+# Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
+MAX_DURATION = 30 * DAY
+FLAGS = ("private", "gateway_scripts")
+IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
+_HEX_ID = re.compile(r"[0-9a-fA-F]{32}")
+
+
+def _is_number(value) -> bool:
+    """True if value is a finite int or float; not a bool, which Python counts as an int."""
+    return type(value) in (int, float) and math.isfinite(value)
 
 
 @dataclass
@@ -151,15 +179,14 @@ class Config:
         return None
 
     def validate(self):
-        """Raise ValueError for settings the spec forbids."""
+        """Raise ValueError for settings the spec forbids, or of the wrong type or out of range."""
+        self._validate_core_types()
         if self.slow not in ("yes", "no", "auto"):
             raise ValueError("slow must be yes, no or auto")
         if self.dht_mode not in ("server", "client"):
             raise ValueError("dht_mode must be server or client")
         if self.provide_strategy not in ("pinned", "roots"):
             raise ValueError("provide_strategy must be pinned or roots")
-        if self.max_blocks_responses < 2:
-            raise ValueError("max_blocks_responses must be at least 2")
         # transfers
         # type() rather than isinstance(): true is an int to Python, but not a count anyone means
         if self.max_jobs is not None and (type(self.max_jobs) is not int or self.max_jobs < 1):
@@ -181,6 +208,47 @@ class Config:
         for slow_node in (False, True):
             if self.effective_republish_interval(slow_node) >= PROVIDER_TTL / 2:
                 raise ValueError("republish_interval must be less than PROVIDER_TTL / 2")
+
+    def _validate_core_types(self):
+        """Raise ValueError for a core setting of the wrong type or out of range.
+
+        type() rather than isinstance(): true is an int to Python, but not a count or a port anyone means; and
+        a string such as "false" or "no" in rnfs.toml must not read as a true flag.
+        """
+        for name, (minimum, maximum) in WHOLE_NUMBERS.items():
+            value = getattr(self, name)
+            if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+                limits = f"{minimum}-{maximum}" if maximum is not None else f"at least {minimum}"
+                raise ValueError(f"{name} must be a whole number, {limits}")
+        for name, minimum in OPTIONAL_WHOLE_NUMBERS.items():
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < minimum):
+                raise ValueError(f"{name} must be a whole number of at least {minimum}, or unset")
+        unset = " (or unset)"
+        for name in RATES:
+            value = getattr(self, name)
+            if not (value is None and name in OPTIONAL) and (not _is_number(value) or value <= 0):
+                raise ValueError(f"{name} must be a number of bits/s above 0{unset if name in OPTIONAL else ''}")
+        for name, positive in DURATIONS.items():
+            value = getattr(self, name)
+            if value is None and name in OPTIONAL:
+                continue
+            if not _is_number(value) or value < 0 or (positive and value == 0) or value > MAX_DURATION:
+                raise ValueError(f"{name} must be a number of seconds, {'above' if positive else 'at least'} 0 "
+                                 f"and at most {MAX_DURATION}{unset if name in OPTIONAL else ''}")
+        for name in FLAGS:
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be true or false")
+        for name in IDENTITY_LISTS:
+            values = getattr(self, name)
+            if not isinstance(values, list) or not all(
+                    isinstance(value, str) and _HEX_ID.fullmatch(value.strip().strip("<>")) for value in values):
+                raise ValueError(f"{name} must be a list of RNS identity hashes (32 hex characters each)")
+        # Node IDs that don't parse are skipped with a warning when joining, but a string isn't a list of them
+        if not isinstance(self.bootstrap_nodes, list) or not all(isinstance(v, str) for v in self.bootstrap_nodes):
+            raise ValueError("bootstrap_nodes must be a list of node IDs (hex)")
+        if self.reticulum_dir is not None and not isinstance(self.reticulum_dir, str):
+            raise ValueError("reticulum_dir must be a directory path")
 
     @classmethod
     def load(cls, rnfs_dir: str = "~/.rnfs/", **overrides) -> "Config":

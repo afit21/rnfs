@@ -3,3 +3,4 @@ prune tests
 prune packaging
 # ...except the dependency lock, which install.sh uses when installing from an sdist
 include packaging/requirements.lock
+include packaging/build-backend.lock

@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=64"]
+# The upper bound is the major version after packaging/build-backend.lock's (which install.sh, build-deb.sh and
+# the workflows build with, hash-checked and without build isolation); raise both together
+requires = ["setuptools>=64,<85"]
 build-backend = "setuptools.build_meta"
 
 [project]

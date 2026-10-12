@@ -11,6 +11,7 @@ Repeated CIDs: every occurrence is checked against its own expectation, but iden
 (the same CID listed the same way at the same depth) are checked once, which is what keeps DAGs that
 repeat subtrees cheap to walk.
 """
+import errno
 import os
 import stat
 from dataclasses import dataclass, replace
@@ -22,6 +23,9 @@ from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, Entry, FileNode, IndexNode
 from rnfs.errors import InvalidDag, NotFound, TooLarge
 from rnfs.log import LOG_WARNING, log
+
+# Errors creating an entry that mean this filesystem can't take its name: the entry is skipped and reported
+_NAME_ERRORS = frozenset({errno.EINVAL, errno.ENAMETOOLONG, errno.EILSEQ})
 
 RAW_TYPE, FILE_TYPE, DIRECTORY_TYPE, INDEX_TYPE = "raw", "file", "directory", "index"
 ANY_TYPES = frozenset({RAW_TYPE, FILE_TYPE, DIRECTORY_TYPE, INDEX_TYPE})
@@ -250,34 +254,44 @@ def resolve(root: Cid, names: list[str], get: Get) -> Expect:
 
 def iter_dag(expect: Expect, get: Get) -> Iterator[tuple[Expect, bytes]]:
     """Every block of a DAG as (expect, block), depth-first, each CID once; every occurrence is checked."""
-    seen_expects: set[Expect] = set()
-    seen_cids: set[Cid] = set()
-    nodes: dict[Cid, bytes] = {}  # DAG node blocks already read, to check later occurrences without rereading
-    raw_lengths: dict[Cid, int] = {}  # raw blocks are only checked by length; don't keep their bytes
-    stack = [expect]
-    while stack:
-        current = stack.pop()
-        if current in seen_expects:
-            continue
-        seen_expects.add(current)
-        cid = current.cid
-        if cid in raw_lengths:
-            check_raw(current, raw_lengths[cid])
-            continue
-        if cid in nodes:
-            stack.extend(reversed(expand(current, nodes[cid])))
-            continue
-        check_cid(current)  # before reading a block that can't be right
-        block = get(current)
-        child_expects = expand(current, block)
-        if cid.is_raw:
-            raw_lengths[cid] = len(block)
-        else:
-            nodes[cid] = block
-        if cid not in seen_cids:
-            seen_cids.add(cid)
-            yield current, block
-        stack.extend(reversed(child_expects))
+    return iter_dags([expect], get)
+
+
+def iter_dags(expects: list[Expect], get: Get) -> Iterator[tuple[Expect, bytes]]:
+    """Every block of the DAGs below expects as (expect, block), depth-first from each in turn, each CID once
+    over them all; every occurrence is checked.
+
+    Kept for the whole walk, so a large export holds little per block: each raw block's length (all its
+    check needs) and the DAG node expectations already checked. A node met again under another expectation
+    is read again rather than having every node's bytes kept.
+    """
+    raw_lengths: dict[bytes, int] = {}  # binary CID -> length, for every raw block yielded
+    node_expects: set[Expect] = set()  # DAG node expectations checked
+    nodes: set[Cid] = set()  # DAG nodes yielded
+    for root in expects:
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            cid = current.cid
+            if cid.is_raw:
+                length = raw_lengths.get(cid.binary)
+                if length is not None:
+                    check_raw(current, length)
+                    continue
+            elif current in node_expects:
+                continue
+            check_cid(current)  # before reading a block that can't be right
+            block = get(current)
+            child_expects = expand(current, block)
+            if cid.is_raw:
+                raw_lengths[cid.binary] = len(block)
+                yield current, block
+                continue
+            node_expects.add(current)
+            if cid not in nodes:
+                nodes.add(cid)
+                yield current, block
+            stack.extend(reversed(child_expects))
 
 
 def read_range(expect: Expect, get: Get, offset: int = 0, length: int | None = None,
@@ -422,8 +436,8 @@ def unsafe_name_reason(name: str) -> str | None:
 def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str]:
     """Write the file or directory expect names to dest, which must not exist yet. Returns warnings.
 
-    Entries whose names the local filesystem would read as a path, or can't represent, are skipped and
-    reported, as are names that collide on this filesystem (e.g. case-insensitive ones). Kind 1 entries
+    Entries whose names the local filesystem would read as a path, or can't represent (it refuses to create
+    them), are skipped and reported, as are names that collide on this filesystem (e.g. case-insensitive ones). Kind 1 entries
     get the execute bit, except on Windows, which has none. Raises TooLarge after max_entries entries,
     counting every occurrence, or after max_entries small chunks (SmallLeaves).
     """
@@ -436,7 +450,8 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
     block = get(expect)
     node = decode_checked(expect, block)
     if not isinstance(node, (DirectoryNode, IndexNode)):
-        _write_file(expect, get, dest, small, block)
+        with open(dest, "xb") as out:
+            _write_file(expect, get, out, small, block)
         return warnings
 
     memo[expect] = node
@@ -455,33 +470,44 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
                 warnings.append(f"skipped {entry_shown!r}: {reason}")
                 continue
             path = os.path.join(where, entry.name)
-            if os.path.lexists(path):
+            try:
+                if entry.kind == dag.KIND_DIRECTORY:
+                    os.mkdir(path)
+                else:
+                    out = open(path, "xb")
+            except FileExistsError:
                 # Everything here was created by this call, so this is another name the filesystem folded
                 warnings.append(f"skipped {entry_shown!r}: it collides with another name on this filesystem")
                 continue
+            except OSError as e:
+                if e.errno not in _NAME_ERRORS:
+                    raise
+                # Allowed on most filesystems, but not this one (e.g. ':' or '?' on FAT, long names on eCryptfs)
+                warnings.append(f"skipped {entry_shown!r}: this filesystem can't represent it ({e.strerror})")
+                continue
             if entry.kind == dag.KIND_DIRECTORY:
-                os.mkdir(path)
                 subdirectories.append((child, path, entry_shown))
             else:
-                _write_file(child, get, path, small)
+                with out:
+                    _write_file(child, get, out, small)
         stack.extend(reversed(subdirectories))
     for warning in warnings:
         log(f"get: {warning}", LOG_WARNING)
     return warnings
 
 
-def _write_file(expect: Expect, get: Get, path: str, small: SmallLeaves, block: bytes | None = None):
-    """Write the file expect names to path (exclusively created), with the execute bit for kind 1."""
-    with open(path, "xb") as out:
-        if block is not None and expect.cid.is_raw:
-            check_raw(expect, len(block))
-            small.meet(len(block))
-            out.write(block)
-        else:
-            for data in read_range(expect, get, small=small):
-                out.write(data)
+def _write_file(expect: Expect, get: Get, out, small: SmallLeaves, block: bytes | None = None):
+    """Write the file expect names to out, a file just created, with the execute bit for kind 1."""
+    if block is not None and expect.cid.is_raw:
+        check_raw(expect, len(block))
+        small.meet(len(block))
+        out.write(block)
+    else:
+        for data in read_range(expect, get, small=small):
+            out.write(data)
     # Windows has no execute bit (os.chmod there only sets or clears read-only), so kind 1 writes a plain file
     if expect.kind == dag.KIND_EXECUTABLE and not fsutil.IS_WINDOWS:
-        mode = os.stat(path).st_mode
+        # Through the descriptor, so a path swapped for a symlink meanwhile can't redirect the chmod
+        mode = os.fstat(out.fileno()).st_mode
         # Execute wherever read is allowed, as the umask already decided read permissions
-        os.chmod(path, stat.S_IMODE(mode) | ((mode & 0o444) >> 2))
+        os.fchmod(out.fileno(), stat.S_IMODE(mode) | ((mode & 0o444) >> 2))

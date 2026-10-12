@@ -13,15 +13,21 @@
 #   --update      re-install from the latest main branch (running the installer again does the same)
 #   --uninstall   remove the venv, the command and the unit (keeps your data in ~/.rnfs)
 #   --python P    use this Python (3.11 or newer) for the venv
-#   --force       replace an existing rnfs command that this installer didn't make (e.g. a pipx one)
+#   --force       replace an existing rnfs command or systemd unit that this installer didn't make
+#                 (e.g. a pipx one)
 #
 # Environment: RNFS_SOURCE  what to install instead of the main branch: a local source directory, a
 #                           .zip/.tar.gz/.whl path or URL, or another pip requirement
 #              RNFS_PYTHON  same as --python
+#              RNFS_ALLOW_SOURCE_BUILDS=1  build dependencies PyPI has no wheel of for this platform (e.g.
+#                           cffi on 32-bit ARM) from their pinned, hash-checked source; the tools that build
+#                           them are then fetched unpinned, and a C compiler and Python headers are needed
 #
-# Dependencies (rns, lxmf, cryptography, ...) are installed at the versions and sha256 hashes pinned in the
-# source's packaging/requirements.lock (pip --require-hashes); a source without one (a .whl, a pip
-# requirement) gets the newest versions instead, with a warning.
+# Dependencies (rns, lxmf, cryptography, ...) are installed as wheels at the versions and sha256 hashes
+# pinned in the source's packaging/requirements.lock (pip --require-hashes --only-binary=:all:), and rnfs
+# itself is built with the setuptools pinned in packaging/build-backend.lock, in a separate build venv
+# without pip's build isolation (which would fetch the newest setuptools). A source without those files (a
+# .whl, a pip requirement) gets the newest versions instead, with a warning.
 # Needs Python 3.11+ with venv and pip (no git). Your rnfs data (~/.rnfs) and Reticulum config (~/.reticulum)
 # are never touched.
 set -eu
@@ -49,7 +55,7 @@ while [ $# -gt 0 ]; do
         --python) [ $# -ge 2 ] || die "--python needs a path"; PYTHON=$2; shift ;;
         --python=*) PYTHON=${1#--python=} ;;
         -h|--help)
-            if [ -f "$0" ]; then sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+            if [ -f "$0" ]; then sed -n '2,/^set -eu$/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'
             else say "See https://github.com/afit21/rnfs/blob/main/install.sh"; fi
             exit 0 ;;
         *) die "unknown option $1 (try --help)" ;;
@@ -90,10 +96,14 @@ fi
 
 if [ "$MODE" = system ]; then
     [ "$(id -u)" = 0 ] || die "--system needs root: run it with sudo (e.g. curl ... | sudo sh -s -- --system)"
+    # Everything made here must be readable by every user (root's umask may be 077)
+    umask 022
     PREFIX=/opt/rnfs
     VENV=$PREFIX/venv
     BIN_DIR=/usr/local/bin
     UNIT_DIR=/etc/systemd/user
+    # pip won't use the invoking user's cache as root (sudo -E) and warns about it; root's own isn't needed
+    PIP_OPTS="--disable-pip-version-check --no-cache-dir"
 else
     [ -n "${HOME:-}" ] || die "HOME isn't set"
     PREFIX=${XDG_DATA_HOME:-$HOME/.local/share}/rnfs
@@ -103,6 +113,7 @@ else
 fi
 LAUNCHER=$BIN_DIR/rnfs
 UNIT=$UNIT_DIR/rnfs.service
+PIP_OPTS=${PIP_OPTS:-"--disable-pip-version-check"}
 
 # Python and venv checks
 
@@ -153,7 +164,9 @@ check_venv() {  # Debian and Ubuntu ship venv's pip bootstrap (ensurepip) as a s
     rm -rf "$probe"
 }
 
-vpip() { "$VENV/bin/python" -I -m pip --disable-pip-version-check "$@"; }
+# shellcheck disable=SC2086  # PIP_OPTS is a list of options
+pip_in() { py=$1; shift; "$py" -I -m pip $PIP_OPTS "$@"; }  # pip_in PYTHON ARGS...: that Python's pip
+vpip() { pip_in "$VENV/bin/python" "$@"; }
 
 venv_ok() {  # the venv exists, works, and uses the Python asked for with --python (if any)
     [ -x "$VENV/bin/python" ] && python_ok "$VENV/bin/python" &&
@@ -170,6 +183,19 @@ check_launcher() {  # fail early if the command's path is taken by something els
     if { [ -e "$LAUNCHER" ] || [ -L "$LAUNCHER" ]; } && ! ours "$LAUNCHER" && [ "$FORCE" = no ]; then
         die "$LAUNCHER already exists and wasn't installed by this script (pipx? a package?).
 Remove it (e.g. pipx uninstall rnfs) or run this again with --force to replace it."
+    fi
+}
+
+UNIT_MARK="installed by rnfs's install.sh"  # in the unit's first line (installs before this check have it too)
+
+unit_ours() {  # the unit is a file this installer wrote
+    [ -f "$UNIT" ] && ! [ -L "$UNIT" ] && grep -qF "$UNIT_MARK" "$UNIT"
+}
+
+check_unit() {  # fail early if --service would replace a unit that this installer didn't write (unless --force)
+    if [ "$SERVICE" = yes ] && { [ -e "$UNIT" ] || [ -L "$UNIT" ]; } && ! unit_ours && [ "$FORCE" = no ]; then
+        die "$UNIT already exists and wasn't written by this script.
+Remove it, or run this again with --force to replace it."
     fi
 }
 
@@ -190,8 +216,9 @@ write_unit() {
         *[\\\"\'[:cntrl:]]*) die "systemd can't run a command whose path contains a quote, backslash or control character: $LAUNCHER" ;;
     esac
     mkdir -p "$UNIT_DIR"
+    if ! unit_ours; then rm -f "$UNIT"; fi  # (--force) a symlink or someone else's unit: replace, don't write through
     cat > "$UNIT" <<EOF
-# systemd user unit for the rnfs daemon, installed by rnfs's install.sh.
+# systemd user unit for the rnfs daemon, $UNIT_MARK.
 #   systemctl --user enable --now rnfs
 #   journalctl --user -u rnfs -f          # logs
 # To keep it running while you're logged out: loginctl enable-linger \$USER
@@ -200,6 +227,9 @@ write_unit() {
 Description=rnfs: content-addressed file sharing over Reticulum
 # Start after rnsd if it also runs as a user service, so rnfs attaches to it rather than starting its own instance
 After=rnsd.service
+# Give up after 5 failed starts in 10 minutes (e.g. the command is missing) instead of retrying forever
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -209,6 +239,14 @@ RestartSec=10
 # The daemon shuts down cleanly on SIGTERM, saving provider records and RNS state
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# Sandboxing that works in a user unit too. Serial devices (RNode, KISS) are unaffected; Bluetooth RNodes are
+# reached through BlueZ's D-Bus (AF_UNIX). An interface program run by a PipeInterface inherits these limits:
+# if it needs another socket family (e.g. AF_PACKET), add it with systemctl --user edit rnfs.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=default.target
@@ -216,7 +254,7 @@ EOF
 }
 
 # The source: a local tree, or an archive downloaded and unpacked here (by Python, so no curl/unzip needed),
-# so its packaging/requirements.lock can be used. A wheel or other pip requirement goes to pip as it is.
+# so its packaging/requirements.lock and packaging/build-backend.lock can be used. A wheel or other pip requirement goes to pip as it is.
 
 unpack() {  # unpack SOURCE DIR: download (if a URL) and unpack the .zip/.tar.* SOURCE in DIR; print its top directory
     "$VENV/bin/python" -I - "$1" "$2" <<'EOF'
@@ -258,9 +296,10 @@ print(only if os.path.isdir(only) else dest)
 EOF
 }
 
-fetch_source() {  # fetch_source WORKDIR: set build_source (what pip builds) and lock (the lock file, or "")
+fetch_source() {  # fetch_source WORKDIR: set build_source (what pip builds), lock and backend_lock (or "")
     build_source=$SOURCE
     lock=""
+    backend_lock=""
     case "${SOURCE%%[?#]*}" in
         *.zip|*.tar.gz|*.tgz|*.tar.bz2|*.tar.xz) is_archive=yes ;;
         *) is_archive=no ;;
@@ -274,15 +313,57 @@ fetch_source() {  # fetch_source WORKDIR: set build_source (what pip builds) and
                     "$SOURCE"/COPYING* "$SOURCE"/rnfs; do
             if [ -e "$item" ]; then cp -R "$item" "$build_source/"; fi
         done
-        if [ -f "$SOURCE/packaging/requirements.lock" ]; then
-            mkdir -p "$build_source/packaging"
-            cp "$SOURCE/packaging/requirements.lock" "$build_source/packaging/"
-        fi
+        for item in "$SOURCE"/packaging/requirements.lock "$SOURCE"/packaging/build-backend.lock; do
+            if [ -f "$item" ]; then
+                mkdir -p "$build_source/packaging"
+                cp "$item" "$build_source/packaging/"
+            fi
+        done
     elif [ "$is_archive" = yes ]; then
         build_source=$(unpack "$SOURCE" "$1") || die "couldn't download or unpack $SOURCE"
         [ -f "$build_source/pyproject.toml" ] && [ -d "$build_source/rnfs" ] || die "$SOURCE isn't an rnfs source archive"
     fi
     if [ -f "$build_source/packaging/requirements.lock" ]; then lock=$build_source/packaging/requirements.lock; fi
+    if [ -f "$build_source/packaging/build-backend.lock" ]; then backend_lock=$build_source/packaging/build-backend.lock; fi
+}
+
+build_wheel() {  # build_wheel WORKDIR: build (or fetch) the rnfs wheel from build_source into WORKDIR
+    if [ -n "$backend_lock" ]; then
+        # With the pinned, hash-checked setuptools, in a venv of its own (so it stays out of rnfs's venv), and
+        # without build isolation, which would fetch the newest setuptools from PyPI
+        "$PYTHON" -I -m venv "$1/build-venv" || die "couldn't create a build venv with $PYTHON"
+        pip_in "$1/build-venv/bin/python" install --quiet --require-hashes --only-binary=:all: -r "$backend_lock" ||
+            die "pip couldn't install the build backend from $backend_lock"
+        pip_in "$1/build-venv/bin/python" wheel --quiet --no-deps --no-build-isolation --wheel-dir "$1" \
+            "$build_source" || die "couldn't build rnfs from $SOURCE"
+    else
+        case "$build_source" in
+            *.whl) ;;
+            *) warn "$SOURCE has no packaging/build-backend.lock, so pip may build it with the newest setuptools (unpinned)" ;;
+        esac
+        vpip wheel --quiet --no-deps --wheel-dir "$1" "$build_source" || die "couldn't build rnfs from $SOURCE"
+    fi
+}
+
+install_locked() {  # install_locked LOCK WORKDIR: rnfs's dependencies, as LOCK pins them (versions and hashes)
+    # Wheels only: building an sdist would fetch its build tools (setuptools, ...) unpinned
+    only_binary=:all:
+    if [ "${RNFS_ALLOW_SOURCE_BUILDS:-}" = 1 ]; then
+        warn "RNFS_ALLOW_SOURCE_BUILDS=1: dependencies without a wheel for this platform are built from source, with unpinned build tools"
+        only_binary=:none:
+    fi
+    if ! vpip install --quiet --require-hashes --only-binary="$only_binary" -r "$1" 2>"$2/pip-errors"; then
+        cat "$2/pip-errors" >&2
+        if grep -q 'No matching distribution' "$2/pip-errors"; then
+            die "PyPI has no prebuilt wheel ($(uname -m), Python $(python_version "$VENV/bin/python")) of one of rnfs's
+dependencies (above). To build it from its pinned, hash-checked source instead (its build tools are then
+fetched unpinned, and it needs a C compiler and Python headers, e.g. apt install build-essential
+python3-dev libffi-dev), run this again with RNFS_ALLOW_SOURCE_BUILDS=1 set:
+  curl -fsSL .../install.sh | RNFS_ALLOW_SOURCE_BUILDS=1 sh             (or: | sudo RNFS_ALLOW_SOURCE_BUILDS=1 sh -s -- --system)"
+        fi
+        die "pip couldn't install rnfs's dependencies from $1"
+    fi
+    cat "$2/pip-errors" >&2  # warnings
 }
 
 have_user_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
@@ -292,8 +373,11 @@ have_user_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user s
 do_install() {
     find_python
     check_launcher
+    check_unit
+    updating=no
     if venv_ok; then
         say "Updating rnfs in $VENV"
+        updating=yes
     else
         check_venv
         if [ -e "$VENV" ]; then
@@ -312,19 +396,22 @@ do_install() {
     trap 'rm -rf "$wheels"' EXIT INT TERM
     say "Fetching and building rnfs from $SOURCE"
     fetch_source "$wheels"
-    vpip wheel --quiet --no-deps --wheel-dir "$wheels" "$build_source" || die "couldn't build rnfs from $SOURCE"
+    build_wheel "$wheels"
     wheel=""
     for found in "$wheels"/rnfs-*.whl; do
         if [ -f "$found" ]; then wheel=$found; break; fi
     done
     [ -n "$wheel" ] || die "building $SOURCE didn't produce an rnfs wheel"
     if [ -n "$lock" ]; then
-        vpip install --quiet --require-hashes -r "$lock" || die "pip couldn't install rnfs's dependencies from $lock"
+        install_locked "$lock" "$wheels"
     else
         warn "$SOURCE has no packaging/requirements.lock, so rnfs's dependencies are installed unpinned (newest versions)"
         vpip install --quiet --upgrade "$wheel" || die "pip couldn't install rnfs's dependencies"
     fi
     vpip install --quiet --force-reinstall --no-deps "$wheel" || die "pip couldn't install rnfs"
+    # rnfs went in with --no-deps: check the lock (or an older venv's leftovers) left nothing missing or conflicting
+    check=$(vpip check 2>&1) || die "rnfs's dependencies in $VENV are incomplete or conflicting:
+$check"
     rm -rf "$wheels"
     trap - EXIT INT TERM
 
@@ -332,10 +419,14 @@ do_install() {
     version=$("$LAUNCHER" --version 2>/dev/null) || die "the installed rnfs doesn't run: $LAUNCHER --version failed"
     say "Installed $version as $LAUNCHER"
 
-    if [ "$SERVICE" = yes ] || [ -f "$UNIT" ]; then
+    if [ "$SERVICE" = yes ] || unit_ours; then
         write_unit
         if [ "$MODE" = system ]; then
             say "Installed the systemd user unit $UNIT; each user can start it with: systemctl --user enable --now rnfs"
+            if [ "$updating" = yes ]; then
+                say "Users already running rnfs keep the old version until they restart it (with the service:"
+                say "  systemctl --user daemon-reload && systemctl --user restart rnfs)"
+            fi
         elif have_user_systemd; then
             systemctl --user daemon-reload
             if [ "$SERVICE" = yes ]; then
@@ -349,6 +440,8 @@ do_install() {
             say "Installed $UNIT, but there's no systemd user session here; start it later with:"
             say "  systemctl --user daemon-reload && systemctl --user enable --now rnfs"
         fi
+    elif [ "$MODE" = system ] && [ "$updating" = yes ]; then
+        say "Users already running rnfs keep the old version until they restart it"
     fi
 
     case ":${PATH:-}:" in
@@ -359,14 +452,36 @@ or run rnfs as $LAUNCHER" ;;
     esac
 }
 
+remove_enable_links() {  # system mode: the links `systemctl --user enable` (or --global) made to our unit
+    # Only symlinks named rnfs.service that point at exactly $UNIT, in each user's default ~/.config (one
+    # set in XDG_CONFIG_HOME isn't known here). find doesn't follow symlinks, and -delete unlinks the entry
+    # it checked, so nothing but such a link is removed.
+    { echo /etc/systemd/user/default.target.wants
+      { getent passwd 2>/dev/null || cat /etc/passwd; } | cut -d: -f6 | sort -u | while IFS= read -r home; do
+          case "$home" in /*) printf '%s\n' "${home%/}/.config/systemd/user/default.target.wants" ;; esac
+      done
+    } | while IFS= read -r wants; do
+        if [ -d "$wants" ]; then
+            find "$wants" -maxdepth 1 -name rnfs.service -type l -lname "$UNIT" -print -delete 2>/dev/null |
+                while IFS= read -r link; do say "Removed $link"; done
+        fi
+    done
+}
+
 do_uninstall() {
-    if [ -f "$UNIT" ]; then
+    if unit_ours; then
         if [ "$MODE" = user ] && have_user_systemd; then
             systemctl --user disable --now rnfs.service >/dev/null 2>&1 || true
         fi
         rm -f "$UNIT"
         if [ "$MODE" = user ] && have_user_systemd; then systemctl --user daemon-reload || true; fi
         say "Removed $UNIT"
+        if [ "$MODE" = system ]; then
+            remove_enable_links
+            say "Users running the rnfs service keep it running until they log out or run: systemctl --user stop rnfs"
+        fi
+    elif [ -e "$UNIT" ] || [ -L "$UNIT" ]; then
+        warn "left $UNIT alone: this installer didn't write it"
     fi
     if ours "$LAUNCHER"; then
         rm -f "$LAUNCHER"

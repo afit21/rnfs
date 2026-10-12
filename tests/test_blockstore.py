@@ -58,6 +58,20 @@ class BlockStoreTest(unittest.TestCase):
         self.assertEqual(self.store.delete(cid), 3)
         self.assertFalse(self.store.has(cid))
 
+    @unittest.skipIf(fsutil.IS_WINDOWS, "Windows can't sync a directory")
+    def test_put_syncs_the_block_before_renaming_and_sync_the_directory(self):
+        # Else a power loss can leave an empty or short file under the CID name, trusted at the next start
+        events = []
+        real_fsync, real_replace = os.fsync, fsutil.replace
+        with mock.patch("os.fsync", side_effect=lambda fd: (events.append("fsync"), real_fsync(fd))[1]), \
+                mock.patch.object(fsutil, "replace", lambda *a: (events.append("rename"), real_replace(*a))[1]):
+            self.store.put(Cid.for_block(RAW, b"durable"), b"durable")
+            self.store.put(Cid.for_block(RAW, b"more"), b"more")
+            self.assertEqual(events, ["fsync", "rename"] * 2)
+            self.store.sync()  # the directory, once for both
+            self.store.sync()  # nothing new since
+        self.assertEqual(events, ["fsync", "rename"] * 2 + ["fsync"])
+
     def test_put_of_a_stored_block_writes_nothing(self):
         # Content-addressed: the bytes are the same, and on Windows replacing a block a reader has open fails
         cid = Cid.for_block(RAW, b"abc")

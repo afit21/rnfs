@@ -209,7 +209,7 @@ def format_peers(peers: list[dict], now: float) -> list[str]:
         rate = human_rate(peer["rate"]) if peer["link"] else "-"
         interface = (peer.get("interface") or "-")[:20]
         flags = (" banned" if peer["banned"] else "") + (f" bad:{peer['bad']}" if peer.get("bad") else "")
-        lines.append(f"{peer['node_id']:<32} {peer['mode'] or '?':<7} {table:>6} "
+        lines.append(f"{_printable(peer['node_id']):<32} {_printable(peer['mode'] or '?'):<7} {table:>6} "
                      f"{peer['hops'] if peer['hops'] is not None else '?':>4} {_printable(interface):<20} "
                      f"{rate:>10} {heard:>6} {human_size(peer['sent']):>9} {human_size(peer['received']):>9} "
                      f"{peer['failed']:>5}{flags}")

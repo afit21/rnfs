@@ -150,6 +150,35 @@ def other_name(i: int) -> bytes:
     return bytes([i]) * 16
 
 
+class FakeKeepers:
+    """The keepers feature as NameManager uses it: a local record, and records other keepers answer."""
+
+    def __init__(self):
+        """Nothing kept, nobody answering."""
+        self.local: dict[bytes, tuple[int, Cid, float]] = {}
+        self.answers: dict[bytes, list[tuple[int, Cid, float]]] = {}
+        self.queried: list[bytes] = []
+
+    def local_record(self, name):
+        """The record kept here for name."""
+        return self.local.get(name)
+
+    def query(self, name):
+        """Records other keepers answer for name."""
+        self.queried.append(name)
+        return self.answers.get(name, [])
+
+    def always_ask(self):
+        """Keepers are asked only when the network gives nothing."""
+        return False
+
+    def published(self, name, identity, app_data):
+        """A local name was published."""
+
+    def heard(self, name, sequence, cid, packet_hash):
+        """A record was heard."""
+
+
 class NamesTestCase(unittest.TestCase):
     """A NameManager in a temporary rnfs dir with fake pins, network and clock."""
 
@@ -326,6 +355,19 @@ class PublishTest(NamesTestCase):
         self.assertEqual(len(self.network.closed), 1)
         self.assertEqual(self.make_manager().list(), [])
 
+    def test_deleted_key_file_releases_pin_once_asked(self):
+        """A name whose key file was deleted by hand has its pin released by release_gone(), not while loading."""
+        self.manager.create("site")
+        self.manager.publish("site", CID_A)
+        os.remove(os.path.join(self.config.names_dir, "site"))
+        restarted = self.make_manager()  # the node isn't set up yet: releasing now would recompute provides
+        self.assertEqual(self.pins.sources, {CID_A: {"name:site"}})
+        restarted.release_gone()
+        self.assertEqual(self.pins.sources, {})
+        self.assertEqual(restarted.list(), [])
+        self.make_manager().release_gone()  # its entry is gone from the state: nothing left to release
+        self.assertEqual(self.pins.sources, {})
+
     def test_sequence_increments(self):
         """Each publish is one higher than the last, and that survives a restart."""
         self.manager.create("site")
@@ -357,6 +399,33 @@ class PublishTest(NamesTestCase):
         # Later publishes don't need the network
         self.manager.publish("moved", CID_C)
         self.assertEqual(self.network.path_requests, [name])
+
+    def test_first_publish_of_imported_key_asks_keepers(self):
+        """Its old announces may have expired while keepers still hold its highest sequence (section 9)."""
+        keepers = self.manager.keepers = FakeKeepers()
+        name = self.manager.import_key("moved", RNS.Identity().get_private_key())
+        keepers.answers[name] = [(7, CID_A, self.clock.now - 10)]
+        self.assertEqual(self.manager.publish("moved", CID_B)["sequence"], 8)
+        self.assertEqual(keepers.queried, [name])
+        # The record this node keeps itself counts too
+        other = self.manager.import_key("other", RNS.Identity().get_private_key())
+        keepers.local[other] = (4, CID_A, self.clock.now - 10)
+        self.assertEqual(self.manager.publish("other", CID_B)["sequence"], 5)
+
+    def test_key_without_state_is_published_above_the_network(self):
+        """With names.json lost, a key's first publish asks the network and keepers, as for an imported key."""
+        keepers = self.manager.keepers = FakeKeepers()
+        name = self.manager.create("site")
+        for cid in (CID_A, CID_B, CID_C):
+            self.manager.publish("site", cid)
+        self.assertEqual(keepers.queried, [])  # a key made here needs no network
+        os.remove(os.path.join(self.config.state_dir, names.STATE_FILE))
+        keepers.answers[name] = [(3, CID_C, self.clock.now - 10)]
+        restarted = self.make_manager()
+        restarted.keepers = keepers
+        self.assertEqual(restarted.publish("site", CID_A)["sequence"], 4)
+        self.assertEqual(keepers.queried, [name])
+        self.assertIn(name, self.network.path_requests)
 
     def test_announces(self):
         """start announces published names with their record; publish re-announces; the loop repeats."""
@@ -529,6 +598,24 @@ class ResolveTest(NamesTestCase):
         result = self.manager.resolve(name, persist=True)
         self.assertEqual((result["sequence"], result["cid"]), (1, str(CID_A)))
         self.assertEqual(self.network.path_requests, [])
+
+    def test_imported_name_resolves_from_network_until_published(self):
+        """An imported key not yet published here may have records elsewhere, so resolving it asks."""
+        name = self.manager.import_key("moved", RNS.Identity().get_private_key())
+        self.network.on_request_path = lambda n: self.network.announce(n, encode_record(6, CID_A), self.clock.now)
+        self.assertEqual(self.manager.resolve(name, persist=True)["sequence"], 6)
+        self.assertEqual(self.network.path_requests, [name])
+
+    def test_heard_time_in_the_future_isnt_fresh(self):
+        """A record heard while the clock ran ahead is refreshed once the clock is corrected."""
+        name = other_name(1)
+        self.network.announce(name, encode_record(1, CID_A), self.clock.now)
+        self.manager.resolve(name, persist=True)
+        with self.manager._lock:  # as loaded from names.json saved while the clock ran ahead
+            self.manager._held[name] = names.Record(1, CID_A, self.clock.now + 10**6)
+        self.network.path_requests.clear()
+        self.manager.resolve(name, persist=True, max_age=60)
+        self.assertEqual(self.network.path_requests, [name])
 
     def test_resolve_rejects_bad_names(self):
         """Names must be 16 bytes."""

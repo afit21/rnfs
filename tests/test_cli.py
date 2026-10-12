@@ -1,5 +1,6 @@
 """Tests for the command line (rnfs/cli.py): parsing, and each command against a live ApiServer with a FakeNode."""
 import contextlib
+import http.server
 import io
 import os
 import socket
@@ -7,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -302,13 +304,69 @@ class OtherCommandTest(CliTestCase):
         original = self.server.server.RequestHandlerClass.dispatch
 
         def spy(handler):
-            seen.append((handler.headers["Host"], handler.headers["X-Rnfs-Api"]))
+            seen.append((handler.path, handler.headers["Host"], handler.headers["X-Rnfs-Api"],
+                         handler.headers[cli.CHALLENGE_HEADER] is not None))
             original(handler)
         with mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy):
             self.ok("gc")
             self.ok("status")
-        self.assertEqual(seen, [(f"127.0.0.1:{self.server.port}", self.server.token),
-                                (f"127.0.0.1:{self.server.port}", None)])  # status needs no token
+        host = f"127.0.0.1:{self.server.port}"
+        self.assertEqual(seen, [("/api/status", host, None, True),  # the daemon proves it knows the token first
+                                ("/api/gc", host, self.server.token, False),
+                                ("/api/status", host, None, False)])  # status needs no token
+
+    def test_printed_fields_are_escaped(self):
+        # Whatever the daemon answers is printed with control characters escaped
+        evil = "bafy\x1b]0;owned\x07\x1b[2J"
+        escaped = cli.printable(evil)
+        cid = self.node.put_file(b"abc")
+        directory = self.node.put_dir({"a": cid})
+        for method, argv, value in (("dir_set", ("dir", "set", directory, "x", cid), {"cid": evil}),
+                                    ("dir_rm", ("dir", "rm", f"{directory}/a"), {"cid": evil}),
+                                    ("name_create", ("name", "create", "site"), {"alias": "site", "name": evil}),
+                                    ("name_resolve", ("name", "resolve", "ab" * 16), {"name": "ab" * 16, "cid": evil}),
+                                    ("verify", ("verify",), {"checked": evil, "bad": []})):
+            with mock.patch.object(self.node, method, return_value=value):
+                out = self.ok(*argv)
+            self.assertNotIn("\x1b", out, argv)
+            self.assertIn(escaped, out, argv)
+        entries = [{"name": "n", "kind": evil, "size": 1, "cid": evil}]
+        with mock.patch.object(self.node, "ls", return_value=entries):
+            out = self.ok("ls", directory)
+        self.assertNotIn("\x1b", out)
+        self.assertEqual(out.count(escaped), 2)
+        with mock.patch.object(self.node, "verify", return_value={"checked": 1, "bad": [evil]}):
+            code, out, _ = self.run_cli("verify")
+        self.assertEqual(code, 1)
+        self.assertIn(f"bad block deleted: {escaped}", out.decode())
+
+    def test_port_numbers_checked(self):
+        for argv in (["--api-port", "99999", "status"], ["status", "--api-port", "0"],
+                     ["daemon", "--gateway-port", "65536"], ["status", "--api-port", "x"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                cli.build_parser().parse_args(argv)
+
+    def test_bad_settings_fail_cleanly(self):
+        # A badly typed setting is a clean error, for client commands and for the daemon (before RNS starts)
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w", encoding="utf-8") as f:
+            f.write('api_port = 99999\n')
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            cli.main(["--dir", self.tmp, "status"])
+        self.assertIn("api_port must be a whole number", str(raised.exception.code))
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w", encoding="utf-8") as f:
+            f.write('private = "no"\n')
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            cli.main(["--dir", self.tmp, "daemon"])
+        self.assertIn("invalid settings: private must be true or false", str(raised.exception.code))
+
+    def test_node_that_cant_start_fails_cleanly(self):
+        # An error building the node (e.g. an rnfs dir that isn't private) is a message, not a traceback
+        from rnfs.errors import RnfsError
+        with mock.patch("rnfs.node.RnfsNode", side_effect=RnfsError("the rnfs dir isn't private")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cli.main(["--dir", self.tmp, "daemon"])
+        self.assertEqual(raised.exception.code, "rnfs: the rnfs dir isn't private")
 
 
 class TokenTest(CliTestCase):
@@ -377,11 +435,61 @@ class TokenTest(CliTestCase):
         self.assertIn("accessible to other users", err)
         self.assertEqual(self.node.called("gc"), [])
 
-    def test_stale_token_is_refused_by_the_daemon(self):
+    def test_stale_token_is_never_sent(self):
+        # The daemon can't prove it knows this token, so the CLI doesn't send it
         cli.write_token(self.token_file, "an old daemon's token")
-        code, _, err = self.run_cli("gc")
+        tokens = []
+        original = self.server.server.RequestHandlerClass.dispatch
+
+        def spy(handler):
+            tokens.append(handler.headers["X-Rnfs-Api"])
+            original(handler)
+        with mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy):
+            code, _, err = self.run_cli("gc")
         self.assertEqual(code, 1)
-        self.assertIn("X-Rnfs-Api", err)
+        self.assertIn("couldn't prove it knows the API token", err)
+        self.assertEqual(tokens, [None])
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_impostor_on_the_api_port_gets_neither_token_nor_key(self):
+        # Another local user listening on the API port while the daemon is down, answering everything 200
+        received = []
+
+        class Impostor(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                received.append((self.path, dict(self.headers), self.rfile.read(length) if length else b""))
+                data = b'{"name": "x", "cid": "y", "version": "1"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header(cli.PROOF_HEADER, "00" * 32)  # a guess
+                self.end_headers()
+                self.wfile.write(data)
+            do_GET = do_POST = answer
+
+        impostor = http.server.HTTPServer(("127.0.0.1", 0), Impostor)
+        threading.Thread(target=impostor.serve_forever, daemon=True).start()
+        self.addCleanup(impostor.server_close)
+        self.addCleanup(impostor.shutdown)
+        key = self.write("key", b"K" * 64)
+        code, out, err = self.run_cli("name", "import", "stolen", key, port=impostor.server_address[1])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't prove", err)
+        self.assertEqual(len(received), 1)  # only the challenge
+        path, headers, body = received[0]
+        self.assertTrue(path.startswith("/api/status"))
+        self.assertNotIn("X-Rnfs-Api", headers)
+        self.assertEqual(body, b"")
+
+    def test_proof_is_bound_to_the_port(self):
+        # A program on another port can't pass on the daemon's answer: the proof covers the daemon's port
+        proof = cli.api_proof("token", 8788, "ab" * 16)
+        self.assertNotEqual(proof, cli.api_proof("token", 8789, "ab" * 16))
+        self.assertNotEqual(proof, cli.api_proof("other", 8788, "ab" * 16))
+        self.assertNotEqual(proof, cli.api_proof("token", 8788, "cd" * 16))
 
 
 if __name__ == "__main__":

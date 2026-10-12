@@ -42,6 +42,13 @@ class SharedFolderTest(unittest.TestCase):
         """The CID add would give an entry."""
         return builder.add_path(os.path.join(self.files, relative), builder.NO_PUT)[0].cid
 
+    def test_state_of_the_wrong_shape_is_moved_aside(self):
+        path = self.folder._state_path
+        for content in ('["a"]', '{"entries": ["a"]}', '{"entries": {"a": {"0": 1}, "b": 5}}'):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.assertEqual(self.open().names(), {}, content)  # records that don't parse are skipped too
+
     def test_creates_missing_directory(self):
         self.assertEqual(self.folder.scan(), set())
         self.assertTrue(os.path.isdir(self.files))

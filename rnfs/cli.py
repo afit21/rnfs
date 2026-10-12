@@ -5,11 +5,15 @@ local API (see rnfs/api.py). Client commands never import RNS, so they start qui
 are resolved to absolute paths here, since the daemon reads and writes them itself.
 
 Client commands authenticate with the token the daemon writes to <rnfs dir>/api_token at each start
-(specification section 11), so only users who can read the rnfs directory can use the daemon.
+(specification section 11), so only users who can read the rnfs directory can use the daemon. They send it
+only once the program on the API port has proved it knows it (api_proof), since while the daemon is down
+any local user could listen there.
 """
 import argparse
 import contextlib
 import errno
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -25,6 +29,9 @@ DEFAULT_DIR = Config.rnfs_dir
 COPY_SIZE = 64 * 1024
 TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every other command
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # Windows lacks it
+# Before sending the token, the CLI makes whatever listens on the API port prove it knows it (api_proof)
+CHALLENGE_HEADER = "X-Rnfs-Challenge"
+PROOF_HEADER = "X-Rnfs-Proof"
 
 
 # text with control characters escaped, so names from other people's DAGs can't drive the terminal
@@ -73,6 +80,12 @@ def remove_token(path: str, token: str):
         pass  # already gone, or unreadable: nothing of ours to clean up
 
 
+def api_proof(token: str, port: int, challenge: str) -> str:
+    """The daemon's answer to a challenge: HMAC-SHA256, keyed by the API token, of the challenge and the port
+    it listens on (so a program on another port can't pass on the daemon's answer)."""
+    return hmac.new(token.encode(), f"rnfs api proof {port} {challenge}".encode(), hashlib.sha256).hexdigest()
+
+
 def read_token(path: str) -> str:
     """The daemon's API token from path; exits with an explanation if it can't be used."""
     try:
@@ -107,17 +120,19 @@ class ApiClient:
         self.token: str | None = None
 
     def request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
-                body=None, length: int | None = None) -> http.client.HTTPResponse:
+                body=None, length: int | None = None, extra_headers: dict | None = None) -> http.client.HTTPResponse:
         """Send a request and return the successful response; exits on errors.
 
         body may be bytes or a file; a file without length is sent chunked.
         """
         url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
         # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
-        headers = {"Host": f"127.0.0.1:{self.port}"}
+        headers = {"Host": f"127.0.0.1:{self.port}", **(extra_headers or {})}
         if (method, path) != ("GET", "/api/status"):
             if self.token is None:
-                self.token = read_token(self.token_file)
+                token = read_token(self.token_file)
+                self.verify_daemon(token)
+                self.token = token
             headers["X-Rnfs-Api"] = self.token
         if json_body is not None:
             body = json.dumps(json_body).encode()
@@ -144,6 +159,18 @@ class ApiClient:
                 message = f"HTTP {response.status} {response.reason}"
             fail(message)
         return response
+
+    def verify_daemon(self, token: str):
+        """Exit unless whatever listens on the API port proves it knows token, before the token (or a name key)
+        is sent to it: while the daemon is down, any local user could be listening on its port."""
+        challenge = secrets.token_hex(16)
+        response = self.request("GET", "/api/status", extra_headers={CHALLENGE_HEADER: challenge})
+        read_all(response)
+        proof = (response.getheader(PROOF_HEADER) or "").strip().encode("ascii", "replace")
+        if not hmac.compare_digest(proof, api_proof(token, self.port, challenge).encode()):
+            fail(f"what listens on API port {self.port} couldn't prove it knows the API token in {self.token_file}, "
+                 f"so nothing was sent to it: it may be another program, or a daemon using another --dir "
+                 f"(or one started before an upgrade: restart it)")
 
     def call(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
              body=None, length: int | None = None):
@@ -203,9 +230,20 @@ def client(args) -> ApiClient:
     if port is None:
         try:
             port = Config.load(args.dir).api_port
-        except (ValueError, OSError) as e:
+        except (ValueError, TypeError, OSError) as e:  # TypeError: a badly typed setting validate() missed
             fail(f"can't read the settings in {args.dir}: {e}")
     return ApiClient(port if port is not None else DEFAULT_API_PORT, token_path(args.dir))
+
+
+def port_number(text: str, minimum: int = 1) -> int:
+    """A TCP port from the command line (argparse type): 1-65535, or from minimum (0: the OS picks one)."""
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid port {text!r}") from None
+    if not minimum <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"invalid port {text!r}: must be {minimum}-65535")
+    return port
 
 
 def absolute(path: str) -> str:
@@ -232,6 +270,7 @@ def run_daemon(args):
     import RNS
 
     from rnfs.api import ApiServer
+    from rnfs.errors import RnfsError
     from rnfs.gateway import GatewayServer
     from rnfs.node import RnfsNode
 
@@ -242,10 +281,16 @@ def run_daemon(args):
                              dht_mode=args.dht_mode, slow=args.slow, private=args.private,
                              provide_strategy=args.provide_strategy,
                              gateway_scripts=False if args.no_gateway_scripts else None)
-    except (ValueError, OSError) as e:
+    except (ValueError, TypeError, OSError) as e:
         fail(f"invalid settings: {e}")
 
-    node = RnfsNode(config)
+    try:
+        node = RnfsNode(config)
+    except (RnfsError, OSError) as e:  # e.g. an rnfs dir that isn't private, or an unreadable state file
+        if RNS.Reticulum.get_instance() is None:
+            fail(str(e))
+        print(f"rnfs: {printable(str(e))}", file=sys.stderr, flush=True)
+        RNS.exit(1)  # Reticulum has started: ends with os._exit, so its threads don't keep the process
     servers = []
 
     def abort(message: str):
@@ -259,7 +304,7 @@ def run_daemon(args):
     try:
         servers.append(ApiServer(node, config.api_port))
         servers.append(GatewayServer(node, config, config.gateway_port))
-    except OSError as e:
+    except (OSError, OverflowError) as e:  # OverflowError: a port over 65535, which validate() should have refused
         abort(f"can't listen on 127.0.0.1: {e}. Is another daemon running? (--api-port, --gateway-port)")
     api, gateway = servers
     # A new token each start, so one copied while an old daemon ran is useless now
@@ -365,7 +410,7 @@ def run_add(args):
             fail(f"no such file or directory: {args.path}")
         result = api.post("/api/add", path=path, wrap=args.wrap, only_hash=args.only_hash, **add_options(args))
     print_warnings(result)
-    print(result["cid"])
+    print(printable(result["cid"]))
 
 
 def default_output(target: str) -> str:
@@ -431,7 +476,7 @@ def run_ls(args):
     """List a directory: kind, size, CID and name (last, since names can contain spaces)."""
     for entry in client(args).get("/api/ls", target=args.target)["entries"]:
         name = printable(entry["name"]) + ("/" if entry["kind"] == "directory" else "")
-        print(f"{entry['kind']:<10} {entry['size']:>12} {entry['cid']} {name}")
+        print(f"{printable(entry['kind']):<10} {printable(entry['size']):>12} {printable(entry['cid'])} {name}")
 
 
 def print_fields(result: dict):
@@ -449,13 +494,13 @@ def run_stat(args):
 
 def run_dir_set(args):
     """Make a directory with an entry added or replaced; print its CID."""
-    print(client(args).post("/api/dir/set", target=args.target, name=args.name, cid=args.cid,
-                            executable=args.exec)["cid"])
+    print(printable(client(args).post("/api/dir/set", target=args.target, name=args.name, cid=args.cid,
+                                      executable=args.exec)["cid"]))
 
 
 def run_dir_rm(args):
     """Make a directory with an entry removed; print its CID."""
-    print(client(args).post("/api/dir/rm", target=args.target)["cid"])
+    print(printable(client(args).post("/api/dir/rm", target=args.target)["cid"]))
 
 
 # Pins
@@ -467,7 +512,7 @@ def run_pin_add(args):
     result = jobs.run_transfer(args, {"kind": "pin", "target": args.target},
                                lambda api: api.post("/api/pin/add", target=args.target))
     if result is not None:
-        print(result["cid"])
+        print(printable(result["cid"]))
 
 
 def run_pin_rm(args):
@@ -492,7 +537,7 @@ def run_pin_ls(args):
     for pin in pins:
         state = "" if pin["complete"] else " (incomplete)"
         name = f"  {display_name(pin['name'])}" if pin.get("name") else ""
-        print(f"{pin['cid']} {','.join(printable(s) for s in pin['sources'])}{state}{name}")
+        print(f"{printable(pin['cid'])} {','.join(printable(s) for s in pin['sources'])}{state}{name}")
 
 
 def run_pin_remote(args):
@@ -508,15 +553,15 @@ def run_pin_remote(args):
 def run_gc(args):
     """Evict every cached fetch."""
     result = client(args).post("/api/gc")
-    print(f"removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes")
+    print(printable(f"removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes"))
 
 
 def run_verify(args):
     """Re-check every stored block; exits with status 1 if any were bad (they are deleted)."""
     result = client(args).post("/api/verify")
-    print(f"checked {result['checked']} blocks")
+    print(printable(f"checked {result['checked']} blocks"))
     for cid in result["bad"]:
-        print(f"bad block deleted: {cid}")
+        print(f"bad block deleted: {printable(cid)}")
     if result["bad"]:
         sys.exit(1)
 
@@ -529,7 +574,7 @@ def run_providers(args):
     providers = client(args).get("/api/providers", cid=args.cid)["providers"]
     if not providers:
         fail("no providers found")
-    print("\n".join(providers))
+    print("\n".join(printable(node_id) for node_id in providers))
 
 
 def run_ping(args):
@@ -547,7 +592,7 @@ def run_ping(args):
 
 def run_name_create(args):
     """Create a name key; print the name."""
-    print(client(args).post("/api/name/create", alias=args.alias)["name"])
+    print(printable(client(args).post("/api/name/create", alias=args.alias)["name"]))
 
 
 def run_name_rm(args):
@@ -586,24 +631,25 @@ def run_name_import(args):
         except OSError as e:
             fail(f"can't read {args.file}: {e}")
     result = client(args).call("POST", "/api/name/import", params={"alias": args.alias}, body=key)
-    print(result["name"])
+    print(printable(result["name"]))
 
 
 def run_name_list(args):
     """List this node's names: alias, name, CID and sequence."""
     for entry in client(args).get("/api/name/list")["names"]:
-        print(f"{printable(entry['alias'])}\t{entry['name']}\t{entry.get('cid') or '-'}\t{entry.get('sequence', 0)}")
+        print("\t".join(printable(value) for value in (entry["alias"], entry["name"], entry.get("cid") or "-",
+                                                          entry.get("sequence", 0))))
 
 
 def run_name_publish(args):
     """Point a name at a target."""
     result = client(args).post("/api/name/publish", alias=args.alias, target=args.target)
-    print(f"published {result['cid']} as {result['name']} (sequence {result['sequence']})")
+    print(printable(f"published {result['cid']} as {result['name']} (sequence {result['sequence']})"))
 
 
 def run_name_resolve(args):
     """Print the CID a name points at."""
-    print(client(args).get("/api/name/resolve", name=args.name)["cid"])
+    print(printable(client(args).get("/api/name/resolve", name=args.name)["cid"]))
 
 
 # Archives and status
@@ -626,7 +672,7 @@ def run_import(args):
         fail(f"no such file: {args.file}")
     result = client(args).post("/api/import", path=path)
     for root in result["roots"]:
-        print(root)
+        print(printable(root))
     for root in result.get("incomplete") or []:
         warn(f"{root} is incomplete in the archive, so it wasn't pinned")
 
@@ -643,12 +689,13 @@ def build_parser() -> argparse.ArgumentParser:
     """The argument parser for every command."""
     parser = argparse.ArgumentParser(prog="rnfs", description="Content-addressed file sharing over Reticulum")
     parser.add_argument("--version", action="version", version=f"rnfs {__version__}")
-    parser.add_argument("--api-port", type=int, default=None, help=f"daemon's API port (default {DEFAULT_API_PORT})")
+    parser.add_argument("--api-port", type=port_number, default=None,
+                        help=f"daemon's API port (default {DEFAULT_API_PORT})")
     parser.add_argument("--dir", default=DEFAULT_DIR, help="rnfs directory (settings, identity, storage)")
     # Repeated on every subcommand so they can also go after the command name. SUPPRESS keeps a
     # subcommand's unset default from overwriting a value given before the command
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--api-port", type=int, default=argparse.SUPPRESS, help="daemon's API port")
+    common.add_argument("--api-port", type=port_number, default=argparse.SUPPRESS, help="daemon's API port")
     common.add_argument("--dir", default=argparse.SUPPRESS, help="rnfs directory")
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
 
@@ -661,7 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon = command(commands, "daemon", run_daemon, "run a node, its API and its gateway")
     daemon.add_argument("--bootstrap", nargs="+", action="extend", metavar="NODE_ID",
                         help="node IDs (hex) to join the DHT through")
-    daemon.add_argument("--gateway-port", type=int, help="gateway port (default 8789)")
+    daemon.add_argument("--gateway-port", type=lambda text: port_number(text, minimum=0),
+                        help="gateway port (default 8789; 0: any free port)")
     daemon.add_argument("--rnsconfig", metavar="DIR",
                         help="Reticulum config directory (default: RNS's own, the one rnsd uses)")
     daemon.add_argument("--dht-mode", choices=["server", "client"])

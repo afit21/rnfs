@@ -20,6 +20,8 @@ Behaviour:
 - Access-Control-Allow-Origin: * on GET (and HEAD, which mirrors GET) only when the Referer's origin is
   this gateway (http://127.0.0.1:<port> or http://localhost:<port>), so sandboxed pages, whose origin is
   opaque, can fetch() their own DAG. Never in private mode. Vary: Referer keeps browser caches honest.
+- Errors other than 500 say what went wrong; a 500 says only that, and its detail (which may name local
+  paths) goes to the log, since a gateway page may be allowed to read the response (the CORS rule above).
 - Requests that aren't the user's own navigation (Sec-Fetch-Site present and not "none") may hold at most
   gateway_fetches network fetches or name resolutions at a time; over that, 503 with Retry-After.
   Content already stored (node.is_local) is served without limit. A request with no Sec-Fetch-Site is
@@ -35,6 +37,7 @@ Behaviour:
 import codecs
 import html
 import mimetypes
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -56,6 +59,7 @@ SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing s
 NAME_CACHE_TIME = 60.0
 NAME_CACHE_SIZE = 1000
 INDEX = "index.html"
+RANGE_NUMBER = re.compile(r"[0-9]{1,18}")  # ASCII digits only (str.isdigit() takes "¹²³"), and below 2**63
 
 # Types some platforms' mimetypes tables lack or get wrong (on Windows, mimetypes also reads the registry,
 # which installed software edits), so the commonest web types are fixed here too
@@ -129,7 +133,8 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None | str:
     if "," in spec or "-" not in spec:
         return None
     first, last = (part.strip() for part in spec.split("-", 1))
-    if not (first.isdigit() or first == "") or not (last.isdigit() or last == "") or first == last == "":
+    if not (RANGE_NUMBER.fullmatch(first) or first == "") or not (RANGE_NUMBER.fullmatch(last) or last == "") \
+            or first == last == "":
         return None
     if first == "":  # suffix: the last N bytes
         suffix = int(last)
@@ -369,7 +374,10 @@ class GatewayHandler(TimedHandler):
             status = error_status(e)
             if status == 500:
                 log(f"gateway {self.command} {loggable(self.path)} failed: {e!r}", LOG_ERROR)
-            self.respond_error(status, str(e) or type(e).__name__, {"Retry-After": RETRY_AFTER} if status == 503 else {})
+                message = "internal error; see the rnfs daemon's log"  # str(e) may name local paths
+            else:
+                message = str(e) or type(e).__name__
+            self.respond_error(status, message, {"Retry-After": RETRY_AFTER} if status == 503 else {})
         finally:
             if self.slot:
                 self.limiter.release()

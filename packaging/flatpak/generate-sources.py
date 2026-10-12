@@ -9,7 +9,8 @@ Writes, next to this script:
 
 The requirements come from pyproject.toml (project.dependencies, plus the optional dependencies except
 development extras) at the exact versions in packaging/requirements.lock, and every wheel's sha256 must be
-one the lock lists, so the output only changes when the lock (or BUILD_REQUIREMENTS) does. The release
+one the lock lists, so the output only changes when the lock (or packaging/build-backend.lock, for
+build-sources.json) does. The release
 workflow re-runs this and fails if the result differs from what's committed. Needs pip >= 23 (for
 `--dry-run --report`) and network access.
 """
@@ -27,8 +28,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 RUNTIME_PYTHONS = ["3.12", "3.13", "3.14"]
 ARCHES = {"x86_64": "x86_64", "aarch64": "aarch64"}  # flatpak arch: manylinux machine name
 LOCK = os.path.join(REPO, "packaging", "requirements.lock")
-# Exact, so the output is reproducible; bump by hand (its hash is checked by flatpak-builder)
-BUILD_REQUIREMENTS = ["setuptools==84.0.0"]
+# The build backend: the setuptools every other build uses (its hash is checked here and by flatpak-builder)
+BACKEND_LOCK = os.path.join(REPO, "packaging", "build-backend.lock")
 DEVELOPMENT_EXTRAS = {"dev", "test", "tests", "docs", "lint"}  # extras not bundled
 
 
@@ -43,9 +44,9 @@ def requirements() -> list[str]:
     return reqs
 
 
-def read_lock() -> dict[str, tuple[str, set[str]]]:
-    """{name: (version, {sha256, ...})} from requirements.lock."""
-    with open(LOCK, encoding="utf-8") as f:
+def read_lock(path: str = LOCK) -> dict[str, tuple[str, set[str]]]:
+    """{name: (version, {sha256, ...})} from requirements.lock (or another hash lock)."""
+    with open(path, encoding="utf-8") as f:
         text = f.read().replace("\\\n", " ")
     lock = {}
     for line in text.splitlines():
@@ -55,19 +56,19 @@ def read_lock() -> dict[str, tuple[str, set[str]]]:
         name, _, version = words[0].partition("==")
         hashes = {w.split(":", 1)[1] for w in words[1:] if w.startswith("--hash=sha256:")}
         if not version or not hashes:
-            raise SystemExit(f"generate-sources.py: {LOCK}: not a pinned, hashed requirement: {words[0]}")
+            raise SystemExit(f"generate-sources.py: {path}: not a pinned, hashed requirement: {words[0]}")
         lock[name.lower()] = (version, hashes)
     return lock
 
 
 def check_locked(wheels: list[dict], lock: dict[str, tuple[str, set[str]]]) -> None:
-    """Exit unless every wheel is a version and file requirements.lock pins."""
+    """Exit unless every wheel is a version and file the lock (requirements.lock, ...) pins."""
     for wheel in wheels:
         name = wheel["name"].lower()
         if name not in lock:
-            raise SystemExit(f"generate-sources.py: {name} isn't in {LOCK}; run packaging/update-lock.py")
+            raise SystemExit(f"generate-sources.py: {name} isn't in the lock; run packaging/update-lock.py")
         if wheel["sha256"] not in lock[name][1]:
-            raise SystemExit(f"generate-sources.py: {wheel['url']} isn't a file {LOCK} pins for {name}")
+            raise SystemExit(f"generate-sources.py: {wheel['url']} isn't a file the lock pins for {name}")
 
 
 def resolve(reqs: list[str], machine: str | None, python: str, pins: list[str] = ()) -> list[dict]:
@@ -121,8 +122,11 @@ def main() -> None:
         ],
         "sources": sorted(sources.values(), key=lambda s: s["url"].rsplit("/", 1)[-1]),
     }
-    build_sources = [{"type": "file", "url": w["url"], "sha256": w["sha256"]}
-                     for w in resolve(BUILD_REQUIREMENTS, None, RUNTIME_PYTHONS[0])]
+    backend = read_lock(BACKEND_LOCK)
+    build_wheels = resolve([f"{name}=={version}" for name, (version, _) in sorted(backend.items())], None,
+                           RUNTIME_PYTHONS[0])
+    check_locked(build_wheels, backend)
+    build_sources = [{"type": "file", "url": w["url"], "sha256": w["sha256"]} for w in build_wheels]
     for name, data in (("python3-deps.json", module), ("build-sources.json", build_sources)):
         with open(os.path.join(HERE, name), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)

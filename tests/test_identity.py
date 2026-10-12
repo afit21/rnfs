@@ -70,6 +70,29 @@ class IdentityFileTest(unittest.TestCase):
         chmod.assert_not_called()
         log.assert_not_called()
 
+    def test_identity_created_meanwhile_is_kept(self):
+        # Another process starting on the same directory saves its identity between our check and our save
+        os.makedirs(self.directory)
+        theirs = RNS.Identity()
+        identity_module.save_identity(theirs, self.path)
+        real_isfile = os.path.isfile
+        calls = []
+
+        def isfile(path):
+            """Not there yet at the first check, as when the other process saves just after it."""
+            calls.append(path)
+            return False if len(calls) == 1 else real_isfile(path)
+        with mock.patch("os.path.isfile", isfile):
+            loaded = load_or_create_identity(self.path)
+        self.assertEqual(loaded.hash, theirs.hash)
+        self.assertEqual(RNS.Identity.from_file(self.path).hash, theirs.hash)
+        self.assertEqual(os.listdir(self.directory), ["identity"])  # our temporary file is gone
+
+    def test_new_identity_is_durable(self):
+        with mock.patch.object(fsutil, "sync_directory") as sync:
+            load_or_create_identity(self.path)
+        sync.assert_called_once_with(os.path.abspath(self.directory))
+
     def test_unreadable_identity_not_overwritten(self):
         os.makedirs(self.directory)
         with open(self.path, "wb") as f:

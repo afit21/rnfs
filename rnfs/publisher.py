@@ -8,11 +8,13 @@
   withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed
   store isn't retried until the next republish. The node also records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
-  from the nodes it was last published to, at once.
+  from the nodes it was last published to, at once, and from nodes of earlier rounds (or of a round cut
+  short) whose record may not have expired yet: the closest set changes as nodes come and go.
 
 Last-published nodes and times are persisted in <state dir>/published.json, so a restart doesn't
 republish what isn't due. A CID whose lookup found no node at all (nothing was sent) is retried after
-RETRY_INTERVAL rather than a whole republish interval.
+RETRY_INTERVAL rather than a whole republish interval; one whose round was stopped before every node was
+sent its keys stays due. Times are wall clock: any in the future (the clock was corrected) count as now.
 
 - **Feature keys** (DhtKey, e.g. kept names) are republished at max(republish interval, KEY_MIN_INTERVAL),
   each with its own fixed jitter of up to +-KEY_JITTER, so they don't all come due in one burst; always
@@ -23,6 +25,7 @@ RETRY_INTERVAL rather than a whole republish interval.
   withdrawals of keys that are still provided).
 """
 import hashlib
+import math
 import os
 import threading
 import time
@@ -31,11 +34,12 @@ from typing import Callable
 from rnfs.config import Config
 from rnfs.constants import DAY, HOUR, PROVIDER_TTL
 from rnfs.content.cid import Cid
-from rnfs.content.storage import Storage, read_json, write_json
+from rnfs.content.storage import Storage, read_json, shaped, write_json
 from rnfs.errors import InvalidDag, NotFound
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, node_name, plural
 
 STATE_FILE = "published.json"
+SECTIONS = ("published", "earlier", "withdraw")  # the state file's objects
 RETRY_INTERVAL = 30.0  # seconds before retrying a CID whose lookup found no nodes to publish to
 MAX_WAIT = 60.0  # the loop wakes at least this often
 KEY_PREFIX = "key:"  # how a DhtKey is written in the state file
@@ -125,6 +129,9 @@ class Publisher:
         self._provided: frozenset[Cid] = frozenset()
         self._served: frozenset[Cid] = frozenset()
         self._published: dict[Cid, tuple[float, list[bytes]]] = {}  # CID -> (when, nodes that recorded it)
+        # Other nodes that may still hold our record of a CID (earlier rounds' closest nodes, or a round cut
+        # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
+        self._earlier: dict[Cid, dict[bytes, float]] = {}
         self._withdrawals: dict[bytes, set[bytes]] = {}  # node -> keys to withdraw from it
         self._retry_at: dict[Cid, float] = {}  # CIDs whose last lookup found no nodes
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
@@ -151,18 +158,43 @@ class Publisher:
     # Persistence
 
     def _load(self):
-        """Load last-published times and nodes, and pending withdrawals."""
+        """Load last-published times and nodes, and pending withdrawals. A file of the wrong shape is set aside
+        as damaged; entries of the wrong shape are skipped."""
         if self._state_path is None:
             return
-        value = read_json(self._state_path) or {}
-        for text, record in (value.get("published") or {}).items():
+        value = read_json(self._state_path, shape=lambda v: all(shaped(key, dict)(v) for key in SECTIONS)) or {}
+        now = self.clock()
+
+        def entries(key: str) -> list:
+            """The items of value[key]."""
+            return list(value.get(key, {}).items())
+
+        def when(number) -> float:
+            """A persisted time, clamped to now; ValueError if it isn't a finite number."""
+            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+                raise ValueError(f"not a time: {number!r}")
+            return min(float(number), now)
+
+        for text, record in entries("published"):
             try:
-                when, nodes = record
-                self._published[_parse_item(text)] = (float(when), [bytes.fromhex(n) for n in nodes])
-            except (ValueError, TypeError):
+                published, nodes = record
+                if not isinstance(nodes, list):
+                    raise TypeError("nodes must be a list")
+                self._published[_parse_item(text)] = (when(published), [bytes.fromhex(n) for n in nodes])
+            except (ValueError, TypeError, OverflowError):
                 continue
-        for node_hex, keys in (value.get("withdraw") or {}).items():
+        for text, nodes in entries("earlier"):
             try:
+                if not isinstance(nodes, dict):
+                    raise TypeError("nodes must be an object")
+                earlier = {bytes.fromhex(n): when(stored) for n, stored in nodes.items()}
+                self._earlier[_parse_item(text)] = {n: t for n, t in earlier.items() if now - t < PROVIDER_TTL}
+            except (ValueError, TypeError, OverflowError):
+                continue
+        for node_hex, keys in entries("withdraw"):
+            try:
+                if not isinstance(keys, list):
+                    raise TypeError("keys must be a list")
                 self._withdrawals[bytes.fromhex(node_hex)] = {bytes.fromhex(k) for k in keys}
             except (ValueError, TypeError):
                 continue
@@ -174,6 +206,8 @@ class Publisher:
         with self._lock:
             value = {"published": {str(cid): [when, [n.hex() for n in nodes]]
                                    for cid, (when, nodes) in self._published.items()},
+                     "earlier": {str(cid): {n.hex(): when for n, when in nodes.items()}
+                                 for cid, nodes in self._earlier.items() if nodes},
                      "withdraw": {node.hex(): sorted(k.hex() for k in keys)
                                   for node, keys in self._withdrawals.items() if keys}}
             write_json(self._state_path, value)
@@ -226,7 +260,7 @@ class Publisher:
                 self._retry_at.pop(cid, None)
                 self.providers.withdraw(cid.key, self.own_id)
                 record = self._published.pop(cid, None)
-                for node_id in (record[1] if record else []):
+                for node_id in set(record[1] if record else []) | set(self._earlier.pop(cid, {})):
                     self._withdrawals.setdefault(node_id, set()).add(cid.key)
             if removed:
                 log(f"no longer providing {plural(len(removed), 'CID')}", LOG_VERBOSE)
@@ -249,10 +283,21 @@ class Publisher:
         record = self._published.get(cid)
         return record is None or now - record[0] >= self.interval_for(cid)
 
+    def _clamp(self, now: float):
+        """Bring times after now back to now (the wall clock was corrected backwards), so republishing and
+        pacing don't stall until the clock catches up. Caller holds the lock."""
+        for cid, (when, nodes) in list(self._published.items()):
+            if when > now:
+                self._published[cid] = (now, nodes)
+        for cid, retry in list(self._retry_at.items()):
+            self._retry_at[cid] = min(retry, now + self.retry_interval)
+        self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
+
     def next_due(self) -> float:
         """Seconds until something is due (0 if now); withdrawals pending count as due."""
         now = self.clock()
         with self._lock:
+            self._clamp(now)
             if any(self._withdrawals.values()):
                 return 0.0
             waits = []
@@ -277,10 +322,10 @@ class Publisher:
         """
         now = self.clock()
         with self._lock:
+            self._clamp(now)
             # Never published first, then the longest unpublished: what pacing defers is the least urgent
             due = sorted((cid for cid in self._provided if self._is_due(cid, now)),
                          key=lambda item: (self._published.get(item, (float("-inf"),))[0], item.key))
-            withdrawals = {node: set(keys) for node, keys in self._withdrawals.items() if keys}
             if self.slow_node:
                 due = due[:SLOW_ROUND_LOOKUPS] if now >= self._next_lookup else []
 
@@ -290,9 +335,15 @@ class Publisher:
                 break
             self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
             closest[cid] = [n for n in self.make_lookup(cid.key).find_closest() if n != self.own_id]
-        if self.slow_node and closest:
-            with self._lock:
+        with self._lock:
+            if self.slow_node and closest:
                 self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * len(closest)
+            # Taken after the lookups, which can be long, so withdrawals queued meanwhile go in this round
+            withdrawals = {node: set(keys) for node, keys in self._withdrawals.items() if keys}
+            for cid in [cid for cid in closest if cid not in self._provided]:
+                # Stopped being provided during its lookup: refresh() has withdrawn it, so don't store it
+                del closest[cid]
+                self.providers.withdraw(cid.key, self.own_id)
 
         by_node: dict[bytes, list[Cid]] = {}
         for cid, nodes in closest.items():
@@ -312,15 +363,18 @@ class Publisher:
                 break
             cids = by_node.get(node_id, [])
             withdrawn = withdrawals.get(node_id, set())
-            # Not retried until the next republish whatever the outcome, so it counts as sent either way
-            ok = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
+            # Not retried until the next republish whatever the outcome, so it counts as sent either way.
+            # The node may hold records of the keys it got before any refusal: those are withdrawn later
+            recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
             sent_withdrawals[node_id] = withdrawn
-            if ok:
-                for cid in cids:
+            for cid in cids:
+                if cid.key in recorded:
                     accepted[cid].append(node_id)
-            else:
-                log(f"{node_name(node_id)} didn't record {plural(len(cids), 'key')}", LOG_VERBOSE)
+            missed = sum(1 for cid in cids if cid.key not in recorded)
+            if missed:
+                log(f"{node_name(node_id)} didn't record {plural(missed, 'key')}", LOG_VERBOSE)
 
+        unfinished: list[Cid] = []
         with self._lock:
             for node_id, keys in sent_withdrawals.items():
                 remaining = self._withdrawals.get(node_id, set()) - keys - superseded.get(node_id, set())
@@ -338,14 +392,30 @@ class Publisher:
                     self._retry_at[cid] = self.clock() + self.retry_interval
                     continue
                 self._retry_at.pop(cid, None)
-                self._published[cid] = (now, accepted[cid])
+                # Nodes this round didn't store it on may still hold an earlier record: withdrawn from too
+                earlier = {n: t for n, t in self._earlier.pop(cid, {}).items() if now - t < PROVIDER_TTL}
+                previous = self._published.pop(cid, None)
+                for node_id in (previous[1] if previous else []):
+                    earlier[node_id] = max(previous[0], earlier.get(node_id, previous[0]))
+                if all(node_id in sent_withdrawals for node_id in nodes):
+                    self._published[cid] = (now, accepted[cid])
+                    for node_id in accepted[cid]:
+                        earlier.pop(node_id, None)
+                else:
+                    # Stopped before every node was sent its keys: left due (unpublished), keeping where it went
+                    earlier.update((node_id, now) for node_id in accepted[cid])
+                    unfinished.append(cid)
+                if earlier:
+                    self._earlier[cid] = earlier
+        published = [cid for cid in closest if cid not in unfinished]
         if closest or sent_withdrawals:
             self.save()
             stored = sum(len(nodes) for nodes in accepted.values())
-            log(f"published {plural(len(closest), 'CID')} ({stored} records on "
-                f"{plural(len(by_node), 'node')}), withdrew {sum(len(k) for k in sent_withdrawals.values())}",
+            log(f"published {plural(len(published), 'CID')} ({stored} records on "
+                f"{plural(len(by_node), 'node')}), withdrew {sum(len(k) for k in sent_withdrawals.values())}"
+                + (f"; stopped before sending {plural(len(unfinished), 'CID')} to every node" if unfinished else ""),
                 LOG_VERBOSE)
-        return {"published": list(closest), "nodes": sorted(set(by_node) | set(sent_withdrawals)),
+        return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values())}
 
     def run(self, stop_event: threading.Event, ready: threading.Event | None = None):

@@ -55,6 +55,7 @@ ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the 
 EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else triggers one
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
 STOP_TIMEOUT = 5.0
+REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetched; more are refused
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
 
@@ -62,19 +63,25 @@ def _make_private_dirs(config: Config):
     """Create the rnfs dir and the node's subdirectories readable by the owner only (0700).
 
     They hold the node's identity, name keys and the local API token, so other local users must not read
-    them; a root left group- or world-accessible by earlier versions is tightened.
+    them; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if the
+    root belongs to another user or can't be made private: its owner could swap the identity or plant a
+    config there.
     """
     root = config.root
     os.makedirs(root, mode=0o700, exist_ok=True)
     # Windows has no Unix permission bits (st_mode always shows others allowed), so only the ACL that the
     # rnfs dir inherits from the user's profile protects it there
-    mode = stat.S_IMODE(os.stat(root).st_mode)
-    if mode & 0o077 and not fsutil.IS_WINDOWS:
-        try:
-            os.chmod(root, 0o700)
+    if not fsutil.IS_WINDOWS:
+        info = os.stat(root)
+        if info.st_uid != os.geteuid():
+            raise RnfsError(f"{root} belongs to another user (uid {info.st_uid}); the rnfs dir must be your own")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o077:
+            try:
+                os.chmod(root, 0o700)
+            except OSError as e:
+                raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
             log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
-        except OSError as e:
-            log(f"couldn't make {root} private to its owner (mode {mode:o}): {e}", LOG_WARNING)
     for directory in (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir):
         os.makedirs(directory, mode=0o700, exist_ok=True)
 
@@ -258,7 +265,8 @@ class RnfsNode:
         _make_private_dirs(config)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
-        self.records = ProviderStore(config.max_records, os.path.join(config.state_dir, PROVIDERS_FILE))
+        self.records = ProviderStore(config.max_records, os.path.join(config.state_dir, PROVIDERS_FILE),
+                                     own_id=node_id)
         self.storage = Storage(config.blocks_dir, config.state_dir, config.max_storage)
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
@@ -272,13 +280,15 @@ class RnfsNode:
         self._lock = threading.Lock()
         self._fetched_path = os.path.join(config.state_dir, FETCHED_FILE)
         self._fetched: set[Cid] = set()
-        for text in read_json(self._fetched_path) or []:
+        for text in read_json(self._fetched_path, shape=lambda value: isinstance(value, list)) or []:
             try:
                 self._fetched.add(Cid.parse(text))
             except (ValueError, TypeError):
                 continue
-        self._remote_reserved: dict[str, dict[Cid, int]] = {}  # remote source -> CIDs being fetched -> size
+        # Remote source -> CIDs waiting or being fetched for it, in the order accepted (fetched one at a time)
+        self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
+        self._remote_workers: set[str] = set()  # remote sources with a thread fetching their pins
         self._refresh_wanted = threading.Event()
         self.stop_event = threading.Event()
         self.joined = threading.Event()
@@ -287,6 +297,8 @@ class RnfsNode:
         self.features: dict[str, features.Feature] = {}
         for cls in features.feature_classes():
             self.features[cls.name] = cls(self)
+        # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too
+        self.names.release_gone()
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
         self.publisher.refresh()
@@ -490,8 +502,9 @@ class RnfsNode:
 
     def _prune_fetched(self):
         """Forget fetched targets that are no longer cached."""
-        cached = self.storage.cached_targets()
         with self._lock:
+            # Read under the lock: a fetch recorded after an earlier snapshot would be forgotten (_note_fetched)
+            cached = self.storage.cached_targets()
             if self._fetched <= cached:
                 return
             self._fetched &= cached
@@ -808,7 +821,11 @@ class RnfsNode:
         return self.client.pin(node_id, Cid.parse(cid), pin)
 
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
-        """A /pin from an allowed identity: release at once, or fetch then pin with source remote:<identity>."""
+        """A /pin from an allowed identity: release at once, or fetch then pin with source remote:<identity>.
+
+        A source's pins are fetched one at a time, so each is checked against its quota with the earlier ones
+        counted; one with REMOTE_PIN_QUEUE pins waiting is refused (False).
+        """
         source = remote_source(identity_hash)
         if not pin:
             with self._lock:
@@ -827,27 +844,51 @@ class RnfsNode:
                 return True
             if source in self.storage.pins().get(cid, set()):
                 return True
-            reserved[cid] = 0
-        threading.Thread(target=self._remote_pin_fetch, args=(cid, source), name="rnfs-remote-pin",
+            if len(reserved) >= REMOTE_PIN_QUEUE:
+                log(f"refused remote pin of {cid} for {source}: {len(reserved)} of its pins are waiting", LOG_WARNING)
+                return False
+            reserved[cid] = None
+            if source in self._remote_workers:
+                return True
+            self._remote_workers.add(source)
+        threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
                          daemon=True).start()
         return True
+
+    def _remote_pin_worker(self, source: str):
+        """Fetch source's remote pins one at a time, oldest first, until none is waiting.
+
+        Concurrent fetches would each be checked against the quota without the others' blocks, so together
+        they could store several times it.
+        """
+        try:
+            while not self.stop_event.is_set():
+                with self._lock:
+                    cid = next(iter(self._remote_reserved.get(source, {})), None)
+                    if cid is None:
+                        return
+                self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
+        finally:
+            with self._lock:
+                self._remote_workers.discard(source)
 
     def _remote_pin_fetch(self, cid: Cid, source: str):
         """Fetch cid for a remote pin, dropping it as soon as its verified size, or the bytes of its DAG's
         blocks met so far, would exceed the quota."""
         quota = self.config.remote_pin_quota
         try:
+            with self._lock:
+                if (source, cid) in self._remote_released:
+                    return  # released while it waited
             with self.fetcher.open(cid, pinned=True) as fetch:
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)
-                with self._lock:
-                    others = sum(n for c, n in self._remote_reserved.get(source, {}).items() if c != cid)
-                    used = self.storage.source_usage(source) + others
-                    if used + content > quota:
-                        log(f"dropping remote pin of {cid} for {source}: {size(content)} would exceed its "
-                            f"quota ({size(used)} of {size(quota)} used)", LOG_WARNING)
-                        return
-                    self._remote_reserved[source][cid] = content
+                # Nothing else is being fetched for source (_remote_pin_worker), so its pins are all it uses
+                used = self.storage.source_usage(source)
+                if used + content > quota:
+                    log(f"dropping remote pin of {cid} for {source}: {size(content)} would exceed its "
+                        f"quota ({size(used)} of {size(quota)} used)", LOG_WARNING)
+                    return
                 # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks
                 fetch.max_dag_bytes = quota - used
                 try:

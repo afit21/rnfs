@@ -1,7 +1,8 @@
 name: release
 
-# Tag vX.Y.Z (matching rnfs.__version__) to build every package and publish a GitHub Release with them and
-# SHA256SUMS. Run it by hand (workflow_dispatch) to build the same artifacts without releasing.
+# Push a tag vX.Y.Z (matching rnfs.__version__) to build every package and publish a GitHub Release with them,
+# SHA256SUMS and signed build provenance. Run it by hand (workflow_dispatch, on any branch or tag) to build the
+# same artifacts without releasing.
 on:
   push:
     tags: ["v*"]
@@ -12,6 +13,8 @@ permissions:
 
 # Actions are pinned to commit SHAs and the Flatpak container to a digest (the comments say which tag);
 # update both together. Values from expressions reach run: scripts only through env:, never spliced in.
+# Build tools come from packaging/build-tools.lock and the build backend from it (or build-backend.lock) with
+# --require-hashes, and builds run without build isolation, so nothing unpinned is fetched for a build.
 jobs:
   version:
     runs-on: ubuntu-latest
@@ -19,6 +22,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
       - id: version
         name: Read rnfs.__version__ (and check it matches the tag)
         run: |
@@ -36,20 +41,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
-      - run: pip install build twine
-      - run: python -m build
+      - name: Install the build tools (packaging/build-tools.lock, hash-checked)
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock
+      - run: python -m build --no-isolation
       - run: twine check dist/*
       - name: Check the sdist leaves out the tests, but has the dependency lock (install.sh uses it)
         run: |
           ! tar tzf dist/rnfs-*.tar.gz | grep -q '/tests/'
           tar tzf dist/rnfs-*.tar.gz | grep -q '/packaging/requirements.lock$'
-      - name: Smoke test the wheel
+      - name: Smoke test the wheel (with the locked dependencies)
         run: |
           python -m venv /tmp/wheel-venv
-          /tmp/wheel-venv/bin/pip install dist/rnfs-*.whl
+          /tmp/wheel-venv/bin/python -m pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock
+          /tmp/wheel-venv/bin/python -m pip install --no-deps dist/rnfs-*.whl
+          /tmp/wheel-venv/bin/python -m pip check
           python packaging/smoke_test.py /tmp/wheel-venv/bin/rnfs
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -67,6 +78,8 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
@@ -100,6 +113,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
@@ -125,6 +140,8 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: flatpak-sources
@@ -162,16 +179,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
-      # The dependencies are the exact versions and files in packaging/requirements.lock (hash-checked)
+      # The dependencies are the exact versions and files in packaging/requirements.lock, and PyInstaller and
+      # setuptools those in packaging/build-tools.lock (both hash-checked)
       - name: Install rnfs, its locked dependencies and PyInstaller
         shell: bash  # stops at the first failing command (pwsh would only check the last one)
         run: |
-          python -m pip install --require-hashes -r packaging/requirements.lock
-          python -m pip install --no-deps .
-          python -m pip install pyinstaller==6.22.3
+          python -m pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock
+          python -m pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock
+          python -m pip install --no-deps --no-build-isolation .
+          python -m pip check
       - name: Build the one-file exe
         run: pyinstaller --clean --noconfirm packaging/pyinstaller/rnfs.spec
       - name: Smoke test (--version, --help, daemon + status)
@@ -189,11 +210,14 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref_type == 'tag'
+    # Only for a pushed tag: a manual run builds the artifacts without publishing, even when started on a tag
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [version, python, deb, flatpak, windows]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write      # create the release
+      id-token: write      # sign the provenance attestation (Sigstore certificate for this workflow run)
+      attestations: write  # store it with the repository
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -205,15 +229,21 @@ jobs:
         run: |
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
+      # Signed SLSA build provenance for every file, which users can check with
+      # gh attestation verify FILE --repo afit21/rnfs
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: artifacts/*
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
-        # A release already made for this tag on GitHub's release page gets the files attached (replacing any
-        # with the same names) rather than failing; otherwise the release is created here
+        # A release already made for this tag on GitHub's release page gets the files attached rather than
+        # failing; otherwise the release is created here. Files already attached are never replaced (no
+        # --clobber): users may have downloaded and checked them, so a re-run with the same names fails instead
         run: |
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$GITHUB_REF_NAME" artifacts/* \
               --repo "$GITHUB_REPOSITORY" \

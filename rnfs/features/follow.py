@@ -220,7 +220,10 @@ class FollowFeature(Feature):
                         self.node.storage.pin(target, source)
                         previous = self._pinned[name]
                         self._pinned[name] = target
-                        self._save()
+                        try:
+                            self._save()
+                        except OSError as e:  # the pins are right; follow.json catches up with the next save
+                            _log(f"saving {FOLLOW_FILE} failed: {e}", "LOG_ERROR")
         except RnfsError as e:
             self._set_state(name, f"fetch of {target} failed: {e}")
             _log(f"fetching {target} for name {name.hex()} failed: {e}", "LOG_WARNING")
@@ -253,7 +256,12 @@ class FollowFeature(Feature):
                     return max(0.0, upcoming - now)
                 name, network = min(due, key=lambda item: self._due[item[0]][0])
                 self._due[name] = (FAR_FUTURE, False)
-            ok = self.check(name, network)
+            try:
+                ok = self.check(name, network)
+            except Exception as e:  # noqa: BLE001 - e.g. disk full saving: a failed check, tried again later
+                _log(f"checking name {name.hex()} failed: {e!r}", "LOG_ERROR")
+                self._set_state(name, f"check failed: {e}")
+                ok = False
             with self._lock:
                 if name in self._pinned and self._due.get(name, (FAR_FUTURE,))[0] == FAR_FUTURE:
                     if ok:
@@ -337,7 +345,7 @@ def run_follow(args):
     """Follow a name."""
     import rnfs.cli
     entry = rnfs.cli.client(args).post("/api/name/follow", name=args.name)
-    print(f"following {entry['name']}; its target is fetched and pinned in the background")
+    print(f"following {_printable(entry['name'])}; its target is fetched and pinned in the background")
 
 
 def run_unfollow(args):
@@ -350,4 +358,5 @@ def run_following(args):
     """List followed names."""
     import rnfs.cli
     for entry in rnfs.cli.client(args).get("/api/name/following")["following"]:
-        print(f"{entry['name']} {entry['pinned'] or '-'} {entry['latest'] or '-'} {_printable(entry['state'])}")
+        print(f"{_printable(entry['name'])} {_printable(entry['pinned'] or '-')} {_printable(entry['latest'] or '-')} "
+              f"{_printable(entry['state'])}")

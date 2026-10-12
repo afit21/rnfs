@@ -1,8 +1,11 @@
 """Blocks on disk: <blocks dir>/<cid>, one file per CID (specification section 8). No RNS dependency.
 
-A block is verified against its CID before it's stored, and written to a temporary file that is then
-renamed, so a file under a CID name is never half-written. Partial files left by a crash are deleted
-when the store is opened. Not locked: Storage serialises access.
+A block is verified against its CID before it's stored, and written to a temporary file that is synced to
+disk and then renamed, so a file under a CID name is never half-written, not even after a power loss. The
+directory is synced by sync(), which Storage calls before saving state that refers to blocks: syncing it on
+every put would cost more than half of what remains of write speed, and a lost name is just a block not
+stored. Partial files left by a crash are deleted when the store is opened. Not locked: Storage serialises
+access.
 
 On Windows a file can't be deleted or replaced while a reader has it open, so a block already stored is
 never rewritten (its content can't differ), and a delete that keeps meeting an open handle is deferred.
@@ -24,6 +27,7 @@ class BlockStore:
     def __init__(self, directory: str):
         """Open (creating if needed) the store at directory and delete partial files left by a crash."""
         self.directory = os.path.expanduser(directory)
+        self._unsynced = False  # blocks were renamed into the directory since the last sync()
         os.makedirs(self.directory, exist_ok=True)
         for name in os.listdir(self.directory):
             if name.startswith(PARTIAL_PREFIX):
@@ -65,6 +69,8 @@ class BlockStore:
         try:
             with os.fdopen(fd, "wb") as out:
                 out.write(block)
+                out.flush()
+                os.fsync(out.fileno())  # else a power loss can leave the renamed file empty or short
             # Atomic, so readers never see a half-written block under a CID name
             try:
                 fsutil.replace(partial_path, path)
@@ -73,12 +79,20 @@ class BlockStore:
                 if not os.path.isfile(path):
                     raise
                 fsutil.remove(partial_path)
+                return
+            self._unsynced = True
         except BaseException:
             try:
                 fsutil.remove(partial_path)
             except OSError:
                 pass
             raise
+
+    def sync(self):
+        """Make the names of the blocks stored so far survive a power loss (sync the directory), if any are new."""
+        if self._unsynced:
+            self._unsynced = False  # first, so a put racing this is synced now or next time
+            fsutil.sync_directory(self.directory)
 
     def delete(self, cid: Cid) -> int | None:
         """Delete the block; returns the bytes freed (0 if not stored), or None if Windows kept it in use."""

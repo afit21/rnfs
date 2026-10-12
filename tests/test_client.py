@@ -98,7 +98,8 @@ class PeerClientTest(unittest.TestCase):
             self.assertIsNone(self.call(lambda: self.client.find(NODE, KEY)))
             peer = self.call(lambda: self.pool.get(NODE))
             self.assertEqual(peer.requests, 0)
-            self.assertFalse(self.call(lambda: self.client.provide(NODE, [KEY], [])))
+            # Unanswered, so it may have been recorded: the key counts as sent there, for a later withdrawal
+            self.assertEqual(self.call(lambda: self.client.provide(NODE, [KEY], [])), {KEY})
             self.assertFalse(self.call(lambda: self.client.pin(NODE, block_of(10, 1)[0], True)))
 
     def test_find_waits_for_a_slot_no_longer_than_the_deadline(self):
@@ -120,7 +121,7 @@ class PeerClientTest(unittest.TestCase):
     def test_provide_batches_over_one_identified_link(self):
         self.respond(lambda link, path, data: True)
         keys = [i.to_bytes(16, "big") for i in range(30)]
-        self.assertTrue(self.call(lambda: self.client.provide(NODE, keys, [])))
+        self.assertEqual(self.call(lambda: self.client.provide(NODE, keys, [])), set(keys))
         (link,) = fakes.FakeLink.created
         self.assertEqual(link.identities, [self.identity])
         self.assertEqual([len(data[0]) for path, data, _ in link.requests], [22, 8])
@@ -131,10 +132,22 @@ class PeerClientTest(unittest.TestCase):
     def test_provide_refused_is_retried_once_then_stops(self):
         self.respond(lambda link, path, data: False)
         keys = [i.to_bytes(16, "big") for i in range(30)]
-        self.assertFalse(self.call(lambda: self.client.provide(NODE, keys, [KEY])))
+        # The refused batch may have been recorded in part; the batch after it was never sent
+        self.assertEqual(self.call(lambda: self.client.provide(NODE, keys, [KEY])), set(keys[:21]))
         (link,) = fakes.FakeLink.created
         self.assertEqual(len(link.requests), 2)  # first batch and its one retry
         self.assertEqual(link.status, fakes.FakeLink.CLOSED)
+
+    def test_provide_reports_the_keys_sent_up_to_a_refusal(self):
+        keys = [i.to_bytes(16, "big") for i in range(50)]
+        self.respond(lambda link, path, data: keys[0] in data[0])  # only the first batch is recorded
+        self.assertEqual(self.call(lambda: self.client.provide(NODE, keys, [])), set(keys[:44]))
+        (link,) = fakes.FakeLink.created
+        self.assertEqual([len(data[0]) for path, data, _ in link.requests], [22, 22, 22])  # one retry
+
+    def test_provide_without_a_link_reports_nothing_sent(self):
+        links.RNS.Transport.await_path = lambda node_id, timeout: False
+        self.assertEqual(self.call(lambda: self.client.provide(NODE, [KEY], [])), set())
 
     def test_pin(self):
         self.respond(lambda link, path, data: path == PIN_PATH and data[1] is True)
@@ -395,7 +408,7 @@ def run_e2e_client(configdir: str, server_hex: str):
     results = {"own_id": node_id_for_identity(identity).hex()}
 
     results["find_before"] = peers.find(server_id, KEY)
-    results["provide"] = peers.provide(server_id, [KEY], [])
+    results["provide"] = peers.provide(server_id, [KEY], []) == {KEY}
     found = peers.find(server_id, KEY)
     results["find_after"] = [[node.hex() for node in ids] for ids in found] if found else None
 

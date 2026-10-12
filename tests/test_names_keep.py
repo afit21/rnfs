@@ -405,6 +405,55 @@ class KeeperNodesTest(unittest.TestCase):
         self.assertNotIn("follow", self.b.feature("keepers").store.reasons(self.name))
         self.assertEqual(follow.following(), [])
 
+    def test_follow_keeps_checking_after_an_unexpected_error(self):
+        # L24: an exception other than RnfsError is a failed check, retried later, not the end of checking
+        cid1 = self.publish(b"version one")
+        self.a.records.store(cid1.key, A_ID)
+        self.advertise(self.a, A_ID)
+        follow = self.b.feature("follow")
+        follow.follow(self.name)
+        with mock.patch.object(follow, "check", side_effect=OSError(28, "No space left on device")):
+            delay = follow.run_due()
+        self.assertGreater(delay, 0)
+        self.assertLess(follow._due[self.name][0], float("inf"))
+        self.assertIn("No space left", follow.following()[0]["state"])
+        self.assertEqual(follow._failures[self.name], 1)
+
+    def test_follow_swaps_pins_when_saving_fails(self):
+        # L24: follow.json failing to save mustn't leave both targets pinned
+        cid1 = self.publish(b"version one")
+        self.a.records.store(cid1.key, A_ID)
+        self.advertise(self.a, A_ID)
+        follow = self.b.feature("follow")
+        follow.follow(self.name)
+        self.assertTrue(follow.check(self.name))
+        cid2 = self.publish(b"version two")
+        self.a.records.store(cid2.key, A_ID)
+        self.b.names.offer(self.name, 2, cid2, 0.0)
+        with mock.patch.object(follow, "_save", side_effect=OSError(28, "No space left on device")):
+            self.assertTrue(follow.check(self.name, network=False))
+        pins = self.b.storage.pins()
+        self.assertEqual(pins.get(cid2), {follow_source(self.name)})
+        self.assertNotIn(cid1, pins)
+
+    def test_keeper_records_below_the_known_sequence_are_refused(self):
+        # L28: a keeper serving an old (validly signed) record can't make this node keep and re-serve it
+        self.publish(b"v1")
+        self.advertise(self.a, A_ID)
+        keeper = self.c.feature("keepers")
+        keeper.keep(self.name)
+        keeper.run_pending()
+        self.advertise(self.c, C_ID)
+        cid2 = self.publish(b"v2")
+        self.b.names.offer(self.name, 2, cid2, 0.0)  # heard while A was online
+        del self.net.nodes[A_ID]
+        kept = self.b.feature("keepers")
+        kept.keep(self.name)
+        kept.run_pending()  # only C answers, with sequence 1
+        self.assertIn(C_ID, self.net.name_requests)
+        self.assertIsNone(kept.store.get(self.name))
+        self.assertEqual(self.b.backend.feature_requests()[NAME_PATH](self.name, None), [])
+
     def test_follow_persists(self):
         cid1 = self.publish(b"persisted")
         self.a.records.store(cid1.key, A_ID)
