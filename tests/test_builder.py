@@ -323,18 +323,20 @@ class PathTest(unittest.TestCase):
         os.symlink("real", os.path.join(self.root, "link"))
         os.symlink(self.tmp.name, os.path.join(self.root, "dirlink"))
         os.mkfifo(os.path.join(self.root, "fifo"))
+        bad_name = True
         try:
             with open(os.path.join(os.fsencode(self.root), b"bad\xff"), "wb") as f:
                 f.write(b"x")
         except OSError:
-            pass  # macOS (APFS) refuses names that aren't UTF-8 itself, so there is nothing to skip
+            bad_name = False  # macOS (APFS) refuses names that aren't UTF-8 itself, so there is nothing to skip
         blocks = Blocks()
         built, warnings = builder.add_path(self.root, blocks.put)
         self.assertEqual([e.name for e in dag.decode(blocks[built.cid]).entries], ["real"])
-        self.assertEqual(len(warnings), 4)
+        self.assertEqual(len(warnings), 4 if bad_name else 3)
         self.assertTrue(any("symlink" in w and "link" in w for w in warnings))
         self.assertTrue(any("fifo" in w for w in warnings))
-        self.assertTrue(any("bad\\xff" in w or "bad\\udcff" in w for w in warnings))
+        if bad_name:
+            self.assertTrue(any("bad\\xff" in w or "bad\\udcff" in w for w in warnings))
 
     def test_single_file_and_wrap(self):
         path = self.write("f.bin", b"content", mode=0o700)
