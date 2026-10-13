@@ -52,7 +52,7 @@ Different package options available at [latest release](https://github.com/afit2
 
 **Windows:**
 
-[`rnfs-0.1.2-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.1.3-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
@@ -65,7 +65,7 @@ Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-lin
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-py3-none-any.whl` ([details](#macos)).
 
 ### 2 - Start rnfs and leave it running in its own terminal:
 
@@ -102,26 +102,26 @@ rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file f
 
 | System | Download | Install |
 |---|---|---|
-| Windows (64-bit) | [`rnfs-0.1.2-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-windows-x64.exe) | [Windows](#windows) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.2_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs_0.1.2_amd64.deb) or [`rnfs_0.1.2_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs_0.1.2_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
-| Other Linux (x86_64) | [`rnfs-0.1.2-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.1.2-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-py3-none-any.whl) | [macOS](#macos) |
+| Windows (64-bit) | [`rnfs-0.1.3-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-windows-x64.exe) | [Windows](#windows) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.3_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs_0.1.3_amd64.deb) or [`rnfs_0.1.3_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs_0.1.3_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
+| Other Linux (x86_64) | [`rnfs-0.1.3-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.3-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-py3-none-any.whl) | [macOS](#macos) |
 
 Every package includes Reticulum and LXMF, gives you one `rnfs` command, and keeps your data in the same
-places. The release also has the source archive (`rnfs-0.1.2.tar.gz`) and `SHA256SUMS`, to
-[check your download](#checking-a-download). These links are for 0.1.2; for a newer version, take the
+places. The release also has the source archive (`rnfs-0.1.3.tar.gz`) and `SHA256SUMS`, to
+[check your download](#checking-a-download). These links are for 0.1.3; for a newer version, take the
 same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
 
 ### Windows
 
-Download [`rnfs-0.1.2-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-windows-x64.exe). It is a single file that
+Download [`rnfs-0.1.3-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-windows-x64.exe). It is a single file that
 includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
 folder, put it on your PATH as `rnfs`:
 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.1.2-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.1.3-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -152,8 +152,8 @@ or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [instal
 there instead. Pick `amd64` or `arm64` to match `dpkg --print-architecture`:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs_0.1.2_amd64.deb
-sudo apt install ./rnfs_0.1.2_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs_0.1.3_amd64.deb
+sudo apt install ./rnfs_0.1.3_amd64.deb
 rnfs daemon                             # or run it in the background:
 systemctl --user enable --now rnfs      # a systemd user service; logs: journalctl --user -u rnfs -f
 ```
@@ -172,9 +172,9 @@ For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flat
 `org.freedesktop.Platform` runtime:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.1.2-x86_64.flatpak
+flatpak install --user rnfs-0.1.3-x86_64.flatpak
 flatpak run io.github.afit21.rnfs daemon
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
 ```
@@ -202,7 +202,7 @@ and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python
 ```sh
 brew install pipx
 pipx ensurepath                 # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.1.2/rnfs-0.1.2-py3-none-any.whl     # includes Reticulum and LXMF
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.3/rnfs-0.1.3-py3-none-any.whl     # includes Reticulum and LXMF
 rnfs daemon
 ```
 
@@ -228,11 +228,11 @@ Each release's `SHA256SUMS` lists the checksum of every file. Download it next t
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing          # Linux
-shasum -a 256 rnfs-0.1.2-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
+shasum -a 256 rnfs-0.1.3-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
 ```
 
 ```powershell
-Get-FileHash .\rnfs-0.1.2-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
+Get-FileHash .\rnfs-0.1.3-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
 ```
 
 ### Other ways to install
@@ -420,16 +420,18 @@ rnfs nodes:
 - **Radio:** add an `RNodeInterface` for LoRa. See the
   [Reticulum manual](https://reticulum.network/manual/interfaces.html).
 
-Your node then learns about other rnfs nodes from their announces. Give it a **bootstrap node** as well, so
-it can join the DHT straight away rather than waiting for announces:
+Your node then learns about other rnfs nodes from their announces, and joins the DHT through the
+project's **bootstrap nodes**, which are built in. It contacts them at every start, and again whenever it
+knows fewer than 3 nodes, so it also gets in where no announces reach it (for example behind a LoRa access
+point), as long as Reticulum can reach them. To join through nodes you choose as well, such as a friend's
+(`rnfs status` shows its node ID), give them first:
 
 ```sh
 rnfs daemon --bootstrap <NODE_ID>          # or bootstrap_nodes = ["<NODE_ID>"] in ~/.rnfs/rnfs.toml
 ```
 
-> *Placeholder: the project doesn't run a public bootstrap node yet. When it does, its node ID (and
-> Reticulum entry point) will be listed here. Meanwhile, use the node ID of a friend's node (`rnfs status`
-> shows it).*
+`default_bootstrap = false` in `rnfs.toml` stops rnfs contacting the built-in nodes. Private mode never
+contacts them.
 
 `rnfs peers` lists the nodes yours knows, nearest first.
 
@@ -526,7 +528,8 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | Setting | Default | Description |
 |---|---|---|
 | `reticulum_dir` | RNS's own | Reticulum config directory (`daemon --rnsconfig`) |
-| `bootstrap_nodes` | `[]` | Node IDs to join the DHT through at startup (`daemon --bootstrap`) |
+| `bootstrap_nodes` | `[]` | Node IDs to join the DHT through, contacted before the built-in ones (`daemon --bootstrap`) |
+| `default_bootstrap` | `true` | Also join through the project's built-in bootstrap nodes. Never used in private mode |
 | `dht_mode` | `"server"` | `"server"` stores DHT records for others; `"client"` only asks (for nodes often offline or short of bandwidth) |
 | `slow` | `"auto"` | `"yes"`, `"no"` or `"auto"`: a slow node uses one provider at a time and fewer parallel queries. `auto` is slow when every interface is under `slow_bitrate` |
 | `slow_bitrate` | `100000` | Links and interfaces below this (bits/s) count as slow |
@@ -870,17 +873,7 @@ rnfs --dir /tmp/a --api-port 9001 add somefile
 rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
-`tests/test_e2e.py` sets up exactly this, with short intervals in each node's `rnfs.toml`.
-
-## Tests
-
-```sh
-python3 -m unittest discover tests                               # unit tests, no network
-RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client  # real daemons over local TCP
-python3 packaging/smoke_test.py dist/rnfs                        # smoke-test a built package
-```
-
-To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack.
+ery thread's stack.
 
 ## Known limitations
 
@@ -892,6 +885,3 @@ To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack
   a directory leaves the sealed files inside it encrypted.
 - LXMF: messages over 256 kB are refused, and unsent messages are lost if the daemon restarts. Offline
   delivery and downloads need `lxmf_propagation_node` (or `--nearest` each time).
-- Windows support is new.
-
-The full list is in [design.md, Status](design.md#status).

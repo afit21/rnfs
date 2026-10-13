@@ -210,6 +210,17 @@ class ReplyFilterTest(RoutingTestCase):
         # Our own lookups still try them
         self.assertEqual(self.table.closest(key), [healthy, failing, silent])
 
+    def test_live_count_leaves_out_the_same_nodes(self):
+        healthy, failing, silent = node_id(1), node_id(2), node_id(3)
+        self.table.heard(silent)
+        self.clock.now += 2 * ANNOUNCE + 1
+        self.table.heard(healthy)
+        self.table.heard(failing)
+        self.table.failed(failing)
+        self.assertEqual((self.table.live_count(), self.table.node_count()), (1, 3))
+        self.table.heard(failing)  # hearing it again makes it live
+        self.assertEqual(self.table.live_count(), 2)
+
 
 class BanTest(RoutingTestCase):
     """Bans drop a node and ignore it for ban_time."""

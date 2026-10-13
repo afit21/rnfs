@@ -57,6 +57,7 @@ NODE_CONFIG = """
 
 # Short intervals so the test runs in seconds; republish_interval must stay below PROVIDER_TTL / 2
 SETTINGS = """
+default_bootstrap = false
 announce_interval = 3600
 startup_announce_delay = 2
 scan_interval = 2

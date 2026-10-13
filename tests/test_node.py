@@ -12,16 +12,17 @@ from unittest import mock
 import RNS
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE
+from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import remote_source
 from rnfs import fetcher
 from rnfs.errors import InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
+from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES
+from tests.support import POSIX_MODES, wait_for
 from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
@@ -627,6 +628,78 @@ class RestartTest(NodeTest):
         with mock.patch.object(self.a.storage, "cached_targets", cached_targets):
             self.a._prune_fetched()
         self.assertEqual(held, [True])
+
+
+class JoinTest(NodeTest):
+    """Joining: bootstrap nodes first (the user's, then the defaults), then a lookup; again while too few."""
+
+    SERVERS = [bytes([0x10 + i] * 16) for i in range(4)]
+    DEAD = [bytes([0xD0 + i] * 16) for i in range(2)]  # node IDs nobody answers for
+    X_ID = bytes([0xE] * 16)
+
+    def setUp(self):
+        """Four servers that know each other, and a record of every /find."""
+        super().setUp()
+        for i, server_id in enumerate(self.SERVERS):
+            self.make_node(f"s{i}", server_id)
+        for server_id in self.SERVERS:
+            for other in self.SERVERS:
+                self.net.nodes[server_id].routing.heard(other)
+        self.finds: list[bytes] = []
+        find = self.net.find
+        self.net.find = lambda node_id, key: (self.finds.append(node_id), find(node_id, key))[1]
+        self.defaults = mock.patch.object(node_module, "DEFAULT_BOOTSTRAP_NODES",
+                                          tuple(n.hex() for n in self.SERVERS[1:]))
+        self.defaults.start()
+        self.addCleanup(self.defaults.stop)
+
+    def joiner(self, **settings) -> RnfsNode:
+        """The node that joins, with an empty routing table."""
+        return self.make_node("x", self.X_ID, **settings)
+
+    def test_default_list_is_well_formed(self):
+        ids = [parse_node_id(text) for text in DEFAULT_BOOTSTRAP_NODES]
+        self.assertTrue(ids)
+        self.assertEqual(len(set(ids)), len(ids))
+
+    def test_user_bootstrap_first_then_defaults_until_two_answer(self):
+        x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()])
+        x.join()
+        self.assertEqual(self.finds[0], self.SERVERS[0])
+        self.assertIn(self.finds[1], self.SERVERS[1:])
+        # The lookup doesn't ask the contacted bootstrap nodes again
+        self.assertEqual(len(self.finds), len(set(self.finds)))
+        self.assertGreaterEqual(x.routing.live_count(), 3)
+
+    def test_unreachable_bootstrap_nodes_dont_stop_the_rest(self):
+        # A fresh slow node knows no identities, and its lookups try only one unknown ID (alpha): bootstrap
+        # nodes are contacted outside that budget, so two dead ones don't use it up
+        x = self.joiner(bootstrap_nodes=[n.hex() for n in self.DEAD + [self.SERVERS[0]]], default_bootstrap=False)
+        x.slow = True
+        x._is_known = lambda node_id: False
+        x.join()
+        self.assertEqual(self.finds[:3], self.DEAD + [self.SERVERS[0]])
+        self.assertTrue(x.routing.contains(self.SERVERS[0]))
+
+    def test_defaults_skipped_when_turned_off_or_private(self):
+        user = [self.DEAD[0].hex()]
+        self.assertEqual(self.joiner(bootstrap_nodes=user, default_bootstrap=False).bootstrap_ids(), [self.DEAD[0]])
+        private = self.make_node("p", bytes([0xF] * 16), bootstrap_nodes=user, private=True)
+        self.assertEqual(private.bootstrap_ids(), [self.DEAD[0]])
+        self.assertEqual(sorted(self.make_node("d", bytes([0xC] * 16)).bootstrap_ids()), sorted(self.SERVERS[1:]))
+
+    def test_joins_again_while_too_few_servers_are_known(self):
+        x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
+        first = self.net.nodes.pop(self.SERVERS[0])  # unreachable at startup
+        with mock.patch.object(node_module, "REJOIN_DELAY", 0.05):
+            thread = threading.Thread(target=x._join, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(x.stop_event.set)
+            self.assertTrue(x.joined.wait(5))
+            self.assertEqual(x.routing.node_count(), 0)
+            self.net.nodes[self.SERVERS[0]] = first
+            wait_for(lambda: x.routing.live_count() >= 3, what="a later join filling the routing table")
 
 
 if __name__ == "__main__":

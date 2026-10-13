@@ -385,9 +385,21 @@ big-endian integer; "closest" means smallest distance.
 - A node is dropped after `max_failures` queries in a row go unanswered; hearing from it resets the count.
   Lossy links can drop a live server this way, so a dropped node's first-seen time is kept for
   `2 × announce_interval`, and it regains its seniority if it comes back within that time.
-- **Joining.** At startup a node queries any bootstrap node IDs it was given (`daemon --bootstrap`) with
-  `/find` for its own node ID, adds those that answer, and continues that lookup, which fills its table with
-  its neighbours.
+- **Joining.** At startup a node sends `/find` for its own node ID to bootstrap nodes, one at a time, until
+  two have answered: first those it was given (`bootstrap_nodes`, `daemon --bootstrap`) in their order,
+  then, unless `default_bootstrap` is off or it is in private mode, the implementation's default bootstrap
+  nodes (rnfs: `DEFAULT_BOOTSTRAP_NODES`) in random order. It adds those that answer, then runs a lookup for
+  its own ID from the servers they listed and its routing table, without asking the contacted nodes again;
+  this fills its table with its neighbours.
+  - Bootstrap nodes are contacted outside the lookup's budget of `alpha` unknown IDs, so unreachable ones
+    don't stop the rest being tried.
+  - A node behind an RNS access-point interface hears no announces from beyond it, so bootstrap nodes are
+    its only way in.
+  - While fewer than 3 servers are known that `/find` replies would include (not failed since last heard,
+    nor silent for over `2 × announce_interval`), the node joins again, 5 minutes after the last join and
+    doubling up to `announce_interval`: on radio every path request is flooded. A node that knows only a
+    small island of servers still contacts the defaults at every start.
+  - Bootstrap nodes get no special trust: once answered, they are ordinary routing-table entries.
 - Because RNS floods announces, on small meshes (a few dozen nodes) the routing table holds most of the
   network, so lookups usually finish in one or two rounds.
 
@@ -997,7 +1009,8 @@ digits). A node MUST NOT start with an invalid setting.
 | `gateway_scripts` | on | |
 | `gateway_fetches` | 2 | Network fetches at a time for requests that aren't the user's own navigation |
 | `api_port`, `gateway_port` | 8788, 8789 | Local API and gateway ports, on 127.0.0.1 (section 11) |
-| `bootstrap_nodes` | empty | Node IDs queried when joining (section 6) |
+| `bootstrap_nodes` | empty | Node IDs contacted first when joining (section 6) |
+| `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |
 | `verbosity` | 0 | Extra logging: 1 per-query detail, 2 RNS debug output |
 | `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket, at most half of it per requester in flight, unsent parts refunded (section 3) |
@@ -1136,7 +1149,7 @@ unreserved, pct-encoded: as in RFC 3986
 | Noise / TLS, peer authentication | RNS Links (encrypted, forward secret); `Link.identify()` |
 | Protocol negotiation, protobuf RPC | RNS link requests and msgpack; versions are destination aspects |
 | Bitswap | `/blocks` over RNS Resources |
-| Bootstrap and peer discovery | RNS announces, plus optional bootstrap node IDs (`daemon --bootstrap`) |
+| Bootstrap and peer discovery | RNS announces, plus bootstrap node IDs: built-in defaults, as in IPFS, and your own (`daemon --bootstrap`) |
 | IPNS records, DHT PUT/GET | RNS announces with signed `app_data`, cached by transport nodes and served by keepers (`/name`) |
 | Swarm key (private networks) | RNS Interface Access Codes; rnfs private mode |
 | Resource manager limits | RNS request and response size limits, plus rnfs's link and request caps |

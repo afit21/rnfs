@@ -2,6 +2,17 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.3
+
+Joining the DHT:
+- Built-in bootstrap nodes (`DEFAULT_BOOTSTRAP_NODES`): every node contacts them when joining, after its own
+  `bootstrap_nodes`, so a new node gets in even where no announces reach it (e.g. behind a LoRa access
+  point). `default_bootstrap = false` turns them off; private mode never uses them.
+- Bootstrap nodes are asked one at a time until two answer, outside the lookup's budget for unknown node IDs:
+  a slow node used to try only one of them, and gave up if that one was down.
+- The node joins again while it knows fewer than 3 live DHT servers, 5 minutes after the last join and
+  doubling up to `announce_interval`. It used to join only at startup.
+
 ## 0.1.2
 
 Maintenance release from the fourth audit: fixes, release guardrails and internal consolidation. No format,
