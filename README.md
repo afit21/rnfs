@@ -5,7 +5,7 @@
 
 **A decentralized file system built for [Reticulum](https://reticulum.network) & based on [IPFS](https://ipfs.tech/) (InterPlanetary File System).**
 
-Share files over LoRa radio, Wi-Fi, local networks or the internet without relying on a an authorative server for file hosting or peer lookups.
+Share files over LoRa radio, Wi-Fi, local networks or the internet without relying on a an authoritative server for file hosting or peer lookups.
 
 Access any file on RNFS by it's **'CID'**.
 
