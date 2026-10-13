@@ -26,7 +26,7 @@ Access any file on RNFS by it's **'CID'**.
 
 **Contents**
 
-[Install](#install) · [Sample files](#sample-files) · [Getting started](#getting-started) ·
+[Install](#install) · [Sample files (with CIDs)](#sample-files) · [Getting started](#getting-started) ·
 [How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
 [Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
 [Tests](#tests) · [Known limitations](#known-limitations) ·
