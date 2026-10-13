@@ -15,6 +15,8 @@ Access any file on RNFS by it's **'CID'**.
 [![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
 
+<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
+
 **Contents**
 
 [Install](#install) · [Sample files](#sample-files) · [Getting started](#getting-started) ·
@@ -23,9 +25,6 @@ Access any file on RNFS by it's **'CID'**.
 [Tests](#tests) · [Known limitations](#known-limitations) ·
 [specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
 </div>
-<p align="center">
-<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
-</p>
 
 ## Why Use RNFS?
 
