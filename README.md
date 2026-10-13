@@ -870,17 +870,7 @@ rnfs --dir /tmp/a --api-port 9001 add somefile
 rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
-`tests/test_e2e.py` sets up exactly this, with short intervals in each node's `rnfs.toml`.
-
-## Tests
-
-```sh
-python3 -m unittest discover tests                               # unit tests, no network
-RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client  # real daemons over local TCP
-python3 packaging/smoke_test.py dist/rnfs                        # smoke-test a built package
-```
-
-To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack.
+ery thread's stack.
 
 ## Known limitations
 
@@ -892,6 +882,3 @@ To debug a running daemon, `kill -USR1 <daemon pid>` prints every thread's stack
   a directory leaves the sealed files inside it encrypted.
 - LXMF: messages over 256 kB are refused, and unsent messages are lost if the daemon restarts. Offline
   delivery and downloads need `lxmf_propagation_node` (or `--nearest` each time).
-- Windows support is new.
-
-The full list is in [design.md, Status](design.md#status).
