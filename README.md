@@ -52,9 +52,14 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 * ***📃 Nodes automatically split up lookup data between themselves -*** Lookup 'Kademlia' for more in depth information, however all nodes on the RNFS network will take responsibility for remembering a part of the overall 'address book' of nodes and a list of which files they host. Assignment of the information is automatic.
 * ***🌱 Automatically find seeders -*** No file of known seeders is needed, RNFS will automatically ask it's peers "who has this file". Kademlia is very efficient at doing this. In a 1 million node network, this would only take 6 hops to find a seeder.
 
-## Quick start
+# Quick start
 
-### 1 - Install
+This section covers the basics to get you using rnfs.
+
+## 1 - Install
+
+> [!WARNING]
+> If you do not already have an instance of the Reticulum installed & setup on your machine, you'll need to update your Reticulum config to connect to the public distributed backbone after running rnfs for the first time. Your Reticulum config can be found in `~/.reticulum` on linux. Refer to [reticulum.network/connect.html](https://reticulum.network/connect.html) for more info on this.
 
 Different package options available at [latest release](https://github.com/afit21/rnfs/releases/latest)
 
@@ -69,6 +74,10 @@ One liner for install script:
 
 `curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh`
 
+To install as a systemctl service, add the service flag:
+
+`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -- -service`
+
 Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-linux-flatpak)
 
 **macOS:**
@@ -81,10 +90,8 @@ Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-lin
 rnfs daemon
 ```
 
-### 3 - Connect to other nodes. Computers on the same local network or Wi-Fi find each other automatically.
-To reach nodes further away, see [Connect to a network](#2-connect-to-a-network).
-
-### 4 - Download a file, for example one of the [sample files](#sample-files):
+### 3 - Download a file
+for example one of the [sample files](#sample-files):
 
 ```sh
 rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o manifesto.pdf
@@ -93,7 +100,7 @@ rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o man
 Or open it in your browser:
 <http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=manifesto.pdf>
 
-### 5 - Share your own file:
+### 4 - Share your own file:
 
 ```sh
 rnfs add holiday.jpg        # prints its CID: give that to anyone who should have the file
