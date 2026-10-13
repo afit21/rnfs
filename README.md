@@ -22,8 +22,10 @@ Access any file on RNFS by it's **'CID'**.
 [Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
 [Tests](#tests) · [Known limitations](#known-limitations) ·
 [specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
-
 </div>
+<p align="center">
+<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
+</p>
 
 ## Why Use RNFS?
 
