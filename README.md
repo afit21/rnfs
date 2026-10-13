@@ -15,7 +15,14 @@ Access any file on RNFS by it's **'CID'**.
 [![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
 
+<hr>
+
+### Publish any file to a string & fetch it over Reticulum
+
+
 <img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
+
+<hr>
 
 **Contents**
 
