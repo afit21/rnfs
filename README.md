@@ -420,16 +420,18 @@ rnfs nodes:
 - **Radio:** add an `RNodeInterface` for LoRa. See the
   [Reticulum manual](https://reticulum.network/manual/interfaces.html).
 
-Your node then learns about other rnfs nodes from their announces. Give it a **bootstrap node** as well, so
-it can join the DHT straight away rather than waiting for announces:
+Your node then learns about other rnfs nodes from their announces, and joins the DHT through the
+project's **bootstrap nodes**, which are built in. It contacts them at every start, and again whenever it
+knows fewer than 3 nodes, so it also gets in where no announces reach it (for example behind a LoRa access
+point), as long as Reticulum can reach them. To join through nodes you choose as well, such as a friend's
+(`rnfs status` shows its node ID), give them first:
 
 ```sh
 rnfs daemon --bootstrap <NODE_ID>          # or bootstrap_nodes = ["<NODE_ID>"] in ~/.rnfs/rnfs.toml
 ```
 
-> *Placeholder: the project doesn't run a public bootstrap node yet. When it does, its node ID (and
-> Reticulum entry point) will be listed here. Meanwhile, use the node ID of a friend's node (`rnfs status`
-> shows it).*
+`default_bootstrap = false` in `rnfs.toml` stops rnfs contacting the built-in nodes. Private mode never
+contacts them.
 
 `rnfs peers` lists the nodes yours knows, nearest first.
 
@@ -526,7 +528,8 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | Setting | Default | Description |
 |---|---|---|
 | `reticulum_dir` | RNS's own | Reticulum config directory (`daemon --rnsconfig`) |
-| `bootstrap_nodes` | `[]` | Node IDs to join the DHT through at startup (`daemon --bootstrap`) |
+| `bootstrap_nodes` | `[]` | Node IDs to join the DHT through, contacted before the built-in ones (`daemon --bootstrap`) |
+| `default_bootstrap` | `true` | Also join through the project's built-in bootstrap nodes. Never used in private mode |
 | `dht_mode` | `"server"` | `"server"` stores DHT records for others; `"client"` only asks (for nodes often offline or short of bandwidth) |
 | `slow` | `"auto"` | `"yes"`, `"no"` or `"auto"`: a slow node uses one provider at a time and fewer parallel queries. `auto` is slow when every interface is under `slow_bitrate` |
 | `slow_bitrate` | `100000` | Links and interfaces below this (bits/s) count as slow |

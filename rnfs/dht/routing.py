@@ -200,6 +200,13 @@ class RoutingTable:
         with self._lock:
             return sum(len(bucket) for bucket in self._buckets)
 
+    def live_count(self) -> int:
+        """Number of servers in the table that /find replies would include: none failed a query since last
+        heard, or has been silent over 2 × announce_interval."""
+        with self._lock:
+            now = self.clock()
+            return sum(1 for bucket in self._buckets for e in bucket.values() if not self._stale(e, now))
+
     def _find(self, node_id: bytes) -> _Entry | None:
         """The entry for node_id, or None (also for malformed IDs and our own). Caller holds the lock."""
         if not isinstance(node_id, bytes) or len(node_id) != ID_LENGTH or node_id == self.own_id:

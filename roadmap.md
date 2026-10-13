@@ -1,25 +1,43 @@
 # 0.1.3
 
+## Default Bootstrap Node List
+DEFAULT_BOOTSTRAP_NODES global variable: node IDs of official, always-on DHT servers, giving new nodes a first contact when no announces reach them (e.g. behind a LoRa access point)
+* Used in the startup join alongside `bootstrap_nodes` (the user's own are tried first), as IPFS does
+* Used again, with backoff, whenever fewer than about 3 servers are known, so isolated nodes and small islands rejoin
+* Tried in random order, with their own path-request budget, so one offline node doesn't block the rest
+* Skipped in private mode, or when a setting turns them off
+* After the join they are ordinary DHT servers, with no extra trust
+
+# 0.1.4
+
 ## CID denylist
 
 - Ability to point to a CID or name as a CID deny list
 
+- Refuse to fetch, provide or store a CID.
+
+- Deny lists can contain file hashes and/or CIDs
+
 ## Migrate to JSON stores to sqlite3
 
-## Improved bootstraping without bootstrap node
+- If JSON store exists, convert to the sqlite3 stor
 
-Add uptime & number of known nodes to startup announce
+## Alternate Pin Sources
+* List if a file was pinned by an application via an API
 
-If an announce is heard from a new node, advertise self to the new node after a random delay if the following conditions are met:
+## Change notifications for other applications to subscribe too
+* New file pinned by daemon
 
-* New node's number of known nodes is zero
-* This node is the closest node in the DHT to the new node that it knows of
-* This node's uptime is above one hour or
 
-This change should not break compatibility with previous versions. Announces without this information should still be recognised as normal
+# 0.1.5 
 
-# 0.1.4
+## Client Library
 
-## Add files without duplicating them with --nocopy flag
+## API versioning and reference
 
-## RNFS content as a folder (linux only)
+## Per-app API tokens
+
+## RNS API
+
+* Destination.hash(identity, "rnfs", "api")
+* Whitelist and/or API key for auth

@@ -33,7 +33,7 @@ DURATIONS = {  # seconds: name → True if it must be above 0 (else 0 is allowed
 OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset (None)
 # Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
 MAX_DURATION = 30 * DAY
-FLAGS = ("private", "gateway_scripts")
+FLAGS = ("private", "gateway_scripts", "default_bootstrap")
 IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
 _HEX_ID = re.compile(r"[0-9a-fA-F]{32}")
 
@@ -53,7 +53,8 @@ class Config:
     reticulum_dir: str | None = None
     api_port: int = DEFAULT_API_PORT
     gateway_port: int = DEFAULT_GATEWAY_PORT
-    bootstrap_nodes: list[str] = field(default_factory=list)  # node IDs (hex) queried at startup
+    bootstrap_nodes: list[str] = field(default_factory=list)  # node IDs (hex) contacted first when joining
+    default_bootstrap: bool = True  # also contact DEFAULT_BOOTSTRAP_NODES when joining (never in private mode)
     verbosity: int = 0  # added to Reticulum's loglevel: 1 shows per-query detail, 2 shows RNS debug output
 
     slow: str = "auto"  # "yes", "no" or "auto" (section 2)

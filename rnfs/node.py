@@ -4,13 +4,15 @@ facade that the API, gateway and CLI call (design.md, "Node facade").
 Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), the node's
 identity and its rnfs.dht destination, then the routing table, provider records, storage, shared folder,
 fetcher, publisher and names; the request server answers through NodeBackend. Background threads: the
-announcer, the join (bootstrap lookup for our own ID), the publish loop, the name re-announce loop and
+announcer, the join (bootstrap nodes, then a lookup for our own ID, repeated while too few servers are
+known), the publish loop, the name re-announce loop and
 maintenance (shared-folder scans, provider record expiry and saves, max_storage enforcement).
 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
 """
 import os
+import random
 import secrets
 import shutil
 import stat
@@ -23,7 +25,7 @@ import RNS
 
 from rnfs import __version__, features, fsutil
 from rnfs.config import Config
-from rnfs.constants import APP_NAME, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
+from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
@@ -56,6 +58,9 @@ EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else tr
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
 STOP_TIMEOUT = 5.0
 REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetched; more are refused
+BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many have answered
+MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
+REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
 
@@ -259,6 +264,12 @@ class RnfsNode:
         self.slow = slow
         self._is_known = is_known
         self.members = {h.strip().strip("<>").lower() for h in config.members}
+        self._bootstrap_nodes: list[bytes] = []  # bootstrap_nodes that parse, in the order given
+        for text in config.bootstrap_nodes:
+            try:
+                self._bootstrap_nodes.append(parse_node_id(text))
+            except ValueError as e:
+                log(f"ignoring bootstrap node: {e}", LOG_WARNING)
         _make_private_dirs(config)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
@@ -410,28 +421,82 @@ class RnfsNode:
             log(f"{plural(added, 'DHT server')} known from announces heard before", LOG_VERBOSE)
 
     def _join(self):
-        """Query the bootstrap nodes for our own ID and continue that lookup, filling the routing table."""
+        """Join at startup, then again whenever fewer than MIN_SERVERS live servers are known (section 6).
+
+        A join that leaves too few servers is retried after REJOIN_DELAY, doubling up to announce_interval:
+        on radio, every path request for a bootstrap node is flooded.
+        """
         try:
             if self.reticulum is not None:
                 self._seed_routing()
-            bootstrap = []
-            for text in self.config.bootstrap_nodes:
-                try:
-                    bootstrap.append(parse_node_id(text))
-                except ValueError as e:
-                    log(f"ignoring bootstrap node: {e}", LOG_WARNING)
-            if bootstrap or self.routing.node_count():
-                lookup = Lookup(self.node_id, bootstrap + self.routing.closest(self.node_id), self.client.find,
-                                self.node_id, alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
-                                timeout=self.config.lookup_timeout, is_known=self._is_known,
-                                on_answer=self._answered, on_failure=self.routing.failed,
-                                exclude=self.routing.is_banned)
-                lookup.find_closest()
-                log(f"joined the DHT: {plural(self.routing.node_count(), 'server')} known", LOG_NOTICE)
+            self.join()
         except Exception as e:
             log(f"joining the DHT failed: {e!r}", LOG_ERROR)
         finally:
             self.joined.set()
+        delay = REJOIN_DELAY
+        while not self.stop_event.wait(delay):
+            if self.routing.live_count() >= MIN_SERVERS:
+                delay = REJOIN_DELAY
+                continue
+            try:
+                self.join()
+            except Exception as e:
+                log(f"joining the DHT failed: {e!r}", LOG_ERROR)
+            delay = min(2 * delay, self.config.announce_interval)
+
+    def join(self):
+        """Contact bootstrap nodes, then look up our own ID from what they and the routing table know."""
+        contacted, start = self._contact_bootstrap()
+        start = start + self.routing.closest(self.node_id)
+        if not start:
+            log("no DHT servers known yet: waiting for announces", LOG_VERBOSE)
+            return
+        # The bootstrap nodes contacted already answered (or failed) a /find for this key: not asked again
+        lookup = Lookup(self.node_id, start, self.client.find, self.node_id,
+                        alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
+                        timeout=self.config.lookup_timeout, is_known=self._is_known,
+                        on_answer=self._answered, on_failure=self.routing.failed,
+                        exclude=lambda node_id: node_id in contacted or self.routing.is_banned(node_id))
+        lookup.find_closest()
+        log(f"joined the DHT: {plural(self.routing.node_count(), 'server')} known", LOG_NOTICE)
+
+    def bootstrap_ids(self) -> list[bytes]:
+        """Bootstrap nodes in the order a join contacts them: bootstrap_nodes as given, then (unless
+        default_bootstrap is off or in private mode) DEFAULT_BOOTSTRAP_NODES in a fresh random order."""
+        defaults = []
+        if self.config.default_bootstrap and not self.config.private:
+            defaults = [bytes.fromhex(text) for text in DEFAULT_BOOTSTRAP_NODES]
+            random.shuffle(defaults)
+        ids = list(dict.fromkeys(self._bootstrap_nodes + defaults))
+        return [node_id for node_id in ids if node_id != self.node_id and not self.routing.is_banned(node_id)]
+
+    def _contact_bootstrap(self) -> tuple[set[bytes], list[bytes]]:
+        """Ask bootstrap nodes for our own ID, one at a time, until BOOTSTRAP_ANSWERS have answered.
+
+        Each costs a path request if its identity isn't known, outside any lookup's budget for unknown IDs,
+        so an unreachable one doesn't stop the rest being tried. Returns the nodes contacted and the
+        servers their answers listed.
+        """
+        contacted: set[bytes] = set()
+        found: list[bytes] = []
+        answered = 0
+        for node_id in self.bootstrap_ids():
+            if answered >= BOOTSTRAP_ANSWERS or self.stop_event.is_set():
+                break
+            contacted.add(node_id)
+            try:
+                reply = self.client.find(node_id, self.node_id)
+            except Exception:
+                reply = None
+            if reply is None:
+                log(f"bootstrap node {node_name(node_id)} didn't answer", LOG_VERBOSE)
+                self.routing.failed(node_id)
+                continue
+            answered += 1
+            self._answered(node_id)
+            found.extend(reply[1])
+        return contacted, found
 
     def _run_publisher(self):
         """The publish loop, started once the join has filled the routing table."""

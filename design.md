@@ -362,7 +362,7 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 
 | Thread | Owner | Does |
 |---|---|---|
-| `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining, publishing, name announces, periodic saves and eviction |
+| `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting) |
 | `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits ≤ 2 s |
@@ -416,6 +416,11 @@ checks a built package (`--version`, `--help`, daemon and status).
 Everything in the specification is implemented, with these simplifications and additions:
 - The routing table isn't persisted. At startup it is seeded from the rnfs.dht server announces that RNS
   cached within 2 × `announce_interval` (`Identity.known_destinations`, an RNS internal), then the join runs.
+- Joining (`RnfsNode._join`, `join`): bootstrap nodes are asked one at a time with `PeerClient.find`, outside
+  any `Lookup`, until `BOOTSTRAP_ANSWERS` (2) answer; the lookup that follows excludes them. The thread then
+  checks `RoutingTable.live_count()` every `REJOIN_DELAY` (300 s) and joins again while it is under
+  `MIN_SERVERS` (3), doubling the wait up to `announce_interval`. `DEFAULT_BOOTSTRAP_NODES` lives in
+  `rnfs/constants.py` and changes only with a release; the e2e test turns it off (`default_bootstrap = false`).
 - Publishing runs one closest-nodes lookup per due CID, one after another. Lookups aren't shared between keys
   that have the same closest nodes, but `/provide` requests are batched per node. Slow nodes pace these
   lookups (at most 10 per round, 30 s per lookup on average), which only delays republishing; withdrawals
