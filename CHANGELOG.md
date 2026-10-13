@@ -2,7 +2,7 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## Unreleased
+## 0.1.3
 
 Joining the DHT:
 - Built-in bootstrap nodes (`DEFAULT_BOOTSTRAP_NODES`): every node contacts them when joining, after its own
