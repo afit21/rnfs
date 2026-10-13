@@ -52,4 +52,5 @@ DEFAULT_BOOTSTRAP_NODES = (
     "5e395b3045b68c881d5db62c146033eb",  # Sydney, Australia (AWS)
     "bddad1ec2f4a4a6112d3d42afabfd94a",  # Broken Hill, Australia
     "24770a7a9221b97d583905a839bc4fce",  # Central US (Google Cloud)
+    "4a8dec339ac23f9a6f423b6ee0a84c16", # Midrid (Google Cloud)
 )
