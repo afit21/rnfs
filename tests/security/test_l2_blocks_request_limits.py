@@ -32,6 +32,7 @@ class ParseDuplicatesTest(unittest.TestCase):
         link = h.connect(FakeInterface("hub", TCP_BITRATE), mtu=1500, mdu=1400)
         self.assertIs(h.blocks(link, [c1, c1]), False)
         self.assertEqual(h.server.pools.responses(), [])
+        h.server.rates.record(link.link_id, 64 * KIB, 8000 * 8)  # measured, so more than one block fits
         self.assertEqual(h.blocks(link, [c1, c2], max_bytes=MAX_RESPONSE_SIZE), [b1, b2])  # distinct served
 
 

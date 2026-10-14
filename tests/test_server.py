@@ -48,7 +48,7 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(server.select_blocks([c1, c2], {c2: b2}.get, 0), [None, b2])
 
     def test_capped_by_max_response_size(self):
-        self.assertEqual(server.blocks_budget(10 * 1024 * KIB, None, None, 60), MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+        self.assertEqual(server.blocks_budget(10 * 1024 * KIB, 1e9, None, 60), MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
 
     def test_capped_by_response_target_at_rate_estimate(self):
         self.assertEqual(server.blocks_budget(1_000_000, 8000, None, 60), 60_000)
@@ -444,6 +444,7 @@ class RequestServerTest(unittest.TestCase):
 
     def test_response_is_tracked_until_complete_and_gives_rate(self):
         link = self.connect(b"a", mtu=1500, mdu=1400)
+        self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
         (c1, b1), (c2, b2) = self.big[:2]
         self.assertEqual(self.blocks(link, [c1, c2]), [b1, b2])
         self.assertEqual(self.server.incoming.in_progress(link.link_id), (1, 1))
@@ -665,6 +666,7 @@ class RequestServerTest(unittest.TestCase):
         capacity = airtime.remaining()
         cids = [cid for cid, _ in self.big]
         link = self.connect(b"a")
+        self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
         self.assertIsNot(self.blocks(link, cids), False)
         response = self.server.pools.responses()[0]
         charged = capacity - airtime.remaining()
@@ -676,6 +678,7 @@ class RequestServerTest(unittest.TestCase):
         # A link closed mid-transfer refunds the rest too
         before = airtime.remaining()
         other = self.connect(b"b")
+        self.server.rates.record(other.link_id, 64 * KIB, 1_000_000)
         self.assertIsNot(self.blocks(other, cids[:2]), False)
         self.send(other).progress = 0.5
         packed = before - airtime.remaining()
@@ -726,6 +729,7 @@ class RequestServerTest(unittest.TestCase):
         answers = []
         for i in range(3):
             link = self.connect(bytes([0x10 + i]))
+            self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
             answers.append(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, cids), link, greedy,
                                     request_id=bytes([i]) * 16))
         self.assertIsNot(answers[0], False)
