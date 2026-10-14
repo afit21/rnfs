@@ -161,6 +161,15 @@ pass a `max_response_size` just above their largest honest answer.
 - At most `max_incoming_links` incoming links. When full, one is closed to make room: the link idle longest
   with no request in progress, or else a random one with no `/blocks` response in progress. In private mode,
   links not identified as a member's are chosen first.
+- **Half-open links.** RNS validates every link request (a key exchange, a proof, a watchdog thread) and keeps
+  the link waiting for the initiator's RTT packet for `6 s × hops + 360 s`; only then is it established and
+  counted above. So, on `rnfs.dht` and on the LXMF delivery destination, links still waiting (RNS `PENDING`
+  or `HANDSHAKE`) are counted in a bucket of their own, also of `max_incoming_links`. When a link request
+  arrives with the bucket full, the oldest waiting link on the interface holding the most of them (the
+  request's own interface on a tie) is closed, rather than the request refused: an honest handshake completes
+  within about one round trip, so a flood can't keep honest initiators out by keeping the bucket full, and a
+  flood arriving on one interface closes its own links first. Each request still costs the node the key
+  exchange and a proof; RNS's own long responder timeout is the root cause.
 - rnfs neither sends nor accepts compressed Resources. Handlers are registered with `auto_compress=False`,
   and nodes MUST set RNS's maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in
   RNS 1.5.6) to 0, since RNS decompresses before any rnfs check runs. Setting it to 0 also stops RNS
@@ -774,7 +783,7 @@ as is cheap. Rules live in the sections referenced.
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
 | Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress; requester stall detection (2, 3, 7) |
-| Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links (3) |
+| Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |

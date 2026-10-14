@@ -66,7 +66,8 @@ rnfs/
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
-    guards.py         process-wide guard rejecting oversized or request Resource advertisements (3, 10)
+    guards.py         process-wide guard rejecting oversized or request Resource advertisements (3, 10); the
+                      half-open incoming link cap per destination (3)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
     client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
@@ -318,6 +319,11 @@ and in total, never persisted.
   `RequestServer.traffic` and `PeerClient.traffic` share one `Traffic`.
 - `network/guards.py` also rejects, on `rnfs.dht` links only (recognised by the link's destination or owner
   name `rnfs.dht.<hex>`), any Resource advertisement with more than one segment.
+- `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
+  instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
+  RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in
+  `destination.links` on the interface holding the most until fewer than `limit` remain. `RequestServer`
+  applies it to `rnfs.dht` and the LXMF feature to its delivery destination, both at `max_incoming_links`.
 
 ## Features
 

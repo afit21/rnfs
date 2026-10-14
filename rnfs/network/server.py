@@ -531,6 +531,8 @@ class RequestServer:
         RNS.Resource.AUTO_COMPRESS_MAX_SIZE = 0
         # Process-wide: reject request Resources and advertisements whose transfer outgrows their size
         guards.install()
+        # Links that never finish their handshake are kept in a bucket of their own, below max_incoming_links
+        guards.limit_half_open(destination, config.max_incoming_links)
         destination.set_max_request_size(MAX_REQUEST_SIZE)
         destination.set_link_established_callback(self._link_established)
         handlers = {

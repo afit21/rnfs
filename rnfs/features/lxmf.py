@@ -1543,6 +1543,7 @@ class LxmfNetwork:
         import RNS
         from RNS.vendor import umsgpack
 
+        from rnfs.network import guards
         from rnfs.network.identity import load_or_create_identity
         self.RNS, self.LXMF, self.msgpack = RNS, LXMF, umsgpack
         self.feature = feature
@@ -1587,6 +1588,8 @@ class LxmfNetwork:
 
         self.router.request_messages_from_propagation_node = request_messages
         self.destination = self.router.register_delivery_identity(self.identity, display_name=self.display_name)
+        # The delivery destination takes link requests too: bound its half-open links as rnfs.dht's (section 3)
+        guards.limit_half_open(self.destination, config.max_incoming_links)
         self.address = bytes(self.destination.hash)
         self.router.register_delivery_callback(self._delivered)
         self._announce_handler = None
