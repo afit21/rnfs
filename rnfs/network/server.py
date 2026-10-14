@@ -24,8 +24,8 @@ from typing import Callable, Protocol
 import RNS
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE,
-                            PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
+                            MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
@@ -86,10 +86,12 @@ def blocks_budget(max_bytes: int, rate_estimate: float | None, upload_cap: float
                   response_target: float) -> int:
     """Total block bytes a /blocks response may hold after its first served block (section 7)."""
     limit = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
-    if rate_estimate is not None:
-        rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
-        limit = min(limit, rates.transfer_bytes(response_target, rate))
-    return limit
+    if rate_estimate is None:
+        # What a requester asks for until the link has a rate estimate (section 7), enforced: otherwise one
+        # small request could ask for a ~1 MiB response with a deadline of many hours
+        return min(limit, CHUNK_SIZE)
+    rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
+    return min(limit, rates.transfer_bytes(response_target, rate))
 
 
 def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], limit: int) -> list[bytes | None]:
@@ -173,7 +175,10 @@ class Response:
         self.concluded = False  # its Resource's conclusion has been handled
         self.finished = False
         self.done = threading.Event()  # set once finished, to cut short a pacing wait
-        self.charged = 0  # bytes of upload_budget charged and not yet settled (refunded, or kept once sent)
+        # upload_budget (section 3): charged as it is sent, not up front
+        self.cost = 0  # packed bytes it will cost the budget if all of it is sent (0: not charged)
+        self.charged = 0  # bytes charged so far: a small reservation, then what has been sent
+        self.settled = False  # its charge is final: it concluded, or how much it sends can't be followed
         self.requester: bytes | None = None  # identity hash (else link ID) whose budget share it counts against
         self.identity: bytes | None = None  # the requester's identity hash, if it identified
         # Displacement protection (section 3)
@@ -526,6 +531,8 @@ class RequestServer:
         RNS.Resource.AUTO_COMPRESS_MAX_SIZE = 0
         # Process-wide: reject request Resources and advertisements whose transfer outgrows their size
         guards.install()
+        # Links that never finish their handshake are kept in a bucket of their own, below max_incoming_links
+        guards.limit_half_open(destination, config.max_incoming_links)
         destination.set_max_request_size(MAX_REQUEST_SIZE)
         destination.set_link_established_callback(self._link_established)
         handlers = {
@@ -754,7 +761,8 @@ class RequestServer:
 
             # The upload cap applies once the link has a rate estimate (section 3)
             cap = self.config.effective_max_upload_rate(slow, rate) if rate is not None else None
-            limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target))
+            limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target),
+                                       self._committed(response))
             response.requester = identity if identity is not None else link_id
             share = self._budget_share_left(response)
             if share is not None:
@@ -766,17 +774,19 @@ class RequestServer:
             entries = select_blocks(cids, self.backend.served_block, limit)
             body = protocol.encode_blocks_response(entries)
             packed = protocol.packed_response_size(request_id, body)
-            # The upload budget is charged for responses carrying blocks; answers of only None are tiny
-            charged = packed if any(entry is not None for entry in entries) else 0
-            if charged and not self.airtime.spend(charged):
+            mdu = link.get_mdu() or protocol.DEFAULT_MDU
+            single = packed <= mdu
+            untracked = link_id not in self.watched
+            # The upload budget is charged for responses carrying blocks (answers of only None are tiny), as
+            # they are sent: up front only a reservation of about one packet (its advertisement), or all of it
+            # if it goes as one packet or its progress can't be followed
+            if any(entry is not None for entry in entries) and not self._admit(
+                    response, packed, packed if single or untracked else min(packed, mdu)):
                 self.traffic.refused(mesh.REFUSED_BUDGET)
-                log(f"refused /blocks: {size(charged)} is over what is left of upload_budget", LOG_VERBOSE)
+                log(f"refused /blocks: {size(packed)} is over what is left of upload_budget", LOG_VERBOSE)
                 return False
-            with self.lock:
-                response.charged = charged  # settled when it concludes: what wasn't sent is refunded
             if response.finished:
-                self._refund(response)  # unless finishing it (displacement) refunded it already
-                return False  # displaced while it was being built
+                return False  # displaced while it was being built (_admit charged nothing, or _finish settled)
             with self.lock:
                 if link_id in self.links:  # a closed link's entry would never be forgotten
                     self.pacer.started(link_id, packed, cap)
@@ -784,17 +794,19 @@ class RequestServer:
             log(f"/blocks: sending {plural(served, 'block')} of {len(cids)} requested ({size(packed)})", LOG_VERBOSE)
             self.traffic.sent(node_id_for_identity(remote_identity) if remote_identity is not None else None,
                               mesh.interface_label(getattr(link, "attached_interface", None)), packed)
-            mdu = link.get_mdu() or protocol.DEFAULT_MDU
-            if packed <= mdu:
+            if single:
                 with self.lock:
-                    response.charged = 0  # sent as a single packet once we return: the charge stands
+                    response.settled = True  # sent as a single packet once we return: the charge stands
                 return body  # nothing to track
             response.size = packed
             response.deadline = response.started + rates.response_deadline(packed, rate, self.config)
             response.grace = grace
             self._restart_grace(response)
             response.find_until = self.clock() + REGISTER_WINDOW
-            response.untracked = link_id not in self.watched
+            response.untracked = untracked
+            if untracked:
+                with self.lock:
+                    response.settled = True  # charged in full: how much is sent can't be followed
             # From here the slots are freed when the Resource concludes, is cancelled, or the link closes
             handed_over = True
             self.wake.set()
@@ -841,8 +853,6 @@ class RequestServer:
             if response.untracked:
                 # Without RNS internals, the requester asking again is the only sign the response arrived
                 self.rates.record(link_id, response.size, self._expected_rate(link))
-                with self.lock:
-                    response.charged = 0
                 self._finish(response)
                 continue
             resource = response.resource
@@ -912,42 +922,90 @@ class RequestServer:
                 return
             response.finished = True
         response.done.set()
-        self._refund(response)
+        self._settle(response)
         self.pools.release(response)
         self.incoming.finish_request(response.link_id, blocks=True)
 
-    def _refund(self, response: Response):
-        """Give upload_budget back what a response that didn't complete was charged but didn't send.
+    def _admit(self, response: Response, cost: int, reservation: int) -> bool:
+        """Charge upload_budget reservation of a response that will cost it cost bytes, if the budget allows
+        the response. False if it must be refused.
 
-        Without this, a requester that rejects (or never fetches) its responses' Resources would drain the
-        node-wide budget while receiving nothing. A completed one keeps its charge, and so does one we can't
-        follow (untracked) or whose progress can't be read: how much was sent is unknown.
+        Admissions are taken one at a time, each counting what the others are still committed to send, so
+        responses admitted together can't overrun what the bucket holds.
         """
         with self.lock:
-            charged, response.charged = response.charged, 0
-        resource = response.resource
-        if not charged or response.untracked or getattr(resource, "status", None) == RNS.Resource.COMPLETE:
-            return
-        sent = response.sent
-        if resource is not None:
-            try:
-                sent = resource.get_progress() * (response.size or 0)
-            except Exception:
+            if response.finished:
+                return True  # displaced meanwhile: nothing to charge, and the caller sees it finished
+            if not self.airtime.reserve(cost, reservation, self._committed(response)):
+                return False
+            response.cost, response.charged = cost, reservation
+            return True
+
+    def _committed(self, response: Response | None = None) -> int:
+        """Budget bytes the responses in flight (other than response) are committed to send but haven't been
+        charged: each one's unsent rest while it is within its grace or has sent something. A response past its
+        grace with nothing sent (one its requester isn't fetching) commits nothing."""
+        if self.airtime.bucket is None:
+            return 0
+        now = self.clock()
+        return sum(max(0, other.cost - other.charged) for other in self.pools.responses()
+                   if other is not response and not other.finished and not other.settled and other.cost
+                   and (other.in_grace(now) or other.sent > 0))
+
+    def _charge_progress(self, response: Response):
+        """Charge upload_budget for what response has sent since it was last charged."""
+        with self.lock:
+            if response.settled or not response.cost:
                 return
-        self.airtime.refund(int(charged - min(charged, max(0.0, sent))))
+            sent = min(response.cost, int(response.sent))
+            extra = sent - response.charged
+            if extra <= 0:
+                return
+            response.charged = sent
+        self.airtime.charge(extra)
+
+    def _settle(self, response: Response):
+        """Make a concluded response's budget charge final, once: what it sent (its whole cost if it completed,
+        or if how much it sent can't be read), with any reservation it didn't use given back.
+
+        So a requester that rejects (or never fetches) its responses' Resources costs the node-wide budget
+        nothing beyond them being in flight, and a cancelled one costs what was sent.
+        """
+        with self.lock:
+            if response.settled or not response.cost:
+                response.settled = True
+                return
+            response.settled = True
+            charged = response.charged
+        resource = response.resource
+        final = response.cost
+        if getattr(resource, "status", None) != RNS.Resource.COMPLETE:
+            try:
+                sent = resource.get_progress() * (response.size or 0) if resource is not None else response.sent
+                final = min(response.cost, int(max(0.0, sent)))
+            except Exception:
+                pass  # progress unknown: it is charged in full
+        with self.lock:
+            response.charged = final
+        if final > charged:
+            self.airtime.charge(final - charged)
+        elif final < charged:
+            self.airtime.refund(charged - final)
 
     def _budget_share_left(self, response: Response) -> int | None:
         """Budget bytes response's requester may still have in flight (None without upload_budget).
 
-        One requester's responses in flight may hold at most half the bucket's capacity, so withholding
-        proofs on several links can't hold the whole budget until their deadlines pass.
+        One requester's responses in flight may cost at most half the bucket's capacity in all, so one requester
+        can't size its responses to take the whole budget at once and leave others none. Unidentified links
+        each count as their own requester and fresh identities are free, so this is fairness among requesters,
+        not a bound on a determined one: what bounds that is that the budget is only charged as bytes are sent.
         """
         bucket = self.airtime.bucket
         if bucket is None:
             return None
         responses = self.pools.responses()
         with self.lock:
-            in_flight = sum(other.charged for other in responses
+            in_flight = sum(other.cost for other in responses
                             if other is not response and other.requester == response.requester and not other.finished)
         return int(bucket.capacity // 2) - in_flight
 
@@ -958,7 +1016,7 @@ class RequestServer:
             first, response.concluded = not response.concluded, True
         if first and getattr(resource, "status", None) == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
-        self._finish(response)  # refunds what a failed or cancelled Resource didn't send
+        self._finish(response)  # charges what was sent: all of a completed Resource
 
     def _cancel(self, response: Response, reason: str):
         """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""
@@ -1047,6 +1105,8 @@ class RequestServer:
                     response.note_progress(resource.get_progress() * response.size, now)
                 except Exception:
                     resource = None  # progress unknown: only the deadline applies
+                else:
+                    self._charge_progress(response)
                 if resource is not None and self._check_progress(response, now):
                     continue
 

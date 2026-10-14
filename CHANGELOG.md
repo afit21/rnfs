@@ -50,6 +50,21 @@ Serving `/blocks` under load:
   holds no slot in a full pool may displace a zero-progress response from an interface holding two or more.
 - A `/blocks` request that repeats a CID is refused as malformed, so a node can't be made to read and serve
   the same block several times in one response.
+- On a link with no rate estimate a `/blocks` response holds at most `CHUNK_SIZE` of blocks after the first
+  (which is always served): what requesters already ask for there. It used to be whatever `max_bytes` the
+  requester sent, so one packet could ask for a ~1 MiB response with a deadline of many hours.
+- `upload_budget` is charged as a response is sent, from its Resource's progress, instead of its full size up
+  front with a refund at the end. A response is charged about one packet when it starts, and the rest of it is
+  set aside only while it is within its grace or moving, so responses a requester never downloads (each
+  unidentified link counting as its own requester) no longer hold the budget. A completed response costs its
+  size and a cancelled one what it sent, as before. The half-per-requester rule now caps what one requester's
+  responses in flight may cost.
+- Link requests that never complete their handshake are counted in a bucket of their own, of
+  `max_incoming_links`, on `rnfs.dht` and the LXMF delivery destination. When it is full the oldest one on the
+  busiest interface is closed. RNS keeps such links (each with a thread) for at least 366 s and rnfs only saw
+  links once established, so a flood of link requests could exhaust the node's memory or threads.
+- Known limit: many unidentified links that each hold a slot for one grace, then sit out their cooldown, can
+  still deny the fast pool over a shared interface (specification section 10).
 
 DHT and names:
 - A full provider store keeps a tenth of its room as a newcomer pool, with random eviction inside it, so a

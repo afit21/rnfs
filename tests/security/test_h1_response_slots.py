@@ -290,8 +290,8 @@ class RequestServerSlotsTest(unittest.TestCase):
         a = self.tcp(h)
         resource = self.take(h, a)
         response = h.response(a)
-        charged = response.charged
-        self.assertGreater(charged, CHUNK_SIZE)
+        charged = response.charged  # charged as sent: only a reservation so far
+        self.assertGreater(response.cost, CHUNK_SIZE)
         h.tick(response.grace + h.config.deadline_slack - 0.01)
         self.assertFalse(resource.cancelled)
         h.tick(0.5)
@@ -307,7 +307,6 @@ class RequestServerSlotsTest(unittest.TestCase):
         resource = self.take(h, a)
         resource.status = RNS.Resource.TRANSFERRING
         response = h.response(a)
-        charged = response.charged
         for second in range(1, 11):
             resource.progress = 0.03 * second
             h.tick(1)
@@ -316,8 +315,8 @@ class RequestServerSlotsTest(unittest.TestCase):
         h.tick(1)
         self.assertTrue(resource.cancelled)
         self.assertIsNone(h.response(a))
-        self.assertEqual(len(refunds), 1)
-        self.assertAlmostEqual(refunds[0], charged - 0.3 * response.size, delta=2)  # what wasn't sent
+        self.assertEqual(sum(refunds), 0)  # charged as it was sent, so nothing to give back
+        self.assertAlmostEqual(response.charged, 0.3 * response.size, delta=2)  # what was sent
         self.assertFalse(h.server.cooldowns.active(a.link_id))  # it was moving well above its floor
 
     def test_complete_resource_is_concluded_not_cancelled(self):

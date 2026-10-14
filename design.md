@@ -66,7 +66,8 @@ rnfs/
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
-    guards.py         process-wide guard rejecting oversized or request Resource advertisements (3, 10)
+    guards.py         process-wide guard rejecting oversized or request Resource advertisements (3, 10); the
+                      half-open incoming link cap per destination (3)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
     client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
@@ -315,15 +316,23 @@ and in total, never persisted.
   `/blocks` from a link (and its identity, if identified) whose response was displaced or cancelled for making
   no progress, for `blocks_cooldown`, cheaply and before any slot is taken.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
-  caps the block budget, and charges the bucket once the response's size is known. Each `Response` records
-  its charge and its requester (identity hash, else link ID); one requester's unsettled charges may reach at
-  most half the bucket's capacity (`_budget_share_left` cuts the budget, or refuses). When a response
-  concludes (`_finish`), a failed, cancelled, displaced or never-started Resource, or one whose link closed,
-  refunds `charged − progress × size`; completed, single-packet and untracked responses, and ones whose
-  progress can't be read, keep their charge.
+  caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
+  (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
+  (one admission at a time) allows a response if the bucket holds its cost beyond `_committed()` (the
+  uncharged rest of other responses within their grace or that have sent something), and charges a
+  reservation of at most the link's MDU; single-packet and untracked responses are charged in full.
+  `check_responses` charges progress as it reads it (`_charge_progress`), and `_settle` (from `_finish`)
+  makes the charge final: the cost if completed or progress is unreadable, else progress × size, refunding
+  an unused reservation. One requester's responses in flight may cost at most half the bucket's capacity
+  (`_budget_share_left` cuts the budget, or refuses).
   `RequestServer.traffic` and `PeerClient.traffic` share one `Traffic`.
 - `network/guards.py` also rejects, on `rnfs.dht` links only (recognised by the link's destination or owner
   name `rnfs.dht.<hex>`), any Resource advertisement with more than one segment.
+- `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
+  instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
+  RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in
+  `destination.links` on the interface holding the most until fewer than `limit` remain. `RequestServer`
+  applies it to `rnfs.dht` and the LXMF feature to its delivery destination, both at `max_incoming_links`.
 
 ## Features
 

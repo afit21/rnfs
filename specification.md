@@ -162,6 +162,15 @@ pass a `max_response_size` just above their largest honest answer.
 - At most `max_incoming_links` incoming links. When full, one is closed to make room: the link idle longest
   with no request in progress, or else a random one with no `/blocks` response in progress. In private mode,
   links not identified as a member's are chosen first.
+- **Half-open links.** RNS validates every link request (a key exchange, a proof, a watchdog thread) and keeps
+  the link waiting for the initiator's RTT packet for `6 s × hops + 360 s`; only then is it established and
+  counted above. So, on `rnfs.dht` and on the LXMF delivery destination, links still waiting (RNS `PENDING`
+  or `HANDSHAKE`) are counted in a bucket of their own, also of `max_incoming_links`. When a link request
+  arrives with the bucket full, the oldest waiting link on the interface holding the most of them (the
+  request's own interface on a tie) is closed, rather than the request refused: an honest handshake completes
+  within about one round trip, so a flood can't keep honest initiators out by keeping the bucket full, and a
+  flood arriving on one interface closes its own links first. Each request still costs the node the key
+  exchange and a proof; RNS's own long responder timeout is the root cause.
 - rnfs neither sends nor accepts compressed Resources. Handlers are registered with `auto_compress=False`,
   and nodes MUST set RNS's maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in
   RNS 1.5.6) to 0, since RNS decompresses before any rnfs check runs. Setting it to 0 also stops RNS
@@ -200,20 +209,29 @@ refused by them SHOULD be answered at once, before a response slot is reserved o
   inclusive and end exclusive; a range may wrap past midnight. During a range `/blocks` MUST be refused.
 - **Upload budget** (`upload_budget`, bytes per hour, node-wide): a token bucket of `upload_budget` bytes,
   refilled continuously at `upload_budget / 3600` bytes per second, starting full.
-  - A response carrying at least one block is charged its packed size. It is allowed if the bucket holds at
-    least that size, or if the bucket is full, so one honest response larger than what is left is delayed but
-    never starved; the bucket may go into debt this way. A response refused for its size is not charged.
-  - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have at most
-    half the bucket's capacity charged in responses still in flight. Its response's block budget is cut to
+  - A response carrying at least one block costs its packed size, **charged as it is sent** (from its
+    Resource's progress), not up front. It is allowed if the bucket holds at least that size beyond what the
+    responses in flight are still committed to send, or if the bucket is full and nothing is committed, so one
+    honest response larger than what is left is delayed but never starved; the bucket may go into debt this
+    way. A response refused for its size is not charged.
+  - **Reservation and commitment.** When it is allowed, a response is charged a reservation of at most one
+    packet (the link's MDU: its advertisement). The rest of it counts as committed, when admitting other
+    responses, while it is within its grace (Displacement, above) or once it has sent something, so responses
+    admitted together can't overrun the bucket. A response past its grace with nothing sent commits nothing:
+    responses a requester never downloads hold at most their reservations. A single-packet response, and one
+    whose progress can't be followed, is charged in full when it is allowed.
+  - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have
+    responses in flight costing at most half the bucket's capacity. Its response's block budget is cut to
     what is left of that share (the first block is always included, section 7), and a requester at its share
     is refused. So with a full bucket one response is at most about `upload_budget / 2`, and one requester
-    can't take the whole budget.
-  - **Settlement.** When a charged response ends without completing (it failed, was cancelled, missed its
-    deadline, was displaced, never started, or its link closed), what it didn't send is given back: the
-    charge less its progress times its size. Completed responses, single-packet responses and responses whose
-    progress can't be read keep their charge.
-  - While the bucket is not full, the response's block budget (section 7) is cut to what the bucket holds,
-    less 1 KiB.
+    can't size its responses to take the whole budget at once. Identities are free, so this shares the bucket
+    among requesters rather than bounding a determined one; what keeps a requester that withholds downloads
+    from holding the budget is that only bytes sent are charged.
+  - **Settlement.** When a response concludes (it completed, failed, was cancelled, missed its deadline, was
+    displaced, never started, or its link closed), its charge is made final: its size if it completed or its
+    progress can't be read, else its progress times its size. A reservation it didn't use is given back.
+  - While the bucket is not full, or responses in flight are committed, the response's block budget (section
+    7) is cut to what the bucket holds less what is committed, less 1 KiB.
   - A request arriving while the bucket is empty or in debt is refused before its response is built.
   - Responses of only `None` entries are not charged.
 
@@ -532,7 +550,7 @@ and repeat.
   - `max_bytes`;
   - `MAX_RESPONSE_SIZE − 1 KiB`, so the encoded response stays within `MAX_RESPONSE_SIZE`;
   - if the link has a rate estimate, `response_target` of transfer at the lower of that estimate and
-    `max_upload_rate`;
+    `max_upload_rate`; if it has none, `CHUNK_SIZE` (what a requester asks for then, enforced);
   - with an upload budget whose bucket isn't full, what the bucket holds, less 1 KiB, and in any case what is
     left of the requester's half share (section 3, Airtime controls).
 - **What a node serves:** only blocks in the DAG of a CID it currently provides (the same reachability GC
@@ -804,14 +822,14 @@ as is cheap. Rules live in the sections referenced.
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
 | Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress; requester stall detection (2, 3, 7) |
-| Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links (3) |
+| Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
 | Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
-| Uploads exhausting a shared channel | `upload_budget` (at most half of it per requester in flight, unsent parts refunded), interface rules and quiet hours, applied to `/blocks` only (3) |
+| Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
 | Republishing and retries draining airtime | Small `keep_max_names`; slower, jittered republishing of name keys; paced lookups on slow nodes; follow backoff (6, 9) |
 
@@ -867,12 +885,19 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - An attacker that behaves exactly like a slow-link client competes fairly for the slow pool's slots, and
   can't be told apart from one.
 - Displacement protection and the cooldown stop a requester holding a response slot without transferring, and
-  the cooldown binds a link and its identity. A flood of fresh unidentified links that each take a slot,
-  transfer nothing, and are replaced before their cooldown matters can still keep a pool busy; each counts as
-  its own requester, so the cooldown doesn't bind them. Where all such links arrive over one interface
-  (a single upstream transport node), the per-interface rule can't separate them from honest requesters on
-  the same interface either. The hold is no longer free — the attacker must keep opening links, which incoming
-  link admission and RNS link establishment bound — but the fast pool can still be denied this way.
+  the cooldown binds a link and its identity. But each unidentified link is its own requester, so many links
+  that each take a slot, transfer nothing for one grace, and then sit out their cooldown can still keep a pool
+  busy: either fresh links, at about one per grace per slot (0.7 a second for the two fast slots over TCP,
+  whose grace is 3 s), or a fixed set of about `slots × (blocks_cooldown + grace) / grace` links (42 at the
+  defaults, within `max_incoming_links`), used in turn. Where they all arrive over one interface (a single
+  upstream transport node), nothing at admission tells them from honest requesters on the same interface: a
+  newcomer with no history looks the same either way. Limits on young links or on new links per interface
+  don't bind the fixed set and would hold back honest peers reaching the node through one transport node; a
+  waiting list giving freed slots to the requester refused longest ago only shares slots per link, which the
+  attacker multiplies (measured over real RNS: no change, honest refusal 0.95–1.0 either way). So the fast
+  pool can still be denied this way. The hold is no longer free: the attacker must keep links open and
+  polling, or keep opening them. An operator under such an attack can raise `blocks_cooldown`, so that a fixed
+  set would need more links than `max_incoming_links` admits, leaving only fresh links to do it.
 - An outside web site can frame a gateway page and receive public content from it by `postMessage` (outside
   private mode, only content public by CID).
 
@@ -1113,7 +1138,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |
 | `verbosity` | 0 | Extra logging: 1 per-query detail, 2 RNS debug output |
-| `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket, at most half of it per requester in flight, unsent parts refunded (section 3) |
+| `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket charged for bytes sent, at most half of it per requester in flight (section 3) |
 | `serve_interfaces` | empty (all) | Serve `/blocks` only on these RNS interfaces (names or prefixes, case-insensitive; a spawned interface also matches its parent's name) |
 | `no_serve_interfaces` | empty | Never serve `/blocks` on these interfaces; takes precedence over `serve_interfaces` |
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
