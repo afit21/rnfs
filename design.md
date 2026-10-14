@@ -137,7 +137,13 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   (max(256 MiB, 2% of the filesystem)) free. `max_storage` itself never refuses a fetch: it is enforced by
   eviction once fetches end.
 - `evict() -> set[Cid]` enforce `max_storage` (LRU cached fetches); `gc() -> stats` evicts every cached fetch;
-  both delete unreachable blocks and report targets no longer complete, so the node can withdraw them.
+  both delete unreachable blocks and report targets no longer complete, so the node can withdraw them. Both
+  first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
+  memos; completeness via `dag_blocks`), then decide and delete under the lock from the pins, sessions and
+  records current then, so `get` (and `/blocks` serving) waits only for that in-memory walk and the deletions,
+  and a block that became reachable meanwhile is kept. `pins.json` is still written under the lock on every
+  pin and unpin: a pin must be on disk when `pin()` returns (names' crash consistency and `rnfs pin add`
+  depend on it), and before a collection can delete what an `unpin()` released.
 - `verify() -> stats` re-checks every block, deleting bad ones.
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
@@ -236,7 +242,10 @@ first `refresh()` only after the features have registered their key sources, so 
 kept names' keys. `publish_due` republishes `DhtKey`s every max(effective `republish_interval`, 3 days)
 with a per-key ±10% jitter (capped below `PROVIDER_TTL / 2`), drops a withdrawal of any key it provides to
 the same node in that round, and on slow nodes runs at most 10 lookups per round, waiting 30 s × the
-round's lookups before the next (never-published items first, then the longest unpublished).
+round's lookups before the next (never-published items first, then the longest unpublished). When
+`refresh()` finds a key provided again, it cancels that key's queued withdrawals (their nodes join its earlier
+nodes) and re-records the node's own record, and a round sends only withdrawals still queued when it reaches
+each node, so a withdrawal queued while the key was briefly unprovided never follows a store of it.
 `protocol.provide_batches` puts withdrawals before stores, and a key in both lists is only stored.
 
 Errors: `ValueError` → 400, `NotFound` → 404, `TooLarge` → 413, `InvalidDag` → 422, `Busy` → 503,
@@ -464,8 +473,11 @@ Everything in the specification is implemented, with these simplifications and a
 - Withdrawals are sent once, with any provides due for the same node. One that fails isn't retried, since the
   record expires after `PROVIDER_TTL`. A CID is withdrawn from the nodes of its last round and from nodes of
   earlier rounds, or of a round cut short, that may still hold its record (`Publisher._earlier`, persisted in
-  `published.json`, forgotten after `PROVIDER_TTL`). A round stopped before every node was sent its keys
-  leaves its CIDs due, and persisted times later than now are clamped to now.
+  `published.json`, forgotten after `PROVIDER_TTL`). Each node that accepts a key is added there as its
+  `/provide` returns, and `published.json` is saved every 10 nodes or 30 s of a round
+  (`SAVE_EVERY_NODES`, `SAVE_EVERY_SECONDS`), so a crash loses at most that much of where a round stored.
+  A round stopped before every node was sent its keys leaves its CIDs due, and persisted times later than now
+  are clamped to now.
 - A CID whose lookup found no nodes to publish to is retried after 30 s rather than at the next republish.
 - When every provider has failed, the provider lookup runs again only if its previous run found a new
   provider (and time is left).
@@ -555,8 +567,15 @@ Everything in the specification is implemented, with these simplifications and a
   (`NameManager.record` or the kept record) from two keepers, at most `keeper_rounds()` batches (3; 2 on slow
   nodes, where one current answer is enough once a sequence is known).
 - **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
-  offers kept records, makes a path request and queries keepers before choosing a sequence. The pins of name
-  keys deleted by hand are released by `release_gone()`, once the features are set up. The name table marks
+  offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins
+  the new target, saves `names.json` (the commit point; a failed save rolls the record back and releases the
+  new pin) and only then releases the old target, so `names.json`'s target is pinned at every step. Once the
+  features are set up, `reconcile_pins(storage.pins())` releases the pins of name keys deleted by hand
+  (`release_gone()`), pins a recorded target again if its pin is missing, and releases `name:` pins nothing
+  records; a key without a `names.json` entry keeps its pins until its next publish or removal (`_stale`,
+  where a release that failed with `OSError` also waits). `Storage.pin`/`unpin` undo their change in memory
+  if saving `pins.json` fails. Follow and LXMF do the same for their sources at start
+  (`_release_unfollowed`, `_release_unrecorded`). The name table marks
   entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
   no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
   `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`), which `_offer` checks.

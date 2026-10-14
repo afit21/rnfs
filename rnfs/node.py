@@ -313,8 +313,9 @@ class RnfsNode:
         self.features: dict[str, features.Feature] = {}
         for cls in features.feature_classes():
             self.features[cls.name] = cls(self)
-        # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too
-        self.names.release_gone()
+        # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
+        # name pins are made to match names.json, which a crash inside a publish can leave them disagreeing with
+        self.names.reconcile_pins(self.storage.pins())
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
         self.publisher.refresh()

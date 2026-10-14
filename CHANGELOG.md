@@ -92,6 +92,25 @@ DHT and names:
 - A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
   client never sends more.
 
+Publishing, names and storage:
+- A CID unpinned and pinned again while a publish round was sending (or evicted and fetched again) could be
+  withdrawn by the next round from the nodes that had just stored it, and the node's own record of it was
+  gone too, until its next republish. Providing a key again now cancels its queued withdrawals and records
+  the node itself again, and a round sends only the withdrawals still queued.
+- Where a publish round stored each key is saved as the round goes (every 10 nodes or 30 s), so records stored
+  by a round cut short by a crash are withdrawn later; they used to stay until they expired.
+- `name publish` is crash-consistent: it pins the new target, saves `names.json`, then releases the old
+  target, and a failed save (a full disk) undoes the publish. A crash or failed save used to leave the name
+  recorded at a target no longer pinned (which `gc` deleted) and the new one pinned by `name:<alias>`, which
+  `pin rm` refused and `name rm` didn't release. At start the node now makes `name:` pins match `names.json`,
+  releases `follow:` pins of names no longer followed and `lxmf:` pins no saved inbox message records, which
+  a crash inside `name unfollow` or before the inbox was saved used to leave for good. A followed name's check
+  releases every other target its pin source holds. A pin or unpin whose `pins.json` save fails no longer
+  stays changed in memory.
+- Eviction and `gc` read the DAG nodes they walk before taking the storage lock, so serving `/blocks` no longer
+  waits while the first eviction after a start reads every stored DAG node (about 0.4 s with 20 000 blocks);
+  what to delete is still decided under the lock, so nothing that became reachable meanwhile is deleted.
+
 ## 0.1.3
 
 Joining the DHT:

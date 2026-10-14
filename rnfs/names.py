@@ -210,8 +210,8 @@ class NameAnnounceHandler:
 class NameManager:
     """This node's name keys and records, and the records it has heard. Thread-safe.
 
-    Lifecycle: construct (loads keys and state, no RNS needed), release_gone() once the node and its features are
-    set up, start() once Reticulum runs, run(stop_event) on a thread for re-announces, stop() at shutdown.
+    Lifecycle: construct (loads keys and state, no RNS needed), reconcile_pins() once the node and its features
+    are set up, start() once Reticulum runs, run(stop_event) on a thread for re-announces, stop() at shutdown.
     """
 
     def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic):
@@ -255,6 +255,12 @@ class NameManager:
         self.keepers = None
         # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
         self._gone: list[tuple[str, Cid]] = []
+        # Aliases with an entry in names.json: for these the recorded target (or none) is the only CID their pin
+        # source may hold (reconcile_pins). A key without one (names.json lost) may have pins nothing records
+        self._recorded: set[str] = set()
+        # alias -> CIDs its pin source holds that its record doesn't (left by a crash, or an unpin that failed):
+        # released by its next publish or removal
+        self._stale: dict[str, set[Cid]] = {}
 
         self._remove_old_temps()
         self._load_keys()
@@ -300,8 +306,11 @@ class NameManager:
         with self._lock:
             self._identity(alias)
             published = self._published.pop(alias, None)
+            held = self._stale.pop(alias, set())
             if published is not None and published.cid is not None:
-                self._pins.unpin(published.cid, PIN_SOURCE_PREFIX + alias)
+                held.add(published.cid)
+            self._release(alias, held)
+            self._stale.pop(alias, None)  # one that failed is released at the next start (reconcile_pins)
             self._next_announce.pop(alias, None)
             destination = self._destinations.pop(alias, None)
             if destination is not None:
@@ -309,6 +318,7 @@ class NameManager:
             name = self._names.pop(alias)
             del self._aliases[name]
             del self._keys[alias]
+            self._recorded.discard(alias)
             # State first: a crash before the key file is gone leaves an unpublished name, not a lost pin
             self._save()
             key_path = self._key_path(alias)
@@ -331,6 +341,57 @@ class NameManager:
                 self._pins.unpin(cid, PIN_SOURCE_PREFIX + alias)
             if gone:
                 self._save()  # its entry is dropped only once its pin is released
+
+    def reconcile_pins(self, pins: dict[Cid, set[str]]):
+        """Make the name pins (pins: every pin and its sources, as storage.pins() gives them) match names.json,
+        once the node is set up: release_gone(), then pin each recorded target that lacks its name's pin and
+        release name pins nothing records (a crash inside publish() can leave one, and earlier rnfs versions
+        could leave one that `pin rm` and `name rm` couldn't remove).
+
+        A key with no names.json entry (the file was lost) keeps its pins until its next publish or removal,
+        which release them; a pin of an alias with no key at all is released.
+        """
+        self.release_gone()
+        with self._lock:
+            held: dict[str, set[Cid]] = {}
+            for cid, sources in pins.items():
+                for source in sources:
+                    if source.startswith(PIN_SOURCE_PREFIX):
+                        held.setdefault(source[len(PIN_SOURCE_PREFIX):], set()).add(cid)
+            for alias in sorted(set(held) | set(self._keys)):
+                cids = held.get(alias, set())
+                if alias not in self._keys:
+                    log(f"releasing the pins of name {alias}, which has no key", LOG_WARNING)
+                    self._release(alias, cids)
+                    self._stale.pop(alias, None)  # retried at the next start
+                    continue
+                recorded = self._published[alias].cid
+                if alias not in self._recorded:
+                    if cids:
+                        log(f"name {alias} has no record in {STATE_FILE}; its pins are released at its next "
+                            "publish", LOG_WARNING)
+                        self._stale.setdefault(alias, set()).update(cids)
+                    continue
+                if recorded is not None and recorded not in cids:
+                    log(f"pinning {recorded} again for name {alias}, as {STATE_FILE} records", LOG_WARNING)
+                    try:
+                        self._pins.pin(recorded, PIN_SOURCE_PREFIX + alias)
+                    except OSError as e:  # e.g. a read-only state directory: start all the same
+                        log(f"could not pin {recorded} for name {alias}: {e}", LOG_ERROR)
+                extra = cids - {recorded}
+                if extra:
+                    log(f"releasing {len(extra)} pin(s) of name {alias} that {STATE_FILE} doesn't record", LOG_WARNING)
+                    self._release(alias, extra)
+
+    def _release(self, alias: str, cids):
+        """Release alias's pin source from cids; one that fails (a disk error saving pins) is logged and kept in
+        _stale, for the next publish or removal. Lock held."""
+        for cid in cids:
+            try:
+                self._pins.unpin(cid, PIN_SOURCE_PREFIX + alias)
+            except OSError as e:
+                log(f"could not release {cid} from name {alias}: {e}", LOG_ERROR)
+                self._stale.setdefault(alias, set()).add(cid)
 
     def name(self, alias: str) -> bytes:
         """alias's name. NotFound if no such alias."""
@@ -377,15 +438,27 @@ class NameManager:
                 raise RnfsError(f"name {alias} has reached the highest sequence")
 
             source = PIN_SOURCE_PREFIX + alias
-            # Pin the new target before releasing the old one, so blocks they share are never unprotected
+            # Crash-consistent: pin the new target, then save names.json (the commit point), then release the old
+            # target. A crash leaves at most an extra pin of this source, which reconcile_pins() releases at the
+            # next start, and the recorded target is pinned at every step (blocks they share stay protected)
             self._pins.pin(cid, source)
-            if previous.cid is not None and previous.cid != cid:
-                self._pins.unpin(previous.cid, source)
-
+            held_before = self._held.get(name)
             self._published[alias] = _Published(sequence, cid)
-            self._drop_from_table(name)
             self._held[name] = Record(sequence, cid, self._clock())
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                # Not published: back to what names.json still says (ENOSPC, EIO)
+                self._published[alias] = previous
+                if held_before is None:
+                    self._held.pop(name, None)
+                else:
+                    self._held[name] = held_before
+                if cid != previous.cid and cid not in self._stale.get(alias, set()):
+                    self._release(alias, {cid})
+                raise
+            self._drop_from_table(name)
+            self._release(alias, ({previous.cid} | self._stale.pop(alias, set())) - {cid, None})
             self._announce(alias)
             identity = self._keys[alias]
         log(f"published {name.hex()} ({alias}) -> {cid}, sequence {sequence}", LOG_NOTICE)
@@ -753,6 +826,7 @@ class NameManager:
         self._aliases[name] = alias
         self._published[alias] = published
         self._save()
+        self._recorded.add(alias)
         if self._started:
             self._open_destination(alias)
 
@@ -810,6 +884,7 @@ class NameManager:
                 published = _Published(int(entry["sequence"]), cid, bool(entry.get("imported", False)))
                 if alias in self._keys:
                     self._published[alias] = published
+                    self._recorded.add(alias)
                 elif cid is not None:
                     # Its key file was deleted by hand: nothing will republish it, so release its pin
                     self._gone.append((alias, cid))

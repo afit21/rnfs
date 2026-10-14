@@ -47,6 +47,10 @@ KEY_PREFIX = "key:"  # how a DhtKey is written in the state file
 # PROVIDER_TTL (7 days), so republishing every 3 days still survives a missed round
 KEY_MIN_INTERVAL = 3 * DAY
 KEY_JITTER = 0.1  # +-10% of the interval, fixed per key
+# While a round sends, where it stored is saved after this many nodes or seconds, whichever comes first, so a
+# crash loses at most that much of it (a record no saved state lists can't be withdrawn: it lives PROVIDER_TTL)
+SAVE_EVERY_NODES = 10
+SAVE_EVERY_SECONDS = 30.0
 # Slow nodes: a closest-nodes lookup is several /find exchanges (alpha 1, a few hops), seconds of airtime at
 # LoRa rates. One per 30 s keeps republishing a hundred keys to well under 1% of a day's airtime per hour
 SLOW_LOOKUP_PACE = 30.0
@@ -262,12 +266,34 @@ class Publisher:
                 record = self._published.pop(cid, None)
                 for node_id in set(record[1] if record else []) | set(self._earlier.pop(cid, {})):
                     self._withdrawals.setdefault(node_id, set()).add(cid.key)
+            cancelled = [cid for cid in added if self._provide_again(cid)]
             if removed:
                 log(f"no longer providing {plural(len(removed), 'CID')}", LOG_VERBOSE)
-        if removed:
+        if removed or cancelled:
             self.save()
         if removed or any(self._is_due(cid, self.clock()) for cid in added):
             self.wake()
+
+    def _provide_again(self, cid: "Cid | DhtKey") -> bool:
+        """cid is provided (again): record ourselves locally and cancel withdrawals of its key still queued;
+        True if any were. Lock held.
+
+        A withdrawal queued when it stopped being provided would otherwise reach a node after a round stored it
+        there again, deleting the fresh record (section 6). Those nodes may still hold a record of it, so they
+        join its earlier nodes, to be withdrawn from should it stop being provided again.
+        """
+        self.providers.store(cid.key, self.own_id)  # refresh() withdrew it when it stopped being provided
+        now = self.clock()
+        cancelled = False
+        for node_id, keys in list(self._withdrawals.items()):
+            if cid.key in keys:
+                keys.discard(cid.key)
+                if not keys:
+                    del self._withdrawals[node_id]
+                earlier = self._earlier.setdefault(cid, {})
+                earlier[node_id] = max(now, earlier.get(node_id, now))
+                cancelled = True
+        return cancelled
 
     # Publishing
 
@@ -345,39 +371,61 @@ class Publisher:
                 del closest[cid]
                 self.providers.withdraw(cid.key, self.own_id)
 
-        by_node: dict[bytes, list[Cid]] = {}
-        for cid, nodes in closest.items():
-            for node_id in nodes:
-                by_node.setdefault(node_id, []).append(cid)
-        superseded: dict[bytes, set[bytes]] = {}
-        for node_id, cids in by_node.items():
-            # Withdrawing a key from a node while storing it there would delete the fresh record (a restart
-            # can queue withdrawals of keys still provided): the store wins, and the withdrawal is dropped
-            if node_id in withdrawals:
-                superseded[node_id] = withdrawals[node_id] & {cid.key for cid in cids}
-                withdrawals[node_id] -= superseded[node_id]
+            by_node: dict[bytes, list[Cid]] = {}
+            for cid, nodes in closest.items():
+                for node_id in nodes:
+                    by_node.setdefault(node_id, []).append(cid)
+            for node_id, cids in by_node.items():
+                # Withdrawing a key from a node while storing it there would delete the fresh record: the store
+                # wins, and the withdrawal is dropped (refresh() cancels those of a key provided again, so this
+                # is only for state from elsewhere)
+                superseded = withdrawals.get(node_id, set()) & {cid.key for cid in cids}
+                if superseded:
+                    withdrawals[node_id] -= superseded
+                    self._withdrawals[node_id] -= superseded
+                    if not self._withdrawals[node_id]:
+                        del self._withdrawals[node_id]
         accepted: dict[Cid, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
+        unsaved, saved_at = 0, self.clock()
         for node_id in sorted(set(by_node) | set(withdrawals)):
             if should_stop():
                 break
             cids = by_node.get(node_id, [])
-            withdrawn = withdrawals.get(node_id, set())
+            with self._lock:
+                # Only what is still queued: a key provided again since the snapshot had its withdrawals cancelled
+                withdrawn = withdrawals.get(node_id, set()) & self._withdrawals.get(node_id, set())
+            if not cids and not withdrawn:
+                continue
             # Not retried until the next republish whatever the outcome, so it counts as sent either way.
             # The node may hold records of the keys it got before any refusal: those are withdrawn later
             recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
             sent_withdrawals[node_id] = withdrawn
-            for cid in cids:
-                if cid.key in recorded:
+            answered = self.clock()
+            with self._lock:
+                for cid in cids:
+                    if cid.key not in recorded:
+                        continue
                     accepted[cid].append(node_id)
+                    # Remembered at once, and saved every few nodes, so a round cut short by a crash still
+                    # leaves a record of where it stored, to withdraw from (the round's end settles the rest)
+                    if cid in self._provided:
+                        earlier = self._earlier.setdefault(cid, {})
+                        earlier[node_id] = max(answered, earlier.get(node_id, answered))
+                    else:
+                        self._withdrawals.setdefault(node_id, set()).add(cid.key)
             missed = sum(1 for cid in cids if cid.key not in recorded)
             if missed:
                 log(f"{node_name(node_id)} didn't record {plural(missed, 'key')}", LOG_VERBOSE)
+            unsaved += 1
+            if unsaved >= SAVE_EVERY_NODES or answered - saved_at >= SAVE_EVERY_SECONDS:
+                self.save()
+                unsaved, saved_at = 0, answered
 
         unfinished: list[Cid] = []
         with self._lock:
             for node_id, keys in sent_withdrawals.items():
-                remaining = self._withdrawals.get(node_id, set()) - keys - superseded.get(node_id, set())
+                remaining = self._withdrawals.get(node_id, set()) - keys
                 if remaining:
                     self._withdrawals[node_id] = remaining
                 else:
@@ -403,7 +451,8 @@ class Publisher:
                         earlier.pop(node_id, None)
                 else:
                     # Stopped before every node was sent its keys: left due (unpublished), keeping where it went
-                    earlier.update((node_id, now) for node_id in accepted[cid])
+                    for node_id in accepted[cid]:
+                        earlier[node_id] = max(now, earlier.get(node_id, now))
                     unfinished.append(cid)
                 if earlier:
                     self._earlier[cid] = earlier
