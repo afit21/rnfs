@@ -20,8 +20,9 @@ Behaviour:
 - Access-Control-Allow-Origin: * on GET (and HEAD, which mirrors GET) only when the Referer's origin is
   this gateway (http://127.0.0.1:<port> or http://localhost:<port>), so sandboxed pages, whose origin is
   opaque, can fetch() their own DAG. Never in private mode. Vary: Referer keeps browser caches honest.
-- Errors other than 500 say what went wrong; a 500 says only that, and its detail (which may name local
-  paths) goes to the log, since a gateway page may be allowed to read the response (the CORS rule above).
+- A GatewayError (the gateway's own refusals) or NotFound says what went wrong. Every other error (a 400,
+  413, 422, 503 or 507 from the node, or a 500) gets only a fixed message for its status: a node error's text
+  can name local paths, disk space or limits. The detail goes to the log (500: as an error; others verbose).
 - Requests that aren't the user's own navigation (Sec-Fetch-Site present and not "none") may hold at most
   gateway_fetches network fetches or name resolutions at a time; over that, 503 with Retry-After.
   Content already stored (node.is_local) is served without limit. A request with no Sec-Fetch-Site is
@@ -47,7 +48,8 @@ from rnfs.api import LocalServer, TimedHandler, error_status, host_allowed, logg
 from rnfs import gateway_formats  # --- content ---
 from rnfs.content.cid import Cid
 from rnfs.content.seal import is_sealed  # --- content ---
-from rnfs.log import LOG_ERROR, log
+from rnfs.errors import NotFound
+from rnfs.log import LOG_ERROR, LOG_VERBOSE, log
 
 CSP_SCRIPTS = ("sandbox allow-scripts allow-forms allow-popups; "
                "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'")
@@ -59,6 +61,10 @@ SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing s
 NAME_CACHE_TIME = 60.0
 NAME_CACHE_SIZE = 1000
 INDEX = "index.html"
+# What an error from the node says on the gateway, by status: never its own text (see the module docstring)
+ERROR_MESSAGES = {400: "invalid request", 413: "too large for this node's download limits",
+                  422: "invalid content: it breaks the rnfs format's rules", 503: "the node is busy; try again shortly",
+                  507: "not enough free disk space on this node", 500: "internal error; see the rnfs daemon's log"}
 RANGE_NUMBER = re.compile(r"[0-9]{1,18}")  # ASCII digits only (str.isdigit() takes "¹²³"), and below 2**63
 
 # Types some platforms' mimetypes tables lack or get wrong (on Windows, mimetypes also reads the registry,
@@ -370,14 +376,15 @@ class GatewayHandler(TimedHandler):
             self.serve()
         except GatewayError as e:
             self.respond_error(e.status, str(e), e.headers)
+        except NotFound as e:
+            self.respond_error(404, str(e) or "not found", {})
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
-            if status == 500:
-                log(f"gateway {self.command} {loggable(self.path)} failed: {e!r}", LOG_ERROR)
-                message = "internal error; see the rnfs daemon's log"  # str(e) may name local paths
-            else:
-                message = str(e) or type(e).__name__
-            self.respond_error(status, message, {"Retry-After": RETRY_AFTER} if status == 503 else {})
+            # str(e) may name local paths (a StorageFull's or an OSError's) or the node's limits: logged only
+            log(f"gateway {self.command} {loggable(self.path)} failed: {e!r}",
+                LOG_ERROR if status == 500 else LOG_VERBOSE)
+            self.respond_error(status, ERROR_MESSAGES.get(status, ERROR_MESSAGES[500]),
+                               {"Retry-After": RETRY_AFTER} if status == 503 else {})
         finally:
             if self.slot:
                 self.limiter.release()

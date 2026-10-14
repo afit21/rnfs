@@ -677,8 +677,9 @@ class Storage:
             return  # can't tell; writing the blocks reports a real failure
         reserve = max(DISK_RESERVE_MIN, int(usage.total * DISK_RESERVE_FRACTION))
         if nbytes > usage.free - reserve:
-            raise StorageFull(f"not enough free disk space: {size(nbytes)} more would leave less than "
-                              f"{size(reserve)} free in {self.blocks.directory} ({size(usage.free)} free)")
+            # No path: the message can travel beyond the local user (job errors, companion pages relaying daemon errors)
+            raise StorageFull(f"not enough free disk space: {size(nbytes)} more would leave less than the "
+                              f"{size(reserve)} reserve free ({size(usage.free)} free)")
 
     def evict(self, needed: int = 0) -> set[Cid]:
         """Enforce max_storage, leaving room for needed more bytes: delete unreached blocks, then cached

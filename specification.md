@@ -886,8 +886,9 @@ gateway can never reach the API.
   allow-scripts allow-forms allow-popups; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
   form-action 'self'`. Pages run in an opaque origin and can't load resources from other servers;
   navigation and WebRTC can still reveal the viewer. A node MAY disable scripts (`gateway_scripts`).
-- A `500` response says only that an internal error happened; its details, which may name local paths, go to
-  the log, since a gateway page may be allowed to read the response (below).
+- The gateway's own refusals (a bad path or CID, a method other than GET or HEAD, a `409` or `416`…) and a `404`
+  say what went wrong. Any other error from the node (`400`, `413`, `422`, `503`, `507` or `500`) gets only a
+  fixed message for its status; the details, which may name local paths, disk space or limits, go to the log.
 - `GET` (and `HEAD`) responses carry `Access-Control-Allow-Origin: *` only when the request's `Referer` has the
   gateway's own origin (`127.0.0.1:8789` or `localhost:8789`), so pages can `fetch()` files in their own DAG
   despite their opaque origin, while other web sites can't read rnfs content directly. In private mode the

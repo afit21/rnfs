@@ -2,6 +2,14 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## Unreleased
+
+Gateway privacy:
+- Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
+  message for their status; the detail goes to the daemon's log. A `507` used to show the local blocks
+  directory, the free disk space and the reserve. The storage-full message no longer names the directory
+  anywhere (the CLI and API still show free space against the reserve).
+
 ## 0.1.3
 
 Joining the DHT:

@@ -248,8 +248,9 @@ belongs to another user or can't be made 0700 (not on Windows). A response to a 
 `X-Rnfs-Challenge: <32 hex>` carries `X-Rnfs-Proof: cli.api_proof(token, port, challenge)` (HMAC-SHA256 of
 `rnfs api proof <port> <challenge>`); `ApiClient.verify_daemon` checks it with `GET /api/status` before first
 sending the token. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
-32, gateway 64) and refuse HTTP/0.9 with a 400 carrying the usual headers. Gateway 500s say only "internal
-error" (the detail goes to the log); malformed `Range` headers are ignored.
+32, gateway 64) and refuse HTTP/0.9 with a 400 carrying the usual headers. Gateway errors raised by the node
+(anything but `GatewayError` and `NotFound`: 400, 413, 422, 503, 507, 500) say only a fixed message per status
+(`gateway.ERROR_MESSAGES`; the detail goes to the log); malformed `Range` headers are ignored.
 
 ## Content additions
 

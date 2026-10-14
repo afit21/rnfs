@@ -1,9 +1,10 @@
-"""I1: a gateway 507 (storage full) carries the StorageFull message as is, which names the local blocks directory
+"""I1: a gateway 507 (storage full) carried the StorageFull message as is, which named the local blocks directory
 and the disk's free space and reserve.
 
 A real offline node holds a file root whose chunks claim 2**60 bytes each; the gateway's GET of it fails the disk
 check before anything is fetched, and the 507's body is read back. The disk usage is fixed by a mock so the sizes in
-the message are known. The fixed behaviour sends a generic message for 507, as it already does for 500.
+the message are known. The gateway now sends a generic message for 507, as it does for 500, and the StorageFull
+message itself no longer names the directory; it keeps the figures, for the local user's CLI and API.
 """
 import os
 import shutil
@@ -18,6 +19,7 @@ from rnfs.content import dag
 from rnfs.content import storage as storage_module
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.storage import USER
+from rnfs.errors import StorageFull
 from rnfs.gateway import GatewayServer
 from rnfs.log import size
 from rnfs.node import RnfsNode
@@ -71,20 +73,19 @@ class GatewayStorageFullTest(unittest.TestCase):
         details = [self.config.rnfs_dir, self.config.blocks_dir, size(FREE), size(self.reserve)]
         return [detail for detail in details if detail in body]
 
-    def test_507_names_the_blocks_directory_and_disk_space(self):
-        status, body = self.get_root()
-        self.assertEqual(status, 507, body)
-        self.assertIn(self.config.blocks_dir, body)
-        self.assertIn(f"{size(FREE)} free", body)
-        self.assertIn(size(self.reserve), body)
-
-    # I1: fails until the gateway sends a generic message for 507, without the local path or disk figures
-    @unittest.expectedFailure
     def test_507_message_is_generic(self):
         status, body = self.get_root()
         self.assertEqual(status, 507, body)
         self.assertEqual(self.local_details(body), [], f"the 507 body reveals local details: {body!r}")
 
+    def test_storage_full_names_no_path_but_keeps_the_figures(self):
+        # What the CLI and API show the local user: free space against the reserve, but not where the blocks are
+        with self.assertRaises(StorageFull) as caught:
+            self.node.storage.check_disk(2 ** 60)
+        message = str(caught.exception)
+        self.assertNotIn(self.config.rnfs_dir, message)
+        self.assertIn(f"{size(FREE)} free", message)
+        self.assertIn(size(self.reserve), message)
 
 if __name__ == "__main__":
     unittest.main()
