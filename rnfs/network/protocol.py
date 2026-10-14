@@ -18,8 +18,8 @@ import time
 import RNS
 from RNS.vendor import umsgpack
 
-from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE,
-                            MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH)
+from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_BLOCK_SIZE, MAX_PROVIDE_KEYS,
+                            MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH)
 from rnfs.content.cid import Cid
 
 __all__ = ["FIND_PATH", "PROVIDE_PATH", "BLOCKS_PATH", "PIN_PATH"]
@@ -114,10 +114,12 @@ def encode_provide(keys: list[bytes], withdrawn: list[bytes]) -> list:
 
 
 def parse_provide_request(data) -> tuple[list[bytes], list[bytes]] | None:
-    """(keys, withdrawn keys) from a /provide request, or None if malformed."""
+    """(keys, withdrawn keys) from a /provide request, or None if malformed (over MAX_PROVIDE_KEYS in all)."""
     if type(data) is not list or len(data) != 2:
         return None
     keys, withdrawn = data
+    if type(keys) is not list or type(withdrawn) is not list or len(keys) + len(withdrawn) > MAX_PROVIDE_KEYS:
+        return None
     if not is_id_list(keys) or not is_id_list(withdrawn):
         return None
     return keys, withdrawn

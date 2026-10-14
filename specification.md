@@ -123,7 +123,8 @@ pass a `max_response_size` just above their largest honest answer.
   left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered.
 - Every request fits in one packet: at most `min(Link.get_mdu(), MAX_REQUEST_SIZE)` bytes including RNS's
   request framing (~28 bytes). Batch sizes are computed from that (e.g. 22 keys per `/provide` at the default
-  MTU, counting both lists).
+  MTU, counting both lists). A `/provide` carries at most 55 keys, counting both lists (the most that fit
+  `MAX_REQUEST_SIZE`); a longer one is malformed.
 
 **Limits.** These keep a node usable under load.
 - Requests are at most `MAX_REQUEST_SIZE` (`Destination.set_max_request_size`).
@@ -473,9 +474,19 @@ and repeat.
 - A record expires `PROVIDER_TTL` after it was last stored, keeps its first-stored time across republishes,
   and is removed on withdrawal. These times are wall-clock and persisted; one later than the current time (a
   clock since corrected backwards) counts as now, so a record can't outlive its TTL.
-- A node keeps at most `max_records`. When full, it evicts a record of the publisher it first saw most
-  recently, so a flood of new identities displaces only itself. First-seen times are persisted, and dropped
-  once a publisher has no records left.
+- A node keeps at most `max_records`, a tenth of them in a *newcomer pool*. When the rest is full, a
+  publisher first seen before the most recent one there evicts a record of that most recent publisher (the
+  one it stored least recently), so a flood of new identities can't displace older publishers. Any other
+  publisher (one not seen before, or the most recent one) stores into the pool, evicting a pooled record
+  chosen at random when the pool is full, but never one of its own: so a new publisher can always store
+  something, and a flood churns only the pool. A pooled record leaves the pool when it is republished while
+  the rest has room. The node's own records are always accepted.
+- First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
+  (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
+  oldest departure forgotten first), so a publisher that was away for a while isn't new again.
+- A node SHOULD limit how many records one publisher holds, its own excepted (rnfs: `max_records / 100`, at
+  least 10, once the publisher has been seen for `provider_seniority`, and a tenth of that, at least 10,
+  before), so one identity can't fill the store and a fresh one gets little.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
   max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
@@ -983,7 +994,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit) |
 | `startup_announce_delay` | 30 s | Second announce after startup |
 | `max_parallel_providers` | 3; 1 on slow nodes | |
-| `provider_seniority` | 1 day | Providers in the routing table this long are tried first |
+| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first; a publisher seen this long gets its full share of the provider store |
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
 | `stall_timeout` | 120 s | |

@@ -2,6 +2,18 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## Unreleased
+
+DHT and names:
+- A full provider store keeps a tenth of its room as a newcomer pool, with random eviction inside it, so a
+  publisher it hasn't seen can still store records; about 100 identities filling the store used to lock out
+  every new publisher. Publishers seen before still displace the newest one outside the pool, and the node's
+  own records are always accepted (they were refused once the store was full). A publisher's share of the
+  store grows with age: a tenth of it until it has been seen for `provider_seniority`. First-seen times are
+  kept for a week after a publisher's last record goes, so one that was away for a while isn't new again.
+- A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
+  client never sends more.
+
 ## 0.1.3
 
 Joining the DHT:

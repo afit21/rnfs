@@ -150,12 +150,17 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 (True if dropped), `remove(node_id)`, `ban(node_id)`, `is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
 `seniority(node_id) -> float | None` (seconds in the table), `contains(node_id)`, `node_count()`.
 
-`providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random)`:
-`store(key, publisher) -> bool`, `withdraw(key, publisher)`, `for_reply(key, exclude=lambda id: False) -> list[bytes]`,
-`expire()`, `record_count()`, `save()`. Local limits against flooding: one publisher holds at most max(10,
-`max_records` // 100) records (not the node's own, `own_id`), and a key keeps at most 1000 publishers: a
-newcomer to a full key evicts a random one, never one of the `K/2` oldest records. Times later than now (a
-clock corrected backwards) are clamped to now at load and at each `expire()`.
+`providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random,
+own_id=None, seniority=0)`: `store(key, publisher) -> bool`, `withdraw(key, publisher)`,
+`for_reply(key, exclude=lambda id: False) -> list[bytes]`, `expire()`, `record_count()`, `allowance(publisher)`,
+`save()`. Local limits against flooding: one publisher holds at most max(10, `max_records` // 100) records once
+seen for `seniority` (the node passes `provider_seniority`) and a tenth of that (at least 10) before, the
+node's own (`own_id`) excepted; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
+one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool with random eviction: the
+pooled records sit in a list for O(1) random picks, and the newest publisher with records outside the pool comes
+from a heap of (first seen, arrival) with stale entries dropped lazily. First-seen times of departed publishers
+(seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order. Times later than now
+(a clock corrected backwards) are clamped to now at load and at each `expire()`.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
