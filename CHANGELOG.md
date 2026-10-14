@@ -73,6 +73,14 @@ DHT and names:
 - A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
   client never sends more.
 
+Publishing, names and storage:
+- A CID unpinned and pinned again while a publish round was sending (or evicted and fetched again) could be
+  withdrawn by the next round from the nodes that had just stored it, and the node's own record of it was
+  gone too, until its next republish. Providing a key again now cancels its queued withdrawals and records
+  the node itself again, and a round sends only the withdrawals still queued.
+- Where a publish round stored each key is saved as the round goes (every 10 nodes or 30 s), so records stored
+  by a round cut short by a crash are withdrawn later; they used to stay until they expired.
+
 ## 0.1.3
 
 Joining the DHT:

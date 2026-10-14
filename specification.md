@@ -475,12 +475,14 @@ and repeat.
   a request it refused (e.g. up to a local limit), so the publisher SHOULD count every key it sent to that
   node, up to and including that request, as possibly recorded there.
 - To stop providing a CID (unpinned, deleted), a node SHOULD send it as a withdrawn key to the nodes it last
-  published it to, and to nodes of earlier rounds (or of a round cut short) whose record may not have expired:
-  the closest nodes change as nodes come and go.
+  published it to, and to nodes of earlier rounds (or of a round cut short, including by a crash) whose record
+  may not have expired: the closest nodes change as nodes come and go. So it SHOULD persist where a round
+  stored as the round goes, not only when it ends (rnfs: every 10 nodes or 30 s).
 - A responder applies a `/provide`'s withdrawals before its keys, so a key in both lists is stored. A
   publisher MUST NOT send a withdrawal of a key in a later request to the same node than a store of it (that
-  would delete what it just stored): it sends withdrawals in the first batches, and doesn't withdraw a key it
-  is providing to that node in the same round.
+  would delete what it just stored): it sends withdrawals in the first batches, doesn't withdraw a key it
+  is providing to that node in the same round, and cancels the withdrawals still queued for a key when it
+  provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
   (rnfs: at most 10 per publish round, and after a round of n lookups the next waits 30 × n s; items never
   published go first, then those unpublished longest). Withdrawals are not delayed by this.
