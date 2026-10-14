@@ -88,6 +88,9 @@ Publishing, names and storage:
   a crash inside `name unfollow` or before the inbox was saved used to leave for good. A followed name's check
   releases every other target its pin source holds. A pin or unpin whose `pins.json` save fails no longer
   stays changed in memory.
+- Eviction and `gc` read the DAG nodes they walk before taking the storage lock, so serving `/blocks` no longer
+  waits while the first eviction after a start reads every stored DAG node (about 0.4 s with 20 000 blocks);
+  what to delete is still decided under the lock, so nothing that became reachable meanwhile is deleted.
 
 ## 0.1.3
 

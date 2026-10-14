@@ -13,7 +13,8 @@
 
 Pins and cache records are persisted as JSON under state_dir: pins at once, cache records (which change on
 every fetch) by save(), which the node calls periodically and at shutdown. Thread-safe: one lock guards the
-indexes; long walks (completeness) run outside it and are discarded if blocks were deleted meanwhile.
+indexes; long walks run outside it: completeness walks are discarded if blocks were deleted meanwhile, and
+eviction and gc read the DAG nodes they will walk beforehand (_warm), deciding what to delete under the lock.
 """
 import json
 import os
@@ -44,6 +45,7 @@ DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the bloc
 DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
+MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
 
 _IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
 
@@ -177,6 +179,8 @@ class Storage:
         self._cache: OrderedDict[tuple[Cid, tuple[str, ...]], Cid] = OrderedDict()  # oldest first
         self._sessions: list[Session] = []
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
+        # Where a path step leads from a stored DAG node: node -> {name: _step_in's answer}; memoised like _links
+        self._steps: dict[Cid, dict[str, tuple[Cid, bool] | None]] = {}
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
         self._generation = 0  # incremented whenever blocks are deleted, invalidating walks in progress
         self._cache_dirty = False  # cache records changed since the last save()
@@ -434,16 +438,46 @@ class Storage:
         children decide what collection keeps."""
         if cid.is_raw or cid not in self._sizes:
             return None
+        node = self._read_node(cid)
+        return DAMAGED if node is MISSING else node
+
+    def _read_node(self, cid: Cid):
+        """The DAG node cid read from disk, needing no lock: as _node, but MISSING if it isn't stored."""
+        if cid.is_raw:
+            return None
         try:
             block = self.blocks.get(cid)
         except OSError:
-            block = None
-        if block is None or len(block) > MAX_BLOCK_SIZE or not cid.verify(block):
+            return DAMAGED
+        if block is None:
+            return MISSING
+        if len(block) > MAX_BLOCK_SIZE or not cid.verify(block):
             return DAMAGED
         try:
             return dag.decode(block)
         except InvalidDag:
             return None
+
+    @staticmethod
+    def _listed(node) -> tuple[Cid, ...]:
+        """The CIDs a decoded DAG node lists; none for None (raw, missing or invalid)."""
+        if node is None:
+            return ()
+        if isinstance(node, DirectoryNode):
+            return tuple(entry.cid for entry in node.entries)
+        return tuple(child.cid for child in node.children)
+
+    @staticmethod
+    def _step_in(node, name: str) -> tuple[Cid, bool] | None:
+        """Where the path step name leads from a decoded node: (entry, True) through a directory, (child, False)
+        to the index node child that may hold it, or None (no such entry, or not a directory)."""
+        if isinstance(node, DirectoryNode):
+            entry = next((e for e in node.entries if e.name == name), None)
+            return None if entry is None else (entry.cid, True)
+        if isinstance(node, IndexNode):
+            candidates = [c for c in node.children if c.first_name <= name]
+            return (candidates[-1].cid, False) if candidates else None
+        return None
 
     def _children(self, cid: Cid) -> tuple[Cid, ...] | None:
         """CIDs listed by a stored DAG node; none for raw, missing or invalid blocks; None if the node is
@@ -452,13 +486,7 @@ class Storage:
             node = self._node(cid)
             if node is DAMAGED:
                 return None  # not memoised: verify() removes it, or a fetch replaces it
-            if node is None:
-                listed: tuple[Cid, ...] = ()
-            elif isinstance(node, DirectoryNode):
-                listed = tuple(entry.cid for entry in node.entries)
-            else:
-                listed = tuple(child.cid for child in node.children)
-            self._links[cid] = listed
+            self._links[cid] = self._listed(node)
         return self._links[cid]
 
     def _reach(self, roots, known: set[Cid] | frozenset[Cid] = frozenset(),
@@ -491,30 +519,85 @@ class Storage:
                 if current.is_raw or current not in self._sizes:
                     return found
                 found.add(current)
-                node = self._node(current)
-                if node is DAMAGED and damaged is not None:
-                    damaged.add(current)
-                if isinstance(node, DirectoryNode):
-                    entry = next((e for e in node.entries if e.name == name), None)
-                    if entry is None:
-                        return found
-                    current = entry.cid
-                    break
-                if isinstance(node, IndexNode):
-                    candidates = [c for c in node.children if c.first_name <= name]
-                    if not candidates:
-                        return found
-                    current = candidates[-1].cid
-                    continue
-                return found
+                step = self._steps.get(current, {}).get(name, MISSING)
+                if step is MISSING:
+                    node = self._node(current)
+                    if node is DAMAGED:
+                        if damaged is not None:
+                            damaged.add(current)
+                        return found  # not memoised, as in _children
+                    step = self._steps.setdefault(current, {})[name] = self._step_in(node, name)
+                if step is None:
+                    return found
+                current, through_directory = step
+                if through_directory:
+                    break  # the next name
         return found
+
+    def _warm(self, roots: set[Cid], paths: list[tuple[Cid, tuple[str, ...]]]):
+        """Read and decode, without the lock, the DAG nodes a collection will walk from roots and along paths,
+        and memoise what they list (_links, _steps), so the walk under the lock reads (almost) nothing from disk
+        and /blocks serving isn't held up behind it.
+
+        Only a memo is filled here, never a decision: a CID's content never changes, and only nodes read whole
+        and matching their CID are memoised (a damaged or missing one is left for the walk under the lock). What
+        to delete is still decided under the lock, from the pins, sessions and records current then, so a block
+        that became reachable meanwhile is kept; nodes stored meanwhile are read under the lock.
+        """
+        with self._lock:
+            links = dict(self._links)
+            steps = {cid: dict(names) for cid, names in self._steps.items()}
+        found_links: dict[Cid, tuple[Cid, ...]] = {}
+        found_steps: dict[tuple[Cid, str], tuple[Cid, bool] | None] = {}
+        seen: set[Cid] = set()
+        stack = list(roots)
+        while stack:
+            cid = stack.pop()
+            if cid in seen or cid.is_raw:
+                continue
+            seen.add(cid)
+            listed = links.get(cid)
+            if listed is None:
+                node = self._read_node(cid)
+                if node is MISSING or node is DAMAGED:
+                    continue
+                listed = found_links[cid] = self._listed(node)
+            stack.extend(child for child in listed if child not in seen and not child.is_raw)
+
+        def step(cid: Cid, name: str):
+            """_step_in's answer for cid, memoised or read; MISSING if cid can't be read."""
+            known = steps.get(cid, {}).get(name, found_steps.get((cid, name), MISSING))
+            if known is MISSING:
+                node = self._read_node(cid)
+                if node is MISSING or node is DAMAGED:
+                    return MISSING
+                known = found_steps[(cid, name)] = self._step_in(node, name)
+            return known
+
+        for root, names in paths:
+            current, ended = root, False
+            for name in names:
+                while not ended:
+                    result = None if current.is_raw else step(current, name)
+                    if result is None or result is MISSING:
+                        ended = True  # the path ends here, or the walk under the lock reads it
+                    else:
+                        current, through_directory = result
+                        if through_directory:
+                            break  # the next name
+                if ended:
+                    break
+        with self._lock:
+            for cid, listed in found_links.items():
+                if cid in self._sizes:
+                    self._links.setdefault(cid, listed)
+            for (cid, name), step in found_steps.items():
+                if cid in self._sizes:
+                    self._steps.setdefault(cid, {}).setdefault(name, step)
 
     def _live(self, damaged: set[Cid] | None = None) -> set[Cid]:
         """Every stored block a pin, a session or a cached fetch reaches (lock held)."""
-        roots = set(self._pins)
-        for session in self._sessions:
-            roots |= session.cids
-        roots |= set(self._cache.values())
+        roots = self._roots() | set(self._cache.values())
         live = self._reach(roots, damaged=damaged)
         for root, names in self._cache:
             live |= self._path_cids(root, names, damaged)
@@ -553,6 +636,7 @@ class Storage:
                 deleted.add(cid)
                 freed += self._sizes.pop(cid)
                 self._links.pop(cid, None)
+                self._steps.pop(cid, None)
                 self._reported_damaged.discard(cid)
         if deleted:
             self._used -= freed
@@ -583,11 +667,8 @@ class Storage:
         """
         if not self._cache and not self._maybe_garbage:
             return set(), 0, 0  # only pins and sessions hold blocks: there is nothing to evict
-        roots = set(self._pins)
-        for session in self._sessions:
-            roots |= session.cids
         damaged: set[Cid] = set()
-        live = self._reach(roots, damaged=damaged)
+        live = self._reach(self._roots(), damaged=damaged)
         kept = sum(self._sizes[cid] for cid in live)
         records = list(self._cache.items())  # oldest first
         keep = 0
@@ -703,18 +784,46 @@ class Storage:
 
         Returns pins and cached targets that were complete and no longer are, for withdrawal.
         """
+        def wanted() -> bool:
+            """Whether eviction has anything to do (lock held)."""
+            # With nothing evictable, don't walk everything to find that out again
+            return self._used + needed > self.max_storage and (bool(self._cache) or self._maybe_garbage)
+
         with self._lock:
-            if self._used + needed <= self.max_storage:
+            if not wanted():
                 return set()
-            if not self._cache and not self._maybe_garbage:
-                return set()  # nothing is evictable: don't walk everything to find that out again
-            before = self._complete_sets(self._targets())
+            targets = self._targets()
+            roots = self._roots() | set(self._cache.values())
+            paths = [key for key in self._cache if key[1]]
+        # The long part, reading DAG nodes from disk, runs without the lock (_warm)
+        before = self._complete_sets(targets)
+        self._warm(roots, paths)
+        with self._lock:
+            if not wanted():
+                return set()  # another eviction did it meanwhile
+            before = self._with_memoised(before)
             limit = self.max_storage - needed - self.max_storage // EVICT_MARGIN
             deleted, freed, evicted = self._evict_to(max(0, limit))
             if deleted:
                 log(f"storage: evicted {plural(evicted, 'cached fetch')}, freeing {size(freed)} "
                     f"in {plural(len(deleted), 'block')}", LOG_VERBOSE)
             return {cid for cid, blocks in before.items() if blocks & deleted}
+
+    def _roots(self) -> set[Cid]:
+        """What pins and sessions hold (lock held)."""
+        roots = set(self._pins)
+        for session in self._sessions:
+            roots |= session.cids
+        return roots
+
+    def _with_memoised(self, before: dict[Cid, frozenset[Cid]]) -> dict[Cid, frozenset[Cid]]:
+        """before (complete DAGs found without the lock) plus the targets memoised as complete now, which a
+        deletion about to happen may make incomplete (lock held)."""
+        result = dict(before)
+        for cid in self._targets():
+            if cid in self._complete:
+                result[cid] = self._complete[cid]
+        return result
 
     def gc(self) -> dict:
         """Evict every cached fetch and delete every block no pin or session reaches.
@@ -723,7 +832,13 @@ class Storage:
         "uncached": set[Cid] targets of the evicted fetches}.
         """
         with self._lock:
-            before = self._complete_sets(self._targets())
+            targets = self._targets()
+            roots = self._roots()
+        # The long part without the lock, as in evict(); every cached fetch goes, so only pins and sessions count
+        before = self._complete_sets(targets)
+        self._warm(roots, [])
+        with self._lock:
+            before = self._with_memoised(before)
             uncached = set(self._cache.values())
             if self._cache:
                 self._cache.clear()

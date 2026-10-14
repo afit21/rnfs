@@ -136,7 +136,13 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   (max(256 MiB, 2% of the filesystem)) free. `max_storage` itself never refuses a fetch: it is enforced by
   eviction once fetches end.
 - `evict() -> set[Cid]` enforce `max_storage` (LRU cached fetches); `gc() -> stats` evicts every cached fetch;
-  both delete unreachable blocks and report targets no longer complete, so the node can withdraw them.
+  both delete unreachable blocks and report targets no longer complete, so the node can withdraw them. Both
+  first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
+  memos; completeness via `dag_blocks`), then decide and delete under the lock from the pins, sessions and
+  records current then, so `get` (and `/blocks` serving) waits only for that in-memory walk and the deletions,
+  and a block that became reachable meanwhile is kept. `pins.json` is still written under the lock on every
+  pin and unpin: a pin must be on disk when `pin()` returns (names' crash consistency and `rnfs pin add`
+  depend on it), and before a collection can delete what an `unpin()` released.
 - `verify() -> stats` re-checks every block, deleting bad ones.
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
