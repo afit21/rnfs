@@ -624,8 +624,14 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
 **Name keys.**
 - Each name has its own RNS identity, stored at `<rnfs dir>/names/<alias>`.
 - The name is the hash of that identity's `rnfs.name` destination: 16 bytes, shown as 32 hex characters.
-- Separate keys mean names can't be linked to each other or to the node, and a name can be moved to another
-  machine by exporting its key.
+- A separate key per name means a name can be moved to another machine by exporting its key, and that the name,
+  its announces and its signed records carry nothing that identifies the node or the node's other names.
+- Publishing a name does link it to the node, as providing content does in IPFS (a provider record reveals
+  the PeerID providing a CID). The owner keeps its own names (Keepers, below), so it provides each name's key
+  under its node ID, usually with the oldest record; and it pins and provides each name's target. Anyone who
+  knows a name can look up its keepers and its target's providers and find the owner's node ID there, so the
+  names one node publishes can be linked to that node and to each other. Only names published from different
+  nodes are unlinked.
 
 **Record.**
 - The name destination's announce `app_data` is `[sequence, cid]` (msgpack: unsigned integer, binary CID).
@@ -706,8 +712,10 @@ resolves after its owner's announce has expired from the network.
   once it holds a record of the name. The
   prefix keeps these keys apart from CID keys (SHA-256 of a 36- or 39-byte binary CID).
 - **What is kept.** A node keeps the names its user keeps (`name keep`) or follows, at most `keep_max_names`,
-  and MUST keep its own published names, with records it signs itself, so they resolve through it. Each kept
-  name costs a provider record republished by this node (and, if followed, a pin), hence the small default.
+  and MUST keep its own published names, with records it signs itself, so they resolve through it. Keeping
+  advertises the node's ID under the name's key, which links the node to every name it keeps or publishes
+  (Name keys, above). Each kept name costs a provider record republished by this node (and, if followed, a
+  pin), hence the small default.
   Kept names still without a record are asked for again every `announce_interval`, in turn (rnfs: at most 64
   per round, continuing after the last one asked).
 - **Refreshing.** A keeper replaces its record when it gets a verifying record with a higher sequence, or the
@@ -787,6 +795,8 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - With the default `roots` strategy, complete downloads are published and served while cached, which
   reveals them. With `pinned`, downloads are neither published nor served. Gateway fetches never are.
 - DHT keys don't hide which CID is wanted from someone who already knows the CID.
+- Provider records are public: anyone can look up which node IDs provide a CID, or keep a name. A node's own
+  names are linked to it this way (section 9).
 - Transport nodes on the path see traffic volume and timing.
 - Content is public by CID. Sealed files (section 5) keep their content and name from everyone but their
   recipients, not their size or recipient list.

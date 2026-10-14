@@ -24,6 +24,9 @@ DHT and names:
   place of another name that was only heard, and the highest sequence of each name resolved this way is saved
   in `state/name-floor.json` (up to 4 × `name_table_size` names), so no older record is accepted after table
   churn or a restart.
+- The specification no longer claims that a node's names can't be linked to it or to each other: the node
+  keeps its own names and provides their targets under its node ID, so its names are linked to it, as
+  providing content reveals the provider in IPFS. Behaviour is unchanged.
 - A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
   client never sends more.
 
