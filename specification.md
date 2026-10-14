@@ -844,12 +844,19 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - An attacker that behaves exactly like a slow-link client competes fairly for the slow pool's slots, and
   can't be told apart from one.
 - Displacement protection and the cooldown stop a requester holding a response slot without transferring, and
-  the cooldown binds a link and its identity. A flood of fresh unidentified links that each take a slot,
-  transfer nothing, and are replaced before their cooldown matters can still keep a pool busy; each counts as
-  its own requester, so the cooldown doesn't bind them. Where all such links arrive over one interface
-  (a single upstream transport node), the per-interface rule can't separate them from honest requesters on
-  the same interface either. The hold is no longer free — the attacker must keep opening links, which incoming
-  link admission and RNS link establishment bound — but the fast pool can still be denied this way.
+  the cooldown binds a link and its identity. But each unidentified link is its own requester, so many links
+  that each take a slot, transfer nothing for one grace, and then sit out their cooldown can still keep a pool
+  busy: either fresh links, at about one per grace per slot (0.7 a second for the two fast slots over TCP,
+  whose grace is 3 s), or a fixed set of about `slots × (blocks_cooldown + grace) / grace` links (42 at the
+  defaults, within `max_incoming_links`), used in turn. Where they all arrive over one interface (a single
+  upstream transport node), nothing at admission tells them from honest requesters on the same interface: a
+  newcomer with no history looks the same either way. Limits on young links or on new links per interface
+  don't bind the fixed set and would hold back honest peers reaching the node through one transport node; a
+  waiting list giving freed slots to the requester refused longest ago only shares slots per link, which the
+  attacker multiplies (measured over real RNS: no change, honest refusal 0.95–1.0 either way). So the fast
+  pool can still be denied this way. The hold is no longer free: the attacker must keep links open and
+  polling, or keep opening them. An operator under such an attack can raise `blocks_cooldown`, so that a fixed
+  set would need more links than `max_incoming_links` admits, leaving only fresh links to do it.
 - An outside web site can frame a gateway page and receive public content from it by `postMessage` (outside
   private mode, only content public by CID).
 
