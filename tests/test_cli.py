@@ -301,7 +301,9 @@ class OtherCommandTest(CliTestCase):
         host = f"127.0.0.1:{self.server.port}"
         self.assertEqual(seen, [("/api/status", host, None, True),  # the daemon proves it knows the token first
                                 ("/api/gc", host, self.server.token, False),
-                                ("/api/status", host, None, False)])  # status needs no token
+                                # status sends it too, after the proof: without it the daemon only says its version
+                                ("/api/status", host, None, True),
+                                ("/api/status", host, self.server.token, False)])
 
     def test_printed_fields_are_escaped(self):
         # Whatever the daemon answers is printed with control characters escaped

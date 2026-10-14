@@ -165,6 +165,7 @@ class LocalFacadeTest(NodeTest):
         self.assertTrue(self.a.is_local(cid))
         self.assertFalse(self.a.is_local(str(Cid.for_block(RAW, b"elsewhere"))))
         self.assertEqual(self.a.pin_ls(), [{"cid": cid, "sources": ["user"], "complete": True, "type": "directory",
+                                            "sealed": False,
                                             "name": os.path.abspath(os.path.join(self.tmp.name, "tree"))}])
         self.assertEqual(self.a.stat(cid)["blocks"], self.a.stat(cid)["local_blocks"])
         self.assertIn(Cid.parse(cid), self.a.publisher.provided())

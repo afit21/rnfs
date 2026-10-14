@@ -81,8 +81,13 @@ class H1RealRnsTest(unittest.TestCase):
         return proc
 
     def _status(self):
+        # With the API token: without it, status says only the version
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.api_port}/api/status", timeout=2) as r:
+            with open(os.path.join(self.victim_dir, "api_token"), encoding="ascii") as f:
+                token = f.read().strip()
+            request = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/api/status",
+                                             headers={"X-Rnfs-Api": token})
+            with urllib.request.urlopen(request, timeout=2) as r:
                 return json.load(r)
         except OSError:
             return None
