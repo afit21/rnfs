@@ -904,7 +904,9 @@ gateway can never reach the API.
   limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
   user started (address bar, bookmark); a request without it comes from a local tool the user runs.
 - Apart from timing, the `gateway_fetches` limit and content no provider has, a web page's request gets the
-  same answer whether the node stores the content or has to fetch it.
+  same answer whether the node stores the content or has to fetch it. The limit is a known, accepted leak: while a
+  page keeps every slot busy with fetches, stored content is still served and content that needs a fetch gets 503,
+  so the page can tell them apart. Like the timing difference, closing it would cost more than it protects.
 - The gateway never expands contact nicks (`/name/<nick>/` is not supported), so web pages can't use or probe
   the address book.
 

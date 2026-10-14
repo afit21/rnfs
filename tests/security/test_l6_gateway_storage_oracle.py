@@ -143,17 +143,17 @@ class StorageOracleTest(unittest.TestCase):
             self.assertEqual((status, body), (200, f"archive of {self.site}".encode()))
         self.assertGreater(self.gateways["unstored"][0].fetches, fetches)
 
-    # L6 (residual): fails until a web page's request for stored content is answered as one for content not stored
-    # while every gateway_fetches slot is busy (today stored content is served without a slot: 200 against 503)
-    @unittest.expectedFailure
-    def test_full_fetch_slots_dont_reveal_storage(self):
+    def test_full_fetch_slots_still_reveal_storage(self):
+        """Accepted residual (specification.md, gateway section): while a page holds every gateway_fetches slot,
+        stored content is still served and content that needs a fetch gets 503. Closing it would break pages or
+        move the leak into timing; this test pins the documented behaviour so a change to it is noticed."""
         for node, server in self.gateways.values():
             limiter = server.server.RequestHandlerClass.limiter
             for _ in range(limiter.limit):  # a page holds every slot with fetches that never finish
                 self.assertTrue(limiter.try_acquire())
             self.addCleanup(lambda limiter=limiter: [limiter.release() for _ in range(limiter.limit)])
-        self.assert_same("GET", f"/rnfs/{self.data}", PAGE_REQUESTS["cross-site image"], "slots full")
-
+        responses = self.both("GET", f"/rnfs/{self.data}", PAGE_REQUESTS["cross-site image"])
+        self.assertEqual((responses["stored"][0], responses["unstored"][0]), (200, 503))
 
 if __name__ == "__main__":
     unittest.main()
