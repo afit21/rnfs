@@ -952,12 +952,13 @@ class RnfsNode:
                         f"quota ({size(used)} of {size(quota)} used)", LOG_WARNING)
                     return
                 # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks
+                # (fetch_dag also bounds them by what the size can hold, whichever is lower)
                 fetch.max_dag_bytes = quota - used
                 try:
                     fetch.fetch_dag(expect)
-                except TooLarge:
+                except TooLarge as e:
                     log(f"dropping remote pin of {cid} for {source}: its blocks would exceed its quota "
-                        f"({size(used)} of {size(quota)} used)", LOG_WARNING)
+                        f"({size(used)} of {size(quota)} used) or what its size can hold: {e}", LOG_WARNING)
                     return
                 with self._lock:
                     # Checked and pinned under the lock, so a release arriving now is either seen or undoes it

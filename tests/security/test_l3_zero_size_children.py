@@ -1,10 +1,11 @@
-"""L3: a file node may list children of size 0, so a file that declares 1 byte can make `get` download an unbounded
+"""L3: a file node may list children of size 0, so a file that declares 1 byte could make `get` download an unbounded
 DAG of empty file nodes.
 
 B gets, through the real Fetcher and default config limits, a root served by A whose content is b"x" but whose DAG
-holds about 2 MB of distinct file nodes made only of empty chunks. `get` downloads every one of them (and, with a
-small max_storage, evicts an unrelated cached fetch to make room), while reading the same file the way `cat` does
-fetches 2 blocks. The fixed behaviour bounds a `get` by the declared size plus per-node overhead.
+holds about 2 MB of distinct file nodes made only of empty chunks. Before the fix `get` downloaded every one of them
+(and, with a small max_storage, evicted an unrelated cached fetch to make room). fetch_dag now bounds the DAG's
+bytes by what the declared size can hold (rnfs.fetcher.dag_bound), so the get is refused with TooLarge after the
+root, and reading the same file the way `cat` does still fetches 2 blocks.
 """
 import io
 import os
@@ -12,7 +13,7 @@ import unittest
 
 from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import Cid
-from rnfs.errors import RnfsError
+from rnfs.errors import RnfsError, TooLarge
 from tests.security._content_helpers import SLACK, TwoNodeTest
 from tests.test_node import A_ID
 
@@ -38,28 +39,24 @@ class ZeroSizeChildrenTest(TwoNodeTest):
         cid = Cid.parse(self.honest)
         return cid in self.b.storage.cached_targets() and self.b.storage.is_complete(cid)
 
-    def test_get_downloads_every_empty_file_node(self):
+    def test_get_is_refused_without_evicting_the_cache(self):
         self.assertEqual(self.b.info(str(self.bomb.root))["size"], 1)  # what info and the gateway show
         out = os.path.join(self.tmp.name, "out")
-        self.b.get(str(self.bomb.root), out)
-        with open(out, "rb") as f:
-            self.assertEqual(f.read(), b"x")
-        # Every distinct block of the DAG came over the network (the root for info, the rest for get) to write
-        # 1 byte: about 2 MB
-        self.assertEqual(self.net.downloaded_blocks, len(self.bomb.blocks))
-        self.assertEqual(self.net.downloaded_bytes, self.bomb.total_bytes())
-        self.assertGreater(self.net.downloaded_bytes, 2_000_000)  # over 8 times what the fixed bound allows
-        self.assertGreater(self.net.downloaded_bytes, 8 * (self.bomb.size + SLACK))
-        # Room for it was made by evicting the unrelated cached fetch
-        self.assertFalse(self.honest_cached())
+        with self.assertRaises(TooLarge) as caught:
+            self.b.get(str(self.bomb.root), out)
+        self.assertIn("refusing it", str(caught.exception))
+        self.assertFalse(os.path.lexists(out))
+        # Only the root came over the network (for info): none of the empty file nodes below it
+        self.assertEqual(self.net.downloaded_blocks, 1)
+        self.assertLess(self.net.downloaded_bytes, self.bomb.size + SLACK)
+        # Nothing needed room, so the unrelated cached fetch is still there
+        self.assertTrue(self.honest_cached())
 
     def test_read_range_fetches_two_blocks(self):
         self.assertEqual(b"".join(self.b.read(str(self.bomb.root))), b"x")
         self.assertEqual(self.net.downloaded_blocks, 2)  # the root and the 1-byte chunk: empty subtrees skipped
         self.assertTrue(self.honest_cached())
 
-    # L3: fails until a get of a root declaring N bytes downloads at most about N bytes plus per-node overhead
-    @unittest.expectedFailure
     def test_get_downloads_about_the_declared_size(self):
         out = os.path.join(self.tmp.name, "out")
         try:

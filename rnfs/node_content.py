@@ -193,7 +193,8 @@ def block(node, cid: str, for_gateway: bool = False) -> bytes:
 
 def export_stream(node, target: str, start: Callable[[int], BinaryIO | None], for_gateway: bool = False) -> dict:
     """Fetch the target's DAG, then write its archive to start(exact archive length): the stream to write to,
-    or None to write nothing (HEAD). Limits as for export: max_download_size, max_output_entries."""
+    or None to write nothing (HEAD). Limits as for export: max_download_size, max_output_entries, and the DAG
+    byte bound of fetch_dag."""
     root, names = walker.parse_target(target)
     with node._fetching(root, names, None, for_gateway) as fetch:
         expect = fetch.resolve()

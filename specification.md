@@ -533,15 +533,28 @@ and repeat.
    (section 5), so a DAG can't hide its size.
 4. Writing out a DAG (`get`, `ls`, the gateway, `export`) stops with an error after `max_output_entries`
    entries, counting every occurrence. This catches DAGs that repeat empty subtrees, which have size 0.
-5. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
+5. Fetching a target's whole DAG (`get`, `pin add`, `export`, `dir set` and `dir rm`, a followed name's new
+   target, the gateway's archives, remote pins and LXMF auto-fetches) is bounded by what its verified size can
+   hold. The bytes of its distinct blocks, stored or downloaded, may not exceed the size, plus 64 bytes per
+   4 KiB of it (rounded up), plus 1 KiB, plus 1 KiB per directory entry or index child met (at most
+   `max_output_entries` of them); a remote pin's or auto-fetch's quota applies too, whichever is lower. A file
+   node may list children of size 0, so without this a file that declares 1 byte could hold any number of
+   distinct nodes. Every DAG built by the tree rule (section 5) stays far inside the bound: its file nodes take
+   under 13 bytes per 4 KiB of content, and each entry, with the nodes above it and the levels of a file
+   below it, under 1 KiB. A fetch that would exceed it fails ("too large") without marking the root invalid.
+   While the bound applies, a requester asks only for blocks that fit the room it leaves, counting a DAG node
+   not yet received as `MAX_BLOCK_SIZE` (a directory or index node as its header only, since its entries bring
+   more room than they take), and always for at least one block when none is in flight, so a fetch downloads
+   at most about one block beyond the bound. Byte-range reads are lazy and skip empty children instead.
+6. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
    only contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or
    misses the same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels
    the transfer, and its blocks are requested again from another provider; providers that keep failing are
    handled as in section 6. A fetch that fails or is cancelled closes the links of its requests still in
    flight, so their responses don't keep using the link and hold up the next `/blocks` to those nodes.
-6. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
+7. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
-7. When the target is complete, the node provides it if its strategy says so (section 6).
+8. When the target is complete, the node provides it if its strategy says so (section 6).
 
 ## 8. Storage
 
@@ -688,7 +701,9 @@ resolves after its owner's announce has expired from the network.
 
 **Following.** A node MAY *follow* a name (`name follow`): it keeps the name and pins its latest target with
 source `follow:<name>`. When the name moves, the new target is fetched completely in the background and
-pinned, and only then is the previous target's follow pin released, so a complete copy is always held. A
+pinned, and only then is the previous target's follow pin released, so a complete copy is always held. The
+fetch has the usual limits: `max_download_size`, the DAG byte bound of its new target's size (section 7) and
+the disk reserve (section 8). A
 followed name is checked when a newer record is heard and every `announce_interval`.
 - The periodic check uses the record held, unless nothing was heard for the name for
   2 × `announce_interval`; only then does it resolve through the network (a path request, then keepers).
@@ -719,7 +734,7 @@ as is cheap. Rules live in the sections referenced.
 | Threat | Protection |
 |---|---|
 | Forged or corrupted data | Every block verified against its CID (7) |
-| Size lies, repeated or empty-subtree bombs, deep trees | Verified sizes, `max_download_size`, `max_output_entries`, `MAX_DEPTH`, each block fetched once (5, 7) |
+| Size lies, repeated or empty-subtree bombs, deep trees | Verified sizes, `max_download_size`, `max_output_entries`, the DAG byte bound of whole-DAG fetches, `MAX_DEPTH`, each block fetched once (5, 7) |
 | Malformed DAG nodes | Strict msgpack types, re-encoding and per-node checks (5). The tree rule gives honest writers one CID per content; readers don't enforce it |
 | Advertising on someone else's behalf | Records name only the identified requester (6) |
 | Advertising content it doesn't have, or stale records | Failed providers removed; the search runs again; withdrawals (6, 7) |
