@@ -235,6 +235,15 @@ shasum -a 256 rnfs-0.1.3-py3-none-any.whl         # macOS: compare with the line
 Get-FileHash .\rnfs-0.1.3-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
 ```
 
+A matching checksum shows the download is whole, not who made it: anyone able to replace a release's files
+could replace `SHA256SUMS` too. Every file also has signed build provenance, which shows it was built by this
+repository's release workflow. Check it with the [GitHub CLI](https://cli.github.com/) (2.49 or newer,
+logged in with `gh auth login`):
+
+```sh
+gh attestation verify rnfs_0.1.3_amd64.deb --repo afit21/rnfs
+```
+
 ### Other ways to install
 
 The install script installs the latest release; pipx from GitHub and a source checkout install the latest
@@ -255,8 +264,11 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 ```
 
 This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
-`~/.local/share/rnfs/venv`. Dependencies are installed at the versions pinned in the source's
-`packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
+`~/.local/share/rnfs/venv`. It installs the release's source archive (`rnfs-X.Y.Z.tar.gz`) only if it matches
+the release's `SHA256SUMS` and, if the [GitHub CLI](https://cli.github.com/) (2.49 or newer) is installed and
+logged in, its signed build provenance (`gh attestation verify`). Without `gh` it warns that only the checksum
+was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it stop instead. Dependencies are installed at the
+versions pinned in the source's `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
 `~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
 
 ```sh
@@ -271,6 +283,7 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   the service, it restarts.
 - **Main branch:** `--main` installs the latest code from the main branch, which may be newer than the
   latest release. Give it again each time you update, or the next update goes back to the latest release.
+  The branch has no checksums or provenance to check.
 - **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
   `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
   `loginctl enable-linger $USER`.

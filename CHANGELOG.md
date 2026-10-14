@@ -31,6 +31,13 @@ Platform and packaging:
   An existing rnfs dir or identity file that lets others in is tightened (with a notice), the daemon refuses
   an rnfs dir owned by another account, and every command refuses a token file others can read, as on POSIX.
   A `--dir` outside `%USERPROFILE%` gets a warning. Not yet tested on Windows itself.
+- `install.sh` installs the latest release from its sdist (`rnfs-X.Y.Z.tar.gz`, a release file) instead of
+  GitHub's archive of the tag, which neither `SHA256SUMS` nor the build provenance covers and which a moved tag
+  would change unnoticed. The sdist must match the release's `SHA256SUMS`; where the GitHub CLI (2.49 or
+  newer) is installed and logged in, its signed provenance is checked too (`gh attestation verify`, signed by
+  the release workflow), and a mismatch or failed check stops the install. Without `gh` it warns that only
+  the checksum was checked; `RNFS_REQUIRE_ATTESTATION=1` makes that an error. The README's "Checking a
+  download" shows `gh attestation verify`.
 - The identity file's permission fix no longer follows a symlink: a symlink at the identity path is left as
   it is, with a warning, and the file is changed through a descriptor opened with `O_NOFOLLOW`.
 
