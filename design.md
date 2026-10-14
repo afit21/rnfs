@@ -306,12 +306,15 @@ and in total, never persisted.
   `/blocks` from a link (and its identity, if identified) whose response was displaced or cancelled for making
   no progress, for `blocks_cooldown`, cheaply and before any slot is taken.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
-  caps the block budget, and charges the bucket once the response's size is known. Each `Response` records
-  its charge and its requester (identity hash, else link ID); one requester's unsettled charges may reach at
-  most half the bucket's capacity (`_budget_share_left` cuts the budget, or refuses). When a response
-  concludes (`_finish`), a failed, cancelled, displaced or never-started Resource, or one whose link closed,
-  refunds `charged − progress × size`; completed, single-packet and untracked responses, and ones whose
-  progress can't be read, keep their charge.
+  caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
+  (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
+  (one admission at a time) allows a response if the bucket holds its cost beyond `_committed()` (the
+  uncharged rest of other responses within their grace or that have sent something), and charges a
+  reservation of at most the link's MDU; single-packet and untracked responses are charged in full.
+  `check_responses` charges progress as it reads it (`_charge_progress`), and `_settle` (from `_finish`)
+  makes the charge final: the cost if completed or progress is unreadable, else progress × size, refunding
+  an unused reservation. One requester's responses in flight may cost at most half the bucket's capacity
+  (`_budget_share_left` cuts the budget, or refuses).
   `RequestServer.traffic` and `PeerClient.traffic` share one `Traffic`.
 - `network/guards.py` also rejects, on `rnfs.dht` links only (recognised by the link's destination or owner
   name `rnfs.dht.<hex>`), any Resource advertisement with more than one segment.

@@ -199,20 +199,29 @@ refused by them SHOULD be answered at once, before a response slot is reserved o
   inclusive and end exclusive; a range may wrap past midnight. During a range `/blocks` MUST be refused.
 - **Upload budget** (`upload_budget`, bytes per hour, node-wide): a token bucket of `upload_budget` bytes,
   refilled continuously at `upload_budget / 3600` bytes per second, starting full.
-  - A response carrying at least one block is charged its packed size. It is allowed if the bucket holds at
-    least that size, or if the bucket is full, so one honest response larger than what is left is delayed but
-    never starved; the bucket may go into debt this way. A response refused for its size is not charged.
-  - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have at most
-    half the bucket's capacity charged in responses still in flight. Its response's block budget is cut to
+  - A response carrying at least one block costs its packed size, **charged as it is sent** (from its
+    Resource's progress), not up front. It is allowed if the bucket holds at least that size beyond what the
+    responses in flight are still committed to send, or if the bucket is full and nothing is committed, so one
+    honest response larger than what is left is delayed but never starved; the bucket may go into debt this
+    way. A response refused for its size is not charged.
+  - **Reservation and commitment.** When it is allowed, a response is charged a reservation of at most one
+    packet (the link's MDU: its advertisement). The rest of it counts as committed, when admitting other
+    responses, while it is within its grace (Displacement, above) or once it has sent something, so responses
+    admitted together can't overrun the bucket. A response past its grace with nothing sent commits nothing:
+    responses a requester never downloads hold at most their reservations. A single-packet response, and one
+    whose progress can't be followed, is charged in full when it is allowed.
+  - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have
+    responses in flight costing at most half the bucket's capacity. Its response's block budget is cut to
     what is left of that share (the first block is always included, section 7), and a requester at its share
     is refused. So with a full bucket one response is at most about `upload_budget / 2`, and one requester
-    can't take the whole budget.
-  - **Settlement.** When a charged response ends without completing (it failed, was cancelled, missed its
-    deadline, was displaced, never started, or its link closed), what it didn't send is given back: the
-    charge less its progress times its size. Completed responses, single-packet responses and responses whose
-    progress can't be read keep their charge.
-  - While the bucket is not full, the response's block budget (section 7) is cut to what the bucket holds,
-    less 1 KiB.
+    can't size its responses to take the whole budget at once. Identities are free, so this shares the bucket
+    among requesters rather than bounding a determined one; what keeps a requester that withholds downloads
+    from holding the budget is that only bytes sent are charged.
+  - **Settlement.** When a response concludes (it completed, failed, was cancelled, missed its deadline, was
+    displaced, never started, or its link closed), its charge is made final: its size if it completed or its
+    progress can't be read, else its progress times its size. A reservation it didn't use is given back.
+  - While the bucket is not full, or responses in flight are committed, the response's block budget (section
+    7) is cut to what the bucket holds less what is committed, less 1 KiB.
   - A request arriving while the bucket is empty or in debt is refused before its response is built.
   - Responses of only `None` entries are not charged.
 
@@ -772,7 +781,7 @@ as is cheap. Rules live in the sections referenced.
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
 | Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
-| Uploads exhausting a shared channel | `upload_budget` (at most half of it per requester in flight, unsent parts refunded), interface rules and quiet hours, applied to `/blocks` only (3) |
+| Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
 | Republishing and retries draining airtime | Small `keep_max_names`; slower, jittered republishing of name keys; paced lookups on slow nodes; follow backoff (6, 9) |
 
@@ -1068,7 +1077,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |
 | `verbosity` | 0 | Extra logging: 1 per-query detail, 2 RNS debug output |
-| `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket, at most half of it per requester in flight, unsent parts refunded (section 3) |
+| `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket charged for bytes sent, at most half of it per requester in flight (section 3) |
 | `serve_interfaces` | empty (all) | Serve `/blocks` only on these RNS interfaces (names or prefixes, case-insensitive; a spawned interface also matches its parent's name) |
 | `no_serve_interfaces` | empty | Never serve `/blocks` on these interfaces; takes precedence over `serve_interfaces` |
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
