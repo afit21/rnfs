@@ -193,7 +193,10 @@ class LinkPoolTest(unittest.TestCase):
         self.assertEqual(peer.link.identities, [])
 
     def test_private_mode_identifies_every_link(self):
-        pool = links.LinkPool(self.identity, Config(private=True))
+        # Private mode links only to members: NODE's recalled identity is one
+        member = types.SimpleNamespace(node_id=NODE, hash=bytes([7]) * 16)
+        links.RNS.Identity = types.SimpleNamespace(recall=lambda node_id: member)
+        pool = links.LinkPool(self.identity, Config(private=True, members=[member.hash.hex()]))
         self.addCleanup(pool.close_all)
         peer = run(self, lambda: pool.get(NODE))
         self.assertEqual(peer.link.identities, [self.identity])

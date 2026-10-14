@@ -17,6 +17,26 @@ Fixes:
   the output fits, so a `get` could fill the disk.
 - Names given as text must be exactly 32 hex digits (optionally in `<angle brackets>`, with spaces around):
   whitespace between the digits used to be skipped, giving a name shorter than 16 bytes.
+- A remote `/pin` accepted just as the previous one of that identity finished was answered "accepted" and
+  never fetched (sending it again didn't help): the fetch thread now deregisters in the same step that finds
+  nothing left. If the thread can't be started the `/pin` is refused, where the identity used to be stuck
+  until a restart, its pins queuing up and then being refused.
+- Remote pins accepted but not yet fetched survive a restart: they are saved in `state/remote_pins.json` and
+  fetched again at start, unless their identity has left `remote_pin_identities`. They used to be dropped
+  silently.
+
+Local API and privacy:
+- `GET /api/status` without the API token answers only `{"version": ...}`, enough for health checks; the node
+  ID, identity hash, LXMF address and traffic counters need the token, as `/api/lxmf/address` already did.
+  `rnfs status` sends the token (without a readable one it prints just the version and says why).
+- `pin ls` says which pins are sealed files: `(sealed)` in the listing and `"sealed": true` in `--json`
+  (`false` for other files and directories, `null` when the stored blocks can't tell). The local name of a
+  sealed add is still the path or name you gave, kept on your machine only; anything that shows pins to
+  others must leave sealed entries out.
+- The README and specification now say plainly that under the default `provide_strategy = "roots"` every
+  complete download, `cat` and `stat` of other nodes' content included, is provided and served, so anyone
+  can learn what the node fetched, and that `"pinned"` avoids it; and that scripts showing content to others
+  must use `cat --raw`, since `cat` decrypts sealed files this node can open. Behaviour is unchanged.
 
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
@@ -91,6 +111,14 @@ DHT and names:
   providing content reveals the provider in IPFS. Behaviour is unchanged.
 - A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
   client never sends more.
+- A `/provide` from a publisher already holding its share of the provider store is refused cheaply: its
+  expired records are looked for at most once per batch, and not at all while none can have expired. Each
+  refused key used to rescan all of the publisher's records (about 5 ms of work per request under the
+  store's lock at the default size).
+- Private mode drops the provider records of non-members when the node starts (those stored while it was
+  public, or by a member since removed from `members`), and `/find` replies leave out any non-member's
+  record; such records used to be handed to members for up to a week. A private node also links only to
+  members, so it never identifies itself to an outsider.
 
 Publishing, names and storage:
 - A CID unpinned and pinned again while a publish round was sending (or evicted and fetched again) could be

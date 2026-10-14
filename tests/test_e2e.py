@@ -108,9 +108,14 @@ class Daemon:
         self.node_id = wait_for(self.status, 60, f"{name} daemon to start")["node_id"]
 
     def status(self) -> dict | None:
-        """The daemon's status, or None while its API is not up yet."""
+        """The daemon's status (with its API token: without it, status says only the version), or None while
+        its API is not up yet."""
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.api_port}/api/status", timeout=2) as response:
+            with open(os.path.join(self.dir, "api_token"), encoding="ascii") as f:
+                token = f.read().strip()
+            request = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/api/status",
+                                             headers={"X-Rnfs-Api": token})
+            with urllib.request.urlopen(request, timeout=2) as response:
                 return json.load(response)
         except OSError:
             if self.proc.poll() is not None:

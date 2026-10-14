@@ -2,7 +2,8 @@
 provide content the visitor chose. The CID comes from var_cid; the page ran stat, ls, `pin add` and cat on it
 with no allowlist and no per-visitor limit. `pin add` pins USER (node.py:821-833), which the node then
 provides; and with the default provide_strategy="roots", stat/cat alone already make a cached complete fetch
-be provided, so dropping only the pin would not stop the seeding.
+be provided, so dropping only the pin would not stop the seeding. That part is documented behaviour of
+"roots" (kept as the default by the user's decision; "pinned" avoids it), tested as such below.
 
 The fixed page shows only the operator's own complete pins (source user or folder) and CIDs in the operator's
 allowlist file; for anything else it runs nothing but `rnfs pin ls`, which never fetches. Allowlisted CIDs are
@@ -102,15 +103,22 @@ class DisplayPagePinTest(PageTestCase):
         self.assertEqual(calls, [["pin", "ls", "--json", self.cid]])
         self.assertEqual(self.stored_blocks(self.cid), 0)
 
-    # H2 (core): fails while `rnfs stat` / `rnfs cat` of remote content make the node provide it under
-    # provide_strategy="roots". The page no longer runs them for CIDs it doesn't share (the test above);
-    # a CLI read that doesn't provide (like the gateway's for_gateway reads) needs a core change.
-    @unittest.expectedFailure
-    def test_stat_and_cat_alone_make_the_node_provide(self):
-        """Removing only the `pin add` isn't enough: with provide_strategy="roots", the page's remaining
-        stat and cat calls make the complete cached fetch be provided."""
-        self.victim.stat(self.cid)  # the page's `rnfs stat`
-        b"".join(self.victim.read(self.cid))  # the page's `rnfs cat`
+    def test_stat_and_cat_of_remote_content_are_provided_under_roots(self):
+        """Documented behaviour (specification section 6, "Provide strategy", and section 7, "What a node
+        serves"; README `provide_strategy`): under the default "roots", every complete download is provided,
+        including reads through `rnfs stat` and `rnfs cat`, so anyone can learn what the node fetched. That is
+        why the page runs neither for CIDs it doesn't share (the test above)."""
+        self.victim.stat(self.cid)  # the old page's `rnfs stat`
+        b"".join(self.victim.read(self.cid))  # the old page's `rnfs cat`
+        self.assertEqual(self.victim.config.provide_strategy, "roots")
+        self.assertIn(self.key, self.victim.publisher.provided())
+
+    def test_pinned_strategy_does_not_provide_reads(self):
+        """With provide_strategy = "pinned", the same reads are cache that is never provided (section 6)."""
+        self.victim.config.provide_strategy = "pinned"
+        self.victim.stat(self.cid)
+        b"".join(self.victim.read(self.cid))
+        self.victim.publisher.refresh()
         self.assertNotIn(self.key, self.victim.publisher.provided())
 
     def test_contact_pin_is_not_shown(self):
