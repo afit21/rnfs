@@ -10,10 +10,16 @@ guards.limit_half_open replaces a destination's incoming_link_request and reads 
 link's status, attached_interface and request_time, and closes links with Link.teardown(); those are checked
 the same way, with one functional check against a real (offline) RNS.Destination.
 
+The response pre-check (L1) replaces Link.response_resource_concluded and Link.receive, reads a completed
+Resource's data, status, has_metadata, request_id and total_size, decrypts response packets with Link.decrypt
+and fails a refused response through Link.handle_response; each is checked, with functional checks on a real
+(offline) Link. The request rate limit (L17b) relies on RNS sending nothing for a handler that returns None.
+
 Written against RNS 1.5.6. Nothing here starts Reticulum.
 """
 import ast
 import inspect
+import io
 import re
 import textwrap
 import unittest
@@ -143,6 +149,112 @@ class RnsHalfOpenLinkInternalsTest(unittest.TestCase):
         self.assertEqual(calls, [b"too short to be a link request"])  # through the guard, then RNS's own
         self.assertEqual(destination.links, [])  # RNS rejected the malformed request as before
         self.assertEqual(guards.half_open_links(destination), [])
+
+
+class RnsResponsePrecheckInternalsTest(unittest.TestCase):
+    """Each RNS method guards hooks or calls to check responses before RNS decodes them (L1) is present and
+    behaves as rnfs expects."""
+
+    def setUp(self):
+        from rnfs.network import guards
+        self.guards = guards
+        guards.install()
+
+    def test_response_resource_concluded_is_looked_up_on_the_link_and_decodes_the_data(self):
+        # RNS passes self.response_resource_concluded (looked up when the advertisement arrives, so the class
+        # attribute the guard replaces) as the response Resource's callback, which decodes resource.data
+        receive = _normal_source(RNS.Link._Link__receive)
+        self.assertIn("RNS.Resource.accept(packet,callback=self.response_resource_concluded,", receive)
+        original = _normal_source(self.guards._original_response_resource_concluded)
+        for expected in ("ifresource.status==RNS.Resource.COMPLETE:", "ifresource.has_metadata:",
+                         "packed_response=resource.data.read()", "umsgpack.unpackb(packed_response)",
+                         "self.handle_response(request_id,response_data,resource.total_size,resource.size)"):
+            self.assertIn(expected, original)
+        self.assertEqual(list(inspect.signature(self.guards._original_response_resource_concluded).parameters),
+                         ["self", "resource"])
+
+    def test_completed_resource_data_is_a_seekable_file_and_request_id_is_set(self):
+        # assemble() marks the Resource COMPLETE, then hands the callback an open file the guard reads and rewinds
+        assemble = _normal_source(RNS.Resource.assemble)
+        self.assertIn("self.status=Resource.COMPLETE", assemble)
+        self.assertIn("self.data=open(self.storagepath,'rb')", assemble)
+        self.assertLess(assemble.index("self.data=open(self.storagepath,'rb')"), assemble.index("self.callback(self)"))
+        # Metadata is decoded inside assemble, before any callback: so rnfs refuses it at the advertisement
+        self.assertIn("self.metadata=umsgpack.unpackb(metadata_file.read())", assemble)
+        accept = _normal_source(self.guards._original_accept)
+        self.assertIn("resource=Resource(None,advertisement_packet.link,request_id=request_id)", accept)
+        self.assertIn("self.request_id=request_id", _normal_source(RNS.Resource.__init__))
+        self.assertIn("resource.has_metadata=True", accept)
+        self.assertIn("ifadv.x:", accept)
+        self.assertIn("total_size", inspect.getsource(RNS.Resource.__init__) + inspect.getsource(RNS.Resource.accept))
+
+    def test_advertisement_x_flag_is_has_metadata(self):
+        from RNS.vendor import umsgpack
+        adv = RNS.ResourceAdvertisement.unpack(umsgpack.packb(
+            {"t": 100, "d": 90, "n": 1, "h": bytes(32), "r": bytes(4), "o": bytes(32), "i": 1, "l": 1,
+             "q": bytes(16), "f": 0x01 | 0x10 | 0x20, "m": bytes(4)}))
+        self.assertIs(adv.x, True)
+        self.assertIn("self.x=resource.has_metadata", _normal_source(RNS.ResourceAdvertisement.__init__))
+
+    def test_handle_response_hands_the_response_to_the_pending_request(self):
+        self.assertEqual(list(inspect.signature(RNS.Link.handle_response).parameters)[:5],
+                         ["self", "request_id", "response_data", "response_size", "response_transfer_size"])
+        source = _normal_source(RNS.Link.handle_response)
+        self.assertIn("ifpending_request.request_id==request_id:", source)
+        self.assertIn("pending_request.response_received(response_data,metadata)", source)
+
+    def test_receive_is_called_on_the_link_and_decodes_response_packets(self):
+        # Transport hands every link packet to link.receive (the class attribute the guard replaces), which
+        # decrypts a RESPONSE packet and decodes it before matching it to a request
+        self.assertIn("else:link.receive(packet)", _normal_source(RNS.Transport))
+        self.assertEqual(list(inspect.signature(self.guards._original_receive).parameters), ["self", "packet"])
+        self.assertIn("self.__receive(packet)", _normal_source(self.guards._original_receive))
+        receive = _normal_source(RNS.Link._Link__receive)
+        branch = receive[receive.index("elifpacket.context==RNS.Packet.RESPONSE:"):]
+        self.assertIn("packed_response=self.decrypt(packet.data)", branch)
+        self.assertIn("unpacked_response=umsgpack.unpackb(packed_response)", branch)
+        self.assertEqual(list(inspect.signature(RNS.Link.decrypt).parameters), ["self", "ciphertext"])
+        self.assertIn("self.initiator", inspect.getsource(RNS.Link.__init__))
+
+    def test_default_mtu_packets_are_below_the_check_size(self):
+        # Response packets larger than RNS's default MTU are checked; a default-MTU link never carries one
+        self.assertEqual(self.guards.PACKET_CHECK_SIZE, RNS.Reticulum.MTU)
+        self.assertLess(RNS.Link.MDU + RNS.Identity.TOKEN_OVERHEAD + 16, self.guards.PACKET_CHECK_SIZE)
+
+    def test_guards_run_on_a_real_link(self):
+        from unittest import mock
+
+        from RNS.vendor import umsgpack
+        with mock.patch.object(RNS.Transport, "register_destination"):
+            dht = RNS.Destination(RNS.Identity(), RNS.Destination.IN, RNS.Destination.SINGLE, "rnfs", "dht")
+        link = RNS.Link(owner=dht)  # incoming, as RNS makes one for a link request
+        self.assertTrue(self.guards.is_dht_link(link) and not link.initiator)
+        bomb = b"\x92\xc4\x10" + bytes(16) + b"\xdd\x00\x01\x00\x00" + b"\x90" * 65536
+        with mock.patch.object(umsgpack, "unpackb", wraps=umsgpack.unpackb) as unpackb, \
+                mock.patch.object(self.guards, "_log_refused_response"), \
+                mock.patch.object(self.guards, "_log_unexpected_response"), \
+                mock.patch.object(link, "decrypt") as decrypt:
+            link.receive(mock.Mock(context=RNS.Packet.RESPONSE, packet_type=RNS.Packet.DATA, data=bomb))
+            decrypt.assert_not_called()  # an incoming link's response packet is dropped unread
+            resource = mock.Mock(status=RNS.Resource.COMPLETE, has_metadata=False, data=io.BytesIO(bomb),
+                                 request_id=bytes(16), total_size=len(bomb), size=len(bomb))
+            link.response_resource_concluded(resource)
+            unpackb.assert_not_called()
+            resource.data = io.BytesIO(umsgpack.packb([bytes(16), [b"block"]]))
+            link.response_resource_concluded(resource)
+            unpackb.assert_called_once()  # an honest response reaches RNS's own decoding
+
+
+class RnsRequestRateInternalsTest(unittest.TestCase):
+    """The request rate limit (L17b) answers a request over the limit with None: RNS then sends nothing."""
+
+    def test_none_response_sends_nothing(self):
+        source = _normal_source(RNS.Link.handle_request)
+        self.assertIn("ifresponse!=None:", source)
+        # and RNS starts a thread per request packet before any handler runs (what the limit can't prevent)
+        receive = _normal_source(RNS.Link._Link__receive)
+        branch = receive[receive.index("elifpacket.context==RNS.Packet.REQUEST:"):]
+        self.assertIn("threading.Thread(target=job,daemon=True).start()", branch)
 
 
 def _normal_source(function) -> str:

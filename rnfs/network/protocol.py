@@ -20,7 +20,7 @@ from RNS.vendor import umsgpack
 
 from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_BLOCK_SIZE, MAX_PROVIDE_KEYS,
                             MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH)
-from rnfs.content.cid import Cid
+from rnfs.content.cid import RAW, Cid
 
 __all__ = ["FIND_PATH", "PROVIDE_PATH", "BLOCKS_PATH", "PIN_PATH"]
 
@@ -254,3 +254,134 @@ REQUEST_ID_LENGTH = RNS.Identity.TRUNCATED_HASHLENGTH // 8
 MAX_FIND_RESPONSE_SIZE = packed_response_size(bytes(REQUEST_ID_LENGTH),
                                               encode_find_response([bytes(ID_LENGTH)] * K, [bytes(ID_LENGTH)] * K))
 MAX_ACCEPT_RESPONSE_SIZE = packed_response_size(bytes(REQUEST_ID_LENGTH), True)  # /provide, /pin: True or False
+
+
+def _most_cids_per_request() -> int:
+    """The most CIDs one /blocks request of at most MAX_REQUEST_SIZE can carry: all of the shortest kind (raw)."""
+    shortest = Cid.for_block(RAW, b"")
+    count = 1
+    while fits(BLOCKS_PATH, encode_blocks(0, [shortest] * (count + 1)), MAX_REQUEST_SIZE):
+        count += 1
+    return count
+
+
+# So also the most entries a /blocks response can have (26)
+MAX_BLOCKS_CIDS = _most_cids_per_request()
+
+
+# Packed responses, checked before RNS decodes them (section 3)
+#
+# RNS decodes a response with umsgpack before handing it over, and a payload of one-byte empty arrays or maps
+# becomes some 70 times its size in Python objects. response_refusal reads only msgpack headers: it builds no
+# objects, skips each bin by its length and reads at most a few dozen headers, so it costs the same for a
+# response of any size. It accepts every response that one of rnfs.dht's parsers could accept.
+
+_NIL, _FALSE, _TRUE = 0xC0, 0xC2, 0xC3
+_BIN_WIDTHS = {0xC4: 1, 0xC5: 2, 0xC6: 4}  # bin8, bin16, bin32: bytes of length after the code
+_ARRAY_WIDTHS = {0xDC: 2, 0xDD: 4}  # array16, array32: bytes of count after the code (fixarray: 0x90-0x9f)
+
+
+def _array_at(packed: bytes, position: int) -> tuple[int, int] | None:
+    """(element count, position after the header) of an array header at position, or None if there's none.
+
+    An array claiming more elements than there are bytes left is refused: every element takes at least one.
+    """
+    if position >= len(packed):
+        return None
+    code = packed[position]
+    if 0x90 <= code <= 0x9F:
+        count, position = code & 0x0F, position + 1
+    elif code in _ARRAY_WIDTHS:
+        start = position + 1 + _ARRAY_WIDTHS[code]
+        if start > len(packed):
+            return None
+        count, position = int.from_bytes(packed[position + 1:start], "big"), start
+    else:
+        return None
+    return (count, position) if count <= len(packed) - position else None
+
+
+def _bin_at(packed: bytes, position: int) -> tuple[int, int] | None:
+    """(length, position after its data) of a bin at position, or None if there's none or it overruns."""
+    if position >= len(packed) or packed[position] not in _BIN_WIDTHS:
+        return None
+    start = position + 1 + _BIN_WIDTHS[packed[position]]
+    if start > len(packed):
+        return None
+    length = int.from_bytes(packed[position + 1:start], "big")
+    return (length, start + length) if start + length <= len(packed) else None
+
+
+def _find_answer_end(packed: bytes, position: int) -> int | None:
+    """Position after a /find answer ([[ID, …], [ID, …]], each list at most K long) at position, or None."""
+    outer = _array_at(packed, position)
+    if outer is None or outer[0] != 2:
+        return None
+    position = outer[1]
+    for _ in range(2):
+        ids = _array_at(packed, position)
+        if ids is None or ids[0] > K:
+            return None
+        position = ids[1]
+        for _ in range(ids[0]):
+            item = _bin_at(packed, position)
+            if item is None or item[0] != ID_LENGTH:
+                return None
+            position = item[1]
+    return position
+
+
+def _entries_end(packed: bytes, position: int) -> tuple[int | None, str | None]:
+    """(position after, None) for a /blocks answer at position: a list of at most MAX_BLOCKS_CIDS entries, each
+    a bin of at most MAX_BLOCK_SIZE bytes or nil; else (None, why not)."""
+    entries = _array_at(packed, position)
+    if entries is None:
+        return None, "not a list"
+    count, position = entries
+    if count > MAX_BLOCKS_CIDS:
+        return None, f"{count} entries, more than a request can ask for"
+    for _ in range(count):
+        if position < len(packed) and packed[position] == _NIL:
+            position += 1
+            continue
+        block = _bin_at(packed, position)
+        if block is None:
+            return None, "an entry that is neither a block nor None"
+        if block[0] > MAX_BLOCK_SIZE:
+            return None, f"a {block[0]}-byte entry, over MAX_BLOCK_SIZE"
+        position = block[1]
+    return position, None
+
+
+def response_refusal(packed: bytes) -> str | None:
+    """Why packed (RNS's response framing, [request_id, response], as received) can't hold any rnfs.dht
+    response, judged from msgpack headers alone without decoding it; None if it may.
+
+    The response may be True, False or None (a /provide or /pin answer, or a refusal), a /find answer, or a
+    /blocks answer (also the shape of a /name one). Nothing may follow it.
+    """
+    outer = _array_at(packed, 0)
+    request_id = _bin_at(packed, outer[1]) if outer is not None and outer[0] == 2 else None
+    if request_id is None or request_id[0] != REQUEST_ID_LENGTH or request_id[1] >= len(packed):
+        return "not a response"
+    position = request_id[1]
+    if packed[position] in (_NIL, _FALSE, _TRUE):
+        end = position + 1
+    else:
+        end = _find_answer_end(packed, position)
+        if end is None:
+            end, reason = _entries_end(packed, position)
+            if end is None:
+                return reason
+    if end != len(packed):
+        return f"{len(packed) - end} bytes after the response"
+    return None
+
+
+def packed_request_id(packed: bytes) -> bytes | None:
+    """The request ID at the head of packed response framing, read without decoding the rest; None if absent."""
+    outer = _array_at(packed, 0)
+    request_id = _bin_at(packed, outer[1]) if outer is not None and outer[0] == 2 else None
+    if request_id is None or request_id[0] != REQUEST_ID_LENGTH:
+        return None
+    return bytes(packed[request_id[1] - REQUEST_ID_LENGTH:request_id[1]])
