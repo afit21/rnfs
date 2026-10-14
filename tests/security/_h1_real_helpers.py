@@ -167,7 +167,7 @@ def role_attacker(configdir, node_id_hex, cid, n_links=8, rtt_seconds=3600.0, po
     RNS.Resource.accept = staticmethod(lambda *a, **k: None)  # never download a response Resource
     RNS.Reticulum(configdir=os.path.abspath(configdir))
     dest = resolve(node_id_hex)
-    cids = [cid_binary(cid)] * 15  # duplicates -> a ~960 KiB response, sent as a held Resource
+    cids = [cid_binary(cid)]  # one CID, a 64 KiB Resource: a request repeating a CID is refused as malformed (L2)
     links = []
     for _ in range(int(n_links)):
         link = open_link(dest)

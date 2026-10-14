@@ -6,12 +6,11 @@ response slots, and an honest requester process issuing the same /blocks request
 
 The attacker opens a handful of links, inflates each link's rtt (so a response it never downloads stays
 ADVERTISED, holding its slot, since RNS times an advertised Resource out after link.rtt * 6), and keeps
-firing /blocks for 15 copies of the CID (a ~960 KiB Resource -- duplicates are kept, see L2). With only two
-fast-pool slots by default (max_blocks_responses = 4), both fill and every honest request is refused with
-"every fast-link response slot is busy".
+firing /blocks for the CID (a 64 KiB Resource; a request repeating a CID is refused as malformed, see L2). With
+only two fast-pool slots by default (max_blocks_responses = 4), both filled and, before the H1 fix, every honest
+request was refused with "every fast-link response slot is busy".
 
-This test asserts the SAFE behaviour -- that an honest requester keeps being served while the attacker runs
--- so it fails until H1 is fixed. See @unittest.expectedFailure below.
+This test asserts the SAFE behaviour -- that an honest requester keeps being served while the attacker runs.
 
 Opt in with RNFS_E2E=1 (real daemons and RNS networking), like tests/test_e2e.py.
 """
@@ -134,7 +133,7 @@ class H1RealRnsTest(unittest.TestCase):
         support.wait_for(ready, 90, "attacker to hold the slots", interval=0.5)
         time.sleep(8)  # let the held responses settle into both fast-pool slots
 
-        # Safe behaviour: the honest requester should still be served. It is not -- H1.
+        # Safe behaviour: the honest requester should still be served.
         attack = self._honest("honest_attack", 20)
         self.assertLessEqual(
             attack["refusal_rate"], SAFE_REFUSAL_RATE,
