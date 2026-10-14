@@ -463,7 +463,9 @@ rnfs add report.pdf --wrap      # in a directory, so the link keeps its name: <c
 `add` stores the file in your node, **pins** it (keeps it) and announces to the DHT that you have it. Give
 the CID to others. They can get it while your node, or any other node that pinned it, is reachable. Files
 you drop into `~/.rnfs/files/` are added and shared automatically. `rnfs pin rm <cid>` stops sharing a file,
-and `rnfs gc` frees space used by downloads you didn't pin.
+and `rnfs gc` frees space used by downloads you didn't pin. By default your node also shares what you
+download (`get`, `cat`, even `stat` of a small file) while it's cached, so others can see what you fetched;
+set `provide_strategy = "pinned"` to share only what you pin.
 
 ### 5. Names: a link that can change
 
@@ -497,7 +499,7 @@ only makes sense on IP networks. It is **not** compatible with IPFS. The full co
 | Bitswap | `/blocks` requests over Reticulum Resources. Downloads are multi-source, resumable and verified. Providers are ranked by seniority, then hops and link speed. Responses are sized to the link's measured rate. |
 | IPNS | Names are Reticulum announces with a signed record. **Keepers** (any node, with `name keep`) store and re-serve a name's signed record, so it outlives its owner's announces. |
 | Pinning, remote pinning, GC | The same, with pin sources (user, folder, name, remote, follow, LXMF). `add --no-pin` adds a file as evictable cache. |
-| Reprovider strategies | `roots` (default: what you added or pinned, plus your complete downloads while cached) or `pinned` (only what you added or pinned). |
+| Reprovider strategies | `roots` (default: what you added or pinned, plus your complete downloads while cached, which anyone can then see) or `pinned` (only what you added or pinned). |
 | CAR files | rnfs archives: `export` / `import`. |
 | HTTP gateway | Local gateway with sandboxed pages, plus trustless `?format=raw` and `?format=archive`. |
 | MFS | `dir set` / `dir rm` make edited copies of a directory; use a name for the mutable root. |
@@ -540,7 +542,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `announce_interval` | `21600` (6 h) | How often the node (and its names) announce; keep it ≥ 1 h |
 | `startup_announce_delay` | `30` | Second announce after startup |
 | `republish_interval` | 24 h; 3 days on slow nodes | How often provider records are republished; must be under 3.5 days |
-| `provide_strategy` | `"roots"` | `"roots"`: share pins and complete downloads while they're cached (up to `max_storage`); `"pinned"`: share only pins, so downloads stay private |
+| `provide_strategy` | `"roots"` | `"roots"`: share pins and every complete download while it's cached (up to `max_storage`), whatever fetched it: `get`, `cat`, even a `stat` of a small file. The node is then listed as a provider and serves those blocks, so **anyone can learn what it downloaded**. `"pinned"`: share only pins, so downloads stay private |
 | `provider_seniority` | `86400` (1 day) | Providers and name keepers known this long are tried first; publishers seen this long get their full share of a full provider store |
 | `lookup_timeout` | `600` | Time budget of a DHT lookup |
 | `path_timeout` | `30` | Wait for a Reticulum path |
@@ -559,7 +561,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `max_download_size` | none | Refuse fetches larger than this |
 | `max_output_entries` | `100000` | Most directory entries a listing, `get` or export may write |
 | `scan_interval` | `60` | How often the shared folder `files/` is scanned |
-| `remote_pin_identities` | `[]` | Identity hashes allowed to ask this node to pin (`pin remote add`); a node's is the `identity_hash` in its `rnfs status` |
+| `remote_pin_identities` | `[]` | Identity hashes allowed to ask this node to pin (`pin remote add`); a node's is the `identity_hash` in its `rnfs status`. Pins accepted and not yet fetched are resumed after a restart |
 | `remote_pin_quota` | `1073741824` (1 GiB) | Storage each of those identities may use |
 
 **Transfers**
@@ -624,7 +626,7 @@ The inbox keeps at most 500 messages (4 MiB in all), and at most 50 from any one
 
 | Setting | Default | Description |
 |---|---|---|
-| `private` | `false` | Private mode: every link identifies and only `members` are served (`daemon --private`) |
+| `private` | `false` | Private mode: every link identifies, links go only to `members`, only they are served, and only their provider records are kept and handed out (`daemon --private`) |
 | `members` | `[]` | Identity hashes of the members. `rnfs status` shows a node's `identity_hash` (so does `rnid -i ~/.rnfs/storage/identity`) |
 
 ## Commands
@@ -647,7 +649,7 @@ node ID is expected, a node contact's nick works too.
 | Command | Description |
 |---|---|
 | `rnfs daemon [--bootstrap NODE_ID…] [--rnsconfig DIR] [--gateway-port N] [--dht-mode server\|client] [--slow yes\|no\|auto] [--private] [--provide-strategy pinned\|roots] [--no-gateway-scripts] [-v\|-vv]` | Run a node with its API and gateway |
-| `rnfs status` | Node ID, identity hash (what others list in `members` and `remote_pin_identities`), known nodes, records, storage, traffic, jobs, LXMF address |
+| `rnfs status` | Node ID, identity hash (what others list in `members` and `remote_pin_identities`), known nodes, records, storage, traffic, jobs, LXMF address. Without a readable API token (another user's health check) only the daemon's version |
 | `rnfs peers [--json]` | Known nodes: DHT mode, seniority, hops, interface, link rate, last heard, traffic, bans |
 | `rnfs stats [--json]` | Traffic since start: totals, uploads refused by your limits, per interface |
 | `rnfs ping NODE_ID` | Round-trip time to a node |
@@ -689,6 +691,10 @@ interrupted transfer never leaves a half-written file under the real name. Names
 printed and logged with control characters escaped.
 
 `get`/`cat --raw` give a sealed file's stored (encrypted) bytes. `cat --block` gives a CID's own block.
+`cat` and `get` decrypt sealed files this node can open, so scripts and pages that show content to other
+people must use `cat --raw` (and refuse what starts with `rnfs-sealed`), or skip pins that `pin ls --json`
+marks `"sealed": true`. Under the default `provide_strategy`, anything such a script reads completely is
+also shared from your node (see `provide_strategy`).
 
 **Pins and storage**
 
@@ -696,7 +702,7 @@ printed and logged with control characters escaped.
 |---|---|
 | `rnfs pin add TARGET [--background]` | Fetch completely and pin (share) |
 | `rnfs pin rm CID` | Remove your pin |
-| `rnfs pin ls [CID] [--json]` | Pins, their sources (`user`, `folder`, `name:…`, `remote:…`, `follow:…`, `lxmf:…`) and where each came from: the local path you added it from (`~/notes.txt`, `(stdin)`, `archive …`, the target given to `pin add`), the shared-folder file name, or for a directory its single entry's name or entry count. These names are kept only on your machine; pins made before this was added show none for plain files |
+| `rnfs pin ls [CID] [--json]` | Pins, their sources (`user`, `folder`, `name:…`, `remote:…`, `follow:…`, `lxmf:…`), whether each is a sealed file (`(sealed)`; `"sealed": true`, `false`, or `null` if not stored enough to tell) and where each came from: the local path you added it from (`~/notes.txt`, `(stdin)`, `archive …`, the target given to `pin add`), the shared-folder file name, or for a directory its single entry's name or entry count. These names are kept only on your machine, sealed files' too (their sealed name is what others can't read): anything that publishes a pin list must leave sealed entries out; pins made before this was added show none for plain files |
 | `rnfs pin remote add NODE_ID CID` / `rnfs pin remote rm NODE_ID CID` | Ask another node to pin or unpin (it must list your identity in `remote_pin_identities`) |
 | `rnfs gc` | Evict every cached download |
 | `rnfs verify` | Re-check every stored block against its CID |
@@ -885,5 +891,8 @@ ery thread's stack.
   forged.
 - Sealed files hide content and file name, not size or recipients, and don't prove who sealed them. `get` of
   a directory leaves the sealed files inside it encrypted.
+- With the default `provide_strategy = "roots"`, every complete download is provided to the DHT and served,
+  including `cat` and `stat` reads of other nodes' content: anyone can learn what your node fetched. Use
+  `"pinned"` to keep downloads private.
 - LXMF: messages over 256 kB are refused, and unsent messages are lost if the daemon restarts. Offline
   delivery and downloads need `lxmf_propagation_node` (or `--nearest` each time).

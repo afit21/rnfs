@@ -153,11 +153,14 @@ min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keep
 `node_count()`.
 
 `providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random,
-own_id=None, seniority=0)`: `store(key, publisher) -> bool`, `withdraw(key, publisher)`,
-`for_reply(key, exclude=lambda id: False) -> list[bytes]`, `expire()`, `record_count()`, `allowance(publisher)`,
-`save()`. Local limits against flooding: one publisher holds at most max(10, `max_records` // 100) records once
-seen for `seniority` (the node passes `provider_seniority`) and a tenth of that (at least 10) before, the
-node's own (`own_id`) excepted; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
+own_id=None, seniority=0)`: `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
+keys, withdrawn) -> int`, `retain(keep) -> int` (drops every record of publishers `keep` rejects: private mode's
+non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `expire()`, `record_count()`,
+`allowance(publisher)`, `save()`. Local limits against flooding: one publisher holds at most max(10,
+`max_records` // 100) records once seen for `seniority` (the node passes `provider_seniority`) and a tenth of
+that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
+swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
+from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
 one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool with random eviction: the
 pooled records sit in a list for O(1) random picks, and the newest publisher with records outside the pool comes
 from a heap of (first seen, arrival) with stale entries dropped lazily. First-seen times of departed publishers
@@ -178,6 +181,10 @@ provider, so the keeper search can wait for providers listed by more than one so
 `is_dht_server() -> bool`, `find(key) -> (providers, nodes)`, `provide(publisher_id, keys, withdrawn) -> bool`,
 `served_block(cid) -> bytes | None` (only blocks in the DAG of a currently provided CID, re-verified),
 `remote_pin(identity_hash, cid, pin) -> bool`, `is_member(identity_hash) -> bool` (private mode).
+`NodeBackend.find` leaves out providers `RnfsNode.excluded_provider` rejects: banned, and in private mode
+non-members (`_is_member_publisher`: this node, a publisher whose `/provide` the server let through as a member
+this run, or a node ID whose recalled identity is a member, as routing admission checks). In private mode the
+node also drops non-members' records at start (`ProviderStore.retain`).
 
 `client.py` — `PeerClient(links, config)`:
 `find(node_id, key) -> (providers, nodes) | None`, `provide(node_id, keys, withdrawn) -> set[bytes]` (identified
@@ -186,8 +193,8 @@ first refused or unanswered one), `blocks(node_id, cids, on_progress=None) -> Bl
 FAILED / STALLED; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None,
 `.unsent` cut by the budget, `.bad` hash mismatches), `pin(node_id, cid, pin) -> bool`, `ping(node_id) -> float |
 None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht` destination of the identity
-RNS recalls, and only if its hash is the node ID asked for; the idle sweep spares a link `LinkPool.get()` handed
-out within `link_idle_timeout`.
+RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if that identity is on
+`members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
 
 `announces.py` — `DhtAnnouncer(destination, config)` sets `app_data` to the mode and runs the announce schedule;
 `DhtAnnounceHandler(on_server, on_client, is_banned)`.
@@ -213,7 +220,7 @@ out within `link_idle_timeout`.
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
-| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names), its shared-folder entry, or a directory's single entry or entry count |
+| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. Callers that show pins to others must skip `sealed` entries' names and content |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
@@ -224,7 +231,7 @@ out within `link_idle_timeout`.
 | `name_publish(alias, target)` | `{"name", "cid", "sequence"}` |
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}` |
-| `status()` | `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -249,7 +256,10 @@ are absolute paths on the daemon's machine (the CLI resolves them); stdin is upl
 `/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`. `GET /api/info` and `POST /api/get` take
 an optional `from` (node ID); `GET /api/name/resolve?name=` takes a name or a name contact's nick.
 
-The API requires `X-Rnfs-Api: <token>` on every request except `GET /api/status`. The daemon writes a new random
+The API requires `X-Rnfs-Api: <token>` on every request except `GET /api/status`, which without a valid token
+answers only `{"version"}` (health checks, and `verify_daemon`, which reads only the proof header); the CLI sends
+the token with every other request, `rnfs status` included (without a readable token it prints the version
+and says why). The daemon writes a new random
 token to `<rnfs dir>/api_token` (mode 0600, in the 0700 rnfs dir) at each start and the CLI reads it, so other
 local users and processes can't drive the API. `_make_private_dirs` refuses to start (RnfsError) if the rnfs dir
 belongs to another user or can't be made 0700 (not on Windows). A response to a request with
@@ -416,7 +426,8 @@ Slow work that runs while a lock is held:
 Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to disk: `pins.json`, `cache.json`
 (storage); `pin_names.json` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin
 list); `providers.json` (provider records); `published.json` (publisher: last rounds, earlier rounds' nodes,
-pending withdrawals); `fetched.json` (targets fetched for the user, for `roots`); `names.json` (sequences, name
+pending withdrawals); `fetched.json` (targets fetched for the user, for `roots`); `remote_pins.json` (remote pins accepted and
+not yet fetched, `[[source, cid], ...]` in order); `names.json` (sequences, name
 table); `name-floor.json` (highest sequence of names resolved for the gateway or auto-fetch, at most
 4 × `name_table_size`, saved by the re-announce loop when changed); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
 plus `warnings_total`; older results are capped at load); `keepers.json` (records re-verified at load);
@@ -501,7 +512,12 @@ Everything in the specification is implemented, with these simplifications and a
 - A remote pin's usage is the larger of its content size and its DAG's block bytes. It is dropped once the
   root block shows the quota would be exceeded, or once the blocks fetched exceed it. A source's remote pins
   are fetched one at a time, oldest first (`_remote_pin_worker`), so the quota check counts every earlier pin;
-  at most 64 (`REMOTE_PIN_QUEUE`) may be waiting or fetching, and further `/pin`s are refused.
+  at most 64 (`REMOTE_PIN_QUEUE`) may be waiting or fetching, and further `/pin`s are refused. A worker leaves
+  `_remote_workers` in the same critical section in which it finds its queue empty, so a `/pin` arriving as it
+  exits starts a new one; if `Thread.start()` fails the pin is given back and refused. The pins waiting are
+  saved to `state/remote_pins.json` by maintenance (when changed) and at stop, and `_resume_remote_pins` queues
+  them again at start (skipping those already pinned or whose identity left `remote_pin_identities`); workers
+  wait for the first join before fetching, and a fetch cut short by stopping stays queued.
 - Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks at a time ahead of what has been
   written out. A read may meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds
   files built from repeated tiny or empty subtrees without limiting honest large files.

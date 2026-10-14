@@ -222,7 +222,12 @@ across shared interfaces and transport nodes, a node MAY run in private mode:
 - every link identifies;
 - handlers answer `False` to identities not on the member list (checked inside the handler, since RNS's
   `ALLOW_LIST` drops refused requests silently);
-- the routing table admits only members.
+- the routing table admits only members;
+- provider records are kept and handed out only for members: at start the node drops the records of every
+  publisher whose node ID it can't tie to a member identity (stored while it was public, or by a member since
+  removed from the list), and `/find` replies leave out any such record;
+- outgoing links go only to nodes whose identity is a member, so the node never identifies itself to an
+  outsider (one listed as a provider anywhere, say).
 
 ## 4. Content identifiers
 
@@ -510,11 +515,14 @@ and repeat.
   don't come due at once; the jittered interval stays below `PROVIDER_TTL / 2`.
 - **Provide strategy** (`provide_strategy`):
   - `roots` (default) provides every complete pin, and every complete fetched target while it is cached
-    (so at most `max_storage` of downloads at a time).
-  - `pinned` provides every complete pin only.
+    (so at most `max_storage` of downloads at a time). That is every complete download, whatever the command:
+    `get`, `cat`, and even `stat`, `info` or `ls` of another node's content when what they fetched is the
+    whole target (a small file is one block). Anyone can look up the provider records, or ask the node for
+    the blocks (section 7), and so learn what it fetched.
+  - `pinned` provides every complete pin only, so downloads are never published or served.
 
   `roots` helps popular content spread; `pinned` uses less airtime and doesn't publish what a user
-  downloads.
+  downloads. Gateway fetches are never provided under either.
   Nothing else inside a DAG is provided separately: share `<root>/<path>`, or pin the inner CID to provide
   it. Keepers also provide the keys of the names they keep (section 9), under any strategy.
 
@@ -650,6 +658,9 @@ old pin.
   fetched one at a time, in the order accepted, so each is checked with the earlier ones counted; a node MAY
   refuse `/pin` from a source with many pins waiting (rnfs: 64).
 - The requester learns that a remote pin is complete when the node shows up as a provider (`providers`).
+- `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
+  pins waiting (`state/remote_pins.json`, about once a second and at stop) and resumes them after a restart,
+  unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
 
 ## 9. Names
@@ -829,8 +840,9 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 **Privacy** (outside private mode, where every link identifies).
 - Lookups and downloads use unidentified links, so the nodes asked learn only that *some* node wants a key.
 - Publishing uses a separate identified link, never reused.
-- With the default `roots` strategy, complete downloads are published and served while cached, which
-  reveals them. With `pinned`, downloads are neither published nor served. Gateway fetches never are.
+- With the default `roots` strategy, complete downloads (by any command, `cat` and `stat` included) are
+  published and served while cached, so anyone can learn what the node fetched. With
+  `pinned`, downloads are neither published nor served. Gateway fetches never are.
 - DHT keys don't hide which CID is wanted from someone who already knows the CID.
 - Provider records are public: anyone can look up which node IDs provide a CID, or keep a name. A node's own
   names are linked to it this way (section 9).
@@ -885,11 +897,11 @@ are local conveniences, not part of the protocol.
 |---|---|
 | `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files); `--chunker fastcdc` uses content-defined chunks (section 5) |
 | `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; `--raw` writes the stored bytes |
-| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--block` writes the CID's own block |
+| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
 | `stat <cid>[/path]` | Size, block count, and how much is held locally |
 | `dir set <cid>[/path] <name> <cid> [--exec]`, `dir rm <cid>/<path>` | Make a new directory with an entry added, replaced or removed, and pin it with source `user` (fetching the complete directory, file contents included) |
-| `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]` | Manage pins; `ls` shows their sources and a local name: where each was added from on this machine (recorded locally, never sent), the shared-folder entry, or what a stored directory holds |
+| `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: where each was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds |
 | `pin remote add\|rm <node ID> <cid>` | Remote pinning |
 | `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
 | `providers <cid>` | Find nodes providing a CID |
@@ -903,7 +915,7 @@ are local conveniences, not part of the protocol.
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, LXMF address |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, LXMF address (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -925,7 +937,9 @@ gateway can never reach the API.
   access. Every local process, of every user, can connect to `127.0.0.1`, and the API reads and writes
   files as the daemon's user, so only users who can read the rnfs directory may use it. Web pages can't
   learn the token, and the custom header needs a CORS preflight, which fails: this also blocks cross-site
-  requests. Status stays open for health checks.
+  requests. `GET /api/status` stays open for health checks and the proof check below, but without the
+  token it MUST say no more than the daemon's version (rnfs: `{"version": ...}`); the full status (node ID,
+  identity hash, LXMF address, traffic) needs the token like every other request.
 - The daemon MUST refuse to start if the rnfs directory belongs to another user or can't be made accessible
   to its owner only (outside Windows, where it relies on the ACL inherited from the user's profile).
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
