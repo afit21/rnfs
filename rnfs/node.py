@@ -26,7 +26,7 @@ import RNS
 from rnfs import __version__, features, fsutil
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
-from rnfs.content import archive, builder, dag, edit, walker
+from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content import chunker as content_chunker
@@ -882,10 +882,14 @@ class RnfsNode:
         self.publisher.refresh()
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
-        """Pins with their sources, whether they're complete, their type and a local name when one is known.
+        """Pins with their sources, whether they're complete, their type, whether they're sealed files and a
+        local name when one is known.
 
         The name is where the pin was added from on this machine (pin_names), the shared-folder entry it
-        came from, or for a stored directory its single entry's name (add --wrap) or its entry count.
+        came from, or for a stored directory its single entry's name (add --wrap) or its entry count. For a
+        sealed file it is still the local path or the name given to add (this node's own record, for its user):
+        `sealed` tells callers that show pins to others not to show the name or the content. `sealed` is None
+        when it can't be told without fetching (the root or the file's first chunk isn't stored).
         """
         pins = self.storage.pins()
         self.pin_names.prune(set(pins))
@@ -898,8 +902,18 @@ class RnfsNode:
             kind, inside = self._pin_shape(c)
             name = self.pin_names.get(c) or (folder_names.get(c) if FOLDER in sources else None) or inside
             result.append({"cid": str(c), "sources": sorted(sources), "complete": self.storage.is_complete(c),
-                           "type": kind, "name": name})
+                           "type": kind, "sealed": self._pin_sealed(c, kind), "name": name})
         return result
+
+    def _pin_sealed(self, cid: Cid, kind: str | None) -> bool | None:
+        """True if a pinned file is sealed (its first bytes carry the sealed-file magic), False if it isn't or
+        is a directory, None if that isn't known from stored blocks. Never fetches."""
+        if kind == "directory":
+            return False
+        if kind is None:
+            return None
+        head = node_content.stored_head(self, str(cid), len(seal.MAGIC))
+        return None if head is None else seal.is_sealed(head)
 
     def _pin_shape(self, cid: Cid) -> tuple[str | None, str | None]:
         """(type, name from inside) of a pin whose root block is stored: "file" or "directory", and for a

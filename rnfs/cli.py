@@ -529,7 +529,7 @@ def run_pin_ls(args):
         print(json.dumps(pins, indent=2))
         return
     for pin in pins:
-        state = "" if pin["complete"] else " (incomplete)"
+        state = ("" if pin["complete"] else " (incomplete)") + (" (sealed)" if pin.get("sealed") else "")
         name = f"  {display_name(pin['name'])}" if pin.get("name") else ""
         print(f"{printable(pin['cid'])} {','.join(printable(s) for s in pin['sources'])}{state}{name}")
 
