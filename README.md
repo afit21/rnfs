@@ -344,6 +344,11 @@ Uninstalling never deletes it.
 | `files/` | the shared folder: anything put here is added, pinned and shared automatically |
 | `api_token` | the running daemon's API token |
 
+The rnfs directory holds your keys and the API token, so rnfs keeps it private: readable by you only, and on
+Windows with an access list for you and SYSTEM only (also on another drive or under `C:\ProgramData`, where
+Windows would otherwise let every local user read it). A `--dir` outside your user profile still gets a
+warning on Windows, since accounts that can change its parent folder could replace it.
+
 The shared folder must not be writable by accounts you don't trust. rnfs skips links inside it and checks
 every directory and file it opens there, but on Windows, where directories are walked by path, someone who
 can write to it gets a race: swapping a directory for a junction while it is scanned. The checks are made to

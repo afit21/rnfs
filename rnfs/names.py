@@ -746,7 +746,7 @@ class NameManager:
         os.makedirs(self.config.names_dir, mode=0o700, exist_ok=True)
         # Written atomically and private: RNS's Identity.to_file does neither. The temp name starts with "."
         # (fsutil.PARTIAL_PREFIX) so it can never be an alias
-        fsutil.write_atomic(self._key_path(alias), identity.get_private_key(), mode=0o600)
+        fsutil.write_atomic(self._key_path(alias), identity.get_private_key(), mode=0o600, private=True)
         name = name_for_identity(identity)
         self._keys[alias] = identity
         self._names[alias] = name

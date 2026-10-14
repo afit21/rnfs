@@ -191,7 +191,8 @@ def _temp_path(directory: str) -> str:
     return os.path.join(directory, PARTIAL_PREFIX + secrets.token_hex(8))
 
 
-def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = True, exclusive: bool = False):
+def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = True, exclusive: bool = False,
+                 private: bool = False):
     """Replace path with data, so a crash or power loss leaves the old or the new file whole. Raises OSError.
 
     data goes to a new temporary file in path's directory (O_EXCL, plus O_NOFOLLOW where it exists, i.e. not on
@@ -199,8 +200,10 @@ def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = T
     disk and renamed over path (retried on Windows while path is in use); a symlink at path is replaced, not
     written through. If durable, the
     directory is then synced so the rename survives a power loss too. With exclusive, an existing path is kept
-    and FileExistsError raised instead. On any failure before the rename the temporary file is removed and path
-    is left as it was.
+    and FileExistsError raised instead. With private (for keys and the API token, written with mode 0600), on
+    Windows, where mode sets no access list, the file also gets a protected DACL for this user and SYSTEM only
+    (winacl.make_private) before it takes path's place. On any failure before the rename the temporary file is
+    removed and path is left as it was.
     """
     directory = os.path.dirname(path) or "."
     temp = _temp_path(directory)
@@ -211,6 +214,9 @@ def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = T
             f.write(data)
             f.flush()
             os.fsync(f.fileno())  # else a power loss can leave path empty once renamed
+        if private and IS_WINDOWS:
+            from rnfs import winacl
+            winacl.make_private(temp)  # by path, once closed: the handle written through can't change its DACL
         if exclusive:
             rename_new(temp, path)
         else:

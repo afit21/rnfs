@@ -25,6 +25,12 @@ Platform and packaging:
   reading it. A directory swapped for a junction during a scan used to import files from outside the shared
   folder and share them; now what changed is skipped with a warning. The README says the shared folder must
   not be writable by accounts you don't trust. Not yet tested on Windows itself.
+- On Windows the rnfs dir, the API token, the node and LXMF identities and name keys get a protected access
+  list allowing only the user and SYSTEM; they used to inherit their folder's, which with `--dir` outside the
+  user profile (another drive, `C:\ProgramData`) usually let every local user read the token and the keys.
+  An existing rnfs dir or identity file that lets others in is tightened (with a notice), the daemon refuses
+  an rnfs dir owned by another account, and every command refuses a token file others can read, as on POSIX.
+  A `--dir` outside `%USERPROFILE%` gets a warning. Not yet tested on Windows itself.
 
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
