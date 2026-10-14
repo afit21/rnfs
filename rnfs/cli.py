@@ -101,7 +101,8 @@ def read_token(path: str) -> str:
 class ApiClient:
     """Talks to the daemon's API on 127.0.0.1:port, exiting with a friendly message on any error.
 
-    token_file is read on the first request that needs it: status needs no token, for health checks.
+    token_file is read on the first request: every request carries the token but the proof check's status
+    request (status without the token says only the daemon's version, for health checks).
     """
 
     def __init__(self, port: int, token_file: str):
@@ -110,15 +111,17 @@ class ApiClient:
         self.token: str | None = None
 
     def request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
-                body=None, length: int | None = None, extra_headers: dict | None = None) -> http.client.HTTPResponse:
+                body=None, length: int | None = None, extra_headers: dict | None = None,
+                authenticated: bool = True) -> http.client.HTTPResponse:
         """Send a request and return the successful response; exits on errors.
 
-        body may be bytes or a file; a file without length is sent chunked.
+        body may be bytes or a file; a file without length is sent chunked. Unless authenticated is False (the
+        proof check), the token is sent, once the daemon has proved it knows it.
         """
         url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
         # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
         headers = {"Host": f"127.0.0.1:{self.port}", **(extra_headers or {})}
-        if (method, path) != ("GET", "/api/status"):
+        if authenticated:
             if self.token is None:
                 token = read_token(self.token_file)
                 self.verify_daemon(token)
@@ -154,7 +157,8 @@ class ApiClient:
         """Exit unless whatever listens on the API port proves it knows token, before the token (or a name key)
         is sent to it: while the daemon is down, any local user could be listening on its port."""
         challenge = secrets.token_hex(16)
-        response = self.request("GET", "/api/status", extra_headers={CHALLENGE_HEADER: challenge})
+        response = self.request("GET", "/api/status", extra_headers={CHALLENGE_HEADER: challenge},
+                                authenticated=False)
         read_all(response)
         proof = (response.getheader(PROOF_HEADER) or "").strip().encode("ascii", "replace")
         if not hmac.compare_digest(proof, api_proof(token, self.port, challenge).encode()):
@@ -163,9 +167,9 @@ class ApiClient:
                  f"(or one started before an upgrade: restart it)")
 
     def call(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
-             body=None, length: int | None = None):
+             body=None, length: int | None = None, authenticated: bool = True):
         """Send a request and return its decoded JSON response."""
-        response = self.request(method, path, params, json_body, body, length)
+        response = self.request(method, path, params, json_body, body, length, authenticated=authenticated)
         try:
             return json.loads(read_all(response))
         except ValueError:
@@ -668,8 +672,14 @@ def run_import(args):
 
 
 def run_status(args):
-    """Print the daemon's status, one "name: value" per line."""
-    print_fields(client(args).get("/api/status"))
+    """Print the daemon's status, one "name: value" per line. Without a readable API token (a health check by
+    another user), only the version the daemon says without it."""
+    api = client(args)
+    if not os.access(api.token_file, os.R_OK):
+        print_fields(api.call("GET", "/api/status", authenticated=False))
+        warn(f"no readable API token at {api.token_file}: the daemon only says its version without it")
+        return
+    print_fields(api.get("/api/status"))
 
 
 # Parser
