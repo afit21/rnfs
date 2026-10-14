@@ -381,16 +381,26 @@ announces (forgotten after 7 days unheard), but uses one automatically only if i
 the nearest heard is used only for a request with `nearest`, and without a configured node the feature logs
 once (notice) that downloads and the fallback are off. On a propagation-node link it cancels any response
 Resource over 1 MB (4 × `DELIVERY_LIMIT_KB`) or of more than one segment and tears the link down, and asks for
-at most 64 messages per download. Messages from unknown senders are held (at most 32; further ones dropped, and
-none from senders `accepts()` would ignore) while their identity is requested: one path request per sender per
-2 minutes, from a node-wide token bucket (burst 3, then one per 10 s). A held message stays in the queue while
-it is retried, so it still counts as a duplicate and against the limit. The inbox (`MessageLog`) holds at most
-500 records and 4 MiB as JSON, 50 per sender not in `lxmf_auto_fetch_from`, 16 KiB per record (links beyond it
-dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none; the pin's
+at most 64 messages per download. `LxmfFeature.trusted()` is true for senders in `lxmf_accept_from` or
+`lxmf_auto_fetch_from` and LXMF contacts (`ContactsFeature.has(address, "lxmf")`, an index kept beside the
+address book). Messages from unknown senders are held (`_hold`: at most 32, 8 per claimed sender; further ones
+dropped, and none from senders `accepts()` would ignore, but a trusted sender's takes the place of the newest
+held for the untrusted sender holding the most) while their identity is requested: one path request per sender
+per 2 minutes, from a node-wide token bucket (burst 3, then one per 10 s), trusted senders' held messages
+retried first. A held message is dropped 30 s (`HOLD_PATH_WAIT`) after its sender's path request, or its own
+arrival if later, with no identity known, and after 2 minutes in any case. A held message stays in the queue
+while it is retried, so it still counts as a duplicate and against the limit. The inbox (`MessageLog`) holds at
+most 500 records and 4 MiB as JSON, 50 per sender not in `lxmf_auto_fetch_from`, 16 KiB per record (links
+beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none;
+`add(reserved=)` keeps trusted senders' records from being evicted except for each other's (untrusted ones go
+first), so free identities can't push them out, and untrusted senders' new records come from a node-wide token
+bucket (`UNTRUSTED_BURST` 32, then one per `UNTRUSTED_INTERVAL` 60 s, on `LxmfFeature.clock`). The pin's
 "pinned" state is recorded in the same locked section that pins. Auto-fetched `name/` links resolve with
 `persist=False`; each auto-fetch runs under a `fetcher.observing` observer cancelled when the node stops or the
 message is removed, and links still "queued" in the inbox are queued again at `start()`
-(`_requeue_auto_fetches`, within the 64-entry queue). Links without the field are read from the first
+(`_requeue_auto_fetches`, within the 64-entry queue). The queue (`_RoundRobin`) keeps one FIFO per sender and
+takes senders in turn; when it is full, a sender with at least two fewer waiting than the busiest takes the
+busiest one's newest place (that link is marked skipped). Links without the field are read from the first
 `MAX_SCAN_CHARS` (16 384) characters of the content. `inbox get` (through the jobs feature) checks every output
 before starting any (two links with one output are refused), then submits a get job per link with its `from`
 and `fallback_dht`; once one has started, a later link's failure is reported in its result (`error`) rather
@@ -422,7 +432,7 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 | `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits ≤ 2 s |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
 | `rnfs-follow` | follow | every check and fetch, one at a time |
-| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second; auto-fetch, one at a time (LXMF runs its own job thread) |
+| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second; auto-fetch, one at a time, senders in turn (LXMF runs its own job thread) |
 
 The API and gateway run one thread per connection, capped (32 and 64).
 
@@ -450,7 +460,7 @@ not yet fetched, `[[source, cid], ...]` in order); `names.json` (sequences, name
 table); `name-floor.json` (highest sequence of names resolved for the gateway or auto-fetch, at most
 4 × `name_table_size`, saved by the re-announce loop when changed); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
 plus `warnings_total`; older results are capped at load); `keepers.json` (records re-verified at load);
-`follow.json`; `contacts.json`; `lxmf_inbox.json` (500 messages, 4 MiB, 50 per untrusted sender, 16 KiB per
+`follow.json`; `contacts.json`; `lxmf_inbox.json` (500 messages, 4 MiB, 50 per non-auto-fetch sender, 16 KiB per
 record) and `lxmf_outbox.json` (200; unfinished messages are marked failed at a restart), both UTF-8 JSON with
 non-ASCII characters written as is. Elsewhere: `storage/identity`, `storage/lxmf_identity` (0600),
 `names/<alias>` (name keys), `lxmf/` (LXMF's ratchets, delivered-message IDs, stamp costs), `api_token` (while
@@ -612,9 +622,15 @@ Everything in the specification is implemented, with these simplifications and a
 - **LXMF.** Propagation delivery and downloads aren't covered by the e2e test (it has no propagation node).
   Stamps a recipient demands are computed by LXMF (CPU, in subprocesses). Messages over 256 kB are refused.
   The outbound queue is lost at a restart (LXMF doesn't keep it). A message from a sender whose identity
-  can't be found within 2 minutes is lost (LXMF has already marked it delivered). Links sent carry the node
-  ID as `from` unless `lxmf_send_from_hint = false`; the default display name (`rnfs node`) doesn't. No
-  propagation node is used unless configured (or asked for with `--nearest`).
+  can't be found within 2 minutes (30 s after an unanswered path request) is lost, as is one the hold queue
+  or the rate limit on untrusted senders has no room for: LXMF has already recorded it as delivered and the
+  sender has its delivery proof. A steady stream of forged messages can still crowd a first message from an
+  untrusted sender out of the hold queue, and messages with rnfs links from new identities can use up the
+  untrusted senders' rate limit; trusted senders (contacts, `lxmf_accept_from`, `lxmf_auto_fetch_from`) are
+  not held back by either, though forgeries claiming one of them can take its 8 hold places until its
+  identity is known. One auto-fetch runs at a time, so a long one still delays every sender's next. Links
+  sent carry the node ID as `from` unless `lxmf_send_from_hint = false`; the default display name
+  (`rnfs node`) doesn't. No propagation node is used unless configured (or asked for with `--nearest`).
 - **Packaging.** Release artifacts (`.deb` for amd64/arm64, x86_64 Flatpak, Windows x64 exe, wheel and sdist)
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
   `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with

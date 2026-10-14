@@ -139,6 +139,23 @@ Publishing, names and storage:
   waits while the first eviction after a start reads every stored DAG node (about 0.4 s with 20 000 blocks);
   what to delete is still decided under the lock, so nothing that became reachable meanwhile is deleted.
 
+LXMF:
+- Senders in `lxmf_accept_from` or `lxmf_auto_fetch_from` and LXMF contacts are trusted. Their inbox messages
+  are dropped only to make room for each other's, after every other sender's message without pins. With
+  `lxmf_accept_from` empty (the default), about ten new LXMF identities, which cost nothing, could push every
+  message not holding pins out of the inbox, including contacts' messages and auto-fetches that had failed.
+- New inbox messages from senders not trusted are rate limited node-wide: 32 at once, then one a minute. The
+  README now recommends setting `lxmf_accept_from`.
+- Messages from senders whose identity isn't known yet: at most 8 of the 32 held may claim one sender, a held
+  message is dropped 30 s after an unanswered path request instead of waiting 2 minutes, a message claiming
+  a trusted sender takes the place of one held for an unknown sender, and trusted senders get path requests
+  first. 32 forged messages used to fill the queue, so a real first message from a new sender was dropped.
+  LXMF has already told the sender such a message was delivered, so it can still be lost; trusted senders
+  are now protected.
+- Auto-fetches take senders in turn, and a sender with few links waiting gets a place in a full queue from
+  the sender with the most. One sender's backlog used to delay every other sender's auto-fetches, and once
+  it filled the 64-link queue their links were skipped.
+
 ## 0.1.3
 
 Joining the DHT:

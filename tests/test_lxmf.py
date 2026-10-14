@@ -22,6 +22,7 @@ from rnfs.features import lxmf
 from rnfs.features.lxmf import FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE, Incoming, Link, MessageLog
 from rnfs.node import RnfsNode
 
+from tests.support import FakeClock
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -517,13 +518,16 @@ class AutoFetchTest(FeatureTestCase):
         self.assertNotIn(target, self.b.storage.pins())
 
     def test_flood_from_many_senders_keeps_trusted_pins(self):
-        # RM-M1 (PoC inbox_flood.py): INBOX_LIMIT messages from fresh identities
+        # RM-M1 (PoC inbox_flood.py): INBOX_LIMIT messages from fresh identities, slowly enough to pass the rate
+        # limit on senders not trusted (L12)
         feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
+        feature.clock = FakeClock()
         trusted = feature.received(self.link_message())
         feature.process_auto_fetches()
         target = self.target_cid()
         junk = Link(self.cid).uri().encode()
         for i in range(lxmf.INBOX_LIMIT + 10):
+            feature.clock.now += lxmf.UNTRUSTED_INTERVAL
             feature.received(message(os.urandom(16), junk, number=i % 256))
         self.assertIn(self.source(), self.b.storage.pins()[target])
         self.assertIsNotNone(feature.inbox.get(trusted))
@@ -531,8 +535,10 @@ class AutoFetchTest(FeatureTestCase):
 
     def test_one_sender_is_capped(self):
         feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
+        feature.clock = FakeClock()
         junk = Link(self.cid).uri().encode()
         for i in range(lxmf.INBOX_PER_SENDER + 5):
+            feature.clock.now += lxmf.UNTRUSTED_INTERVAL  # within the rate limit on senders not trusted (L12)
             feature.received(message(OTHER, junk, number=i))
         feature.received(self.link_message(source=bytes([0x54] * 16), number=1))
         senders = [e["from"] for e in feature.inbox_list()]

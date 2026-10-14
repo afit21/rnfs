@@ -606,12 +606,19 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `lxmf_send_from_hint` | `true` | Links you send carry `from=<your node ID>`, so recipients can fetch straight from your node when the DHT doesn't know it. This tells everyone who reads the message which rnfs node your LXMF address belongs to; `false` leaves it out |
 | `lxmf_propagation_node` | none | Propagation node (32 hex) for `send --propagate`, for resending direct messages that failed, and for the periodic downloads. Without it none of these happen automatically; a propagation node only heard announcing itself is used only with `--nearest` |
 | `lxmf_sync_interval` | `3600` | How often waiting messages are downloaded from `lxmf_propagation_node`; 0 never |
-| `lxmf_accept_from` | `[]` (everyone) | Only keep messages from these LXMF addresses |
+| `lxmf_accept_from` | `[]` (everyone) | Only keep messages from these LXMF addresses (recommended: see below) |
 | `lxmf_auto_fetch_from` | `[]` | Senders whose links are fetched and pinned automatically |
 | `lxmf_auto_fetch_quota` | `1073741824` (1 GiB) | Storage each auto-fetch sender may use |
 
 The inbox keeps at most 500 messages (4 MiB in all), and at most 50 from any one sender not in
 `lxmf_auto_fetch_from`. Messages holding auto-fetched pins aren't pushed out by other people's messages.
+
+Senders you've named (in `lxmf_accept_from`, in `lxmf_auto_fetch_from`, or as an LXMF contact with
+`rnfs contacts add NICK ADDRESS --kind lxmf`) are trusted. Anyone can make new LXMF addresses for free, so
+messages from everyone else can only push out each other's, and at most 32 new ones are kept in a burst,
+then one a minute; while a flood lasts, a stranger's message may not be kept. If you only expect links from
+people you know, set `lxmf_accept_from` to their addresses: messages from anyone else are then ignored, and
+nobody can crowd them out.
 
 **Gateway and API**
 
@@ -895,4 +902,6 @@ ery thread's stack.
   including `cat` and `stat` reads of other nodes' content: anyone can learn what your node fetched. Use
   `"pinned"` to keep downloads private.
 - LXMF: messages over 256 kB are refused, and unsent messages are lost if the daemon restarts. Offline
-  delivery and downloads need `lxmf_propagation_node` (or `--nearest` each time).
+  delivery and downloads need `lxmf_propagation_node` (or `--nearest` each time). A message rnfs can't keep
+  (from a stranger during a flood, or from a sender whose identity can't be found) is lost, though the
+  sender's app shows it as delivered; senders you trust (see the LXMF settings) are protected from floods.

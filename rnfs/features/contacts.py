@@ -9,7 +9,8 @@
 - A target may start with a name contact's nick: `rnfs get alice/docs/report.pdf` resolves alice's name to
   its CID first (RnfsNode._parse_target calls expand_target; never for the gateway, so web pages can't use
   or probe the address book). Wherever the CLI takes a node ID (`get --from`, `ping`, `pin remote`), a node
-  contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf").
+  contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf"), and trusts
+  senders that has(address, "lxmf") finds.
 - Stored in <state dir>/contacts.json (atomic, UTF-8), at most MAX_CONTACTS entries.
 
 No RNS at module level (the CLI imports this module).
@@ -81,6 +82,7 @@ class ContactsFeature(Feature):
         self._path = os.path.join(node.config.state_dir, CONTACTS_FILE)
         self._lock = threading.Lock()
         self._contacts: dict[str, tuple[str, bytes]] = {}  # nick -> (kind, hash)
+        self._nicks: dict[tuple[str, bytes], int] = {}  # (kind, hash) -> how many nicks name it, for has()
         # name -> (CID, monotonic time of the resolve that found it), reused for EXPAND_AGE
         self._expanded: dict[bytes, tuple[str, float]] = {}
         self._load()
@@ -97,11 +99,22 @@ class ContactsFeature(Feature):
         for nick, entry in entries.items():
             try:
                 check_nick(nick)
-                self._contacts[nick] = (check_kind(entry["kind"]), parse_hex(entry["id"]))
+                self._set(nick, (check_kind(entry["kind"]), parse_hex(entry["id"])))
             except (KeyError, TypeError, ValueError):
                 self._log(f"ignoring malformed contact {nick!r} in {self._path}", LOG_WARNING)
             if len(self._contacts) >= MAX_CONTACTS:
                 break
+
+    def _set(self, nick: str, value: tuple[str, bytes] | None):
+        """Set or (None) delete a contact, keeping _nicks in step (lock held, or loading)."""
+        old = self._contacts.pop(nick, None)
+        if old is not None:
+            self._nicks[old] -= 1
+            if not self._nicks[old]:
+                del self._nicks[old]
+        if value is not None:
+            self._contacts[nick] = value
+            self._nicks[value] = self._nicks.get(value, 0) + 1
 
     def _save(self):
         """Write contacts.json atomically (lock held)."""
@@ -130,7 +143,7 @@ class ContactsFeature(Feature):
         with self._lock:
             if nick not in self._contacts and len(self._contacts) >= MAX_CONTACTS:
                 raise ValueError(f"the address book is full ({MAX_CONTACTS} contacts)")
-            self._contacts[nick] = (kind, ident)
+            self._set(nick, (kind, ident))
             self._save()
         self._log(f"added {nick}: {kind} {ident.hex()}")
         return {"nick": nick, "kind": kind, "id": ident.hex()}
@@ -139,8 +152,9 @@ class ContactsFeature(Feature):
         """Delete a contact. NotFound if there is none."""
         check_nick(nick)
         with self._lock:
-            if self._contacts.pop(nick, None) is None:
+            if nick not in self._contacts:
                 raise NotFound(f"no contact {nick}")
+            self._set(nick, None)
             self._save()
 
     def list(self) -> list[dict]:
@@ -158,6 +172,11 @@ class ContactsFeature(Feature):
         if entry is None or (kind is not None and entry[0] != kind):
             return None
         return entry[1]
+
+    def has(self, ident: bytes, kind: str) -> bool:
+        """Whether some contact of that kind has hash ident (for other features: LXMF trusts its contacts)."""
+        with self._lock:
+            return (kind, bytes(ident)) in self._nicks
 
     def get(self, nick: str) -> dict:
         """One contact. NotFound if there is none; ValueError for an invalid nick."""
