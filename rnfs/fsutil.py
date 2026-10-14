@@ -216,7 +216,9 @@ def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = T
             os.fsync(f.fileno())  # else a power loss can leave path empty once renamed
         if private and IS_WINDOWS:
             from rnfs import winacl
-            winacl.make_private(temp)  # by path, once closed: the handle written through can't change its DACL
+            # By path, once closed (the handle written through can't change its DACL), retried while a virus
+            # scanner has the new file open
+            _retrying(winacl.make_private, temp)
         if exclusive:
             rename_new(temp, path)
         else:
