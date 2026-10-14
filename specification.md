@@ -862,9 +862,11 @@ gateway can never reach the API.
     the whole file sent.
   - `/rnfs/` responses carry `ETag: "<cid>"` and `Cache-Control: immutable`.
   - Sealed files are served as `application/octet-stream`, whatever their name says, and never decrypted;
-    the gateway reads a file's first bytes to recognise them. A `HEAD`, or a range not starting at byte 0,
-    uses those bytes (to recognise a sealed file, or to sniff) only if they are already stored, and never
-    fetches them: its Content-Type then comes from the name, or is `application/octet-stream`.
+    the gateway reads a file's first bytes to recognise them. The user's own `HEAD`, or range not starting
+    at byte 0, uses those bytes (to recognise a sealed file, or to sniff) only if they are already stored,
+    and never fetches them: its Content-Type then comes from the name, or is `application/octet-stream`. A
+    request that isn't the user's own navigation (below) always reads them, fetching them if need be, so its
+    Content-Type doesn't depend on what the node stores.
 - **Trustless responses** (`/rnfs/` only; `/name/` answers `?format=` with 400):
   - `/rnfs/<cid>?format=raw` returns the CID's own block, re-verified, as `application/vnd.rnfs.raw`; a path
     is refused (400).
@@ -872,10 +874,10 @@ gateway can never reach the API.
     `application/vnd.rnfs.archive` with `Content-Disposition: attachment; filename="<target cid>.rnfs-archive"`
     and an exact `Content-Length`; it is byte-identical to `rnfs export`. Its length must be known before
     its first byte, so it needs the whole DAG: a request that isn't the user's own navigation (`Sec-Fetch-Site`
-    present and not `none`) and any `HEAD` get an archive only of a target stored completely on the node,
-    and otherwise `409 Conflict`. The user's own `GET` fetches the whole DAG first, within
-    `max_download_size` and `max_output_entries` (413 otherwise), and the fetch is cancelled if the client
-    disconnects. A bare-CID `If-None-Match` revalidation is answered 304 before anything else.
+    present and not `none`) and any `HEAD` get `409 Conflict`, whether the target is stored or not (an answer
+    that depended on it would tell web pages what the node stores). The user's own `GET` fetches the whole
+    DAG first, within `max_download_size` and `max_output_entries` (413 otherwise), and the fetch is
+    cancelled if the client disconnects. A bare-CID `If-None-Match` revalidation is answered 304 before anything else.
   - Both carry `ETag: "<target cid>.raw"` or `"<target cid>.archive"` and `Cache-Control: immutable`
     (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, no CORS headers, and
     for `?format=raw` `gateway_fetches`) applies. Unknown formats get 400.
@@ -899,7 +901,10 @@ gateway can never reach the API.
   table (section 9).
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
   `gateway_fetches` network fetches or name resolutions at a time. Content already stored is served without
-  limit.
+  limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
+  user started (address bar, bookmark); a request without it comes from a local tool the user runs.
+- Apart from timing, the `gateway_fetches` limit and content no provider has, a web page's request gets the
+  same answer whether the node stores the content or has to fetch it.
 - The gateway never expands contact nicks (`/name/<nick>/` is not supported), so web pages can't use or probe
   the address book.
 

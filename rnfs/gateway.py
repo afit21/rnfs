@@ -6,9 +6,11 @@ GET/HEAD /name/<name>[/path]  content a name points at, resolved with for_gatewa
 Behaviour:
 - Path segments are percent-decoded one by one; a decoded segment can't contain "/" or NUL, so every
   segment is exactly one name.
-- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. A
-  HEAD, or a range not starting at byte 0, uses the first bytes only if they are stored (else the name, or
-  application/octet-stream), so it never fetches what it doesn't send.
+- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. The
+  user's own HEAD, or range not starting at byte 0, uses the first bytes only if they are stored (else the
+  name, or application/octet-stream), so it never fetches what it doesn't send. A web page's request (see
+  limited() below) always reads them, fetching them if need be, so what a page can observe of the type
+  (e.g. through nosniff or opaque-response blocking) never depends on what is stored.
   Single byte ranges (206, 416, Accept-Ranges; If-Range honoured); several ranges get the whole file.
 - Directories: without a trailing slash, 301 to the slash form; with one, index.html if present, else
   an HTML-escaped listing with percent-encoded links.
@@ -504,8 +506,9 @@ class GatewayHandler(TimedHandler):
             byte_range = None  # the client's partial copy may be of something else: send it all
         if byte_range == "unsatisfiable":
             raise GatewayError(416, "range not satisfiable", {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
-        content_type = self.file_type(target, size, filename, self.command != "HEAD" and
-                                      (byte_range is None or byte_range[0] == 0))
+        # A web page's HEAD or later range reads the first bytes too: its type mustn't depend on what is stored
+        content_type = self.file_type(target, size, filename, self.limited() or (
+            self.command != "HEAD" and (byte_range is None or byte_range[0] == 0)))
         headers = {"Accept-Ranges": "bytes", **cache}
         if self.param("filename"):
             headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
@@ -521,14 +524,15 @@ class GatewayHandler(TimedHandler):
         chunks = iter(self.node.read(target, offset=start, length=length, for_gateway=True))
         self.send_stream(status, content_type, length, headers, chunks)
 
-    def file_type(self, target: str, size: int, filename: str | None, sends_start: bool) -> str:
+    def file_type(self, target: str, size: int, filename: str | None, read_start: bool) -> str:
         """A file's Content-Type: octet-stream for a sealed file (never decrypted here), else by name or sniffed.
 
-        The first bytes are fetched only when the response sends them anyway; for a HEAD or a range starting
-        later they are used only if already stored, so such a request fetches nothing it doesn't send.
+        With read_start (a response that sends the first bytes anyway, or any web page's request) they are
+        read, fetched if need be. Otherwise (the user's own HEAD or range starting later) they are used only if
+        already stored, so such a request fetches nothing it doesn't send.
         """
         length = min(size, SNIFF_SIZE)
-        if sends_start:
+        if read_start:
             head = b"".join(self.node.read(target, offset=0, length=length, for_gateway=True))
         else:
             stored_head = getattr(self.node, "stored_head", None)  # facades without it: only complete targets

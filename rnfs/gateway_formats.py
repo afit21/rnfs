@@ -12,10 +12,12 @@ plain response's "<cid>". Fetches count against gateway_fetches like any other, 
 max_download_size and max_output_entries. /name/ paths don't take ?format= (the result must be named by
 the CID it is checked against).
 
-An archive needs the target's whole DAG before its first byte (its length is in the headers), so a web
-page's request (Sec-Fetch-Site present and not "none") or a HEAD gets one only of a target already stored
-completely, else 409; nobody waiting for a body shouldn't make the node fetch a whole DAG. The user's own
-GET of one not stored fetches it, and that fetch is cancelled once the client disconnects.
+An archive needs the target's whole DAG before its first byte (its length is in the headers), so it is made
+only for the user's own GET (handler.limited() false: no Sec-Fetch-Site, or "none"), which fetches what
+isn't stored; that fetch is cancelled once the client disconnects. A web page's request or a HEAD always
+gets 409, stored or not: nobody waiting for a body shouldn't make the node fetch a whole DAG, and answering
+200 for stored targets only would tell web pages what the node stores (an iframe of a 200 with
+Content-Disposition attachment becomes a download and fires no load event; a 409 page does).
 """
 import select
 import socket
@@ -56,10 +58,11 @@ def serve_format(handler, segments: list[str], names: list[str]):
 
     if not names and etag_matches(handler.headers.get("If-None-Match"), f'"{root}.archive"'):
         return _not_modified(handler, f'"{root}.archive"', IMMUTABLE)  # a revalidation needs nothing stored
-    if (handler.limited() or handler.command == "HEAD") and not handler.node.is_local(target):
-        raise GatewayError(409, "an archive of content not completely stored on this node is only made for a GET "
-                                "of the user's own (not a web page's request or a HEAD): fetching it takes the "
-                                "whole DAG; open the URL directly or `rnfs pin` it first")
+    if handler.limited() or handler.command == "HEAD":
+        # Whether the target is stored or not: the answer must not tell a web page which it is
+        raise GatewayError(409, "an archive is only made for a GET of the user's own, never for a web page's "
+                                "request or a HEAD, whether the content is stored or not: open the URL directly, "
+                                "or use `rnfs export`")
     if names:
         cid = handler.node.info(target, for_gateway=True)["cid"]  # the ETag names the target, not the root
     else:

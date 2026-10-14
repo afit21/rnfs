@@ -195,10 +195,10 @@ out within `link_idle_timeout`.
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
 | `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`; the sealed name is None unless `safe_default_name` accepts it) |
-| `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (gateway `HEAD` and ranges not at 0) |
+| `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0) |
 | `read(target, offset=0, length=None, for_gateway=False, from_node=None, raw=False)` | iterator of bytes of a file (range fetched only; sealed files decrypted unless `raw` or `for_gateway`) |
 | `block(cid, for_gateway=False)` | the CID's own block, verified (`cat --block`, `?format=raw`) |
-| `export_stream(target, start, for_gateway=False)` | fetches the DAG, then writes its archive to `start(exact length)` (`?format=archive`; `None` for HEAD). The gateway calls it for a limited request or a HEAD only when `is_local(target)`, and otherwise inside `fetcher.observing(ClientWatch)`, which cancels the fetch once the client disconnects |
+| `export_stream(target, start, for_gateway=False)` | fetches the DAG, then writes its archive to `start(exact length)` (`?format=archive`; `None` for HEAD). The gateway calls it only for the user's own GET (never for a limited request or a HEAD, stored or not), inside `fetcher.observing(ClientWatch)`, which cancels the fetch once the client disconnects |
 | `ls(target, for_gateway=False)` | `[{"name", "kind": "file"\|"executable"\|"directory", "size", "cid"}]` |
 | `stat(target)` | `{"cid", "size", "blocks", "local_blocks", "local_bytes"}` |
 | `is_local(target)` | `bool`: everything needed is stored, so no network fetch |
@@ -274,17 +274,18 @@ possible future way to let pages read their own DAG.
   identity hash; the node's own identity; contacts), `open_sealed` over a Fetch's `read_range`,
   `sealed_info`, `write_sealed`, `block`, `export_stream`, and the API option parser `add_options`.
 - `gateway_formats.py` — `?format=raw|archive`; `archive.archive_size` gives the exact length, so the archive
-  is sent with a Content-Length before streaming. An archive for a web page's request or a HEAD is made only
-  of a target stored completely (else 409), so archives never take a `gateway_fetches` slot; a bare-CID
-  `If-None-Match` revalidation answers 304 first.
+  is sent with a Content-Length before streaming. A web page's request or a HEAD always gets 409, stored or
+  not (a 200 for stored targets only told pages what is stored: L6), so archives never take a
+  `gateway_fetches` slot; a bare-CID `If-None-Match` revalidation answers 304 first.
 - `content/seal.py` rejects a final segment of more than 65536 plaintext bytes, and `SealedFile.name` is None
   for a name that fails its tag, isn't UTF-8 or isn't a valid name. `write_sealed` reads the name before
   creating the output, so nothing raised there leaves a file. `open_sealed` reports the stored (ciphertext)
   size as a job's total, which is what its done bytes count.
 - Cost: `get`, `cat` and `info` of a file read its first 12 bytes to detect sealing (`--raw` skips this), so
   the first chunk is fetched first even for a `cat --offset` deep in a file. The gateway does so only for a
-  GET from byte 0; a HEAD, or a range not at 0, uses the first bytes only if already stored
-  (`stored_head`), else takes the Content-Type from the name, or `application/octet-stream`.
+  GET from byte 0 or a web page's request (`limited()`, so its type never depends on what is stored); the
+  user's own HEAD, or range not at 0, uses the first bytes only if already stored (`stored_head`), else takes
+  the Content-Type from the name, or `application/octet-stream`.
 
 ## Mesh
 

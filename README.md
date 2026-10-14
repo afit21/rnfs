@@ -767,8 +767,8 @@ Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
 - `?filename=` sets the type and the download name.
 - `/rnfs/<cid>?format=raw` returns the block, and `/rnfs/<cid>[/path]?format=archive` returns an archive
   you can `rnfs import`. You can check both against the CID without trusting the gateway. A web page's
-  request or a `HEAD` gets an archive only of content stored completely on your node (409 otherwise);
-  opening the URL yourself fetches it first.
+  request or a `HEAD` never gets an archive (409), so pages can't tell what your node stores; opening the
+  URL yourself fetches what isn't stored first.
 - Pages are sandboxed: they can show files of their own content (images, scripts, style sheets), but no page
   can read gateway responses with `fetch()`. Sealed files are never decrypted by the gateway.
 

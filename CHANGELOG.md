@@ -13,6 +13,12 @@ Gateway privacy:
   (`Access-Control-Allow-Origin` for a gateway `Referer`) never worked in browsers, since sandboxed pages
   send no `Referer`, and it is dropped from the specification. Pages still load their DAG's files as
   images, scripts, style sheets and frames. Per-CID origins may bring reading back later.
+- `?format=archive` answers every web page's request and every `HEAD` with `409`, stored or not. It used to
+  answer `200` for content stored on the node, which let any web site tell what the user had downloaded or
+  viewed (an iframe of a download fires no load event). The user's own `GET` is unchanged.
+- A web page's `HEAD`, or range not starting at byte 0, takes its Content-Type from the file's first bytes,
+  fetched if need be, as its `GET` does. It used to sniff them only if stored (else
+  `application/octet-stream`), which a page may be able to observe (e.g. through opaque-response blocking).
 
 ## 0.1.3
 
