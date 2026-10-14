@@ -592,6 +592,9 @@ and repeat.
 - The disk is the hard bound: a fetch (pinned or not) is refused if what it still has to store — its verified
   size, or the range's size, before downloading, then each response — would leave less than
   max(256 MiB, 2% of the filesystem) free on the filesystem holding `<rnfs dir>/blocks/`.
+- `get` and `export` write their output only if it leaves the same reserve (of the output's filesystem) free.
+  When that is the filesystem holding the blocks, what `get` still has to fetch counts too: its verified size
+  less the bytes of the target's DAG already stored.
 
 **Shared folder.** Every `scan_interval`, files and directories in `<rnfs dir>/files/` are imported as with
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its

@@ -465,7 +465,10 @@ Everything in the specification is implemented, with these simplifications and a
   may evict what it fetched if pins alone fill `max_storage`. Any fetch is refused with `StorageFull` ("not
   enough free disk space") if its remaining size, the range's size, or a response would leave less than
   max(256 MiB, 2%) of the blocks' filesystem free (`Storage.check_disk`, `DISK_RESERVE_MIN`/`_FRACTION`).
-  `get` and `export` also check free disk space at the destination first.
+  `get` and `export` also check free disk space at the destination first (`node._check_free_space`): the
+  output must leave the same reserve free there, and when the destination is on the blocks' filesystem, `get`
+  (and a sealed file's write-out) counts what it still has to fetch too (the verified size less the bytes of
+  the target's DAG already stored).
 - Roots found invalid are remembered in `state/invalid.json` (at most 10 000, oldest dropped), and there is
   no command to clear them. Cache records are capped at 10 000 (LRU). Both are saved every 30 s and at stop.
 - A remote pin's usage is the larger of its content size and its DAG's block bytes. It is dropped once the

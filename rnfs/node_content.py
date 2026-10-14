@@ -147,11 +147,14 @@ def sealed_name(sealed: seal.SealedFile) -> str | None:
     return fsutil.safe_default_name(sealed.name, None)
 
 
-def write_sealed(sealed: seal.SealedFile, output: str) -> dict:
-    """Decrypt a sealed file to output (created exclusively), removing it again if anything fails."""
+def write_sealed(sealed: seal.SealedFile, output: str, blocks_dir: str | None = None, to_fetch: int = 0) -> dict:
+    """Decrypt a sealed file to output (created exclusively), removing it again if anything fails.
+
+    Refused (TooLarge) unless it leaves the disk reserve free, counting the to_fetch bytes still to be stored
+    in blocks_dir if that is on the same filesystem (rnfs.node._check_free_space)."""
     from rnfs.node import _check_free_space, _remove_created  # rnfs.node imports this module
 
-    _check_free_space(output, sealed.size)
+    _check_free_space(output, sealed.size, blocks_dir, to_fetch)
     name = sealed_name(sealed)  # before creating output, so nothing raising here leaves a file behind
     try:
         out = open(output, "xb")

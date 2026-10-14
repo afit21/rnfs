@@ -12,6 +12,9 @@ Fixes:
   amount of data. Content built by `add` (either chunker) stays far inside the bound, and fetches of it ask
   for blocks as before. Requests under the bound never ask for more than it leaves, so a refused fetch
   downloads at most about one block too many.
+- `get` and `export` refuse output that would leave less than the disk reserve (max(256 MiB, 2%)) free, and
+  `get` counts the blocks it still has to fetch when they go to the same disk. They used to check only that
+  the output fits, so a `get` could fill the disk.
 
 ## 0.1.3
 

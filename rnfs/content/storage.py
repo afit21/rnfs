@@ -48,6 +48,11 @@ DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unrea
 _IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
 
 
+def disk_reserve(total: int) -> int:
+    """The free space a filesystem of total bytes must keep: max(DISK_RESERVE_MIN, DISK_RESERVE_FRACTION of it)."""
+    return max(DISK_RESERVE_MIN, int(total * DISK_RESERVE_FRACTION))
+
+
 def check_source(source: str):
     """Raise ValueError unless source is a valid pin source."""
     if source in (USER, FOLDER):
@@ -675,7 +680,7 @@ class Storage:
             usage = shutil.disk_usage(self.blocks.directory)
         except OSError:
             return  # can't tell; writing the blocks reports a real failure
-        reserve = max(DISK_RESERVE_MIN, int(usage.total * DISK_RESERVE_FRACTION))
+        reserve = disk_reserve(usage.total)
         if nbytes > usage.free - reserve:
             raise StorageFull(f"not enough free disk space: {size(nbytes)} more would leave less than "
                               f"{size(reserve)} free in {self.blocks.directory} ({size(usage.free)} free)")
