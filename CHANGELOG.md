@@ -15,6 +15,8 @@ Fixes:
 - `get` and `export` refuse output that would leave less than the disk reserve (max(256 MiB, 2%)) free, and
   `get` counts the blocks it still has to fetch when they go to the same disk. They used to check only that
   the output fits, so a `get` could fill the disk.
+- Names given as text must be exactly 32 hex digits (optionally in `<angle brackets>`, with spaces around):
+  whitespace between the digits used to be skipped, giving a name shorter than 16 bytes.
 
 ## 0.1.3
 
