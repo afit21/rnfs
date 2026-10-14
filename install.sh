@@ -268,6 +268,11 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+# Only the system calls ordinary services make, for this machine's own architecture (seccomp, which works in a
+# user unit because NoNewPrivileges is set). A PipeInterface's program is held to the same. MemoryDenyWriteExecute
+# is left out: libffi closures, which cffi (under cryptography) can use, may need writable executable memory.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

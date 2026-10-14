@@ -224,6 +224,9 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [tests, version, python, deb, flatpak, windows]
     runs-on: ubuntu-latest
+    # Protection rules (required reviewers, which tags may deploy) are set on this environment in the
+    # repository's settings, so publishing can be gated beyond whoever can push a v* tag
+    environment: release
     permissions:
       contents: write      # create the release
       id-token: write      # sign the provenance attestation (Sigstore certificate for this workflow run)

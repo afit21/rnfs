@@ -41,6 +41,10 @@ Platform and packaging:
 - The release workflow's Debian 12 smoke test mounts the checkout read-only (it installs a copy of the
   `.deb`), runs an image pinned by digest with `no-new-privileges`, and runs the smoke test as `nobody`. The
   container could change the `.deb` just before it was uploaded, checksummed and attested.
+- The release job runs in a `release` environment, so publishing can be gated by that environment's
+  protection rules (set in the repository's settings).
+- The systemd user unit (`contrib/rnfs.service` and the one `install.sh` writes) adds
+  `SystemCallFilter=@system-service` and `SystemCallArchitectures=native`.
 - The identity file's permission fix no longer follows a symlink: a symlink at the identity path is left as
   it is, with a warning, and the file is changed through a descriptor opened with `O_NOFOLLOW`.
 
