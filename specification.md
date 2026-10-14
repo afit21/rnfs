@@ -521,7 +521,7 @@ and repeat.
   - `max_bytes`;
   - `MAX_RESPONSE_SIZE − 1 KiB`, so the encoded response stays within `MAX_RESPONSE_SIZE`;
   - if the link has a rate estimate, `response_target` of transfer at the lower of that estimate and
-    `max_upload_rate`;
+    `max_upload_rate`; if it has none, `CHUNK_SIZE` (what a requester asks for then, enforced);
   - with an upload budget whose bucket isn't full, what the bucket holds, less 1 KiB, and in any case what is
     left of the requester's half share (section 3, Airtime controls).
 - **What a node serves:** only blocks in the DAG of a CID it currently provides (the same reachability GC

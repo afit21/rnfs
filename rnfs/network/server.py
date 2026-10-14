@@ -24,8 +24,8 @@ from typing import Callable, Protocol
 import RNS
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE,
-                            PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
+                            MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
@@ -86,10 +86,12 @@ def blocks_budget(max_bytes: int, rate_estimate: float | None, upload_cap: float
                   response_target: float) -> int:
     """Total block bytes a /blocks response may hold after its first served block (section 7)."""
     limit = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
-    if rate_estimate is not None:
-        rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
-        limit = min(limit, rates.transfer_bytes(response_target, rate))
-    return limit
+    if rate_estimate is None:
+        # What a requester asks for until the link has a rate estimate (section 7), enforced: otherwise one
+        # small request could ask for a ~1 MiB response with a deadline of many hours
+        return min(limit, CHUNK_SIZE)
+    rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
+    return min(limit, rates.transfer_bytes(response_target, rate))
 
 
 def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], limit: int) -> list[bytes | None]:

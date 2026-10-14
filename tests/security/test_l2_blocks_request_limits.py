@@ -1,13 +1,9 @@
 """L2: the /blocks server used to serve duplicate CIDs and, on a link with no rate estimate, cap a response
 only at the requester's max_bytes (up to ~1 MiB).
 
-Duplicate CIDs: FIXED here. A request that repeats a CID is refused as malformed, so a node can't be made to
-read and serve the same block several times in one response.
-
-The unmeasured-link budget cap (at CHUNK_SIZE) is NOT applied, because doing so changes behaviour that four
-tests in tests/test_server.py (another session's file) assert, and those must keep passing. The cap tests below
-assert the safe (capped) behaviour and are @unittest.expectedFailure until the cap lands together with those
-tests' updates (the exact diffs are in the handback report).
+Both are fixed. A request that repeats a CID is refused as malformed, so a node can't be made to read and serve
+the same block several times in one response; and on a link with no rate estimate the budget is CHUNK_SIZE
+(the first served block is still always included), so one packet can't ask for a ~1 MiB response.
 """
 import unittest
 
@@ -54,16 +50,12 @@ class MeasuredBudgetTest(unittest.TestCase):
 
 
 class UnmeasuredBudgetCapTest(unittest.TestCase):
-    """The unmeasured-link budget cap at CHUNK_SIZE: the safe behaviour, not yet applied (see module docstring)."""
+    """The unmeasured-link budget cap at CHUNK_SIZE."""
 
-    # L2: fails until blocks_budget caps an unmeasured link at CHUNK_SIZE (and tests/test_server.py is updated)
-    @unittest.expectedFailure
     def test_budget_without_a_rate_estimate_is_capped_at_chunk_size(self):
         self.assertEqual(server.blocks_budget(10 * CHUNK_SIZE, None, None, 60), CHUNK_SIZE)
         self.assertEqual(server.blocks_budget(MAX_RESPONSE_SIZE, None, None, 60), CHUNK_SIZE)
 
-    # L2: fails until an unmeasured link's response is capped at CHUNK_SIZE
-    @unittest.expectedFailure
     def test_unmeasured_link_response_is_small(self):
         blocks = {cid: data for cid, data in (block_of(CHUNK_SIZE, i) for i in range(10))}
         h = ServerHarness(blocks)
@@ -72,7 +64,7 @@ class UnmeasuredBudgetCapTest(unittest.TestCase):
         self.assertEqual(len(served), 1)  # one CHUNK_SIZE block, not ten
 
     def test_first_block_is_still_served_whole_regardless(self):
-        # The first served block is always included, up to MAX_BLOCK_SIZE, whether or not the cap applies
+        # The first served block is always included, up to MAX_BLOCK_SIZE, even over the cap
         (c1, b1), (c2, b2) = block_of(MAX_BLOCK_SIZE, 1), block_of(CHUNK_SIZE, 2)
         h = ServerHarness({c1: b1, c2: b2})
         link = h.connect(FakeInterface("hub", TCP_BITRATE), mtu=1500, mdu=1400)
