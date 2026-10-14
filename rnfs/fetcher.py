@@ -642,8 +642,8 @@ class Fetch:
     def _rank(self, node_id: bytes, path: mesh.PathInfo, order: int) -> tuple:
         """Sort key for a provider: seniority stays first (an attacker's fresh identities can't jump the
         queue by being near), then hops and next-hop bitrate, then order."""
-        known_for = self.fetcher.routing.seniority(node_id)
-        return mesh.provider_rank(known_for is not None and known_for >= self.config.provider_seniority, path, order)
+        senior = self.fetcher.routing.is_senior(node_id, self.config.provider_seniority)
+        return mesh.provider_rank(senior, path, order)
 
     def _path(self, node_id: bytes) -> mesh.PathInfo:
         """What RNS knows about the path to node_id (nothing if the lookup fails)."""

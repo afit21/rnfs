@@ -648,10 +648,23 @@ the name through the network and asks keepers (below), since the key's earlier r
 - To refresh, call `Transport.request_path(name)`, wait up to `path_timeout`, then read
   `Identity.recall_app_data(name)`.
 - If the path request heard nothing within `path_timeout` (or always, with `keeper_query = always`), ask
-  keepers (below): find providers of the name's key (section 6, stopping once `alpha` are known), ask up to
-  `alpha` of them with `/name`, and offer every verifying record to the sequence rules. A keeper query (a DHT
-  lookup plus up to `alpha` requests) costs roughly ten times the airtime of a resolve a path response
-  answers, so `always` SHOULD NOT be used on slow links.
+  keepers (below). Storing a provider record is free, so neither a record's age nor the order a reply lists it
+  in may decide which keepers are asked:
+  - Find providers of the name's key (section 6). Providers recorded locally are candidates, never a reason
+    to skip the search, which runs until 3 × `alpha` are known and more than one source listed some (this
+    node's own records count as one source), or until the lookup is complete.
+  - Rank the candidates by routing-table seniority, as providers are (section 6): servers in the routing table
+    for over `provider_seniority` that haven't failed a query since last heard nor been silent for
+    2 × `announce_interval` first, then other such servers, then servers that failed a query or went silent
+    (an owner that has left), then IDs not in the table; at random within each group.
+  - Ask them with `/name`, a batch of `alpha` at a time, and offer every verifying record to the sequence
+    rules, so the highest valid sequence wins. Ask another batch while no answer reaches the highest sequence
+    already known for the name (from an announce, an earlier resolve or a kept record), or while fewer than two
+    keepers have answered; at most 3 batches. A slow node (`alpha` 1) asks at most 2 batches, and asks the
+    second for want of a second answer only when it knows no sequence to compare the first against.
+
+  A keeper query (a DHT lookup plus a few requests) costs roughly ten to twenty times the airtime of a
+  resolve a path response answers, so `always` SHOULD NOT be used on slow links.
 - Return the record with the highest sequence held, and how long ago it was heard (for a record from a
   keeper, from its signed emission time, never in the future).
 

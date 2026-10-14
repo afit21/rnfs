@@ -85,6 +85,7 @@ class Lookup:
         self._allowed_unknown: set[bytes] = set()  # unknown IDs that were given a path request
         self._refused_unknown: set[bytes] = set()  # unknown IDs over the budget
         self._reported: set[bytes] = set()  # providers already passed to on_provider, in any run
+        self._listing: set[bytes] = set()  # nodes whose reply listed a provider, in any run
         self._last_known: dict[bytes, int] = {}  # the nodes the last run knew of and hadn't seen fail
         self._last_queried: set[bytes] = set()  # the nodes the last run queried
         self._wake: queue.Queue | None = None
@@ -144,6 +145,12 @@ class Lookup:
         if self.deadline is None:
             return self.timeout
         return max(0.0, self.deadline - self.clock())
+
+    def listing_count(self) -> int:
+        """How many nodes have answered with at least one provider (in any run), so a caller can tell
+        providers vouched for by several nodes from those one node listed."""
+        with self._lock:
+            return len(self._listing)
 
     def closest_answered(self) -> list[bytes]:
         """The k closest nodes that answered in any run so far, closest first."""
@@ -237,6 +244,9 @@ class Lookup:
             with self._lock:
                 self._answered.add(node_id)
             providers, nodes = reply
+            if providers:
+                with self._lock:
+                    self._listing.add(node_id)
             for new_id in nodes:
                 if new_id not in known and new_id not in queried and self._usable(new_id):
                     known[new_id] = self._distance(new_id)

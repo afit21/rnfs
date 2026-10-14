@@ -148,7 +148,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `routing.py` — `RoutingTable(own_id, config, clock=time.monotonic)`:
 `heard(node_id) -> bool` (proven server: announce in server mode, or answered `/find`), `failed(node_id) -> bool`
 (True if dropped), `remove(node_id)`, `ban(node_id)`, `is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
-`seniority(node_id) -> float | None` (seconds in the table), `contains(node_id)`, `node_count()`.
+`seniority(node_id) -> float | None` (seconds in the table), `is_senior(node_id, min_age)`, `standing(node_id,
+min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `contains(node_id)`,
+`node_count()`.
 
 `providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random,
 own_id=None, seniority=0)`: `store(key, publisher) -> bool`, `withdraw(key, publisher)`,
@@ -167,7 +169,8 @@ from a heap of (first seen, arrival) with stale entries dropped lazily. First-se
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure)` with
 `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. `is_known(id)`
 says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup (`allow_unknown(id)`, also
-used by the fetcher for provider IDs).
+used by the fetcher for provider IDs). `listing_count()` is how many nodes have answered with at least one
+provider, so the keeper search can wait for providers listed by more than one source.
 
 ## Network layer interfaces
 
@@ -490,7 +493,11 @@ Everything in the specification is implemented, with these simplifications and a
   sends nothing for a `None` response, so "not kept" is `[]`. Kept records are offered to `NameManager` at
   startup and on every resolve (the rollback floor). Kept names without a record are retried round robin, at
   most 64 per `announce_interval`, continuing after the last one asked. `_store` refuses a record below the
-  sequence `NameManager` holds for the name.
+  sequence `NameManager` holds for the name. `ask_keepers` searches for 3 × alpha candidates from two sources
+  (`Lookup.listing_count`, plus one for local records), ranks them with `RoutingTable.standing` and a random
+  tie-break (`rank_keepers`), and asks batches of alpha until an answer reaches the highest known sequence
+  (`NameManager.record` or the kept record) from two keepers, at most `keeper_rounds()` batches (3; 2 on slow
+  nodes, where one current answer is enough once a sequence is known).
 - **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. The pins of name
   keys deleted by hand are released by `release_gone()`, once the features are set up.

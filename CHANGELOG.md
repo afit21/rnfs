@@ -11,6 +11,14 @@ DHT and names:
   own records are always accepted (they were refused once the store was full). A publisher's share of the
   store grows with age: a tenth of it until it has been seen for `provider_seniority`. First-seen times are
   kept for a week after a publisher's last record goes, so one that was away for a while isn't new again.
+- Resolving through keepers no longer asks only the first `alpha` keepers found, oldest record first: a few
+  identities that stored provider records for a name's key before its real keepers (and, on a slow node, the
+  departed owner's own record) could hide every keeper. Keepers recorded locally no longer skip the DHT search,
+  which now looks for 3 × `alpha` keepers listed by more than one node; they are ranked by routing-table
+  seniority (live servers first, then those that failed or went silent, then unknown IDs), at random within
+  each group, and asked a batch at a time. Another batch is asked while no answer reaches the sequence already
+  known or only one keeper answered, at most 3 batches (2 on slow nodes, where a second `/name` is spent only
+  if there's no known sequence to check the first answer against).
 - A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
   client never sends more.
 
