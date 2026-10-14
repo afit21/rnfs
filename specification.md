@@ -673,8 +673,15 @@ what prevent rollback.
 - For every name this node has published, or resolved through the CLI or API, it MUST persist the highest
   sequence seen, and never accept a lower one from any source.
 - At equal sequence, the record already held is kept.
-- Records for other names (heard, or resolved by the gateway) are kept only in a table of at most
-  `name_table_size` entries, least recently used evicted first.
+- Records for other names (heard, or resolved by the gateway or LXMF auto-fetch) are kept only in a table of
+  at most `name_table_size` entries, least recently used evicted first. An announce of a name the node isn't
+  resolving or keeping takes a place only if one is free or held by another name that was only heard, so a
+  flood of announces of new names can't push out the names the node resolved.
+- For names resolved without being persisted (gateway, auto-fetch), the node SHOULD persist the highest
+  sequence it returned, as a floor below which no record of that name is accepted, so such a resolve never
+  goes back after table churn or a restart. The record itself isn't persisted. (rnfs: up to
+  4 × `name_table_size` names, least recently resolved forgotten first, saved at least every minute and at
+  shutdown.)
 - Records from keepers are subject to the same persisted-sequence and no-rollback rules as announces.
 - A record this node keeps (below) is a floor for resolving that name: it MUST be offered to the sequence
   rules at startup and on every resolve, so an older validly signed announce is never accepted for a kept
@@ -1023,7 +1030,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `max_storage` | 10 GiB | |
 | `max_download_size` | none | |
 | `max_output_entries` | 100 000 | |
-| `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API |
+| `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API (four times as many sequence floors, section 9) |
 | `remote_pin_quota` | 1 GiB per remote identity | |
 | `remote_pin_identities` | empty | Identities allowed to send `/pin` |
 | `private` | off | Private mode (section 3) |

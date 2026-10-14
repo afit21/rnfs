@@ -19,6 +19,11 @@ DHT and names:
   each group, and asked a batch at a time. Another batch is asked while no answer reaches the sequence already
   known or only one keeper answered, at most 3 batches (2 on slow nodes, where a second `/name` is spent only
   if there's no known sequence to check the first answer against).
+- Gateway and LXMF auto-fetch name resolves can no longer be rolled back by flooding announces of new names
+  and replaying an old one: an announce of a name the node isn't resolving or keeping only takes the table
+  place of another name that was only heard, and the highest sequence of each name resolved this way is saved
+  in `state/name-floor.json` (up to 4 × `name_table_size` names), so no older record is accepted after table
+  churn or a restart.
 - A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
   client never sends more.
 

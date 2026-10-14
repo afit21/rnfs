@@ -400,7 +400,8 @@ Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to di
 (storage); `pin_names.json` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin
 list); `providers.json` (provider records); `published.json` (publisher: last rounds, earlier rounds' nodes,
 pending withdrawals); `fetched.json` (targets fetched for the user, for `roots`); `names.json` (sequences, name
-table); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
+table); `name-floor.json` (highest sequence of names resolved for the gateway or auto-fetch, at most
+4 × `name_table_size`, saved by the re-announce loop when changed); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
 plus `warnings_total`; older results are capped at load); `keepers.json` (records re-verified at load);
 `follow.json`; `contacts.json`; `lxmf_inbox.json` (500 messages, 4 MiB, 50 per untrusted sender, 16 KiB per
 record) and `lxmf_outbox.json` (200; unfinished messages are marked failed at a restart), both UTF-8 JSON with
@@ -500,7 +501,10 @@ Everything in the specification is implemented, with these simplifications and a
   nodes, where one current answer is enough once a sequence is known).
 - **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. The pins of name
-  keys deleted by hand are released by `release_gone()`, once the features are set up.
+  keys deleted by hand are released by `release_gone()`, once the features are set up. The name table marks
+  entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
+  no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
+  `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`), which `_offer` checks.
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
