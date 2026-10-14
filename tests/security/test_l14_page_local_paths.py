@@ -4,7 +4,7 @@ the CLI's stderr verbatim on every error path (index.mu:54, 66, 86, 90, 94).
 
 This runs the page's real script with a CLI that fails exactly as rnfs does when the daemon is down, and
 checks the visitor is not shown the local path the error carries. The fixed pages show a generic message and
-write the detail to page.log in their data dir; the tests check that too.
+write the detail to page.log in their data dir; the tests check that too, for both pages.
 """
 import os
 import tempfile
@@ -68,6 +68,17 @@ class LocalPathLeakTest(unittest.TestCase):
         self.assertNotIn(missing, output)
         self.assertIn("can't be shown right now", output)
         self.assertIn(missing, self.log())
+
+    def test_index_page_hides_cli_stderr_paths(self):
+        """The file-index-node page, with the daemon down, shows a generic message and logs the detail."""
+        def run(argv, *args, **kwargs):
+            """Fail as the CLI does when the daemon is down."""
+            return helpers._Completed(1, stderr=DAEMON_DOWN)
+
+        output = helpers.exec_index_page(run, self.data_dir)
+        self.assertNotIn(RNFS_DIR, output)
+        self.assertIn("The file list isn't available right now", output)
+        self.assertIn(DAEMON_DOWN, self.log())
 
     def test_log_is_kept_small(self):
         """Past LOG_MAX bytes the log moves to page.log.1, so visitors causing errors can't fill the disk."""
