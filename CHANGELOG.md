@@ -38,6 +38,36 @@ Local API and privacy:
   can learn what the node fetched, and that `"pinned"` avoids it; and that scripts showing content to others
   must use `cat --raw`, since `cat` decrypts sealed files this node can open. Behaviour is unchanged.
 
+Platform and packaging:
+- Where directories are walked by path (Windows), adding a directory or scanning the shared folder checks
+  each directory again whenever it lists it (same file ID, not a junction, symlink or other name-surrogate
+  reparse point, real path still inside the folder) and each file's final path, from its open handle, before
+  reading it. A directory swapped for a junction during a scan used to import files from outside the shared
+  folder and share them; now what changed is skipped with a warning. The README says the shared folder must
+  not be writable by accounts you don't trust. Not yet tested on Windows itself.
+- On Windows the rnfs dir, the API token, the node and LXMF identities and name keys get a protected access
+  list allowing only the user and SYSTEM; they used to inherit their folder's, which with `--dir` outside the
+  user profile (another drive, `C:\ProgramData`) usually let every local user read the token and the keys.
+  An existing rnfs dir or identity file that lets others in is tightened (with a notice), the daemon refuses
+  an rnfs dir owned by another account, and every command refuses a token file others can read, as on POSIX.
+  A `--dir` outside `%USERPROFILE%` gets a warning. Not yet tested on Windows itself.
+- `install.sh` installs the latest release from its sdist (`rnfs-X.Y.Z.tar.gz`, a release file) instead of
+  GitHub's archive of the tag, which neither `SHA256SUMS` nor the build provenance covers and which a moved tag
+  would change unnoticed. The sdist must match the release's `SHA256SUMS`; where the GitHub CLI (2.49 or
+  newer) is installed and logged in, its signed provenance is checked too (`gh attestation verify`, signed by
+  the release workflow), and a mismatch or failed check stops the install. Without `gh` it warns that only
+  the checksum was checked; `RNFS_REQUIRE_ATTESTATION=1` makes that an error. The README's "Checking a
+  download" shows `gh attestation verify`.
+- The release workflow's Debian 12 smoke test mounts the checkout read-only (it installs a copy of the
+  `.deb`), runs an image pinned by digest with `no-new-privileges`, and runs the smoke test as `nobody`. The
+  container could change the `.deb` just before it was uploaded, checksummed and attested.
+- The release job runs in a `release` environment, so publishing can be gated by that environment's
+  protection rules (set in the repository's settings).
+- The systemd user unit (`contrib/rnfs.service` and the one `install.sh` writes) adds
+  `SystemCallFilter=@system-service` and `SystemCallArchitectures=native`.
+- The identity file's permission fix no longer follows a symlink: a symlink at the identity path is left as
+  it is, with a warning, and the file is changed through a descriptor opened with `O_NOFOLLOW`.
+
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
   message for their status; the detail goes to the daemon's log. A `507` used to show the local blocks

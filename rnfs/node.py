@@ -23,7 +23,7 @@ from typing import BinaryIO, Iterator
 
 import RNS
 
-from rnfs import __version__, features, fsutil
+from rnfs import __version__, features, fsutil, winacl
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, seal, walker
@@ -66,7 +66,8 @@ KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND
 
 
 def _make_private_dirs(config: Config):
-    """Create the rnfs dir and the node's subdirectories readable by the owner only (0700).
+    """Create the rnfs dir and the node's subdirectories readable by the owner only (0700; on Windows, a
+    protected access list for the user and SYSTEM, see winacl).
 
     They hold the node's identity, name keys and the local API token, so other local users must not read
     them; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if the
@@ -74,9 +75,10 @@ def _make_private_dirs(config: Config):
     config there.
     """
     root = config.root
+    existed = os.path.isdir(root)
     os.makedirs(root, mode=0o700, exist_ok=True)
-    # Windows has no Unix permission bits (st_mode always shows others allowed), so only the ACL that the
-    # rnfs dir inherits from the user's profile protects it there
+    # Windows has no Unix permission bits (st_mode always shows others allowed): an explicit access list there
+    winacl.secure_rnfs_dir(root, created=not existed)
     if not fsutil.IS_WINDOWS:
         info = os.stat(root)
         if info.st_uid != os.geteuid():

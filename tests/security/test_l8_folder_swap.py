@@ -3,9 +3,10 @@ shared folder for a junction during a scan imports files from outside the folder
 
 Simulated on any POSIX system: builder.FD_WALK is forced to False and a symlink stands in for the junction. The swap
 happens at a fixed point of the scan (after the signature walk of a top-level entry, or right after a nested
-directory passed its check), so there is no timing race. With the path walk the outside file is imported and pinned
-"folder" (so the node provides it); with the descriptor walk (FD_WALK True, the real setting on Linux and macOS)
-it never is.
+directory passed its check), so there is no timing race. Before the fix, the path walk imported the outside file and
+pinned it "folder" (so the node provided it); now the path walk checks each directory again whenever it lists it, and
+each file's final path, so neither walk (nor the descriptor walk, FD_WALK True, the real setting on Linux and macOS)
+ever reads it.
 """
 import os
 import tempfile
@@ -16,7 +17,7 @@ from unittest import mock
 from rnfs.content import builder, dag, shared_folder, walker
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, Storage
+from rnfs.content.storage import Storage
 from tests.support import CAN_SYMLINK
 
 SECRET = b"TOP SECRET: outside the shared folder"
@@ -111,23 +112,10 @@ class FolderSwapTest(unittest.TestCase):
         """Imported files that came from the private directory."""
         return {path for path in self.imported_files(pins) if path.endswith("secret.txt")}
 
-    def assert_leaked(self, pins: set[Cid]):
-        """The secret was read into storage and is in the folder's pinned (so provided) DAG."""
-        self.assertTrue(self.storage.has(Cid.for_block(RAW, SECRET)))
-        self.assertTrue(self.outside_files(pins))
-        self.assertEqual(pins, self.storage.pinned_by(FOLDER))
-
     def assert_not_leaked(self, pins: set[Cid]):
         """Nothing from outside the folder was read into storage."""
         self.assertFalse(self.storage.has(Cid.for_block(RAW, SECRET)), "the secret's block was stored")
         self.assertEqual(self.outside_files(pins), set(), "imported from outside the folder")
-
-    def test_path_walk_imports_outside_files(self):
-        for swapping in (self.swap_after_signature, self.swap_after_check):
-            with self.subTest(swapping.__name__):
-                self.make_folder()
-                pins = self.scan(False, swapping)
-                self.assert_leaked(pins)
 
     @unittest.skipUnless(builder.FD_WALK, "directories opened by descriptor (POSIX)")
     def test_descriptor_walk_stays_in_the_folder(self):
@@ -138,9 +126,6 @@ class FolderSwapTest(unittest.TestCase):
                 self.assertTrue(os.path.islink(self.drop) or os.path.islink(os.path.join(self.drop, "sub")))
                 self.assert_not_leaked(pins)
 
-    # L8: fails until the path walk re-checks each directory's identity (or walks by handle) so a swapped-in
-    # junction can't lead outside the folder
-    @unittest.expectedFailure
     def test_path_walk_stays_in_the_folder(self):
         for swapping in (self.swap_after_signature, self.swap_after_check):
             self.make_folder()

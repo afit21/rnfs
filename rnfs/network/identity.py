@@ -4,7 +4,7 @@ import stat
 
 import RNS
 
-from rnfs import fsutil
+from rnfs import fsutil, winacl
 from rnfs.constants import APP_NAME, DHT_ASPECT, ID_LENGTH
 from rnfs.log import LOG_WARNING, log
 
@@ -38,12 +38,13 @@ def save_identity(identity: RNS.Identity, path: str, replace: bool = True) -> bo
     world-readable) and could leave a truncated key behind if interrupted.
     """
     # The file is created with O_CREAT | O_EXCL and mode 0600 (IDENTITY_MODE), which a umask can only narrow,
-    # so no chmod is needed (and os.fchmod doesn't exist on Windows before Python 3.13). On Windows the file
-    # inherits the rnfs dir's ACL instead: under the user's profile, only them, admins and SYSTEM. Without
+    # so no chmod is needed (and os.fchmod doesn't exist on Windows before Python 3.13). On Windows, where the
+    # mode sets no access list, it gets a protected one for this user and SYSTEM only (private). Without
     # replace, rename_new keeps an existing file atomically where the platform allows (hard link,
     # RENAME_NOREPLACE)
     try:
-        fsutil.write_atomic(path, identity.get_private_key(), mode=IDENTITY_MODE, exclusive=not replace)
+        fsutil.write_atomic(path, identity.get_private_key(), mode=IDENTITY_MODE, exclusive=not replace,
+                            private=True)
     except FileExistsError:
         if replace:
             raise
@@ -52,15 +53,37 @@ def save_identity(identity: RNS.Identity, path: str, replace: bool = True) -> bo
 
 
 def _restrict_permissions(path: str):
-    """Make an existing identity file owner-only if group or others could access it (e.g. an older rnfs's)."""
+    """Make an existing identity file owner-only if group or others could access it (e.g. an older rnfs's).
+
+    Never through a symlink: a symlink at path is left alone, with a warning, and the file is opened without
+    following one (O_NOFOLLOW) and changed through that descriptor, so a link put there can't get another
+    file's permissions changed. On Windows, which has no Unix permission bits (st_mode always shows group and
+    others allowed), its access list is checked and tightened instead (winacl).
+    """
     if fsutil.IS_WINDOWS:
-        return  # no Unix permission bits: st_mode always shows group and others allowed, so this would always fire
+        try:
+            reason = winacl.tighten(path)
+        except OSError as e:
+            log(f"could not restrict access to identity file {path}: {e}", LOG_WARNING)
+            return
+        if reason is not None:
+            log(f"identity file {path} was accessible to other users ({reason}); "
+                f"restricted it to you and SYSTEM", LOG_WARNING)
+        return
     try:
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        if mode & 0o077:
-            os.chmod(path, IDENTITY_MODE)
-            log(f"identity file {path} was accessible to other users (mode {mode:o}); "
-                f"restricted it to {IDENTITY_MODE:o}", LOG_WARNING)
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            log(f"identity file {path} is a symlink, so its permissions weren't checked; make sure only you "
+                f"can read the file it points to", LOG_WARNING)
+            return
+        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        try:
+            mode = stat.S_IMODE(os.fstat(fd).st_mode)
+            if mode & 0o077:
+                os.fchmod(fd, IDENTITY_MODE)
+                log(f"identity file {path} was accessible to other users (mode {mode:o}); "
+                    f"restricted it to {IDENTITY_MODE:o}", LOG_WARNING)
+        finally:
+            os.close(fd)
     except OSError as e:
         log(f"could not restrict the permissions of identity file {path}: {e}", LOG_WARNING)
 

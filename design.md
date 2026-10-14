@@ -272,7 +272,12 @@ the token with every other request, `rnfs status` included (without a readable t
 and says why). The daemon writes a new random
 token to `<rnfs dir>/api_token` (mode 0600, in the 0700 rnfs dir) at each start and the CLI reads it, so other
 local users and processes can't drive the API. `_make_private_dirs` refuses to start (RnfsError) if the rnfs dir
-belongs to another user or can't be made 0700 (not on Windows). A response to a request with
+belongs to another user or can't be made 0700. On Windows (`rnfs/winacl.py`), mode bits set no ACL, so a new
+rnfs dir gets a protected DACL allowing only the user and SYSTEM (inherited below it), an existing one that
+allows anyone else is given it, and one owned by another account is refused; the token, identity and name key
+files get the same DACL before they are renamed into place (`fsutil.write_atomic(private=True)`), and
+`read_token` checks the opened token's DACL (Administrators tolerated). A `--dir` outside `%USERPROFILE%` is
+warned about. The advapi32 calls are behind `winacl.backend`, which tests replace with a fake. A response to a request with
 `X-Rnfs-Challenge: <32 hex>` carries `X-Rnfs-Proof: cli.api_proof(token, port, challenge)` (HMAC-SHA256 of
 `rnfs api proof <port> <challenge>`); `ApiClient.verify_daemon` checks it with `GET /api/status` before first
 sending the token. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
@@ -568,9 +573,13 @@ Everything in the specification is implemented, with these simplifications and a
 - `get` (`walker.write_out`) skips and reports names the destination filesystem refuses to create (EINVAL,
   ENAMETOOLONG, EILSEQ: e.g. `?` on FAT, long names on eCryptfs) rather than failing the whole write-out.
 - On Windows (`rnfs/fsutil.py`, `IS_WINDOWS`): there is no execute bit, so `add` records every file as kind 0
-  and `get` sets none; Unix permission checks are skipped (the rnfs dir relies on the ACL it inherits from the
-  user's profile). Directories are walked by path rather than descriptor, each entry's type and file ID checked
-  before use, and directory junctions are skipped like symlinks. Replacing or deleting a file another handle
+  and `get` sets none; Unix permission checks are replaced by access-list ones (`winacl`, see the API
+  section). Directories are walked by path rather than descriptor, each entry's type and file ID checked
+  before use, and directory junctions (and other name-surrogate reparse points) are skipped like symlinks.
+  Each directory is checked again whenever it is listed (`builder.list_directory`: same file ID, not a link,
+  real path inside the walk's root), and each file opened below it must have its final path
+  (`fsutil.final_path`, GetFinalPathNameByHandleW) inside that root, so a directory swapped for a junction
+  mid-walk can't lead outside it (audit L8). Replacing or deleting a file another handle
   has open is retried for about a second; a block still in use then stays stored and indexed and is deleted by
   a later collection. `get` skips names Windows can't represent (`:`, device names, trailing dots), and the
   API and gateway bind their ports exclusively. The daemon stops cleanly on Ctrl+C or Ctrl+Break (SIGBREAK).

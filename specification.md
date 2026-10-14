@@ -967,15 +967,16 @@ gateway can never reach the API.
   DNS rebinding.
 - Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
-  `<rnfs dir>/api_token` with mode 0600; the CLI reads it from there and refuses a file other users can
-  access. Every local process, of every user, can connect to `127.0.0.1`, and the API reads and writes
+  `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
+  SYSTEM); the CLI reads it from there and refuses a file other users can access. Every local process, of every user, can connect to `127.0.0.1`, and the API reads and writes
   files as the daemon's user, so only users who can read the rnfs directory may use it. Web pages can't
   learn the token, and the custom header needs a CORS preflight, which fails: this also blocks cross-site
   requests. `GET /api/status` stays open for health checks and the proof check below, but without the
   token it MUST say no more than the daemon's version (rnfs: `{"version": ...}`); the full status (node ID,
   identity hash, LXMF address, traffic) needs the token like every other request.
 - The daemon MUST refuse to start if the rnfs directory belongs to another user or can't be made accessible
-  to its owner only (outside Windows, where it relies on the ACL inherited from the user's profile).
+  to its owner only (on Windows: a protected access list allowing only the user and SYSTEM, which the files
+  below it inherit; Administrators are tolerated where an older version left them).
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it first sends the token, the CLI checks this proof with a `GET /api/status`, so a program another
