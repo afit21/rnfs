@@ -123,16 +123,21 @@ class FormatTest(unittest.TestCase):
                 self.assertIsNone(self.get(f"/rnfs/{self.root}?format={fmt}", headers)[1]
                                   ["Access-Control-Allow-Origin"], headers)
 
-    def test_gateway_fetches_limit(self):
+    def test_raw_blocks_need_a_users_get(self):
+        """A web page's raw request or a HEAD gets 409 whether the block is stored or not (a 200 download for
+        stored blocks only would tell pages what is stored: L6), so it never takes a gateway_fetches slot."""
         missing = str(Cid.for_block(RAW, b"not stored anywhere"))
         limiter = self.server.server.RequestHandlerClass.limiter
         self.assertTrue(limiter.try_acquire())  # the only slot is busy
         try:
-            status, headers, _ = self.get(f"/rnfs/{missing}?format=raw", {"Sec-Fetch-Site": "cross-site"})
-            self.assertEqual(status, 503)
-            self.assert_common(headers)
-            # Stored content is served without limit
-            self.assertEqual(self.get(f"/rnfs/{self.root}?format=raw", {"Sec-Fetch-Site": "cross-site"})[0], 200)
+            for cid in (missing, self.root):
+                for headers, method in (({"Sec-Fetch-Site": "cross-site"}, "GET"),
+                                        ({"Sec-Fetch-Site": "same-origin"}, "HEAD"), ({}, "HEAD")):
+                    status, response, _ = self.get(f"/rnfs/{cid}?format=raw", headers, method)
+                    self.assertEqual(status, 409, (cid, headers, method))
+                    self.assert_common(response)
+            # The user's own GET is served, and isn't limited
+            self.assertEqual(self.get(f"/rnfs/{self.root}?format=raw", {"Sec-Fetch-Site": "none"})[0], 200)
         finally:
             limiter.release()
 
