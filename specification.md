@@ -1203,11 +1203,17 @@ unreserved, pct-encoded: as in RFC 3986
   decompression is bounded to 1 MB.
 
 **Receiving.**
+- Senders in `lxmf_accept_from` or `lxmf_auto_fetch_from`, and LXMF contacts (section 11), are *trusted*.
+  Anyone else can make as many LXMF identities as they like, so the bounds below protect trusted senders'
+  messages from them.
 - A message is accepted only once LXMF has validated its signature with the sender's identity. A message from
-  a sender whose identity isn't known yet is held (at most 32, for up to 2 minutes; when 32 are held, further
-  ones are dropped, so held ones are not pushed out) while a path request fetches it, then validated. The
-  source of such a message is unauthenticated until its identity is known, so path requests for held senders
-  are sent at most once per sender per 2 minutes, and at most 3 at once, then one per 10 seconds node-wide.
+  a sender whose identity isn't known yet is held while a path request fetches it, then validated: at most
+  32, at most 8 claiming one sender, for up to 2 minutes, and only 30 seconds after its path request was sent
+  (or after it arrived, if later) if no answer has made the identity known. When 32 are held, a further one
+  is dropped, so held ones are not pushed out, unless it claims a trusted sender: then it takes the place of
+  the newest message held for the untrusted sender holding the most. The source of such a message is
+  unauthenticated until its identity is known, so path requests for held senders are sent at most once per
+  sender per 2 minutes, and at most 3 at once, then one per 10 seconds node-wide, trusted senders first.
 - If `lxmf_accept_from` is not empty, messages from other senders (except those in `lxmf_auto_fetch_from`)
   are ignored, and those from unknown senders are not held. Messages without rnfs links are ignored.
 - The links come from the field if it is valid, else from the first 16 384 characters of the content. A link
@@ -1217,11 +1223,16 @@ unreserved, pct-encoded: as in RFC 3986
 - At most 500 messages and 4 MiB (as JSON) are kept, and at most 50 from one sender not in
   `lxmf_auto_fetch_from`. To make room, the oldest message holding no auto-fetched pins (none pinned or
   queued) is dropped; a message holding pins is not dropped for others' messages: if every kept message holds
-  pins, a new message without any is not kept (and one with pins pushes out the oldest). Each message's
-  record is at most 16 KiB as JSON: links beyond that are dropped (the first is always kept), then text is
-  cut.
+  pins, a new message without any is not kept (and one with pins pushes out the oldest). A trusted sender's
+  message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
+  message without pins is left; a new message from an untrusted sender that would need one dropped is not
+  kept. New messages from untrusted senders are also rate limited node-wide: 32 at once, then one per minute;
+  others are not kept. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
+  first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `lxmf:<sender address>`, one fetch at a time (at most 64 waiting; further links are skipped). Auto-fetches
+  `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
+  do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
+  whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or
   removing the message stops a fetch in progress. The fetch is refused if the target's verified size plus what
   that source already pins would exceed `lxmf_auto_fetch_quota`, or if the blocks of its DAG would (as for
