@@ -522,7 +522,11 @@ Everything in the specification is implemented, with these simplifications and a
 - On Windows (`rnfs/fsutil.py`, `IS_WINDOWS`): there is no execute bit, so `add` records every file as kind 0
   and `get` sets none; Unix permission checks are skipped (the rnfs dir relies on the ACL it inherits from the
   user's profile). Directories are walked by path rather than descriptor, each entry's type and file ID checked
-  before use, and directory junctions are skipped like symlinks. Replacing or deleting a file another handle
+  before use, and directory junctions (and other name-surrogate reparse points) are skipped like symlinks.
+  Each directory is checked again whenever it is listed (`builder.list_directory`: same file ID, not a link,
+  real path inside the walk's root), and each file opened below it must have its final path
+  (`fsutil.final_path`, GetFinalPathNameByHandleW) inside that root, so a directory swapped for a junction
+  mid-walk can't lead outside it (audit L8). Replacing or deleting a file another handle
   has open is retried for about a second; a block still in use then stays stored and indexed and is deleted by
   a later collection. `get` skips names Windows can't represent (`:`, device names, trailing dots), and the
   API and gateway bind their ports exclusively. The daemon stops cleanly on Ctrl+C or Ctrl+Break (SIGBREAK).

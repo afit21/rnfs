@@ -50,9 +50,7 @@ def open_signature(handle: builder.Handle, st: os.stat_result, path: str) -> str
         # Deeper than MAX_DEPTH can't be added anyway; don't recurse without bound
         if item is None or not stat.S_ISDIR(mode) or depth > constants.MAX_DEPTH + 1:
             return
-        with os.scandir(item) as listing:
-            children = sorted(listing, key=lambda entry: entry.name)
-        for child in children:
+        for child in builder.list_directory(item):
             child_path = os.path.join(item_path, child.name)
             child_st = builder.listed_stat(child, child_path)
             # A Windows junction stats as a directory, but add skips it like a symlink: don't walk into it
@@ -116,8 +114,7 @@ class SharedFolder:
             try:
                 if not stat.S_ISDIR(st.st_mode):
                     raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
-                with os.scandir(folder) as listing:
-                    items = sorted(listing, key=lambda entry: entry.name)
+                items = builder.list_directory(folder)
                 for item in items:
                     result = self._scan_item(folder, item)
                     if result is not None:

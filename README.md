@@ -344,6 +344,11 @@ Uninstalling never deletes it.
 | `files/` | the shared folder: anything put here is added, pinned and shared automatically |
 | `api_token` | the running daemon's API token |
 
+The shared folder must not be writable by accounts you don't trust. rnfs skips links inside it and checks
+every directory and file it opens there, but on Windows, where directories are walked by path, someone who
+can write to it gets a race: swapping a directory for a junction while it is scanned. The checks are made to
+win that race, but don't rely on them: keep `files/` (and anything you link it to) changeable only by you.
+
 ## Sample files
 
 Some files & Folders that I host as examples for everyone to download. Fetch them with a running daemon that is

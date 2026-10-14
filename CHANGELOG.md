@@ -18,6 +18,14 @@ Fixes:
 - Names given as text must be exactly 32 hex digits (optionally in `<angle brackets>`, with spaces around):
   whitespace between the digits used to be skipped, giving a name shorter than 16 bytes.
 
+Platform and packaging:
+- Where directories are walked by path (Windows), adding a directory or scanning the shared folder checks
+  each directory again whenever it lists it (same file ID, not a junction, symlink or other name-surrogate
+  reparse point, real path still inside the folder) and each file's final path, from its open handle, before
+  reading it. A directory swapped for a junction during a scan used to import files from outside the shared
+  folder and share them; now what changed is skipped with a warning. The README says the shared folder must
+  not be writable by accounts you don't trust. Not yet tested on Windows itself.
+
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
   message for their status; the detail goes to the daemon's log. A `507` used to show the local blocks
