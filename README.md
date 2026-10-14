@@ -541,7 +541,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `startup_announce_delay` | `30` | Second announce after startup |
 | `republish_interval` | 24 h; 3 days on slow nodes | How often provider records are republished; must be under 3.5 days |
 | `provide_strategy` | `"roots"` | `"roots"`: share pins and complete downloads while they're cached (up to `max_storage`); `"pinned"`: share only pins, so downloads stay private |
-| `provider_seniority` | `86400` (1 day) | Providers known this long are tried first |
+| `provider_seniority` | `86400` (1 day) | Providers and name keepers known this long are tried first; publishers seen this long get their full share of a full provider store |
 | `lookup_timeout` | `600` | Time budget of a DHT lookup |
 | `path_timeout` | `30` | Wait for a Reticulum path |
 | `max_failures` | `3` | Unanswered queries before a node is dropped; busy refusals before a provider is skipped |
