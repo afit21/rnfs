@@ -177,9 +177,10 @@ class NodeBackend:
         return self.node.config.dht_mode == "server"
 
     def find(self, key: bytes) -> tuple[list[bytes], list[bytes]]:
-        """Providers of key (oldest half plus a random half, banned left out) and the closest servers."""
+        """Providers of key (oldest half plus a random half, banned left out, and in private mode non-members)
+        and the closest servers."""
         routing = self.node.routing
-        providers = self.node.records.for_reply(key, exclude=routing.is_banned)
+        providers = self.node.records.for_reply(key, exclude=self.node.excluded_provider)
         nodes = [n for n in routing.closest(key, for_reply=True) if n != self.node.node_id]
         return providers, nodes
 
@@ -187,6 +188,9 @@ class NodeBackend:
         """Record publisher_id for keys; True only if every key was recorded. Banned publishers are ignored."""
         if not self.is_dht_server() or self.node.routing.is_banned(publisher_id):
             return False
+        if self.node.config.private:
+            # The request server let it through as a member (private mode checks every handler's requester)
+            self.node._member_publishers.add(publisher_id)
         return self.node.records.provide(publisher_id, keys, withdrawn) == len(keys)
 
     def served_block(self, cid: Cid) -> bytes | None:
@@ -273,6 +277,8 @@ class RnfsNode:
         self.slow = slow
         self._is_known = is_known
         self.members = {h.strip().strip("<>").lower() for h in config.members}
+        # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)
+        self._member_publishers: set[bytes] = set()
         self._bootstrap_nodes: list[bytes] = []  # bootstrap_nodes that parse, in the order given
         for text in config.bootstrap_nodes:
             try:
@@ -284,6 +290,11 @@ class RnfsNode:
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
         self.records = ProviderStore(config.max_records, os.path.join(config.state_dir, PROVIDERS_FILE),
                                      own_id=node_id, seniority=config.provider_seniority)
+        if config.private:
+            # Records stored while the node was public, or from a member removed since, are never handed out
+            removed = self.records.retain(self._is_member_publisher)
+            if removed:
+                log(f"private mode: dropped {plural(removed, 'provider record')} of non-members", LOG_NOTICE)
         self.storage = Storage(config.blocks_dir, config.state_dir, config.max_storage)
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
@@ -408,6 +419,18 @@ class RnfsNode:
         """Private mode's routing table admission: node_id's identity is a member."""
         identity = RNS.Identity.recall(node_id)
         return identity is not None and identity.hash.hex() in self.members
+
+    def _is_member_publisher(self, node_id: bytes) -> bool:
+        """Private mode: True if node_id's provider records may be kept and handed out (this node, a node that
+        provided as a member this run, or one whose identity RNS knows to be a member)."""
+        return node_id == self.node_id or node_id in self._member_publishers or self._is_member_node(node_id)
+
+    def excluded_provider(self, node_id: bytes) -> bool:
+        """True if a provider must be left out of /find replies and providers(): banned, or in private mode
+        not a member."""
+        if self.routing.is_banned(node_id):
+            return True
+        return self.config.private and not self._is_member_publisher(node_id)
 
     def _seed_routing(self):
         """Add servers whose announces RNS heard (and cached) within 2 × announce_interval, before a restart.
@@ -1115,7 +1138,7 @@ class RnfsNode:
     def providers(self, cid: str) -> list[bytes]:
         """Nodes providing cid: records held here, then everything a complete provider lookup finds."""
         parsed = Cid.parse(cid)
-        found: list[bytes] = list(self.records.providers(parsed.key, exclude=self.routing.is_banned))
+        found: list[bytes] = list(self.records.providers(parsed.key, exclude=self.excluded_provider))
 
         def add(node_id: bytes):
             """Collect a provider the lookup reports."""

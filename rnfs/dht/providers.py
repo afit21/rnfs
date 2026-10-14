@@ -200,6 +200,26 @@ class ProviderStore:
                 self.withdraw(key, publisher)
             return sum(self.store(key, publisher) for key in keys)
 
+    def retain(self, keep: Callable[[bytes], bool]) -> int:
+        """Remove every record of publishers for which keep(publisher) is False (own_id's are always kept), as
+        private mode does with non-members' records. Returns how many records were removed.
+
+        keep is asked once per publisher, outside the lock (it may consult other locked state, like RNS's).
+        """
+        with self._lock:
+            publishers = [publisher for publisher in self._publishers if publisher != self.own_id]
+        dropped = {publisher for publisher in publishers if not keep(publisher)}
+        removed = 0
+        with self._lock:
+            for publisher in dropped:
+                entry = self._publishers.get(publisher)
+                for key in list(entry.keys) if entry is not None else ():
+                    removed += self._remove(key, publisher)
+                # Not kept as departed either: its standing here came from records it shouldn't have had
+                self._departed.pop(publisher, None)
+            self._dirty = self._dirty or removed > 0
+        return removed
+
     def allowance(self, publisher: bytes) -> int | None:
         """How many records publisher may hold now: None (no limit) for own_id."""
         with self._lock:
