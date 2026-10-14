@@ -157,14 +157,19 @@ def encode_blocks(max_bytes: int, cids: list[Cid]) -> list:
 
 
 def parse_blocks_request(data) -> tuple[int, list[Cid]] | None:
-    """(max_bytes, CIDs) from a /blocks request, or None if malformed."""
+    """(max_bytes, CIDs) from a /blocks request, or None if malformed.
+
+    A request that repeats a CID is malformed: honest requesters ask for each CID once (the client drops
+    duplicates), so a duplicate is only ever an attempt to make the node read and serve the same block several
+    times in one response (specification section 7).
+    """
     if type(data) is not list or len(data) != 2:
         return None
     max_bytes, binaries = data
     if not is_count(max_bytes) or type(binaries) is not list:
         return None
     cids = [parse_cid(binary) for binary in binaries]
-    if any(cid is None for cid in cids):
+    if any(cid is None for cid in cids) or len(set(cids)) != len(cids):
         return None
     return max_bytes, cids
 

@@ -113,7 +113,6 @@ class H1RealRnsTest(unittest.TestCase):
         with open(out) as f:
             return json.load(f)
 
-    @unittest.expectedFailure  # H1: fails until the victim stops letting one peer hold every /blocks slot
     def test_one_peer_denies_the_blocks_service(self):
         # Baseline: honest alone is always served.
         baseline = self._honest("honest_baseline", 6)

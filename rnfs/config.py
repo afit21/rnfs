@@ -28,7 +28,8 @@ RATES = ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate")  # bits/s, abo
 DURATIONS = {  # seconds: name → True if it must be above 0 (else 0 is allowed too)
     "republish_interval": True, "announce_interval": True, "startup_announce_delay": False,
     "provider_seniority": False, "response_target": True, "deadline_slack": False, "stall_timeout": True,
-    "lookup_timeout": True, "path_timeout": True, "link_idle_timeout": True, "ban_time": False, "scan_interval": True,
+    "blocks_cooldown": False, "lookup_timeout": True, "path_timeout": True, "link_idle_timeout": True,
+    "ban_time": False, "scan_interval": True,
 }
 OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset (None)
 # Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
@@ -72,6 +73,8 @@ class Config:
     response_target: float = 60
     deadline_slack: float = 30
     stall_timeout: float = 120
+    # /blocks refused to a link (and identity) whose response was displaced or cancelled for making no progress
+    blocks_cooldown: float = 60
     lookup_timeout: float = 600
     path_timeout: float = 30
     max_failures: int = 3

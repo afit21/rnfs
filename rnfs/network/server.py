@@ -14,10 +14,11 @@ Link.outgoing_resources is polled as a backup), followed to conclusion through t
 cancelled with Resource.cancel(). A response keeps its slots until its Resource concludes. These are RNS
 1.5.6 internals; if they are missing, a response is cancelled by closing its link.
 """
+import math
 import random
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Callable, Protocol
 
 import RNS
@@ -41,6 +42,20 @@ MONITOR_TICK = 0.25
 # requester doesn't give up meanwhile. Not RTT-based: the requester can inflate the link's RTT
 MAX_PACING_WAIT = protocol.REQUEST_TIMEOUT_WITHOUT_RTT / 2
 CLOSED_MEMORY = 1024  # closed incoming links remembered, so a late request can't track them again
+
+# Displacement protection (section 3): a response is protected for a grace the node measures itself, then only
+# while it makes progress. Never from link.rtt, which the requester sets
+GRACE_BASE = 3.0  # seconds: handling at both ends and a round trip on a fast link, before the first part request
+# A Resource advertisement fills at most one packet at RNS's default MTU (ResourceAdvertisement.HASHMAP_MAX_LEN is
+# sized to Link.MDU), so it takes at most this long per hop at the interface's bitrate
+ADVERTISEMENT_BITS = 500 * 8
+MAX_GRACE_HOPS = 32  # the requester can raise the hop count it reports; the grace is capped anyway
+# Progress floor on a directly connected link: 1/1000 of the interface's bitrate (1.25 kB/s on a 10 Mbit/s TCP
+# interface). Far below what an honest transfer gets from a direct neighbour, but a requester trickling below it
+# loses its protection. Behind more hops the path may be much slower than our interface, so only the
+# unmeasured_bitrate floor applies there
+FLOOR_FRACTION = 1 / 1000
+COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
 
 
 class Backend(Protocol):
@@ -98,6 +113,48 @@ def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], 
     return entries
 
 
+def link_path(link) -> tuple[object | None, float | None, int | None]:
+    """(receiving interface, its bitrate in bits/s, hop count) of an incoming link; None for what is unknown.
+
+    RNS 1.5.6 dependency: Link.attached_interface (the interface the link request arrived on), Interface.bitrate
+    (the node's own configuration, or the interface's own guess) and Link.expected_hops (the hop count of the
+    requester's RTT packet, which the requester can raise but transport nodes only increase). Read with
+    defaults, so a changed RNS falls back to the conservative values the callers use for unknowns.
+    """
+    interface = getattr(link, "attached_interface", None)
+    bitrate = getattr(interface, "bitrate", None)
+    if type(bitrate) not in (int, float) or not math.isfinite(bitrate) or bitrate <= 0:
+        bitrate = None
+    hops = getattr(link, "expected_hops", None)
+    if type(hops) is not int or hops < 0:
+        hops = None
+    return interface, bitrate, hops
+
+
+def response_grace(bitrate: float | None, hops: int | None, config: Config) -> float:
+    """Seconds a new response is protected from displacement before it must show progress (section 3).
+
+    Enough for the advertisement to reach the requester and its first part request to come back over hops hops
+    at the receiving interface's bitrate (unmeasured_bitrate if unknown), plus GRACE_BASE, at most
+    deadline_slack. E.g. 3 hops at 1 kbit/s: 3 + 2 × 3 × 4 s = 27 s; any hop count over TCP: about 3 s.
+    """
+    rate = bitrate if bitrate else config.unmeasured_bitrate
+    hops = min(max(1, hops or 1), MAX_GRACE_HOPS)
+    return min(config.deadline_slack, GRACE_BASE + 2 * hops * ADVERTISEMENT_BITS / rate)
+
+
+def progress_floor(bitrate: float | None, hops: int | None, config: Config) -> float:
+    """Bytes/s a response must keep up, once its grace is over, to stay protected (section 3).
+
+    unmeasured_bitrate (which every honest path is assumed to beat), or for a directly connected requester
+    FLOOR_FRACTION of the interface's bitrate if that is more.
+    """
+    floor = config.unmeasured_bitrate / 8
+    if bitrate and hops == 1:
+        floor = max(floor, bitrate * FLOOR_FRACTION / 8)
+    return floor
+
+
 class Response:
     """A /blocks response in progress, holding a slot in one of the pools."""
 
@@ -118,17 +175,59 @@ class Response:
         self.done = threading.Event()  # set once finished, to cut short a pacing wait
         self.charged = 0  # bytes of upload_budget charged and not yet settled (refunded, or kept once sent)
         self.requester: bytes | None = None  # identity hash (else link ID) whose budget share it counts against
+        self.identity: bytes | None = None  # the requester's identity hash, if it identified
+        # Displacement protection (section 3)
+        self.grace = float("inf")  # seconds from grace_start it is protected whatever its progress
+        self.grace_start = started  # restarted when it is handed to RNS and when its Resource is advertised
+        self.floor = 0.0  # bytes/s it must keep up after its grace to stay protected
+        self.interface = None  # the RNS interface its request arrived on, if known
+        self.progress_at = started  # when sent last grew (or it was handed to RNS)
+        self.first_progress = None  # when sent was first seen above 0
+        self.idle = False  # displaced or cancelled for making no progress: its requester cools down
 
     def throughput(self, now: float) -> float:
         """Bytes per second sent so far."""
         return self.sent / max(now - self.started, 1e-6)
 
+    def note_progress(self, sent: float, now: float):
+        """Record the bytes sent so far, as read from its Resource."""
+        if sent > self.sent:
+            self.progress_at = now
+            if self.first_progress is None:
+                self.first_progress = now
+        self.sent = sent
+
+    def progress_rate(self, now: float) -> float:
+        """Bytes per second since it started moving: a slow start inside the grace doesn't count against it."""
+        if self.sent <= 0:
+            return 0.0
+        since = self.first_progress if self.first_progress is not None else self.started
+        return self.sent / max(now - since, 1.0)
+
+    def in_grace(self, now: float) -> bool:
+        """Whether it is still within its grace."""
+        return now - self.grace_start <= self.grace
+
+    def moving(self, now: float) -> bool:
+        """Whether it is making progress at or above its floor (always, if its progress can't be read)."""
+        return self.untracked or (self.sent > 0 and self.progress_rate(now) >= self.floor)
+
+    def protected(self, now: float) -> bool:
+        """Whether no newcomer may displace it for making no progress: within its grace, or moving."""
+        return self.in_grace(now) or self.moving(now)
+
 
 class ResponsePools:
     """Slots for /blocks responses: max_responses // 2 for slow links, the rest for others. Thread-safe.
 
-    Each pool competes only with itself. When a pool is full, a new response displaces the pool's response
-    with the lowest throughput if that response is older than deadline_slack; otherwise it is refused.
+    Each pool competes only with itself. When a pool is full, a new response may displace (section 3), never
+    a response on its own link:
+    - the response making least progress among those past their grace and below their progress floor (it is
+      marked idle, and its requester cools down);
+    - else, if the newcomer's interface holds no slot in the pool, the oldest response with nothing sent from
+      an interface holding two or more, even within its grace;
+    - else the pool's response with the lowest throughput, if it is older than deadline_slack and past its grace.
+    Otherwise it is refused.
     """
 
     def __init__(self, max_responses: int, deadline_slack: float, clock: Callable[[], float] = time.monotonic):
@@ -139,21 +238,46 @@ class ResponsePools:
         self.active: dict[str, list[Response]] = {SLOW_POOL: [], FAST_POOL: []}
         self.lock = threading.Lock()
 
-    def reserve(self, pool: str, link_id: bytes, request_id: bytes) -> tuple[Response | None, Response | None]:
-        """Take a slot in pool: (new response, or None if refused; displaced response to cancel, or None)."""
+    def reserve(self, pool: str, link_id: bytes, request_id: bytes, grace: float | None = None, floor: float = 0.0,
+                interface=None) -> tuple[Response | None, Response | None]:
+        """Take a slot in pool: (new response, or None if refused; displaced response to cancel, or None).
+
+        grace (default deadline_slack), floor and interface are the new response's (section 3).
+        """
         with self.lock:
             now = self.clock()
             members = self.active[pool]
             displaced = None
             if len(members) >= self.capacity[pool]:
-                slowest = min(members, key=lambda r: r.throughput(now))
-                if now - slowest.started <= self.deadline_slack:
+                displaced = self._displaceable(members, link_id, interface, now)
+                if displaced is None:
                     return None, None
-                displaced = slowest
                 members.remove(displaced)
             response = Response(link_id, request_id, pool, now)
+            response.grace = self.deadline_slack if grace is None else grace
+            response.floor = floor
+            response.interface = interface
             members.append(response)
             return response, displaced
+
+    def _displaceable(self, members: list[Response], link_id: bytes, interface, now: float) -> Response | None:
+        """The member a newcomer on link_id arriving on interface may displace, or None. Caller holds the lock."""
+        others = [r for r in members if r.link_id != link_id]
+        idle = [r for r in others if not r.protected(now)]
+        if idle:
+            displaced = min(idle, key=lambda r: (r.progress_rate(now), r.sent, r.started))
+            displaced.idle = True
+            return displaced
+        if interface is not None and all(r.interface is not interface for r in members):
+            held = Counter(id(r.interface) for r in members if r.interface is not None)
+            crowded = [r for r in others if r.interface is not None and held[id(r.interface)] >= 2
+                       and r.sent <= 0 and not r.untracked]
+            if crowded:
+                return min(crowded, key=lambda r: r.started)
+        slowest = min(members, key=lambda r: r.throughput(now))
+        if slowest.link_id == link_id or now - slowest.started <= self.deadline_slack or slowest.in_grace(now):
+            return None
+        return slowest
 
     def release(self, response: Response) -> bool:
         """Free response's slot. True if it held one."""
@@ -296,6 +420,47 @@ class IncomingLinks:
             return (state.requests, state.blocks) if state else (0, 0)
 
 
+class Cooldowns:
+    """Links and identities refused /blocks for a while, after a response of theirs was displaced or cancelled
+    for making no progress (section 3). Thread-safe, and cheap to ask."""
+
+    def __init__(self, duration: float, clock: Callable[[], float] = time.monotonic):
+        """No one cooling down; each cooldown lasts duration seconds (0: none)."""
+        self.duration = duration
+        self.clock = clock
+        self.until: OrderedDict[bytes, float] = OrderedDict()  # key -> end, soonest first (one duration for all)
+        self.lock = threading.Lock()
+
+    def add(self, *keys: bytes | None):
+        """Start a cooldown for each key given (None is skipped)."""
+        if self.duration <= 0:
+            return
+        with self.lock:
+            now = self.clock()
+            for key in keys:
+                if key is not None:
+                    self.until.pop(key, None)
+                    self.until[key] = now + self.duration
+            self._prune(now)
+
+    def active(self, *keys: bytes | None) -> bool:
+        """Whether any key given is cooling down."""
+        with self.lock:
+            now = self.clock()
+            self._prune(now)
+            return any(key is not None and key in self.until for key in keys)
+
+    def forget(self, key: bytes):
+        """Drop key (a closed link's ID: it never comes back)."""
+        with self.lock:
+            self.until.pop(key, None)
+
+    def _prune(self, now: float):
+        """Drop ended cooldowns, and the oldest beyond COOLDOWN_MEMORY. Caller holds the lock."""
+        while self.until and (len(self.until) > COOLDOWN_MEMORY or next(iter(self.until.values())) <= now):
+            self.until.popitem(last=False)
+
+
 class UploadPacer:
     """max_upload_rate between responses: a link's next response starts no sooner than bytes × 8 / cap
     seconds after the previous one started. Thread-safe."""
@@ -341,6 +506,7 @@ class RequestServer:
         self.pools = ResponsePools(config.max_blocks_responses, config.deadline_slack, clock)
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
+        self.cooldowns = Cooldowns(config.blocks_cooldown, clock)
         # mesh: airtime controls on /blocks and the traffic counters (shared with the client by the node)
         self.airtime = mesh.AirtimePolicy(config, clock)
         self.traffic = traffic if traffic is not None else mesh.Traffic()
@@ -439,6 +605,7 @@ class RequestServer:
             if response.link_id == link_id:
                 self._finish(response)
         self.incoming.remove(link_id)
+        self.cooldowns.forget(link_id)
         self.pacer.forget(link_id)
         self.rates.forget(link_id)
 
@@ -540,6 +707,10 @@ class RequestServer:
         link = self._find_link(link_id)
         if parsed is None or link is None:
             return False
+        identity = bytes(remote_identity.hash) if remote_identity is not None else None
+        if self.cooldowns.active(link_id, identity):
+            log("refused /blocks: that requester's last response made no progress", LOG_VERBOSE)
+            return False
         # mesh airtime controls: refused (False) at once, so the requester tries another provider
         refusal = self.airtime.refusal(mesh.interface_names(getattr(link, "attached_interface", None)))
         if refusal is not None:
@@ -561,9 +732,18 @@ class RequestServer:
                 return False
             rate = self.rates.get(link_id)
             slow = rates.link_is_slow(link, rate, self.config)
-            response, displaced = self.pools.reserve(SLOW_POOL if slow else FAST_POOL, link_id, request_id)
+            interface, bitrate, hops = link_path(link)
+            grace = response_grace(bitrate, hops, self.config)
+            # Until it is handed to RNS, the grace also covers the pacing wait
+            response, displaced = self.pools.reserve(SLOW_POOL if slow else FAST_POOL, link_id, request_id,
+                                                     grace=min(self.config.deadline_slack, grace + wait),
+                                                     floor=progress_floor(bitrate, hops, self.config),
+                                                     interface=interface)
+            if response is not None:
+                response.identity = identity
             if displaced is not None:
-                self._cancel(displaced, "displaced by a new request")
+                self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
+                             else "displaced by a new request")
             if response is None:
                 log(f"refused /blocks: every {'slow' if slow else 'fast'}-link response slot is busy", LOG_VERBOSE)
                 return False
@@ -575,7 +755,7 @@ class RequestServer:
             # The upload cap applies once the link has a rate estimate (section 3)
             cap = self.config.effective_max_upload_rate(slow, rate) if rate is not None else None
             limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target))
-            response.requester = bytes(remote_identity.hash) if remote_identity is not None else link_id
+            response.requester = identity if identity is not None else link_id
             share = self._budget_share_left(response)
             if share is not None:
                 if share <= 0:
@@ -611,6 +791,8 @@ class RequestServer:
                 return body  # nothing to track
             response.size = packed
             response.deadline = response.started + rates.response_deadline(packed, rate, self.config)
+            response.grace = grace
+            self._restart_grace(response)
             response.find_until = self.clock() + REGISTER_WINDOW
             response.untracked = link_id not in self.watched
             # From here the slots are freed when the Resource concludes, is cancelled, or the link closes
@@ -708,9 +890,20 @@ class RequestServer:
         request_id = getattr(resource, "request_id", None)
         for response in self.pools.responses():
             if response.link_id == link.link_id and response.request_id == request_id and response.resource is None:
-                response.resource = resource
-                self._hook(response, link, resource)
+                self._attach(response, link, resource)
                 return
+
+    def _attach(self, response: Response, link, resource):
+        """Follow resource, just advertised, as the response's: its grace starts again from here."""
+        response.resource = resource
+        self._restart_grace(response)
+        self._hook(response, link, resource)
+
+    def _restart_grace(self, response: Response):
+        """Start the response's grace (and its progress clock) now: it was just handed to RNS, or advertised."""
+        now = self.clock()
+        response.grace_start = max(response.grace_start, now)
+        response.progress_at = max(response.progress_at, now)
 
     def _finish(self, response: Response):
         """Free a response's pool slot and its link's /blocks slot, and settle its budget charge, once."""
@@ -775,6 +968,9 @@ class RequestServer:
         if resource is None and link is not None and not response.untracked:
             resource = self._find_resource(link, response.request_id)
         log(f"cancelling a /blocks response: {reason}", LOG_VERBOSE)
+        if response.idle:
+            # Its requester made no progress with the slot: it can't take one again for a while (section 3)
+            self.cooldowns.add(response.link_id, response.identity)
         self._finish(response)
         if resource is not None and callable(getattr(resource, "cancel", None)):
             resource.cancel()
@@ -832,8 +1028,7 @@ class RequestServer:
                 # Normally the registration hook finds it; polling is a backup
                 resource = self._find_resource(link, response.request_id)
                 if resource is not None:
-                    response.resource = resource
-                    self._hook(response, link, resource)
+                    self._attach(response, link, resource)
                 elif now > response.find_until and not getattr(link, "outgoing_resources", None):
                     # Never registered although nothing on the link is ahead of it: RNS failed to send it.
                     # Its slots are only freed by closing the link, which certainly ends it.
@@ -849,13 +1044,33 @@ class RequestServer:
                     self._concluded(response, link, resource)
                     continue
                 try:
-                    response.sent = resource.get_progress() * response.size
+                    response.note_progress(resource.get_progress() * response.size, now)
                 except Exception:
-                    pass
+                    resource = None  # progress unknown: only the deadline applies
+                if resource is not None and self._check_progress(response, now):
+                    continue
 
             if not response.finished and now > response.deadline:
                 self._cancel(response, f"missed its deadline ({size(response.size)})")
         return searching
+
+    def _check_progress(self, response: Response, now: float) -> bool:
+        """Cancel (and refund) a response whose Resource makes no progress (section 3). True if cancelled.
+
+        One with nothing sent is cancelled deadline_slack after its grace ended (by then a newcomer could have
+        displaced it anyway; this also gives its budget charge back when nobody else asks), and any response
+        with no progress for stall_timeout. Either way, its requester cools down unless it was moving.
+        """
+        idle_for = now - response.progress_at
+        if response.sent <= 0 and now - response.grace_start > response.grace + self.config.deadline_slack:
+            reason = f"nothing sent {idle_for:.0f}s after it was advertised"
+        elif idle_for > self.config.stall_timeout:
+            reason = f"no progress for {idle_for:.0f}s"
+        else:
+            return False
+        response.idle = not response.moving(now)
+        self._cancel(response, reason)
+        return True
 
     def _monitor_loop(self):
         """Run check_responses until stopped."""

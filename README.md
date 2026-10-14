@@ -570,6 +570,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `response_target` | `60` | Transfer time each block response aims for |
 | `deadline_slack` | `30` | Added to response deadlines |
 | `stall_timeout` | `120` | A response with no progress for this long is abandoned |
+| `blocks_cooldown` | `60` | A link whose response made no progress is refused `/blocks` this long |
 | `max_blocks_responses` | `4` | Uploads in progress at once (half reserved for slow links; ≥ 2) |
 | `max_upload_rate` | none; half the measured rate on slow links | Upload cap per link (bits/s) |
 | `max_jobs` | 2; 1 on slow nodes | Transfers (`get`, `pin add`, `export`) running at once; set 1 on a slow radio |
