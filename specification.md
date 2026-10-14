@@ -135,12 +135,29 @@ pass a `max_response_size` just above their largest honest answer.
   pool competes only with itself, so neither kind of client can crowd out the other.
   - A response's **deadline** is 3 × its size at the link's rate estimate (at `unmeasured_bitrate` if it has
     none), plus `deadline_slack`. A response not finished by then is cancelled.
-  - When a pool is full, a new `/blocks` request for it displaces that pool's in-progress response with the
-    lowest throughput, if that response is older than `deadline_slack`; otherwise the new request is refused.
+  - **Displacement protection is earned by progress**, so a response that holds a slot without transferring
+    can't keep honest requests out. A response is protected from displacement only while it is within a
+    per-response **grace** the node measures itself, or while it is moving data at or above a **throughput
+    floor**. The grace is `base + 2 × hops × advertisement_bits / bitrate`, clamped to
+    `[grace_min, deadline_slack]`, where `bitrate` is the receiving interface's configured bitrate
+    (`Link.attached_interface`'s `bitrate`, `unmeasured_bitrate` if unknown) and `hops` is the request's hop
+    count (`Link.expected_hops`, clamped, since a requester can inflate it). It is never derived from
+    `link.rtt`, which the requester controls. The floor is `unmeasured_bitrate / 8` bytes/s, or a small
+    fraction of the interface's bitrate for a directly connected requester.
+  - When a pool is full, a new `/blocks` request displaces one of the pool's responses, never one on its own
+    link: the response making least progress among those that are unprotected (past their grace and below the
+    floor); else, if the newcomer's receiving interface holds no slot in the pool, the oldest response with
+    nothing sent from an interface that holds two or more; else the response with the lowest throughput, if it
+    is older than `deadline_slack` and past its grace. Otherwise the request is refused.
+  - A response that makes **no progress** is cancelled and its budget charge refunded: one with nothing sent,
+    once its grace plus `deadline_slack` has passed; any response with no progress for `stall_timeout`.
+  - **Cooldown.** A link (and its identity, if it identified) whose response was displaced or cancelled for
+    making no progress is refused new `/blocks` for `blocks_cooldown`. The refusal is answered at once, before
+    any slot is reserved or block read.
   - A handler gets no direct handle on the response Resource RNS sends for it. Responses are tracked through
     the link's outgoing Resources (`Link.outgoing_resources`, matched by `request_id`) and cancelled with
-    `Resource.cancel()`. These are RNS internals that may change between versions; if they're unavailable, a
-    response is cancelled by closing its link.
+    `Resource.cancel()` (which acts only while the Resource is not yet complete). These are RNS internals that
+    may change between versions; if they're unavailable, a response is cancelled by closing its link.
 - At most `max_incoming_links` incoming links. When full, one is closed to make room: the link idle longest
   with no request in progress, or else a random one with no `/blocks` response in progress. In private mode,
   links not identified as a member's are chosen first.
@@ -493,7 +510,9 @@ and repeat.
 ## 7. Transfer
 
 **`/blocks`.**
-- **Request:** `[max_bytes, [cid, …]]`, with as many CIDs as fit in one packet.
+- **Request:** `[max_bytes, [cid, …]]`, with as many CIDs as fit in one packet. The CIDs MUST be distinct; a
+  request that repeats a CID is malformed and refused, so a node can't be made to read and serve the same
+  block several times in one response.
 - **Response:** a list in request order, one entry per CID until the budget is reached. Each entry is the
   block, or `None` if the node doesn't hold it or doesn't serve it. Entries after the last returned were not
   sent because of the budget.
@@ -727,7 +746,7 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement of the slowest response within separate slow and fast pools; requester stall detection (2, 3, 7) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress; requester stall detection (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
@@ -788,6 +807,13 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   link's rate estimate at the responder; the effect is limited to that link.
 - An attacker that behaves exactly like a slow-link client competes fairly for the slow pool's slots, and
   can't be told apart from one.
+- Displacement protection and the cooldown stop a requester holding a response slot without transferring, and
+  the cooldown binds a link and its identity. A flood of fresh unidentified links that each take a slot,
+  transfer nothing, and are replaced before their cooldown matters can still keep a pool busy; each counts as
+  its own requester, so the cooldown doesn't bind them. Where all such links arrive over one interface
+  (a single upstream transport node), the per-interface rule can't separate them from honest requesters on
+  the same interface either. The hold is no longer free — the attacker must keep opening links, which incoming
+  link admission and RNS link establishment bound — but the fast pool can still be denied this way.
 - An outside web site can frame a gateway page and receive public content from it by `postMessage` (outside
   private mode, only content public by CID).
 
@@ -966,8 +992,8 @@ constants are fixed in section 5; they matter only to writers that choose them a
 is not 1), flags are `true` or `false`, rates (bits/s) and times (seconds, at most 30 days) are finite numbers.
 Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_parallel_providers`,
 `max_failures`, `max_incoming_links` and `min_rate_sample` are at least 1; other sizes and counts at least 0;
-rates above 0; times above 0, except `startup_announce_delay`, `provider_seniority`, `deadline_slack` and
-`ban_time`, which may be 0. `members` and `remote_pin_identities` are lists of identity hashes (32 hex
+rates above 0; times above 0, except `startup_announce_delay`, `provider_seniority`, `deadline_slack`,
+`blocks_cooldown` and `ban_time`, which may be 0. `members` and `remote_pin_identities` are lists of identity hashes (32 hex
 digits). A node MUST NOT start with an invalid setting.
 
 | Name | Default | Notes |
@@ -986,7 +1012,8 @@ digits). A node MUST NOT start with an invalid setting.
 | `provider_seniority` | 1 day | Providers in the routing table this long are tried first |
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
-| `stall_timeout` | 120 s | |
+| `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
+| `blocks_cooldown` | 60 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
 | `path_timeout` | 30 s | Waiting for an RNS path |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |

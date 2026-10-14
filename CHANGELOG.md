@@ -2,6 +2,21 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## Unreleased
+
+Serving `/blocks` under load:
+- Displacement protection is now earned by progress, so one peer can no longer hold every `/blocks` response
+  slot almost for free. A response is protected from displacement only while it is within a short grace the
+  node measures from the receiving interface's bitrate and the request's hop count (never from the
+  requester-controlled `link.rtt`), or while it is moving data at or above a throughput floor. A response that
+  transfers nothing is cancelled and its upload-budget charge refunded once its grace passes, and any response
+  with no progress for `stall_timeout` is cancelled too.
+- A link (and its identity, if it identified) whose response was displaced or cancelled for making no progress
+  is refused new `/blocks` for `blocks_cooldown` (new setting, default 60 s). A newcomer on an interface that
+  holds no slot in a full pool may displace a zero-progress response from an interface holding two or more.
+- A `/blocks` request that repeats a CID is refused as malformed, so a node can't be made to read and serve
+  the same block several times in one response.
+
 ## 0.1.3
 
 Joining the DHT:

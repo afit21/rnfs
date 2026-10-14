@@ -288,6 +288,15 @@ injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 100
 and in total, never persisted.
 - `Fetcher.path_info` (default: nothing known) is set by the node to `RnsPaths.info`; `Fetch._rank` orders
   both providers and open-link probes, and each provider caches its `PathInfo`.
+- `ResponsePools` protects a response from displacement only while it is within a grace it measures from the
+  link's interface bitrate and hop count (`link_path`, `response_grace`, never from `link.rtt`), or moving at
+  or above a floor (`progress_floor`). A full pool displaces the least-progressing unprotected response (else
+  an interface-fairness pick: a zero-progress response from an interface holding two or more slots, for a
+  newcomer whose interface holds none; else the old slowest-past-`deadline_slack` rule), never one on the
+  newcomer's own link. `check_responses` cancels and refunds a response that has sent nothing once its grace
+  plus `deadline_slack` has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses
+  `/blocks` from a link (and its identity, if identified) whose response was displaced or cancelled for making
+  no progress, for `blocks_cooldown`, cheaply and before any slot is taken.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
   caps the block budget, and charges the bucket once the response's size is known. Each `Response` records
   its charge and its requester (identity hash, else link ID); one requester's unsettled charges may reach at
