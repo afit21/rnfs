@@ -15,8 +15,11 @@ A name resolves through RNS only while its owner is online or a transport node s
   a CID (batched /provide, republish, withdrawal); the prefix keeps it apart from CID keys (SHA-256 of a
   36- or 39-byte binary CID). A name is advertised only once a record of it is held.
 - **Resolving** (NameManager.resolve): when the path request heard nothing (or always, with keeper_query =
-  "always"), find providers of the name's key and ask up to alpha of them with /name; only verifying records
-  are offered to the usual sequence rules (persisted highest sequence, no rollback).
+  "always"), find providers of the name's key (past the first alpha, with local records only candidates), rank
+  them by routing-table standing then at random, and ask them with /name a batch of alpha at a time, asking
+  another batch (up to a bound) while no answer reaches the sequence already known or only one keeper
+  answered; only verifying records are offered to the usual sequence rules (persisted highest sequence, no
+  rollback).
 - **What is kept.** Names kept by the user (`rnfs name keep`), followed names (rnfs.features.follow), and
   this node's own published names, which it signs itself. At most keep_max_names, own names not counted.
 - **Refreshing.** On hearing an announce with a higher sequence for a kept name, the signed announce is read
@@ -32,6 +35,7 @@ No RNS at module level (the CLI imports this module): it is imported inside func
 """
 import hashlib
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -62,6 +66,8 @@ MAX_PENDING = 64  # kept names waiting for a background refresh; more wait for t
 RNS_CACHE_TRIES = 4  # a shared instance forwards an announce to its clients before caching it
 RNS_CACHE_WAIT = 0.5
 LOOP_INTERVAL = 60.0  # the background thread syncs own names and saves at least this often
+KEEPER_CANDIDATES = 3  # the search for a name's keepers runs until 3 × alpha are known (from 2+ sources)
+KEEPER_ROUNDS = 3  # batches of alpha keepers one query asks at most (2 on slow nodes)
 REQUEST_ID_LENGTH = 16
 
 
@@ -379,6 +385,7 @@ class KeepersFeature(Feature):
         # The last name the periodic retry queued: the next retry starts after it, so past MAX_PENDING
         # names without a record every one is asked in turn
         self._retry_cursor: bytes | None = None
+        self._rng = random.Random()  # breaks ties between keepers of equal standing
         node.names.keepers = self
         node.publisher.add_key_source(self.store.provided_keys)
         # Kept records are the floor for resolving: NameManager persists only names resolved by the user,
@@ -629,25 +636,44 @@ class KeepersFeature(Feature):
         return [(record.sequence, record.cid, min(float(record.emitted), now)) for record in records]
 
     def ask_keepers(self, name: bytes) -> list[SignedRecord]:
-        """Find up to alpha keepers of name in the DHT and ask each with /name; the verifying records."""
+        """Find keepers of name in the DHT and ask them with /name, a batch of alpha at a time; the verifying
+        records.
+
+        Keepers recorded here are candidates, never a reason to skip the search, which runs until
+        KEEPER_CANDIDATES × alpha are known and more than one source listed some (this node's records count as
+        one), or the lookup is complete: identities that stored records for the name's key first can't take
+        every slot. Candidates are asked best standing first (rank_keepers). Another batch is asked, up to
+        keeper_rounds() in all, while no answer reaches the highest sequence already known for the name (from
+        an announce, a resolve or a kept record), or fewer than two keepers answered (on a slow node: only
+        while nothing is known to compare against). Each verifying record is returned; the caller keeps the
+        highest sequence.
+        """
         node = self.node
         key = name_key(name)
         alpha = node.config.effective_alpha(node.slow)
-        found = [p for p in node.records.providers(key, exclude=node.routing.is_banned) if p != node.node_id]
+        banned = node.routing.is_banned
+        local = [p for p in node.records.providers(key, exclude=banned) if p != node.node_id]
+        found = dict.fromkeys(local)
         lookup = node._lookup(key)
+        wanted = KEEPER_CANDIDATES * alpha
 
         def add(provider: bytes):
             """Collect a provider the lookup reports."""
-            if provider != node.node_id and provider not in found and not node.routing.is_banned(provider):
-                found.append(provider)
+            if provider != node.node_id and provider not in found and not banned(provider):
+                found[provider] = None
 
-        if len(found) < alpha:
-            lookup.find_providers(add, should_stop=lambda: len(found) >= alpha)
-        chosen = [p for p in found if node._is_known(p) or lookup.allow_unknown(p)][:alpha]
-        if not chosen:
+        def enough() -> bool:
+            """Enough candidates, listed by more than one source."""
+            return len(found) >= wanted and lookup.listing_count() + (1 if local else 0) >= 2
+
+        lookup.find_providers(add, should_stop=enough)
+        candidates = self.rank_keepers(list(found))
+        if not candidates:
             _log(f"no keepers found for name {name.hex()}")
             return []
+        floor = self._known_sequence(name)
         results: list[SignedRecord] = []
+        answered: set[bytes] = set()
         lock = threading.Lock()
 
         def ask(provider: bytes):
@@ -661,17 +687,66 @@ class KeepersFeature(Feature):
                 return
             with lock:
                 results.append(record)
+                answered.add(provider)
 
-        threads = [threading.Thread(target=ask, args=(provider,), name="rnfs-keeper-query", daemon=True)
-                   for provider in chosen]
-        for thread in threads:
-            thread.start()
         deadline = time.monotonic() + max(1.0, lookup.remaining())
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
+        asked = 0
+        for _ in range(self.keeper_rounds()):
+            batch = []
+            while candidates and len(batch) < alpha:
+                provider = candidates.pop(0)
+                if node._is_known(provider) or lookup.allow_unknown(provider):
+                    batch.append(provider)
+            if not batch:
+                break
+            asked += len(batch)
+            threads = [threading.Thread(target=ask, args=(provider,), name="rnfs-keeper-query", daemon=True)
+                       for provider in batch]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(max(0.0, deadline - time.monotonic()))
+            with lock:
+                best = max((record.sequence for record in results), default=None)
+                responders = len(answered)
+            current = best is not None and (floor is None or best >= floor)
+            # A second keeper's answer is only worth its airtime on a slow node if there's nothing to check
+            # the first against
+            confirmed = responders >= 2 or (node.slow and floor is not None)
+            if (current and confirmed) or time.monotonic() >= deadline:
+                break
         with lock:
-            _log(f"asked {len(chosen)} keepers of name {name.hex()}: {len(results)} verifying records")
+            _log(f"asked {asked} of {asked + len(candidates)} keepers of name {name.hex()}: "
+                 f"{len(results)} verifying records")
             return list(results)
+
+    def keeper_rounds(self) -> int:
+        """How many batches of alpha keepers one query asks at most: KEEPER_ROUNDS, or 2 on a slow node, where
+        alpha is 1 and each /name costs a link and two packets of airtime."""
+        return 2 if self.node.slow else KEEPER_ROUNDS
+
+    def rank_keepers(self, candidates: list[bytes]) -> list[bytes]:
+        """candidates in the order to ask them: by routing-table standing (RoutingTable.standing: servers known
+        for provider_seniority and healthy first, then healthy ones, then those that failed a query or went
+        silent, such as an owner that has left, then IDs not in the table), then at random, as the fetcher
+        ranks providers by seniority first. Recording a provider record is free, so neither its age nor the
+        order replies list it in decides."""
+        routing = self.node.routing
+        seniority = self.node.config.provider_seniority
+        ranked = [(routing.standing(provider, seniority), self._rng.random(), provider) for provider in candidates]
+        ranked.sort()
+        return [provider for _, _, provider in ranked]
+
+    def _known_sequence(self, name: bytes) -> int | None:
+        """The highest sequence this node knows for name (record held by NameManager, or kept), or None."""
+        known = []
+        record = self.node.names.record(name)
+        if record is not None:
+            known.append(record.sequence)
+        kept = self.store.get(name)
+        if kept is not None:
+            known.append(kept.sequence)
+        return max(known, default=None)
 
     # Serving
 

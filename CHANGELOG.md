@@ -47,6 +47,32 @@ Serving `/blocks` under load:
 - A `/blocks` request that repeats a CID is refused as malformed, so a node can't be made to read and serve
   the same block several times in one response.
 
+DHT and names:
+- A full provider store keeps a tenth of its room as a newcomer pool, with random eviction inside it, so a
+  publisher it hasn't seen can still store records; about 100 identities filling the store used to lock out
+  every new publisher. Publishers seen before still displace the newest one outside the pool, and the node's
+  own records are always accepted (they were refused once the store was full). A publisher's share of the
+  store grows with age: a tenth of it until it has been seen for `provider_seniority`. First-seen times are
+  kept for a week after a publisher's last record goes, so one that was away for a while isn't new again.
+- Resolving through keepers no longer asks only the first `alpha` keepers found, oldest record first: a few
+  identities that stored provider records for a name's key before its real keepers (and, on a slow node, the
+  departed owner's own record) could hide every keeper. Keepers recorded locally no longer skip the DHT search,
+  which now looks for 3 × `alpha` keepers listed by more than one node; they are ranked by routing-table
+  seniority (live servers first, then those that failed or went silent, then unknown IDs), at random within
+  each group, and asked a batch at a time. Another batch is asked while no answer reaches the sequence already
+  known or only one keeper answered, at most 3 batches (2 on slow nodes, where a second `/name` is spent only
+  if there's no known sequence to check the first answer against).
+- Gateway and LXMF auto-fetch name resolves can no longer be rolled back by flooding announces of new names
+  and replaying an old one: an announce of a name the node isn't resolving or keeping only takes the table
+  place of another name that was only heard, and the highest sequence of each name resolved this way is saved
+  in `state/name-floor.json` (up to 4 × `name_table_size` names), so no older record is accepted after table
+  churn or a restart.
+- The specification no longer claims that a node's names can't be linked to it or to each other: the node
+  keeps its own names and provides their targets under its node ID, so its names are linked to it, as
+  providing content reveals the provider in IPFS. Behaviour is unchanged.
+- A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
+  client never sends more.
+
 ## 0.1.3
 
 Joining the DHT:

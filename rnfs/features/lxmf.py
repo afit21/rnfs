@@ -1009,7 +1009,8 @@ class LxmfFeature(features.Feature):
         """The root CID and path a link names, resolving a name (falling back to the CID it was sent with).
 
         persist False (auto-fetch): the name's record goes only into the bounded table, so names arriving
-        unasked don't grow names.json."""
+        unasked don't grow names.json; its sequence still goes into the bounded, saved floor, so a later
+        auto-fetch of the name never resolves to an older record."""
         if link.name is None:
             return link.cid, list(link.path)
         from rnfs.errors import NotFound

@@ -4,6 +4,8 @@ A name is the hash of an `rnfs.name` destination whose RNS identity is the name'
 `[sequence, binary CID]` in msgpack, rides in the destination's announce app_data, which RNS signs. RNS stores
 any validly signed announce, including a replayed old one, so the highest sequence seen is persisted for every
 name this node publishes or resolves for the user, and lower sequences are never accepted from any source.
+Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
+names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor.
 
 Every RNS call goes through `RnsNetwork`, so tests swap in a fake and run without Reticulum.
 """
@@ -22,6 +24,7 @@ from rnfs import fsutil
 from rnfs.config import _HEX_ID, Config  # _HEX_ID: exactly 32 hex digits, as identity lists are checked
 from rnfs.constants import APP_NAME, ID_LENGTH, NAME_ASPECT
 from rnfs.content.cid import Cid
+from rnfs.content.storage import read_json
 from rnfs.errors import NotFound, RnfsError
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, log
 
@@ -33,6 +36,9 @@ MAX_SEQUENCE = 2**64 - 1  # largest msgpack unsigned integer
 MAX_RECORD_SIZE = 64
 STATE_FILE = "names.json"
 STATE_VERSION = 1
+FLOOR_FILE = "name-floor.json"
+FLOOR_VERSION = 1
+FLOOR_FACTOR = 4  # the floor holds up to this many times name_table_size names, so it outlasts table churn
 PIN_SOURCE_PREFIX = "name:"
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
@@ -227,6 +233,16 @@ class NameManager:
         self._held: dict[bytes, Record] = {}
         # Every other name's record: in memory, least recently used first, at most name_table_size
         self._table: OrderedDict[bytes, Record] = OrderedDict()
+        # The table's names that were only heard, never resolved here, least recently used first. An announce of a
+        # name this node isn't resolving and doesn't know may only take the place of one of these, so a flood of
+        # new names can't push out the names it resolved
+        self._heard_only: OrderedDict[bytes, None] = OrderedDict()
+        # Highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), least recently resolved
+        # first, at most FLOOR_FACTOR × name_table_size: saved, so such a resolve never goes back after table churn
+        # or a restart
+        self._floor: OrderedDict[bytes, int] = OrderedDict()
+        self._floor_path = os.path.join(config.state_dir, FLOOR_FILE)
+        self._floor_dirty = False
         self._held_dirty = False  # heard times changed without a save
 
         self._destinations: dict[str, object] = {}
@@ -243,6 +259,7 @@ class NameManager:
         self._remove_old_temps()
         self._load_keys()
         self._load_state()
+        self._load_floor()
 
     # Keys
 
@@ -366,7 +383,7 @@ class NameManager:
                 self._pins.unpin(previous.cid, source)
 
             self._published[alias] = _Published(sequence, cid)
-            self._table.pop(name, None)
+            self._drop_from_table(name)
             self._held[name] = Record(sequence, cid, self._clock())
             self._save()
             self._announce(alias)
@@ -406,6 +423,7 @@ class NameManager:
                 for event in events:
                     event.set()
             self._save()
+            self._save_floor()
 
     def announce_due(self) -> float:
         """Re-announce every name whose announce_interval has passed; seconds until the next is due."""
@@ -416,6 +434,8 @@ class NameManager:
                     self._announce(alias)
             if self._held_dirty:
                 self._save()
+            if self._floor_dirty:
+                self._save_floor()
             if not self._next_announce:
                 return self.config.announce_interval
             return max(0.0, min(self._next_announce.values()) - now)
@@ -436,8 +456,9 @@ class NameManager:
         """The highest record held for name after refreshing it: {"name", "cid", "sequence", "age"}, or None.
 
         persist is True for the CLI and API (the highest sequence is then kept forever) and False for the gateway
-        (the record goes only into the bounded table). The network refresh, which can take path_timeout, is
-        skipped for this node's own names and when the held record was heard less than max_age seconds ago.
+        and LXMF auto-fetch (the record goes only into the bounded table, and its sequence into the bounded floor).
+        The network refresh, which can take path_timeout, is skipped for this node's own names and when the held
+        record was heard less than max_age seconds ago.
         """
         name = _check_name(name)
         self._offer_kept(name)
@@ -468,9 +489,11 @@ class NameManager:
             if record is None:
                 return None
             if persist and name not in self._held:
-                self._table.pop(name, None)
+                self._drop_from_table(name)
                 self._held[name] = record
                 self._save()
+            elif name not in self._held:
+                self._resolved(name, record.sequence)
             return {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
                     "age": max(0.0, self._clock() - record.heard)}
 
@@ -537,9 +560,13 @@ class NameManager:
     def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
         parsed = parse_record(app_data)
+        # A name kept here may take a table place like a resolved one (asked outside our lock, as always)
+        kept = parsed is not None and self.keepers is not None and self.keepers.local_record(bytes(name)) is not None
         with self._lock:
             if parsed is not None:
-                self._offer(bytes(name), parsed[0], parsed[1], self._clock())
+                # Unasked: not being resolved (a path response would have a waiter) nor kept
+                unasked = not kept and name not in self._waiters
+                self._offer(bytes(name), parsed[0], parsed[1], self._clock(), unasked=unasked)
             else:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):
@@ -574,13 +601,21 @@ class NameManager:
         record = self._table.get(name)
         if record is not None and touch:
             self._table.move_to_end(name)
+            if name in self._heard_only:
+                self._heard_only.move_to_end(name)
         return record
 
-    def _offer(self, name: bytes, sequence: int, cid: Cid, heard: float) -> bool:
-        """Apply a validly signed record: True if it replaced the one held. Lower sequences are refused, and at
-        an equal sequence the record already held is kept."""
+    def _offer(self, name: bytes, sequence: int, cid: Cid, heard: float, unasked: bool = False) -> bool:
+        """Apply a validly signed record: True if it replaced the one held. Lower sequences (than the record held,
+        or the floor of a name resolved before) are refused, and at an equal sequence the record already held is
+        kept. unasked: an announce of a name this node isn't resolving or keeping, which takes a table place only
+        if it is free or held by another name that was only heard."""
         held_here = name in self._held
         current = self._record(name, touch=False)
+        floor = None if held_here else self._floor.get(name)
+        if floor is not None and sequence < floor:
+            log(f"refused record {sequence} for name {name.hex()}: already resolved {floor}", LOG_VERBOSE)
+            return False
         if current is not None:
             if sequence < current.sequence:
                 log(f"refused record {sequence} for name {name.hex()}: already hold {current.sequence}",
@@ -592,23 +627,69 @@ class NameManager:
                     self._store(name, Record(sequence, cid, heard), held_here)
                     self._held_dirty |= held_here
                 elif not held_here:
-                    self._table.move_to_end(name)
+                    self._touch(name)
                 return False
 
-        self._store(name, Record(sequence, cid, heard), held_here)
+        if not self._store(name, Record(sequence, cid, heard), held_here, unasked):
+            return False
         if held_here:
             self._save()
         return True
 
-    def _store(self, name: bytes, record: Record, held_here: bool):
-        """Put record in the persisted map or the bounded table, evicting the least recently used."""
+    def _store(self, name: bytes, record: Record, held_here: bool, unasked: bool = False) -> bool:
+        """Put record in the persisted map or the bounded table, making room in the table. False if an unasked
+        record found no room (every place is a name resolved or kept here)."""
         if held_here:
             self._held[name] = record
-            return
+            return True
+        limit = max(0, self.config.name_table_size)
+        if name not in self._table:
+            # Names only heard make room first; one resolved or kept here only for another such name
+            while len(self._table) >= limit and self._heard_only:
+                evicted, _ = self._heard_only.popitem(last=False)
+                del self._table[evicted]
+            if len(self._table) >= limit and unasked:
+                return False
+            while self._table and len(self._table) >= limit:
+                self._table.popitem(last=False)
+            if unasked:
+                self._heard_only[name] = None
         self._table[name] = record
+        self._touch(name)
+        floor = self._floor.get(name)
+        if floor is not None and record.sequence > floor:
+            self._floor[name] = record.sequence
+            self._floor_dirty = True
+        if len(self._table) > limit:  # name_table_size 0: nothing is kept
+            self._drop_from_table(name)
+        return True
+
+    def _touch(self, name: bytes):
+        """Mark a table entry recently used."""
         self._table.move_to_end(name)
-        while len(self._table) > max(0, self.config.name_table_size):
-            self._table.popitem(last=False)
+        if name in self._heard_only:
+            self._heard_only.move_to_end(name)
+
+    def _drop_from_table(self, name: bytes):
+        """Remove name from the table (it is held now)."""
+        self._table.pop(name, None)
+        self._heard_only.pop(name, None)
+
+    def _resolved(self, name: bytes, sequence: int):
+        """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
+        floor for later resolves (least recently resolved forgotten first)."""
+        self._heard_only.pop(name, None)
+        previous = self._floor.pop(name, None)
+        self._floor[name] = sequence if previous is None else max(previous, sequence)
+        if self._floor[name] != previous:
+            self._floor_dirty = True
+        while len(self._floor) > self._floor_size():
+            self._floor.popitem(last=False)
+            self._floor_dirty = True
+
+    def _floor_size(self) -> int:
+        """How many names the floor holds at most."""
+        return FLOOR_FACTOR * max(0, self.config.name_table_size)
 
     # RNS destinations; callers hold the lock
 
@@ -741,6 +822,40 @@ class NameManager:
             # A key with no state entry (names.json lost, or the key copied in by hand) may have been published
             # elsewhere: treated as imported, so its first publish looks for its records first
             self._published.setdefault(alias, _Published(0, None, imported=True))
+
+    def _load_floor(self):
+        """Read the floor of names resolved without persist. A damaged file is moved aside and the node starts
+        without it (it only bounds rollback of gateway and auto-fetch resolves); entries that don't parse are
+        skipped."""
+        state = read_json(self._floor_path, shape=lambda value: isinstance(value, dict)
+                          and value.get("version") == FLOOR_VERSION and isinstance(value.get("floor"), list))
+        if state is None:
+            return
+        for entry in state["floor"]:
+            try:
+                name_hex, sequence = entry
+                name = parse_name(name_hex)
+            except (TypeError, ValueError):
+                continue
+            if type(sequence) is int and 0 <= sequence <= MAX_SEQUENCE and name not in self._held:
+                self._floor.pop(name, None)
+                self._floor[name] = sequence
+        while len(self._floor) > self._floor_size():
+            self._floor.popitem(last=False)
+
+    def _save_floor(self):
+        """Write the floor atomically, least recently resolved first, if it changed. Saved by announce_due (at
+        least every minute while running) and stop(), not on every resolve, since it holds thousands of names."""
+        if not self._floor_dirty:
+            return
+        state = {"version": FLOOR_VERSION, "floor": [[name.hex(), sequence] for name, sequence in self._floor.items()]}
+        os.makedirs(self.config.state_dir, exist_ok=True)
+        try:
+            fsutil.write_atomic(self._floor_path, json.dumps(state, separators=(",", ":")).encode())
+        except OSError as e:
+            log(f"could not save {self._floor_path}: {e}", LOG_WARNING)
+            return
+        self._floor_dirty = False
 
     def _save(self):
         """Write published and held records atomically."""

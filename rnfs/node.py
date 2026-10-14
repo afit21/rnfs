@@ -282,7 +282,7 @@ class RnfsNode:
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
         self.records = ProviderStore(config.max_records, os.path.join(config.state_dir, PROVIDERS_FILE),
-                                     own_id=node_id)
+                                     own_id=node_id, seniority=config.provider_seniority)
         self.storage = Storage(config.blocks_dir, config.state_dir, config.max_storage)
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)

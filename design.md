@@ -148,21 +148,29 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `routing.py` — `RoutingTable(own_id, config, clock=time.monotonic)`:
 `heard(node_id) -> bool` (proven server: announce in server mode, or answered `/find`), `failed(node_id) -> bool`
 (True if dropped), `remove(node_id)`, `ban(node_id)`, `is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
-`seniority(node_id) -> float | None` (seconds in the table), `contains(node_id)`, `node_count()`.
+`seniority(node_id) -> float | None` (seconds in the table), `is_senior(node_id, min_age)`, `standing(node_id,
+min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `contains(node_id)`,
+`node_count()`.
 
-`providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random)`:
-`store(key, publisher) -> bool`, `withdraw(key, publisher)`, `for_reply(key, exclude=lambda id: False) -> list[bytes]`,
-`expire()`, `record_count()`, `save()`. Local limits against flooding: one publisher holds at most max(10,
-`max_records` // 100) records (not the node's own, `own_id`), and a key keeps at most 1000 publishers: a
-newcomer to a full key evicts a random one, never one of the `K/2` oldest records. Times later than now (a
-clock corrected backwards) are clamped to now at load and at each `expire()`.
+`providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random,
+own_id=None, seniority=0)`: `store(key, publisher) -> bool`, `withdraw(key, publisher)`,
+`for_reply(key, exclude=lambda id: False) -> list[bytes]`, `expire()`, `record_count()`, `allowance(publisher)`,
+`save()`. Local limits against flooding: one publisher holds at most max(10, `max_records` // 100) records once
+seen for `seniority` (the node passes `provider_seniority`) and a tenth of that (at least 10) before, the
+node's own (`own_id`) excepted; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
+one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool with random eviction: the
+pooled records sit in a list for O(1) random picks, and the newest publisher with records outside the pool comes
+from a heap of (first seen, arrival) with stale entries dropped lazily. First-seen times of departed publishers
+(seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order. Times later than now
+(a clock corrected backwards) are clamped to now at load and at each `expire()`.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure)` with
 `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. `is_known(id)`
 says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup (`allow_unknown(id)`, also
-used by the fetcher for provider IDs).
+used by the fetcher for provider IDs). `listing_count()` is how many nodes have answered with at least one
+provider, so the keeper search can wait for providers listed by more than one source.
 
 ## Network layer interfaces
 
@@ -409,7 +417,8 @@ Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to di
 (storage); `pin_names.json` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin
 list); `providers.json` (provider records); `published.json` (publisher: last rounds, earlier rounds' nodes,
 pending withdrawals); `fetched.json` (targets fetched for the user, for `roots`); `names.json` (sequences, name
-table); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
+table); `name-floor.json` (highest sequence of names resolved for the gateway or auto-fetch, at most
+4 × `name_table_size`, saved by the re-announce loop when changed); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
 plus `warnings_total`; older results are capped at load); `keepers.json` (records re-verified at load);
 `follow.json`; `contacts.json`; `lxmf_inbox.json` (500 messages, 4 MiB, 50 per untrusted sender, 16 KiB per
 record) and `lxmf_outbox.json` (200; unfinished messages are marked failed at a restart), both UTF-8 JSON with
@@ -530,10 +539,17 @@ Everything in the specification is implemented, with these simplifications and a
   sends nothing for a `None` response, so "not kept" is `[]`. Kept records are offered to `NameManager` at
   startup and on every resolve (the rollback floor). Kept names without a record are retried round robin, at
   most 64 per `announce_interval`, continuing after the last one asked. `_store` refuses a record below the
-  sequence `NameManager` holds for the name.
+  sequence `NameManager` holds for the name. `ask_keepers` searches for 3 × alpha candidates from two sources
+  (`Lookup.listing_count`, plus one for local records), ranks them with `RoutingTable.standing` and a random
+  tie-break (`rank_keepers`), and asks batches of alpha until an answer reaches the highest known sequence
+  (`NameManager.record` or the kept record) from two keepers, at most `keeper_rounds()` batches (3; 2 on slow
+  nodes, where one current answer is enough once a sequence is known).
 - **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. The pins of name
-  keys deleted by hand are released by `release_gone()`, once the features are set up.
+  keys deleted by hand are released by `release_gone()`, once the features are set up. The name table marks
+  entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
+  no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
+  `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`), which `_offer` checks.
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held

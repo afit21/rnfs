@@ -123,7 +123,8 @@ pass a `max_response_size` just above their largest honest answer.
   left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered.
 - Every request fits in one packet: at most `min(Link.get_mdu(), MAX_REQUEST_SIZE)` bytes including RNS's
   request framing (~28 bytes). Batch sizes are computed from that (e.g. 22 keys per `/provide` at the default
-  MTU, counting both lists).
+  MTU, counting both lists). A `/provide` carries at most 55 keys, counting both lists (the most that fit
+  `MAX_REQUEST_SIZE`); a longer one is malformed.
 
 **Limits.** These keep a node usable under load.
 - Requests are at most `MAX_REQUEST_SIZE` (`Destination.set_max_request_size`).
@@ -490,9 +491,19 @@ and repeat.
 - A record expires `PROVIDER_TTL` after it was last stored, keeps its first-stored time across republishes,
   and is removed on withdrawal. These times are wall-clock and persisted; one later than the current time (a
   clock since corrected backwards) counts as now, so a record can't outlive its TTL.
-- A node keeps at most `max_records`. When full, it evicts a record of the publisher it first saw most
-  recently, so a flood of new identities displaces only itself. First-seen times are persisted, and dropped
-  once a publisher has no records left.
+- A node keeps at most `max_records`, a tenth of them in a *newcomer pool*. When the rest is full, a
+  publisher first seen before the most recent one there evicts a record of that most recent publisher (the
+  one it stored least recently), so a flood of new identities can't displace older publishers. Any other
+  publisher (one not seen before, or the most recent one) stores into the pool, evicting a pooled record
+  chosen at random when the pool is full, but never one of its own: so a new publisher can always store
+  something, and a flood churns only the pool. A pooled record leaves the pool when it is republished while
+  the rest has room. The node's own records are always accepted.
+- First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
+  (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
+  oldest departure forgotten first), so a publisher that was away for a while isn't new again.
+- A node SHOULD limit how many records one publisher holds, its own excepted (rnfs: `max_records / 100`, at
+  least 10, once the publisher has been seen for `provider_seniority`, and a tenth of that, at least 10,
+  before), so one identity can't fill the store and a fresh one gets little.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
   max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
@@ -648,8 +659,14 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
 **Name keys.**
 - Each name has its own RNS identity, stored at `<rnfs dir>/names/<alias>`.
 - The name is the hash of that identity's `rnfs.name` destination: 16 bytes, shown as 32 hex characters.
-- Separate keys mean names can't be linked to each other or to the node, and a name can be moved to another
-  machine by exporting its key.
+- A separate key per name means a name can be moved to another machine by exporting its key, and that the name,
+  its announces and its signed records carry nothing that identifies the node or the node's other names.
+- Publishing a name does link it to the node, as providing content does in IPFS (a provider record reveals
+  the PeerID providing a CID). The owner keeps its own names (Keepers, below), so it provides each name's key
+  under its node ID, usually with the oldest record; and it pins and provides each name's target. Anyone who
+  knows a name can look up its keepers and its target's providers and find the owner's node ID there, so the
+  names one node publishes can be linked to that node and to each other. Only names published from different
+  nodes are unlinked.
 
 **Record.**
 - The name destination's announce `app_data` is `[sequence, cid]` (msgpack: unsigned integer, binary CID).
@@ -672,10 +689,23 @@ the name through the network and asks keepers (below), since the key's earlier r
 - To refresh, call `Transport.request_path(name)`, wait up to `path_timeout`, then read
   `Identity.recall_app_data(name)`.
 - If the path request heard nothing within `path_timeout` (or always, with `keeper_query = always`), ask
-  keepers (below): find providers of the name's key (section 6, stopping once `alpha` are known), ask up to
-  `alpha` of them with `/name`, and offer every verifying record to the sequence rules. A keeper query (a DHT
-  lookup plus up to `alpha` requests) costs roughly ten times the airtime of a resolve a path response
-  answers, so `always` SHOULD NOT be used on slow links.
+  keepers (below). Storing a provider record is free, so neither a record's age nor the order a reply lists it
+  in may decide which keepers are asked:
+  - Find providers of the name's key (section 6). Providers recorded locally are candidates, never a reason
+    to skip the search, which runs until 3 × `alpha` are known and more than one source listed some (this
+    node's own records count as one source), or until the lookup is complete.
+  - Rank the candidates by routing-table seniority, as providers are (section 6): servers in the routing table
+    for over `provider_seniority` that haven't failed a query since last heard nor been silent for
+    2 × `announce_interval` first, then other such servers, then servers that failed a query or went silent
+    (an owner that has left), then IDs not in the table; at random within each group.
+  - Ask them with `/name`, a batch of `alpha` at a time, and offer every verifying record to the sequence
+    rules, so the highest valid sequence wins. Ask another batch while no answer reaches the highest sequence
+    already known for the name (from an announce, an earlier resolve or a kept record), or while fewer than two
+    keepers have answered; at most 3 batches. A slow node (`alpha` 1) asks at most 2 batches, and asks the
+    second for want of a second answer only when it knows no sequence to compare the first against.
+
+  A keeper query (a DHT lookup plus a few requests) costs roughly ten to twenty times the airtime of a
+  resolve a path response answers, so `always` SHOULD NOT be used on slow links.
 - Return the record with the highest sequence held, and how long ago it was heard (for a record from a
   keeper, from its signed emission time, never in the future).
 
@@ -684,8 +714,15 @@ what prevent rollback.
 - For every name this node has published, or resolved through the CLI or API, it MUST persist the highest
   sequence seen, and never accept a lower one from any source.
 - At equal sequence, the record already held is kept.
-- Records for other names (heard, or resolved by the gateway) are kept only in a table of at most
-  `name_table_size` entries, least recently used evicted first.
+- Records for other names (heard, or resolved by the gateway or LXMF auto-fetch) are kept only in a table of
+  at most `name_table_size` entries, least recently used evicted first. An announce of a name the node isn't
+  resolving or keeping takes a place only if one is free or held by another name that was only heard, so a
+  flood of announces of new names can't push out the names the node resolved.
+- For names resolved without being persisted (gateway, auto-fetch), the node SHOULD persist the highest
+  sequence it returned, as a floor below which no record of that name is accepted, so such a resolve never
+  goes back after table churn or a restart. The record itself isn't persisted. (rnfs: up to
+  4 × `name_table_size` names, least recently resolved forgotten first, saved at least every minute and at
+  shutdown.)
 - Records from keepers are subject to the same persisted-sequence and no-rollback rules as announces.
 - A record this node keeps (below) is a floor for resolving that name: it MUST be offered to the sequence
   rules at startup and on every resolve, so an older validly signed announce is never accepted for a kept
@@ -710,8 +747,10 @@ resolves after its owner's announce has expired from the network.
   once it holds a record of the name. The
   prefix keeps these keys apart from CID keys (SHA-256 of a 36- or 39-byte binary CID).
 - **What is kept.** A node keeps the names its user keeps (`name keep`) or follows, at most `keep_max_names`,
-  and MUST keep its own published names, with records it signs itself, so they resolve through it. Each kept
-  name costs a provider record republished by this node (and, if followed, a pin), hence the small default.
+  and MUST keep its own published names, with records it signs itself, so they resolve through it. Keeping
+  advertises the node's ID under the name's key, which links the node to every name it keeps or publishes
+  (Name keys, above). Each kept name costs a provider record republished by this node (and, if followed, a
+  pin), hence the small default.
   Kept names still without a record are asked for again every `announce_interval`, in turn (rnfs: at most 64
   per round, continuing after the last one asked).
 - **Refreshing.** A keeper replaces its record when it gets a verifying record with a higher sequence, or the
@@ -793,6 +832,8 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - With the default `roots` strategy, complete downloads are published and served while cached, which
   reveals them. With `pinned`, downloads are neither published nor served. Gateway fetches never are.
 - DHT keys don't hide which CID is wanted from someone who already knows the CID.
+- Provider records are public: anyone can look up which node IDs provide a CID, or keep a name. A node's own
+  names are linked to it this way (section 9).
 - Transport nodes on the path see traffic volume and timing.
 - Content is public by CID. Sealed files (section 5) keep their content and name from everyone but their
   recipients, not their size or recipient list.
@@ -1037,7 +1078,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit) |
 | `startup_announce_delay` | 30 s | Second announce after startup |
 | `max_parallel_providers` | 3; 1 on slow nodes | |
-| `provider_seniority` | 1 day | Providers in the routing table this long are tried first |
+| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first; a publisher seen this long gets its full share of the provider store |
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
@@ -1054,7 +1095,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `max_storage` | 10 GiB | |
 | `max_download_size` | none | |
 | `max_output_entries` | 100 000 | |
-| `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API |
+| `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API (four times as many sequence floors, section 9) |
 | `remote_pin_quota` | 1 GiB per remote identity | |
 | `remote_pin_identities` | empty | Identities allowed to send `/pin` |
 | `private` | off | Private mode (section 3) |
