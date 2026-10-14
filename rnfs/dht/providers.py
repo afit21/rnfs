@@ -62,9 +62,11 @@ class _Record:
 
 class _Publisher:
     """A publisher with records here: when it was first seen, which keys it provides, and how many of its
-    records are outside the pool. `order` breaks first-seen ties (the one stored later is newer)."""
+    records are outside the pool. `order` breaks first-seen ties (the one stored later is newer).
+    `sweep_after`: none of its records can expire before this time (known from its last sweep for expired
+    records; later stores only add later expiries), so a sweep before then would find nothing."""
 
-    __slots__ = ("first_seen", "order", "keys", "main")
+    __slots__ = ("first_seen", "order", "keys", "main", "sweep_after")
 
     def __init__(self, first_seen: float, order: int):
         """Publisher first seen at first_seen, with no keys yet."""
@@ -72,6 +74,7 @@ class _Publisher:
         self.order = order
         self.keys: set[bytes] = set()
         self.main = 0
+        self.sweep_after = float("-inf")
 
 
 class ProviderStore:
@@ -190,6 +193,8 @@ class ProviderStore:
         """Apply one /provide batch from publisher: withdraw `withdrawn`, then store `keys`.
 
         Returns how many of `keys` were recorded (the rest were refused: the store is full or a limit applied).
+        A publisher at its allowance costs little: its expired records are swept at most once per batch (none
+        while none can have expired), and each new key is then refused without scanning its records again.
         """
         check_id(publisher)
         keys, withdrawn = list(keys), list(withdrawn)
@@ -244,7 +249,11 @@ class ProviderStore:
         entry = self._publishers.get(publisher)
         allowance = self._allowance(publisher, now)
         if entry is not None and allowance is not None and len(entry.keys) >= allowance:
-            self._drop_expired([(owned, publisher) for owned in entry.keys], now)
+            # At its limit: refused at once unless one of its records may have expired since its last sweep
+            # (scanning all of them for every key of a refused batch made each refusal cost thousands of checks)
+            if now < entry.sweep_after:
+                return False
+            self._sweep_publisher(publisher, entry, now)
             if publisher in self._publishers and len(self._publishers[publisher].keys) >= allowance:
                 return False
         records = self._records.get(key)
@@ -258,6 +267,18 @@ class ProviderStore:
                 self._remove(key, victim)
                 self._dirty = True
         return True
+
+    def _sweep_publisher(self, publisher: bytes, entry: _Publisher, now: float):
+        """Remove publisher's expired records, and note when the next of the rest expires. Caller holds the lock."""
+        earliest = float("inf")
+        for key in list(entry.keys):
+            record = self._records[key][publisher]
+            if now - record.last_stored >= self.ttl:
+                self._remove(key, publisher)
+                self._dirty = True
+            else:
+                earliest = min(earliest, record.last_stored)
+        entry.sweep_after = earliest + self.ttl
 
     def _drop_expired(self, pairs: list[tuple[bytes, bytes]], now: float):
         """Remove those of the (key, publisher) records given that have expired by now. Caller holds the lock."""
@@ -426,16 +447,19 @@ class ProviderStore:
 
     def _clamp(self, now: float):
         """Bring every time after now back to now (the clock was corrected backwards). Caller holds the lock."""
+        stored_moved = False
         for records in self._records.values():
             for record in records.values():
                 if record.last_stored > now:
                     record.last_stored = now
-                    self._dirty = True
+                    stored_moved = self._dirty = True
                 if record.first_stored > now:
                     record.first_stored = now
                     self._dirty = True
         moved = False
         for entry in self._publishers.values():
+            if stored_moved:
+                entry.sweep_after = float("-inf")  # expiries moved earlier: its next sweep can't be skipped
             if entry.first_seen > now:
                 entry.first_seen = now
                 moved = True
