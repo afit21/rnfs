@@ -11,8 +11,8 @@ on:
 permissions:
   contents: read
 
-# Actions are pinned to commit SHAs and the Flatpak container to a digest (the comments say which tag);
-# update both together. Values from expressions reach run: scripts only through env:, never spliced in.
+# Actions are pinned to commit SHAs and the Flatpak and Debian containers to digests (the comments say which
+# tag); update them together. Values from expressions reach run: scripts only through env:, never spliced in.
 # Build tools come from packaging/build-tools.lock and the build backend from it (or build-backend.lock) with
 # --require-hashes, and builds run without build isolation, so nothing unpinned is fetched for a build.
 jobs:
@@ -95,14 +95,23 @@ jobs:
           rnfs --version
           python3 packaging/smoke_test.py /usr/bin/rnfs
           sudo apt-get remove -y rnfs
+      # The .deb is uploaded, checksummed and attested next, so the container must not be able to change it:
+      # the checkout is mounted read-only (the .deb is copied out to be installed), the image is pinned by
+      # digest (debian:12, the multi-arch index as of 2026-10-14), and only apt-get runs as root; the smoke
+      # test runs as nobody
       - name: Install and smoke test (Debian 12, Python 3.11)
         if: matrix.arch == 'amd64'
         run: |
-          docker run --rm -v "$PWD:/w" -w /w debian:12 sh -ec '
+          docker run --rm --security-opt no-new-privileges -v "$PWD:/w:ro" -w /w \
+            debian:12@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 sh -ec '
+            cp dist/rnfs_*_amd64.deb /tmp/
             apt-get update -qq
-            apt-get install -y -qq ./dist/rnfs_*_amd64.deb >/dev/null
+            apt-get install -y -qq /tmp/rnfs_*_amd64.deb >/dev/null
             python3 --version
-            python3 packaging/smoke_test.py /usr/bin/rnfs'
+            mkdir /tmp/smoke
+            chown nobody:nogroup /tmp/smoke
+            HOME=/tmp/smoke TMPDIR=/tmp/smoke setpriv --reuid=nobody --regid=nogroup --clear-groups \
+              python3 packaging/smoke_test.py /usr/bin/rnfs'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: release-deb-${{ matrix.arch }}

@@ -38,6 +38,9 @@ Platform and packaging:
   the release workflow), and a mismatch or failed check stops the install. Without `gh` it warns that only
   the checksum was checked; `RNFS_REQUIRE_ATTESTATION=1` makes that an error. The README's "Checking a
   download" shows `gh attestation verify`.
+- The release workflow's Debian 12 smoke test mounts the checkout read-only (it installs a copy of the
+  `.deb`), runs an image pinned by digest with `no-new-privileges`, and runs the smoke test as `nobody`. The
+  container could change the `.deb` just before it was uploaded, checksummed and attested.
 - The identity file's permission fix no longer follows a symlink: a symlink at the identity path is left as
   it is, with a warning, and the file is changed through a descriptor opened with `O_NOFOLLOW`.
 
