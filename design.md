@@ -551,8 +551,15 @@ Everything in the specification is implemented, with these simplifications and a
   (`NameManager.record` or the kept record) from two keepers, at most `keeper_rounds()` batches (3; 2 on slow
   nodes, where one current answer is enough once a sequence is known).
 - **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
-  offers kept records, makes a path request and queries keepers before choosing a sequence. The pins of name
-  keys deleted by hand are released by `release_gone()`, once the features are set up. The name table marks
+  offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins
+  the new target, saves `names.json` (the commit point; a failed save rolls the record back and releases the
+  new pin) and only then releases the old target, so `names.json`'s target is pinned at every step. Once the
+  features are set up, `reconcile_pins(storage.pins())` releases the pins of name keys deleted by hand
+  (`release_gone()`), pins a recorded target again if its pin is missing, and releases `name:` pins nothing
+  records; a key without a `names.json` entry keeps its pins until its next publish or removal (`_stale`,
+  where a release that failed with `OSError` also waits). `Storage.pin`/`unpin` undo their change in memory
+  if saving `pins.json` fails. Follow and LXMF do the same for their sources at start
+  (`_release_unfollowed`, `_release_unrecorded`). The name table marks
   entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
   no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
   `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`), which `_offer` checks.

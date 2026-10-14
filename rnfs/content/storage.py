@@ -320,7 +320,14 @@ class Storage:
             sources = self._pins.setdefault(cid, set())
             if source not in sources:
                 sources.add(source)
-                self._save_pins()
+                try:
+                    self._save_pins()
+                except BaseException:
+                    # Not saved (a full or failing disk): not pinned, so memory says what pins.json does
+                    sources.discard(source)
+                    if not sources:
+                        del self._pins[cid]
+                    raise
 
     def unpin(self, cid: Cid, source: str) -> bool:
         """Release source's hold on cid; True if it held it. Blocks go at the next evict() or gc()."""
@@ -332,7 +339,11 @@ class Storage:
             if not sources:
                 del self._pins[cid]
                 self._maybe_garbage = True
-            self._save_pins()
+            try:
+                self._save_pins()
+            except BaseException:
+                self._pins.setdefault(cid, set()).add(source)  # still pinned, as pins.json says
+                raise
             return True
 
     def pins(self) -> dict[Cid, set[str]]:

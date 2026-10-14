@@ -674,6 +674,7 @@ class LxmfFeature(features.Feature):
                 # LXMF doesn't persist its outbound queue
                 self.outbox.update(entry["id"], state="failed", error="the daemon stopped before it was delivered")
         self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
+        self._release_unrecorded()
         self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
         self._told_no_pn = False  # logged once how to set a propagation node
         self._auto_queue: deque = deque()
@@ -681,6 +682,20 @@ class LxmfFeature(features.Feature):
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._threads: list[threading.Thread] = []
+
+    def _release_unrecorded(self):
+        """Release lxmf: pins no inbox message records as pinned. Pins are saved at once and the inbox every
+        few seconds, so a crash can leave a pin whose message is gone or still queued; nothing else would release
+        it (`pin rm` releases only the user's pins). A queued link is fetched and pinned again at start()."""
+        from rnfs.content.storage import LXMF_PREFIX
+        recorded = {(entry.get("from"), result.get("cid")) for entry in self.inbox.entries()
+                    for result in entry.get("auto") or [] if isinstance(result, dict) and result.get("state") == "pinned"}
+        for cid, sources in self.node.storage.pins().items():
+            for source in sources:
+                if source.startswith(LXMF_PREFIX) and (source[len(LXMF_PREFIX):], str(cid)) not in recorded:
+                    _log(f"releasing {cid}, pinned for a message from {source[len(LXMF_PREFIX):]} that the inbox "
+                         "no longer records", LOG_WARNING)
+                    self.node.storage.unpin(cid, source)
 
     @staticmethod
     def _propagated_sent(entry: dict) -> bool:

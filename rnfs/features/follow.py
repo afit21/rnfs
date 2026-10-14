@@ -75,6 +75,7 @@ class FollowFeature(Feature):
         self._keepers = node.feature("keepers")
         self._keepers.add_listener(self._changed)
         self._load()
+        self._release_unfollowed()
 
     # State
 
@@ -93,6 +94,21 @@ class FollowFeature(Feature):
                 continue
             if len(name) == ID_LENGTH:
                 self._pinned[name] = pinned
+
+    def _release_unfollowed(self):
+        """Release follow pins of names no longer followed: a crash inside unfollow, after follow.json was saved,
+        leaves one that nothing else would release (`pin rm` releases only the user's pins)."""
+        for cid, sources in self.node.storage.pins().items():
+            for source in sources:
+                if not source.startswith(SOURCE_PREFIX):
+                    continue
+                try:
+                    name = bytes.fromhex(source[len(SOURCE_PREFIX):])
+                except ValueError:
+                    continue
+                if name not in self._pinned:
+                    _log(f"releasing {cid}, pinned for name {name.hex()}, which is no longer followed", LOG_WARNING)
+                    self.node.storage.unpin(cid, source)
 
     def _save(self):
         """Write follow.json atomically (lock held)."""
@@ -148,8 +164,10 @@ class FollowFeature(Feature):
             self._failures.pop(name, None)
             self._resolved.discard(name)
             self._save()
-        if pinned is not None:
-            self.node.storage.unpin(pinned, follow_source(name))
+        # Every target its source holds: a crash during an earlier check may have left more than the one recorded
+        source = follow_source(name)
+        for cid in self.node.storage.pinned_by(source) | ({pinned} if pinned is not None else set()):
+            self.node.storage.unpin(cid, source)
         try:
             self._keepers.unkeep(name, FOLLOW)
         except NotFound:
@@ -232,9 +250,11 @@ class FollowFeature(Feature):
             return False
         if not followed:
             return True  # unfollowed while fetching: nothing was pinned
-        # The old target is released only now that the new one is complete
-        if previous is not None and previous != target:
-            self.node.storage.unpin(previous, source)
+        # The old target is released only now that the new one is complete, with any other the source holds (a
+        # crash between pinning and saving follow.json leaves the target pinned but not recorded)
+        for cid in self.node.storage.pinned_by(source) | ({previous} if previous is not None else set()):
+            if cid != target:
+                self.node.storage.unpin(cid, source)
         self.node.publisher.refresh()
         self._set_state(name, "current")
         _log(f"name {name.hex()} now pinned at {target}", LOG_NOTICE)

@@ -80,6 +80,14 @@ Publishing, names and storage:
   the node itself again, and a round sends only the withdrawals still queued.
 - Where a publish round stored each key is saved as the round goes (every 10 nodes or 30 s), so records stored
   by a round cut short by a crash are withdrawn later; they used to stay until they expired.
+- `name publish` is crash-consistent: it pins the new target, saves `names.json`, then releases the old
+  target, and a failed save (a full disk) undoes the publish. A crash or failed save used to leave the name
+  recorded at a target no longer pinned (which `gc` deleted) and the new one pinned by `name:<alias>`, which
+  `pin rm` refused and `name rm` didn't release. At start the node now makes `name:` pins match `names.json`,
+  releases `follow:` pins of names no longer followed and `lxmf:` pins no saved inbox message records, which
+  a crash inside `name unfollow` or before the inbox was saved used to leave for good. A followed name's check
+  releases every other target its pin source holds. A pin or unpin whose `pins.json` save fails no longer
+  stays changed in memory.
 
 ## 0.1.3
 

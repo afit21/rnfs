@@ -603,6 +603,11 @@ and repeat.
 - `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
   a followed name's newer target once that is complete; removing the LXMF messages that hold it.
+- Pins are saved at once; the state that records why a source holds a pin (`names.json`, `follow.json`, the
+  LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes `name:` pins
+  match `names.json` (pinning a recorded target again, releasing the rest), and releases `follow:` pins of
+  names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
+  again). A followed name's check releases every other target its source holds.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
   running jobs (section 11), are protected as if pinned.
 
@@ -678,10 +683,12 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
 
 **Publish** (`name publish <alias> <cid>[/path]`):
 1. Resolve any path to a CID locally.
-2. Pin the target with source `name:<alias>`, and release that source from the previous target.
+2. Pin the target with source `name:<alias>`.
 3. Set the record with `sequence` one higher than both the publisher's stored sequence and the highest it can
-   resolve, and persist it.
-4. Announce, and re-announce every `announce_interval`.
+   resolve, and persist it. If that fails, the publish fails and the pin of step 2 is released.
+4. Release that source from the previous target (only now, so a crash leaves the target the persisted record
+   names pinned; any other pin of the source is released at the next start, section 8).
+5. Announce, and re-announce every `announce_interval`.
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
