@@ -50,6 +50,7 @@ from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 
 PROVIDERS_FILE = "providers.json"
+REMOTE_PINS_FILE = "remote_pins.json"  # remote pins accepted and not yet fetched: [[source, cid], ...] in order
 FETCHED_FILE = "fetched.json"  # cached targets fetched for the user (not the gateway): the roots strategy's
 SAVE_INTERVAL = 300.0  # seconds between saves of provider records
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records and invalid roots, when they changed
@@ -305,6 +306,9 @@ class RnfsNode:
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
         self._remote_workers: set[str] = set()  # remote sources with a thread fetching their pins
+        self._remote_pins_path = os.path.join(config.state_dir, REMOTE_PINS_FILE)  # those waiting, for a restart
+        self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
+        self._remote_pins_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._refresh_wanted = threading.Event()
         self.stop_event = threading.Event()
         self.joined = threading.Event()
@@ -331,6 +335,7 @@ class RnfsNode:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
+        self._resume_remote_pins()
         for feature in self.features.values():
             try:
                 feature.start()
@@ -361,6 +366,7 @@ class RnfsNode:
         for thread in self.threads:
             thread.join(max(0.0, deadline - time.monotonic()))
         self.records.save()
+        self._save_remote_pins()
         self.publisher.save()
         self._save_state()
         if self.links is not None:
@@ -552,6 +558,7 @@ class RnfsNode:
         if self._refresh_wanted.is_set():
             self._refresh_wanted.clear()
             self.publisher.refresh()
+        self._save_remote_pins()
 
     def _maintenance_loop(self):
         """Run maintain() about once a second until stopped."""
@@ -899,7 +906,9 @@ class RnfsNode:
         """A /pin from an allowed identity: release at once, or fetch then pin with source remote:<identity>.
 
         A source's pins are fetched one at a time, so each is checked against its quota with the earlier ones
-        counted; one with REMOTE_PIN_QUEUE pins waiting is refused (False).
+        counted; one with REMOTE_PIN_QUEUE pins waiting is refused (False), and so is one whose fetch thread
+        can't be started. Accepted pins are saved (remote_pins.json) until fetched, and resumed at the next
+        start if the node stops first.
         """
         source = remote_source(identity_hash)
         if not pin:
@@ -907,6 +916,7 @@ class RnfsNode:
                 if cid in self._remote_reserved.get(source, {}):
                     # Still being fetched: it mustn't be pinned when the fetch ends
                     self._remote_released.add((source, cid))
+                    self._remote_pins_dirty = True
                     log(f"released remote pin of {cid} for {source} while fetching it", LOG_NOTICE)
             if self.storage.unpin(cid, source):
                 log(f"released remote pin of {cid} for {source}", LOG_NOTICE)
@@ -915,7 +925,9 @@ class RnfsNode:
         with self._lock:
             reserved = self._remote_reserved.setdefault(source, {})
             if cid in reserved:
-                self._remote_released.discard((source, cid))  # pinned again before the fetch ended
+                if (source, cid) in self._remote_released:
+                    self._remote_released.discard((source, cid))  # pinned again before the fetch ended
+                    self._remote_pins_dirty = True
                 return True
             if source in self.storage.pins().get(cid, set()):
                 return True
@@ -923,29 +935,117 @@ class RnfsNode:
                 log(f"refused remote pin of {cid} for {source}: {len(reserved)} of its pins are waiting", LOG_WARNING)
                 return False
             reserved[cid] = None
-            if source in self._remote_workers:
-                return True
-            self._remote_workers.add(source)
-        threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
-                         daemon=True).start()
+            self._remote_pins_dirty = True
+            return self._ensure_remote_worker(source, cid)
+
+    def _ensure_remote_worker(self, source: str, cid: Cid) -> bool:
+        """Start source's fetch thread unless it has one; False if it can't be started, with cid (the pin just
+        reserved) given back. Caller holds the lock.
+
+        A worker leaves _remote_workers in the same critical section in which it finds nothing waiting, so a
+        pin reserved after that starts a new one, and one reserved before it is fetched by the old one.
+        """
+        if source in self._remote_workers:
+            return True
+        thread = threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
+                                  daemon=True)
+        try:
+            thread.start()
+        except RuntimeError as e:  # can't start new thread: out of threads or memory
+            reserved = self._remote_reserved.get(source, {})
+            reserved.pop(cid, None)
+            if not reserved:
+                self._remote_reserved.pop(source, None)
+            self._remote_pins_dirty = True
+            log(f"refused remote pin of {cid} for {source}: couldn't start its fetch: {e}", LOG_ERROR)
+            return False
+        # Registered after start() succeeds, still under the lock, so the worker can't look before it is
+        self._remote_workers.add(source)
         return True
 
     def _remote_pin_worker(self, source: str):
-        """Fetch source's remote pins one at a time, oldest first, until none is waiting.
+        """Fetch source's remote pins one at a time, oldest first, until none is waiting or the node stops.
 
         Concurrent fetches would each be checked against the quota without the others' blocks, so together
-        they could store several times it.
+        they could store several times it. Pins waiting when the node stops stay saved for the next start.
         """
-        try:
-            while not self.stop_event.is_set():
-                with self._lock:
-                    cid = next(iter(self._remote_reserved.get(source, {})), None)
-                    if cid is None:
-                        return
-                self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
-        finally:
+        # Resumed and early pins wait for the join: a lookup before it would find no provider and drop them
+        while not self.joined.is_set():
+            if self.stop_event.wait(0.5):
+                break
+        while True:
             with self._lock:
-                self._remote_workers.discard(source)
+                cid = None if self.stop_event.is_set() else next(iter(self._remote_reserved.get(source, {})), None)
+                if cid is None:
+                    # Deregistered in the same critical section that saw nothing waiting: a /pin arriving after
+                    # it starts a new worker instead of relying on this one, which is about to return
+                    self._remote_workers.discard(source)
+                    return
+            try:
+                self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
+            except BaseException:
+                with self._lock:
+                    self._remote_workers.discard(source)
+                raise
+
+    def _save_remote_pins(self):
+        """Save the remote pins waiting or being fetched, in the order accepted (released ones left out), if
+        they changed, so a restart resumes them. Run by maintenance (about every second) and at stop, not on
+        every /pin: a crash loses at most the last second's (/pin is best effort, section 8)."""
+        with self._remote_pins_save_lock:
+            with self._lock:
+                if not self._remote_pins_dirty:
+                    return
+                waiting = [[source, str(cid)] for source, cids in self._remote_reserved.items() for cid in cids
+                           if (source, cid) not in self._remote_released]
+                self._remote_pins_dirty = False
+            try:
+                write_json(self._remote_pins_path, waiting)
+            except OSError as e:
+                with self._lock:
+                    self._remote_pins_dirty = True  # try again next time
+                log(f"saving the remote pins waiting failed: {e!r}", LOG_ERROR)
+
+    def _load_remote_pins(self) -> list[tuple[str, Cid]]:
+        """Remote pins saved as waiting, oldest first, from identities still on remote_pin_identities (at most
+        REMOTE_PIN_QUEUE each); others are dropped. Caller holds no lock (it reads a file)."""
+        allowed = {remote_source(h.strip().strip("<>")) for h in self.config.remote_pin_identities}
+        try:
+            saved = read_json(self._remote_pins_path, shape=lambda value: isinstance(value, list)) or []
+        except OSError as e:
+            log(f"reading the remote pins waiting failed: {e!r}", LOG_ERROR)
+            return []
+        pins: dict[tuple[str, Cid], None] = {}
+        counts: dict[str, int] = {}
+        for entry in saved:
+            try:
+                source, text = entry
+                cid = Cid.parse(text)
+            except (ValueError, TypeError):
+                continue
+            if source not in allowed or (source, cid) in pins or counts.get(source, 0) >= REMOTE_PIN_QUEUE:
+                continue
+            counts[source] = counts.get(source, 0) + 1
+            pins[(source, cid)] = None
+        return list(pins)
+
+    def _resume_remote_pins(self):
+        """Queue the remote pins saved as waiting when the node last stopped (called once at start)."""
+        pins = self._load_remote_pins()
+        resumed = 0
+        with self._lock:
+            pinned = self.storage.pins()
+            for source, cid in pins:
+                if source not in pinned.get(cid, set()):
+                    self._remote_reserved.setdefault(source, {})[cid] = None
+                    resumed += 1
+            self._remote_pins_dirty = True
+            for source, cids in list(self._remote_reserved.items()):
+                # A thread that can't be started gives its pin back, so this ends
+                while cids and not self._ensure_remote_worker(source, next(iter(cids))):
+                    pass
+        if resumed:
+            log(f"resuming {plural(resumed, 'remote pin')} accepted before the last stop", LOG_NOTICE)
 
     def _remote_pin_fetch(self, cid: Cid, source: str):
         """Fetch cid for a remote pin, dropping it as soon as its verified size, or the bytes of its DAG's
@@ -987,8 +1087,12 @@ class RnfsNode:
             log(f"remote pin of {cid} for {source} failed: {e!r}", LOG_ERROR)
         finally:
             with self._lock:
-                self._remote_reserved.get(source, {}).pop(cid, None)
-                self._remote_released.discard((source, cid))
+                # Once the node is stopping, a fetch cut short stays waiting, so it is saved for the next start
+                # (a pin that completed meanwhile is skipped then)
+                if not self.stop_event.is_set():
+                    self._remote_reserved.get(source, {}).pop(cid, None)
+                    self._remote_released.discard((source, cid))
+                    self._remote_pins_dirty = True
 
     def gc(self) -> dict:
         """Evict every cached fetch and delete unreachable blocks; withdraw what is no longer complete."""
