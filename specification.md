@@ -856,8 +856,8 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
 - Any web page can make the local gateway fetch content (a plain request to `127.0.0.1` passes the Host
   check), and can time responses to guess what is cached. The gateway's own limits (section 11) bound the
-  airtime this costs: `gateway_fetches`, and no archives of content not already stored for a web page's
-  request or a `HEAD`.
+  airtime this costs: `gateway_fetches`, and no `?format=` response (raw block or archive) at all for a web
+  page's request or a `HEAD`.
 - Every local user can use the gateway, and can make it or the API busy by holding connections up to the
   cap (section 11); the API itself needs the token.
 - Unidentified links can still be tied to their sender by path and timing, e.g. a publisher's `/find` just
@@ -958,14 +958,17 @@ gateway can never reach the API.
   - `/rnfs/<cid>[/path]?format=archive` returns an archive (section 8) of the target, as
     `application/vnd.rnfs.archive` with `Content-Disposition: attachment; filename="<target cid>.rnfs-archive"`
     and an exact `Content-Length`; it is byte-identical to `rnfs export`. Its length must be known before
-    its first byte, so it needs the whole DAG: a request that isn't the user's own navigation (`Sec-Fetch-Site`
-    present and not `none`) and any `HEAD` get `409 Conflict`, whether the target is stored or not (an answer
-    that depended on it would tell web pages what the node stores). The user's own `GET` fetches the whole
-    DAG first, within `max_download_size` and `max_output_entries` (413 otherwise), and the fetch is
-    cancelled if the client disconnects. A bare-CID `If-None-Match` revalidation is answered 304 before anything else.
+    its first byte, so the user's own `GET` fetches the whole DAG first, within `max_download_size` and
+    `max_output_entries` (413 otherwise), and the fetch is cancelled if the client disconnects.
+  - Every format is answered only to the user's own `GET`, which fetches what isn't stored. A request that
+    isn't the user's own navigation (`Sec-Fetch-Site` present and not `none`) and any `HEAD` get
+    `409 Conflict`, whether the target is stored or not, without the node fetching anything. A browser
+    downloads both types, and a frame of a download fires no load event while an error page does, so an
+    answer that depended on what is stored (a download for stored content, a fetch that fails or a `503` for
+    the rest) would tell web pages what the node stores. A bare-CID `If-None-Match` revalidation is answered
+    304 before anything else. Formats therefore never use `gateway_fetches`. Unknown formats get 400.
   - Both carry `ETag: "<target cid>.raw"` or `"<target cid>.archive"` and `Cache-Control: immutable`
-    (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, no CORS headers, and
-    for `?format=raw` `gateway_fetches`) applies. Unknown formats get 400.
+    (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, no CORS headers) applies.
 - **Directories.**
   - A directory path without a trailing slash redirects to the slash form.
   - It is served as its `index.html` if present, otherwise as an HTML-escaped listing.
@@ -992,6 +995,7 @@ gateway can never reach the API.
   same answer whether the node stores the content or has to fetch it. The limit is a known, accepted leak: while a
   page keeps every slot busy with fetches, stored content is still served and content that needs a fetch gets 503,
   so the page can tell them apart. Like the timing difference, closing it would cost more than it protects.
+  None of these applies to `?format=`, which a web page's request never gets (409, above).
 - The gateway never expands contact nicks (`/name/<nick>/` is not supported), so web pages can't use or probe
   the address book.
 

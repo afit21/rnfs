@@ -1,17 +1,21 @@
 """L6: the gateway told web pages which CIDs the node stores: `?format=archive` answered a web page's request or a HEAD
-with 200 for a stored target and 409 for one not stored, and a HEAD's Content-Type was sniffed from stored first
-bytes but application/octet-stream when they weren't.
+with 200 for a stored target and 409 for one not stored, `?format=raw` answered a web page with 200 (a download, which
+fires no load event) for a stored block and a network fetch for one not stored (an error page, or 503 once the page
+held every gateway_fetches slot), and a HEAD's Content-Type was sniffed from stored first bytes but
+application/octet-stream when they weren't.
 
 Two gateways serve the same content (the same CIDs) from two fake nodes, one storing it and one that has to fetch
 every block from its "network" each time (its first bytes are never stored, as for a big file whose first chunk
-isn't). Every request a web page can start (Sec-Fetch-Site other than "none") and every archive HEAD must get the
-same status, headers and body from both. The user's own requests (no Sec-Fetch-Site, or "none") may differ: only
-the user sees them. A last test documents what still differs while gateway_fetches is full.
+isn't). Every request a web page can start (Sec-Fetch-Site other than "none") and every HEAD of a ?format= must get
+the same status, headers and body from both, also for ?format= while the fetch slots are full or the network doesn't
+have the content. The user's own requests (no Sec-Fetch-Site, or "none") may differ: only the user sees them. A last
+test documents what still differs for plain paths while gateway_fetches is full.
 """
 import json
 import unittest
 
 from rnfs.config import Config
+from rnfs.errors import NotFound
 from rnfs.gateway import GatewayServer
 
 from tests.test_api import FakeNode, raw_request
@@ -38,11 +42,14 @@ class NetworkNode(FakeNode):
     def __init__(self):
         super().__init__()
         self.fetches = 0
+        self.findable = True  # False: no provider on the network has the remote CIDs
 
     def _fetch(self, cid: str):
         if cid in self.remote:
             with self.lock:
                 self.fetches += 1
+            if not self.findable:
+                raise NotFound(f"no provider found for {cid}")
 
     def stored_head(self, target, length):
         self.record("stored_head", target, length)
@@ -87,11 +94,24 @@ class StorageOracleTest(unittest.TestCase):
         self.page, self.data, self.site = page, data, site  # the same CIDs on both nodes
 
     def paths(self) -> list[str]:
-        """Every kind of /rnfs/ path: bare files, files by name and sniffed, a site, and both formats."""
+        """Every kind of /rnfs/ path: bare files, files by name and sniffed, a site, and every format."""
         return [f"/rnfs/{self.page}", f"/rnfs/{self.data}", f"/rnfs/{self.site}/", f"/rnfs/{self.site}/page.html",
                 f"/rnfs/{self.site}/data", f"/rnfs/{self.site}", f"/rnfs/{self.page}?filename=x.bin",
-                f"/rnfs/{self.page}?format=raw", f"/rnfs/{self.site}?format=archive",
-                f"/rnfs/{self.site}/page.html?format=archive", f"/rnfs/{self.page}?format=archive"]
+                *self.format_paths(), f"/rnfs/{self.site}/data?format=raw"]
+
+    def format_paths(self) -> list[str]:
+        """Every valid ?format= path: a file's and a directory's block, and archives of a root, a path and a file."""
+        return [f"/rnfs/{self.page}?format=raw", f"/rnfs/{self.data}?format=raw", f"/rnfs/{self.site}?format=raw",
+                f"/rnfs/{self.site}?format=archive", f"/rnfs/{self.site}/page.html?format=archive",
+                f"/rnfs/{self.page}?format=archive"]
+
+    def hold_fetch_slots(self):
+        """A page holds every gateway_fetches slot of both gateways with fetches that never finish."""
+        for node, server in self.gateways.values():
+            limiter = server.server.RequestHandlerClass.limiter
+            for _ in range(limiter.limit):
+                self.assertTrue(limiter.try_acquire())
+            self.addCleanup(lambda limiter=limiter: [limiter.release() for _ in range(limiter.limit)])
 
     def both(self, method: str, path: str, headers: dict) -> dict:
         """kind → (status, headers without Date, body) of the request to each gateway."""
@@ -124,16 +144,34 @@ class StorageOracleTest(unittest.TestCase):
             status, headers, body = self.assert_same("HEAD", path, PAGE_REQUESTS["cross-site image"], path)
             self.assertEqual((status, dict(headers)["Content-Type"], body), (200, expected, b""), path)
 
-    def test_archives_for_pages_and_heads_are_always_409(self):
+    def test_formats_for_pages_and_heads_are_always_409(self):
+        # L6: fails until every ?format= (raw as well as archive) answers a page's request and every HEAD with 409
         users = {"no Sec-Fetch-Site": {}, "Sec-Fetch-Site none": {"Sec-Fetch-Site": "none"}}
-        for path in (f"/rnfs/{self.site}?format=archive", f"/rnfs/{self.site}/page.html?format=archive"):
+        for path in self.format_paths():
             for name, headers in PAGE_REQUESTS.items():
                 for method in ("GET", "HEAD"):
-                    self.assertEqual(self.assert_same(method, path, headers, name)[0], 409, (name, method))
+                    self.assertEqual(self.assert_same(method, path, headers, name)[0], 409, (name, method, path))
             for name, headers in users.items():  # the user's own HEAD
-                self.assertEqual(self.assert_same("HEAD", path, headers, name)[0], 409, name)
+                self.assertEqual(self.assert_same("HEAD", path, headers, name)[0], 409, (name, path))
         for (node, _) in self.gateways.values():
-            self.assertEqual(node.called("export_stream"), [])
+            self.assertEqual((node.called("block"), node.called("export_stream")), ([], []))
+        self.assertEqual(self.gateways["unstored"][0].fetches, 0)  # nothing was fetched for them either
+
+    def test_formats_dont_depend_on_storage_while_fetch_slots_are_full(self):
+        # L6: fails until a page's ?format=raw no longer gets a download if stored and a 503 if not
+        self.hold_fetch_slots()
+        for name, headers in PAGE_REQUESTS.items():
+            for path in self.format_paths():
+                for method in ("GET", "HEAD"):
+                    self.assert_same(method, path, headers, name)
+
+    def test_formats_dont_depend_on_storage_when_the_network_lacks_the_content(self):
+        # L6: fails until a page's ?format=raw no longer gets a download if stored and an error page if not
+        self.gateways["unstored"][0].findable = False
+        for name, headers in PAGE_REQUESTS.items():
+            for path in self.format_paths():
+                for method in ("GET", "HEAD"):
+                    self.assert_same(method, path, headers, name)
 
     def test_users_own_archive_get_still_works(self):
         # The user's own navigation (Sec-Fetch-Site: none) or tool (no header) gets the archive, fetching it if needed
@@ -143,15 +181,21 @@ class StorageOracleTest(unittest.TestCase):
             self.assertEqual((status, body), (200, f"archive of {self.site}".encode()))
         self.assertGreater(self.gateways["unstored"][0].fetches, fetches)
 
+    def test_users_own_raw_get_still_works(self):
+        # The user's own navigation or tool gets the block, fetching it if needed, even while a page holds every slot
+        self.hold_fetch_slots()
+        for headers in ({}, {"Sec-Fetch-Site": "none"}):
+            for cid, block in ((self.page, PAGE), (self.data, PNG)):
+                status, response, body = self.assert_same("GET", f"/rnfs/{cid}?format=raw", headers, headers)
+                self.assertEqual((status, dict(response)["Content-Type"], body),
+                                 (200, "application/vnd.rnfs.raw", block))
+        self.assertEqual(self.gateways["unstored"][0].fetches, 4)
+
     def test_full_fetch_slots_still_reveal_storage(self):
         """Accepted residual (specification.md, gateway section): while a page holds every gateway_fetches slot,
         stored content is still served and content that needs a fetch gets 503. Closing it would break pages or
         move the leak into timing; this test pins the documented behaviour so a change to it is noticed."""
-        for node, server in self.gateways.values():
-            limiter = server.server.RequestHandlerClass.limiter
-            for _ in range(limiter.limit):  # a page holds every slot with fetches that never finish
-                self.assertTrue(limiter.try_acquire())
-            self.addCleanup(lambda limiter=limiter: [limiter.release() for _ in range(limiter.limit)])
+        self.hold_fetch_slots()
         responses = self.both("GET", f"/rnfs/{self.data}", PAGE_REQUESTS["cross-site image"])
         self.assertEqual((responses["stored"][0], responses["unstored"][0]), (200, 503))
 

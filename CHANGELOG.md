@@ -30,6 +30,10 @@ Gateway privacy:
 - `?format=archive` answers every web page's request and every `HEAD` with `409`, stored or not. It used to
   answer `200` for content stored on the node, which let any web site tell what the user had downloaded or
   viewed (an iframe of a download fires no load event). The user's own `GET` is unchanged.
+- `?format=raw` answers every web page's request and every `HEAD` with `409` too, stored or not, and so never
+  takes a `gateway_fetches` slot. A page used to get the block, a download, if it was stored, but a network
+  fetch otherwise (an error page if nobody had it, or `503` once the page held every slot), which told it the
+  same. The user's own `GET` is unchanged.
 - A web page's `HEAD`, or range not starting at byte 0, takes its Content-Type from the file's first bytes,
   fetched if need be, as its `GET` does. It used to sniff them only if stored (else
   `application/octet-stream`), which a page may be able to observe (e.g. through opaque-response blocking).

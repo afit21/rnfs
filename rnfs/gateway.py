@@ -413,7 +413,7 @@ class GatewayHandler(TimedHandler):
             raise GatewayError(404, "gateway paths are /rnfs/<cid>[/path] and /name/<name>[/path]")
         slash = len(segments) > 3 and segments[-1] == ""
         names = [self.decode_segment(segment) for segment in (segments[3:-1] if slash else segments[3:])]
-        if self.param("format") is not None:  # --- content: trustless ?format=raw|archive ---
+        if self.param("format") is not None:  # --- trustless ?format=raw|archive: the user's own GET only ---
             return gateway_formats.serve_format(self, segments, names)
 
         if segments[1] == "rnfs":

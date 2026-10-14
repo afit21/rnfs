@@ -8,16 +8,18 @@ The client can verify either without trusting the gateway: a raw block hashes to
 blocks are checked by `rnfs import` (or any reader) from the root down. Every gateway header rule still
 applies (the handler's end_headers adds nosniff and the CSP, and no CORS header); both are immutable, with
 an ETag naming the target and the format ("<cid>.raw", "<cid>.archive") so they never collide with the
-plain response's "<cid>". Fetches count against gateway_fetches like any other, and archives keep
-max_download_size and max_output_entries. /name/ paths don't take ?format= (the result must be named by
-the CID it is checked against).
+plain response's "<cid>". Archives keep max_download_size and max_output_entries. /name/ paths don't take
+?format= (the result must be named by the CID it is checked against).
 
-An archive needs the target's whole DAG before its first byte (its length is in the headers), so it is made
-only for the user's own GET (handler.limited() false: no Sec-Fetch-Site, or "none"), which fetches what
-isn't stored; that fetch is cancelled once the client disconnects. A web page's request or a HEAD always
-gets 409, stored or not: nobody waiting for a body shouldn't make the node fetch a whole DAG, and answering
-200 for stored targets only would tell web pages what the node stores (an iframe of a 200 with
-Content-Disposition attachment becomes a download and fires no load event; a 409 page does).
+Every format is answered only to the user's own GET (handler.limited() false: no Sec-Fetch-Site, or "none"),
+which fetches what isn't stored (an archive's fetch is cancelled once the client disconnects). A web page's
+request or a HEAD always gets 409, stored or not, before the node is asked anything, so no format ever takes
+a gateway_fetches slot. Neither type is one a browser shows, so a format's 200 is a download, and an iframe
+of a download fires no load event while an error page does: answering a page 200 for stored content but a
+fetch (an error once nobody has it, or 503 once the page holds every gateway_fetches slot) for the rest
+would tell web pages what the node stores (L6). A bare-CID If-None-Match revalidation, which needs nothing
+stored, is answered 304 first. An archive also needs the target's whole DAG before its first byte (its
+length is in the headers), and a request whose body nobody reads shouldn't make the node fetch a whole DAG.
 """
 import select
 import socket
@@ -28,6 +30,7 @@ from rnfs.fetcher import Cancelled, Observer, observing
 RAW_TYPE = "application/vnd.rnfs.raw"
 ARCHIVE_TYPE = "application/vnd.rnfs.archive"
 FORMATS = ("raw", "archive")
+TOOLS = {"raw": "`rnfs cat --block`", "archive": "`rnfs export`"}  # for the 409's message
 
 
 def serve_format(handler, segments: list[str], names: list[str]):
@@ -47,22 +50,18 @@ def serve_format(handler, segments: list[str], names: list[str]):
         raise GatewayError(400, "?format=raw is only for a bare CID: request the CID inside the path itself")
     target = "/".join([root, *names])
 
-    if fmt == "raw":
-        etag = f'"{root}.raw"'
-        if etag_matches(handler.headers.get("If-None-Match"), etag):
-            return _not_modified(handler, etag, IMMUTABLE)
-        if handler.limited() and not handler.node.is_local(root):
-            handler.need_network()
-        block = handler.node.block(root, for_gateway=True)
-        return handler.send_body(200, RAW_TYPE, block, {"ETag": etag, "Cache-Control": IMMUTABLE})
-
-    if not names and etag_matches(handler.headers.get("If-None-Match"), f'"{root}.archive"'):
-        return _not_modified(handler, f'"{root}.archive"', IMMUTABLE)  # a revalidation needs nothing stored
+    if not names and etag_matches(handler.headers.get("If-None-Match"), f'"{root}.{fmt}"'):
+        return _not_modified(handler, f'"{root}.{fmt}"', IMMUTABLE)  # a revalidation needs nothing stored
     if handler.limited() or handler.command == "HEAD":
-        # Whether the target is stored or not: the answer must not tell a web page which it is
-        raise GatewayError(409, "an archive is only made for a GET of the user's own, never for a web page's "
+        # Whether the target is stored or not: the answer must not tell a web page which it is (L6)
+        raise GatewayError(409, f"?format={fmt} is only answered to a GET of the user's own, never to a web page's "
                                 "request or a HEAD, whether the content is stored or not: open the URL directly, "
-                                "or use `rnfs export`")
+                                f"or use {TOOLS[fmt]}")
+
+    if fmt == "raw":
+        block = handler.node.block(root, for_gateway=True)
+        return handler.send_body(200, RAW_TYPE, block, {"ETag": f'"{root}.raw"', "Cache-Control": IMMUTABLE})
+
     if names:
         cid = handler.node.info(target, for_gateway=True)["cid"]  # the ETag names the target, not the root
     else:
