@@ -252,6 +252,12 @@ sending the token. Both HTTP servers (`TimedHandler`) time out slow requests, ca
 (anything but `GatewayError` and `NotFound`: 400, 413, 422, 503, 507, 500) say only a fixed message per status
 (`gateway.ERROR_MESSAGES`; the detail goes to the log); malformed `Range` headers are ignored.
 
+Neither server sends CORS headers. Gateway pages run sandboxed in an opaque origin, so they load their DAG's
+files as subresources but can't read any gateway response with `fetch()`; an earlier rule allowing a gateway
+`Referer` never fired, as browsers send no `Referer` from an opaque origin, and allowing `Origin: null` instead
+would let any site's sandboxed frame read the gateway. A separate origin per root (a subdomain per CID) is the
+possible future way to let pages read their own DAG.
+
 ## Content additions
 
 - `content/chunker.py` — `chunks(stream, size)` yields chunks from the chunker chosen with the context

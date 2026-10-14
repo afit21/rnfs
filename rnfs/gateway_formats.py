@@ -6,9 +6,9 @@ GET/HEAD /rnfs/<cid>[/path]?format=archive   an archive (spec section 8) of the 
 
 The client can verify either without trusting the gateway: a raw block hashes to its CID, and an archive's
 blocks are checked by `rnfs import` (or any reader) from the root down. Every gateway header rule still
-applies (the handler's end_headers adds nosniff, the CSP and the CORS rule); both are immutable, with an
-ETag naming the target and the format ("<cid>.raw", "<cid>.archive") so they never collide with the plain
-response's "<cid>". Fetches count against gateway_fetches like any other, and archives keep
+applies (the handler's end_headers adds nosniff and the CSP, and no CORS header); both are immutable, with
+an ETag naming the target and the format ("<cid>.raw", "<cid>.archive") so they never collide with the
+plain response's "<cid>". Fetches count against gateway_fetches like any other, and archives keep
 max_download_size and max_output_entries. /name/ paths don't take ?format= (the result must be named by
 the CID it is checked against).
 

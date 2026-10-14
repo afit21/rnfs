@@ -17,9 +17,11 @@ Behaviour:
 - Every response, errors and redirects included, carries X-Content-Type-Options: nosniff and the spec's
   sandboxing Content-Security-Policy. With gateway_scripts off, allow-scripts and 'unsafe-eval' are
   dropped and script-src 'none' added, so no script runs even if a browser ignores the sandbox.
-- Access-Control-Allow-Origin: * on GET (and HEAD, which mirrors GET) only when the Referer's origin is
-  this gateway (http://127.0.0.1:<port> or http://localhost:<port>), so sandboxed pages, whose origin is
-  opaque, can fetch() their own DAG. Never in private mode. Vary: Referer keeps browser caches honest.
+- No response carries Access-Control-* headers. Gateway pages run in a sandboxed, opaque origin, so they can
+  load files of their DAG as subresources (img, script, link…) but can't read gateway responses with fetch()
+  or XMLHttpRequest, and neither can any other web page. Sending Access-Control-Allow-Origin for
+  `Origin: null` would let every site's sandboxed iframe or data: page read the gateway. Per-CID origins
+  (a subdomain per root) would be the way to let pages read their own DAG, and are possible future work.
 - A GatewayError (the gateway's own refusals) or NotFound says what went wrong. Every other error (a 400,
   413, 422, 503 or 507 from the node, or a 500) gets only a fixed message for its status: a node error's text
   can name local paths, disk space or limits. The detail goes to the log (500: as an error; others verbose).
@@ -293,25 +295,9 @@ class GatewayHandler(TimedHandler):
         """Add the headers every response carries, then end the headers."""
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", CSP_SCRIPTS if self.config.gateway_scripts else CSP_NO_SCRIPTS)
-        if self.command in ("GET", "HEAD"):
-            self.send_header("Vary", "Referer")
-            if self.cors_allowed():
-                self.send_header("Access-Control-Allow-Origin", "*")
+        # Deliberately no Access-Control-* headers, for any Origin or Referer (module docstring)
         self.headers_sent = True
         super().end_headers()
-
-    def cors_allowed(self) -> bool:
-        """True if the Referer is a page on this gateway and the node isn't in private mode."""
-        if self.config.private:
-            return False
-        # Errors raised while parsing the request (e.g. 431) are sent before self.headers exists
-        headers = getattr(self, "headers", None)
-        referer = headers.get("Referer") if headers is not None else None
-        if not referer:
-            return False
-        url = urlsplit(referer)
-        port = self.server.server_address[1]
-        return url.scheme == "http" and url.netloc.lower() in (f"127.0.0.1:{port}", f"localhost:{port}")
 
     def send_text(self, status: int, message: str, headers: dict | None = None):
         """Send a plain-text response."""

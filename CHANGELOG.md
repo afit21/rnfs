@@ -9,6 +9,10 @@ Gateway privacy:
   message for their status; the detail goes to the daemon's log. A `507` used to show the local blocks
   directory, the free disk space and the reserve. The storage-full message no longer names the directory
   anywhere (the CLI and API still show free space against the reserve).
+- The gateway sends no CORS headers at all. The rule that allowed pages to `fetch()` files in their own DAG
+  (`Access-Control-Allow-Origin` for a gateway `Referer`) never worked in browsers, since sandboxed pages
+  send no `Referer`, and it is dropped from the specification. Pages still load their DAG's files as
+  images, scripts, style sheets and frames. Per-CID origins may bring reading back later.
 
 ## 0.1.3
 

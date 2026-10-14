@@ -877,8 +877,8 @@ gateway can never reach the API.
     `max_download_size` and `max_output_entries` (413 otherwise), and the fetch is cancelled if the client
     disconnects. A bare-CID `If-None-Match` revalidation is answered 304 before anything else.
   - Both carry `ETag: "<target cid>.raw"` or `"<target cid>.archive"` and `Cache-Control: immutable`
-    (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, the CORS rule, and for
-    `?format=raw` `gateway_fetches`) applies. Unknown formats get 400.
+    (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, no CORS headers, and
+    for `?format=raw` `gateway_fetches`) applies. Unknown formats get 400.
 - **Directories.**
   - A directory path without a trailing slash redirects to the slash form.
   - It is served as its `index.html` if present, otherwise as an HTML-escaped listing.
@@ -889,10 +889,12 @@ gateway can never reach the API.
 - The gateway's own refusals (a bad path or CID, a method other than GET or HEAD, a `409` or `416`…) and a `404`
   say what went wrong. Any other error from the node (`400`, `413`, `422`, `503`, `507` or `500`) gets only a
   fixed message for its status; the details, which may name local paths, disk space or limits, go to the log.
-- `GET` (and `HEAD`) responses carry `Access-Control-Allow-Origin: *` only when the request's `Referer` has the
-  gateway's own origin (`127.0.0.1:8789` or `localhost:8789`), so pages can `fetch()` files in their own DAG
-  despite their opaque origin, while other web sites can't read rnfs content directly. In private mode the
-  header is never sent.
+- No response carries `Access-Control-*` headers, whatever the request's `Origin` or `Referer`. Pages run in an
+  opaque origin, so they can load files of their own DAG as subresources (images, scripts, style sheets,
+  frames) but can't read gateway responses with `fetch()` or `XMLHttpRequest`, and neither can other web
+  sites. A gateway MUST NOT allow `Origin: null`: every site's sandboxed frames and `data:` pages send it.
+  A separate origin per root (e.g. a subdomain per CID) would let pages read their own DAG; that is possible
+  future work.
 - Content fetched for the gateway is cache and is never provided. Names it resolves go only into the capped
   table (section 9).
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
