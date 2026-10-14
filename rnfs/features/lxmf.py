@@ -75,7 +75,9 @@ OUTBOX_LIMIT = 200
 AUTO_QUEUE_LIMIT = 64  # auto-fetches waiting; more are skipped
 DELIVERY_LIMIT_KB = 256  # largest LXMF message accepted (LXMF's delivery_limit, in kB); also caps PN downloads
 HOLD_LIMIT = 32  # messages from senders not known yet, held while their identity is requested; more are dropped
+HOLD_PER_SENDER = 8  # of them claiming one sender (the claim is unauthenticated until the identity is known)
 HOLD_TIME = 120.0  # seconds a held message waits for its sender's identity
+HOLD_PATH_WAIT = 30.0  # seconds after its path request (or its arrival, if later) a held message is dropped unanswered
 # Path requests for held messages' senders: their source is unauthenticated until the identity is known, so
 # anyone can claim any. One per sender per HOLD_TIME, and node-wide a token bucket (each one floods all
 # interfaces)
@@ -1831,7 +1833,8 @@ class LxmfNetwork:
                 self.feature.received(self._incoming(message))
             elif message.unverified_reason == self.LXMF.LXMessage.SOURCE_UNKNOWN and message.packed:
                 # Unsigned as far as we can tell: anyone can send these claiming any source, so the queue
-                # keeps what it holds (the newest is dropped) and path requests are rate limited
+                # keeps what it holds (the newest is dropped) unless a trusted sender is claimed, a claimed
+                # sender gets only HOLD_PER_SENDER places, and path requests are rate limited
                 source, packed = bytes(message.source_hash), bytes(message.packed)
                 if not self.feature.accepts(source):
                     # received() would ignore it: holding it would only let forged sources fill the queue
@@ -1839,12 +1842,10 @@ class LxmfNetwork:
                          LOG_VERBOSE)
                     return
                 with self._lock:
-                    queued = len(self._held) < HOLD_LIMIT and all(p != packed for _, p, _ in self._held)
-                    if queued:
-                        self._held.append((time.monotonic() + HOLD_TIME, packed, message.method))
+                    queued = self._hold(source, packed, message.method)
                 if not queued:
-                    _log(f"dropped a message from unknown sender {source.hex()}: already held, or "
-                         f"{HOLD_LIMIT} are held", LOG_VERBOSE)
+                    _log(f"dropped a message from unknown sender {source.hex()}: already held, "
+                         f"{HOLD_PER_SENDER} held from it, or {HOLD_LIMIT} held", LOG_VERBOSE)
                     return
                 self._request_path(source)
                 _log(f"holding a message from {source.hex()} until its identity is known", LOG_VERBOSE)
@@ -1853,6 +1854,32 @@ class LxmfNetwork:
                      LOG_NOTICE)
         except Exception as e:  # noqa: BLE001
             _log(f"handling a received message failed: {e!r}", LOG_ERROR)
+
+    def _hold(self, source: bytes, packed: bytes, method) -> bool:
+        """Hold a message claiming source until its identity is known (lock held); False if it is dropped: the
+        same message is held, HOLD_PER_SENDER claiming source are, or HOLD_LIMIT are. A message claiming a
+        trusted sender (feature.trusted) then takes the place of the newest held for the untrusted sender
+        holding the most."""
+        if any(p == packed for _, p, _ in self._held):
+            return False
+        claims: dict[bytes, int] = {}
+        for _, p, _ in self._held:
+            claims[p[ID_LENGTH:2 * ID_LENGTH]] = claims.get(p[ID_LENGTH:2 * ID_LENGTH], 0) + 1
+        if claims.get(source, 0) >= HOLD_PER_SENDER:
+            return False
+        if len(self._held) >= HOLD_LIMIT:
+            if not self.feature.trusted(source):
+                return False
+            others = [item for item in reversed(self._held)
+                      if not self.feature.trusted(item[1][ID_LENGTH:2 * ID_LENGTH])]
+            if not others:
+                return False
+            victim = max(others, key=lambda item: claims[item[1][ID_LENGTH:2 * ID_LENGTH]])  # newest of most
+            self._held = [item for item in self._held if item is not victim]
+            _log(f"dropped a held message from unknown sender {victim[1][ID_LENGTH:2 * ID_LENGTH].hex()} for one "
+                 f"from trusted sender {source.hex()}", LOG_VERBOSE)
+        self._held.append((time.monotonic() + HOLD_TIME, packed, method))
+        return True
 
     def _request_path(self, destination: bytes) -> bool:
         """Request a path to a held message's sender, at most once per HOLD_TIME per sender and within the
@@ -1875,23 +1902,30 @@ class LxmfNetwork:
         return True
 
     def _retry_held(self):
-        """Validate held messages whose sender's identity is now known; drop those that waited too long.
+        """Validate held messages whose sender's identity is now known; drop those that waited too long: their
+        path request went unanswered for HOLD_PATH_WAIT (counted from their arrival if that is later), or
+        HOLD_TIME passed. Trusted senders' messages go first, so they get the path-request tokens first.
 
         Each stays in the queue until it is done with, so messages arriving meanwhile see it (as a duplicate,
         and against HOLD_LIMIT)."""
         with self._lock:
             held = list(self._held)
         now = time.monotonic()
+        held.sort(key=lambda item: not self.feature.trusted(item[1][ID_LENGTH:2 * ID_LENGTH]))
         for item in held:
             deadline, packed, method = item
             source = packed[ID_LENGTH:2 * ID_LENGTH]
             known = self.RNS.Identity.recall(source) is not None
             if not known and now < deadline:
-                self._request_path(source)  # if the rate limit held it back before
-                continue
+                with self._lock:
+                    asked = self._path_requested.get(source)
+                if asked is None or now < max(asked, deadline - HOLD_TIME) + HOLD_PATH_WAIT:
+                    self._request_path(source)  # if the rate limit held it back before
+                    continue
             try:
                 if not known:
-                    _log(f"dropped a message from {source.hex()}: its identity never became known", LOG_NOTICE)
+                    why = "its path request got no answer" if now < deadline else "its identity never became known"
+                    _log(f"dropped a message from {source.hex()}: {why}", LOG_NOTICE)
                     continue
                 message = self.LXMF.LXMessage.unpack_from_bytes(packed)
                 message.method = method
