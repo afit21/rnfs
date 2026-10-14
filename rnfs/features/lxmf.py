@@ -72,7 +72,7 @@ UNTRUSTED_BURST = 32
 MAX_ENTRY_BYTES = 16 * 1024  # an inbox record as JSON: links beyond it are dropped, then text is cut
 MAX_INBOX_BYTES = 4 * 1024 * 1024  # every inbox record as JSON (held in memory, rewritten on change)
 OUTBOX_LIMIT = 200
-AUTO_QUEUE_LIMIT = 64  # auto-fetches waiting; more are skipped
+AUTO_QUEUE_LIMIT = 64  # auto-fetches waiting (taken round-robin by sender); more are skipped
 DELIVERY_LIMIT_KB = 256  # largest LXMF message accepted (LXMF's delivery_limit, in kB); also caps PN downloads
 HOLD_LIMIT = 32  # messages from senders not known yet, held while their identity is requested; more are dropped
 HOLD_PER_SENDER = 8  # of them claiming one sender (the claim is unauthenticated until the identity is known)
@@ -661,6 +661,61 @@ def _fit_entry(entry: dict):
             entry["title"] = ""
 
 
+class _RoundRobin:
+    """Items waiting in a queue per key (an auto-fetch sender), taken one key at a time in turn, so one key's
+    backlog doesn't hold up another's. Not thread-safe: the caller locks."""
+
+    def __init__(self):
+        """Nothing waiting."""
+        self._queues: dict = {}  # key -> deque of its items; dict order is the turn order
+        self._count = 0
+
+    def __len__(self) -> int:
+        """Items waiting."""
+        return self._count
+
+    def __iter__(self):
+        """The items, in the order popleft() takes them."""
+        queues = [list(queue) for queue in self._queues.values()]
+        for turn in range(max(map(len, queues), default=0)):
+            yield from (queue[turn] for queue in queues if turn < len(queue))
+
+    def count(self, key) -> int:
+        """Items waiting for key."""
+        return len(self._queues.get(key, ()))
+
+    def append(self, key, item):
+        """Add item at the end of key's queue (a new key takes its turn after the others)."""
+        self._queues.setdefault(key, deque()).append(item)
+        self._count += 1
+
+    def popleft(self):
+        """The next item: the oldest of the key whose turn it is, which then goes last. IndexError if empty."""
+        if not self._queues:
+            raise IndexError("nothing waiting")
+        key = next(iter(self._queues))
+        queue = self._queues.pop(key)
+        item = queue.popleft()
+        self._count -= 1
+        if queue:
+            self._queues[key] = queue
+        return item
+
+    def pop_busiest(self, than: int):
+        """Remove and return the newest item of the key with the most waiting, if it has over than + 1 (so taking
+        one from it for a key with than waiting leaves things fairer); else None."""
+        key = max(self._queues, key=lambda k: len(self._queues[k]), default=None)
+        if key is None or len(self._queues[key]) <= than + 1:
+            return None
+        self._count -= 1
+        return self._queues[key].pop()
+
+    def clear(self):
+        """Forget everything waiting."""
+        self._queues.clear()
+        self._count = 0
+
+
 # The feature
 
 
@@ -689,7 +744,7 @@ class LxmfFeature(features.Feature):
         self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
         self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
         self._told_no_pn = False  # logged once how to set a propagation node
-        self._auto_queue: deque = deque()
+        self._auto_queue = _RoundRobin()  # (entry id, link index) by sender
         self.clock = time.monotonic  # for the rate limit on senders not trusted (tests set their own)
         self._untrusted_tokens = float(UNTRUSTED_BURST)
         self._untrusted_at: float | None = None
@@ -982,7 +1037,7 @@ class LxmfFeature(features.Feature):
              LOG_NOTICE)
         if auto:
             for index in range(len(entry["links"])):
-                self._queue_auto_fetch(entry_id, index)
+                self._queue_auto_fetch(entry_id, index, sender)
         return entry_id
 
     def accepts(self, source: bytes) -> bool:
@@ -1174,13 +1229,19 @@ class LxmfFeature(features.Feature):
 
     # Auto-fetch
 
-    def _queue_auto_fetch(self, entry_id: int, index: int):
-        """Queue one link of an inbox message for auto-fetch (skipped when the queue is full)."""
+    def _queue_auto_fetch(self, entry_id: int, index: int, sender: str):
+        """Queue one link of an inbox message from sender for auto-fetch. When the queue is full, the newest link
+        of the sender with the most waiting is skipped instead, if that sender has two more than this one; else
+        this link is."""
+        skipped = {"state": "skipped", "error": "too many auto-fetches waiting"}
         with self._auto_wanted:
             if len(self._auto_queue) >= AUTO_QUEUE_LIMIT:
-                self._set_auto(entry_id, index, {"state": "skipped", "error": "too many auto-fetches waiting"})
-                return
-            self._auto_queue.append((entry_id, index))
+                displaced = self._auto_queue.pop_busiest(self._auto_queue.count(sender))
+                if displaced is None:
+                    self._set_auto(entry_id, index, skipped)
+                    return
+                self._set_auto(*displaced, skipped)
+            self._auto_queue.append(sender, (entry_id, index))
             self._auto_wanted.notify()
 
     def _requeue_auto_fetches(self):
@@ -1189,10 +1250,11 @@ class LxmfFeature(features.Feature):
         for entry in self.inbox.entries():
             for index, result in enumerate(entry.get("auto") or []):
                 if isinstance(result, dict) and result.get("state") == "queued":
-                    self._queue_auto_fetch(entry["id"], index)
+                    self._queue_auto_fetch(entry["id"], index, entry["from"])
 
     def _run_auto_fetch(self):
-        """The auto-fetch worker: one fetch at a time, so quotas are checked against settled usage."""
+        """The auto-fetch worker: one fetch at a time, so quotas are checked against settled usage, taking senders
+        in turn."""
         while not self._stop.is_set():
             with self._auto_wanted:
                 while not self._auto_queue and not self._stop.is_set():
