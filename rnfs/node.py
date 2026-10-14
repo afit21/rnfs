@@ -31,7 +31,7 @@ from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content import chunker as content_chunker
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, USER, Storage, read_json, remote_source, write_json
+from rnfs.content.storage import FOLDER, USER, Storage, disk_reserve, read_json, remote_source, write_json
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
@@ -91,15 +91,23 @@ def _make_private_dirs(config: Config):
         os.makedirs(directory, mode=0o700, exist_ok=True)
 
 
-def _check_free_space(path: str, needed: int):
-    """Raise TooLarge if needed bytes won't fit in the free space of the filesystem path is to be written on."""
+def _check_free_space(path: str, needed: int, blocks_dir: str | None = None, to_fetch: int = 0):
+    """Raise TooLarge unless writing needed bytes to path leaves the disk reserve free on its filesystem.
+
+    If blocks_dir (where a fetch stores its blocks) is on the same filesystem, the to_fetch bytes still to be
+    fetched there before the write count too: the fetch keeps the reserve, and the write-out must as well.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     try:
-        free = shutil.disk_usage(directory).free
+        usage = shutil.disk_usage(directory)
+        if blocks_dir is not None and to_fetch > 0 and os.stat(directory).st_dev == os.stat(blocks_dir).st_dev:
+            needed += to_fetch
     except OSError:
         return  # a missing or unusable directory is reported by the write itself
-    if needed > free:
-        raise TooLarge(f"{size(needed)} won't fit in the {size(free)} free in {directory}")
+    reserve = disk_reserve(usage.total)
+    if needed > usage.free - reserve:
+        raise TooLarge(f"{size(needed)} won't fit in the {size(usage.free)} free in {directory} "
+                       f"while leaving {size(reserve)} free")
 
 
 def _remove_partial(path: str):
@@ -708,11 +716,16 @@ class RnfsNode:
         try:
             with self._fetching(root, names, from_node) as fetch:
                 expect = fetch.resolve()
-                # Its verified size is what writing it out takes, however few blocks it is made of
-                _check_free_space(output, fetch.size_of(expect))
+                # Its verified size is what writing it out takes, however few blocks it is made of; what is
+                # still to be fetched is stored first, on the same disk if the blocks are there
+                content = fetch.size_of(expect)
+                to_fetch = 0 if self.storage.is_complete(expect.cid) else \
+                    max(0, content - self.storage.dag_bytes(expect.cid))
+                _check_free_space(output, content, self.config.blocks_dir, to_fetch)
                 sealed = None if raw else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:  # decrypted as it is fetched (rnfs/content/seal.py)
-                    result = {"cid": str(expect.cid), "warnings": [], **node_content.write_sealed(sealed, partial)}
+                    written = node_content.write_sealed(sealed, partial, self.config.blocks_dir, to_fetch)
+                    result = {"cid": str(expect.cid), "warnings": [], **written}
                 else:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
                     warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries)
@@ -952,12 +965,13 @@ class RnfsNode:
                         f"quota ({size(used)} of {size(quota)} used)", LOG_WARNING)
                     return
                 # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks
+                # (fetch_dag also bounds them by what the size can hold, whichever is lower)
                 fetch.max_dag_bytes = quota - used
                 try:
                     fetch.fetch_dag(expect)
-                except TooLarge:
+                except TooLarge as e:
                     log(f"dropping remote pin of {cid} for {source}: its blocks would exceed its quota "
-                        f"({size(used)} of {size(quota)} used)", LOG_WARNING)
+                        f"({size(used)} of {size(quota)} used) or what its size can hold: {e}", LOG_WARNING)
                     return
                 with self._lock:
                     # Checked and pinned under the lock, so a release arriving now is either seen or undoes it

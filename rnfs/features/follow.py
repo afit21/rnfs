@@ -11,8 +11,8 @@
   doubling with each further failure up to announce_interval; a failed fetch is retried with the record
   held, without a path request.
 - One background thread does every check and fetch, one at a time, so following many names never runs more
-  than one transfer. Fetches obey the usual limits (max_download_size, disk reserve); a followed target is
-  a pin, so it is provided.
+  than one transfer. Fetches obey the usual limits (max_download_size, the DAG byte bound of the new
+  target's declared size, disk reserve); a followed target is a pin, so it is provided.
 - Followed names count against keep_max_names. State: <state dir>/follow.json (atomic).
 
 No RNS at module level (the CLI imports this module).

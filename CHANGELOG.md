@@ -4,6 +4,20 @@
 
 ## Unreleased
 
+Fixes:
+- A fetch of a whole DAG (`get`, `pin add`, `export`, `dir set`/`dir rm`, a followed name's new target, gateway
+  archives, remote pins and LXMF auto-fetches) is refused with "too large" once the DAG's blocks hold more than
+  its declared size can: the size plus 64 bytes per 4 KiB, 1 KiB, and 1 KiB per directory entry met. A file
+  node may list empty children, so a file declaring 1 byte could make `get` or `pin add` download and keep any
+  amount of data. Content built by `add` (either chunker) stays far inside the bound, and fetches of it ask
+  for blocks as before. Requests under the bound never ask for more than it leaves, so a refused fetch
+  downloads at most about one block too many.
+- `get` and `export` refuse output that would leave less than the disk reserve (max(256 MiB, 2%)) free, and
+  `get` counts the blocks it still has to fetch when they go to the same disk. They used to check only that
+  the output fits, so a `get` could fill the disk.
+- Names given as text must be exactly 32 hex digits (optionally in `<angle brackets>`, with spaces around):
+  whitespace between the digits used to be skipped, giving a name shorter than 16 bytes.
+
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
   message for their status; the detail goes to the daemon's log. A `507` used to show the local blocks

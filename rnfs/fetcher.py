@@ -33,7 +33,14 @@ may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY 
 
 Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes
 a fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
-write-outs stop at max_output_entries entries met while fetching. max_storage never refuses a fetch: one
+write-outs stop at max_output_entries entries met while fetching. fetch_dag also bounds the bytes of the
+DAG's distinct blocks by what its declared size can hold (dag_bound: the size, DAG_GRANULE_OVERHEAD per
+DAG_GRANULE of it and DAG_SLACK), plus DAG_ENTRY_OVERHEAD per directory entry or index child met, for at most
+max_output_entries of them; a caller's max_dag_bytes (a quota) can lower it. A file node may list children
+of size 0, so without it a file declaring 1 byte could hold any number of distinct nodes. What the builder
+writes never comes near it (design.md, "DAG byte bound"). While it applies, requests ask for no more than it
+leaves, counting a DAG node as MAX_BLOCK_SIZE until it arrives, so a fetch downloads at most about one block
+beyond it before failing with TooLarge. max_storage never refuses a fetch: one
 that isn't being pinned evicts other cached fetches to make room for each response, and goes over
 max_storage if nothing is evictable (the node evicts again once it ends). What refuses a fetch, pinned or
 not, with StorageFull is the disk: its remaining size, and then each response, must leave the disk reserve
@@ -55,7 +62,7 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, KIB, MAX_REQUEST_SIZE
+from rnfs.constants import CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE
 from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage, read_json, write_json
@@ -74,6 +81,21 @@ DAG_NODE_GUESS = 8 * KIB  # assumed size of a DAG node block when reserving a re
 MAX_BATCH = 32  # CIDs reserved for one request at most; the client sends as many as fit one packet
 INVALID_FILE = "invalid.json"
 MAX_INVALID = 10_000  # roots remembered as invalid; past this the oldest is forgotten
+# The DAG byte bound (dag_bound and fetch_dag; design.md, "DAG byte bound"). Writers cut chunks of CHUNK_SIZE,
+# or with FastCDC of over 16 KiB, so a file has at most one chunk per 16 KiB of content beyond its last; each
+# costs at most 51 bytes of file node (a [cid, size] child), plus about 1/255 of that for the levels above
+DAG_GRANULE = CHUNK_SIZE // 16  # 4 KiB of declared content, the smallest chunk SmallLeaves counts as large...
+DAG_GRANULE_OVERHEAD = 64  # ...may bring this many bytes of file nodes (an honest file needs under 13)
+DAG_ENTRY_OVERHEAD = 1 * KIB  # bytes allowed per directory entry or index child met (an honest one needs ~830)
+DAG_SLACK = 1 * KIB  # the target's own node header and the file node levels above its chunks (under 600)
+NODE_ENTRIES = MAX_BLOCK_SIZE // 43  # entries a directory node can hold at most (43 bytes is the smallest)
+
+
+def dag_bound(size: int) -> int:
+    """The most bytes of distinct blocks the DAG of a target declaring size content bytes may hold, before
+    the allowance its directory entries bring (Fetch.fetch_dag): size, DAG_GRANULE_OVERHEAD per DAG_GRANULE
+    of it, and DAG_SLACK."""
+    return size + DAG_GRANULE_OVERHEAD * -(-size // DAG_GRANULE) + DAG_SLACK
 
 
 class Cancelled(RnfsError):
@@ -236,9 +258,11 @@ class Fetch:
         self.downloaded_bytes = 0
         self.node_bytes = 0  # DAG node bytes downloaded, which max_download_size also bounds
         # Set by the caller to bound the bytes of the distinct blocks of the DAG met, stored or downloaded
-        # (a remote pin's quota); TooLarge once over
+        # (a remote pin's quota); TooLarge once over. fetch_dag adds the bound its target's size implies
         self.max_dag_bytes: int | None = None
         self.dag_bytes = 0
+        self._declared: int | None = None  # content bytes the targets of fetch_dag declare, once it runs
+        self._entries = 0  # directory entries and index children of the counted blocks
         self._counted: set[Cid] = set()
         self._progress_at = fetcher.clock()  # last verified block or response progress, for the no-progress deadline
         self.root_delivered = False
@@ -358,12 +382,16 @@ class Fetch:
     def fetch_dag(self, target: Expect, max_entries: int | None = None):
         """Fetch every block of target's DAG not already stored, level by level, checking each.
 
-        With max_entries, raises TooLarge once more directory entries than that are met (for write-outs).
+        Raises TooLarge once its distinct blocks hold more than dag_limit() bytes (what target's declared
+        size and the directory entries met allow, or max_dag_bytes if lower), and with max_entries once more
+        directory entries than that are met (for write-outs).
         """
         with self._checking():
             self.ensure([target])
             size = self.size_of(target)
             self.check_size(size)
+            # From here on the DAG's blocks are counted (the target's again) against what its size can hold
+            self._declared = (self._declared or 0) + size
             if self.observer is not None:
                 self.observer.total(size)
             # The root's own DAG, already complete, was checked from the same expectation when it was memoised
@@ -532,17 +560,76 @@ class Fetch:
                 log(f"stored block {expect.cid} of {self.root} is damaged; fetching it again", LOG_WARNING)
                 return None
             raise
-        self._count_dag(expect.cid, len(block))
+        self._count_dag(expect.cid, len(block), result)
         return result
 
-    def _count_dag(self, cid: Cid, length: int):
-        """Count a block of the DAG once against max_dag_bytes, if set. Raises TooLarge once over."""
-        if self.max_dag_bytes is None or cid in self._counted:
+    def dag_limit(self) -> int | None:
+        """Bytes the distinct blocks of the DAG may hold: max_dag_bytes, and once fetch_dag runs, dag_bound of
+        the size its target declares plus DAG_ENTRY_OVERHEAD per directory entry or index child met (at most
+        max_output_entries of them), whichever is lower. None if neither applies."""
+        limits = [] if self.max_dag_bytes is None else [self.max_dag_bytes]
+        if self._declared is not None:
+            entries = min(self._entries, self.config.max_output_entries)
+            limits.append(dag_bound(self._declared) + DAG_ENTRY_OVERHEAD * entries)
+        return min(limits, default=None)
+
+    def _count_dag(self, cid: Cid, length: int, children: list[Expect] = ()):
+        """Count a block of the DAG once against dag_limit(), if there is one, with the directory entries and
+        index children among its children. Raises TooLarge once over."""
+        if (self.max_dag_bytes is None and self._declared is None) or cid in self._counted:
             return
         self._counted.add(cid)
         self.dag_bytes += length
-        if self.dag_bytes > self.max_dag_bytes:
-            raise TooLarge(f"{self.root} holds more than {self.max_dag_bytes} bytes of blocks")
+        self._entries += sum(1 for child in children if child.kind is not None or child.first_name is not None)
+        limit = self.dag_limit()
+        if self.dag_bytes > limit:
+            if limit == self.max_dag_bytes:
+                raise TooLarge(f"{self.root} holds more than {limit} bytes of blocks")
+            raise TooLarge(f"{self.root} holds more than {limit} bytes of blocks, more than its "
+                           f"{plural(self._declared, 'byte')} of content and its directory entries can take: "
+                           "refusing it")
+
+    def _room(self, wanted: dict[Cid, list[Expect]]) -> tuple | None:
+        """What the limits leave for blocks not yet asked for, after the most the requests in flight can bring:
+        (bytes under the size-derived bound, entries it may still credit, bytes under max_dag_bytes), each None
+        if that limit doesn't apply; None if neither does."""
+        if self._declared is None and self.max_dag_bytes is None:
+            return None
+        bound = None
+        if self._declared is not None:
+            entries = min(self._entries, self.config.max_output_entries)
+            bound = dag_bound(self._declared) + DAG_ENTRY_OVERHEAD * entries - self.dag_bytes
+        quota = None if self.max_dag_bytes is None else self.max_dag_bytes - self.dag_bytes
+        room = (bound, self.config.max_output_entries - self._entries, quota)
+        for cids, _ in self._in_flight.values():
+            for cid in cids:
+                room = self._reserve(cid, wanted, room)
+        return room
+
+    def _reserve(self, cid: Cid, wanted: dict[Cid, list[Expect]], room: tuple) -> tuple:
+        """room (as _room) after the most cid can add to the DAG's bytes: a raw chunk's declared size, otherwise
+        MAX_BLOCK_SIZE; under the size-derived bound, a directory or index node takes only its header while
+        enough entries are left for the most a node holds, since each brings more allowance than it takes."""
+        bound, entries, quota = room
+        expects = wanted.get(cid)
+        if cid in self._counted:
+            return room
+        worst = MAX_BLOCK_SIZE
+        if expects and cid.is_raw and expects[0].size is not None:
+            worst = expects[0].size
+        if bound is not None:
+            if (expects and not cid.is_raw and entries >= NODE_ENTRIES
+                    and not any(walker.FILE_TYPE in expect.types for expect in expects)):
+                bound, entries = bound - 8, entries - NODE_ENTRIES
+            else:
+                bound -= worst
+        return bound, entries, None if quota is None else quota - worst
+
+    @staticmethod
+    def _fits(room: tuple) -> bool:
+        """True if room (as _room) leaves nothing below zero."""
+        bound, _, quota = room
+        return (bound is None or bound >= 0) and (quota is None or quota >= 0)
 
     def _accept(self, cid: Cid, block: bytes, wanted: dict[Cid, list[Expect]], children: dict):
         """Check a verified block against every expectation of it and the limits, then store it.
@@ -556,7 +643,7 @@ class Fetch:
             if limit is not None and self.node_bytes + len(block) > limit:
                 raise TooLarge(f"{self.root}'s DAG nodes would exceed max_download_size ({limit})")
             self.node_bytes += len(block)
-        self._count_dag(cid, len(block))
+        self._count_dag(cid, len(block), children[wanted[cid][0]])
         self.session.put(cid, block)
         self._progress_at = self.fetcher.clock()
         self.downloaded_blocks += 1
@@ -683,8 +770,13 @@ class Fetch:
                 busy_providers += 1
 
     def _take_batch(self, pending: deque, node_id: bytes, wanted: dict[Cid, list[Expect]]) -> list[Cid]:
-        """The next CIDs to ask node_id for: what its budget and one request packet can hold, at least one."""
+        """The next CIDs to ask node_id for: what its budget and one request packet can hold, at least one.
+
+        Under a DAG limit, only what the room it leaves can take for sure (_room), but at least one CID when no
+        request is in flight: so a fetch downloads at most about one block beyond the limit.
+        """
         budget = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
+        room = self._room(wanted)
         batch: list[Cid] = []
         total = 0
         while pending and len(batch) < MAX_BATCH:
@@ -696,6 +788,10 @@ class Fetch:
             # The largest request any link allows; the client sends what fits its link and returns the rest
             if batch and protocol.blocks_batch_size(budget, batch + [cid], MAX_REQUEST_SIZE) <= len(batch):
                 break
+            if room is not None:
+                room = self._reserve(cid, wanted, room)
+                if not self._fits(room) and (batch or self._in_flight):
+                    break
             batch.append(pending.popleft())
             total += guess
         return batch
