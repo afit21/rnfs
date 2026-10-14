@@ -669,8 +669,8 @@ class RequestServerTest(unittest.TestCase):
         self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
         self.assertIsNot(self.blocks(link, cids), False)
         response = self.server.pools.responses()[0]
-        charged = capacity - airtime.remaining()
-        self.assertGreater(charged, 300 * KIB)
+        self.assertGreater(response.cost, 300 * KIB)
+        self.assertLessEqual(capacity - airtime.remaining(), link.mdu)  # charged as sent: a reservation so far
         resource = self.send(link)
         resource.progress = 0.25
         resource.cancel()  # RNS: rejected or timed out, then the callback
@@ -681,7 +681,7 @@ class RequestServerTest(unittest.TestCase):
         self.server.rates.record(other.link_id, 64 * KIB, 1_000_000)
         self.assertIsNot(self.blocks(other, cids[:2]), False)
         self.send(other).progress = 0.5
-        packed = before - airtime.remaining()
+        packed = self.server.pools.responses()[0].size
         other.teardown()
         self.assertAlmostEqual(before - airtime.remaining(), packed / 2, delta=2)
         # A response cancelled before its Resource started (missed deadline) is refunded whole
@@ -696,7 +696,7 @@ class RequestServerTest(unittest.TestCase):
         capacity = airtime.remaining()
         link = self.connect(b"a")
         self.assertIsNot(self.blocks(link), False)
-        charged = capacity - airtime.remaining()
+        charged = self.server.pools.responses()[0].size  # how much was sent is unknown: all of it
         resource = self.send(link)
 
         def unreadable():
@@ -712,7 +712,7 @@ class RequestServerTest(unittest.TestCase):
         capacity = airtime.remaining()
         link = self.connect(b"a")
         self.assertIsNot(self.blocks(link), False)
-        charged = capacity - airtime.remaining()
+        charged = self.server.pools.responses()[0].size
         resource = self.send(link)
         resource.progress = 1.0
         resource.complete()
@@ -737,7 +737,7 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(len(served), 3)  # cut to half the bucket
         self.assertIs(answers[2], False)
         self.assertEqual(self.server.traffic.snapshot()["refused"]["budget"], 1)
-        in_flight = sum(response.charged for response in self.server.pools.responses())
+        in_flight = sum(response.cost for response in self.server.pools.responses())
         self.assertLessEqual(in_flight, 400 * KIB + 2 * 64 * KIB)
         self.assertIsNot(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, cids[:1]),
                                   self.connect(b"z"), RNS.Identity()), False)
