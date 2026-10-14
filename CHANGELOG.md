@@ -31,6 +31,8 @@ Platform and packaging:
   An existing rnfs dir or identity file that lets others in is tightened (with a notice), the daemon refuses
   an rnfs dir owned by another account, and every command refuses a token file others can read, as on POSIX.
   A `--dir` outside `%USERPROFILE%` gets a warning. Not yet tested on Windows itself.
+- The identity file's permission fix no longer follows a symlink: a symlink at the identity path is left as
+  it is, with a warning, and the file is changed through a descriptor opened with `O_NOFOLLOW`.
 
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed

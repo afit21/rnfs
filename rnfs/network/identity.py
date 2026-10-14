@@ -55,8 +55,10 @@ def save_identity(identity: RNS.Identity, path: str, replace: bool = True) -> bo
 def _restrict_permissions(path: str):
     """Make an existing identity file owner-only if group or others could access it (e.g. an older rnfs's).
 
-    On Windows, which has no Unix permission bits (st_mode always shows group and others allowed), its access
-    list is checked and tightened instead (winacl).
+    Never through a symlink: a symlink at path is left alone, with a warning, and the file is opened without
+    following one (O_NOFOLLOW) and changed through that descriptor, so a link put there can't get another
+    file's permissions changed. On Windows, which has no Unix permission bits (st_mode always shows group and
+    others allowed), its access list is checked and tightened instead (winacl).
     """
     if fsutil.IS_WINDOWS:
         try:
@@ -69,11 +71,19 @@ def _restrict_permissions(path: str):
                 f"restricted it to you and SYSTEM", LOG_WARNING)
         return
     try:
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        if mode & 0o077:
-            os.chmod(path, IDENTITY_MODE)
-            log(f"identity file {path} was accessible to other users (mode {mode:o}); "
-                f"restricted it to {IDENTITY_MODE:o}", LOG_WARNING)
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            log(f"identity file {path} is a symlink, so its permissions weren't checked; make sure only you "
+                f"can read the file it points to", LOG_WARNING)
+            return
+        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        try:
+            mode = stat.S_IMODE(os.fstat(fd).st_mode)
+            if mode & 0o077:
+                os.fchmod(fd, IDENTITY_MODE)
+                log(f"identity file {path} was accessible to other users (mode {mode:o}); "
+                    f"restricted it to {IDENTITY_MODE:o}", LOG_WARNING)
+        finally:
+            os.close(fd)
     except OSError as e:
         log(f"could not restrict the permissions of identity file {path}: {e}", LOG_WARNING)
 
