@@ -264,6 +264,24 @@ class CapTest(TwoNodeTest):
             self.b.dir_set(str(directory), "child", str(bomb.root))
         self.assertEqual(self.b.storage.pins(), {})
 
+    def test_a_quota_is_overshot_by_one_block_at_most(self):
+        # Directory nodes bring room under the size-derived bound, but not under a quota: they count in full there
+        with self.a.storage.protect() as session:
+            empty = builder.build_bytes(b"", session.put).cid
+            subdirectories = []
+            for i in range(20):
+                built = builder.build_directory([dag.Entry(name(j, 100) + str(i), empty, 0, 0) for j in range(250)],
+                                                session.put)
+                subdirectories.append(dag.Entry(name(i, 8), built.cid, 0, dag.KIND_DIRECTORY))
+            root = builder.build_directory(subdirectories, session.put).cid
+            self.a.storage.pin(root, USER)
+        self.a.publisher.refresh()
+        self.a.records.store(root.key, A_ID)
+        with self.assertRaises(TooLarge), self.b.fetcher.open(root, pinned=True) as fetch:
+            fetch.max_dag_bytes = 50_000
+            fetch.fetch_dag(fetch.resolve())
+        self.assertLessEqual(self.net.downloaded_bytes, 50_000 + MAX_BLOCK_SIZE)
+
     def test_a_lower_quota_still_applies(self):
         cid = self.add_file(4 * CHUNK_SIZE)
         with self.assertRaises(TooLarge) as caught, self.b.fetcher.open(cid, pinned=True) as fetch:

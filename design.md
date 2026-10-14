@@ -456,9 +456,10 @@ Everything in the specification is implemented, with these simplifications and a
   of what it allows). What it refuses: zero-size children (audit L3), and DAGs of chunks well under 4 KiB,
   which no writer following the tree rule makes. To keep the overshoot to about one block, `_take_batch`
   asks only for what fits the room left after the requests in flight (`_room`, `_reserve`): a raw chunk's
-  declared size, a directory or index node's header (its entries bring more room than they take, while
-  enough entries are left under `max_output_entries`), anything else `MAX_BLOCK_SIZE`; and always one CID
-  when nothing is in flight. Honest fetches are not held back by this: the content still to come leaves
+  declared size, anything else `MAX_BLOCK_SIZE`, except that under the size-derived bound (not under a
+  quota, which entries don't raise) a directory or index node takes only its header, since its entries bring
+  more room than they take while enough are left under `max_output_entries`; and always one CID when nothing
+  is in flight. Honest fetches are not held back by this: the content still to come leaves
   room for many file nodes, and directory nodes cost almost nothing.
 - `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which

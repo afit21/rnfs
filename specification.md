@@ -543,9 +543,9 @@ and repeat.
    under 13 bytes per 4 KiB of content, and each entry, with the nodes above it and the levels of a file
    below it, under 1 KiB. A fetch that would exceed it fails ("too large") without marking the root invalid.
    While the bound applies, a requester asks only for blocks that fit the room it leaves, counting a DAG node
-   not yet received as `MAX_BLOCK_SIZE` (a directory or index node as its header only, since its entries bring
-   more room than they take), and always for at least one block when none is in flight, so a fetch downloads
-   at most about one block beyond the bound. Byte-range reads are lazy and skip empty children instead.
+   not yet received as `MAX_BLOCK_SIZE` (under the size-derived bound, a directory or index node as its header
+   only, since its entries bring more room than they take; under a quota, in full), and always for at least
+   one block when none is in flight, so a fetch downloads at most about one block beyond either. Byte-range reads are lazy and skip empty children instead.
 6. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
    only contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or
    misses the same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels

@@ -589,33 +589,47 @@ class Fetch:
                            f"{plural(self._declared, 'byte')} of content and its directory entries can take: "
                            "refusing it")
 
-    def _room(self, wanted: dict[Cid, list[Expect]]) -> tuple[int, int] | None:
-        """(bytes, entries) dag_limit() leaves for blocks not yet asked for, after the most the requests in
-        flight can bring; None if there is no limit."""
-        limit = self.dag_limit()
-        if limit is None:
+    def _room(self, wanted: dict[Cid, list[Expect]]) -> tuple | None:
+        """What the limits leave for blocks not yet asked for, after the most the requests in flight can bring:
+        (bytes under the size-derived bound, entries it may still credit, bytes under max_dag_bytes), each None
+        if that limit doesn't apply; None if neither does."""
+        if self._declared is None and self.max_dag_bytes is None:
             return None
-        room = (limit - self.dag_bytes, self.config.max_output_entries - self._entries)
+        bound = None
+        if self._declared is not None:
+            entries = min(self._entries, self.config.max_output_entries)
+            bound = dag_bound(self._declared) + DAG_ENTRY_OVERHEAD * entries - self.dag_bytes
+        quota = None if self.max_dag_bytes is None else self.max_dag_bytes - self.dag_bytes
+        room = (bound, self.config.max_output_entries - self._entries, quota)
         for cids, _ in self._in_flight.values():
             for cid in cids:
                 room = self._reserve(cid, wanted, room)
         return room
 
-    def _reserve(self, cid: Cid, wanted: dict[Cid, list[Expect]], room: tuple[int, int]) -> tuple[int, int]:
-        """room after the most cid can add to the DAG's bytes: a raw chunk's size; for a directory or index
-        node only its header, while the entries left can take the most a node holds (each brings more
-        allowance than it takes); otherwise MAX_BLOCK_SIZE."""
-        room_bytes, room_entries = room
+    def _reserve(self, cid: Cid, wanted: dict[Cid, list[Expect]], room: tuple) -> tuple:
+        """room (as _room) after the most cid can add to the DAG's bytes: a raw chunk's declared size, otherwise
+        MAX_BLOCK_SIZE; under the size-derived bound, a directory or index node takes only its header while
+        enough entries are left for the most a node holds, since each brings more allowance than it takes."""
+        bound, entries, quota = room
         expects = wanted.get(cid)
         if cid in self._counted:
             return room
-        if not expects:
-            return room_bytes - MAX_BLOCK_SIZE, room_entries
-        if cid.is_raw:
-            return room_bytes - (MAX_BLOCK_SIZE if expects[0].size is None else expects[0].size), room_entries
-        if room_entries >= NODE_ENTRIES and not any(walker.FILE_TYPE in expect.types for expect in expects):
-            return room_bytes - 8, room_entries - NODE_ENTRIES
-        return room_bytes - MAX_BLOCK_SIZE, room_entries
+        worst = MAX_BLOCK_SIZE
+        if expects and cid.is_raw and expects[0].size is not None:
+            worst = expects[0].size
+        if bound is not None:
+            if (expects and not cid.is_raw and entries >= NODE_ENTRIES
+                    and not any(walker.FILE_TYPE in expect.types for expect in expects)):
+                bound, entries = bound - 8, entries - NODE_ENTRIES
+            else:
+                bound -= worst
+        return bound, entries, None if quota is None else quota - worst
+
+    @staticmethod
+    def _fits(room: tuple) -> bool:
+        """True if room (as _room) leaves nothing below zero."""
+        bound, _, quota = room
+        return (bound is None or bound >= 0) and (quota is None or quota >= 0)
 
     def _accept(self, cid: Cid, block: bytes, wanted: dict[Cid, list[Expect]], children: dict):
         """Check a verified block against every expectation of it and the limits, then store it.
@@ -776,7 +790,7 @@ class Fetch:
                 break
             if room is not None:
                 room = self._reserve(cid, wanted, room)
-                if room[0] < 0 and (batch or self._in_flight):
+                if not self._fits(room) and (batch or self._in_flight):
                     break
             batch.append(pending.popleft())
             total += guess
