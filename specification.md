@@ -685,7 +685,7 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
 1. Resolve any path to a CID locally.
 2. Pin the target with source `name:<alias>`.
 3. Set the record with `sequence` one higher than both the publisher's stored sequence and the highest it can
-   resolve, and persist it. If that fails, the publish fails and the pin of step 2 is released.
+   resolve, and persist it. If that fails, the publish fails and a pin step 2 added is released.
 4. Release that source from the previous target (only now, so a crash leaves the target the persisted record
    names pinned; any other pin of the source is released at the next start, section 8).
 5. Announce, and re-announce every `announce_interval`.

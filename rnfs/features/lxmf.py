@@ -695,7 +695,10 @@ class LxmfFeature(features.Feature):
                 if source.startswith(LXMF_PREFIX) and (source[len(LXMF_PREFIX):], str(cid)) not in recorded:
                     _log(f"releasing {cid}, pinned for a message from {source[len(LXMF_PREFIX):]} that the inbox "
                          "no longer records", LOG_WARNING)
-                    self.node.storage.unpin(cid, source)
+                    try:
+                        self.node.storage.unpin(cid, source)
+                    except OSError as e:  # e.g. a read-only state directory: tried again at the next start
+                        _log(f"could not release {cid}: {e}", LOG_ERROR)
 
     @staticmethod
     def _propagated_sent(entry: dict) -> bool:

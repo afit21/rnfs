@@ -108,7 +108,10 @@ class FollowFeature(Feature):
                     continue
                 if name not in self._pinned:
                     _log(f"releasing {cid}, pinned for name {name.hex()}, which is no longer followed", LOG_WARNING)
-                    self.node.storage.unpin(cid, source)
+                    try:
+                        self.node.storage.unpin(cid, source)
+                    except OSError as e:  # e.g. a read-only state directory: tried again at the next start
+                        _log(f"could not release {cid}: {e}", LOG_ERROR)
 
     def _save(self):
         """Write follow.json atomically (lock held)."""
