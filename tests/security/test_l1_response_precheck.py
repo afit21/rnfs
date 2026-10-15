@@ -8,6 +8,7 @@ shape still reaches the requester decoded as before; the bombs are refused with 
 and a refused response fails the /blocks request exactly as a malformed response does.
 """
 import io
+import random
 import types
 import unittest
 from unittest import mock
@@ -157,6 +158,25 @@ class ResponseResourceTest(_Guarded):
         resource.status = RNS.Resource.FAILED
         RNS.Link.response_resource_concluded(link, resource)
         link.pending_requests[0].request_timed_out.assert_called_once_with(None)  # RNS's own handling
+
+    def test_mutated_responses_never_raise_and_only_decodable_ones_pass(self):
+        rng = random.Random(1)
+        seeds = [umsgpack.packb([REQUEST_ID, response]) for response in honest_responses().values()
+                 if len(umsgpack.packb([REQUEST_ID, response])) < 4096]
+        for _ in range(5000):
+            packed = bytearray(rng.choice(seeds))
+            for _ in range(rng.randint(1, 4)):
+                position = rng.randrange(len(packed) + 1)
+                choice = rng.random()
+                if choice < 0.4 and position < len(packed):
+                    packed[position] = rng.randrange(256)
+                elif choice < 0.7:
+                    del packed[position:]
+                else:
+                    packed.insert(position, rng.randrange(256))
+            packed = bytes(packed)
+            if protocol.response_refusal(packed) is None:
+                self.unpackb(packed)  # anything let through decodes
 
     def test_check_reads_headers_only(self):
         # The check costs the same for any size: it never reads a bin's contents or builds objects
