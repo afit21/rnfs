@@ -2,6 +2,290 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.4
+
+Security release from the fifth audit: fixes for denial of service against `/blocks` serving, unbounded downloads,
+DHT keeper and provider-store takeover, name rollback, gateway privacy leaks, the companion pages, LXMF floods and
+Windows permissions. No wire-format changes: 0.1.4 and 0.1.3 nodes work together.
+
+Fixes:
+- A fetch of a whole DAG (`get`, `pin add`, `export`, `dir set`/`dir rm`, a followed name's new target, gateway
+  archives, remote pins and LXMF auto-fetches) is refused with "too large" once the DAG's blocks hold more than
+  its declared size can: the size plus 64 bytes per 4 KiB, 1 KiB, and what its directory nodes take plus 16
+  bytes per entry (index nodes: their own bytes plus 16 per child, less 64). A file node may list empty
+  children, so a file declaring 1 byte could make `get` or `pin add` download and keep any amount of data.
+  Content built by `add` (either chunker) stays far inside the bound, and fetches of it ask for blocks as
+  before; there is no limit on the entries of a directory you pin (`get` and `export` still stop at
+  `max_output_entries`). Requests under the bound never ask for more than it leaves, so a refused fetch
+  downloads at most about one block too many.
+- A byte-range read (`cat`, the gateway's file responses and Range requests, `/api/cat`, and reading or
+  decrypting a sealed file, as `get`, `cat` and `info` do for one sealed to this node) is refused with "too
+  large" once the file nodes it meets hold more than the range can need: its own bound as above plus two full
+  file nodes (13 KB each) per level a file of the declared size can have (one up to 1 MiB, seven at most).
+  These reads never ran the whole-DAG bound, so `cat` of a file declaring 1 byte could download 7 MB, and
+  `get` of a 12 KB file sealed to you 29 MB; now at most about 184 KB plus one block. A small read that ends
+  inside two file nodes may take one more request than before.
+- `ls` and the gateway's directory listings are bounded the same way, as a fetch of 0 bytes: chains of index
+  nodes of one child each used to be listed level by level without limit (751 KB for 40 entries).
+- `get` and `export` refuse to write when they can't read the free space at the destination (a missing directory, say),
+  instead of writing without the disk reserve check.
+- `get` and `export` refuse output that would leave less than the disk reserve (max(256 MiB, 2%)) free, and
+  `get` counts the blocks it still has to fetch when they go to the same disk. They used to check only that
+  the output fits, so a `get` could fill the disk.
+- Names given as text must be exactly 32 hex digits (optionally in `<angle brackets>`, with spaces around):
+  whitespace between the digits used to be skipped, giving a name shorter than 16 bytes. Node IDs and names
+  given to the local API and the gateway are checked the same way (spaces around allowed, not between).
+- A remote `/pin` accepted just as the previous one of that identity finished was answered "accepted" and
+  never fetched (sending it again didn't help): the fetch thread now deregisters in the same step that finds
+  nothing left. If the thread can't be started the `/pin` is refused, where the identity used to be stuck
+  until a restart, its pins queuing up and then being refused.
+- Remote pins accepted but not yet fetched survive a restart: they are saved in `state/remote_pins.json` and
+  fetched again at start, unless their identity has left `remote_pin_identities`. They used to be dropped
+  silently. An entry of the file that isn't a pair of strings is skipped with a warning; it used to stop the
+  node from starting.
+
+Local API and privacy:
+- `GET /api/status` without the API token answers only `{"version": ...}`, enough for health checks; the node
+  ID, identity hash, LXMF address and traffic counters need the token, as `/api/lxmf/address` already did.
+  `rnfs status` sends the token (without a readable one it prints just the version and says why).
+- `pin ls` says which pins are sealed files: `(sealed)` in the listing and `"sealed": true` in `--json`
+  (`false` for other files and directories, `null` when the stored blocks can't tell). The local name of a
+  sealed add is still the path or name you gave, kept on your machine only; anything that shows pins to
+  others must leave sealed entries out.
+- The README and specification now say plainly that under the default `provide_strategy = "roots"` every
+  complete download, `cat` and `stat` of other nodes' content included, is provided and served, so anyone
+  can learn what the node fetched, and that `"pinned"` avoids it; and that scripts showing content to others
+  must use `cat --raw`, since `cat` decrypts sealed files this node can open. Behaviour is unchanged.
+
+Platform and packaging:
+- Where directories are walked by path (Windows), adding a directory or scanning the shared folder checks
+  each directory again whenever it lists it (same file ID, not a junction, symlink or other name-surrogate
+  reparse point, real path still inside the folder) and each file's final path, from its open handle, before
+  reading it. A directory swapped for a junction during a scan used to import files from outside the shared
+  folder and share them; now what changed is skipped with a warning. The README says the shared folder must
+  not be writable by accounts you don't trust. Not yet tested on Windows itself.
+- On Windows the rnfs dir, the API token, the node and LXMF identities and name keys get a protected access
+  list allowing only the user and SYSTEM; they used to inherit their folder's, which with `--dir` outside the
+  user profile (another drive, `C:\ProgramData`) usually let every local user read the token and the keys.
+  An existing rnfs dir or identity file that lets others in is tightened (with a notice), the daemon refuses
+  an rnfs dir owned by another account, and every command refuses a token file others can read, as on POSIX.
+  A `--dir` outside `%USERPROFILE%` gets a warning. Not yet tested on Windows itself.
+- On Windows a new rnfs dir and its subdirectories get that access list in the call that creates them. A new
+  `--dir` used to have its parent's access list until rnfs set its own, so another local account could put a
+  file in it first (an `rnfs.toml` naming a Reticulum config of theirs, whose interfaces can run programs, or
+  an identity); a new rnfs dir that already holds anything is now refused. `rnfs.toml` and the identity are
+  checked before use, through the handle they are read from: one owned by another account is refused, one
+  others may access is made private with a warning, and one that can't be made private stops rnfs (for the
+  identity this was a warning). An rnfs dir that is a junction or symlink is refused. Not yet tested on
+  Windows itself.
+- The shared folder skips files that have other hard links, with a line in the log, also inside shared
+  directories: someone who may write to `files/` could hard link a file of yours from elsewhere on the same
+  disk into it and have it shared. A file is imported once its other links are gone. `add` is unchanged.
+- `install.sh` installs the latest release from its sdist (`rnfs-X.Y.Z.tar.gz`, a release file) instead of
+  GitHub's archive of the tag, which neither `SHA256SUMS` nor the build provenance covers and which a moved tag
+  would change unnoticed. The sdist must match the release's `SHA256SUMS`; where the GitHub CLI (2.49 or
+  newer) is installed and logged in, its signed provenance is checked too (`gh attestation verify`, signed by
+  the release workflow), and a mismatch or failed check stops the install. Without `gh` it warns that only
+  the checksum was checked; `RNFS_REQUIRE_ATTESTATION=1` makes that an error. The README's "Checking a
+  download" shows `gh attestation verify`.
+- The release workflow's Debian 12 smoke test mounts the checkout read-only (it installs a copy of the
+  `.deb`), runs an image pinned by digest with `no-new-privileges`, and runs the smoke test as `nobody`. The
+  container could change the `.deb` just before it was uploaded, checksummed and attested.
+- The release job runs in a `release` environment, so publishing can be gated by that environment's
+  protection rules (set in the repository's settings).
+- The systemd user unit (`contrib/rnfs.service` and the one `install.sh` writes) adds
+  `SystemCallFilter=@system-service` and `SystemCallArchitectures=native`.
+- The identity file's permission fix no longer follows a symlink, and the daemon refuses to start, with an
+  error, if the identity file is a symlink, belongs to another user or isn't a regular file. A symlink used
+  to be loaded with a warning, and a FIFO there made the start hang. The file is checked, tightened and read
+  through one descriptor opened with `O_NOFOLLOW`, so a file swapped in after the check isn't the one loaded.
+
+Companion NomadNet pages:
+- `display-mu-file` shows only allowlisted CIDs when the node runs in private mode: it used to show any
+  unsealed file the operator pinned (up to 200 KB) to every visitor who knew its CID. Its rate limit is now per
+  visitor where NomadNet says who that is: 10 requests a minute for each visitor who identified, 30 for all who
+  didn't together, and 60 for everyone. One visitor's requests used to lock everyone out for a minute.
+  Identities cost nothing to make, so someone who makes several can still reach the overall limit.
+
+Gateway privacy:
+- Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed
+  message for their status; the detail goes to the daemon's log. A `507` used to show the local blocks
+  directory, the free disk space and the reserve. The storage-full message no longer names the directory
+  anywhere (the CLI and API still show free space against the reserve).
+- The gateway sends no CORS headers at all. The rule that allowed pages to `fetch()` files in their own DAG
+  (`Access-Control-Allow-Origin` for a gateway `Referer`) never worked in browsers, since sandboxed pages
+  send no `Referer`, and it is dropped from the specification. Pages still load their DAG's files as
+  images, scripts, style sheets and frames. Per-CID origins may bring reading back later.
+- `?format=archive` answers every web page's request and every `HEAD` with `409`, stored or not. It used to
+  answer `200` for content stored on the node, which let any web site tell what the user had downloaded or
+  viewed (an iframe of a download fires no load event). The user's own `GET` is unchanged.
+- `?format=raw` answers every web page's request and every `HEAD` with `409` too, stored or not, and so never
+  takes a `gateway_fetches` slot. A page used to get the block, a download, if it was stored, but a network
+  fetch otherwise (an error page if nobody had it, or `503` once the page held every slot), which told it the
+  same. The user's own `GET` is unchanged.
+- A web page's `HEAD`, or range not starting at byte 0, takes its Content-Type from the file's first bytes,
+  fetched if need be, as its `GET` does. It used to sniff them only if stored (else
+  `application/octet-stream`), which a page may be able to observe (e.g. through opaque-response blocking).
+
+Serving `/blocks` under load:
+- Displacement protection is now earned by progress, so one peer can no longer hold every `/blocks` response
+  slot almost for free. A response is protected from displacement only while it is within a short grace the
+  node measures from the path its request came over (never from the requester-controlled `link.rtt`), or while
+  it is moving data at or above a throughput floor. The grace prices the first hop at the receiving
+  interface's bitrate and further hops as slow ones unless RNS raised the link's MTU (so a requester behind a
+  LoRa segment gets enough time however fast the node's own interface is), and on the node's own slow radio it
+  also covers parts queued there for other responses. Attached to a shared instance, where every link arrives
+  on the local interface to it, the bitrate is taken as unknown, so LoRa neighbours aren't held to a 1 Gbit/s
+  interface's grace and floor. A response that transfers nothing is cancelled and its upload-budget charge
+  refunded once its grace passes, and any response with no progress for `stall_timeout` is cancelled too.
+- A link (and its identity, if it identified) whose response was displaced or cancelled for making no progress
+  is refused new `/blocks` for `blocks_cooldown` (new setting, default 300 s). So is one whose response was
+  displaced as the slowest while far behind the rate it needs to be done in time, and a requester whose link
+  or identity already holds a slot can't displace that way, so taking a little of each response no longer
+  keeps one's slots young. A newcomer on an interface that holds no slot in a full pool may displace a
+  zero-progress response from an interface holding two or more, once that response is past half its grace,
+  at most once per grace per interface.
+- Links that aren't slow get 16 `/blocks` slots (new setting `fast_blocks_responses`; it used to be 2, the
+  other half of `max_blocks_responses`), so holding them takes many links each actually downloading. Slow
+  links keep their 2. At most about 40 MiB is held for responses in flight on fast links.
+- A `/blocks` request that repeats a CID is refused as malformed, so a node can't be made to read and serve
+  the same block several times in one response.
+- On a link with no rate estimate a `/blocks` response holds at most `CHUNK_SIZE` of blocks after the first
+  (which is always served): what requesters already ask for there. It used to be whatever `max_bytes` the
+  requester sent, so one packet could ask for a ~1 MiB response with a deadline of many hours.
+- `upload_budget` is charged as a response is sent, from its Resource's progress, instead of its full size up
+  front with a refund at the end. A response is charged about one packet when it starts, and the rest of it is
+  set aside only while it is within its grace, then only what it sends at its rate before its deadline, and
+  nothing below its floor, so responses a requester never downloads or crawls through (each unidentified link
+  counting as its own requester) no longer hold the budget. A completed response costs its
+  size and a cancelled one what it sent, as before. The half-per-requester rule now caps what one requester's
+  responses in flight may cost.
+- Link requests that never complete their handshake are counted in a bucket of their own, of
+  `max_incoming_links`, on `rnfs.dht` and the LXMF delivery destination. When it is full the oldest one on the
+  busiest interface is closed. RNS keeps such links (each with a thread) for at least 366 s and rnfs only saw
+  links once established, so a flood of link requests could exhaust the node's memory or threads. A flood on
+  one interface still shortens the time an honest handshake over that interface has to complete.
+- A link (and its identity) that rejects a `/blocks` response's advertisement, so that none of it is sent,
+  cools down for `blocks_cooldown` as after a response that made no progress. A rejected Resource frees its
+  slot at once, so a requester could have the node build a response, reject it and ask again in a loop (a
+  response of up to 128 KiB on a link with no rate estimate, about 1 ms of CPU each); now it gets one per
+  cooldown. No honest requester rejects a response.
+- Each incoming link may send 2000 requests at once and 2000 a second after that. Requests over the limit are
+  refused before anything is parsed, and after 4 refusals (one more a second) dropped unanswered. RNS has
+  already decoded a request and started a thread for it by then, so this only removes rnfs's share of a
+  flood's cost (about 40% of the node's CPU per request, measured); honest requesters, which wait for their
+  answers, stay far below it.
+- Known limit: over a shared interface, many unidentified links that download slowly but on schedule, or a
+  steady stream of fresh links, can still keep the fast pool busy (specification section 10).
+
+Fetching from other nodes:
+- On `rnfs.dht` links a response's msgpack headers are checked before RNS decodes it, and one that can't be
+  an rnfs response is refused: the request fails as for a malformed response. RNS decoded every response
+  whole first, and a response of one-byte empty arrays or maps cost about 70 times its size in memory (a
+  1 MiB response: ~70 MB and ~0.3 s of CPU). The check reads only headers, so it costs the same for any size.
+  Response packets are checked when larger than RNS's default MTU (links that negotiated a larger one), and a
+  response packet arriving on an incoming `rnfs.dht` link, which has no requests, is dropped unread. Resources
+  carrying metadata, which RNS also decodes first and rnfs never sends, are refused on `rnfs.dht` links.
+  Other destinations (LXMF) are unaffected.
+
+DHT and names:
+- A full provider store keeps a tenth of its room as a newcomer pool, with random eviction inside it, so a
+  publisher it hasn't seen can still store records; about 100 identities filling the store used to lock out
+  every new publisher. Publishers seen before still displace the newest one outside the pool, and the node's
+  own records are always accepted (they were refused once the store was full). A publisher's share of the
+  store grows with age: a tenth of it until it has been seen for `provider_seniority`. First-seen times are
+  kept for a week after a publisher's last record goes, so one that was away for a while isn't new again.
+- Resolving through keepers no longer asks only the first `alpha` keepers found, oldest record first: a few
+  identities that stored provider records for a name's key before its real keepers (and, on a slow node, the
+  departed owner's own record) could hide every keeper. Keepers recorded locally no longer skip the DHT search,
+  which now looks for 3 × `alpha` keepers listed by more than one node; they are ranked by routing-table
+  seniority (live servers first, then those that failed or went silent, then unknown IDs), at random within
+  each group, and asked a batch at a time. Another batch is asked while no answer reaches the sequence already
+  known or only one keeper answered, at most 3 batches (2 on slow nodes, where a second `/name` is spent only
+  if there's no known sequence to check the first answer against).
+- Keeper queries can no longer be steered by identities that only answer `/find`. Keepers are ranked on the
+  routing table as it stood when the query started, so nodes the lookup meets don't rank above keepers recorded
+  here; the search ends early only once two established servers (in the table for `provider_seniority` and
+  healthy) listed keepers, and records stored here count as a source only if an established publisher stored
+  one; each batch first takes keepers listed by a source no earlier pick was listed by; and when the node knows
+  no sequence for the name, only answers from established keepers settle it. Unknown keepers get a budget of
+  `alpha` path requests of their own, which `/find` replies naming unknown nodes can no longer use up. On a slow
+  node a query is still at most two `/name` requests; a fast node may ask up to 9 keepers, and its lookup may
+  run to completion, where established servers are scarce (a young network).
+- A full newcomer pool in the provider store evicts from the publisher holding the most pooled records instead
+  of at random, so a flood of new identities leaves an honest newcomer about a fair share of the pool (16 of its
+  100 records against 600 identities, where it used to keep 1). A newcomer whose last record the pool evicted
+  keeps its first-seen time (at most `max_records / 100` of them), so it still ages into a full share.
+- Gateway and LXMF auto-fetch name resolves can no longer be rolled back by flooding announces of new names
+  and replaying an old one: an announce of a name the node isn't resolving or keeping only takes the table
+  place of another name that was only heard, and the highest sequence of each name resolved this way is saved
+  in `state/name-floor.json` (up to 4 × `name_table_size` names), so no older record is accepted after table
+  churn or a restart.
+- The name floor is saved by the resolve that raises it (at most every 5 s), where a crash up to a minute after a
+  resolve used to lose it, and names resolved in the last 7 days are kept past 4 × `name_table_size`, up to
+  8 ×, so that many resolves of other names no longer let a replayed old record of a recent one back in.
+- The specification no longer claims that a node's names can't be linked to it or to each other: the node
+  keeps its own names and provides their targets under its node ID, so its names are linked to it, as
+  providing content reveals the provider in IPFS. Behaviour is unchanged.
+- A `/provide` carrying more than 55 keys (what fits `MAX_REQUEST_SIZE`) is refused as malformed. rnfs's own
+  client never sends more.
+- A `/provide` from a publisher already holding its share of the provider store is refused cheaply: its
+  expired records are looked for at most once per batch, and not at all while none can have expired. Each
+  refused key used to rescan all of the publisher's records (about 5 ms of work per request under the
+  store's lock at the default size).
+- Private mode drops the provider records of non-members when the node starts (those stored while it was
+  public, or by a member since removed from `members`), and `/find` replies leave out any non-member's
+  record; such records used to be handed to members for up to a week. A private node also links only to
+  members, so it never identifies itself to an outsider.
+
+Publishing, names and storage:
+- A CID unpinned and pinned again while a publish round was sending (or evicted and fetched again) could be
+  withdrawn by the next round from the nodes that had just stored it, and the node's own record of it was
+  gone too, until its next republish. Providing a key again now cancels its queued withdrawals and records
+  the node itself again, and a round sends only the withdrawals still queued.
+- Where a publish round stored each key is saved as the round goes (every 10 nodes or 30 s), so records stored
+  by a round cut short by a crash are withdrawn later; they used to stay until they expired.
+- `name publish` is crash-consistent: it pins the new target, saves `names.json`, then releases the old
+  target, and a failed save (a full disk) undoes the publish. A crash or failed save used to leave the name
+  recorded at a target no longer pinned (which `gc` deleted) and the new one pinned by `name:<alias>`, which
+  `pin rm` refused and `name rm` didn't release. At start the node now makes `name:` pins match `names.json`,
+  releases `follow:` pins of names no longer followed and `lxmf:` pins no saved inbox message records, which
+  a crash inside `name unfollow` or before the inbox was saved used to leave for good. Those two are released
+  only if `follow.json` or the inbox file was read whole: when it is missing, damaged (moved aside) or has a
+  malformed entry, the pins are kept and recorded again, the `follow:` pin's name being followed again and a
+  sender's `lxmf:` pins listed in a new inbox message, whose removal releases them. A followed name's check
+  releases every other target its pin source holds. A pin or unpin whose `pins.json` save fails no longer
+  stays changed in memory.
+- A name key file that is there but can't be read at start (no permission, damaged) no longer counts as a
+  deleted key: the name's pins and its `names.json` entry are kept, so it is back as it was once the file can
+  be read. Its pins used to be released and its entry dropped, leaving the name at sequence 0 with no target.
+- Eviction and `gc` read the DAG nodes they walk before taking the storage lock, so serving `/blocks` no longer
+  waits while the first eviction after a start reads every stored DAG node (about 0.4 s with 20 000 blocks);
+  what to delete is still decided under the lock, so nothing that became reachable meanwhile is deleted.
+
+LXMF:
+- Senders in `lxmf_accept_from` or `lxmf_auto_fetch_from` and LXMF contacts are trusted. Their inbox messages
+  are dropped only to make room for each other's, after every other sender's message without pins. With
+  `lxmf_accept_from` empty (the default), about ten new LXMF identities, which cost nothing, could push every
+  message not holding pins out of the inbox, including contacts' messages and auto-fetches that had failed.
+- New inbox messages from senders not trusted are rate limited node-wide: 32 at once, then one a minute. The
+  README now recommends setting `lxmf_accept_from`.
+- Each sender not trusted also has an allowance of its own, 4 new inbox messages at once, then one per 15
+  minutes, spent before the node-wide limit, so one sender writing once a minute can no longer keep every
+  other stranger's messages out.
+- A message from a sender whose identity isn't known yet, arriving when 8 held messages already claim that
+  sender, now takes the place of the oldest of them instead of being dropped, so forgeries sent first can't
+  keep the sender's real message out.
+- Messages from senders whose identity isn't known yet: at most 8 of the 32 held may claim one sender, a held
+  message is dropped 30 s after an unanswered path request instead of waiting 2 minutes, a message claiming
+  a trusted sender takes the place of one held for an unknown sender, and trusted senders get path requests
+  first. 32 forged messages used to fill the queue, so a real first message from a new sender was dropped.
+  LXMF has already told the sender such a message was delivered, so it can still be lost; trusted senders
+  are now protected.
+- Auto-fetches take senders in turn, and a sender with few links waiting gets a place in a full queue from
+  the sender with the most. One sender's backlog used to delay every other sender's auto-fetches, and once
+  it filled the 64-link queue their links were skipped.
+
 ## 0.1.3
 
 Joining the DHT:

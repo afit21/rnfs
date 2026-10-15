@@ -23,15 +23,15 @@ from typing import BinaryIO, Iterator
 
 import RNS
 
-from rnfs import __version__, features, fsutil
+from rnfs import __version__, features, fsutil, winacl
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
-from rnfs.content import archive, builder, dag, edit, walker
+from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content import chunker as content_chunker
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, USER, Storage, read_json, remote_source, write_json
+from rnfs.content.storage import FOLDER, USER, Storage, disk_reserve, read_json, remote_source, write_json
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
@@ -50,6 +50,7 @@ from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 
 PROVIDERS_FILE = "providers.json"
+REMOTE_PINS_FILE = "remote_pins.json"  # remote pins accepted and not yet fetched: [[source, cid], ...] in order
 FETCHED_FILE = "fetched.json"  # cached targets fetched for the user (not the gateway): the roots strategy's
 SAVE_INTERVAL = 300.0  # seconds between saves of provider records
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records and invalid roots, when they changed
@@ -65,41 +66,56 @@ KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND
 
 
 def _make_private_dirs(config: Config):
-    """Create the rnfs dir and the node's subdirectories readable by the owner only (0700).
+    """Create the rnfs dir and the node's subdirectories readable by the owner only (0700; on Windows, a
+    protected access list for the user and SYSTEM from the moment each is created, see winacl).
 
     They hold the node's identity, name keys and the local API token, so other local users must not read
     them; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if the
     root belongs to another user or can't be made private: its owner could swap the identity or plant a
-    config there.
+    config there. On Windows also if the root is a junction or symlink, or new but not empty.
     """
     root = config.root
+    subdirs = (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir)
+    if fsutil.IS_WINDOWS:
+        # No Unix permission bits there (st_mode always shows others allowed): an explicit access list
+        winacl.secure_rnfs_dir(root, subdirs)
+        return
     os.makedirs(root, mode=0o700, exist_ok=True)
-    # Windows has no Unix permission bits (st_mode always shows others allowed), so only the ACL that the
-    # rnfs dir inherits from the user's profile protects it there
-    if not fsutil.IS_WINDOWS:
-        info = os.stat(root)
-        if info.st_uid != os.geteuid():
-            raise RnfsError(f"{root} belongs to another user (uid {info.st_uid}); the rnfs dir must be your own")
-        mode = stat.S_IMODE(info.st_mode)
-        if mode & 0o077:
-            try:
-                os.chmod(root, 0o700)
-            except OSError as e:
-                raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
-            log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
-    for directory in (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir):
+    info = os.stat(root)
+    if info.st_uid != os.geteuid():
+        raise RnfsError(f"{root} belongs to another user (uid {info.st_uid}); the rnfs dir must be your own")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        try:
+            os.chmod(root, 0o700)
+        except OSError as e:
+            raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
+        log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
+    for directory in subdirs:
         os.makedirs(directory, mode=0o700, exist_ok=True)
 
 
-def _check_free_space(path: str, needed: int):
-    """Raise TooLarge if needed bytes won't fit in the free space of the filesystem path is to be written on."""
+def _check_free_space(path: str, needed: int, blocks_dir: str | None = None, to_fetch: int = 0):
+    """Raise TooLarge unless writing needed bytes to path leaves the disk reserve free on its filesystem.
+
+    If blocks_dir (where a fetch stores its blocks) is on the same filesystem, the to_fetch bytes still to be
+    fetched there before the write count too: the fetch keeps the reserve, and the write-out must as well.
+    Raises OSError if the free space can't be read (a missing directory, say): unchecked, the write could fill
+    the disk.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     try:
-        free = shutil.disk_usage(directory).free
-    except OSError:
-        return  # a missing or unusable directory is reported by the write itself
-    if needed > free:
-        raise TooLarge(f"{size(needed)} won't fit in the {size(free)} free in {directory}")
+        usage = shutil.disk_usage(directory)
+        if blocks_dir is not None and to_fetch > 0 and os.stat(directory).st_dev == os.stat(blocks_dir).st_dev:
+            needed += to_fetch
+    except OSError as e:
+        # The same kind of error (FileNotFoundError, PermissionError...), saying what couldn't be done
+        message = f"can't check the free space for {directory}: {e.strerror or e}"
+        raise (OSError(e.errno, message) if e.errno is not None else OSError(message)) from None
+    reserve = disk_reserve(usage.total)
+    if needed > usage.free - reserve:
+        raise TooLarge(f"{size(needed)} won't fit in the {size(usage.free)} free in {directory} "
+                       f"while leaving {size(reserve)} free")
 
 
 def _remove_partial(path: str):
@@ -168,9 +184,10 @@ class NodeBackend:
         return self.node.config.dht_mode == "server"
 
     def find(self, key: bytes) -> tuple[list[bytes], list[bytes]]:
-        """Providers of key (oldest half plus a random half, banned left out) and the closest servers."""
+        """Providers of key (oldest half plus a random half, banned left out, and in private mode non-members)
+        and the closest servers."""
         routing = self.node.routing
-        providers = self.node.records.for_reply(key, exclude=routing.is_banned)
+        providers = self.node.records.for_reply(key, exclude=self.node.excluded_provider)
         nodes = [n for n in routing.closest(key, for_reply=True) if n != self.node.node_id]
         return providers, nodes
 
@@ -178,6 +195,9 @@ class NodeBackend:
         """Record publisher_id for keys; True only if every key was recorded. Banned publishers are ignored."""
         if not self.is_dht_server() or self.node.routing.is_banned(publisher_id):
             return False
+        if self.node.config.private:
+            # The request server let it through as a member (private mode checks every handler's requester)
+            self.node._member_publishers.add(publisher_id)
         return self.node.records.provide(publisher_id, keys, withdrawn) == len(keys)
 
     def served_block(self, cid: Cid) -> bytes | None:
@@ -264,6 +284,8 @@ class RnfsNode:
         self.slow = slow
         self._is_known = is_known
         self.members = {h.strip().strip("<>").lower() for h in config.members}
+        # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)
+        self._member_publishers: set[bytes] = set()
         self._bootstrap_nodes: list[bytes] = []  # bootstrap_nodes that parse, in the order given
         for text in config.bootstrap_nodes:
             try:
@@ -274,7 +296,12 @@ class RnfsNode:
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
         self.records = ProviderStore(config.max_records, os.path.join(config.state_dir, PROVIDERS_FILE),
-                                     own_id=node_id)
+                                     own_id=node_id, seniority=config.provider_seniority)
+        if config.private:
+            # Records stored while the node was public, or from a member removed since, are never handed out
+            removed = self.records.retain(self._is_member_publisher)
+            if removed:
+                log(f"private mode: dropped {plural(removed, 'provider record')} of non-members", LOG_NOTICE)
         self.storage = Storage(config.blocks_dir, config.state_dir, config.max_storage)
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
@@ -297,6 +324,9 @@ class RnfsNode:
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
         self._remote_workers: set[str] = set()  # remote sources with a thread fetching their pins
+        self._remote_pins_path = os.path.join(config.state_dir, REMOTE_PINS_FILE)  # those waiting, for a restart
+        self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
+        self._remote_pins_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._refresh_wanted = threading.Event()
         self.stop_event = threading.Event()
         self.joined = threading.Event()
@@ -305,8 +335,9 @@ class RnfsNode:
         self.features: dict[str, features.Feature] = {}
         for cls in features.feature_classes():
             self.features[cls.name] = cls(self)
-        # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too
-        self.names.release_gone()
+        # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
+        # name pins are made to match names.json, which a crash inside a publish can leave them disagreeing with
+        self.names.reconcile_pins(self.storage.pins())
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
         self.publisher.refresh()
@@ -323,6 +354,7 @@ class RnfsNode:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
+        self._resume_remote_pins()
         for feature in self.features.values():
             try:
                 feature.start()
@@ -353,6 +385,7 @@ class RnfsNode:
         for thread in self.threads:
             thread.join(max(0.0, deadline - time.monotonic()))
         self.records.save()
+        self._save_remote_pins()
         self.publisher.save()
         self._save_state()
         if self.links is not None:
@@ -394,6 +427,18 @@ class RnfsNode:
         """Private mode's routing table admission: node_id's identity is a member."""
         identity = RNS.Identity.recall(node_id)
         return identity is not None and identity.hash.hex() in self.members
+
+    def _is_member_publisher(self, node_id: bytes) -> bool:
+        """Private mode: True if node_id's provider records may be kept and handed out (this node, a node that
+        provided as a member this run, or one whose identity RNS knows to be a member)."""
+        return node_id == self.node_id or node_id in self._member_publishers or self._is_member_node(node_id)
+
+    def excluded_provider(self, node_id: bytes) -> bool:
+        """True if a provider must be left out of /find replies and providers(): banned, or in private mode
+        not a member."""
+        if self.routing.is_banned(node_id):
+            return True
+        return self.config.private and not self._is_member_publisher(node_id)
 
     def _seed_routing(self):
         """Add servers whose announces RNS heard (and cached) within 2 × announce_interval, before a restart.
@@ -544,6 +589,7 @@ class RnfsNode:
         if self._refresh_wanted.is_set():
             self._refresh_wanted.clear()
             self.publisher.refresh()
+        self._save_remote_pins()
 
     def _maintenance_loop(self):
         """Run maintain() about once a second until stopped."""
@@ -708,11 +754,16 @@ class RnfsNode:
         try:
             with self._fetching(root, names, from_node) as fetch:
                 expect = fetch.resolve()
-                # Its verified size is what writing it out takes, however few blocks it is made of
-                _check_free_space(output, fetch.size_of(expect))
+                # Its verified size is what writing it out takes, however few blocks it is made of; what is
+                # still to be fetched is stored first, on the same disk if the blocks are there
+                content = fetch.size_of(expect)
+                to_fetch = 0 if self.storage.is_complete(expect.cid) else \
+                    max(0, content - self.storage.dag_bytes(expect.cid))
+                _check_free_space(output, content, self.config.blocks_dir, to_fetch)
                 sealed = None if raw else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:  # decrypted as it is fetched (rnfs/content/seal.py)
-                    result = {"cid": str(expect.cid), "warnings": [], **node_content.write_sealed(sealed, partial)}
+                    written = node_content.write_sealed(sealed, partial, self.config.blocks_dir, to_fetch)
+                    result = {"cid": str(expect.cid), "warnings": [], **written}
                 else:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
                     warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries)
@@ -839,10 +890,14 @@ class RnfsNode:
         self.publisher.refresh()
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
-        """Pins with their sources, whether they're complete, their type and a local name when one is known.
+        """Pins with their sources, whether they're complete, their type, whether they're sealed files and a
+        local name when one is known.
 
         The name is where the pin was added from on this machine (pin_names), the shared-folder entry it
-        came from, or for a stored directory its single entry's name (add --wrap) or its entry count.
+        came from, or for a stored directory its single entry's name (add --wrap) or its entry count. For a
+        sealed file it is still the local path or the name given to add (this node's own record, for its user):
+        `sealed` tells callers that show pins to others not to show the name or the content. `sealed` is None
+        when it can't be told without fetching (the root or the file's first chunk isn't stored).
         """
         pins = self.storage.pins()
         self.pin_names.prune(set(pins))
@@ -855,8 +910,18 @@ class RnfsNode:
             kind, inside = self._pin_shape(c)
             name = self.pin_names.get(c) or (folder_names.get(c) if FOLDER in sources else None) or inside
             result.append({"cid": str(c), "sources": sorted(sources), "complete": self.storage.is_complete(c),
-                           "type": kind, "name": name})
+                           "type": kind, "sealed": self._pin_sealed(c, kind), "name": name})
         return result
+
+    def _pin_sealed(self, cid: Cid, kind: str | None) -> bool | None:
+        """True if a pinned file is sealed (its first bytes carry the sealed-file magic), False if it isn't or
+        is a directory, None if that isn't known from stored blocks. Never fetches."""
+        if kind == "directory":
+            return False
+        if kind is None:
+            return None
+        head = node_content.stored_head(self, str(cid), len(seal.MAGIC))
+        return None if head is None else seal.is_sealed(head)
 
     def _pin_shape(self, cid: Cid) -> tuple[str | None, str | None]:
         """(type, name from inside) of a pin whose root block is stored: "file" or "directory", and for a
@@ -886,7 +951,9 @@ class RnfsNode:
         """A /pin from an allowed identity: release at once, or fetch then pin with source remote:<identity>.
 
         A source's pins are fetched one at a time, so each is checked against its quota with the earlier ones
-        counted; one with REMOTE_PIN_QUEUE pins waiting is refused (False).
+        counted; one with REMOTE_PIN_QUEUE pins waiting is refused (False), and so is one whose fetch thread
+        can't be started. Accepted pins are saved (remote_pins.json) until fetched, and resumed at the next
+        start if the node stops first.
         """
         source = remote_source(identity_hash)
         if not pin:
@@ -894,6 +961,7 @@ class RnfsNode:
                 if cid in self._remote_reserved.get(source, {}):
                     # Still being fetched: it mustn't be pinned when the fetch ends
                     self._remote_released.add((source, cid))
+                    self._remote_pins_dirty = True
                     log(f"released remote pin of {cid} for {source} while fetching it", LOG_NOTICE)
             if self.storage.unpin(cid, source):
                 log(f"released remote pin of {cid} for {source}", LOG_NOTICE)
@@ -902,7 +970,9 @@ class RnfsNode:
         with self._lock:
             reserved = self._remote_reserved.setdefault(source, {})
             if cid in reserved:
-                self._remote_released.discard((source, cid))  # pinned again before the fetch ended
+                if (source, cid) in self._remote_released:
+                    self._remote_released.discard((source, cid))  # pinned again before the fetch ended
+                    self._remote_pins_dirty = True
                 return True
             if source in self.storage.pins().get(cid, set()):
                 return True
@@ -910,29 +980,124 @@ class RnfsNode:
                 log(f"refused remote pin of {cid} for {source}: {len(reserved)} of its pins are waiting", LOG_WARNING)
                 return False
             reserved[cid] = None
-            if source in self._remote_workers:
-                return True
-            self._remote_workers.add(source)
-        threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
-                         daemon=True).start()
+            self._remote_pins_dirty = True
+            return self._ensure_remote_worker(source, cid)
+
+    def _ensure_remote_worker(self, source: str, cid: Cid) -> bool:
+        """Start source's fetch thread unless it has one; False if it can't be started, with cid (the pin just
+        reserved) given back. Caller holds the lock.
+
+        A worker leaves _remote_workers in the same critical section in which it finds nothing waiting, so a
+        pin reserved after that starts a new one, and one reserved before it is fetched by the old one.
+        """
+        if source in self._remote_workers:
+            return True
+        thread = threading.Thread(target=self._remote_pin_worker, args=(source,), name="rnfs-remote-pin",
+                                  daemon=True)
+        try:
+            thread.start()
+        except RuntimeError as e:  # can't start new thread: out of threads or memory
+            reserved = self._remote_reserved.get(source, {})
+            reserved.pop(cid, None)
+            if not reserved:
+                self._remote_reserved.pop(source, None)
+            self._remote_pins_dirty = True
+            log(f"refused remote pin of {cid} for {source}: couldn't start its fetch: {e}", LOG_ERROR)
+            return False
+        # Registered after start() succeeds, still under the lock, so the worker can't look before it is
+        self._remote_workers.add(source)
         return True
 
     def _remote_pin_worker(self, source: str):
-        """Fetch source's remote pins one at a time, oldest first, until none is waiting.
+        """Fetch source's remote pins one at a time, oldest first, until none is waiting or the node stops.
 
         Concurrent fetches would each be checked against the quota without the others' blocks, so together
-        they could store several times it.
+        they could store several times it. Pins waiting when the node stops stay saved for the next start.
         """
-        try:
-            while not self.stop_event.is_set():
-                with self._lock:
-                    cid = next(iter(self._remote_reserved.get(source, {})), None)
-                    if cid is None:
-                        return
-                self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
-        finally:
+        # Resumed and early pins wait for the join: a lookup before it would find no provider and drop them
+        while not self.joined.is_set():
+            if self.stop_event.wait(0.5):
+                break
+        while True:
             with self._lock:
-                self._remote_workers.discard(source)
+                cid = None if self.stop_event.is_set() else next(iter(self._remote_reserved.get(source, {})), None)
+                if cid is None:
+                    # Deregistered in the same critical section that saw nothing waiting: a /pin arriving after
+                    # it starts a new worker instead of relying on this one, which is about to return
+                    self._remote_workers.discard(source)
+                    return
+            try:
+                self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
+            except BaseException:
+                with self._lock:
+                    self._remote_workers.discard(source)
+                raise
+
+    def _save_remote_pins(self):
+        """Save the remote pins waiting or being fetched, in the order accepted (released ones left out), if
+        they changed, so a restart resumes them. Run by maintenance (about every second) and at stop, not on
+        every /pin: a crash loses at most the last second's (/pin is best effort, section 8)."""
+        with self._remote_pins_save_lock:
+            with self._lock:
+                if not self._remote_pins_dirty:
+                    return
+                waiting = [[source, str(cid)] for source, cids in self._remote_reserved.items() for cid in cids
+                           if (source, cid) not in self._remote_released]
+                self._remote_pins_dirty = False
+            try:
+                write_json(self._remote_pins_path, waiting)
+            except OSError as e:
+                with self._lock:
+                    self._remote_pins_dirty = True  # try again next time
+                log(f"saving the remote pins waiting failed: {e!r}", LOG_ERROR)
+
+    def _load_remote_pins(self) -> list[tuple[str, Cid]]:
+        """Remote pins saved as waiting, oldest first, from identities still on remote_pin_identities (at most
+        REMOTE_PIN_QUEUE each); others are dropped. Caller holds no lock (it reads a file)."""
+        allowed = {remote_source(h.strip().strip("<>")) for h in self.config.remote_pin_identities}
+        try:
+            saved = read_json(self._remote_pins_path, shape=lambda value: isinstance(value, list)) or []
+        except OSError as e:
+            log(f"reading the remote pins waiting failed: {e!r}", LOG_ERROR)
+            return []
+        pins: dict[tuple[str, Cid], None] = {}
+        counts: dict[str, int] = {}
+        malformed = 0
+        for entry in saved:
+            try:
+                source, text = entry
+                if not isinstance(source, str) or not isinstance(text, str):
+                    raise TypeError("not a pair of strings")  # a list or dict source can't even be looked up
+                cid = Cid.parse(text)
+            except (ValueError, TypeError):
+                malformed += 1
+                continue
+            if source not in allowed or (source, cid) in pins or counts.get(source, 0) >= REMOTE_PIN_QUEUE:
+                continue
+            counts[source] = counts.get(source, 0) + 1
+            pins[(source, cid)] = None
+        if malformed:
+            log(f"skipped {malformed} malformed entr{'y' if malformed == 1 else 'ies'} in {self._remote_pins_path}",
+                LOG_WARNING)
+        return list(pins)
+
+    def _resume_remote_pins(self):
+        """Queue the remote pins saved as waiting when the node last stopped (called once at start)."""
+        pins = self._load_remote_pins()
+        resumed = 0
+        with self._lock:
+            pinned = self.storage.pins()
+            for source, cid in pins:
+                if source not in pinned.get(cid, set()):
+                    self._remote_reserved.setdefault(source, {})[cid] = None
+                    resumed += 1
+            self._remote_pins_dirty = True
+            for source, cids in list(self._remote_reserved.items()):
+                # A thread that can't be started gives its pin back, so this ends
+                while cids and not self._ensure_remote_worker(source, next(iter(cids))):
+                    pass
+        if resumed:
+            log(f"resuming {plural(resumed, 'remote pin')} accepted before the last stop", LOG_NOTICE)
 
     def _remote_pin_fetch(self, cid: Cid, source: str):
         """Fetch cid for a remote pin, dropping it as soon as its verified size, or the bytes of its DAG's
@@ -952,12 +1117,13 @@ class RnfsNode:
                         f"quota ({size(used)} of {size(quota)} used)", LOG_WARNING)
                     return
                 # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks
+                # (fetch_dag also bounds them by what the size can hold, whichever is lower)
                 fetch.max_dag_bytes = quota - used
                 try:
                     fetch.fetch_dag(expect)
-                except TooLarge:
+                except TooLarge as e:
                     log(f"dropping remote pin of {cid} for {source}: its blocks would exceed its quota "
-                        f"({size(used)} of {size(quota)} used)", LOG_WARNING)
+                        f"({size(used)} of {size(quota)} used) or what its size can hold: {e}", LOG_WARNING)
                     return
                 with self._lock:
                     # Checked and pinned under the lock, so a release arriving now is either seen or undoes it
@@ -973,8 +1139,12 @@ class RnfsNode:
             log(f"remote pin of {cid} for {source} failed: {e!r}", LOG_ERROR)
         finally:
             with self._lock:
-                self._remote_reserved.get(source, {}).pop(cid, None)
-                self._remote_released.discard((source, cid))
+                # Once the node is stopping, a fetch cut short stays waiting, so it is saved for the next start
+                # (a pin that completed meanwhile is skipped then)
+                if not self.stop_event.is_set():
+                    self._remote_reserved.get(source, {}).pop(cid, None)
+                    self._remote_released.discard((source, cid))
+                    self._remote_pins_dirty = True
 
     def gc(self) -> dict:
         """Evict every cached fetch and delete unreachable blocks; withdraw what is no longer complete."""
@@ -997,7 +1167,7 @@ class RnfsNode:
     def providers(self, cid: str) -> list[bytes]:
         """Nodes providing cid: records held here, then everything a complete provider lookup finds."""
         parsed = Cid.parse(cid)
-        found: list[bytes] = list(self.records.providers(parsed.key, exclude=self.routing.is_banned))
+        found: list[bytes] = list(self.records.providers(parsed.key, exclude=self.excluded_provider))
 
         def add(node_id: bytes):
             """Collect a provider the lookup reports."""

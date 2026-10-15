@@ -6,7 +6,7 @@
 - A link goes only to a destination whose hash is the node ID asked for (rnfs.dht of the identity RNS
   recalls for it), so one identity can't pose as many node IDs by announcing other destinations.
 - Publishing and /pin use a separate link that identifies, closed when done.
-- In private mode every link identifies.
+- In private mode every link identifies, and links go only to members (identities on `members`).
 - Requesters stay within the per-link limits: at most MAX_REQUESTS_PER_LINK requests in progress on a link,
   at most one of them /blocks. A request waits for a free slot.
 - RNS stops a request's timeout once a response Resource starts arriving, so a node could trickle an answer
@@ -173,6 +173,8 @@ class LinkPool:
         self.identity = identity
         self.config = config
         self.clock = clock
+        # Private mode links only to members: every link identifies, and an outsider mustn't learn who we are
+        self.members = {h.strip().strip("<>").lower() for h in config.members}
         self.shared: dict[bytes, PeerLink] = {}
         self.oneshot: set[PeerLink] = set()
         self.connecting: dict[bytes, threading.Event] = {}  # one thread opens a node's shared link at a time
@@ -263,6 +265,9 @@ class LinkPool:
             # otherwise answer for many node IDs (ground near target keys) or dodge a ban on its real one
             log(f"the identity known for {name} isn't that node's (its rnfs.dht is "
                 f"{node_name(destination.hash)}); not connecting", LOG_VERBOSE)
+            return False
+        if self.config.private and identity.hash.hex() not in self.members:
+            log(f"{name} isn't a member; not connecting in private mode", LOG_VERBOSE)
             return False
         # Set on close too, so a failed link doesn't wait out the full timeout
         settled = threading.Event()

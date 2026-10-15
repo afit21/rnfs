@@ -185,6 +185,33 @@ class RoutingTable:
             entry = self._find(node_id)
             return None if entry is None else self.clock() - entry.first_seen
 
+    def is_senior(self, node_id: bytes, min_age: float) -> bool:
+        """True if node_id has been in the table (kept across a short absence) for at least min_age seconds."""
+        known_for = self.seniority(node_id)
+        return known_for is not None and known_for >= min_age
+
+    def standing(self, node_id: bytes, min_age: float) -> int:
+        """How much node_id is trusted to be a live, long-standing server, best first: 0 in the table for at
+        least min_age and healthy, 1 in the table and healthy, 2 in the table but failed a query since last heard
+        or silent over 2 × announce_interval, 3 not in the table. Ranks keepers (section 9)."""
+        with self._lock:
+            entry = self._find(node_id)
+            return 3 if entry is None else self._standing(entry, min_age, self.clock())
+
+    def standings(self, min_age: float) -> dict[bytes, int]:
+        """standing() of every node in the table now (those left out stand at 3), so a caller can rank nodes
+        on the table as it was before a lookup: nodes the lookup adds by answering don't gain rank from it."""
+        with self._lock:
+            now = self.clock()
+            return {entry.node_id: self._standing(entry, min_age, now)
+                    for bucket in self._buckets for entry in bucket.values()}
+
+    def _standing(self, entry: _Entry, min_age: float, now: float) -> int:
+        """standing() of a node in the table. Caller holds the lock."""
+        if self._stale(entry, now):
+            return 2
+        return 0 if now - entry.first_seen >= min_age else 1
+
     def contains(self, node_id: bytes) -> bool:
         """True if node_id is in the table."""
         with self._lock:

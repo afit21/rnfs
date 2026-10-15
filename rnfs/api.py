@@ -6,7 +6,7 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 
 | Method | Path | Parameters | Response / facade call |
 |---|---|---|---|
-| GET  | /api/status | | `status()` |
+| GET  | /api/status | | `status()`; without the token only `{"version"}` |
 | GET  | /api/info | `target` | `info(target)` |
 | GET  | /api/cat | `target`, `offset`, `length`, `raw`, `block` | the bytes of a file (`read`; sealed files decrypted unless `raw`), Content-Length set; `block=1`: the CID's own block |
 | GET  | /api/ls | `target` | `{"entries": ls(target)}` |
@@ -42,7 +42,8 @@ Security:
   connect to 127.0.0.1, and the API reads and writes files as the daemon's user, so only those who can
   read the rnfs directory may use it. A custom header also forces a CORS preflight, which fails because
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
-  health checks.
+  health checks and the CLI's proof check below, but without the token it answers only `{"version": ...}`:
+  the node and identity hashes, LXMF address and traffic counters need the token like everything else.
 - A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.cli.api_proof>` in its
   response, which only a server knowing the token can make. Before it first sends the token, the CLI makes
   whatever listens on the port prove this (with a status request), so another local user listening there
@@ -70,9 +71,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from rnfs import fsutil
+from rnfs import __version__, fsutil
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.cli import CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.config import _HEX_ID  # exactly 32 hex digits, as names.parse_name and identity lists are checked
 from rnfs.content.cid import Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.log import LOG_ERROR, log
@@ -147,14 +149,11 @@ def parse_cid(text) -> str:
 
 
 def parse_hex_id(text, what: str = "node ID") -> bytes:
-    """A 16-byte node ID or name written as 32 hex characters. Raises ValueError."""
-    try:
-        value = bytes.fromhex(text) if isinstance(text, str) else b""
-    except ValueError:
-        value = b""
-    if len(value) != 16:
+    """A 16-byte node ID or name written as 32 hex characters (spaces around allowed). Raises ValueError."""
+    # Hex digits only: bytes.fromhex alone would skip whitespace between them (as names.parse_name checks)
+    if not isinstance(text, str) or not _HEX_ID.fullmatch(text.strip()):
         raise ValueError(f"invalid {what} {text!r}: must be 32 hex characters")
-    return value
+    return bytes.fromhex(text.strip())
 
 
 def parse_path(text) -> str:
@@ -739,7 +738,10 @@ class ApiHandler(TimedHandler):
     # GET endpoints
 
     def api_status(self):
-        """GET /api/status: the node's summary."""
+        """GET /api/status: the node's summary with the token; without it, only the version (a health check)."""
+        if not self.token_valid():
+            self.send_json(200, {"version": __version__})
+            return
         self.send_json(200, self.node.status())
 
     def api_info(self):

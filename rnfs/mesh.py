@@ -252,6 +252,22 @@ class TokenBucket:
             self._refill()
             self.tokens = min(self.capacity, self.tokens + nbytes)
 
+    def reserve(self, nbytes: int, reservation: int, committed: int = 0) -> bool:
+        """Spend reservation of a response of nbytes if the response is allowed (see the class), counting
+        committed bytes (owed by responses in flight but not yet spent) as gone. False, spending nothing, if not."""
+        with self.lock:
+            self._refill()
+            if self.tokens - committed >= nbytes or (self.tokens >= self.capacity and committed <= 0):
+                self.tokens -= reservation
+                return True
+            return False
+
+    def charge(self, nbytes: int):
+        """Spend nbytes that have been sent, into debt if need be."""
+        with self.lock:
+            self._refill()
+            self.tokens -= nbytes
+
 
 class AirtimePolicy:
     """The airtime controls on /blocks: upload_budget, serve_interfaces / no_serve_interfaces, quiet_hours.
@@ -279,19 +295,30 @@ class AirtimePolicy:
             return REFUSED_BUDGET
         return None
 
-    def limit(self, limit: int) -> int:
-        """A response's block budget (after its first block) cut to what the upload budget holds, unless
-        the bucket is full (when any one response may go)."""
+    def limit(self, limit: int, committed: int = 0) -> int:
+        """A response's block budget (after its first block) cut to what the upload budget holds less what
+        responses in flight are still committed to send, unless the bucket is full and nothing is committed
+        (when any one response may go)."""
         if self.bucket is None:
             return limit
         available = self.bucket.available()
-        if available >= self.bucket.capacity:
+        if available >= self.bucket.capacity and committed <= 0:
             return limit
-        return max(0, min(limit, int(available) - RESPONSE_OVERHEAD))
+        return max(0, min(limit, int(available - committed) - RESPONSE_OVERHEAD))
 
     def spend(self, nbytes: int) -> bool:
         """Charge a response of nbytes to the upload budget. False if it must be refused."""
         return self.bucket is None or self.bucket.take(nbytes)
+
+    def reserve(self, nbytes: int, reservation: int, committed: int = 0) -> bool:
+        """Admit a response of nbytes, charging reservation of it now (the rest is charged as it is sent).
+        False if it must be refused; committed is what responses in flight are still committed to send."""
+        return self.bucket is None or self.bucket.reserve(nbytes, reservation, committed)
+
+    def charge(self, nbytes: int):
+        """Charge nbytes of an admitted response as they are sent."""
+        if self.bucket is not None and nbytes > 0:
+            self.bucket.charge(nbytes)
 
     def refund(self, nbytes: int):
         """A charged response wasn't sent."""

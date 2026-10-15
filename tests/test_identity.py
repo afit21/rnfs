@@ -63,10 +63,11 @@ class IdentityFileTest(unittest.TestCase):
     def test_no_permission_fix_on_windows(self):
         # Windows' st_mode always shows group and others allowed: no chmod or warning at every start
         load_or_create_identity(self.path)
-        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod, \
-                mock.patch.object(identity_module, "log") as log, \
-                mock.patch("os.stat", return_value=mock.Mock(st_mode=0o100666)):
-            identity_module._restrict_permissions(self.path)
+        os.chmod(self.path, 0o666)
+        with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.fchmod", create=True) as fchmod, \
+                mock.patch("os.chmod") as chmod, mock.patch.object(identity_module, "log") as log:
+            load_or_create_identity(self.path)
+        fchmod.assert_not_called()
         chmod.assert_not_called()
         log.assert_not_called()
 

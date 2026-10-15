@@ -1,4 +1,6 @@
-"""A process-wide guard on incoming Resource advertisements (sections 3 and 10: oversized-response bombs).
+"""Guards on RNS: process-wide ones on incoming Resource advertisements and responses (sections 3 and 10:
+oversized-response and decoding bombs), and one per destination on half-open incoming links (section 3: link
+exhaustion).
 
 RNS checks Destination.set_max_request_size and a request's max_response_size only against an
 advertisement's data size (d), but receives, buffers and allocates by its transfer size (t). RNS 1.5.6 caps t
@@ -11,15 +13,42 @@ RNS.Resource.accept once to reject, before anything is allocated:
 - on rnfs.dht links, any multi-segment Resource: the checks above see one segment at a time, so a
   response of many segments (hundreds of MiB, later read wholly into memory) would pass them, while every
   legitimate rnfs response fits one. Other destinations' Resources (LXMF's, whose messages may span
-  segments) are told apart by the link's destination name, which this node chose itself.
+  segments) are told apart by the link's destination name, which this node chose itself;
+- on rnfs.dht links, any Resource carrying metadata: RNS decodes metadata with umsgpack as the Resource
+  completes, before anyone can look at it, and rnfs responses never have any.
+
+RNS also decodes a whole response with umsgpack before handing it to rnfs, and a payload of one-byte empty
+arrays or maps decodes to some 70 times its size in Python objects (1 MiB: ~70 MB and ~0.3 s of CPU). So on
+rnfs.dht links two more RNS methods are wrapped, to check the packed response's msgpack headers first
+(protocol.response_refusal, which costs the same for any size) and refuse what can't be an rnfs response:
+- Link.response_resource_concluded, for responses sent as a Resource;
+- Link.receive, for responses sent as one packet. A packet larger than RNS's default MTU (only possible on a
+  link that negotiated a larger one, up to hundreds of KiB) is decrypted and checked first, so such a link
+  decrypts an honest one twice. An rnfs.dht server sends no requests, so a response packet arriving on an
+  incoming link is dropped unread: RNS would otherwise decode it before finding no request it answers.
+A refused response answers its request with None, which every rnfs.dht parser refuses as malformed, so the
+requester fails it at once, as it would a malformed response.
+
+It also bounds half-open incoming links (section 3, link exhaustion). For every link request, RNS's
+Destination.incoming_link_request runs Link.validate_request, which does the key exchange, sends a proof,
+registers the link and starts a watchdog thread; the link then waits up to 6 s × hops + 360 s for the RTT
+packet that makes it ACTIVE, and only then tells rnfs (the link established callback, where
+max_incoming_links applies). limit_half_open wraps a destination's incoming_link_request so that, before a new
+request is validated, links still waiting (PENDING or HANDSHAKE) are kept below a cap of their own: when it is
+reached, the oldest half-open link on the interface holding the most is closed, rather than the new one
+refused. An honest handshake completes within about one round trip, so a flood can't lock honest initiators
+out by keeping the cap full, and a flood on one interface closes its own links first.
 """
 import threading
+import time
+from collections import Counter
 
 import RNS
 
 from rnfs import __version__
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_RESPONSE_SIZE
-from rnfs.log import LOG_ERROR, LOG_WARNING, log
+from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, plural
+from rnfs.network import protocol
 
 # Resource data is a 4-byte random hash plus the payload, encrypted as an RNS Token: 16-byte IV, 32-byte HMAC
 # and up to 16 bytes of PKCS7 padding. 128 bytes leaves room without letting the transfer outgrow the data.
@@ -28,6 +57,8 @@ MAX_TRANSFER_SIZE = MAX_RESPONSE_SIZE + TRANSFER_OVERHEAD
 
 _lock = threading.Lock()
 _original_accept = None
+_original_response_resource_concluded = None
+_original_receive = None
 _unsupported_reported = False  # the error for an RNS whose advertisements lack t and d, logged once per process
 _ABSENT = object()
 
@@ -73,6 +104,8 @@ def refusal(adv, link=None) -> str | None:
         return f"transfer size {transfer} exceeds the largest response"
     if link is not None and is_dht_link(link) and (getattr(adv, "l", 1) != 1 or getattr(adv, "i", 1) != 1):
         return f"rnfs responses are one segment, not {getattr(adv, 'l', '?')}"
+    if link is not None and is_dht_link(link) and getattr(adv, "x", False):
+        return "rnfs responses carry no metadata"
     return None
 
 
@@ -106,19 +139,217 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
                             request_id=request_id)
 
 
+# Responses checked before RNS decodes them
+
+PACKET_CHECK_SIZE = RNS.Reticulum.MTU  # response packets larger than RNS's default MTU are checked first
+REFUSAL_LOG_INTERVAL = 60.0  # seconds between log lines about refused responses, after the first
+
+
+class _ThrottledLog:
+    """A log line at most every REFUSAL_LOG_INTERVAL seconds, counting the ones left out, so whoever sends
+    refused responses can't flood the log."""
+
+    def __init__(self, clock=time.monotonic):
+        """Nothing logged yet."""
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.logged_at = None
+        self.skipped = 0
+
+    def __call__(self, message: str, level: int):
+        """Log message at level now, or count it if a line was logged less than REFUSAL_LOG_INTERVAL ago."""
+        with self.lock:
+            now = self.clock()
+            if self.logged_at is not None and now - self.logged_at < REFUSAL_LOG_INTERVAL:
+                self.skipped += 1
+                return
+            skipped, self.skipped, self.logged_at = self.skipped, 0, now
+        log(message + (f" ({plural(skipped, 'more')} since the last)" if skipped else ""), level)
+
+
+_log_refused_response = _ThrottledLog()
+_log_unexpected_response = _ThrottledLog()
+
+
+def _answer_as_malformed(link, request_id, size: int):
+    """Answer the request request_id on link with None, which every rnfs.dht parser refuses as malformed."""
+    if request_id is None:
+        return
+    try:
+        link.handle_response(request_id, None, size, size)
+    except Exception as e:
+        log(f"error failing a request whose response was refused: {e}", LOG_WARNING)
+
+
+def _read_resource(resource) -> bytes | None:
+    """A completed response Resource's data (an open file, which RNS reads next), or None if unreadable."""
+    data = getattr(resource, "data", None)
+    try:
+        packed = data.read()
+        data.seek(0)
+    except Exception:
+        return None
+    return packed if isinstance(packed, (bytes, bytearray)) else None
+
+
+def guarded_response_resource_concluded(link, resource):
+    """RNS.Link.response_resource_concluded, but on rnfs.dht links refusing a completed response that can't be
+    an rnfs response before RNS decodes it."""
+    if is_dht_link(link) and getattr(resource, "status", None) == RNS.Resource.COMPLETE:
+        reason = "rnfs responses carry no metadata" if getattr(resource, "has_metadata", False) else None
+        packed = _read_resource(resource) if reason is None else None
+        if packed is not None:
+            reason = protocol.response_refusal(packed)
+        if reason is not None:
+            _log_refused_response(f"refused a response before decoding it: {reason}", LOG_WARNING)
+            _answer_as_malformed(link, getattr(resource, "request_id", None),
+                                 getattr(resource, "total_size", None) or len(packed or b""))
+            return None
+    return _original_response_resource_concluded(link, resource)
+
+
+def guarded_receive(link, packet):
+    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it."""
+    if getattr(packet, "context", None) == RNS.Packet.RESPONSE and is_dht_link(link) \
+            and getattr(packet, "packet_type", None) == RNS.Packet.DATA:
+        if not getattr(link, "initiator", False):
+            _log_unexpected_response("dropped a response arriving on an incoming link, which has no requests",
+                                     LOG_VERBOSE)
+            return None
+        data = getattr(packet, "data", b"")
+        if len(data) > PACKET_CHECK_SIZE:
+            try:
+                packed = link.decrypt(data)
+            except Exception:
+                packed = None
+            reason = protocol.response_refusal(packed) if packed is not None else None
+            if reason is not None:
+                _log_refused_response(f"refused a response before decoding it: {reason}", LOG_WARNING)
+                _answer_as_malformed(link, protocol.packed_request_id(packed), len(packed))
+                return None
+    return _original_receive(link, packet)
+
+
+def _wrap(owner, name: str, guard, staticmethod_: bool = False):
+    """Replace owner.name with guard unless it is already; the original it replaced."""
+    current = owner.__dict__.get(name)
+    if getattr(current, "__func__", current) is guard:
+        return None
+    original = getattr(owner, name)
+    setattr(owner, name, staticmethod(guard) if staticmethod_ else guard)
+    return original
+
+
 def install():
-    """Wrap RNS.Resource.accept with the guard. Idempotent; called by RequestServer and LinkPool."""
-    global _original_accept
+    """Wrap RNS.Resource.accept, Link.response_resource_concluded and Link.receive with the guards. Idempotent;
+    called by RequestServer and LinkPool."""
+    global _original_accept, _original_response_resource_concluded, _original_receive
     with _lock:
-        current = RNS.Resource.__dict__.get("accept")
-        function = getattr(current, "__func__", current)
-        if function is guarded_accept:
-            return
-        _original_accept = RNS.Resource.accept
-        RNS.Resource.accept = staticmethod(guarded_accept)
+        original = _wrap(RNS.Resource, "accept", guarded_accept, staticmethod_=True)
+        if original is not None:
+            _original_accept = original
+        original = _wrap(RNS.Link, "response_resource_concluded", guarded_response_resource_concluded)
+        if original is not None:
+            _original_response_resource_concluded = original
+        original = _wrap(RNS.Link, "receive", guarded_receive)
+        if original is not None:
+            _original_receive = original
 
 
 def installed() -> bool:
-    """True if the guard is in place."""
-    current = RNS.Resource.__dict__.get("accept")
-    return getattr(current, "__func__", current) is guarded_accept
+    """True if the guards are in place."""
+    def wrapped(owner, name, guard):
+        current = owner.__dict__.get(name)
+        return getattr(current, "__func__", current) is guard
+    return (wrapped(RNS.Resource, "accept", guarded_accept)
+            and wrapped(RNS.Link, "response_resource_concluded", guarded_response_resource_concluded)
+            and wrapped(RNS.Link, "receive", guarded_receive))
+
+
+# Half-open incoming links
+
+HALF_OPEN_LOG_INTERVAL = 60.0  # seconds between log lines about closing half-open links
+
+
+def half_open_links(destination) -> list:
+    """destination's incoming links not yet ACTIVE (PENDING or HANDSHAKE: waiting for the RTT packet), oldest
+    first."""
+    waiting = (RNS.Link.PENDING, RNS.Link.HANDSHAKE)
+    links = [link for link in list(getattr(destination, "links", None) or [])
+             if getattr(link, "status", None) in waiting]
+    # destination.links is in arrival order; Link.request_time (set by validate_request) confirms it
+    return sorted(links, key=lambda link: getattr(link, "request_time", None) or 0.0)
+
+
+def half_open_to_close(links: list, interface=None):
+    """Of half-open links (oldest first), the one to close to make room for a request arriving on interface:
+    the oldest on the interface holding the most (the request's own on a tie), so a flood arriving on one
+    interface closes its own links before anyone else's."""
+    if not links:
+        return None
+    held = Counter(id(getattr(link, "attached_interface", None)) for link in links)
+    most = max(held.values())
+    busiest = id(interface) if held.get(id(interface)) == most else None
+    return next(link for link in links if held[id(getattr(link, "attached_interface", None))] == most
+                and busiest in (None, id(getattr(link, "attached_interface", None))))
+
+
+class HalfOpenLimit:
+    """Wraps one destination's incoming_link_request to keep its half-open links below limit (see the module)."""
+
+    def __init__(self, destination, limit: int, clock=time.monotonic):
+        """Guard destination at limit half-open links (at least 1), wrapping its current incoming_link_request."""
+        self.destination = destination
+        self.limit = max(1, int(limit))
+        self.clock = clock
+        self.original = destination.incoming_link_request
+        self.lock = threading.Lock()
+        self.closed = 0  # half-open links closed to make room, in all
+        self.logged_at = None
+        self.logged_closed = 0
+
+    def incoming_link_request(self, data, packet):
+        """RNS's Destination.incoming_link_request, after closing the oldest half-open links over the limit.
+
+        Runs on RNS's inbound packet thread, so it only does quick work: nothing here waits on established
+        links' processing.
+        """
+        interface = getattr(packet, "receiving_interface", None)
+        with self.lock:
+            waiting = half_open_links(self.destination)
+            while len(waiting) >= self.limit:
+                link = half_open_to_close(waiting, interface)
+                waiting.remove(link)
+                self._close(link)
+            return self.original(data, packet)
+
+    def _close(self, link):
+        """Close a half-open link. RNS's teardown() sends the initiator a close packet, so an honest one whose
+        handshake was cut short learns at once and can try again."""
+        try:
+            link.teardown()
+        except Exception as e:
+            log(f"error closing a half-open link: {e}", LOG_WARNING)
+            return
+        self.closed += 1
+        now = self.clock()
+        if self.logged_at is None or now - self.logged_at >= HALF_OPEN_LOG_INTERVAL:
+            log(f"too many incoming links waiting to complete their handshake: closed "
+                f"{plural(self.closed - self.logged_closed, 'half-open link')}, oldest first", LOG_WARNING)
+            self.logged_at, self.logged_closed = now, self.closed
+
+
+def limit_half_open(destination, limit: int) -> HalfOpenLimit | None:
+    """Keep destination's half-open incoming links below limit (see the module). Idempotent: a destination
+    already guarded keeps its guard, with the new limit. None if destination has no incoming_link_request (an
+    RNS that changed, or a test's fake)."""
+    current = getattr(destination, "incoming_link_request", None)
+    guard = getattr(current, "__self__", None)
+    if isinstance(guard, HalfOpenLimit):
+        guard.limit = max(1, int(limit))
+        return guard
+    if not callable(current):
+        return None
+    guard = HalfOpenLimit(destination, limit)
+    destination.incoming_link_request = guard.incoming_link_request
+    return guard

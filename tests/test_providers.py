@@ -155,12 +155,15 @@ class EvictionTest(StoreTestCase):
 
     max_records = 10
 
-    def test_new_publisher_refused_when_full(self):
+    def test_new_publisher_evicts_a_pooled_record_when_full(self):
         for i in range(10):
             self.store.store(ident(100 + i), ident(1))
-        self.assertFalse(self.store.store(KEY, ident(2)))
+        # ident(1)'s last record went into the newcomer pool (a tenth of the store); a new publisher evicts a
+        # random pooled record rather than being refused, and the records outside the pool stay
+        self.assertTrue(self.store.store(KEY, ident(2)))
         self.assertEqual(self.store.record_count(), 10)
-        self.assertIsNone(self.store.first_seen(ident(2)))
+        self.assertEqual(self.store.providers(ident(109)), [])
+        self.assertEqual([len(self.store.providers(ident(100 + i))) for i in range(9)], [1] * 9)
 
     def test_newest_publisher_cannot_churn_its_own_records(self):
         self.store.store(ident(100), ident(1))
@@ -187,15 +190,19 @@ class EvictionTest(StoreTestCase):
         self.assertTrue(self.store.store(ident(201), ident(1)))
         self.assertEqual(self.store.providers(ident(301)), [])
 
-    def test_flood_of_new_identities_displaces_only_itself(self):
+    def test_flood_of_new_identities_displaces_only_pooled_records(self):
         for i in range(5):
             self.store.store(ident(100 + i), ident(1))
             self.store.store(ident(100 + i), ident(2))
         self.clock.now += 1
         accepted = sum(self.store.store(ident(500 + i), ident(10_000 + i)) for i in range(1000))
-        self.assertEqual(accepted, 0)
-        for i in range(5):
+        # Each new identity lands in the newcomer pool (one record here), evicting the one there
+        self.assertEqual(accepted, 1000)
+        self.assertEqual(self.store.record_count(), 10)
+        for i in range(4):
             self.assertEqual(sorted(self.store.providers(ident(100 + i))), [ident(1), ident(2)])
+        # ident(2)'s last record, stored once the rest of the store was full, was the one in the pool
+        self.assertEqual(self.store.providers(ident(104)), [ident(1)])
 
     def test_flood_after_honest_records_only_churns_flooders(self):
         for i in range(6):

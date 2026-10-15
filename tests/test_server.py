@@ -48,7 +48,7 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(server.select_blocks([c1, c2], {c2: b2}.get, 0), [None, b2])
 
     def test_capped_by_max_response_size(self):
-        self.assertEqual(server.blocks_budget(10 * 1024 * KIB, None, None, 60), MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+        self.assertEqual(server.blocks_budget(10 * 1024 * KIB, 1e9, None, 60), MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
 
     def test_capped_by_response_target_at_rate_estimate(self):
         self.assertEqual(server.blocks_budget(1_000_000, 8000, None, 60), 60_000)
@@ -444,6 +444,7 @@ class RequestServerTest(unittest.TestCase):
 
     def test_response_is_tracked_until_complete_and_gives_rate(self):
         link = self.connect(b"a", mtu=1500, mdu=1400)
+        self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
         (c1, b1), (c2, b2) = self.big[:2]
         self.assertEqual(self.blocks(link, [c1, c2]), [b1, b2])
         self.assertEqual(self.server.incoming.in_progress(link.link_id), (1, 1))
@@ -665,10 +666,11 @@ class RequestServerTest(unittest.TestCase):
         capacity = airtime.remaining()
         cids = [cid for cid, _ in self.big]
         link = self.connect(b"a")
+        self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
         self.assertIsNot(self.blocks(link, cids), False)
         response = self.server.pools.responses()[0]
-        charged = capacity - airtime.remaining()
-        self.assertGreater(charged, 300 * KIB)
+        self.assertGreater(response.cost, 300 * KIB)
+        self.assertLessEqual(capacity - airtime.remaining(), link.mdu)  # charged as sent: a reservation so far
         resource = self.send(link)
         resource.progress = 0.25
         resource.cancel()  # RNS: rejected or timed out, then the callback
@@ -676,9 +678,10 @@ class RequestServerTest(unittest.TestCase):
         # A link closed mid-transfer refunds the rest too
         before = airtime.remaining()
         other = self.connect(b"b")
+        self.server.rates.record(other.link_id, 64 * KIB, 1_000_000)
         self.assertIsNot(self.blocks(other, cids[:2]), False)
         self.send(other).progress = 0.5
-        packed = before - airtime.remaining()
+        packed = self.server.pools.responses()[0].size
         other.teardown()
         self.assertAlmostEqual(before - airtime.remaining(), packed / 2, delta=2)
         # A response cancelled before its Resource started (missed deadline) is refunded whole
@@ -693,7 +696,7 @@ class RequestServerTest(unittest.TestCase):
         capacity = airtime.remaining()
         link = self.connect(b"a")
         self.assertIsNot(self.blocks(link), False)
-        charged = capacity - airtime.remaining()
+        charged = self.server.pools.responses()[0].size  # how much was sent is unknown: all of it
         resource = self.send(link)
 
         def unreadable():
@@ -709,7 +712,7 @@ class RequestServerTest(unittest.TestCase):
         capacity = airtime.remaining()
         link = self.connect(b"a")
         self.assertIsNot(self.blocks(link), False)
-        charged = capacity - airtime.remaining()
+        charged = self.server.pools.responses()[0].size
         resource = self.send(link)
         resource.progress = 1.0
         resource.complete()
@@ -726,6 +729,7 @@ class RequestServerTest(unittest.TestCase):
         answers = []
         for i in range(3):
             link = self.connect(bytes([0x10 + i]))
+            self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)  # measured, so more than one block fits
             answers.append(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, cids), link, greedy,
                                     request_id=bytes([i]) * 16))
         self.assertIsNot(answers[0], False)
@@ -733,7 +737,7 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(len(served), 3)  # cut to half the bucket
         self.assertIs(answers[2], False)
         self.assertEqual(self.server.traffic.snapshot()["refused"]["budget"], 1)
-        in_flight = sum(response.charged for response in self.server.pools.responses())
+        in_flight = sum(response.cost for response in self.server.pools.responses())
         self.assertLessEqual(in_flight, 400 * KIB + 2 * 64 * KIB)
         self.assertIsNot(self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, cids[:1]),
                                   self.connect(b"z"), RNS.Identity()), False)

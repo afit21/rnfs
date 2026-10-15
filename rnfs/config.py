@@ -10,6 +10,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field, fields
 
+from rnfs import winacl
 from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
 
 DEFAULT_API_PORT = 8788
@@ -20,15 +21,17 @@ SETTINGS_FILE = "rnfs.toml"
 WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free port (printed at start)
     "api_port": (1, 65535), "gateway_port": (0, 65535), "verbosity": (0, None), "min_rate_sample": (1, None),
     "beta": (1, None), "max_failures": (1, None), "max_incoming_links": (1, None), "max_blocks_responses": (2, None),
-    "max_records": (0, None), "max_storage": (0, None), "max_output_entries": (0, None),
-    "name_table_size": (0, None), "remote_pin_quota": (0, None), "gateway_fetches": (0, None),
+    "fast_blocks_responses": (1, None), "max_records": (0, None), "max_storage": (0, None),
+    "max_output_entries": (0, None), "name_table_size": (0, None), "remote_pin_quota": (0, None),
+    "gateway_fetches": (0, None),
 }
 OPTIONAL_WHOLE_NUMBERS = {"alpha": 1, "max_parallel_providers": 1, "max_download_size": 0}  # name: minimum
 RATES = ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate")  # bits/s, above 0
 DURATIONS = {  # seconds: name → True if it must be above 0 (else 0 is allowed too)
     "republish_interval": True, "announce_interval": True, "startup_announce_delay": False,
     "provider_seniority": False, "response_target": True, "deadline_slack": False, "stall_timeout": True,
-    "lookup_timeout": True, "path_timeout": True, "link_idle_timeout": True, "ban_time": False, "scan_interval": True,
+    "blocks_cooldown": False, "lookup_timeout": True, "path_timeout": True, "link_idle_timeout": True,
+    "ban_time": False, "scan_interval": True,
 }
 OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset (None)
 # Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
@@ -72,12 +75,16 @@ class Config:
     response_target: float = 60
     deadline_slack: float = 30
     stall_timeout: float = 120
+    # /blocks refused to a link (and identity) whose response was displaced or cancelled for making no progress
+    blocks_cooldown: float = 300
     lookup_timeout: float = 600
     path_timeout: float = 30
     max_failures: int = 3
     link_idle_timeout: float = 300
     max_incoming_links: int = 128
-    max_blocks_responses: int = 4  # at least 2
+    max_blocks_responses: int = 4  # at least 2: half of them for slow links, the rest for others
+    # Responses in progress at once on links that aren't slow, if more than the rest of max_blocks_responses
+    fast_blocks_responses: int = 16
     max_upload_rate: float | None = None  # none; half the rate estimate on slow links that have one
     max_records: int = 100_000
     ban_time: float = 1 * HOUR
@@ -258,6 +265,11 @@ class Config:
         path = os.path.join(os.path.expanduser(rnfs_dir), SETTINGS_FILE)
         if os.path.isfile(path):
             with open(path, "rb") as f:
+                # On Windows, owned by and private to this user: its settings pick programs rnfs runs
+                try:
+                    winacl.secure_settings(path, f.fileno())
+                except OSError as e:
+                    raise PermissionError(f"can't trust the settings file: {e}") from None
                 values.update(tomllib.load(f))
         known = {f.name for f in fields(cls)}
         unknown = values.keys() - known

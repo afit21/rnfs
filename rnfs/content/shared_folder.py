@@ -45,14 +45,15 @@ def open_signature(handle: builder.Handle, st: os.stat_result, path: str) -> str
     def add(item: builder.Handle | None, item_path: str, relative: str, st: os.stat_result, depth: int):
         """Fold one item (and, for a directory, open as item, everything in it) into the digest."""
         mode = st.st_mode
-        digest.update(json.dumps([relative.encode("utf-8", "surrogateescape").hex(), stat.S_IFMT(mode),
-                                  st.st_size, st.st_mtime_ns, builder.is_executable(mode)]).encode())
+        fields = [relative.encode("utf-8", "surrogateescape").hex(), stat.S_IFMT(mode), st.st_size,
+                  st.st_mtime_ns, builder.is_executable(mode)]
+        if stat.S_ISREG(mode) and st.st_nlink > 1:
+            fields.append("linked")  # skipped while linked elsewhere: imported once that link is gone
+        digest.update(json.dumps(fields).encode())
         # Deeper than MAX_DEPTH can't be added anyway; don't recurse without bound
         if item is None or not stat.S_ISDIR(mode) or depth > constants.MAX_DEPTH + 1:
             return
-        with os.scandir(item) as listing:
-            children = sorted(listing, key=lambda entry: entry.name)
-        for child in children:
+        for child in builder.list_directory(item):
             child_path = os.path.join(item_path, child.name)
             child_st = builder.listed_stat(child, child_path)
             # A Windows junction stats as a directory, but add skips it like a symlink: don't walk into it
@@ -116,8 +117,7 @@ class SharedFolder:
             try:
                 if not stat.S_ISDIR(st.st_mode):
                     raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
-                with os.scandir(folder) as listing:
-                    items = sorted(listing, key=lambda entry: entry.name)
+                items = builder.list_directory(folder)
                 for item in items:
                     result = self._scan_item(folder, item)
                     if result is not None:
@@ -158,6 +158,12 @@ class SharedFolder:
         except OSError:
             return None  # deleted, swapped or unreadable mid-scan; it'll be picked up next time if it comes back
         try:
+            # A file with another hard link is also a file elsewhere, which someone who may write here could
+            # have linked in (audit L8-R2): skipped, so its pin goes too
+            links = builder.hard_links(handle)
+            if links:
+                self._warn_once(f"hardlink:{item.name}", f"skipped {shown}: {builder.hard_link_reason(links)}")
+                return None
             return self._import(item.name, handle, st, path)
         finally:
             builder.close(handle)
@@ -178,7 +184,7 @@ class SharedFolder:
         warnings: list[str] = []
         try:
             with self.storage.protect() as session:
-                built = builder.build_open(handle, st, path, session.put, warnings)
+                built = builder.build_open(handle, st, path, session.put, warnings, skip_hard_links=True)
                 self.storage.pin(built.cid, FOLDER)
         except (OSError, ValueError, RnfsError) as e:
             self._failed[name] = sig

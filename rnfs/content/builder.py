@@ -212,22 +212,101 @@ def is_executable(mode: int) -> bool:
 # Opening paths. A directory being added may change underneath the walk (the shared folder is writable by
 # whatever puts files there), so every entry is opened relative to its parent's descriptor without following
 # a symlink or blocking on a FIFO, and the opened object must be the regular file or directory that was listed.
+# Where directories can't be opened (FD_WALK is False, as on Windows) they are walked by path, and a directory
+# checked once could be swapped for a link or junction afterwards: so each one is checked again, by stat and by
+# real path, whenever it is listed, and each file opened below it must really be below the walk's root (its
+# final path, from the open file) before a byte is read (audit L8).
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)  # opening a FIFO for reading would otherwise wait for a writer
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-_REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
 # Platforms without these (not Linux or macOS) walk directories by path, checking each entry before using it
 FD_WALK = (os.open in os.supports_dir_fd and os.scandir in os.supports_fd
            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
 # What open(O_NOFOLLOW | O_NONBLOCK [| O_DIRECTORY]) reports for a symlink, socket or non-directory
 _SWAPPED_ERRNOS = {errno.ELOOP, errno.EMLINK, errno.ENOTDIR, errno.ENXIO}
 
-Handle = int | str  # an open file's descriptor; an open directory's descriptor, or its path without FD_WALK
+Handle = int | str  # an open file's descriptor; an open directory's descriptor, or a _DirPath without FD_WALK
 
 
 class Changed(OSError):
     """An entry changed type or identity between being listed and being opened."""
+
+
+class _DirPath(str):
+    """A directory "opened" without FD_WALK: its path, with what is needed to check it again before each use.
+
+    expected is the stat it was listed (or first opened) with, follow whether its path may end in a link (only
+    the root the user named), and root the real path of the walk's root, which nothing below may leave.
+    """
+    expected: os.stat_result
+    follow: bool
+    root: str
+
+
+def _dir_path(path: str, expected: os.stat_result, follow: bool, root: str | None) -> _DirPath:
+    """A _DirPath for path; root None makes it the root of a walk, whose real path must still be it."""
+    handle = _DirPath(path)
+    handle.expected = expected
+    handle.follow = follow
+    if root is None:
+        root = os.path.realpath(path)
+        st = os.stat(root)
+        if (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+            raise Changed(errno.ESTALE, "changed while being read", display_path(path))
+    handle.root = root
+    return handle
+
+
+def _check_dir_path(handle: _DirPath):
+    """Raise Changed unless the path of handle still leads, without a link or junction on the way below its
+    root, to the directory it was opened as."""
+    changed = Changed(errno.ESTALE, "changed while being read", display_path(handle))
+    st = os.stat(handle, follow_symlinks=handle.follow)
+    if (is_link(st) or not stat.S_ISDIR(st.st_mode)
+            or (st.st_dev, st.st_ino) != (handle.expected.st_dev, handle.expected.st_ino)):
+        raise changed
+    # A parent directory swapped for a link would still pass the stat above, if it leads to the same directory
+    # by another way; the real path shows where it is
+    real = os.path.realpath(handle)
+    if not fsutil.is_below(real, handle.root):
+        raise changed
+    st = os.stat(real)
+    if (st.st_dev, st.st_ino) != (handle.expected.st_dev, handle.expected.st_ino):
+        raise changed
+
+
+def _check_below(fd: int, root: str, path: str):
+    """Raise Changed unless the file open as fd (opened by path, below a _DirPath) is really below root.
+
+    Its final path comes from the open file where the system can say (fsutil.final_path): a directory on the
+    way, swapped for a link or junction after its check, can't hide where the open led. Elsewhere the path is
+    resolved again, and must lead to this very file below root.
+    """
+    changed = Changed(errno.ESTALE, "changed while being read", display_path(path))
+    final = fsutil.final_path(fd)
+    if final is None:
+        final = os.path.realpath(path)
+        st, opened = os.stat(final), os.fstat(fd)
+        if (st.st_dev, st.st_ino) != (opened.st_dev, opened.st_ino):
+            raise changed
+    if not fsutil.is_below(final, root):
+        raise changed
+
+
+def list_directory(handle: Handle) -> list[os.DirEntry]:
+    """The entries of the open directory handle, sorted by name.
+
+    A _DirPath is checked before and after it is listed, so a listing of another directory swapped in
+    meanwhile is never used. Raises Changed then, OSError if it can't be listed.
+    """
+    if isinstance(handle, _DirPath):
+        _check_dir_path(handle)
+    with os.scandir(handle) as listing:
+        entries = sorted(listing, key=lambda entry: entry.name)
+    if isinstance(handle, _DirPath):
+        _check_dir_path(handle)
+    return entries
 
 
 def _check_opened(path: str, expected: os.stat_result, handle: Handle, follow: bool = False):
@@ -242,11 +321,15 @@ def _check_opened(path: str, expected: os.stat_result, handle: Handle, follow: b
         raise Changed(errno.ESTALE, "changed while being read", display_path(path))
 
 
-def _open(target: str, dir_fd: int | None, path: str, expected: os.stat_result, follow: bool) -> Handle:
-    """Open target (a name in dir_fd, or a path) as the regular file or directory expected, never blocking."""
+def _open(target: str, dir_fd: int | None, path: str, expected: os.stat_result, follow: bool,
+          root: str | None = None) -> Handle:
+    """Open target (a name in dir_fd, or a path) as the regular file or directory expected, never blocking.
+
+    root is the real path of the walk's root when target is a path below a _DirPath, else None.
+    """
     is_dir = stat.S_ISDIR(expected.st_mode)
     if is_dir and not FD_WALK:
-        handle: Handle = path  # can't open directories here; checked by path instead
+        handle: Handle = _dir_path(path, expected, follow, root)  # can't open directories here: checked by path
     else:
         flags = os.O_RDONLY | fsutil.O_BINARY | _O_NONBLOCK | _O_CLOEXEC | (_O_DIRECTORY if is_dir else 0)
         if not follow:
@@ -259,6 +342,10 @@ def _open(target: str, dir_fd: int | None, path: str, expected: os.stat_result, 
             raise
     try:
         _check_opened(path, expected, handle, follow)
+        if isinstance(handle, _DirPath):
+            _check_dir_path(handle)
+        elif root is not None:
+            _check_below(handle, root, path)
     except BaseException:
         close(handle)
         raise
@@ -284,7 +371,8 @@ def open_child(parent: Handle, name: str, path: str, expected: os.stat_result) -
     """
     if isinstance(parent, int):
         return _open(name, parent, path, expected, False)
-    return _open(path, None, path, expected, False)
+    root = getattr(parent, "root", None) or os.path.realpath(parent)
+    return _open(path, None, path, expected, False, root)
 
 
 def listed_stat(item: os.DirEntry, path: str) -> os.stat_result:
@@ -299,9 +387,7 @@ def listed_stat(item: os.DirEntry, path: str) -> os.stat_result:
     return st
 
 
-def is_link(st: os.stat_result) -> bool:
-    """True for a symlink, or a Windows directory junction (which stat reports as a directory, yet it links)."""
-    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) == _REPARSE_JUNCTION
+is_link = fsutil.is_link  # a symlink, junction or other link-like Windows reparse point
 
 
 def close(handle: Handle):
@@ -324,29 +410,39 @@ def build_path(path: str, put: Put, warnings: list[str]) -> Built:
         close(handle)
 
 
+def hard_links(handle: Handle) -> int:
+    """How many hard links the open regular file handle has beyond one (0 for a directory)."""
+    if not isinstance(handle, int):
+        return 0
+    st = os.fstat(handle)
+    return st.st_nlink - 1 if stat.S_ISREG(st.st_mode) and st.st_nlink > 1 else 0
+
+
 def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings: list[str],
-               depth: int = 1) -> Built:
+               depth: int = 1, skip_hard_links: bool = False) -> Built:
     """Build the regular file or directory open as handle (from open_path or open_child), whose stat is st.
 
-    path is only for messages (and for directories without FD_WALK); depth as for _build_tree.
+    path is only for messages (and for directories without FD_WALK); depth as for _build_tree. With
+    skip_hard_links, files below a directory that have other hard links are skipped with a warning (the shared
+    folder: someone who may write to it could link a file of yours there that you never put in it).
     """
     if stat.S_ISDIR(st.st_mode):
-        return _build_tree(handle, path, put, warnings, depth)
+        return _build_tree(handle, path, put, warnings, depth, skip_hard_links)
     kind = dag.KIND_EXECUTABLE if is_executable(st.st_mode) else dag.KIND_FILE
     # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
     with os.fdopen(handle, "rb", closefd=False) as f:
         return build_file(f, put, kind=kind)
 
 
-def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int) -> Built:
+def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int,
+                skip_hard_links: bool = False) -> Built:
     """Build the open directory at path, which sits depth directories from the root (1 for the root)."""
     # Every directory level adds at least one DAG node, so this bounds the recursion before it gets deep
     if depth > constants.MAX_DEPTH:
         raise TooLarge(f"{display_path(path)} is nested deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     entries = []
     child_height = 0
-    with os.scandir(directory) as listing:
-        children = sorted(listing, key=lambda entry: entry.name)
+    children = list_directory(directory)
     for item in children:
         child_path = os.path.join(path, item.name)
         shown = display_path(child_path)
@@ -366,12 +462,25 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
             warnings.append(f"skipped {shown}: it changed while being added")
             continue
         try:
-            child = build_open(handle, st, child_path, put, warnings, depth + 1)
+            if skip_hard_links and (links := hard_links(handle)):
+                warnings.append(f"skipped {shown}: {hard_link_reason(links)}")
+                continue
+            child = build_open(handle, st, child_path, put, warnings, depth + 1, skip_hard_links)
+        except Changed:
+            # A directory walked by path, swapped when it was listed (see list_directory)
+            warnings.append(f"skipped {shown}: it changed while being added")
+            continue
         finally:
             close(handle)
         entries.append(Entry(item.name, child.cid, child.size, child.kind))
         child_height = max(child_height, child.height)
     return build_directory(entries, put, child_height)
+
+
+def hard_link_reason(links: int) -> str:
+    """Why a file with links other hard links is skipped (shared folder)."""
+    return (f"it has {links} other hard link{'s' if links > 1 else ''}, so it is also a file elsewhere that may "
+            f"not be meant for sharing")
 
 
 def add_path(path: str, put: Put, wrap_it: bool = False) -> tuple[Built, list[str]]:

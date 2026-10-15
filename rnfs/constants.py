@@ -23,6 +23,7 @@ MAX_RESPONSE_SIZE = 1 * MIB - 1  # encoded response; one RNS Resource segment
 ID_LENGTH = 16  # node IDs and DHT keys: RNS destination hashes, 128 bits
 BUCKET_COUNT = 128
 RESPONSE_OVERHEAD = 1 * KIB  # room left for msgpack framing in a /blocks response (section 7)
+MAX_PROVIDE_KEYS = 55  # keys in one /provide, both lists: the most that fit MAX_REQUEST_SIZE (section 4)
 
 # Local, not protocol: a file being written out (.rnfs-get-<random>.partial, .rnfs-job-<id>.partial), then renamed
 PARTIAL_SUFFIX = ".partial"

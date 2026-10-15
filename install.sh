@@ -12,6 +12,7 @@
 #   --service     also install the systemd user unit and start it (system mode: install it for all users,
 #                 each then runs `systemctl --user enable --now rnfs`)
 #   --main        install the main branch, which may be newer than the latest release, instead of the release
+#                 (the branch archive has no checksum or provenance to check)
 #   --update      re-install from the latest release, or the main branch with --main (running the installer
 #                 again does the same)
 #   --uninstall   remove the venv, the command and the unit (keeps your data in ~/.rnfs)
@@ -25,6 +26,15 @@
 #              RNFS_ALLOW_SOURCE_BUILDS=1  build dependencies PyPI has no wheel of for this platform (e.g.
 #                           cffi on 32-bit ARM) from their pinned, hash-checked source; the tools that build
 #                           them are then fetched unpinned, and a C compiler and Python headers are needed
+#              RNFS_REQUIRE_ATTESTATION=1  fail unless the release's signed provenance could be checked (needs
+#                           the GitHub CLI, gh 2.49 or newer, logged in)
+#
+# The latest release is installed from its source archive (rnfs-X.Y.Z.tar.gz, a release file, not the archive
+# GitHub makes of the tag), which must match the release's SHA256SUMS. Where the GitHub CLI (gh 2.49 or newer)
+# is installed and logged in, its signed build provenance is checked too (gh attestation verify, made by
+# release.yml for this repository), and a failed check stops the install. Without gh the install goes ahead with
+# a warning: SHA256SUMS shows the download is whole, but whoever could replace the release's files could
+# replace it too.
 #
 # Dependencies (rns, lxmf, cryptography, ...) are installed as wheels at the versions and sha256 hashes
 # pinned in the source's packaging/requirements.lock (pip --require-hashes --only-binary=:all:), and rnfs
@@ -36,9 +46,12 @@
 set -eu
 
 REPO_URL="https://github.com/afit21/rnfs"
-# Without RNFS_SOURCE, this script (as served from the main branch) installs the latest release's source tree,
-# which may be older than the script. It must keep working with the layout of every release from 0.1.1 on:
-# packaging/requirements.lock and packaging/build-backend.lock, which fetch_source looks for.
+REPO=${REPO_URL#https://github.com/}  # owner/name, for gh
+RELEASE_TAG=""  # the release being installed (set by choose_source), whose files fetch_release checks
+# Without RNFS_SOURCE, this script (as served from the main branch) installs the latest release's sdist, which
+# may be older than the script. It must keep working with every release from 0.1.3 on: release files
+# rnfs-X.Y.Z.tar.gz and SHA256SUMS (with build provenance), and in the sdist packaging/requirements.lock and
+# packaging/build-backend.lock, which fetch_source looks for.
 SOURCE=${RNFS_SOURCE:-}  # empty: chosen by choose_source once Python is found
 MAIN=no
 PYTHON=${RNFS_PYTHON:-}
@@ -255,6 +268,11 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+# Only the system calls ordinary services make, for this machine's own architecture (seccomp, which works in a
+# user unit because NoNewPrivileges is set). A PipeInterface's program is held to the same. MemoryDenyWriteExecute
+# is left out: libffi closures, which cffi (under cryptography) can use, may need writable executable memory.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target
@@ -279,17 +297,91 @@ print(tag)
 EOF
 }
 
-choose_source() {  # without RNFS_SOURCE: the latest release's source archive, or the main branch's with --main
+choose_source() {  # without RNFS_SOURCE: the latest release's sdist (checked by fetch_release), or the main branch's archive with --main
     [ -z "$SOURCE" ] || return 0
     if [ "$MAIN" = yes ]; then
         SOURCE=$REPO_URL/archive/refs/heads/main.zip
-        say "Installing the main branch, which may be newer than the latest release"
+        say "Installing the main branch, which may be newer than the latest release (it has no checksums to check)"
     else
         tag=$(latest_release) || die "couldn't find rnfs's latest release on GitHub. Check your connection, or install
 the main branch instead with --main."
-        SOURCE=$REPO_URL/archive/refs/tags/$tag.zip
+        # The sdist the release workflow built, checksummed and attested, not GitHub's archive of the tag
+        # (archive/refs/tags/...), which nothing covers and which a moved tag would change
+        RELEASE_TAG=$tag
+        SOURCE=$REPO_URL/releases/download/$tag/rnfs-${tag#v}.tar.gz
         say "Installing rnfs $tag, the latest release"
     fi
+}
+
+download() {  # download URL FILE: save URL's content as FILE
+    "$PYTHON" -I - "$1" "$2" <<'EOF'
+import shutil, sys, urllib.request
+
+url, path = sys.argv[1:3]
+try:
+    with urllib.request.urlopen(url, timeout=120) as response, open(path, "wb") as f:
+        shutil.copyfileobj(response, f)
+except OSError as e:
+    sys.exit(f"couldn't download {url}: {e}")
+EOF
+}
+
+verify_release() {  # verify_release FILE SUMS: stop unless FILE matches its line in SUMS and, where gh can tell, its provenance
+    "$PYTHON" -I - "$1" "$2" <<'EOF' || die "$(basename -- "$1") doesn't match the release's SHA256SUMS (above), so it wasn't installed"
+import hashlib, os, sys
+
+path, sums = sys.argv[1:3]
+name = os.path.basename(path)
+with open(sums, encoding="utf-8", errors="replace") as f:
+    lines = [line.split() for line in f]
+# sha256sum's format: the hex digest, then the name (after "*" in binary mode)
+expected = [words[0].lower() for words in lines if len(words) == 2 and words[1].lstrip("*") == name]
+if len(expected) != 1:
+    sys.exit(f"SHA256SUMS has {len(expected)} lines for {name}, not one")
+digest = hashlib.sha256()
+with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(1 << 20), b""):
+        digest.update(chunk)
+if digest.hexdigest() != expected[0]:
+    sys.exit(f"{name} has sha256 {digest.hexdigest()}, but SHA256SUMS says {expected[0]}")
+EOF
+    # SHA256SUMS is a release file like any other: whoever can replace the sdist can replace it too. The signed
+    # provenance can't be made outside this repository's release workflow
+    if gh_can_verify; then
+        # Older gh versions can only name the repository, not the workflow
+        signer=""
+        if gh attestation verify --help 2>&1 | grep -q -e '--signer-workflow'; then
+            signer="--signer-workflow=$REPO/.github/workflows/release.yml"
+        fi
+        # shellcheck disable=SC2086  # signer is one word or nothing
+        if ! gh attestation verify "$1" --repo "$REPO" $signer >"$1.attestation" 2>&1; then
+            cat "$1.attestation" >&2
+            die "gh attestation verify found no valid signed provenance for $(basename -- "$1") (above), so it wasn't
+installed: it must have been built by $REPO's release workflow. Please report this at $REPO_URL/issues."
+        fi
+        say "Checked $(basename -- "$1") against SHA256SUMS and its signed build provenance (gh attestation verify)"
+    elif [ "${RNFS_REQUIRE_ATTESTATION:-}" = 1 ]; then
+        die "RNFS_REQUIRE_ATTESTATION=1, but there's no GitHub CLI (gh 2.49 or newer, logged in with gh auth login) to
+check the release's signed provenance with"
+    else
+        warn "checked $(basename -- "$1") against the release's SHA256SUMS only. That shows the download is whole,
+not that the release workflow built it: with the GitHub CLI (gh 2.49 or newer, logged in with gh auth login) its
+signed provenance is checked too. Set RNFS_REQUIRE_ATTESTATION=1 to refuse to install without that check."
+    fi
+}
+
+gh_can_verify() {  # the GitHub CLI is here, logged in, and new enough to have gh attestation (2.49)
+    command -v gh >/dev/null 2>&1 && gh attestation verify --help >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+}
+
+fetch_release() {  # fetch_release WORKDIR: download the release's sdist and SHA256SUMS, check them, and install that file
+    mkdir "$1/release"
+    sdist=$1/release/rnfs-${RELEASE_TAG#v}.tar.gz
+    download "$REPO_URL/releases/download/$RELEASE_TAG/SHA256SUMS" "$1/release/SHA256SUMS" ||
+        die "couldn't download the SHA256SUMS of release $RELEASE_TAG"
+    download "$SOURCE" "$sdist" || die "couldn't download $SOURCE"
+    verify_release "$sdist" "$1/release/SHA256SUMS"
+    SOURCE=$sdist
 }
 
 # The source: a local tree, or an archive downloaded and unpacked here (by Python, so no curl/unzip needed),
@@ -436,6 +528,7 @@ do_install() {
     wheels=$(mktemp -d "${TMPDIR:-/tmp}/rnfs-install.XXXXXX")
     trap 'rm -rf "$wheels"' EXIT INT TERM
     say "Fetching and building rnfs from $SOURCE"
+    if [ -n "$RELEASE_TAG" ]; then fetch_release "$wheels"; fi
     fetch_source "$wheels"
     build_wheel "$wheels"
     wheel=""

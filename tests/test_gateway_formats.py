@@ -101,9 +101,8 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(headers["ETag"], f'"{target}.archive"')
         other = Storage(os.path.join(self.tmp.name, "o", "blocks"), os.path.join(self.tmp.name, "o", "state"), 10**9)
         self.assertEqual([str(c) for c in archive.import_archive(io.BytesIO(body), other)["roots"]], [target])
-        status, head_headers, head_body = self.get(f"/rnfs/{self.root}/sub?format=archive", method="HEAD")
-        self.assertEqual((status, head_body), (200, b""))
-        self.assertEqual(head_headers["Content-Length"], headers["Content-Length"])
+        # A HEAD never gets an archive, stored or not (L6)
+        self.assertEqual(self.get(f"/rnfs/{self.root}/sub?format=archive", method="HEAD")[0], 409)
         self.assertEqual(self.get(f"/rnfs/{self.root}/sub?format=archive",
                                   {"If-None-Match": f'"{target}.archive"'})[0], 304)
 
@@ -117,29 +116,35 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(status, 413)  # max_output_entries
         self.assert_common(headers)
 
-    def test_cors_rule(self):
+    def test_no_cors_headers(self):
         own = {"Referer": f"http://127.0.0.1:{self.server.port}/rnfs/{self.root}/"}
         for fmt in ("raw", "archive"):
-            self.assertEqual(self.get(f"/rnfs/{self.root}?format={fmt}", own)[1]["Access-Control-Allow-Origin"], "*")
-            self.assertIsNone(self.get(f"/rnfs/{self.root}?format={fmt}",
-                                       {"Referer": "http://example.com/"})[1]["Access-Control-Allow-Origin"])
+            for headers in (own, {"Origin": "null"}, {"Referer": "http://example.com/"}):
+                self.assertIsNone(self.get(f"/rnfs/{self.root}?format={fmt}", headers)[1]
+                                  ["Access-Control-Allow-Origin"], headers)
 
-    def test_gateway_fetches_limit(self):
+    def test_raw_blocks_need_a_users_get(self):
+        """A web page's raw request or a HEAD gets 409 whether the block is stored or not (a 200 download for
+        stored blocks only would tell pages what is stored: L6), so it never takes a gateway_fetches slot."""
         missing = str(Cid.for_block(RAW, b"not stored anywhere"))
         limiter = self.server.server.RequestHandlerClass.limiter
         self.assertTrue(limiter.try_acquire())  # the only slot is busy
         try:
-            status, headers, _ = self.get(f"/rnfs/{missing}?format=raw", {"Sec-Fetch-Site": "cross-site"})
-            self.assertEqual(status, 503)
-            self.assert_common(headers)
-            # Stored content is served without limit
-            self.assertEqual(self.get(f"/rnfs/{self.root}?format=raw", {"Sec-Fetch-Site": "cross-site"})[0], 200)
+            for cid in (missing, self.root):
+                for headers, method in (({"Sec-Fetch-Site": "cross-site"}, "GET"),
+                                        ({"Sec-Fetch-Site": "same-origin"}, "HEAD"), ({}, "HEAD")):
+                    status, response, _ = self.get(f"/rnfs/{cid}?format=raw", headers, method)
+                    self.assertEqual(status, 409, (cid, headers, method))
+                    self.assert_common(response)
+            # The user's own GET is served, and isn't limited
+            self.assertEqual(self.get(f"/rnfs/{self.root}?format=raw", {"Sec-Fetch-Site": "none"})[0], 200)
         finally:
             limiter.release()
 
     def test_archives_of_unstored_content_need_a_users_get(self):
-        """A web page's request or a HEAD gets an archive only of content stored completely: anything else
-        would fetch a whole DAG for nobody (409, with the common headers); the user's own GET still fetches."""
+        """A web page's request or a HEAD never gets an archive: it would fetch a whole DAG for nobody, and a 200
+        for stored content only would tell pages what is stored (409, with the common headers); the user's own
+        GET still fetches."""
         missing = str(Cid.for_block(RAW, b"not stored anywhere"))
         calls = []
         real = self.node.export_stream
@@ -151,7 +156,7 @@ class FormatTest(unittest.TestCase):
             self.assert_common(response)
         self.assertEqual(calls, [])
         self.assertIn(b"stored", self.get(f"/rnfs/{missing}?format=archive", {"Sec-Fetch-Site": "cross-site"})[2])
-        # The user's own GET tries the fetch; stored content is served to anyone, HEAD too
+        # The user's own GET tries the fetch; stored content gets the same 409s, and the user's GET
         def not_found(*args, **kwargs):
             """The fetch finds no provider (this node has no network)."""
             calls.append(args)
@@ -161,8 +166,10 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(self.get(f"/rnfs/{missing}?format=archive", {"Sec-Fetch-Site": "none"})[0], 404)
         self.assertEqual(len(calls), 1)
         self.node.export_stream = real
-        for headers, method in (({"Sec-Fetch-Site": "cross-site"}, "GET"), ({"Sec-Fetch-Site": "cross-site"}, "HEAD")):
-            self.assertEqual(self.get(f"/rnfs/{self.root}?format=archive", headers, method)[0], 200)
+        for headers, method in (({"Sec-Fetch-Site": "cross-site"}, "GET"), ({"Sec-Fetch-Site": "cross-site"}, "HEAD"),
+                                ({}, "HEAD")):
+            self.assertEqual(self.get(f"/rnfs/{self.root}?format=archive", headers, method)[0], 409, (headers, method))
+        self.assertEqual(self.get(f"/rnfs/{self.root}?format=archive", {"Sec-Fetch-Site": "none"})[0], 200)
 
     def test_archive_fetch_is_cancelled_when_the_client_leaves(self):
         """The fetch behind a user's archive GET runs under an observer that cancels it once the client is gone."""

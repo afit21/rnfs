@@ -120,30 +120,91 @@ pass a `max_response_size` just above their largest honest answer.
 - Field types: keys, node IDs and names are 16-byte `bin`; CIDs are binary CIDs as `bin`; blocks are `bin`;
   `max_bytes` is a non-negative integer; `pin` is a boolean; every `/name` response field is `bin`.
 - Any request of another shape, or one refused under the limits below, is answered `False` at once — never
-  left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered.
+  left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered, and a flood over the
+  per-link request rate (below), which after a few refusals is dropped unanswered.
 - Every request fits in one packet: at most `min(Link.get_mdu(), MAX_REQUEST_SIZE)` bytes including RNS's
   request framing (~28 bytes). Batch sizes are computed from that (e.g. 22 keys per `/provide` at the default
-  MTU, counting both lists).
+  MTU, counting both lists). A `/provide` carries at most 55 keys, counting both lists (the most that fit
+  `MAX_REQUEST_SIZE`); a longer one is malformed.
 
 **Limits.** These keep a node usable under load.
 - Requests are at most `MAX_REQUEST_SIZE` (`Destination.set_max_request_size`).
 - Per link: at most `MAX_REQUESTS_PER_LINK` requests in progress, of which at most one is `/blocks`.
   Requesters MUST stay within this.
-- At most `max_blocks_responses` `/blocks` responses are in progress in total, split between two pools:
-  responses on slow links (`max_blocks_responses` // 2 slots) and on other links (the rest), so each pool
-  has at least one slot. A response stays in the pool it started in, even if its link's class changes. Each
-  pool competes only with itself, so neither kind of client can crowd out the other.
+- **Request rate per link.** RNS decrypts and decodes every request packet and starts a thread for it before
+  any handler runs, so nothing in rnfs stops that work; a node SHOULD at least keep a flood from costing it
+  the handler's work and an answer. rnfs takes a token from a per-link bucket (2000 requests, refilled at 2000
+  a second) before parsing anything. A request over it is answered `False` while the link has refusals left
+  (4, one more a second), so a requester that gets there backs off as from any refusal, and dropped
+  unanswered after that. An honest requester waits for its answers, `MAX_REQUESTS_PER_LINK` at a time, so it
+  stays far below this over a real network (over loopback a 10,000-key `/provide` runs at about 900 requests
+  a second). Measured over real RNS, the limit cuts the node's CPU per flood request by about 40% (the rest is
+  RNS's own work), so the flood rate one link needs to saturate the node about doubles.
+- `/blocks` responses in progress are split between two pools: responses on slow links
+  (`max_blocks_responses` // 2 slots) and on other links (`fast_blocks_responses` slots, or the rest of
+  `max_blocks_responses` if that is more), so each pool has at least one slot. A response stays in the pool it
+  started in, even if its link's class changes. Each pool competes only with itself, so neither kind of client
+  can crowd out the other. A response in flight holds its encoded size about 2.4 times over in RNS (measured
+  with RNS 1.5.6: the encrypted data and its parts), and at most `CHUNK_SIZE` plus one block on a link with no
+  rate estimate, so at the defaults the fast pool holds at most about 40 MiB (16 responses of 1 MiB on links
+  with a rate estimate; about 7 MiB with none) and the slow pool a few MiB.
   - A response's **deadline** is 3 × its size at the link's rate estimate (at `unmeasured_bitrate` if it has
     none), plus `deadline_slack`. A response not finished by then is cancelled.
-  - When a pool is full, a new `/blocks` request for it displaces that pool's in-progress response with the
-    lowest throughput, if that response is older than `deadline_slack`; otherwise the new request is refused.
+  - **Displacement protection is earned by progress**, so a response that holds a slot without transferring
+    can't keep honest requests out. A response is protected from displacement only while it is within a
+    per-response **grace** the node measures itself, or while it is moving data at or above a **throughput
+    floor**. The grace is `base + 2 × (time for the advertisement to cross the path) + queue`, clamped to
+    `[grace_min, deadline_slack]`. The advertisement (one packet, `advertisement_bits`) crosses the first hop at
+    the receiving interface's configured bitrate (`Link.attached_interface`'s `bitrate`) and each further hop
+    of the request's hop count (`Link.expected_hops`, clamped, since a requester can inflate it) at
+    `unmeasured_bitrate`, or at `slow_bitrate` if RNS raised the link's MTU above 500, which it does only
+    across interfaces that configure their MTU (none of them slow radios); a hop behind a transport node may
+    be a LoRa segment however fast the node's own interface is. An unknown bitrate is priced like a further
+    hop. Attached to a shared instance, every link arrives on the local interface to it (RNS
+    `LocalClientInterface`, recognised as RNS does by its `is_connected_to_shared_instance` attribute), whose
+    bitrate says nothing about the path, so the bitrate is unknown there. On the node's own slow interface
+    (below `slow_bitrate`), `queue` is one window of parts (10 packets of 500 bytes) at its bitrate for each
+    response in flight on it: the advertisement may wait behind them, and RNS can't tell when it actually
+    leaves the radio. The grace is never derived from `link.rtt`, which the requester controls. The floor is
+    `unmeasured_bitrate / 8` bytes/s, or a small fraction of the interface's bitrate (if known) for a directly
+    connected requester.
+  - When a pool is full, a new `/blocks` request displaces one of the pool's responses, never one on its own
+    link: the response making least progress among those that are unprotected (past their grace and below the
+    floor); else, if the newcomer's receiving interface holds no slot in the pool, the oldest response with
+    nothing sent from an interface that holds two or more, once it is past half its grace and at most one
+    within a grace from each interface; else, if neither the newcomer's link nor its identity holds a slot in
+    the pool, the response with the lowest throughput, if it is older than `deadline_slack` and past its
+    grace. Otherwise the request is refused.
+  - A response that makes **no progress** is cancelled and its budget charge refunded: one with nothing sent,
+    once its grace plus `deadline_slack` has passed; any response with no progress for `stall_timeout`.
+  - **Cooldown.** A link (and its identity, if it identified) whose response was displaced or cancelled for
+    making no progress, or whose response Resource it rejected before any of it was sent (no honest requester
+    does: otherwise one could have the node build a response, reject it and ask again in a loop), is refused
+    new `/blocks` for `blocks_cooldown`. A response displaced as the slowest counts as making no progress if
+    it was moving at less than a quarter of the rate it needs to be done when due: by its deadline, or, on a
+    link with no rate estimate whose MTU RNS raised, by the deadline it would have at `slow_bitrate`. So a
+    requester taking a little of each response can't keep its slots young by displacing its own responses
+    from a spare link; an honest one keeping to its schedule is displaced without a cooldown. The refusal is
+    answered at once, before any slot is reserved or block read.
   - A handler gets no direct handle on the response Resource RNS sends for it. Responses are tracked through
     the link's outgoing Resources (`Link.outgoing_resources`, matched by `request_id`) and cancelled with
-    `Resource.cancel()`. These are RNS internals that may change between versions; if they're unavailable, a
-    response is cancelled by closing its link.
+    `Resource.cancel()` (which acts only while the Resource is not yet complete). These are RNS internals that
+    may change between versions; if they're unavailable, a response is cancelled by closing its link.
 - At most `max_incoming_links` incoming links. When full, one is closed to make room: the link idle longest
   with no request in progress, or else a random one with no `/blocks` response in progress. In private mode,
   links not identified as a member's are chosen first.
+- **Half-open links.** RNS validates every link request (a key exchange, a proof, a watchdog thread) and keeps
+  the link waiting for the initiator's RTT packet for `6 s × hops + 360 s`; only then is it established and
+  counted above. So, on `rnfs.dht` and on the LXMF delivery destination, links still waiting (RNS `PENDING`
+  or `HANDSHAKE`) are counted in a bucket of their own, also of `max_incoming_links`. When a link request
+  arrives with the bucket full, the oldest waiting link on the interface holding the most of them (the
+  request's own interface on a tie) is closed, rather than the request refused. So a flood can't fill the
+  bucket and keep everyone out, and a flood arriving on one interface closes its own links first. It does
+  shorten every handshake on that interface: at R link requests a second, a link waiting there is closed after
+  about `max_incoming_links` / R seconds (1.3 s at 100 a second, at the default), so an honest initiator
+  reaching the node over the same interface whose handshake takes longer is cut off (RNS tells it at once, and
+  it may try again), while initiators on other interfaces are not affected. Each request still costs the node
+  the key exchange and a proof; RNS's own long responder timeout is the root cause.
 - rnfs neither sends nor accepts compressed Resources. Handlers are registered with `auto_compress=False`,
   and nodes MUST set RNS's maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in
   RNS 1.5.6) to 0, since RNS decompresses before any rnfs check runs. Setting it to 0 also stops RNS
@@ -153,8 +214,19 @@ pass a `max_response_size` just above their largest honest answer.
   (rnfs requests always fit one packet), or whose transfer size exceeds its data size or `MAX_RESPONSE_SIZE`
   by more than the encryption overhead (rnfs: 128 bytes). RNS checks those limits per segment, so on
   `rnfs.dht` links (either end) a node SHOULD also reject any advertisement of more than one segment: every
-  rnfs response fits one (`MAX_RESPONSE_SIZE`). Other protocols' Resources in the same process (LXMF) are
-  not affected.
+  rnfs response fits one (`MAX_RESPONSE_SIZE`). On `rnfs.dht` links it SHOULD also reject one with metadata,
+  which RNS decodes as the Resource completes and rnfs responses never carry. Other protocols' Resources in
+  the same process (LXMF) are not affected.
+- RNS decodes a whole response with msgpack before handing it over, and one-byte empty arrays or maps decode
+  to some 70 times their size in objects (a 1 MiB response: ~70 MB and ~0.3 s of CPU). So on `rnfs.dht`
+  links a node SHOULD check a response's msgpack headers before RNS decodes it, without building objects, and
+  refuse one that can't be an rnfs response: anything but `[request_id, response]` with a 16-byte `bin`
+  request ID and a response that is `True`, `False`, `nil`, a `/find` answer, or a list of at most 26 entries
+  (the most CIDs a `/blocks` request can carry), each a `bin` of at most `MAX_BLOCK_SIZE` or `nil`, with
+  nothing after it. rnfs checks responses sent as a Resource, and those sent as one packet larger than RNS's
+  default MTU (only links that negotiated a larger MTU carry them; smaller ones decode to little). A refused
+  response fails its request as a malformed one does. A responder sends no requests, so a response packet on
+  an incoming `rnfs.dht` link is dropped unread.
 - `max_upload_rate` caps bytes sent for `/blocks` on a link once it has a rate estimate. RNS paces a Resource
   by its receiver, so the cap is applied between responses: the response budget uses the lower of the rate
   estimate and `max_upload_rate`, and the next response on that link starts no sooner than
@@ -182,20 +254,31 @@ refused by them SHOULD be answered at once, before a response slot is reserved o
   inclusive and end exclusive; a range may wrap past midnight. During a range `/blocks` MUST be refused.
 - **Upload budget** (`upload_budget`, bytes per hour, node-wide): a token bucket of `upload_budget` bytes,
   refilled continuously at `upload_budget / 3600` bytes per second, starting full.
-  - A response carrying at least one block is charged its packed size. It is allowed if the bucket holds at
-    least that size, or if the bucket is full, so one honest response larger than what is left is delayed but
-    never starved; the bucket may go into debt this way. A response refused for its size is not charged.
-  - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have at most
-    half the bucket's capacity charged in responses still in flight. Its response's block budget is cut to
+  - A response carrying at least one block costs its packed size, **charged as it is sent** (from its
+    Resource's progress), not up front. It is allowed if the bucket holds at least that size beyond what the
+    responses in flight are still committed to send, or if the bucket is full and nothing is committed, so one
+    honest response larger than what is left is delayed but never starved; the bucket may go into debt this
+    way. A response refused for its size is not charged.
+  - **Reservation and commitment.** When it is allowed, a response is charged a reservation of at most one
+    packet (the link's MDU: its advertisement). The rest of it counts as committed, when admitting other
+    responses, while it is within its grace (Displacement, above), so responses admitted together can't
+    overrun the bucket. After its grace a response commits at most what it sends at its progress rate before
+    its deadline, and nothing while it is below its floor (or has sent nothing): responses a requester never
+    downloads, or crawls through, hold at most their reservations, so a few of them can't hold admission while
+    spending nothing. A single-packet response, and one whose progress can't be followed, is charged in full
+    when it is allowed.
+  - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have
+    responses in flight costing at most half the bucket's capacity. Its response's block budget is cut to
     what is left of that share (the first block is always included, section 7), and a requester at its share
     is refused. So with a full bucket one response is at most about `upload_budget / 2`, and one requester
-    can't take the whole budget.
-  - **Settlement.** When a charged response ends without completing (it failed, was cancelled, missed its
-    deadline, was displaced, never started, or its link closed), what it didn't send is given back: the
-    charge less its progress times its size. Completed responses, single-packet responses and responses whose
-    progress can't be read keep their charge.
-  - While the bucket is not full, the response's block budget (section 7) is cut to what the bucket holds,
-    less 1 KiB.
+    can't size its responses to take the whole budget at once. Identities are free, so this shares the bucket
+    among requesters rather than bounding a determined one; what keeps a requester that withholds downloads
+    from holding the budget is that only bytes sent are charged.
+  - **Settlement.** When a response concludes (it completed, failed, was cancelled, missed its deadline, was
+    displaced, never started, or its link closed), its charge is made final: its size if it completed or its
+    progress can't be read, else its progress times its size. A reservation it didn't use is given back.
+  - While the bucket is not full, or responses in flight are committed, the response's block budget (section
+    7) is cut to what the bucket holds less what is committed, less 1 KiB.
   - A request arriving while the bucket is empty or in debt is refused before its response is built.
   - Responses of only `None` entries are not charged.
 
@@ -204,7 +287,12 @@ across shared interfaces and transport nodes, a node MAY run in private mode:
 - every link identifies;
 - handlers answer `False` to identities not on the member list (checked inside the handler, since RNS's
   `ALLOW_LIST` drops refused requests silently);
-- the routing table admits only members.
+- the routing table admits only members;
+- provider records are kept and handed out only for members: at start the node drops the records of every
+  publisher whose node ID it can't tie to a member identity (stored while it was public, or by a member since
+  removed from the list), and `/find` replies leave out any such record;
+- outgoing links go only to nodes whose identity is a member, so the node never identifies itself to an
+  outsider (one listed as a provider anywhere, say).
 
 ## 4. Content identifiers
 
@@ -414,7 +502,8 @@ big-endian integer; "closest" means smallest distance.
 **Lookups.** Query the `alpha` closest known nodes not yet queried with `/find`, merge the nodes they return,
 and repeat.
 - A returned node or provider ID with no known identity (`Identity.recall` fails) costs a path request; at most
-  `alpha` such IDs are tried per lookup.
+  `alpha` such IDs are tried per lookup. (A keeper query asks unknown keepers from a budget of its own, also
+  `alpha`, so nodes named in `/find` replies can't use it up, section 9.)
 - Nodes that fail to answer are dropped from the lookup and counted in the routing table.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
@@ -457,12 +546,14 @@ and repeat.
   a request it refused (e.g. up to a local limit), so the publisher SHOULD count every key it sent to that
   node, up to and including that request, as possibly recorded there.
 - To stop providing a CID (unpinned, deleted), a node SHOULD send it as a withdrawn key to the nodes it last
-  published it to, and to nodes of earlier rounds (or of a round cut short) whose record may not have expired:
-  the closest nodes change as nodes come and go.
+  published it to, and to nodes of earlier rounds (or of a round cut short, including by a crash) whose record
+  may not have expired: the closest nodes change as nodes come and go. So it SHOULD persist where a round
+  stored as the round goes, not only when it ends (rnfs: every 10 nodes or 30 s).
 - A responder applies a `/provide`'s withdrawals before its keys, so a key in both lists is stored. A
   publisher MUST NOT send a withdrawal of a key in a later request to the same node than a store of it (that
-  would delete what it just stored): it sends withdrawals in the first batches, and doesn't withdraw a key it
-  is providing to that node in the same round.
+  would delete what it just stored): it sends withdrawals in the first batches, doesn't withdraw a key it
+  is providing to that node in the same round, and cancels the withdrawals still queued for a key when it
+  provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
   (rnfs: at most 10 per publish round, and after a round of n lookups the next waits 30 × n s; items never
   published go first, then those unpublished longest). Withdrawals are not delayed by this.
@@ -473,27 +564,47 @@ and repeat.
 - A record expires `PROVIDER_TTL` after it was last stored, keeps its first-stored time across republishes,
   and is removed on withdrawal. These times are wall-clock and persisted; one later than the current time (a
   clock since corrected backwards) counts as now, so a record can't outlive its TTL.
-- A node keeps at most `max_records`. When full, it evicts a record of the publisher it first saw most
-  recently, so a flood of new identities displaces only itself. First-seen times are persisted, and dropped
-  once a publisher has no records left.
+- A node keeps at most `max_records`, a tenth of them in a *newcomer pool*. When the rest is full, a
+  publisher first seen before the most recent one there evicts a record of that most recent publisher (the
+  one it stored least recently), so a flood of new identities can't displace older publishers. Any other
+  publisher (one not seen before, or the most recent one) stores into the pool. A full pool evicts the
+  record pooled first of a publisher holding the most pooled records (one chosen at random if several hold
+  as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
+  always store something, a flood churns only the pool, and the pool is shared out evenly between
+  publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
+  republished while the rest has room. The node's own records are always accepted.
+- First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
+  (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
+  oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer
+  whose last record a full pool evicted keeps its first-seen time too, so a flood can't keep it new forever
+  (rnfs: at most `max_records / 100` such newcomers, at least 10; when more, the one first seen most recently
+  is forgotten).
+- A node SHOULD limit how many records one publisher holds, its own excepted (rnfs: `max_records / 100`, at
+  least 10, once the publisher has been seen for `provider_seniority`, and a tenth of that, at least 10,
+  before), so one identity can't fill the store and a fresh one gets little.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
   max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
   don't come due at once; the jittered interval stays below `PROVIDER_TTL / 2`.
 - **Provide strategy** (`provide_strategy`):
   - `roots` (default) provides every complete pin, and every complete fetched target while it is cached
-    (so at most `max_storage` of downloads at a time).
-  - `pinned` provides every complete pin only.
+    (so at most `max_storage` of downloads at a time). That is every complete download, whatever the command:
+    `get`, `cat`, and even `stat`, `info` or `ls` of another node's content when what they fetched is the
+    whole target (a small file is one block). Anyone can look up the provider records, or ask the node for
+    the blocks (section 7), and so learn what it fetched.
+  - `pinned` provides every complete pin only, so downloads are never published or served.
 
   `roots` helps popular content spread; `pinned` uses less airtime and doesn't publish what a user
-  downloads.
+  downloads. Gateway fetches are never provided under either.
   Nothing else inside a DAG is provided separately: share `<root>/<path>`, or pin the inner CID to provide
   it. Keepers also provide the keys of the names they keep (section 9), under any strategy.
 
 ## 7. Transfer
 
 **`/blocks`.**
-- **Request:** `[max_bytes, [cid, …]]`, with as many CIDs as fit in one packet.
+- **Request:** `[max_bytes, [cid, …]]`, with as many CIDs as fit in one packet. The CIDs MUST be distinct; a
+  request that repeats a CID is malformed and refused, so a node can't be made to read and serve the same
+  block several times in one response.
 - **Response:** a list in request order, one entry per CID until the budget is reached. Each entry is the
   block, or `None` if the node doesn't hold it or doesn't serve it. Entries after the last returned were not
   sent because of the budget.
@@ -502,9 +613,10 @@ and repeat.
   - `max_bytes`;
   - `MAX_RESPONSE_SIZE − 1 KiB`, so the encoded response stays within `MAX_RESPONSE_SIZE`;
   - if the link has a rate estimate, `response_target` of transfer at the lower of that estimate and
-    `max_upload_rate`;
-  - with an upload budget whose bucket isn't full, what the bucket holds, less 1 KiB, and in any case what is
-    left of the requester's half share (section 3, Airtime controls).
+    `max_upload_rate`; if it has none, `CHUNK_SIZE` (what a requester asks for then, enforced);
+  - with an upload budget whose bucket isn't full or with responses in flight committed, what the bucket holds
+    less what they are committed to send, less 1 KiB, and in any case what is left of the requester's half
+    share (section 3, Airtime controls).
 - **What a node serves:** only blocks in the DAG of a CID it currently provides (the same reachability GC
   computes). With `pinned`, cached downloads answer `None`, so a node's download history can't be read by
   asking for it. With the default `roots`, complete cached downloads are provided and served, so they can.
@@ -533,15 +645,41 @@ and repeat.
    (section 5), so a DAG can't hide its size.
 4. Writing out a DAG (`get`, `ls`, the gateway, `export`) stops with an error after `max_output_entries`
    entries, counting every occurrence. This catches DAGs that repeat empty subtrees, which have size 0.
-5. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
+5. Fetching a target's whole DAG (`get`, `pin add`, `export`, `dir set` and `dir rm`, a followed name's new
+   target, the gateway's archives, remote pins and LXMF auto-fetches) is bounded by what its verified size can
+   hold. The bytes of its distinct blocks, stored or downloaded, may not exceed the size, plus 64 bytes per
+   4 KiB of it (rounded up), plus 1 KiB, plus what its directory and index nodes bring: a directory node its
+   own bytes and 16 bytes per entry, an index node its own bytes and 16 bytes per child less 64. A remote pin's
+   or auto-fetch's quota applies too, whichever is lower. A file node may list children of size 0, and index
+   nodes of one child can be chained, so without this a file that declares 1 byte, or a directory of empty
+   files, could hold any number of distinct nodes. Every DAG built by the tree rule (section 5) stays far
+   inside the bound: its file nodes take under 13 bytes per 4 KiB of content plus under 600 bytes, which the
+   64 bytes per 4 KiB cover for any file of more than one chunk; its index nodes cost under 2 bytes per entry,
+   and at most 48 bytes a level before the entries below them arrive. A fetch that would exceed it
+   fails ("too large") without marking the root invalid. While the bound applies, a requester asks only for
+   blocks that fit the room it leaves, counting a DAG node not yet received as `MAX_BLOCK_SIZE` (under the
+   size-derived bound, a directory or index node as nothing, since it costs at most 64 bytes; under a quota,
+   in full), and always for at least one block when none is in flight, so a fetch downloads at most about one
+   block beyond either. Listing a directory (`ls`, the gateway's listings) fetches only its directory and
+   index nodes, under the same bound for a size of 0.
+6. A byte-range read (`cat`, the gateway's file responses and Range requests, a sealed file's header and its
+   decryption by `get`, `cat` and `info`) is lazy: it fetches only the chunks covering the range and the file
+   nodes above them, and skips empty children. The file nodes it meets, stored or downloaded, may not exceed
+   what the range's size can hold (as in item 5, for the range's size), plus two file nodes of 256 children
+   (13,061 bytes) for each level a file of the target's verified size can have under the tree rule with
+   chunks of 4 KiB or more (one level up to 1 MiB, seven for any size): a range ends inside at most two nodes
+   of a level. Otherwise it fails ("too large"); a requester counts a file node not yet received as
+   `MAX_BLOCK_SIZE`, as in item 5, so a small range ending in two nodes of a level asks for them one at a
+   time.
+7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
    only contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or
    misses the same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels
    the transfer, and its blocks are requested again from another provider; providers that keep failing are
    handled as in section 6. A fetch that fails or is cancelled closes the links of its requests still in
    flight, so their responses don't keep using the link and hold up the next `/blocks` to those nodes.
-6. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
+8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
-7. When the target is complete, the node provides it if its strategy says so (section 6).
+9. When the target is complete, the node provides it if its strategy says so (section 6).
 
 ## 8. Storage
 
@@ -558,6 +696,16 @@ and repeat.
 - `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
   a followed name's newer target once that is complete; removing the LXMF messages that hold it.
+- Pins are saved at once; the state that records why a source holds a pin (`names.json`, `follow.json`, the
+  LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes `name:` pins
+  match `names.json` (pinning a recorded target again, releasing the rest), and releases `follow:` pins of
+  names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
+  again). A followed name's check releases every other target its source holds.
+- That release needs the state read whole. If `follow.json` or the inbox file is missing, damaged (moved
+  aside as `.damaged`) or holds a malformed entry, such pins are kept and recorded again: a `follow:` pin's
+  name is followed again, and a sender's `lxmf:` pins get a new inbox message listing them, whose removal
+  releases them. A name key file that is there but can't be read keeps its name's pins and `names.json`
+  entry; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
   running jobs (section 11), are protected as if pinned.
 
@@ -579,10 +727,16 @@ and repeat.
 - The disk is the hard bound: a fetch (pinned or not) is refused if what it still has to store — its verified
   size, or the range's size, before downloading, then each response — would leave less than
   max(256 MiB, 2% of the filesystem) free on the filesystem holding `<rnfs dir>/blocks/`.
+- `get` and `export` write their output only if it leaves the same reserve (of the output's filesystem) free.
+  When that is the filesystem holding the blocks, what `get` still has to fetch counts too: its verified size
+  less the bytes of the target's DAG already stored. If the free space there can't be read (the directory is
+  missing, say), they fail without writing.
 
 **Shared folder.** Every `scan_interval`, files and directories in `<rnfs dir>/files/` are imported as with
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
-old pin.
+old pin. Unlike `add`, a scan MUST skip (with a log line) a regular file that has other hard links, at the
+top level and inside shared directories: it is also a file elsewhere, which whoever may write to the folder
+could have linked in. It is imported at the next scan after its other links are gone.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
@@ -604,6 +758,9 @@ old pin.
   fetched one at a time, in the order accepted, so each is checked with the earlier ones counted; a node MAY
   refuse `/pin` from a source with many pins waiting (rnfs: 64).
 - The requester learns that a remote pin is complete when the node shows up as a provider (`providers`).
+- `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
+  pins waiting (`state/remote_pins.json`, about once a second and at stop) and resumes them after a restart,
+  unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
 
 ## 9. Names
@@ -613,8 +770,14 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
 **Name keys.**
 - Each name has its own RNS identity, stored at `<rnfs dir>/names/<alias>`.
 - The name is the hash of that identity's `rnfs.name` destination: 16 bytes, shown as 32 hex characters.
-- Separate keys mean names can't be linked to each other or to the node, and a name can be moved to another
-  machine by exporting its key.
+- A separate key per name means a name can be moved to another machine by exporting its key, and that the name,
+  its announces and its signed records carry nothing that identifies the node or the node's other names.
+- Publishing a name does link it to the node, as providing content does in IPFS (a provider record reveals
+  the PeerID providing a CID). The owner keeps its own names (Keepers, below), so it provides each name's key
+  under its node ID, usually with the oldest record; and it pins and provides each name's target. Anyone who
+  knows a name can look up its keepers and its target's providers and find the owner's node ID there, so the
+  names one node publishes can be linked to that node and to each other. Only names published from different
+  nodes are unlinked.
 
 **Record.**
 - The name destination's announce `app_data` is `[sequence, cid]` (msgpack: unsigned integer, binary CID).
@@ -624,10 +787,12 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
 
 **Publish** (`name publish <alias> <cid>[/path]`):
 1. Resolve any path to a CID locally.
-2. Pin the target with source `name:<alias>`, and release that source from the previous target.
+2. Pin the target with source `name:<alias>`.
 3. Set the record with `sequence` one higher than both the publisher's stored sequence and the highest it can
-   resolve, and persist it.
-4. Announce, and re-announce every `announce_interval`.
+   resolve, and persist it. If that fails, the publish fails and a pin step 2 added is released.
+4. Release that source from the previous target (only now, so a crash leaves the target the persisted record
+   names pinned; any other pin of the source is released at the next start, section 8).
+5. Announce, and re-announce every `announce_interval`.
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
@@ -637,10 +802,32 @@ the name through the network and asks keepers (below), since the key's earlier r
 - To refresh, call `Transport.request_path(name)`, wait up to `path_timeout`, then read
   `Identity.recall_app_data(name)`.
 - If the path request heard nothing within `path_timeout` (or always, with `keeper_query = always`), ask
-  keepers (below): find providers of the name's key (section 6, stopping once `alpha` are known), ask up to
-  `alpha` of them with `/name`, and offer every verifying record to the sequence rules. A keeper query (a DHT
-  lookup plus up to `alpha` requests) costs roughly ten times the airtime of a resolve a path response
-  answers, so `always` SHOULD NOT be used on slow links.
+  keepers (below). Storing a provider record is free, and so is answering `/find`, so neither a record's age,
+  nor the order a reply lists it in, nor how many nodes list it may decide which keepers are asked. Standing
+  is read from the routing table as it was when the query started: a node the lookup meets doesn't gain rank
+  from answering it, and one that fails a query meanwhile loses rank. An *established* node is one that was
+  in the table for over `provider_seniority` then, and hasn't failed a query since last heard nor been silent
+  for 2 × `announce_interval`.
+  - Find providers of the name's key (section 6). Providers recorded locally are candidates, never a reason
+    to skip the search, which runs until 3 × `alpha` are known and two established sources listed some, or
+    until the lookup is complete. A source is a node whose `/find` answer listed providers, or this node if
+    it holds a record stored by an established publisher.
+  - Rank the candidates by routing-table seniority, as providers are (section 6): established servers first,
+    then other servers in the table, then servers that failed a query or went silent (an owner that has
+    left), then IDs not in the table; at random within each group.
+  - Ask them with `/name`, a batch of `alpha` at a time, and offer every verifying record to the sequence
+    rules, so the highest valid sequence wins. Each batch takes first, in rank order, candidates listed by a
+    source no earlier candidate of the query was listed by (this node holding a record, an established node,
+    or, counted as one source, none of these), then the rest in rank order. A candidate whose identity isn't
+    known (each costs a path request) is asked within a budget of `alpha` such candidates per query, apart
+    from the lookup's (section 6). Ask another batch while no answer reaches the highest sequence already
+    known for the name (from an announce, an earlier resolve or a kept record), or while fewer than two
+    keepers have answered; when no sequence is known, only established keepers' answers count toward those
+    two. At most 3 batches. A slow node (`alpha` 1) asks at most 2 batches, and asks the second for want of a
+    second answer only when it knows no sequence to compare the first against.
+
+  A keeper query (a DHT lookup plus a few requests) costs roughly ten to twenty times the airtime of a
+  resolve a path response answers, so `always` SHOULD NOT be used on slow links.
 - Return the record with the highest sequence held, and how long ago it was heard (for a record from a
   keeper, from its signed emission time, never in the future).
 
@@ -649,8 +836,16 @@ what prevent rollback.
 - For every name this node has published, or resolved through the CLI or API, it MUST persist the highest
   sequence seen, and never accept a lower one from any source.
 - At equal sequence, the record already held is kept.
-- Records for other names (heard, or resolved by the gateway) are kept only in a table of at most
-  `name_table_size` entries, least recently used evicted first.
+- Records for other names (heard, or resolved by the gateway or LXMF auto-fetch) are kept only in a table of
+  at most `name_table_size` entries, least recently used evicted first. An announce of a name the node isn't
+  resolving or keeping takes a place only if one is free or held by another name that was only heard, so a
+  flood of announces of new names can't push out the names the node resolved.
+- For names resolved without being persisted (gateway, auto-fetch), the node SHOULD persist the highest
+  sequence it returned, as a floor below which no record of that name is accepted, so such a resolve never
+  goes back after table churn or a restart. The record itself isn't persisted. (rnfs: up to
+  4 × `name_table_size` names, least recently resolved forgotten first, except that names resolved in the
+  last 7 days are kept up to 8 × `name_table_size`; saved by a resolve that raises the floor, at most every
+  5 s, otherwise at least every minute and at shutdown.)
 - Records from keepers are subject to the same persisted-sequence and no-rollback rules as announces.
 - A record this node keeps (below) is a floor for resolving that name: it MUST be offered to the sequence
   rules at startup and on every resolve, so an older validly signed announce is never accepted for a kept
@@ -675,8 +870,10 @@ resolves after its owner's announce has expired from the network.
   once it holds a record of the name. The
   prefix keeps these keys apart from CID keys (SHA-256 of a 36- or 39-byte binary CID).
 - **What is kept.** A node keeps the names its user keeps (`name keep`) or follows, at most `keep_max_names`,
-  and MUST keep its own published names, with records it signs itself, so they resolve through it. Each kept
-  name costs a provider record republished by this node (and, if followed, a pin), hence the small default.
+  and MUST keep its own published names, with records it signs itself, so they resolve through it. Keeping
+  advertises the node's ID under the name's key, which links the node to every name it keeps or publishes
+  (Name keys, above). Each kept name costs a provider record republished by this node (and, if followed, a
+  pin), hence the small default.
   Kept names still without a record are asked for again every `announce_interval`, in turn (rnfs: at most 64
   per round, continuing after the last one asked).
 - **Refreshing.** A keeper replaces its record when it gets a verifying record with a higher sequence, or the
@@ -688,7 +885,9 @@ resolves after its owner's announce has expired from the network.
 
 **Following.** A node MAY *follow* a name (`name follow`): it keeps the name and pins its latest target with
 source `follow:<name>`. When the name moves, the new target is fetched completely in the background and
-pinned, and only then is the previous target's follow pin released, so a complete copy is always held. A
+pinned, and only then is the previous target's follow pin released, so a complete copy is always held. The
+fetch has the usual limits: `max_download_size`, the DAG byte bound of its new target's size (section 7) and
+the disk reserve (section 8). A
 followed name is checked when a newer record is heard and every `announce_interval`.
 - The periodic check uses the record held, unless nothing was heard for the name for
   2 × `announce_interval`; only then does it resolve through the network (a path request, then keepers).
@@ -719,7 +918,7 @@ as is cheap. Rules live in the sections referenced.
 | Threat | Protection |
 |---|---|
 | Forged or corrupted data | Every block verified against its CID (7) |
-| Size lies, repeated or empty-subtree bombs, deep trees | Verified sizes, `max_download_size`, `max_output_entries`, `MAX_DEPTH`, each block fetched once (5, 7) |
+| Size lies, repeated or empty-subtree bombs, deep trees | Verified sizes, `max_download_size`, `max_output_entries`, the DAG byte bounds of whole-DAG fetches, listings and byte-range reads, `MAX_DEPTH`, each block fetched once (5, 7) |
 | Malformed DAG nodes | Strict msgpack types, re-encoding and per-node checks (5). The tree rule gives honest writers one CID per content; readers don't enforce it |
 | Advertising on someone else's behalf | Records name only the identified requester (6) |
 | Advertising content it doesn't have, or stale records | Failed providers removed; the search runs again; withdrawals (6, 7) |
@@ -727,15 +926,15 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement of the slowest response within separate slow and fast pools; requester stall detection (2, 3, 7) |
-| Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links (3) |
-| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes (3, 7, 13) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected unsent, or fell far behind its schedule; many fast-link slots; requester stall detection (2, 3, 7) |
+| Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
+| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
-| Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked (9) |
+| Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
-| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
-| Uploads exhausting a shared channel | `upload_budget` (at most half of it per requester in flight, unsent parts refunded), interface rules and quiet hours, applied to `/blocks` only (3) |
+| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
+| Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
 | Republishing and retries draining airtime | Small `keep_max_names`; slower, jittered republishing of name keys; paced lookups on slow nodes; follow backoff (6, 9) |
 
@@ -753,9 +952,12 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 **Privacy** (outside private mode, where every link identifies).
 - Lookups and downloads use unidentified links, so the nodes asked learn only that *some* node wants a key.
 - Publishing uses a separate identified link, never reused.
-- With the default `roots` strategy, complete downloads are published and served while cached, which
-  reveals them. With `pinned`, downloads are neither published nor served. Gateway fetches never are.
+- With the default `roots` strategy, complete downloads (by any command, `cat` and `stat` included) are
+  published and served while cached, so anyone can learn what the node fetched. With
+  `pinned`, downloads are neither published nor served. Gateway fetches never are.
 - DHT keys don't hide which CID is wanted from someone who already knows the CID.
+- Provider records are public: anyone can look up which node IDs provide a CID, or keep a name. A node's own
+  names are linked to it this way (section 9).
 - Transport nodes on the path see traffic volume and timing.
 - Content is public by CID. Sealed files (section 5) keep their content and name from everyone but their
   recipients, not their size or recipient list.
@@ -771,15 +973,25 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   make that key hard to find (a Sybil attack); it can't forge data. `get <cid> --from <node ID>` bypasses
   the DHT when a provider is known.
 - Patient attackers that keep identities alive for days defeat the preference for old records and long-known
-  providers.
+  providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
+  answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
+  sequence or reaches a keeper they don't list (one recorded locally, or listed by another established node).
+- A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
+  newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
+  while fewer than the bounded number of newcomers first seen before it were evicted too.
 - Bans are evaded by switching identity; they only make an attacker pay for a new one.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
+- RNS decrypts and decodes every request packet and starts a thread for it before rnfs sees it, so a link
+  sending requests as fast as its interface carries them still costs the node that work (about 0.14 ms of CPU
+  each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
+  `/blocks` responses only after RNS has received them can be made to build one per cooldown per link, and
+  RNS spends a key exchange on every new link.
 - Any web page can make the local gateway fetch content (a plain request to `127.0.0.1` passes the Host
   check), and can time responses to guess what is cached. The gateway's own limits (section 11) bound the
-  airtime this costs: `gateway_fetches`, and no archives of content not already stored for a web page's
-  request or a `HEAD`.
+  airtime this costs: `gateway_fetches`, and no `?format=` response (raw block or archive) at all for a web
+  page's request or a `HEAD`.
 - Every local user can use the gateway, and can make it or the API busy by holding connections up to the
   cap (section 11); the API itself needs the token.
 - Unidentified links can still be tied to their sender by path and timing, e.g. a publisher's `/find` just
@@ -788,6 +1000,30 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   link's rate estimate at the responder; the effect is limited to that link.
 - An attacker that behaves exactly like a slow-link client competes fairly for the slow pool's slots, and
   can't be told apart from one.
+- Displacement protection and the cooldown stop a requester holding a response slot without transferring, and
+  the cooldown binds a link and its identity. But each unidentified link is its own requester, and where links
+  all arrive over one interface (a single upstream transport node, or every link of a node attached to a
+  shared instance), nothing at admission tells them from honest requesters on it: a newcomer with no history
+  looks the same either way. So a pool can still be kept busy in two ways (Medium). Measured with the test
+  fakes over 10 simulated minutes, an honest requester fetching every ~10 s (three tries 2 s apart) and the
+  attacker asking every 50 ms over the same TCP interface, reporting two hops:
+  - **Slow downloaders.** Links that each download their responses at about the rate they need to be done when
+    due keep their slots: 18 links pulling ~1.3 kB/s each (~21 kB/s in all) held the 16 fast slots, and the
+    honest requester was refused 95% of the time. At 300 B/s each, or taking one part of each response and
+    renewing it from a spare link, they were cooled down (refused 4–7%; before, 3 links taking one part each,
+    ~90 B/s in all, held the then two fast slots: 98%).
+  - **Fresh-link churn.** A new unidentified link for each request, holding a slot for a grace (or, taking one
+    part, until displaced as the slowest after `deadline_slack`) and never asking again: one new link a second
+    taking one part each (~0.7 kB/s) left the honest requester refused 35% of the time, two a second 63%, and
+    ten a second taking nothing 81%.
+  A fixed set of links used in turn needs about `slots × (blocks_cooldown + hold) / hold` links (176 for the
+  fast pool at the defaults, with a 30 s hold), more than `max_incoming_links` admits; 40 links taking one
+  part each were refused 11% of the time. Limits on young links or on new links per interface would hold back
+  honest peers reaching the node through one transport node; a waiting list giving freed slots to the
+  requester refused longest ago only shares slots per link, which the attacker multiplies (measured over real
+  RNS: no change, honest refusal 0.95–1.0 either way). The hold is not free: the attacker must keep
+  downloading, or keep opening links. An operator under such an attack can raise `fast_blocks_responses`, or
+  `blocks_cooldown`.
 - An outside web site can frame a gateway page and receive public content from it by `postMessage` (outside
   private mode, only content public by CID).
 
@@ -800,11 +1036,11 @@ are local conveniences, not part of the protocol.
 |---|---|
 | `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files); `--chunker fastcdc` uses content-defined chunks (section 5) |
 | `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; `--raw` writes the stored bytes |
-| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--block` writes the CID's own block |
+| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
 | `stat <cid>[/path]` | Size, block count, and how much is held locally |
 | `dir set <cid>[/path] <name> <cid> [--exec]`, `dir rm <cid>/<path>` | Make a new directory with an entry added, replaced or removed, and pin it with source `user` (fetching the complete directory, file contents included) |
-| `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]` | Manage pins; `ls` shows their sources and a local name: where each was added from on this machine (recorded locally, never sent), the shared-folder entry, or what a stored directory holds |
+| `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: where each was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds |
 | `pin remote add\|rm <node ID> <cid>` | Remote pinning |
 | `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
 | `providers <cid>` | Find nodes providing a CID |
@@ -818,7 +1054,7 @@ are local conveniences, not part of the protocol.
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, LXMF address |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, LXMF address (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -836,13 +1072,22 @@ gateway can never reach the API.
   DNS rebinding.
 - Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
-  `<rnfs dir>/api_token` with mode 0600; the CLI reads it from there and refuses a file other users can
-  access. Every local process, of every user, can connect to `127.0.0.1`, and the API reads and writes
+  `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
+  SYSTEM); the CLI reads it from there and refuses a file other users can access. Every local process, of every user, can connect to `127.0.0.1`, and the API reads and writes
   files as the daemon's user, so only users who can read the rnfs directory may use it. Web pages can't
   learn the token, and the custom header needs a CORS preflight, which fails: this also blocks cross-site
-  requests. Status stays open for health checks.
+  requests. `GET /api/status` stays open for health checks and the proof check below, but without the
+  token it MUST say no more than the daemon's version (rnfs: `{"version": ...}`); the full status (node ID,
+  identity hash, LXMF address, traffic) needs the token like every other request.
 - The daemon MUST refuse to start if the rnfs directory belongs to another user or can't be made accessible
-  to its owner only (outside Windows, where it relies on the ACL inherited from the user's profile).
+  to its owner only (on Windows: a protected access list allowing only the user and SYSTEM, which the files
+  below it inherit; Administrators are tolerated where an older version left them). On Windows a new rnfs
+  directory and its subdirectories MUST get that access list when they are created (not after), the daemon
+  MUST refuse a new one that already holds anything, and one that is a junction or symlink. The settings file
+  (`rnfs.toml`) and the identity MUST be checked before use, through the handle they are read from: one owned
+  by another user (account) is refused, one others may access is made private (with a warning), and one that
+  can't be made private stops rnfs. The identity MUST also be a regular file (not a symlink, FIFO or device);
+  anything else stops the daemon with an error.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it first sends the token, the CLI checks this proof with a `GET /api/status`, so a program another
@@ -862,23 +1107,28 @@ gateway can never reach the API.
     the whole file sent.
   - `/rnfs/` responses carry `ETag: "<cid>"` and `Cache-Control: immutable`.
   - Sealed files are served as `application/octet-stream`, whatever their name says, and never decrypted;
-    the gateway reads a file's first bytes to recognise them. A `HEAD`, or a range not starting at byte 0,
-    uses those bytes (to recognise a sealed file, or to sniff) only if they are already stored, and never
-    fetches them: its Content-Type then comes from the name, or is `application/octet-stream`.
+    the gateway reads a file's first bytes to recognise them. The user's own `HEAD`, or range not starting
+    at byte 0, uses those bytes (to recognise a sealed file, or to sniff) only if they are already stored,
+    and never fetches them: its Content-Type then comes from the name, or is `application/octet-stream`. A
+    request that isn't the user's own navigation (below) always reads them, fetching them if need be, so its
+    Content-Type doesn't depend on what the node stores.
 - **Trustless responses** (`/rnfs/` only; `/name/` answers `?format=` with 400):
   - `/rnfs/<cid>?format=raw` returns the CID's own block, re-verified, as `application/vnd.rnfs.raw`; a path
     is refused (400).
   - `/rnfs/<cid>[/path]?format=archive` returns an archive (section 8) of the target, as
     `application/vnd.rnfs.archive` with `Content-Disposition: attachment; filename="<target cid>.rnfs-archive"`
     and an exact `Content-Length`; it is byte-identical to `rnfs export`. Its length must be known before
-    its first byte, so it needs the whole DAG: a request that isn't the user's own navigation (`Sec-Fetch-Site`
-    present and not `none`) and any `HEAD` get an archive only of a target stored completely on the node,
-    and otherwise `409 Conflict`. The user's own `GET` fetches the whole DAG first, within
-    `max_download_size` and `max_output_entries` (413 otherwise), and the fetch is cancelled if the client
-    disconnects. A bare-CID `If-None-Match` revalidation is answered 304 before anything else.
+    its first byte, so the user's own `GET` fetches the whole DAG first, within `max_download_size` and
+    `max_output_entries` (413 otherwise), and the fetch is cancelled if the client disconnects.
+  - Every format is answered only to the user's own `GET`, which fetches what isn't stored. A request that
+    isn't the user's own navigation (`Sec-Fetch-Site` present and not `none`) and any `HEAD` get
+    `409 Conflict`, whether the target is stored or not, without the node fetching anything. A browser
+    downloads both types, and a frame of a download fires no load event while an error page does, so an
+    answer that depended on what is stored (a download for stored content, a fetch that fails or a `503` for
+    the rest) would tell web pages what the node stores. A bare-CID `If-None-Match` revalidation is answered
+    304 before anything else. Formats therefore never use `gateway_fetches`. Unknown formats get 400.
   - Both carry `ETag: "<target cid>.raw"` or `"<target cid>.archive"` and `Cache-Control: immutable`
-    (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, the CORS rule, and for
-    `?format=raw` `gateway_fetches`) applies. Unknown formats get 400.
+    (`If-None-Match` answers 304), and every other gateway rule (the CSP, nosniff, no CORS headers) applies.
 - **Directories.**
   - A directory path without a trailing slash redirects to the slash form.
   - It is served as its `index.html` if present, otherwise as an HTML-escaped listing.
@@ -886,17 +1136,26 @@ gateway can never reach the API.
   allow-scripts allow-forms allow-popups; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
   form-action 'self'`. Pages run in an opaque origin and can't load resources from other servers;
   navigation and WebRTC can still reveal the viewer. A node MAY disable scripts (`gateway_scripts`).
-- A `500` response says only that an internal error happened; its details, which may name local paths, go to
-  the log, since a gateway page may be allowed to read the response (below).
-- `GET` (and `HEAD`) responses carry `Access-Control-Allow-Origin: *` only when the request's `Referer` has the
-  gateway's own origin (`127.0.0.1:8789` or `localhost:8789`), so pages can `fetch()` files in their own DAG
-  despite their opaque origin, while other web sites can't read rnfs content directly. In private mode the
-  header is never sent.
+- The gateway's own refusals (a bad path or CID, a method other than GET or HEAD, a `409` or `416`…) and a `404`
+  say what went wrong. Any other error from the node (`400`, `413`, `422`, `503`, `507` or `500`) gets only a
+  fixed message for its status; the details, which may name local paths, disk space or limits, go to the log.
+- No response carries `Access-Control-*` headers, whatever the request's `Origin` or `Referer`. Pages run in an
+  opaque origin, so they can load files of their own DAG as subresources (images, scripts, style sheets,
+  frames) but can't read gateway responses with `fetch()` or `XMLHttpRequest`, and neither can other web
+  sites. A gateway MUST NOT allow `Origin: null`: every site's sandboxed frames and `data:` pages send it.
+  A separate origin per root (e.g. a subdomain per CID) would let pages read their own DAG; that is possible
+  future work.
 - Content fetched for the gateway is cache and is never provided. Names it resolves go only into the capped
   table (section 9).
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
   `gateway_fetches` network fetches or name resolutions at a time. Content already stored is served without
-  limit.
+  limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
+  user started (address bar, bookmark); a request without it comes from a local tool the user runs.
+- Apart from timing, the `gateway_fetches` limit and content no provider has, a web page's request gets the
+  same answer whether the node stores the content or has to fetch it. The limit is a known, accepted leak: while a
+  page keeps every slot busy with fetches, stored content is still served and content that needs a fetch gets 503,
+  so the page can tell them apart. Like the timing difference, closing it would cost more than it protects.
+  None of these applies to `?format=`, which a web page's request never gets (409, above).
 - The gateway never expands contact nicks (`/name/<nick>/` is not supported), so web pages can't use or probe
   the address book.
 
@@ -965,10 +1224,11 @@ constants are fixed in section 5; they matter only to writers that choose them a
 **Local settings.** Each node may change these. Settings have exact types: whole numbers are integers (`true`
 is not 1), flags are `true` or `false`, rates (bits/s) and times (seconds, at most 30 days) are finite numbers.
 Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_parallel_providers`,
-`max_failures`, `max_incoming_links` and `min_rate_sample` are at least 1; other sizes and counts at least 0;
-rates above 0; times above 0, except `startup_announce_delay`, `provider_seniority`, `deadline_slack` and
-`ban_time`, which may be 0. `members` and `remote_pin_identities` are lists of identity hashes (32 hex
-digits). A node MUST NOT start with an invalid setting.
+`max_failures`, `max_incoming_links`, `fast_blocks_responses` and `min_rate_sample` are at least 1; other
+sizes and counts at least 0; rates above 0; times above 0, except `startup_announce_delay`,
+`provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
+`remote_pin_identities` are lists of identity hashes (32 hex digits). A node MUST NOT start with an invalid
+setting.
 
 | Name | Default | Notes |
 |---|---|---|
@@ -983,23 +1243,25 @@ digits). A node MUST NOT start with an invalid setting.
 | `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit) |
 | `startup_announce_delay` | 30 s | Second announce after startup |
 | `max_parallel_providers` | 3; 1 on slow nodes | |
-| `provider_seniority` | 1 day | Providers in the routing table this long are tried first |
+| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first; a publisher seen this long gets its full share of the provider store |
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
-| `stall_timeout` | 120 s | |
+| `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
+| `blocks_cooldown` | 300 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
 | `path_timeout` | 30 s | Waiting for an RNS path |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |
 | `link_idle_timeout` | 5 min | |
 | `max_incoming_links` | 128 | |
-| `max_blocks_responses` | 4 | `/blocks` responses in progress, in total; half for slow links. At least 2 |
+| `max_blocks_responses` | 4 | `/blocks` responses in progress on slow links: half of this; the rest for other links, unless `fast_blocks_responses` is more. At least 2 |
+| `fast_blocks_responses` | 16 | `/blocks` responses in progress on links that aren't slow, if more than the rest of `max_blocks_responses` |
 | `max_upload_rate` | none; half the rate estimate on slow links that have one | |
 | `max_records` | 100 000 | |
 | `ban_time` | 1 h | |
 | `max_storage` | 10 GiB | |
 | `max_download_size` | none | |
 | `max_output_entries` | 100 000 | |
-| `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API |
+| `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API (four times as many sequence floors, section 9) |
 | `remote_pin_quota` | 1 GiB per remote identity | |
 | `remote_pin_identities` | empty | Identities allowed to send `/pin` |
 | `private` | off | Private mode (section 3) |
@@ -1013,7 +1275,7 @@ digits). A node MUST NOT start with an invalid setting.
 | `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |
 | `verbosity` | 0 | Extra logging: 1 per-query detail, 2 RNS debug output |
-| `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket, at most half of it per requester in flight, unsent parts refunded (section 3) |
+| `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket charged for bytes sent, at most half of it per requester in flight (section 3) |
 | `serve_interfaces` | empty (all) | Serve `/blocks` only on these RNS interfaces (names or prefixes, case-insensitive; a spawned interface also matches its parent's name) |
 | `no_serve_interfaces` | empty | Never serve `/blocks` on these interfaces; takes precedence over `serve_interfaces` |
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
@@ -1107,11 +1369,18 @@ unreserved, pct-encoded: as in RFC 3986
   decompression is bounded to 1 MB.
 
 **Receiving.**
+- Senders in `lxmf_accept_from` or `lxmf_auto_fetch_from`, and LXMF contacts (section 11), are *trusted*.
+  Anyone else can make as many LXMF identities as they like, so the bounds below protect trusted senders'
+  messages from them.
 - A message is accepted only once LXMF has validated its signature with the sender's identity. A message from
-  a sender whose identity isn't known yet is held (at most 32, for up to 2 minutes; when 32 are held, further
-  ones are dropped, so held ones are not pushed out) while a path request fetches it, then validated. The
-  source of such a message is unauthenticated until its identity is known, so path requests for held senders
-  are sent at most once per sender per 2 minutes, and at most 3 at once, then one per 10 seconds node-wide.
+  a sender whose identity isn't known yet is held while a path request fetches it, then validated: at most
+  32, at most 8 claiming one sender, for up to 2 minutes, and only 30 seconds after its path request was sent
+  (or after it arrived, if later) if no answer has made the identity known. A ninth message claiming one
+  sender takes the place of the oldest of its 8, so forgeries sent first can't keep the sender's real message
+  out. When 32 are held, a further one is dropped, so held ones are not pushed out, unless it claims a trusted
+  sender: then it takes the place of the newest message held for the untrusted sender holding the most. The source of such a message is
+  unauthenticated until its identity is known, so path requests for held senders are sent at most once per
+  sender per 2 minutes, and at most 3 at once, then one per 10 seconds node-wide, trusted senders first.
 - If `lxmf_accept_from` is not empty, messages from other senders (except those in `lxmf_auto_fetch_from`)
   are ignored, and those from unknown senders are not held. Messages without rnfs links are ignored.
 - The links come from the field if it is valid, else from the first 16 384 characters of the content. A link
@@ -1121,11 +1390,17 @@ unreserved, pct-encoded: as in RFC 3986
 - At most 500 messages and 4 MiB (as JSON) are kept, and at most 50 from one sender not in
   `lxmf_auto_fetch_from`. To make room, the oldest message holding no auto-fetched pins (none pinned or
   queued) is dropped; a message holding pins is not dropped for others' messages: if every kept message holds
-  pins, a new message without any is not kept (and one with pins pushes out the oldest). Each message's
-  record is at most 16 KiB as JSON: links beyond that are dropped (the first is always kept), then text is
-  cut.
+  pins, a new message without any is not kept (and one with pins pushes out the oldest). A trusted sender's
+  message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
+  message without pins is left; a new message from an untrusted sender that would need one dropped is not
+  kept. New messages from untrusted senders are also rate limited: each sender has an allowance of 4 at once,
+  then one per 15 minutes, and within it messages are taken from a node-wide bucket of 32 at once, then one
+  per minute; others are not kept. So one sender can't keep the node-wide bucket empty for everyone else. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
+  first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `lxmf:<sender address>`, one fetch at a time (at most 64 waiting; further links are skipped). Auto-fetches
+  `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
+  do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
+  whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or
   removing the message stops a fetch in progress. The fetch is refused if the target's verified size plus what
   that source already pins would exceed `lxmf_auto_fetch_quota`, or if the blocks of its DAG would (as for

@@ -7,6 +7,7 @@ remove() retry for about a second while the file is in use; elsewhere they are p
 import errno
 import os
 import secrets
+import stat
 import sys
 import time
 
@@ -24,6 +25,11 @@ PARTIAL_PREFIX = ".partial-"
 
 # Seconds slept between attempts while Windows reports a file in use: about 1 s in all
 RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25)
+
+_REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+# Reparse tags with this bit are name surrogates: they stand for another file or directory (symlinks,
+# junctions, WSL symlinks), unlike placeholders such as OneDrive's that hold the file itself
+_REPARSE_NAME_SURROGATE = 0x20000000
 
 # Device names Windows reserves in every directory, with or without an extension (also as superscript digits)
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
@@ -124,12 +130,82 @@ def sync_directory(directory: str):
         os.close(fd)
 
 
+def final_path(fd: int) -> str | None:
+    """The path the system holds for the file open as fd, every link and junction resolved; None where the
+    platform can't say. Raises OSError if it can but fails.
+
+    What was opened, not where its path leads now: a directory swapped for a link after the open can't change
+    it. Linux reads /proc/self/fd, macOS asks fcntl(F_GETPATH) and Windows GetFinalPathNameByHandleW (by the
+    real platform, not IS_WINDOWS, which tests patch).
+    """
+    if os.name == "nt":
+        return _windows_final_path(fd)
+    if sys.platform.startswith("linux"):
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except FileNotFoundError:
+            return None  # no /proc mounted
+        return path if path.startswith("/") else None  # e.g. "anon_inode:[...]": not a file at a path
+    if sys.platform == "darwin":
+        import fcntl
+        if hasattr(fcntl, "F_GETPATH"):
+            return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+    return None
+
+
+def strip_windows_prefix(path: str) -> str:
+    r"""A path from GetFinalPathNameByHandleW in the form os.path.realpath gives: \\?\C:\x as C:\x and
+    \\?\UNC\server\share\x as \\server\share\x."""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def _windows_final_path(fd: int) -> str:
+    """final_path on Windows: GetFinalPathNameByHandleW on the descriptor's handle, in drive-letter form."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    function = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
+    function.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    function.restype = wintypes.DWORD
+    handle = msvcrt.get_osfhandle(fd)
+    size = 1024
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        length = function(handle, buffer, size, 0)  # 0: FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+        if length == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if length < size:
+            return strip_windows_prefix(buffer.value)
+        size = length + 1  # the buffer was too small, and length is what it needs
+
+
+def is_link(st: os.stat_result) -> bool:
+    """True for a symlink, a Windows directory junction (which stat reports as a directory, yet it links) or any
+    other Windows reparse point that stands for another file (a name surrogate); st is from lstat."""
+    tag = getattr(st, "st_reparse_tag", 0)
+    return stat.S_ISLNK(st.st_mode) or tag == _REPARSE_JUNCTION or bool(tag & _REPARSE_NAME_SURROGATE)
+
+
+def is_below(path: str, root: str) -> bool:
+    """True if path is root or inside it; both should be real (resolved) paths. Case-insensitive on Windows."""
+    path, root = os.path.normcase(path), os.path.normcase(root)
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False  # on different drives, or one relative
+
+
 def _temp_path(directory: str) -> str:
     """A new, unpredictable name for a temporary file in directory."""
     return os.path.join(directory, PARTIAL_PREFIX + secrets.token_hex(8))
 
 
-def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = True, exclusive: bool = False):
+def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = True, exclusive: bool = False,
+                 private: bool = False):
     """Replace path with data, so a crash or power loss leaves the old or the new file whole. Raises OSError.
 
     data goes to a new temporary file in path's directory (O_EXCL, plus O_NOFOLLOW where it exists, i.e. not on
@@ -137,8 +213,10 @@ def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = T
     disk and renamed over path (retried on Windows while path is in use); a symlink at path is replaced, not
     written through. If durable, the
     directory is then synced so the rename survives a power loss too. With exclusive, an existing path is kept
-    and FileExistsError raised instead. On any failure before the rename the temporary file is removed and path
-    is left as it was.
+    and FileExistsError raised instead. With private (for keys and the API token, written with mode 0600), on
+    Windows, where mode sets no access list, the file also gets a protected DACL for this user and SYSTEM only
+    (winacl.make_private) before it takes path's place. On any failure before the rename the temporary file is
+    removed and path is left as it was.
     """
     directory = os.path.dirname(path) or "."
     temp = _temp_path(directory)
@@ -149,6 +227,11 @@ def write_atomic(path: str, data: bytes, *, mode: int = 0o644, durable: bool = T
             f.write(data)
             f.flush()
             os.fsync(f.fileno())  # else a power loss can leave path empty once renamed
+        if private and IS_WINDOWS:
+            from rnfs import winacl
+            # By path, once closed (the handle written through can't change its DACL), retried while a virus
+            # scanner has the new file open
+            _retrying(winacl.make_private, temp)
         if exclusive:
             rename_new(temp, path)
         else:

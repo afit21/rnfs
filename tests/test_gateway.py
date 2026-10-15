@@ -86,20 +86,15 @@ class HeaderTest(GatewayTestCase):
             self.assertEqual(self.get(f"/rnfs/{self.text}", host=host)[0], 403, host)
         self.assertEqual(self.node.called("info"), [])
 
-    def test_cors_only_for_own_referer(self):
+    def test_no_cors_headers(self):
+        # Not even for a gateway Referer (which sandboxed pages never send) or Origin: null (which every site's
+        # sandboxed frames send): no web page may read gateway responses
         path = f"/rnfs/{self.text}"
-        for referer in (f"http://127.0.0.1:{self.port}/rnfs/{self.root}/page.html", f"http://localhost:{self.port}/"):
+        for headers in ({"Referer": f"http://127.0.0.1:{self.port}/rnfs/{self.root}/page.html"},
+                        {"Referer": f"http://localhost:{self.port}/"}, {"Origin": "null"}, {}):
             for method in ("GET", "HEAD"):
-                headers = self.get(path, {"Referer": referer}, method=method)[1]
-                self.assertEqual(headers["Access-Control-Allow-Origin"], "*", referer)
-            # Errors too, so a page can tell a missing file from a blocked one
-            self.assertEqual(self.get(f"/rnfs/{self.root}/missing", {"Referer": referer})[1]
-                             ["Access-Control-Allow-Origin"], "*")
-        for referer in (None, "http://evil.example/", f"http://127.0.0.1:{self.port + 1}/",
-                        f"https://127.0.0.1:{self.port}/", f"http://127.0.0.1:{self.port}.evil.example/", "garbage"):
-            headers = self.get(path, {"Referer": referer} if referer else {})[1]
-            self.assertNotIn("Access-Control-Allow-Origin", headers, referer)
-        self.assertEqual(self.get(path)[1]["Vary"], "Referer")
+                self.assertNotIn("Access-Control-Allow-Origin", self.get(path, headers, method=method)[1], headers)
+            self.assertNotIn("Access-Control-Allow-Origin", self.get(f"/rnfs/{self.root}/missing", headers)[1])
 
     def test_scripts_off(self):
         self.config.gateway_scripts = False
@@ -205,16 +200,15 @@ class FileTest(GatewayTestCase):
         self.assertNotIn("ETag", headers)
 
     def test_500_body_names_no_local_path(self):
-        # A gateway page may read error responses (the CORS rule): the detail goes only to the log
+        # A node error's text may name local paths: the detail goes only to the log
         error = OSError(28, "No space left on device", "/home/alice/.rnfs/blocks/abc")
-        referer = {"Referer": f"http://127.0.0.1:{self.port}/rnfs/{self.root}/"}
         with mock.patch.object(self.node, "info", side_effect=error), mock.patch("rnfs.gateway.log") as log:
-            status, headers, body = self.get(f"/rnfs/{self.text}", referer)
-        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (500, "*"))
+            status, headers, body = self.get(f"/rnfs/{self.text}")
+        self.assertEqual(status, 500)
         self.assertNotIn(b"alice", body)
         self.assertIn("No space left on device", log.call_args.args[0])
         with mock.patch.object(self.node, "info", side_effect=ValueError("bad target")):
-            self.assertEqual(self.get(f"/rnfs/{self.text}")[2], b"bad target\n")  # other errors still explain
+            self.assertEqual(self.get(f"/rnfs/{self.text}")[2], b"invalid request\n")  # a fixed message per status
 
     def test_http_0_9_gets_headers(self):
         # A bare body for an HTTP/0.9 request would have no CSP: it is refused, with the usual headers
