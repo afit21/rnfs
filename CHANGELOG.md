@@ -66,6 +66,17 @@ Platform and packaging:
   An existing rnfs dir or identity file that lets others in is tightened (with a notice), the daemon refuses
   an rnfs dir owned by another account, and every command refuses a token file others can read, as on POSIX.
   A `--dir` outside `%USERPROFILE%` gets a warning. Not yet tested on Windows itself.
+- On Windows a new rnfs dir and its subdirectories get that access list in the call that creates them. A new
+  `--dir` used to have its parent's access list until rnfs set its own, so another local account could put a
+  file in it first (an `rnfs.toml` naming a Reticulum config of theirs, whose interfaces can run programs, or
+  an identity); a new rnfs dir that already holds anything is now refused. `rnfs.toml` and the identity are
+  checked before use, through the handle they are read from: one owned by another account is refused, one
+  others may access is made private with a warning, and one that can't be made private stops rnfs (for the
+  identity this was a warning). An rnfs dir that is a junction or symlink is refused. Not yet tested on
+  Windows itself.
+- The shared folder skips files that have other hard links, with a line in the log, also inside shared
+  directories: someone who may write to `files/` could hard link a file of yours from elsewhere on the same
+  disk into it and have it shared. A file is imported once its other links are gone. `add` is unchanged.
 - `install.sh` installs the latest release from its sdist (`rnfs-X.Y.Z.tar.gz`, a release file) instead of
   GitHub's archive of the tag, which neither `SHA256SUMS` nor the build provenance covers and which a moved tag
   would change unnoticed. The sdist must match the release's `SHA256SUMS`; where the GitHub CLI (2.49 or
@@ -80,8 +91,17 @@ Platform and packaging:
   protection rules (set in the repository's settings).
 - The systemd user unit (`contrib/rnfs.service` and the one `install.sh` writes) adds
   `SystemCallFilter=@system-service` and `SystemCallArchitectures=native`.
-- The identity file's permission fix no longer follows a symlink: a symlink at the identity path is left as
-  it is, with a warning, and the file is changed through a descriptor opened with `O_NOFOLLOW`.
+- The identity file's permission fix no longer follows a symlink, and the daemon refuses to start, with an
+  error, if the identity file is a symlink, belongs to another user or isn't a regular file. A symlink used
+  to be loaded with a warning, and a FIFO there made the start hang. The file is checked, tightened and read
+  through one descriptor opened with `O_NOFOLLOW`, so a file swapped in after the check isn't the one loaded.
+
+Companion NomadNet pages:
+- `display-mu-file` shows only allowlisted CIDs when the node runs in private mode: it used to show any
+  unsealed file the operator pinned (up to 200 KB) to every visitor who knew its CID. Its rate limit is now per
+  visitor where NomadNet says who that is: 10 requests a minute for each visitor who identified, 30 for all who
+  didn't together, and 60 for everyone. One visitor's requests used to lock everyone out for a minute.
+  Identities cost nothing to make, so someone who makes several can still reach the overall limit.
 
 Gateway privacy:
 - Errors from the node other than not-found (`400`, `413`, `422`, `503`, `507`, as well as `500`) get a fixed

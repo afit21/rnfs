@@ -734,7 +734,9 @@ and repeat.
 
 **Shared folder.** Every `scan_interval`, files and directories in `<rnfs dir>/files/` are imported as with
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
-old pin.
+old pin. Unlike `add`, a scan MUST skip (with a log line) a regular file that has other hard links, at the
+top level and inside shared directories: it is also a file elsewhere, which whoever may write to the folder
+could have linked in. It is imported at the next scan after its other links are gone.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
@@ -1079,7 +1081,13 @@ gateway can never reach the API.
   identity hash, LXMF address, traffic) needs the token like every other request.
 - The daemon MUST refuse to start if the rnfs directory belongs to another user or can't be made accessible
   to its owner only (on Windows: a protected access list allowing only the user and SYSTEM, which the files
-  below it inherit; Administrators are tolerated where an older version left them).
+  below it inherit; Administrators are tolerated where an older version left them). On Windows a new rnfs
+  directory and its subdirectories MUST get that access list when they are created (not after), the daemon
+  MUST refuse a new one that already holds anything, and one that is a junction or symlink. The settings file
+  (`rnfs.toml`) and the identity MUST be checked before use, through the handle they are read from: one owned
+  by another user (account) is refused, one others may access is made private (with a warning), and one that
+  can't be made private stops rnfs. The identity MUST also be a regular file (not a symlink, FIFO or device);
+  anything else stops the daemon with an error.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it first sends the token, the CLI checks this proof with a `GET /api/status`, so a program another

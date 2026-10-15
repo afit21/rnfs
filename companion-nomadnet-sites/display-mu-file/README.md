@@ -25,8 +25,10 @@ just because a visitor asked for it. It shows a file only if one of these is tru
 - **Its CID is in your allowlist** (see below). These are the only files the page fetches from the network
   if this node doesn't have them yet.
 
-Files your pins share are shown to anyone who knows the CID, whatever `private` mode allows over RNFS
-itself. Don't pin files there that you wouldn't put on the page.
+If your node runs in `private` mode (members only), the page shows **only allowlisted CIDs**: RNFS shares your
+pins with members only, and the page can't tell who is one. It asks `rnfs status` whether the node is private,
+and treats an answer that doesn't say as private. Otherwise your pins are shown to anyone who knows the CID, so
+don't pin files you wouldn't put on the page.
 
 The page also refuses:
 
@@ -57,7 +59,7 @@ directory, so none of it is served. The page creates the directory with mode 070
 | `allowlist.txt` | Your allowlist. You create and edit it. |
 | `page.log` | Errors, with details. Moved to `page.log.1` past 1 MB. |
 | `lock` | Lets only one request run at a time. |
-| `rate.json` | Times of recent requests, for the rate limit. |
+| `rate.json` | Times of recent requests (with the visitor's identity hash, if they identified), for the rate limits. |
 
 NomadNet runs pages with a minimal environment. `RNFS_PAGE_DIR` overrides the directory, but it only works
 when you run the page by hand, for example to test it:
@@ -86,10 +88,18 @@ allowlisted file available, pin it yourself with `rnfs pin add <CID>`.
 ### Busy and rate limits
 
 Only one request runs at a time. A visitor who arrives while another request is running is asked to try
-again in a moment. There are also at most `RATE_LIMIT` requests (30) in any `RATE_WINDOW` (60 s), counted
-across all visitors. Requests with a malformed CID aren't counted, because they never reach rnfs. Both checks
-fail closed: if the page can't use its data directory, it shows nothing. You can change these numbers at the
-top of `index.mu`.
+again in a moment. There are also rate limits, each over any `RATE_WINDOW` (60 s):
+
+- `VISITOR_LIMIT` (10) requests from each visitor who identified to your node. NomadNet tells the page who
+  that is (`remote_identity`) only when the visitor chose to identify on the link.
+- `RATE_LIMIT` (30) requests from all visitors who didn't identify, together. Nothing tells them apart:
+  NomadNet's other value, `link_id`, is new with every link the visitor opens.
+- `TOTAL_LIMIT` (60) requests from everyone.
+
+So one visitor can't use up everyone else's requests. Identities cost nothing to make, though: someone who
+makes several can still reach `TOTAL_LIMIT`, and then every visitor waits for the window to pass. Requests
+with a malformed CID aren't counted, because they never reach rnfs. All checks fail closed: if the page can't
+use its data directory, it shows nothing. You can change these numbers at the top of `index.mu`.
 
 ### The log
 
