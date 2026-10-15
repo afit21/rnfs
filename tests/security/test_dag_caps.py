@@ -1,5 +1,6 @@
 """DAG byte bound (fix for L3, N1 and L5): fetch_dag bounds the bytes of a DAG's distinct blocks by what its declared
-size and the directory entries met can hold (rnfs.fetcher.dag_bound plus DAG_ENTRY_OVERHEAD per entry).
+size can hold (rnfs.fetcher.dag_bound) plus what its directory and index nodes bring (rnfs.fetcher.node_credit: their
+own bytes and DAG_ENTRY_OVERHEAD per entry or index child, less INDEX_NODE_COST for an index node).
 
 The tests check the bound's formula; that everything the builder writes (a file of hundreds of chunks over two node
 levels, FastCDC chunks, deep and wide directories with the longest names, empty files and directories) is fetched
@@ -19,7 +20,8 @@ from rnfs.content import builder, dag, walker
 from rnfs.content.cid import DAG, EMPTY_FILE, RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.errors import TooLarge
-from rnfs.fetcher import DAG_ENTRY_OVERHEAD, DAG_GRANULE, DAG_GRANULE_OVERHEAD, DAG_SLACK, dag_bound
+from rnfs.fetcher import (DAG_ENTRY_OVERHEAD, DAG_GRANULE, DAG_GRANULE_OVERHEAD, DAG_SLACK, INDEX_NODE_COST, dag_bound,
+                          node_credit)
 from tests.security._content_helpers import TwoNodeTest
 from tests.test_node import A_ID
 
@@ -50,10 +52,16 @@ class DagBoundTest(unittest.TestCase):
         full = len(dag.encode(dag.FileNode([dag.Child(Cid.for_block(DAG, b"%d" % i), dag.MAX_SIZE)
                                             for i in range(MAX_CHILDREN)])))
         self.assertLess(full, MAX_CHILDREN * (16 * 1024 // DAG_GRANULE) * DAG_GRANULE_OVERHEAD / 4)
-        # A directory entry with the longest name, and an index child, take well under DAG_ENTRY_OVERHEAD
-        entry = len(dag.encode(dag.DirectoryNode([dag.Entry(name(0), Cid.for_block(DAG, b"x"), dag.MAX_SIZE, 2)])))
-        index = len(dag.encode(dag.IndexNode([dag.IndexChild(name(0), Cid.for_block(DAG, b"x"), dag.MAX_SIZE)])))
-        self.assertLess(max(entry, index), DAG_ENTRY_OVERHEAD // 3)
+        # A directory node pays for itself; so does an index node of a few children, but one of a single child
+        # costs a little, so a chain of them can't pay for itself
+        index = dag.IndexNode([dag.IndexChild(name(0), Cid.for_block(DAG, b"x"), dag.MAX_SIZE)])
+        expect = walker.Expect(Cid.for_block(DAG, dag.encode(index)), dag.MAX_SIZE, walker.DIRECTORY_TYPES, 1)
+        block = dag.encode(index)
+        self.assertLess(node_credit(len(block), walker.expand(expect, block)), len(block))
+        self.assertGreater(INDEX_NODE_COST, 3 * DAG_ENTRY_OVERHEAD)
+        # An honest index tree has at most one node that costs anything per level, met before the entries below
+        # it bring their share: seven levels (2^64 entries) fit DAG_SLACK
+        self.assertLess(7 * (INDEX_NODE_COST - DAG_ENTRY_OVERHEAD), DAG_SLACK)
 
 
 class CapTest(TwoNodeTest):
@@ -91,30 +99,35 @@ class CapTest(TwoNodeTest):
         self.a.records.store(cid.key, A_ID)
         return cid
 
-    def usage(self, node, cid: Cid) -> tuple[int, int, int]:
-        """(declared size, bytes of distinct blocks, entries and index children counted) of a stored DAG."""
+    def usage(self, node, cid: Cid) -> tuple[int, int, int, int]:
+        """(declared size, bytes of distinct blocks, what its nodes bring to the bound, directory entries) of a
+        stored DAG."""
         get = node.storage.getter()
         expect = walker.root_expect(cid)
-        total = entries = 0
+        total = credit = entries = 0
         for current, block in walker.iter_dag(expect, get):
             total += len(block)
             if not current.cid.is_raw:
-                entries += sum(1 for child in walker.expand(current, block)
-                               if child.kind is not None or child.first_name is not None)
-        return walker.size_of(expect, get(expect)), total, entries
+                children = walker.expand(current, block)
+                credit += node_credit(len(block), children)
+                entries += sum(1 for child in children if child.kind is not None)
+        return walker.size_of(expect, get(expect)), total, credit, entries
 
     def assert_well_inside(self, cid: Cid):
-        """B fetched cid's DAG with get, pin add and export; its overhead takes under half what the bound allows."""
+        """B fetched cid's DAG with get, pin add and export; of the bound's margin (what neither the content nor
+        nodes paying for themselves take: dag_bound beyond the size, and DAG_ENTRY_OVERHEAD per entry), its
+        nodes take under half."""
         out = os.path.join(self.tmp.name, f"out{self.random.random()}")
         self.b.pin_add(str(cid))
         self.assertIn(USER, self.b.storage.pins()[cid])
         self.assertTrue(self.b.storage.is_complete(cid))
         self.b.get(str(cid), out)
         self.b.export(str(cid), out + ".archive")
-        size, total, entries = self.usage(self.b, cid)
-        allowed = dag_bound(size) + DAG_ENTRY_OVERHEAD * min(entries, self.b.config.max_output_entries)
-        self.assertLessEqual(total - size, (allowed - size) / 2,
-                             f"{total - size} bytes of nodes for {size} bytes and {entries} entries")
+        size, total, credit, entries = self.usage(self.b, cid)
+        allowed = dag_bound(size) + credit
+        margin = dag_bound(size) - size + DAG_ENTRY_OVERHEAD * entries
+        self.assertGreaterEqual(allowed - total, margin / 2,
+                                f"{total} bytes of blocks for {size} bytes and {entries} entries: {allowed} allowed")
         return out
 
     # Honest content
