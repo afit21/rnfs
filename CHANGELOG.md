@@ -2,7 +2,11 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## Unreleased
+## 0.1.4
+
+Security release from the fifth audit: fixes for denial of service against `/blocks` serving, unbounded downloads,
+DHT keeper and provider-store takeover, name rollback, gateway privacy leaks, the companion pages, LXMF floods and
+Windows permissions. No wire-format changes: 0.1.4 and 0.1.3 nodes work together.
 
 Fixes:
 - A fetch of a whole DAG (`get`, `pin add`, `export`, `dir set`/`dir rm`, a followed name's new target, gateway
