@@ -208,7 +208,7 @@ except Exception as error:  # the daemon isn't running, rnfs isn't installed, ..
 else:
     folders = [pin for pin in pins if pin.get("type") == "directory"]
     files = [pin for pin in pins if pin.get("type") != "directory"]
-    shown = section("Folders", folders)
-    shown = section("Files", files) or shown
-    if not shown:
+    listed = section("Folders", folders)
+    listed = section("Files", files) or listed
+    if not listed:
         print("Nothing is shared yet.")
