@@ -525,9 +525,20 @@ class SecurityTest(NodeTest):
         self.assertEqual(list(self.a.storage.pins()), cids[:1])
 
     def test_remote_pins_waiting_are_capped(self):
-        self.net.blocks = lambda node_id, cids, on_progress=None: time.sleep(0.2) or BlocksResult("failed", unsent=cids)
-        with mock.patch.object(node_module, "REMOTE_PIN_QUEUE", 3):
+        # The worker's fetches are held until all five /pin requests are in: these CIDs have no provider, so
+        # an unheld fetch can fail at its lookup and free a place between two requests on a slow machine
+        go = threading.Event()
+        real_fetch = self.a._remote_pin_fetch
+
+        def held_fetch(cid, source):
+            """Wait for the test, then fetch as the node does."""
+            go.wait(10)
+            return real_fetch(cid, source)
+
+        with mock.patch.object(node_module, "REMOTE_PIN_QUEUE", 3), \
+                mock.patch.object(self.a, "_remote_pin_fetch", held_fetch):
             accepted = [self.a.backend.remote_pin(IDENTITY, Cid.for_block(RAW, b"%d" % i), True) for i in range(5)]
+            go.set()
         self.assertEqual(accepted, [True, True, True, False, False])
         self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY)), 30))
 
