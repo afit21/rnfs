@@ -10,6 +10,10 @@ DEFAULT_BOOTSTRAP_NODES global variable: node IDs of official, always-on DHT ser
 
 # 0.1.4
 
+Big fabel 5.5 audit and valnerability patch
+
+# 0.1.5
+
 ## CID denylist
 
 - Ability to point to a CID or name as a CID deny list
@@ -18,7 +22,9 @@ DEFAULT_BOOTSTRAP_NODES global variable: node IDs of official, always-on DHT ser
 
 - Deny lists can contain file hashes and/or CIDs
 
-## Migrate to JSON stores to sqlite3
+## Sqlite3 migration
+
+## Migrate to JSON stores to sqlite3 if they exist on startup
 
 - If JSON store exists, convert to the sqlite3 stor
 
@@ -29,15 +35,13 @@ DEFAULT_BOOTSTRAP_NODES global variable: node IDs of official, always-on DHT ser
 * New file pinned by daemon
 
 
-# 0.1.5 
+# 0.1.6 
 
 ## Client Library
 
 ## API versioning and reference
 
 ## Per-app API tokens
-
-## RNS API
 
 * Destination.hash(identity, "rnfs", "api")
 * Whitelist and/or API key for auth
