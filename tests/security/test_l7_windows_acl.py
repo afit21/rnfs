@@ -275,6 +275,7 @@ class NameKeyTest(NamesTestCase):
             self.assertEqual(winacl.problem(acl.read(os.path.join(self.config.names_dir, "site")), USER), None)
 
 
+@unittest.skipIf(os.name == "nt", "runs the POSIX code path, which needs os.geteuid")
 class PosixUnchangedTest(unittest.TestCase):
     """Outside Windows nothing here calls the backend: the mode-bit checks stay what they were."""
 

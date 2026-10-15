@@ -41,6 +41,7 @@ SDIST = b"rnfs-9.9.9 source archive"
 
 
 @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
+@unittest.skipIf(os.name == "nt", "install.sh is the Linux and macOS route, and its file:// release needs POSIX paths")
 class ReleaseCheckTest(unittest.TestCase):
     """A fake release v9.9.9 (its sdist and SHA256SUMS) under a file:// REPO_URL."""
 
