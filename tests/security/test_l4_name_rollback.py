@@ -120,7 +120,9 @@ class FloorChurnTest(unittest.TestCase):
         self.assertTrue(result is None or result["sequence"] >= 5, f"gateway resolve went back from 5: {result}")
 
     def test_floor_bounded(self):
+        """Names resolved over FLOOR_KEEP_AGE ago are forgotten past FLOOR_FACTOR × name_table_size."""
         for i in range(names.FLOOR_FACTOR * 3 + 5):
+            self.clock.now += names.FLOOR_KEEP_AGE
             self.network.announce(flood_name(i), encode_record(1, OLD), self.clock.now)
             self.manager.resolve(flood_name(i), persist=False)
         self.assertEqual(len(self.manager._floor), names.FLOOR_FACTOR * 3)
