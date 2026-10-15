@@ -1074,13 +1074,31 @@ class RequestServer:
         return int(bucket.capacity // 2) - in_flight
 
     def _concluded(self, response: Response, link, resource):
-        """The response's Resource concluded: record the rate if it completed, and free the slots."""
+        """The response's Resource concluded: record the rate if it completed, start a cooldown if its requester
+        rejected it with nothing sent, and free the slots."""
         with self.lock:
             # The Resource's callback, the monitor and the next request may all notice; handle it once
             first, response.concluded = not response.concluded, True
-        if first and getattr(resource, "status", None) == RNS.Resource.COMPLETE:
+        status = getattr(resource, "status", None)
+        if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
+        elif first and status == RNS.Resource.REJECTED and not self._sent_any(response, resource):
+            # Turned down at its advertisement (no honest requester does that): no progress, so its requester
+            # cools down as for a response cancelled for making none, rather than having the node build another
+            # at once (section 3)
+            log("a /blocks response was rejected with nothing sent: its requester cools down", LOG_VERBOSE)
+            self.cooldowns.add(response.link_id, response.identity)
         self._finish(response)  # charges what was sent: all of a completed Resource
+
+    @staticmethod
+    def _sent_any(response: Response, resource) -> bool:
+        """Whether any of response's Resource was sent (or that can't be read)."""
+        if response.sent > 0:
+            return True
+        try:
+            return resource.get_progress() > 0
+        except Exception:
+            return True
 
     def _cancel(self, response: Response, reason: str):
         """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""

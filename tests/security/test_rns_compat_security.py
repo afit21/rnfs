@@ -13,7 +13,9 @@ the same way, with one functional check against a real (offline) RNS.Destination
 The response pre-check (L1) replaces Link.response_resource_concluded and Link.receive, reads a completed
 Resource's data, status, has_metadata, request_id and total_size, decrypts response packets with Link.decrypt
 and fails a refused response through Link.handle_response; each is checked, with functional checks on a real
-(offline) Link. The request rate limit (L17b) relies on RNS sending nothing for a handler that returns None.
+(offline) Link. The request rate limit (L17b) relies on RNS sending nothing for a handler that returns None,
+and the cooldown after a rejected response (L17a) on how RNS concludes an outgoing Resource the receiver
+rejects.
 
 Written against RNS 1.5.6. Nothing here starts Reticulum.
 """
@@ -255,6 +257,26 @@ class RnsRequestRateInternalsTest(unittest.TestCase):
         receive = _normal_source(RNS.Link._Link__receive)
         branch = receive[receive.index("elifpacket.context==RNS.Packet.REQUEST:"):]
         self.assertIn("threading.Thread(target=job,daemon=True).start()", branch)
+
+
+class RnsRejectedResourceInternalsTest(unittest.TestCase):
+    """A rejected outgoing Resource concludes as the server expects (L17a): status REJECTED, then the callback,
+    with get_progress() counting the parts sent."""
+
+    def test_rejection_sets_rejected_and_runs_the_callback(self):
+        receive = _normal_source(RNS.Link._Link__receive)
+        branch = receive[receive.index("elifpacket.context==RNS.Packet.RESOURCE_RCL:"):]
+        self.assertIn("forresourceinself.outgoing_resources:ifresource_hash==resource.hash:resource._rejected()",
+                      branch)
+        rejected = _normal_source(RNS.Resource._rejected)
+        for expected in ("self.status=Resource.REJECTED", "self.link.cancel_outgoing_resource(self)",
+                         "self.callback(self)"):
+            self.assertIn(expected, rejected)
+        self.assertGreater(RNS.Resource.REJECTED, RNS.Resource.COMPLETE)  # the monitor treats it as concluded
+
+    def test_progress_of_an_outgoing_resource_counts_sent_parts(self):
+        progress = _normal_source(RNS.Resource.get_progress)
+        self.assertIn("elifself.initiator:ifnotself.split:self.processed_parts=self.sent_parts", progress)
 
 
 def _normal_source(function) -> str:
