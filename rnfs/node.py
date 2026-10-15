@@ -1057,16 +1057,23 @@ class RnfsNode:
             return []
         pins: dict[tuple[str, Cid], None] = {}
         counts: dict[str, int] = {}
+        malformed = 0
         for entry in saved:
             try:
                 source, text = entry
+                if not isinstance(source, str) or not isinstance(text, str):
+                    raise TypeError("not a pair of strings")  # a list or dict source can't even be looked up
                 cid = Cid.parse(text)
             except (ValueError, TypeError):
+                malformed += 1
                 continue
             if source not in allowed or (source, cid) in pins or counts.get(source, 0) >= REMOTE_PIN_QUEUE:
                 continue
             counts[source] = counts.get(source, 0) + 1
             pins[(source, cid)] = None
+        if malformed:
+            log(f"skipped {malformed} malformed entr{'y' if malformed == 1 else 'ies'} in {self._remote_pins_path}",
+                LOG_WARNING)
         return list(pins)
 
     def _resume_remote_pins(self):
