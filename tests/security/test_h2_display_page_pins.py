@@ -135,11 +135,12 @@ class OperatorPinTest(PageTestCase):
     """CIDs the operator pinned on the victim itself."""
 
     def test_operator_pin_is_shown_without_fetching_or_pinning(self):
-        """A complete user pin is shown, read with a bounded raw cat; no pin add, ls or other command runs."""
+        """A complete user pin is shown, read with a bounded raw cat; no pin add, ls or other command runs (status
+        says whether the node is in private mode)."""
         cid = self.victim.add_stream(io.BytesIO(b"the operator's notes\n"))["cid"]
         output, calls = self.view(cid)
         self.assertIn("the operator's notes", output)
-        self.assertEqual(calls, [["pin", "ls", "--json", cid], ["stat", cid],
+        self.assertEqual(calls, [["pin", "ls", "--json", cid], ["status"], ["stat", cid],
                                  ["cat", cid, "--raw", "--length", str(self.page("MAX_SIZE"))]])
 
     def test_sealed_operator_pin_is_not_shown(self):
@@ -151,7 +152,8 @@ class OperatorPinTest(PageTestCase):
         self.assertIn("sealed", output)
 
     def test_folder_pin_is_refused_as_a_folder(self):
-        """A pinned directory isn't a file to show, and nothing more than its pin listing is read."""
+        """A pinned directory isn't a file to show, and nothing more than its pin listing (and the node's
+        status) is read."""
         folder = os.path.join(self.tmp.name, "shared")
         os.makedirs(folder)
         with open(os.path.join(folder, "a.txt"), "wb") as f:
@@ -159,7 +161,7 @@ class OperatorPinTest(PageTestCase):
         cid = self.victim.add_path(folder)["cid"]
         output, calls = self.view(cid)
         self.assertIn("is a folder", output)
-        self.assertEqual(calls, [["pin", "ls", "--json", cid]])
+        self.assertEqual(calls, [["pin", "ls", "--json", cid], ["status"]])
 
 
 class AllowlistTest(PageTestCase):
@@ -211,15 +213,15 @@ class AllowlistTest(PageTestCase):
         clock = [1000.0]
 
         def slow_run(argv, *args, **kwargs):
-            """Record the timeout the page passes, and let 50 seconds pass for each command."""
+            """Record the timeout the page passes, and let 30 seconds pass for each command."""
             timeouts.append(kwargs["timeout"])
-            clock[0] += 50
+            clock[0] += 30
             return run(argv, *args, **kwargs)
 
         with mock.patch.object(time, "monotonic", lambda: clock[0]):
             helpers.exec_display_page(slow_run, cid, self.data_dir)
         timeout = self.page("TIMEOUT")
-        self.assertEqual(timeouts, [timeout, timeout - 50, timeout - 100])
+        self.assertEqual(timeouts, [timeout, timeout - 30, timeout - 60, timeout - 90])
 
 
 class LockAndRateLimitTest(PageTestCase):
