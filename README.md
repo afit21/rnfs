@@ -76,7 +76,7 @@ One liner for install script:
 
 To install as a systemctl service, add the service flag:
 
-`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -- -service`
+`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --service`
 
 Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-linux-flatpak)
 
