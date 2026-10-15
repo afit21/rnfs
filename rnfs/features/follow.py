@@ -74,30 +74,38 @@ class FollowFeature(Feature):
         self._thread: threading.Thread | None = None
         self._keepers = node.feature("keepers")
         self._keepers.add_listener(self._changed)
-        self._load()
-        self._release_unfollowed()
+        self._reconcile(self._load())
 
     # State
 
-    def _load(self):
-        """Read follow.json, skipping malformed entries."""
+    def _load(self) -> bool:
+        """Read follow.json, skipping malformed entries; True if it was there and every entry was read."""
         from rnfs.content.storage import read_json
-        state = read_json(self._path)
+        state = read_json(self._path)  # a damaged file is moved aside and gives None, as a missing one does
         entries = state.get("names") if isinstance(state, dict) else None
         if not isinstance(entries, dict):
-            return
+            return False
+        clean = True
         for name_hex, entry in entries.items():
             try:
                 name = bytes.fromhex(name_hex)
                 pinned = Cid.parse(entry["pinned"]) if entry.get("pinned") is not None else None
             except (AttributeError, KeyError, TypeError, ValueError):
+                clean = False
                 continue
             if len(name) == ID_LENGTH:
                 self._pinned[name] = pinned
+            else:
+                clean = False
+        return clean
 
-    def _release_unfollowed(self):
-        """Release follow pins of names no longer followed: a crash inside unfollow, after follow.json was saved,
-        leaves one that nothing else would release (`pin rm` releases only the user's pins)."""
+    def _reconcile(self, clean: bool):
+        """Make the follow pins match follow.json. If it was read whole (clean), release follow pins of names it
+        doesn't list: a crash inside unfollow, after follow.json was saved, leaves one that nothing else would
+        release (`pin rm` releases only the user's pins). Otherwise (missing, damaged or with a malformed entry)
+        such a pin is the record of a name still followed: follow it again, so it is kept, checked and can be
+        unfollowed."""
+        held: dict[bytes, set[Cid]] = {}
         for cid, sources in self.node.storage.pins().items():
             for source in sources:
                 if not source.startswith(SOURCE_PREFIX):
@@ -106,12 +114,29 @@ class FollowFeature(Feature):
                     name = bytes.fromhex(source[len(SOURCE_PREFIX):])
                 except ValueError:
                     continue
-                if name not in self._pinned:
-                    _log(f"releasing {cid}, pinned for name {name.hex()}, which is no longer followed", LOG_WARNING)
-                    try:
-                        self.node.storage.unpin(cid, source)
-                    except OSError as e:  # e.g. a read-only state directory: tried again at the next start
-                        _log(f"could not release {cid}: {e}", LOG_ERROR)
+                if len(name) == ID_LENGTH and name not in self._pinned:
+                    held.setdefault(name, set()).add(cid)
+        if not held:
+            return
+        if not clean:
+            for name, cids in sorted(held.items()):
+                # One target is its pin; several (a crash during a check) are sorted out by its next check
+                self._pinned[name] = next(iter(cids)) if len(cids) == 1 else None
+                _log(f"{FOLLOW_FILE} is missing, damaged or incomplete: following name {name.hex()} again, "
+                     f"as its pin of {', '.join(sorted(str(cid) for cid in cids))} shows", LOG_WARNING)
+            try:
+                self._save()
+            except OSError as e:  # the pins are kept; follow.json is rebuilt again at the next start
+                _log(f"saving {FOLLOW_FILE} failed: {e}", LOG_ERROR)
+            return
+        for name, cids in held.items():
+            source = follow_source(name)
+            for cid in cids:
+                _log(f"releasing {cid}, pinned for name {name.hex()}, which is no longer followed", LOG_WARNING)
+                try:
+                    self.node.storage.unpin(cid, source)
+                except OSError as e:  # e.g. a read-only state directory: tried again at the next start
+                    _log(f"could not release {cid}: {e}", LOG_ERROR)
 
     def _save(self):
         """Write follow.json atomically (lock held)."""

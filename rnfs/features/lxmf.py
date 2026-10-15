@@ -432,7 +432,7 @@ class MessageLog:
     At most limit records and max_bytes of JSON are kept. To make room, the oldest record protect() is false
     for is dropped; a protected one only when every other is protected too. add() may also name records that
     are dropped only for each other's (reserved). valid() checks records loaded from the file (malformed ones
-    are dropped).
+    are dropped; clean says whether the file was there and every record in it was read).
     """
 
     def __init__(self, path: str, limit: int, max_bytes: int | None = None, protect=None, valid=None):
@@ -448,10 +448,11 @@ class MessageLog:
         self._entries: list[dict] = []
         self._sizes: dict[int, int] = {}  # id -> bytes as JSON
         from rnfs.content.storage import read_json
-        stored = read_json(path)
+        stored = read_json(path)  # a damaged file is moved aside and gives None, as a missing one does
+        self.clean = False  # the file was there and every record in it was read
         if isinstance(stored, dict):
             entries = stored.get("messages")
-            bad, seen = 0, set()
+            bad, seen = 0 if isinstance(entries, list) else 1, set()
             for entry in entries if isinstance(entries, list) else []:
                 if isinstance(entry, dict) and type(entry.get("id")) is int and entry["id"] > 0 \
                         and entry["id"] not in seen and (valid is None or valid(entry)):
@@ -461,6 +462,7 @@ class MessageLog:
                     bad += 1
             if bad:
                 _log(f"dropped {bad} malformed record(s) from {path}", LOG_WARNING)
+            self.clean = not bad
             self._entries = self._entries[-limit:]
             self._sizes = {e["id"]: _json_bytes(e) for e in self._entries}
             while self.max_bytes is not None and len(self._entries) > 1 and sum(self._sizes.values()) > max_bytes:
@@ -758,19 +760,55 @@ class LxmfFeature(features.Feature):
     def _release_unrecorded(self):
         """Release lxmf: pins no inbox message records as pinned. Pins are saved at once and the inbox every
         few seconds, so a crash can leave a pin whose message is gone or still queued; nothing else would release
-        it (`pin rm` releases only the user's pins). A queued link is fetched and pinned again at start()."""
+        it (`pin rm` releases only the user's pins). A queued link is fetched and pinned again at start().
+
+        Only if the inbox file was read whole: when it is missing, damaged (moved aside) or had a malformed record,
+        such a pin may be one a lost message held. Then each sender's unrecorded pins are kept and recorded in a
+        new inbox message, so they are kept at later starts too and removing that message releases them."""
         from rnfs.content.storage import LXMF_PREFIX
         recorded = {(entry.get("from"), result.get("cid")) for entry in self.inbox.entries()
                     for result in entry.get("auto") or [] if isinstance(result, dict) and result.get("state") == "pinned"}
+        unrecorded: dict[str, list[Cid]] = {}
         for cid, sources in self.node.storage.pins().items():
             for source in sources:
                 if source.startswith(LXMF_PREFIX) and (source[len(LXMF_PREFIX):], str(cid)) not in recorded:
-                    _log(f"releasing {cid}, pinned for a message from {source[len(LXMF_PREFIX):]} that the inbox "
-                         "no longer records", LOG_WARNING)
-                    try:
-                        self.node.storage.unpin(cid, source)
-                    except OSError as e:  # e.g. a read-only state directory: tried again at the next start
-                        _log(f"could not release {cid}: {e}", LOG_ERROR)
+                    unrecorded.setdefault(source[len(LXMF_PREFIX):], []).append(cid)
+        if not self.inbox.clean:
+            for sender, cids in sorted(unrecorded.items()):
+                self._record_kept(sender, sorted(cids, key=str))
+            return
+        for sender, cids in unrecorded.items():
+            for cid in cids:
+                _log(f"releasing {cid}, pinned for a message from {sender} that the inbox no longer records",
+                     LOG_WARNING)
+                try:
+                    self.node.storage.unpin(cid, LXMF_PREFIX + sender)
+                except OSError as e:  # e.g. a read-only state directory: tried again at the next start
+                    _log(f"could not release {cid}: {e}", LOG_ERROR)
+
+    def _record_kept(self, sender: str, cids: list[Cid]):
+        """Keep sender's lxmf: pins of cids, which an inbox that didn't load whole doesn't record: add an inbox
+        message from sender recording them as pinned, and save the inbox."""
+        listed = ", ".join(str(cid) for cid in cids)
+        if _HEX32.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
+            _log(f"keeping {listed}, pinned for {sender!r}, which isn't an LXMF address", LOG_WARNING)
+            return
+        _log(f"the inbox file is missing, damaged or incomplete: keeping {listed}, pinned for a message from "
+             f"{sender} it no longer has, in a new inbox message (remove it to release them)", LOG_WARNING)
+        links = [Link(cid) for cid in cids]
+        entry = {"hash": "", "from": sender, "display_name": None, "sent": None, "received": time.time(),
+                 "title": "", "method": "unknown", "links": [link.to_json() for link in links],
+                 "text": "Restored by rnfs at start: the inbox file was missing or damaged, and these links were "
+                         "pinned for a message from this sender that it no longer has. Remove this message to "
+                         "release them.",
+                 "auto": [{"state": "pinned", "cid": str(cid)} for cid in cids]}
+        with self._lock:
+            _, dropped = self.inbox.add(entry)
+            self._release(dropped)
+        try:
+            self.inbox.save()
+        except OSError as e:  # the pins are kept; recorded again at the next start
+            _log(f"saving the inbox failed: {e}", LOG_ERROR)
 
     @staticmethod
     def _propagated_sent(entry: dict) -> bool:
