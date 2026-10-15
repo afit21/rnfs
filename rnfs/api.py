@@ -74,6 +74,7 @@ from urllib.parse import parse_qs, urlsplit
 from rnfs import __version__, fsutil
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.cli import CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.config import _HEX_ID  # exactly 32 hex digits, as names.parse_name and identity lists are checked
 from rnfs.content.cid import Cid
 from rnfs.errors import Busy, InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.log import LOG_ERROR, log
@@ -148,14 +149,11 @@ def parse_cid(text) -> str:
 
 
 def parse_hex_id(text, what: str = "node ID") -> bytes:
-    """A 16-byte node ID or name written as 32 hex characters. Raises ValueError."""
-    try:
-        value = bytes.fromhex(text) if isinstance(text, str) else b""
-    except ValueError:
-        value = b""
-    if len(value) != 16:
+    """A 16-byte node ID or name written as 32 hex characters (spaces around allowed). Raises ValueError."""
+    # Hex digits only: bytes.fromhex alone would skip whitespace between them (as names.parse_name checks)
+    if not isinstance(text, str) or not _HEX_ID.fullmatch(text.strip()):
         raise ValueError(f"invalid {what} {text!r}: must be 32 hex characters")
-    return value
+    return bytes.fromhex(text.strip())
 
 
 def parse_path(text) -> str:

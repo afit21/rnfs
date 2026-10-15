@@ -7,16 +7,30 @@
 Fixes:
 - A fetch of a whole DAG (`get`, `pin add`, `export`, `dir set`/`dir rm`, a followed name's new target, gateway
   archives, remote pins and LXMF auto-fetches) is refused with "too large" once the DAG's blocks hold more than
-  its declared size can: the size plus 64 bytes per 4 KiB, 1 KiB, and 1 KiB per directory entry met. A file
-  node may list empty children, so a file declaring 1 byte could make `get` or `pin add` download and keep any
-  amount of data. Content built by `add` (either chunker) stays far inside the bound, and fetches of it ask
-  for blocks as before. Requests under the bound never ask for more than it leaves, so a refused fetch
+  its declared size can: the size plus 64 bytes per 4 KiB, 1 KiB, and what its directory nodes take plus 16
+  bytes per entry (index nodes: their own bytes plus 16 per child, less 64). A file node may list empty
+  children, so a file declaring 1 byte could make `get` or `pin add` download and keep any amount of data.
+  Content built by `add` (either chunker) stays far inside the bound, and fetches of it ask for blocks as
+  before; there is no limit on the entries of a directory you pin (`get` and `export` still stop at
+  `max_output_entries`). Requests under the bound never ask for more than it leaves, so a refused fetch
   downloads at most about one block too many.
+- A byte-range read (`cat`, the gateway's file responses and Range requests, `/api/cat`, and reading or
+  decrypting a sealed file, as `get`, `cat` and `info` do for one sealed to this node) is refused with "too
+  large" once the file nodes it meets hold more than the range can need: its own bound as above plus two full
+  file nodes (13 KB each) per level a file of the declared size can have (one up to 1 MiB, seven at most).
+  These reads never ran the whole-DAG bound, so `cat` of a file declaring 1 byte could download 7 MB, and
+  `get` of a 12 KB file sealed to you 29 MB; now at most about 184 KB plus one block. A small read that ends
+  inside two file nodes may take one more request than before.
+- `ls` and the gateway's directory listings are bounded the same way, as a fetch of 0 bytes: chains of index
+  nodes of one child each used to be listed level by level without limit (751 KB for 40 entries).
+- `get` and `export` refuse to write when they can't read the free space at the destination (a missing directory, say),
+  instead of writing without the disk reserve check.
 - `get` and `export` refuse output that would leave less than the disk reserve (max(256 MiB, 2%)) free, and
   `get` counts the blocks it still has to fetch when they go to the same disk. They used to check only that
   the output fits, so a `get` could fill the disk.
 - Names given as text must be exactly 32 hex digits (optionally in `<angle brackets>`, with spaces around):
-  whitespace between the digits used to be skipped, giving a name shorter than 16 bytes.
+  whitespace between the digits used to be skipped, giving a name shorter than 16 bytes. Node IDs and names
+  given to the local API and the gateway are checked the same way (spaces around allowed, not between).
 - A remote `/pin` accepted just as the previous one of that identity finished was answered "accepted" and
   never fetched (sending it again didn't help): the fetch thread now deregisters in the same step that finds
   nothing left. If the thread can't be started the `/pin` is refused, where the identity used to be stuck

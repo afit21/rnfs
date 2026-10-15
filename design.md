@@ -540,28 +540,58 @@ Everything in the specification is implemented, with these simplifications and a
 - **DAG byte bound** (`fetcher.dag_bound`, `Fetch.dag_limit`). `fetch_dag` counts the bytes of the distinct
   blocks of its target's DAG, stored or downloaded, against `dag_bound(size)` = size + `DAG_GRANULE_OVERHEAD`
   (64) per `DAG_GRANULE` (4 KiB, `SmallLeaves`' threshold) of the declared size + `DAG_SLACK` (1 KiB), plus
-  `DAG_ENTRY_OVERHEAD` (1 KiB) per directory entry or index child of the counted nodes (at most
-  `max_output_entries` of them), and `max_dag_bytes` (a remote pin's or auto-fetch's quota) if lower; over it
-  is `TooLarge`, not `InvalidDag`. Every caller gets it, since it lives in `fetch_dag`: `get`, `pin_add`,
+  what the counted directory and index nodes bring (`node_credit`): a directory node its own bytes and
+  `DAG_ENTRY_OVERHEAD` (16) per entry, an index node its own bytes and 16 per child less `INDEX_NODE_COST`
+  (64), never below 0; and `max_dag_bytes` (a remote pin's or auto-fetch's quota) if lower. Over it is
+  `TooLarge`, not `InvalidDag`. Every caller gets it, since it lives in `fetch_dag`: `get`, `pin_add`,
   `dir_set`/`dir_rm`, `export`, `export_stream`, follow, remote pins and LXMF auto-fetches. Why the builder's
   output never comes near it: a file node child is at most 51 bytes (`[cid, size]`: 39-byte CID, 9-byte size)
   and a node header at most 7; fixed chunks are 64 KiB and FastCDC chunks over 16 KiB except a file's last,
   so with the levels above (at most n/255 + 8 nodes for n chunks) a file takes under 13 bytes per 4 KiB plus
-  under 600 bytes (its last chunk and up to 8 levels). Those 600 bytes come out of `DAG_SLACK` for the target
-  itself, or out of its entry's 1 KiB, which also covers the entry (at most 309 bytes with a 255-byte name),
-  the header of the node it points to and its share of the index nodes above. An empty file is the 0-byte raw
-  block and an empty directory 3 bytes, the same block each time. Counting is incremental and the allowance
-  only grows: a node's entries are credited when its block is counted, before anything below it, and the
-  chunks are counted against the declared size, so the bound holds at every block, not only at the end
-  (tests/security/test_dag_caps.py fetches large, FastCDC, deep, wide and empty trees, using under a third
-  of what it allows). What it refuses: zero-size children (audit L3), and DAGs of chunks well under 4 KiB,
-  which no writer following the tree rule makes. To keep the overshoot to about one block, `_take_batch`
-  asks only for what fits the room left after the requests in flight (`_room`, `_reserve`): a raw chunk's
-  declared size, anything else `MAX_BLOCK_SIZE`, except that under the size-derived bound (not under a
-  quota, which entries don't raise) a directory or index node takes only its header, since its entries bring
-  more room than they take while enough are left under `max_output_entries`; and always one CID when nothing
-  is in flight. Honest fetches are not held back by this: the content still to come leaves
-  room for many file nodes, and directory nodes cost almost nothing.
+  under 600 bytes (its last chunk and up to 8 levels). A file with a node has two chunks or more, the first
+  at least 16 KiB, so its 64 bytes per 4 KiB (at least 256 per chunk but its last) cover both, inside a
+  directory as for the target itself. A directory node pays for itself, so an entry costs nothing whatever
+  its name. An index node is met before the entries below it, which is why its children bring their 16 bytes
+  in advance: one of 4 children or more pays for itself, and the tree rule fills every index node but the
+  last of its level, so an honest directory meets at most 48 bytes of index nodes per level (at most 7 levels)
+  before its entries arrive, inside `DAG_SLACK`, and about one index node per 65,536 entries after that. An
+  empty file is the 0-byte raw block and an empty directory 3 bytes, the same block each time. Counting is
+  incremental: a node's credit is added when its block is counted, before anything below it, and the chunks
+  are counted against the declared size, so the bound holds at every block, not only at the end
+  (tests/security/test_dag_caps.py fetches large, FastCDC, deep, wide and empty trees: they use at most 8%
+  of the bound's margin, the part neither the content nor nodes paying for themselves take). What it
+  refuses: zero-size children (audit L3), chains of index nodes (48 bytes a level), duplicate entries
+  carrying other blocks (each brings 16 bytes beyond its own: a 0-byte directory carries at most that much
+  of other nodes, where 1 KiB per entry used to let it carry 20 times its own bytes), and DAGs of chunks well
+  under 4 KiB, which no writer following the tree rule makes. The credit isn't capped at
+  `max_output_entries` entries, so a pin of an honest directory of any size is allowed (`get` and `export`
+  still stop at `max_output_entries` entries); a directory's blocks are then about what an honest directory
+  of as many entries takes, and `max_download_size` and quotas bound them. To keep the overshoot to about
+  one block, `_take_batch` asks only for what fits the room left after the requests in flight (`_room`,
+  `_reserve`): a raw chunk's declared size, anything else `MAX_BLOCK_SIZE`, except that under the
+  size-derived bound (not under a quota, which entries don't raise) a directory or index node takes nothing,
+  since it costs at most 64 bytes (a request of `MAX_BATCH` of them overshoots by at most 2 KiB); and always
+  one CID when nothing is in flight. Honest fetches are not held back by this: the content still to come
+  leaves room for many file nodes, and directory nodes cost nothing.
+- **Listings** (`fetch_listing`: `ls`, the gateway's directory pages) fetch only directory and index nodes,
+  and are bounded as `fetch_dag` is for a declared size of 0 (`_declared` = 0): `DAG_SLACK` plus the nodes'
+  credit. It used to count index children per level only, so 40 entries below chains of single-child index
+  nodes down to `MAX_DEPTH` took 751 KB; now a single-child index node costs 48 bytes, and those chains are
+  refused after 24 KB.
+- **Byte-range reads** (`read_range`: `cat`, the gateway's file responses, `/api/cat`, a sealed file's
+  header and its decryption by `get`, `cat` and `info`, which never run `fetch_dag`) count the bytes of the
+  distinct file nodes each call meets, stored or downloaded, against `range_bound(size, length)` =
+  `dag_bound(length)` + 2 × `file_levels(size)` × `FILE_NODE_MAX` (13,061 bytes: a header of 5 and 256
+  children of 51). Nodes wholly inside the range cost no more than in a whole file of `length` bytes; on each
+  level the range ends inside at most two more; and an honest file of `size` bytes, cut into chunks of 4 KiB
+  or more, has `file_levels(size)` levels: enough 256-wide levels for size / 4 KiB + 1 chunks, one up to
+  1 MiB, two up to 256 MiB, seven for any size. Raw chunks aren't counted: they hold the range and at most
+  two chunks more. A file node padded with empty children made `cat` of a file declaring 1 byte download
+  7.3 MB (and a sealed `get` of 12 KB 29 MB); now the read stops at about 27 KB plus one block, and at most
+  about 184 KB plus one block for any declared size. The budget (`_RangeBudget`) is set only while
+  `_range_leaves` ensures a node's children, since another read of the same fetch may run between a
+  generator's steps; `_reserve` counts a file node not yet received as `MAX_BLOCK_SIZE` against it, so a
+  small honest range ending inside two nodes of a level asks for them in two requests instead of one.
 - `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which
   may evict what it fetched if pins alone fill `max_storage`. Any fetch is refused with `StorageFull` ("not
@@ -570,7 +600,8 @@ Everything in the specification is implemented, with these simplifications and a
   `get` and `export` also check free disk space at the destination first (`node._check_free_space`): the
   output must leave the same reserve free there, and when the destination is on the blocks' filesystem, `get`
   (and a sealed file's write-out) counts what it still has to fetch too (the verified size less the bytes of
-  the target's DAG already stored).
+  the target's DAG already stored). If the destination's free space can't be read, the check raises the
+  `OSError` (same errno, saying so) instead of letting the write go ahead unchecked.
 - Roots found invalid are remembered in `state/invalid.json` (at most 10 000, oldest dropped), and there is
   no command to clear them. Cache records are capped at 10 000 (LRU). Both are saved every 30 s and at stop.
 - A remote pin's usage is the larger of its content size and its DAG's block bytes. It is dropped once the
