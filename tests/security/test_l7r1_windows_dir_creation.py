@@ -17,9 +17,12 @@ import struct
 import unittest
 from unittest import mock
 
+import RNS
+
 from rnfs import node as node_module, winacl
 from rnfs.config import SETTINGS_FILE, Config
 from rnfs.errors import RnfsError
+from rnfs.network import identity as identity_module
 from rnfs.winacl import Dacl
 from tests.security.test_l7_windows_acl import OTHER, USER, WindowsTestCase, allow
 
@@ -117,6 +120,36 @@ class SettingsFileTest(WindowsTestCase):
             Config.load(self.root)
         log.assert_not_called()
         self.assertEqual(self.acl.set_calls, [])
+
+
+class IdentityFileTest(WindowsTestCase):
+    """load_or_create_identity on Windows: a foreign or untightenable identity stops the node."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.tmp.name, "storage", "identity")
+        os.makedirs(os.path.dirname(self.path))
+        RNS.Identity().to_file(self.path)
+
+    def test_identity_of_another_account_is_refused(self):
+        self.acl.set(self.path, Dacl(OTHER, [allow(OTHER), allow(USER)]))
+        with mock.patch.object(identity_module, "log"):
+            with self.assertRaisesRegex(RnfsError, f"belongs to {OTHER}"):
+                identity_module.load_or_create_identity(self.path)
+
+    def test_identity_that_cant_be_tightened_stops_the_node(self):
+        with mock.patch.object(self.acl, "set_private", side_effect=PermissionError(5, "Access is denied")), \
+                mock.patch.object(identity_module, "log"):
+            with self.assertRaisesRegex(RnfsError, "can't be made private to you"):
+                identity_module.load_or_create_identity(self.path)
+
+    def test_identity_dacl_is_checked_through_the_opened_file(self):
+        with mock.patch.object(identity_module, "log"):
+            identity_module.load_or_create_identity(self.path)
+        reads = list(self.acl.read_fds)
+        self.assertTrue(reads and all(fd is not None for fd in reads),
+                        "the identity's DACL was read by path, not from the file read")
+        self.assertTrue(self.private(self.path))
 
 
 if __name__ == "__main__":
