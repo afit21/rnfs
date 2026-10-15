@@ -923,8 +923,6 @@ rnfs --dir /tmp/a --api-port 9001 add somefile
 rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
-ery thread's stack.
-
 ## Known limitations
 
 - A name resolves only while its owner, a transport node that remembers its announce, or a keeper is

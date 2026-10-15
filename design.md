@@ -519,7 +519,7 @@ and a resumed job removes one left by a crash.
 
 ## Tests
 
-How to run the tests is in [README.md, Tests](README.md#tests). Feature tests live in their own files
+The commands CI runs the tests with are in `.github/workflows/tests.yml`. Feature tests live in their own files
 (`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`, `test_seal.py`, `test_chunker.py`,
 `test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and `test_e2e.py` has a marked block per
 feature. CI (`.github/workflows/tests.yml`) runs them on Linux, macOS and Windows; `packaging/smoke_test.py`
