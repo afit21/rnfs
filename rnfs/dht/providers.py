@@ -4,8 +4,10 @@ A record says "publisher provides key". Records expire PROVIDER_TTL after they w
 their first-stored time across republishes. At most max_records are kept, a tenth of them in a newcomer
 pool. When the rest is full, a publisher seen before evicts a record of the publisher first seen most
 recently, so a flood of new identities can't displace older publishers; a publisher not seen before (or the
-one seen most recently) stores into the pool instead, evicting a random pooled record when it is full, so
-a new publisher can always store something. This node's own records are always accepted.
+one seen most recently) stores into the pool instead. A full pool evicts a record of the publisher holding the
+most pooled records (one of them at random, if several hold as many), never the storer's own, so a new
+publisher can always store something and a flood of identities evens out the pool rather than emptying it of
+everyone else's records. This node's own records are always accepted.
 
 Local limits, not part of the protocol, bound what one identity can take: a publisher holds at most
 max_records // PUBLISHER_SHARE records once it has been seen for `seniority`, and a tenth of that before (so
@@ -14,7 +16,9 @@ node's own records are exempt); and a key has at most MAX_PUBLISHERS_PER_KEY pub
 stay cheap however many identities advertise one key). A newcomer to a full key evicts one of its publishers
 at random, never one of the K/2 oldest records: refusing newcomers would let early Sybil identities hold the
 key, and the random half of /find replies relies on newcomers getting stored. A publisher's first-seen time
-is kept for a TTL after its last record goes, so one that was away for a while isn't new again.
+is kept for a TTL after its last record goes, so one that was away for a while isn't new again; that of a
+newcomer whose last record was evicted from the pool is kept too, in a smaller memory that forgets the most
+recently first seen first, so a flood can't keep a new publisher new forever.
 
 Times are wall clock and persisted, so a time in the future (the clock ran ahead, then was corrected) is
 clamped to now on load and at each expire(); otherwise such records would outlive their TTL.
@@ -38,9 +42,10 @@ _EXPIRE_INTERVAL = 60  # when full, scan for expired records at most this often 
 PUBLISHER_SHARE = 100  # a publisher may hold at most max_records // PUBLISHER_SHARE records ...
 MIN_PER_PUBLISHER = 10  # ... but at least this many, so small stores still work
 NEWCOMER_SHARE = 10  # until seen for `seniority`, a publisher may hold a tenth of that (at least MIN_PER_PUBLISHER)
-POOL_SHARE = 10  # max_records // POOL_SHARE records are a newcomer pool, with random eviction inside it
+POOL_SHARE = 10  # max_records // POOL_SHARE records are a newcomer pool, evicting from its biggest holder
 MAX_PUBLISHERS_PER_KEY = 1000  # publishers recorded per key; a newcomer evicts a random non-senior one
 DEPARTED_SHARE = 10  # first-seen times kept for publishers with no records left: at most max_records // this
+EVICTED_SHARE = 10  # ... and for newcomers evicted from the pool: at most pool_size // this (MIN_PER_PUBLISHER)
 
 
 def _never(node_id: bytes) -> bool:
@@ -82,7 +87,8 @@ class ProviderStore:
 
     `clock` is wall-clock seconds, since times are persisted. `state_path` (None: memory only) is where
     save() writes records and first-seen times as JSON; it is loaded on construction. `rng` picks the
-    random half of /find replies, the publisher a full key evicts and the pooled record a newcomer evicts.
+    random half of /find replies, the publisher a full key evicts and, among the publishers holding the most
+    pooled records, the one a full pool evicts from.
     """
 
     def __init__(self, max_records: int, state_path: str | None, ttl: float = PROVIDER_TTL,
@@ -116,11 +122,21 @@ class ProviderStore:
         # Publishers with records outside the pool, newest first: (-first_seen, -order, publisher). Entries go
         # stale as publishers lose their last such record and are dropped when they reach the top
         self._newest: list[tuple[float, int, bytes]] = []
-        self._pool: list[tuple[bytes, bytes]] = []  # pooled (key, publisher) records, for a random pick
-        self._pool_index: dict[tuple[bytes, bytes], int] = {}  # position in _pool
+        self._pooled: dict[bytes, dict[bytes, None]] = {}  # publisher -> its pooled keys, oldest pooled first
+        self._pool_count = 0
+        # Publishers by how many pooled records they hold (count -> list, with each one's place in its list), so
+        # a full pool finds one of its biggest holders in O(1)
+        self._holders: dict[int, list[bytes]] = {}
+        self._holder_index: dict[bytes, int] = {}
+        self._most_pooled = 0
         # Publishers whose last record went: publisher -> (first seen, when it went), oldest departure first
         self._departed: OrderedDict[bytes, tuple[float, float]] = OrderedDict()
         self._departed_size = max(MIN_PER_PUBLISHER, max(0, max_records) // DEPARTED_SHARE)
+        # Newcomers (not seen for `seniority`) whose last record a full pool evicted: publisher -> (first seen,
+        # when evicted), oldest eviction first. When full, the one first seen most recently is forgotten, so a
+        # flood of fresh identities can't push out a newcomer seen before it
+        self._evicted: dict[bytes, tuple[float, float]] = {}
+        self._evicted_size = max(MIN_PER_PUBLISHER, self.pool_size // EVICTED_SHARE)
         self._count = 0
         self._main_count = 0
         self._dirty = False
@@ -169,14 +185,14 @@ class ProviderStore:
             if entry is None:
                 first_seen = self._departed_first_seen(publisher, now)
                 self._departed.pop(publisher, None)
+                self._evicted.pop(publisher, None)
                 entry = self._publishers[publisher] = _Publisher(now if first_seen is None else first_seen,
                                                                  next(self._order))
             entry.keys.add(key)
             record = self._records.setdefault(key, {})[publisher] = _Record(now, now, pooled)
             self._count += 1
             if pooled:
-                self._pool_index[(key, publisher)] = len(self._pool)
-                self._pool.append((key, publisher))
+                self._pool_add(key, publisher)
             else:
                 self._add_main(publisher, entry)
             self._dirty = True
@@ -222,6 +238,7 @@ class ProviderStore:
                     removed += self._remove(key, publisher)
                 # Not kept as departed either: its standing here came from records it shouldn't have had
                 self._departed.pop(publisher, None)
+                self._evicted.pop(publisher, None)
             self._dirty = self._dirty or removed > 0
         return removed
 
@@ -312,12 +329,19 @@ class ProviderStore:
             return False
         if self.pool_size <= 0:
             return None
-        if len(self._pool) < self.pool_size:
+        if self._pool_count < self.pool_size:
             return True
-        key, victim_id = self._pool[self.rng.randrange(len(self._pool))]
-        if victim_id == publisher and not own:
-            return None  # a publisher can't churn its own pooled records
-        self._remove(key, victim_id)
+        # Fair shares: a publisher already holding as many pooled records as anyone can't push others out (nor
+        # churn its own); any other takes a record from one of those holding the most
+        if not own and len(self._pooled.get(publisher, ())) >= self._most_pooled:
+            return None
+        holders = self._holders[self._most_pooled]
+        index = self.rng.randrange(len(holders))
+        victim_id = holders[index]
+        if victim_id == publisher and len(holders) > 1:  # own records: another's first, if another holds as many
+            victim_id = holders[(index + 1) % len(holders)]
+        key = next(iter(self._pooled[victim_id]))  # the one it had pooled first
+        self._remove(key, victim_id, evicted=True)
         return True
 
     @staticmethod
@@ -366,16 +390,45 @@ class ProviderStore:
         record.pooled = False
         self._add_main(publisher, self._publishers[publisher])
 
-    def _drop_from_pool(self, key: bytes, publisher: bytes):
-        """Forget a pooled record's place in the pool, swapping the last one in. Caller holds the lock."""
-        index = self._pool_index.pop((key, publisher))
-        last = self._pool.pop()
-        if index < len(self._pool):
-            self._pool[index] = last
-            self._pool_index[last] = index
+    def _pool_add(self, key: bytes, publisher: bytes):
+        """Count a record of publisher in the pool. Caller holds the lock."""
+        keys = self._pooled.setdefault(publisher, {})
+        keys[key] = None
+        self._pool_count += 1
+        self._recount(publisher, len(keys) - 1, len(keys))
 
-    def _remove(self, key: bytes, publisher: bytes) -> bool:
-        """Delete one record, and the publisher once it has none left. Caller holds the lock."""
+    def _drop_from_pool(self, key: bytes, publisher: bytes):
+        """Forget a pooled record. Caller holds the lock."""
+        keys = self._pooled[publisher]
+        del keys[key]
+        if not keys:
+            del self._pooled[publisher]
+        self._pool_count -= 1
+        self._recount(publisher, len(keys) + 1, len(keys))
+
+    def _recount(self, publisher: bytes, old: int, new: int):
+        """Move publisher from the holders of old pooled records to those of new (0: none). Caller holds the lock."""
+        if old:
+            holders = self._holders[old]
+            index = self._holder_index.pop(publisher)
+            last = holders.pop()
+            if index < len(holders):
+                holders[index] = last
+                self._holder_index[last] = index
+            if not holders:
+                del self._holders[old]
+        if new:
+            holders = self._holders.setdefault(new, [])
+            self._holder_index[publisher] = len(holders)
+            holders.append(publisher)
+        # Counts move by one, so the most held drops by at most one
+        self._most_pooled = max(self._most_pooled, new)
+        if self._most_pooled and self._most_pooled not in self._holders:
+            self._most_pooled -= 1
+
+    def _remove(self, key: bytes, publisher: bytes, evicted: bool = False) -> bool:
+        """Delete one record, and the publisher once it has none left (evicted: a full pool took it). Caller holds
+        the lock."""
         records = self._records.get(key)
         if records is None:
             return False
@@ -394,24 +447,36 @@ class ProviderStore:
             entry.main -= 1
         if not entry.keys:
             del self._publishers[publisher]
-            self._depart(publisher, entry.first_seen, self.clock())
+            self._depart(publisher, entry.first_seen, self.clock(), evicted)
         return True
 
-    def _depart(self, publisher: bytes, first_seen: float, now: float):
+    def _depart(self, publisher: bytes, first_seen: float, now: float, evicted: bool = False):
         """Keep the first-seen time of a publisher whose last record went, for a TTL, if it had been seen for
         `seniority` (a younger one has no standing to lose, and leaving those out means a flood of fresh
-        identities can't push the others out). Caller holds the lock."""
+        identities can't push the others out). A younger one whose last record a full pool evicted is kept
+        in a memory of its own, so being pushed out doesn't make it new again. Caller holds the lock."""
         self._departed.pop(publisher, None)
+        self._evicted.pop(publisher, None)
         if now - first_seen < self.seniority:
+            if evicted:
+                self._remember_evicted(publisher, first_seen, now)
             return
         self._departed[publisher] = (first_seen, now)
         while len(self._departed) > self._departed_size:
             self._departed.popitem(last=False)
 
+    def _remember_evicted(self, publisher: bytes, first_seen: float, now: float):
+        """Keep a pool-evicted newcomer's first-seen time; when the memory is full, the one first seen most
+        recently (perhaps this one) is forgotten. Caller holds the lock."""
+        self._evicted[publisher] = (first_seen, now)
+        if len(self._evicted) > self._evicted_size:
+            newest = max(self._evicted, key=lambda p: self._evicted[p][0])
+            del self._evicted[newest]
+
     def _departed_first_seen(self, publisher: bytes, now: float) -> float | None:
         """First-seen time of a publisher whose last record went less than a TTL ago, else None. Caller holds
         the lock."""
-        departed = self._departed.get(publisher)
+        departed = self._departed.get(publisher) or self._evicted.get(publisher)
         if departed is None or now - departed[1] >= self.ttl:
             return None
         return departed[0]
@@ -442,6 +507,9 @@ class ProviderStore:
         while self._departed and now - next(iter(self._departed.values()))[1] >= self.ttl:
             self._departed.popitem(last=False)
             self._dirty = True
+        while self._evicted and now - next(iter(self._evicted.values()))[1] >= self.ttl:
+            del self._evicted[next(iter(self._evicted))]
+            self._dirty = True
         self._dirty = self._dirty or bool(expired)
         return len(expired)
 
@@ -463,10 +531,11 @@ class ProviderStore:
             if entry.first_seen > now:
                 entry.first_seen = now
                 moved = True
-        for publisher, (first_seen, departed) in list(self._departed.items()):
-            if first_seen > now or departed > now:
-                self._departed[publisher] = (min(first_seen, now), min(departed, now))
-                self._dirty = True
+        for memory in (self._departed, self._evicted):
+            for publisher, (first_seen, departed) in list(memory.items()):
+                if first_seen > now or departed > now:
+                    memory[publisher] = (min(first_seen, now), min(departed, now))
+                    self._dirty = True
         if moved:
             self._rebuild_newest()
             self._dirty = True
@@ -558,6 +627,8 @@ class ProviderStore:
                                 for key, records in self._records.items() for publisher, record in records.items()],
                     "departed": [[publisher.hex(), first_seen, departed]
                                  for publisher, (first_seen, departed) in self._departed.items()],
+                    "evicted": [[publisher.hex(), first_seen, evicted]
+                                for publisher, (first_seen, evicted) in self._evicted.items()],
                 }
                 self._dirty = False
             directory = os.path.dirname(os.path.abspath(self.state_path))
@@ -584,6 +655,7 @@ class ProviderStore:
             records = [(bytes.fromhex(r[0]), bytes.fromhex(r[1]), float(r[2]), float(r[3]),
                         len(r) > 4 and bool(r[4])) for r in state["records"]]
             departed = [(bytes.fromhex(p), float(seen), float(left)) for p, seen, left in state.get("departed", [])]
+            evicted = [(bytes.fromhex(p), float(seen), float(left)) for p, seen, left in state.get("evicted", [])]
         except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, IndexError):
             return
         now = self.clock()
@@ -605,7 +677,7 @@ class ProviderStore:
                 continue
             # Where it was if there is room there, else wherever there is
             main_room = self._main_count < self.main_size
-            pool_room = len(self._pool) < self.pool_size
+            pool_room = self._pool_count < self.pool_size
             if not (main_room or pool_room):
                 continue
             pooled = pool_room if pooled or not main_room else False
@@ -614,8 +686,7 @@ class ProviderStore:
             entry.keys.add(key)
             self._count += 1
             if pooled:
-                self._pool_index[(key, publisher)] = len(self._pool)
-                self._pool.append((key, publisher))
+                self._pool_add(key, publisher)
             else:
                 self._main_count += 1
                 entry.main += 1
@@ -626,3 +697,7 @@ class ProviderStore:
             if (len(publisher) == ID_LENGTH and seen == seen and left == left and publisher not in self._publishers
                     and now - min(left, now) < self.ttl):
                 self._depart(publisher, min(seen, now), min(left, now))
+        for publisher, seen, left in sorted(evicted, key=lambda item: item[2]):
+            if (len(publisher) == ID_LENGTH and seen == seen and left == left and publisher not in self._publishers
+                    and publisher not in self._departed and now - min(left, now) < self.ttl):
+                self._remember_evicted(publisher, min(seen, now), min(left, now))
