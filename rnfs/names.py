@@ -255,6 +255,10 @@ class NameManager:
         self.keepers = None
         # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
         self._gone: list[tuple[str, Cid]] = []
+        # Aliases whose key file is there but couldn't be read (permissions, damage): not names this node can
+        # use, but not gone either, so their pins stay and their names.json entry (or None) is written back as
+        # it was, for when the file can be read again
+        self._unreadable: dict[str, dict | None] = {}
         # Aliases with an entry in names.json: for these the recorded target (or none) is the only CID their pin
         # source may hold (reconcile_pins). A key without one (names.json lost) may have pins nothing records
         self._recorded: set[str] = set()
@@ -349,7 +353,8 @@ class NameManager:
         could leave one that `pin rm` and `name rm` couldn't remove).
 
         A key with no names.json entry (the file was lost) keeps its pins until its next publish or removal,
-        which release them; a pin of an alias with no key at all is released.
+        which release them; a pin of an alias with no key file at all is released, but one whose key file is
+        there and can't be read is kept.
         """
         self.release_gone()
         with self._lock:
@@ -360,6 +365,9 @@ class NameManager:
                         held.setdefault(source[len(PIN_SOURCE_PREFIX):], set()).add(cid)
             for alias in sorted(set(held) | set(self._keys)):
                 cids = held.get(alias, set())
+                if alias in self._unreadable:
+                    log(f"keeping the pins of name {alias}, whose key file can't be read", LOG_WARNING)
+                    continue
                 if alias not in self._keys:
                     log(f"releasing the pins of name {alias}, which has no key", LOG_WARNING)
                     self._release(alias, cids)
@@ -853,11 +861,12 @@ class NameManager:
             return
         for alias in entries:
             path = self._key_path(alias)
-            if not _ALIAS.fullmatch(alias) or not os.path.isfile(path):
-                continue
-            identity = RNS.Identity.from_file(path)
+            if not _ALIAS.fullmatch(alias) or not (os.path.isfile(path) or os.path.islink(path)):
+                continue  # not a key file (a directory, a FIFO, ...)
+            identity = RNS.Identity.from_file(path) if os.path.isfile(path) else None  # None: a dangling symlink
             if identity is None:
-                log(f"could not read name key {path}; skipping it", LOG_ERROR)
+                log(f"could not read name key {path}; skipping it, and keeping its pins and records", LOG_ERROR)
+                self._unreadable[alias] = None
                 continue
             name = name_for_identity(identity)
             if name in self._aliases:
@@ -885,6 +894,8 @@ class NameManager:
                 if alias in self._keys:
                     self._published[alias] = published
                     self._recorded.add(alias)
+                elif alias in self._unreadable:
+                    self._unreadable[alias] = entry  # written back unchanged by _save
                 elif cid is not None:
                     # Its key file was deleted by hand: nothing will republish it, so release its pin
                     self._gone.append((alias, cid))
@@ -934,11 +945,15 @@ class NameManager:
 
     def _save(self):
         """Write published and held records atomically."""
+        published = {alias: {"sequence": p.sequence, "cid": str(p.cid) if p.cid is not None else None,
+                             "imported": p.imported}
+                     for alias, p in self._published.items()}
+        for alias, entry in self._unreadable.items():
+            if entry is not None and alias not in published:
+                published[alias] = entry
         state = {
             "version": STATE_VERSION,
-            "published": {alias: {"sequence": p.sequence, "cid": str(p.cid) if p.cid is not None else None,
-                                  "imported": p.imported}
-                          for alias, p in sorted(self._published.items())},
+            "published": dict(sorted(published.items())),
             "held": {name.hex(): {"sequence": r.sequence, "cid": str(r.cid), "heard": r.heard}
                      for name, r in sorted(self._held.items())},
         }
