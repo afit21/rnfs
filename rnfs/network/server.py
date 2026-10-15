@@ -1,8 +1,9 @@
 """Answering other nodes' requests on rnfs.dht, within every section 3 limit, and the /blocks budget (section 7).
 
 RNS calls each request handler on a thread of its own and sends back whatever it returns. Malformed and
-refused requests get False straight away, never silence (except requests over MAX_REQUEST_SIZE, which RNS
-drops before any handler runs).
+refused requests get False straight away, never silence, except requests over MAX_REQUEST_SIZE, which RNS
+drops before any handler runs, and a flood over a link's request rate limit (REQUEST_BURST, REQUEST_RATE),
+which after a few refusals gets no answer.
 
 The policy parts (response pools, deadlines and displacement, the /blocks budget, incoming-link eviction,
 upload pacing) are plain classes with an injected clock, so they can be tested without RNS. RequestServer
@@ -56,6 +57,21 @@ MAX_GRACE_HOPS = 32  # the requester can raise the hop count it reports; the gra
 # unmeasured_bitrate floor applies there
 FLOOR_FRACTION = 1 / 1000
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
+# Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
+# An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
+# that many per round trip. Over real RNS on loopback (the shortest round trip there is), a 10,000-key /provide
+# (182 requests, one at a time) ran at ~900 a second and two threads sending /find back to back at 2,100-3,600;
+# the busiest link in the end-to-end tests saw 13 in a second. So the limit binds only on a link sending faster
+# than any rnfs requester over a real network (or a tight loop like that last one, slowed to the rate). Requests over it are answered False while the link has refusals
+# left (OVER_RATE_REFUSALS, one more a second), so a requester that gets there backs off as from any refusal,
+# and dropped unanswered after that. RNS has already decrypted and decoded each request and started its thread
+# by then; what the limit saves is the handler's work and the answer (about 40% of a /find's cost to the node)
+REQUEST_BURST = 2000
+REQUEST_RATE = 2000.0
+OVER_RATE_REFUSALS = 2 * MAX_REQUESTS_PER_LINK
+OVER_RATE_LOG_INTERVAL = 60.0  # seconds between log lines about requests over the rate limit
+# IncomingLinks.take_token outcomes
+REQUEST_OK, REQUEST_REFUSED, REQUEST_DROPPED = "ok", "refused", "dropped"
 
 
 class Backend(Protocol):
@@ -305,16 +321,19 @@ class ResponsePools:
 
 
 class _LinkState:
-    """Requests in progress on one incoming link."""
+    """Requests in progress on one incoming link, and its request rate limit."""
 
-    __slots__ = ("requests", "blocks", "last_active", "waiting")
+    __slots__ = ("requests", "blocks", "last_active", "waiting", "tokens", "refusals", "refilled_at")
 
     def __init__(self, now: float):
-        """A link with nothing in progress, active now."""
+        """A link with nothing in progress, active now, with full request and refusal buckets."""
         self.requests = 0
         self.blocks = 0
         self.last_active = now
         self.waiting = False  # a /blocks request is waiting for the previous response's proof
+        self.tokens = float(REQUEST_BURST)
+        self.refusals = float(OVER_RATE_REFUSALS)
+        self.refilled_at = now
 
 
 class IncomingLinks:
@@ -377,6 +396,31 @@ class IncomingLinks:
                 state.blocks += 1
             state.last_active = self.clock()
             return True
+
+    def take_token(self, link_id: bytes) -> str:
+        """Count a request arriving on link_id against the link's rate limit: REQUEST_OK, or, over the limit
+        (REQUEST_BURST at once, REQUEST_RATE a second after that), REQUEST_REFUSED while the link has refusals
+        left and REQUEST_DROPPED after that. A closed link isn't tracked again: its requests are let through,
+        to be refused by the handlers."""
+        with self.lock:
+            if link_id in self.closed:
+                return REQUEST_OK
+            now = self.clock()
+            state = self.links.get(link_id)
+            if state is None:
+                # A link established before we were tracking; count it from now
+                state = self.links[link_id] = _LinkState(now)
+            elapsed = max(0.0, now - state.refilled_at)
+            state.refilled_at = now
+            state.tokens = min(float(REQUEST_BURST), state.tokens + elapsed * REQUEST_RATE)
+            state.refusals = min(float(OVER_RATE_REFUSALS), state.refusals + elapsed)
+            if state.tokens >= 1:
+                state.tokens -= 1
+                return REQUEST_OK
+            if state.refusals >= 1:
+                state.refusals -= 1
+                return REQUEST_REFUSED
+            return REQUEST_DROPPED
 
     def start_waiting(self, link_id: bytes) -> bool:
         """Let one /blocks request on link_id wait for the previous response to conclude. False if one already is."""
@@ -525,6 +569,9 @@ class RequestServer:
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.pin_identities = {h.strip().strip("<>").lower() for h in config.remote_pin_identities}
+        self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
+        self.over_rate_logged_at: float | None = None
+        self.over_rate_logged = 0
 
         # Process-wide: refuses compressed incoming Resources (RNS decompresses at most this many bytes, so
         # any compressed payload fails) and stops RNS compressing outgoing ones (section 3)
@@ -635,6 +682,11 @@ class RequestServer:
         """Wrap handler so an unexpected error answers False rather than leaving the requester waiting."""
         def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
             """RNS's six-argument request handler signature."""
+            # First, before any parsing: the link's rate limit. None: RNS sends no answer
+            allowed = self.incoming.take_token(link_id)
+            if allowed != REQUEST_OK:
+                self._over_rate()
+                return False if allowed == REQUEST_REFUSED else None
             try:
                 if self.config.private and not self._is_member(remote_identity):
                     log(f"refused {path} from a non-member", LOG_VERBOSE)
@@ -644,6 +696,18 @@ class RequestServer:
                 log(f"error answering {path}: {e}", LOG_ERROR)
                 return False
         return response_generator
+
+    def _over_rate(self):
+        """Count a request over its link's rate limit, logging at most once a minute."""
+        with self.lock:
+            self.over_rate += 1
+            now = self.clock()
+            if self.over_rate_logged_at is not None and now - self.over_rate_logged_at < OVER_RATE_LOG_INTERVAL:
+                return
+            dropped, self.over_rate_logged, self.over_rate_logged_at = (self.over_rate - self.over_rate_logged,
+                                                                        self.over_rate, now)
+        log(f"refused or dropped {plural(dropped, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
+            f"once, {REQUEST_RATE:g} a second)", LOG_WARNING)
 
     def _is_member(self, remote_identity) -> bool:
         """True if the requester identified as a member (private mode)."""
