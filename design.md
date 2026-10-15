@@ -331,15 +331,24 @@ injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 100
 and in total, never persisted.
 - `Fetcher.path_info` (default: nothing known) is set by the node to `RnsPaths.info`; `Fetch._rank` orders
   both providers and open-link probes, and each provider caches its `PathInfo`.
-- `ResponsePools` protects a response from displacement only while it is within a grace it measures from the
-  link's interface bitrate and hop count (`link_path`, `response_grace`, never from `link.rtt`), or moving at
-  or above a floor (`progress_floor`). A full pool displaces the least-progressing unprotected response (else
-  an interface-fairness pick: a zero-progress response from an interface holding two or more slots, for a
-  newcomer whose interface holds none; else the old slowest-past-`deadline_slack` rule), never one on the
-  newcomer's own link. `check_responses` cancels and refunds a response that has sent nothing once its grace
-  plus `deadline_slack` has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses
-  `/blocks` from a link (and its identity, if identified) whose response was displaced or cancelled for making
-  no progress, for `blocks_cooldown`, cheaply and before any slot is taken. `_concluded` starts the same
+- `ResponsePools` has `max_blocks_responses // 2` slow-link slots and `fast_blocks_responses` (or the rest, if
+  more) for others. It protects a response from displacement only while it is within a grace it measures from
+  the link's path (`link_path`, `fast_path`, `response_grace`, never from `link.rtt`), or moving at or above a
+  floor (`progress_floor`). `link_path` treats the interface to a shared instance (`via_shared_instance`: RNS's
+  `is_connected_to_shared_instance` attribute, else the `LocalClientInterface` class name) as of unknown
+  bitrate. `response_grace` prices the first hop at the interface's bitrate and the others at
+  `unmeasured_bitrate`, or `slow_bitrate` when `fast_path` (the link's MTU is above 500, which RNS allows only
+  across interfaces that configure their MTU), and adds `RequestServer._queued_bits` on the node's own slow
+  interface (a window of parts per response in flight there). A full pool displaces the least-progressing
+  unprotected response; else (`_fairness_pick`), for a newcomer whose interface holds no slot, the oldest
+  zero-progress response past half its grace from an interface holding two or more, at most once per grace
+  per interface (`fairness_at`); else, for a newcomer whose link and identity hold no slot, the slowest
+  response older than `deadline_slack` and past its grace, marked idle if `Response.far_behind` (below a
+  quarter of `needed_rate`, measured against `Response.due`). Never one on the newcomer's own link.
+  `check_responses` cancels and refunds a response that has sent nothing once its grace plus `deadline_slack`
+  has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses `/blocks` from a link
+  (and its identity, if identified) whose response was displaced or cancelled idle, for `blocks_cooldown`,
+  cheaply and before any slot is taken. `_concluded` starts the same
   cooldown for a response whose Resource the requester rejected (`REJECTED`) with nothing sent (`_sent_any`:
   `Response.sent`, else the Resource's `get_progress()`).
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
@@ -349,8 +358,9 @@ and in total, never persisted.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
   caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
   (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
-  (one admission at a time) allows a response if the bucket holds its cost beyond `_committed()` (the
-  uncharged rest of other responses within their grace or that have sent something), and charges a
+  (one admission at a time) allows a response if the bucket holds its cost beyond `_committed()` (the sum of
+  other responses' `Response.commitment`: the uncharged rest within the grace; after it, what the progress
+  rate sends before the deadline, or nothing below the floor), and charges a
   reservation of at most the link's MDU; single-packet and untracked responses are charged in full.
   `check_responses` charges progress as it reads it (`_charge_progress`), and `_settle` (from `_finish`)
   makes the charge final: the cost if completed or progress is unreadable, else progress × size, refunding

@@ -51,11 +51,18 @@ GRACE_BASE = 3.0  # seconds: handling at both ends and a round trip on a fast li
 # sized to Link.MDU), so it takes at most this long per hop at the interface's bitrate
 ADVERTISEMENT_BITS = 500 * 8
 MAX_GRACE_HOPS = 32  # the requester can raise the hop count it reports; the grace is capped anyway
+# What may be queued ahead of an advertisement on the node's own slow radio, per other response on that interface:
+# one window of parts (RNS.Resource.WINDOW_MAX_SLOW, 10, of at most one 500-byte packet each). With the radio's
+# default flow control off, RNS hands packets to the device at once, so when one actually leaves can't be read
+QUEUED_WINDOW_BITS = 10 * 500 * 8
 # Progress floor on a directly connected link: 1/1000 of the interface's bitrate (1.25 kB/s on a 10 Mbit/s TCP
 # interface). Far below what an honest transfer gets from a direct neighbour, but a requester trickling below it
 # loses its protection. Behind more hops the path may be much slower than our interface, so only the
 # unmeasured_bitrate floor applies there
 FLOOR_FRACTION = 1 / 1000
+# A response displaced for a newcomer while making progress at less than this fraction of the rate it needs to
+# be done when it is due (Response.due) counts as making none: its requester cools down
+FAR_BEHIND = 1 / 4
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
 # Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
 # An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
@@ -137,11 +144,14 @@ def link_path(link) -> tuple[object | None, float | None, int | None]:
     RNS 1.5.6 dependency: Link.attached_interface (the interface the link request arrived on), Interface.bitrate
     (the node's own configuration, or the interface's own guess) and Link.expected_hops (the hop count of the
     requester's RTT packet, which the requester can raise but transport nodes only increase). Read with
-    defaults, so a changed RNS falls back to the conservative values the callers use for unknowns.
+    defaults, so a changed RNS falls back to the conservative values the callers use for unknowns. Attached to a
+    shared instance, every link arrives on the local interface to it, whose bitrate (1 Gbit/s) says nothing
+    about the path, so the bitrate is unknown (via_shared_instance).
     """
     interface = getattr(link, "attached_interface", None)
     bitrate = getattr(interface, "bitrate", None)
-    if type(bitrate) not in (int, float) or not math.isfinite(bitrate) or bitrate <= 0:
+    if type(bitrate) not in (int, float) or not math.isfinite(bitrate) or bitrate <= 0 \
+            or via_shared_instance(interface):
         bitrate = None
     hops = getattr(link, "expected_hops", None)
     if type(hops) is not int or hops < 0:
@@ -149,16 +159,46 @@ def link_path(link) -> tuple[object | None, float | None, int | None]:
     return interface, bitrate, hops
 
 
-def response_grace(bitrate: float | None, hops: int | None, config: Config) -> float:
+def via_shared_instance(interface) -> bool:
+    """Whether interface is a local one between RNS instances on this machine: the client end of the connection
+    to a shared instance (or, in the instance, a local client's), not a link to the network.
+
+    RNS 1.5.6 dependency: Transport.interface_to_shared_instance tells the interface to the shared instance by
+    its is_connected_to_shared_instance attribute (LocalClientInterface sets it; the spawned server-side ends set
+    it False). The class names are a fallback.
+    """
+    return interface is not None and (hasattr(interface, "is_connected_to_shared_instance")
+                                      or type(interface).__name__ in rates.LOCAL_INTERFACE_TYPES)
+
+
+def fast_path(link) -> bool:
+    """Whether RNS raised the link's MTU above rates.SLOW_MTU, which it does only if every interface on the path
+    autoconfigures its MTU (from 62.5 kbit/s up, Interface.optimise_mtu) or has a fixed one: no LoRa or other
+    KISS radio on it. A requester can lower its link's MTU, never raise it past what the path allows."""
+    try:
+        mtu = link.get_mtu()
+    except Exception:
+        return False
+    return type(mtu) is int and mtu > rates.SLOW_MTU
+
+
+def response_grace(bitrate: float | None, hops: int | None, config: Config, fast: bool = False,
+                   queued_bits: float = 0) -> float:
     """Seconds a new response is protected from displacement before it must show progress (section 3).
 
-    Enough for the advertisement to reach the requester and its first part request to come back over hops hops
-    at the receiving interface's bitrate (unmeasured_bitrate if unknown), plus GRACE_BASE, at most
-    deadline_slack. E.g. 3 hops at 1 kbit/s: 3 + 2 × 3 × 4 s = 27 s; any hop count over TCP: about 3 s.
+    Enough for the advertisement to reach the requester and its first part request to come back over hops hops,
+    plus GRACE_BASE, at most deadline_slack. The first hop is priced at the receiving interface's bitrate; the
+    others, which may be much slower, at slow_bitrate on a fast path (fast_path) and unmeasured_bitrate
+    otherwise, as is an unknown bitrate. queued_bits is what may be queued ahead of the advertisement on the
+    node's own interface. E.g. 1 hop at 1 kbit/s: 3 + 2 × 4 s = 11 s; 3 hops behind a TCP interface with a LoRa
+    segment, or anything at an unknown bitrate off a fast path: deadline_slack; any hop count on a fast path
+    over TCP: 3-5 s.
     """
-    rate = bitrate if bitrate else config.unmeasured_bitrate
+    beyond = config.slow_bitrate if fast else config.unmeasured_bitrate
+    rate = bitrate if bitrate else beyond
     hops = min(max(1, hops or 1), MAX_GRACE_HOPS)
-    return min(config.deadline_slack, GRACE_BASE + 2 * hops * ADVERTISEMENT_BITS / rate)
+    one_way = ADVERTISEMENT_BITS / rate + (hops - 1) * ADVERTISEMENT_BITS / min(rate, beyond)
+    return min(config.deadline_slack, GRACE_BASE + 2 * one_way + queued_bits / rate)
 
 
 def progress_floor(bitrate: float | None, hops: int | None, config: Config) -> float:
@@ -184,6 +224,9 @@ class Response:
         self.started = started
         self.size: int | None = None  # packed bytes, once built
         self.deadline = float("inf")  # absolute time by which it must have finished
+        # When it should be done judging from its path: its deadline, or for one with no rate estimate on a fast
+        # path (fast_path), the deadline it would have at slow_bitrate, which every interface on that path beats
+        self.due = float("inf")
         self.sent = 0.0  # bytes sent so far, from the Resource's progress
         self.resource = None  # the RNS Resource carrying it, once found
         self.find_until = float("inf")
@@ -237,40 +280,69 @@ class Response:
         """Whether no newcomer may displace it for making no progress: within its grace, or moving."""
         return self.in_grace(now) or self.moving(now)
 
+    def needed_rate(self, now: float) -> float:
+        """Bytes per second it must send from now on to be done when it is due (0 if its size isn't known yet)."""
+        if self.size is None or self.untracked:
+            return 0.0
+        return max(0.0, self.size - self.sent) / max(min(self.due, self.deadline) - now, 1.0)
+
+    def far_behind(self, now: float) -> bool:
+        """Whether it is moving at less than FAR_BEHIND of the rate it needs to be done when it is due."""
+        return self.progress_rate(now) < FAR_BEHIND * self.needed_rate(now)
+
+    def commitment(self, now: float) -> int:
+        """Budget bytes it may still send that haven't been charged (upload_budget, section 3): its uncharged rest
+        while it is within its grace; after that, at most what it sends at its progress rate before its deadline,
+        and nothing if it is below its floor (or has sent nothing)."""
+        rest = max(0, self.cost - self.charged)
+        if self.in_grace(now):
+            return rest
+        if not self.moving(now):
+            return 0
+        return int(min(rest, self.progress_rate(now) * max(0.0, self.deadline - now)))
+
 
 class ResponsePools:
-    """Slots for /blocks responses: max_responses // 2 for slow links, the rest for others. Thread-safe.
+    """Slots for /blocks responses: max_responses // 2 for slow links, the rest (or fast_responses, if more) for
+    others. Thread-safe.
 
     Each pool competes only with itself. When a pool is full, a new response may displace (section 3), never
     a response on its own link:
     - the response making least progress among those past their grace and below their progress floor (it is
       marked idle, and its requester cools down);
     - else, if the newcomer's interface holds no slot in the pool, the oldest response with nothing sent from
-      an interface holding two or more, even within its grace;
-    - else the pool's response with the lowest throughput, if it is older than deadline_slack and past its grace.
+      an interface holding two or more that is past half its grace, at most once per grace per interface;
+    - else, if neither the newcomer's link nor its identity holds a slot in the pool, the pool's response with the
+      lowest throughput, if it is older than deadline_slack and past its grace (marked idle if it is far behind
+      the rate it needs to be done when it is due).
     Otherwise it is refused.
     """
 
-    def __init__(self, max_responses: int, deadline_slack: float, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, max_responses: int, deadline_slack: float, clock: Callable[[], float] = time.monotonic,
+                 fast_responses: int | None = None):
         """Empty pools."""
-        self.capacity = {SLOW_POOL: max_responses // 2, FAST_POOL: max_responses - max_responses // 2}
+        slow = max_responses // 2
+        self.capacity = {SLOW_POOL: slow, FAST_POOL: max(max_responses - slow, fast_responses or 0)}
         self.deadline_slack = deadline_slack
         self.clock = clock
         self.active: dict[str, list[Response]] = {SLOW_POOL: [], FAST_POOL: []}
+        # id(interface) -> when it last lost a response to a newcomer from another interface
+        self.fairness_at: dict[int, float] = {}
         self.lock = threading.Lock()
 
     def reserve(self, pool: str, link_id: bytes, request_id: bytes, grace: float | None = None, floor: float = 0.0,
-                interface=None) -> tuple[Response | None, Response | None]:
+                interface=None, identity: bytes | None = None) -> tuple[Response | None, Response | None]:
         """Take a slot in pool: (new response, or None if refused; displaced response to cancel, or None).
 
-        grace (default deadline_slack), floor and interface are the new response's (section 3).
+        grace (default deadline_slack), floor, interface and identity (its requester's identity hash, if it
+        identified) are the new response's (section 3).
         """
         with self.lock:
             now = self.clock()
             members = self.active[pool]
             displaced = None
             if len(members) >= self.capacity[pool]:
-                displaced = self._displaceable(members, link_id, interface, now)
+                displaced = self._displaceable(members, link_id, interface, identity, now)
                 if displaced is None:
                     return None, None
                 members.remove(displaced)
@@ -278,11 +350,14 @@ class ResponsePools:
             response.grace = self.deadline_slack if grace is None else grace
             response.floor = floor
             response.interface = interface
+            response.identity = identity
             members.append(response)
             return response, displaced
 
-    def _displaceable(self, members: list[Response], link_id: bytes, interface, now: float) -> Response | None:
-        """The member a newcomer on link_id arriving on interface may displace, or None. Caller holds the lock."""
+    def _displaceable(self, members: list[Response], link_id: bytes, interface, identity: bytes | None,
+                      now: float) -> Response | None:
+        """The member a newcomer on link_id (of identity) arriving on interface may displace, or None. Caller
+        holds the lock."""
         others = [r for r in members if r.link_id != link_id]
         idle = [r for r in others if not r.protected(now)]
         if idle:
@@ -290,15 +365,35 @@ class ResponsePools:
             displaced.idle = True
             return displaced
         if interface is not None and all(r.interface is not interface for r in members):
-            held = Counter(id(r.interface) for r in members if r.interface is not None)
-            crowded = [r for r in others if r.interface is not None and held[id(r.interface)] >= 2
-                       and r.sent <= 0 and not r.untracked]
-            if crowded:
-                return min(crowded, key=lambda r: r.started)
-        slowest = min(members, key=lambda r: r.throughput(now))
-        if slowest.link_id == link_id or now - slowest.started <= self.deadline_slack or slowest.in_grace(now):
+            displaced = self._fairness_pick(others, now)
+            if displaced is not None:
+                return displaced
+        # The slowest moving response, for a newcomer holding nothing in the pool: a requester can't keep its own
+        # responses young by displacing them from its own link or identity
+        if any(r.link_id == link_id or (identity is not None and r.identity == identity) for r in members):
             return None
+        slowest = min(members, key=lambda r: r.throughput(now))
+        if now - slowest.started <= self.deadline_slack or slowest.in_grace(now):
+            return None
+        # Far behind what it needs to finish in time: no better than making no progress, so its requester cools
+        # down (else one taking a little of each response could renew its slots this way from a spare link)
+        slowest.idle = slowest.far_behind(now)
         return slowest
+
+    def _fairness_pick(self, others: list[Response], now: float) -> Response | None:
+        """For a newcomer from an interface holding no slot: the oldest response with nothing sent from an
+        interface holding two or more, once it is past half its grace and that interface hasn't lost one this
+        way within the response's grace. Caller holds the lock."""
+        self.fairness_at = {key: at for key, at in self.fairness_at.items() if now - at <= self.deadline_slack}
+        held = Counter(id(r.interface) for r in others if r.interface is not None)
+        crowded = [r for r in others if r.interface is not None and held[id(r.interface)] >= 2
+                   and r.sent <= 0 and not r.untracked and now - r.grace_start > r.grace / 2
+                   and now - self.fairness_at.get(id(r.interface), -math.inf) > r.grace]
+        if not crowded:
+            return None
+        displaced = min(crowded, key=lambda r: r.started)
+        self.fairness_at[id(displaced.interface)] = now
+        return displaced
 
     def release(self, response: Response) -> bool:
         """Free response's slot. True if it held one."""
@@ -552,7 +647,8 @@ class RequestServer:
         self.config = config
         self.backend = backend
         self.clock = clock
-        self.pools = ResponsePools(config.max_blocks_responses, config.deadline_slack, clock)
+        self.pools = ResponsePools(config.max_blocks_responses, config.deadline_slack, clock,
+                                   config.fast_blocks_responses)
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
         self.cooldowns = Cooldowns(config.blocks_cooldown, clock)
@@ -804,14 +900,13 @@ class RequestServer:
             rate = self.rates.get(link_id)
             slow = rates.link_is_slow(link, rate, self.config)
             interface, bitrate, hops = link_path(link)
-            grace = response_grace(bitrate, hops, self.config)
+            fast = fast_path(link)
+            grace = response_grace(bitrate, hops, self.config, fast, self._queued_bits(interface, bitrate))
             # Until it is handed to RNS, the grace also covers the pacing wait
             response, displaced = self.pools.reserve(SLOW_POOL if slow else FAST_POOL, link_id, request_id,
                                                      grace=min(self.config.deadline_slack, grace + wait),
                                                      floor=progress_floor(bitrate, hops, self.config),
-                                                     interface=interface)
-            if response is not None:
-                response.identity = identity
+                                                     interface=interface, identity=identity)
             if displaced is not None:
                 self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
                              else "displaced by a new request")
@@ -864,6 +959,8 @@ class RequestServer:
                 return body  # nothing to track
             response.size = packed
             response.deadline = response.started + rates.response_deadline(packed, rate, self.config)
+            response.due = response.started + rates.response_deadline(
+                packed, rate or (self.config.slow_bitrate if fast else None), self.config)
             response.grace = grace
             self._restart_grace(response)
             response.find_until = self.clock() + REGISTER_WINDOW
@@ -881,6 +978,13 @@ class RequestServer:
                     self._finish(response)  # frees the pool slot and the link's /blocks slot exactly once
                 else:
                     self.incoming.finish_request(link_id, blocks=True)
+
+    def _queued_bits(self, interface, bitrate: float | None) -> float:
+        """What may be queued ahead of a new response's advertisement on the node's own interface, if it is a slow
+        one (below slow_bitrate): a window of parts for each response in flight on it (QUEUED_WINDOW_BITS)."""
+        if interface is None or not bitrate or bitrate >= self.config.slow_bitrate:
+            return 0
+        return QUEUED_WINDOW_BITS * sum(1 for r in self.pools.responses() if r.interface is interface)
 
     @staticmethod
     def _pace(response: Response, wait: float):
@@ -1007,14 +1111,15 @@ class RequestServer:
 
     def _committed(self, response: Response | None = None) -> int:
         """Budget bytes the responses in flight (other than response) are committed to send but haven't been
-        charged: each one's unsent rest while it is within its grace or has sent something. A response past its
-        grace with nothing sent (one its requester isn't fetching) commits nothing."""
+        charged (Response.commitment): each one's unsent rest while it is within its grace, and after that what
+        it can send at its progress rate before its deadline. One past its grace with nothing sent (its requester
+        isn't fetching it) or crawling below its floor commits nothing, so a few such responses can't hold
+        admission while spending nothing."""
         if self.airtime.bucket is None:
             return 0
         now = self.clock()
-        return sum(max(0, other.cost - other.charged) for other in self.pools.responses()
-                   if other is not response and not other.finished and not other.settled and other.cost
-                   and (other.in_grace(now) or other.sent > 0))
+        return sum(other.commitment(now) for other in self.pools.responses()
+                   if other is not response and not other.finished and not other.settled and other.cost)
 
     def _charge_progress(self, response: Response):
         """Charge upload_budget for what response has sent since it was last charged."""

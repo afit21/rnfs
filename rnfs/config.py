@@ -20,8 +20,9 @@ SETTINGS_FILE = "rnfs.toml"
 WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free port (printed at start)
     "api_port": (1, 65535), "gateway_port": (0, 65535), "verbosity": (0, None), "min_rate_sample": (1, None),
     "beta": (1, None), "max_failures": (1, None), "max_incoming_links": (1, None), "max_blocks_responses": (2, None),
-    "max_records": (0, None), "max_storage": (0, None), "max_output_entries": (0, None),
-    "name_table_size": (0, None), "remote_pin_quota": (0, None), "gateway_fetches": (0, None),
+    "fast_blocks_responses": (1, None), "max_records": (0, None), "max_storage": (0, None),
+    "max_output_entries": (0, None), "name_table_size": (0, None), "remote_pin_quota": (0, None),
+    "gateway_fetches": (0, None),
 }
 OPTIONAL_WHOLE_NUMBERS = {"alpha": 1, "max_parallel_providers": 1, "max_download_size": 0}  # name: minimum
 RATES = ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate")  # bits/s, above 0
@@ -74,13 +75,15 @@ class Config:
     deadline_slack: float = 30
     stall_timeout: float = 120
     # /blocks refused to a link (and identity) whose response was displaced or cancelled for making no progress
-    blocks_cooldown: float = 60
+    blocks_cooldown: float = 300
     lookup_timeout: float = 600
     path_timeout: float = 30
     max_failures: int = 3
     link_idle_timeout: float = 300
     max_incoming_links: int = 128
-    max_blocks_responses: int = 4  # at least 2
+    max_blocks_responses: int = 4  # at least 2: half of them for slow links, the rest for others
+    # Responses in progress at once on links that aren't slow, if more than the rest of max_blocks_responses
+    fast_blocks_responses: int = 16
     max_upload_rate: float | None = None  # none; half the rate estimate on slow links that have one
     max_records: int = 100_000
     ban_time: float = 1 * HOUR
