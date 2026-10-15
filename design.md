@@ -157,7 +157,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `heard(node_id) -> bool` (proven server: announce in server mode, or answered `/find`), `failed(node_id) -> bool`
 (True if dropped), `remove(node_id)`, `ban(node_id)`, `is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
 `seniority(node_id) -> float | None` (seconds in the table), `is_senior(node_id, min_age)`, `standing(node_id,
-min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `contains(node_id)`,
+min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
+dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
 `node_count()`.
 
 `providers.py` — `ProviderStore(max_records, state_path, ttl=PROVIDER_TTL, clock=time.time, rng=random,
@@ -169,10 +170,14 @@ non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `expire
 that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
 swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
 from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
-one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool with random eviction: the
-pooled records sit in a list for O(1) random picks, and the newest publisher with records outside the pool comes
+one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool evicting by fair share: each
+publisher's pooled keys sit in an ordered dict (oldest pooled first), and publishers in lists by how many they
+hold (`_holders`, with each one's index, and `_most_pooled`), so a full pool picks one of the biggest holders at
+random in O(1); one already holding the most is refused. The newest publisher with records outside the pool comes
 from a heap of (first seen, arrival) with stale entries dropped lazily. First-seen times of departed publishers
-(seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order. Times later than now
+(seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order; those of younger
+publishers whose last record the pool evicted (`_evicted`) for a TTL too, at most `pool_size` // 10 (at least
+10), forgetting the one first seen most recently when full (an O(n) scan, only on such evictions). Times later than now
 (a clock corrected backwards) are clamped to now at load and at each `expire()`.
 
 `lookup.py` — network access is injected:
@@ -181,7 +186,8 @@ from a heap of (first seen, arrival) with stale entries dropped lazily. First-se
 `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. `is_known(id)`
 says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup (`allow_unknown(id)`, also
 used by the fetcher for provider IDs). `listing_count()` is how many nodes have answered with at least one
-provider, so the keeper search can wait for providers listed by more than one source.
+provider, `listing_nodes()` which, and `listers(provider)` which listed a given provider, so the keeper search
+can tell who vouches for its candidates.
 
 ## Network layer interfaces
 
@@ -405,9 +411,9 @@ once (notice) that downloads and the fallback are off. On a propagation-node lin
 Resource over 1 MB (4 × `DELIVERY_LIMIT_KB`) or of more than one segment and tears the link down, and asks for
 at most 64 messages per download. `LxmfFeature.trusted()` is true for senders in `lxmf_accept_from` or
 `lxmf_auto_fetch_from` and LXMF contacts (`ContactsFeature.has(address, "lxmf")`, an index kept beside the
-address book). Messages from unknown senders are held (`_hold`: at most 32, 8 per claimed sender; further ones
-dropped, and none from senders `accepts()` would ignore, but a trusted sender's takes the place of the newest
-held for the untrusted sender holding the most) while their identity is requested: one path request per sender
+address book). Messages from unknown senders are held (`_hold`: at most 32, 8 per claimed sender, a ninth
+claiming one taking the place of its oldest; further ones dropped, and none from senders `accepts()` would
+ignore, but a trusted sender's takes the place of the newest held for the untrusted sender holding the most) while their identity is requested: one path request per sender
 per 2 minutes, from a node-wide token bucket (burst 3, then one per 10 s), trusted senders' held messages
 retried first. A held message is dropped 30 s (`HOLD_PATH_WAIT`) after its sender's path request, or its own
 arrival if later, with no identity known, and after 2 minutes in any case. A held message stays in the queue
@@ -415,8 +421,10 @@ while it is retried, so it still counts as a duplicate and against the limit. Th
 most 500 records and 4 MiB as JSON, 50 per sender not in `lxmf_auto_fetch_from`, 16 KiB per record (links
 beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none;
 `add(reserved=)` keeps trusted senders' records from being evicted except for each other's (untrusted ones go
-first), so free identities can't push them out, and untrusted senders' new records come from a node-wide token
-bucket (`UNTRUSTED_BURST` 32, then one per `UNTRUSTED_INTERVAL` 60 s, on `LxmfFeature.clock`). The pin's
+first), so free identities can't push them out, and untrusted senders' new records come from a per-sender
+allowance (`SENDER_BURST` 4, then one per `SENDER_INTERVAL` 15 min; `_sender_tokens`, the last
+`SENDER_ALLOWANCES` 256 senders) and then a node-wide token bucket (`UNTRUSTED_BURST` 32, then one per
+`UNTRUSTED_INTERVAL` 60 s), both on `LxmfFeature.clock`; a message refused by either takes from neither. The pin's
 "pinned" state is recorded in the same locked section that pins. Auto-fetched `name/` links resolve with
 `persist=False`; each auto-fetch runs under a `fetcher.observing` observer cancelled when the node stops or the
 message is removed, and links still "queued" in the inbox are queued again at `start()`
@@ -479,8 +487,10 @@ Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to di
 list); `providers.json` (provider records); `published.json` (publisher: last rounds, earlier rounds' nodes,
 pending withdrawals); `fetched.json` (targets fetched for the user, for `roots`); `remote_pins.json` (remote pins accepted and
 not yet fetched, `[[source, cid], ...]` in order); `names.json` (sequences, name
-table); `name-floor.json` (highest sequence of names resolved for the gateway or auto-fetch, at most
-4 × `name_table_size`, saved by the re-announce loop when changed); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
+table); `name-floor.json` (`[[name, sequence, resolved], ...]`: highest sequence of names resolved for the
+gateway or auto-fetch and when, at most 4 × `name_table_size`, or 8 × for names resolved within 7 days; saved by
+a resolve raising it, at most every 5 s, and by the re-announce loop when changed; entries without the time load
+as resolved long ago); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
 plus `warnings_total`; older results are capped at load); `keepers.json` (records re-verified at load);
 `follow.json`; `contacts.json`; `lxmf_inbox.json` (500 messages, 4 MiB, 50 per non-auto-fetch sender, 16 KiB per
 record) and `lxmf_outbox.json` (200; unfinished messages are marked failed at a restart), both UTF-8 JSON with
@@ -613,11 +623,19 @@ Everything in the specification is implemented, with these simplifications and a
   sends nothing for a `None` response, so "not kept" is `[]`. Kept records are offered to `NameManager` at
   startup and on every resolve (the rollback floor). Kept names without a record are retried round robin, at
   most 64 per `announce_interval`, continuing after the last one asked. `_store` refuses a record below the
-  sequence `NameManager` holds for the name. `ask_keepers` searches for 3 × alpha candidates from two sources
-  (`Lookup.listing_count`, plus one for local records), ranks them with `RoutingTable.standing` and a random
-  tie-break (`rank_keepers`), and asks batches of alpha until an answer reaches the highest known sequence
-  (`NameManager.record` or the kept record) from two keepers, at most `keeper_rounds()` batches (3; 2 on slow
-  nodes, where one current answer is enough once a sequence is known).
+  sequence `NameManager` holds for the name. `ask_keepers` takes `RoutingTable.standings` before its lookup and
+  uses the worse of that and the current standing (`_standing`), so nodes the lookup adds to the table don't
+  gain rank; "established" is standing 0. It searches for 3 × alpha candidates from two established sources
+  (`Lookup.listing_nodes`, plus this node if an established publisher stored a record here), ranks them
+  (`rank_keepers(candidates, before)`: standing, then a random tie-break), and asks batches of alpha: each
+  batch first takes, in rank order, candidates with a source no earlier pick had (`vouched`: established
+  listers from `Lookup.listers`, this node for local records, else the shared `_UNVOUCHED`), then fills in
+  rank order. Unknown keepers come from a budget of alpha of the query's own (`may_ask`). Batches go on until
+  an answer reaches the highest known sequence (`NameManager.record` or the kept record) from two keepers
+  (two established ones when no sequence is known), at most `keeper_rounds()` batches (3; 2 on slow nodes,
+  where one current answer is enough once a sequence is known). On a slow node that is still at most two
+  `/name`; a fast node with no known sequence and no established keepers asks all 3 batches (up to 9), and the
+  lookup runs to completion unless two established nodes list keepers.
 - **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins
   the new target, saves `names.json` (the commit point; a failed save rolls the record back and releases the
@@ -633,7 +651,12 @@ Everything in the specification is implemented, with these simplifications and a
   message per sender listing them), so a later start keeps them too. The name table marks
   entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
   no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
-  `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`), which `_offer` checks.
+  `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`: name -> (sequence, wall time
+  last resolved), in resolve order), which `_offer` checks. A raise (or a new name) saves `name-floor.json`
+  at once if the last save was `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`;
+  renewing only the time marks it for the next save after an hour. `_trim_floor` drops the least recently
+  resolved past `FLOOR_FACTOR` × `name_table_size`, but stops at one resolved within `FLOOR_KEEP_AGE` (7 days)
+  until the floor holds `FLOOR_HARD_FACTOR` (2) times that.
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
