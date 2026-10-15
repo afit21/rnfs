@@ -7,8 +7,9 @@ exception. Where an encoder exists, decode(encode(x)) == x, and for canonical fo
 for every accepted b.
 
 Needs hypothesis, which is a development tool and not one of rnfs's dependencies: without it every test here
-is skipped. The default run is small and deterministic (derandomized); set RNFS_FUZZ_EXAMPLES (e.g. 3000)
-for a deeper, randomized run.
+is skipped, which includes CI (it installs only the locked dependencies). Run it by hand in an environment
+that has hypothesis: `python -m unittest tests.security.test_fuzz_parsers`. The default run is small and
+deterministic (derandomized); set RNFS_FUZZ_EXAMPLES (e.g. 3000) for a deeper, randomized run.
 """
 import io
 import os
