@@ -185,8 +185,10 @@ class KeeperDiscoveryTest(unittest.TestCase):
         self.assertLessEqual(len(self.net.name_requests), 2)
 
     def test_fast_resolver_asks_one_batch_when_two_keepers_answer(self):
-        """alpha 3: the first batch reaches A's replacement keepers C and D, which both answer; nothing more."""
+        """alpha 3: the first batch reaches A's replacement keepers C and D, established servers in B's table,
+        which both answer; nothing more."""
         self.build()
+        self.b.config.provider_seniority = 0  # every server in B's table is established
         self.keep_on_c()
         keeper = self.d.feature("keepers")
         keeper.keep(self.name)
@@ -195,7 +197,8 @@ class KeeperDiscoveryTest(unittest.TestCase):
         self.d.publisher.publish_due()
         self.squat([self.b], SQUATTERS)
         with mock.patch.object(self.b.feature("keepers"), "rank_keepers",
-                               lambda candidates: sorted(candidates, key=lambda p: (p not in (C_ID, D_ID), p))):
+                               lambda candidates, before=None: sorted(candidates,
+                                                                      key=lambda p: (p not in (C_ID, D_ID), p))):
             result = self.resolve_without_owner()
         self.assertEqual(sorted(self.net.name_requests[:2]), [C_ID, D_ID])
         self.assertEqual(len(self.net.name_requests), 3)  # one batch of alpha
@@ -221,7 +224,7 @@ class KeeperDiscoveryTest(unittest.TestCase):
         cid2 = self.two_keepers_one_behind()
         order = [C_ID, D_ID]
         with mock.patch.object(self.b.feature("keepers"), "rank_keepers",
-                               lambda candidates: sorted(candidates, key=lambda p: order.index(p) if p in order
+                               lambda candidates, before=None: sorted(candidates, key=lambda p: order.index(p) if p in order
                                                          else len(order))):
             result = self.resolve_without_owner()
         self.assertEqual(self.net.name_requests, [C_ID, D_ID])
@@ -233,7 +236,7 @@ class KeeperDiscoveryTest(unittest.TestCase):
         self.two_keepers_one_behind()
         order = [D_ID, C_ID]
         with mock.patch.object(self.b.feature("keepers"), "rank_keepers",
-                               lambda candidates: sorted(candidates, key=lambda p: order.index(p) if p in order
+                               lambda candidates, before=None: sorted(candidates, key=lambda p: order.index(p) if p in order
                                                          else len(order))):
             result = self.resolve_without_owner()
         self.assertEqual(self.net.name_requests, [D_ID])
