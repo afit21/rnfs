@@ -91,13 +91,24 @@ Gateway privacy:
 Serving `/blocks` under load:
 - Displacement protection is now earned by progress, so one peer can no longer hold every `/blocks` response
   slot almost for free. A response is protected from displacement only while it is within a short grace the
-  node measures from the receiving interface's bitrate and the request's hop count (never from the
-  requester-controlled `link.rtt`), or while it is moving data at or above a throughput floor. A response that
-  transfers nothing is cancelled and its upload-budget charge refunded once its grace passes, and any response
-  with no progress for `stall_timeout` is cancelled too.
+  node measures from the path its request came over (never from the requester-controlled `link.rtt`), or while
+  it is moving data at or above a throughput floor. The grace prices the first hop at the receiving
+  interface's bitrate and further hops as slow ones unless RNS raised the link's MTU (so a requester behind a
+  LoRa segment gets enough time however fast the node's own interface is), and on the node's own slow radio it
+  also covers parts queued there for other responses. Attached to a shared instance, where every link arrives
+  on the local interface to it, the bitrate is taken as unknown, so LoRa neighbours aren't held to a 1 Gbit/s
+  interface's grace and floor. A response that transfers nothing is cancelled and its upload-budget charge
+  refunded once its grace passes, and any response with no progress for `stall_timeout` is cancelled too.
 - A link (and its identity, if it identified) whose response was displaced or cancelled for making no progress
-  is refused new `/blocks` for `blocks_cooldown` (new setting, default 60 s). A newcomer on an interface that
-  holds no slot in a full pool may displace a zero-progress response from an interface holding two or more.
+  is refused new `/blocks` for `blocks_cooldown` (new setting, default 300 s). So is one whose response was
+  displaced as the slowest while far behind the rate it needs to be done in time, and a requester whose link
+  or identity already holds a slot can't displace that way, so taking a little of each response no longer
+  keeps one's slots young. A newcomer on an interface that holds no slot in a full pool may displace a
+  zero-progress response from an interface holding two or more, once that response is past half its grace,
+  at most once per grace per interface.
+- Links that aren't slow get 16 `/blocks` slots (new setting `fast_blocks_responses`; it used to be 2, the
+  other half of `max_blocks_responses`), so holding them takes many links each actually downloading. Slow
+  links keep their 2. At most about 40 MiB is held for responses in flight on fast links.
 - A `/blocks` request that repeats a CID is refused as malformed, so a node can't be made to read and serve
   the same block several times in one response.
 - On a link with no rate estimate a `/blocks` response holds at most `CHUNK_SIZE` of blocks after the first
@@ -105,14 +116,16 @@ Serving `/blocks` under load:
   requester sent, so one packet could ask for a ~1 MiB response with a deadline of many hours.
 - `upload_budget` is charged as a response is sent, from its Resource's progress, instead of its full size up
   front with a refund at the end. A response is charged about one packet when it starts, and the rest of it is
-  set aside only while it is within its grace or moving, so responses a requester never downloads (each
-  unidentified link counting as its own requester) no longer hold the budget. A completed response costs its
+  set aside only while it is within its grace, then only what it sends at its rate before its deadline, and
+  nothing below its floor, so responses a requester never downloads or crawls through (each unidentified link
+  counting as its own requester) no longer hold the budget. A completed response costs its
   size and a cancelled one what it sent, as before. The half-per-requester rule now caps what one requester's
   responses in flight may cost.
 - Link requests that never complete their handshake are counted in a bucket of their own, of
   `max_incoming_links`, on `rnfs.dht` and the LXMF delivery destination. When it is full the oldest one on the
   busiest interface is closed. RNS keeps such links (each with a thread) for at least 366 s and rnfs only saw
-  links once established, so a flood of link requests could exhaust the node's memory or threads.
+  links once established, so a flood of link requests could exhaust the node's memory or threads. A flood on
+  one interface still shortens the time an honest handshake over that interface has to complete.
 - A link (and its identity) that rejects a `/blocks` response's advertisement, so that none of it is sent,
   cools down for `blocks_cooldown` as after a response that made no progress. A rejected Resource frees its
   slot at once, so a requester could have the node build a response, reject it and ask again in a loop (a
@@ -123,8 +136,8 @@ Serving `/blocks` under load:
   already decoded a request and started a thread for it by then, so this only removes rnfs's share of a
   flood's cost (about 40% of the node's CPU per request, measured); honest requesters, which wait for their
   answers, stay far below it.
-- Known limit: many unidentified links that each hold a slot for one grace, then sit out their cooldown, can
-  still deny the fast pool over a shared interface (specification section 10).
+- Known limit: over a shared interface, many unidentified links that download slowly but on schedule, or a
+  steady stream of fresh links, can still keep the fast pool busy (specification section 10).
 
 Fetching from other nodes:
 - On `rnfs.dht` links a response's msgpack headers are checked before RNS decodes it, and one that can't be

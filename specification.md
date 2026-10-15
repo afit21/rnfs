@@ -140,33 +140,52 @@ pass a `max_response_size` just above their largest honest answer.
   stays far below this over a real network (over loopback a 10,000-key `/provide` runs at about 900 requests
   a second). Measured over real RNS, the limit cuts the node's CPU per flood request by about 40% (the rest is
   RNS's own work), so the flood rate one link needs to saturate the node about doubles.
-- At most `max_blocks_responses` `/blocks` responses are in progress in total, split between two pools:
-  responses on slow links (`max_blocks_responses` // 2 slots) and on other links (the rest), so each pool
-  has at least one slot. A response stays in the pool it started in, even if its link's class changes. Each
-  pool competes only with itself, so neither kind of client can crowd out the other.
+- `/blocks` responses in progress are split between two pools: responses on slow links
+  (`max_blocks_responses` // 2 slots) and on other links (`fast_blocks_responses` slots, or the rest of
+  `max_blocks_responses` if that is more), so each pool has at least one slot. A response stays in the pool it
+  started in, even if its link's class changes. Each pool competes only with itself, so neither kind of client
+  can crowd out the other. A response in flight holds its encoded size about 2.4 times over in RNS (measured
+  with RNS 1.5.6: the encrypted data and its parts), and at most `CHUNK_SIZE` plus one block on a link with no
+  rate estimate, so at the defaults the fast pool holds at most about 40 MiB (16 responses of 1 MiB on links
+  with a rate estimate; about 7 MiB with none) and the slow pool a few MiB.
   - A response's **deadline** is 3 × its size at the link's rate estimate (at `unmeasured_bitrate` if it has
     none), plus `deadline_slack`. A response not finished by then is cancelled.
   - **Displacement protection is earned by progress**, so a response that holds a slot without transferring
     can't keep honest requests out. A response is protected from displacement only while it is within a
     per-response **grace** the node measures itself, or while it is moving data at or above a **throughput
-    floor**. The grace is `base + 2 × hops × advertisement_bits / bitrate`, clamped to
-    `[grace_min, deadline_slack]`, where `bitrate` is the receiving interface's configured bitrate
-    (`Link.attached_interface`'s `bitrate`, `unmeasured_bitrate` if unknown) and `hops` is the request's hop
-    count (`Link.expected_hops`, clamped, since a requester can inflate it). It is never derived from
-    `link.rtt`, which the requester controls. The floor is `unmeasured_bitrate / 8` bytes/s, or a small
-    fraction of the interface's bitrate for a directly connected requester.
+    floor**. The grace is `base + 2 × (time for the advertisement to cross the path) + queue`, clamped to
+    `[grace_min, deadline_slack]`. The advertisement (one packet, `advertisement_bits`) crosses the first hop at
+    the receiving interface's configured bitrate (`Link.attached_interface`'s `bitrate`) and each further hop
+    of the request's hop count (`Link.expected_hops`, clamped, since a requester can inflate it) at
+    `unmeasured_bitrate`, or at `slow_bitrate` if RNS raised the link's MTU above 500, which it does only
+    across interfaces that configure their MTU (none of them slow radios); a hop behind a transport node may
+    be a LoRa segment however fast the node's own interface is. An unknown bitrate is priced like a further
+    hop. Attached to a shared instance, every link arrives on the local interface to it (RNS
+    `LocalClientInterface`, recognised as RNS does by its `is_connected_to_shared_instance` attribute), whose
+    bitrate says nothing about the path, so the bitrate is unknown there. On the node's own slow interface
+    (below `slow_bitrate`), `queue` is one window of parts (10 packets of 500 bytes) at its bitrate for each
+    response in flight on it: the advertisement may wait behind them, and RNS can't tell when it actually
+    leaves the radio. The grace is never derived from `link.rtt`, which the requester controls. The floor is
+    `unmeasured_bitrate / 8` bytes/s, or a small fraction of the interface's bitrate (if known) for a directly
+    connected requester.
   - When a pool is full, a new `/blocks` request displaces one of the pool's responses, never one on its own
     link: the response making least progress among those that are unprotected (past their grace and below the
     floor); else, if the newcomer's receiving interface holds no slot in the pool, the oldest response with
-    nothing sent from an interface that holds two or more; else the response with the lowest throughput, if it
-    is older than `deadline_slack` and past its grace. Otherwise the request is refused.
+    nothing sent from an interface that holds two or more, once it is past half its grace and at most one
+    within a grace from each interface; else, if neither the newcomer's link nor its identity holds a slot in
+    the pool, the response with the lowest throughput, if it is older than `deadline_slack` and past its
+    grace. Otherwise the request is refused.
   - A response that makes **no progress** is cancelled and its budget charge refunded: one with nothing sent,
     once its grace plus `deadline_slack` has passed; any response with no progress for `stall_timeout`.
   - **Cooldown.** A link (and its identity, if it identified) whose response was displaced or cancelled for
     making no progress, or whose response Resource it rejected before any of it was sent (no honest requester
     does: otherwise one could have the node build a response, reject it and ask again in a loop), is refused
-    new `/blocks` for `blocks_cooldown`. The refusal is answered at once, before
-    any slot is reserved or block read.
+    new `/blocks` for `blocks_cooldown`. A response displaced as the slowest counts as making no progress if
+    it was moving at less than a quarter of the rate it needs to be done when due: by its deadline, or, on a
+    link with no rate estimate whose MTU RNS raised, by the deadline it would have at `slow_bitrate`. So a
+    requester taking a little of each response can't keep its slots young by displacing its own responses
+    from a spare link; an honest one keeping to its schedule is displaced without a cooldown. The refusal is
+    answered at once, before any slot is reserved or block read.
   - A handler gets no direct handle on the response Resource RNS sends for it. Responses are tracked through
     the link's outgoing Resources (`Link.outgoing_resources`, matched by `request_id`) and cancelled with
     `Resource.cancel()` (which acts only while the Resource is not yet complete). These are RNS internals that
@@ -179,10 +198,13 @@ pass a `max_response_size` just above their largest honest answer.
   counted above. So, on `rnfs.dht` and on the LXMF delivery destination, links still waiting (RNS `PENDING`
   or `HANDSHAKE`) are counted in a bucket of their own, also of `max_incoming_links`. When a link request
   arrives with the bucket full, the oldest waiting link on the interface holding the most of them (the
-  request's own interface on a tie) is closed, rather than the request refused: an honest handshake completes
-  within about one round trip, so a flood can't keep honest initiators out by keeping the bucket full, and a
-  flood arriving on one interface closes its own links first. Each request still costs the node the key
-  exchange and a proof; RNS's own long responder timeout is the root cause.
+  request's own interface on a tie) is closed, rather than the request refused. So a flood can't fill the
+  bucket and keep everyone out, and a flood arriving on one interface closes its own links first. It does
+  shorten every handshake on that interface: at R link requests a second, a link waiting there is closed after
+  about `max_incoming_links` / R seconds (1.3 s at 100 a second, at the default), so an honest initiator
+  reaching the node over the same interface whose handshake takes longer is cut off (RNS tells it at once, and
+  it may try again), while initiators on other interfaces are not affected. Each request still costs the node
+  the key exchange and a proof; RNS's own long responder timeout is the root cause.
 - rnfs neither sends nor accepts compressed Resources. Handlers are registered with `auto_compress=False`,
   and nodes MUST set RNS's maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in
   RNS 1.5.6) to 0, since RNS decompresses before any rnfs check runs. Setting it to 0 also stops RNS
@@ -239,10 +261,12 @@ refused by them SHOULD be answered at once, before a response slot is reserved o
     way. A response refused for its size is not charged.
   - **Reservation and commitment.** When it is allowed, a response is charged a reservation of at most one
     packet (the link's MDU: its advertisement). The rest of it counts as committed, when admitting other
-    responses, while it is within its grace (Displacement, above) or once it has sent something, so responses
-    admitted together can't overrun the bucket. A response past its grace with nothing sent commits nothing:
-    responses a requester never downloads hold at most their reservations. A single-packet response, and one
-    whose progress can't be followed, is charged in full when it is allowed.
+    responses, while it is within its grace (Displacement, above), so responses admitted together can't
+    overrun the bucket. After its grace a response commits at most what it sends at its progress rate before
+    its deadline, and nothing while it is below its floor (or has sent nothing): responses a requester never
+    downloads, or crawls through, hold at most their reservations, so a few of them can't hold admission while
+    spending nothing. A single-packet response, and one whose progress can't be followed, is charged in full
+    when it is allowed.
   - **Per requester.** One requester (its identity; each unidentified link counts as its own) may have
     responses in flight costing at most half the bucket's capacity. Its response's block budget is cut to
     what is left of that share (the first block is always included, section 7), and a requester at its share
@@ -584,8 +608,9 @@ and repeat.
   - `MAX_RESPONSE_SIZE − 1 KiB`, so the encoded response stays within `MAX_RESPONSE_SIZE`;
   - if the link has a rate estimate, `response_target` of transfer at the lower of that estimate and
     `max_upload_rate`; if it has none, `CHUNK_SIZE` (what a requester asks for then, enforced);
-  - with an upload budget whose bucket isn't full, what the bucket holds, less 1 KiB, and in any case what is
-    left of the requester's half share (section 3, Airtime controls).
+  - with an upload budget whose bucket isn't full or with responses in flight committed, what the bucket holds
+    less what they are committed to send, less 1 KiB, and in any case what is left of the requester's half
+    share (section 3, Airtime controls).
 - **What a node serves:** only blocks in the DAG of a CID it currently provides (the same reachability GC
   computes). With `pinned`, cached downloads answer `None`, so a node's download history can't be read by
   asking for it. With the default `roots`, complete cached downloads are provided and served, so they can.
@@ -864,7 +889,7 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress or was rejected unsent; requester stall detection (2, 3, 7) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected unsent, or fell far behind its schedule; many fast-link slots; requester stall detection (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
@@ -934,19 +959,29 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - An attacker that behaves exactly like a slow-link client competes fairly for the slow pool's slots, and
   can't be told apart from one.
 - Displacement protection and the cooldown stop a requester holding a response slot without transferring, and
-  the cooldown binds a link and its identity. But each unidentified link is its own requester, so many links
-  that each take a slot, transfer nothing for one grace, and then sit out their cooldown can still keep a pool
-  busy: either fresh links, at about one per grace per slot (0.7 a second for the two fast slots over TCP,
-  whose grace is 3 s), or a fixed set of about `slots × (blocks_cooldown + grace) / grace` links (42 at the
-  defaults, within `max_incoming_links`), used in turn. Where they all arrive over one interface (a single
-  upstream transport node), nothing at admission tells them from honest requesters on the same interface: a
-  newcomer with no history looks the same either way. Limits on young links or on new links per interface
-  don't bind the fixed set and would hold back honest peers reaching the node through one transport node; a
-  waiting list giving freed slots to the requester refused longest ago only shares slots per link, which the
-  attacker multiplies (measured over real RNS: no change, honest refusal 0.95–1.0 either way). So the fast
-  pool can still be denied this way. The hold is no longer free: the attacker must keep links open and
-  polling, or keep opening them. An operator under such an attack can raise `blocks_cooldown`, so that a fixed
-  set would need more links than `max_incoming_links` admits, leaving only fresh links to do it.
+  the cooldown binds a link and its identity. But each unidentified link is its own requester, and where links
+  all arrive over one interface (a single upstream transport node, or every link of a node attached to a
+  shared instance), nothing at admission tells them from honest requesters on it: a newcomer with no history
+  looks the same either way. So a pool can still be kept busy in two ways (Medium). Measured with the test
+  fakes over 10 simulated minutes, an honest requester fetching every ~10 s (three tries 2 s apart) and the
+  attacker asking every 50 ms over the same TCP interface, reporting two hops:
+  - **Slow downloaders.** Links that each download their responses at about the rate they need to be done when
+    due keep their slots: 18 links pulling ~1.3 kB/s each (~21 kB/s in all) held the 16 fast slots, and the
+    honest requester was refused 95% of the time. At 300 B/s each, or taking one part of each response and
+    renewing it from a spare link, they were cooled down (refused 4–7%; before, 3 links taking one part each,
+    ~90 B/s in all, held the then two fast slots: 98%).
+  - **Fresh-link churn.** A new unidentified link for each request, holding a slot for a grace (or, taking one
+    part, until displaced as the slowest after `deadline_slack`) and never asking again: one new link a second
+    taking one part each (~0.7 kB/s) left the honest requester refused 35% of the time, two a second 63%, and
+    ten a second taking nothing 81%.
+  A fixed set of links used in turn needs about `slots × (blocks_cooldown + hold) / hold` links (176 for the
+  fast pool at the defaults, with a 30 s hold), more than `max_incoming_links` admits; 40 links taking one
+  part each were refused 11% of the time. Limits on young links or on new links per interface would hold back
+  honest peers reaching the node through one transport node; a waiting list giving freed slots to the
+  requester refused longest ago only shares slots per link, which the attacker multiplies (measured over real
+  RNS: no change, honest refusal 0.95–1.0 either way). The hold is not free: the attacker must keep
+  downloading, or keep opening links. An operator under such an attack can raise `fast_blocks_responses`, or
+  `blocks_cooldown`.
 - An outside web site can frame a gateway page and receive public content from it by `postMessage` (outside
   private mode, only content public by CID).
 
@@ -1141,10 +1176,11 @@ constants are fixed in section 5; they matter only to writers that choose them a
 **Local settings.** Each node may change these. Settings have exact types: whole numbers are integers (`true`
 is not 1), flags are `true` or `false`, rates (bits/s) and times (seconds, at most 30 days) are finite numbers.
 Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_parallel_providers`,
-`max_failures`, `max_incoming_links` and `min_rate_sample` are at least 1; other sizes and counts at least 0;
-rates above 0; times above 0, except `startup_announce_delay`, `provider_seniority`, `deadline_slack`,
-`blocks_cooldown` and `ban_time`, which may be 0. `members` and `remote_pin_identities` are lists of identity hashes (32 hex
-digits). A node MUST NOT start with an invalid setting.
+`max_failures`, `max_incoming_links`, `fast_blocks_responses` and `min_rate_sample` are at least 1; other
+sizes and counts at least 0; rates above 0; times above 0, except `startup_announce_delay`,
+`provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
+`remote_pin_identities` are lists of identity hashes (32 hex digits). A node MUST NOT start with an invalid
+setting.
 
 | Name | Default | Notes |
 |---|---|---|
@@ -1163,13 +1199,14 @@ digits). A node MUST NOT start with an invalid setting.
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
-| `blocks_cooldown` | 60 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
+| `blocks_cooldown` | 300 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
 | `path_timeout` | 30 s | Waiting for an RNS path |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |
 | `link_idle_timeout` | 5 min | |
 | `max_incoming_links` | 128 | |
-| `max_blocks_responses` | 4 | `/blocks` responses in progress, in total; half for slow links. At least 2 |
+| `max_blocks_responses` | 4 | `/blocks` responses in progress on slow links: half of this; the rest for other links, unless `fast_blocks_responses` is more. At least 2 |
+| `fast_blocks_responses` | 16 | `/blocks` responses in progress on links that aren't slow, if more than the rest of `max_blocks_responses` |
 | `max_upload_rate` | none; half the rate estimate on slow links that have one | |
 | `max_records` | 100 000 | |
 | `ban_time` | 1 h | |
