@@ -66,8 +66,9 @@ rnfs/
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
-    guards.py         process-wide guard rejecting oversized or request Resource advertisements (3, 10); the
-                      half-open incoming link cap per destination (3)
+    guards.py         process-wide guards rejecting oversized or request Resource advertisements and, on
+                      rnfs.dht links, responses that fail a msgpack header check before RNS decodes them
+                      (3, 10); the half-open incoming link cap per destination (3)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
     client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
@@ -338,7 +339,13 @@ and in total, never persisted.
   newcomer's own link. `check_responses` cancels and refunds a response that has sent nothing once its grace
   plus `deadline_slack` has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses
   `/blocks` from a link (and its identity, if identified) whose response was displaced or cancelled for making
-  no progress, for `blocks_cooldown`, cheaply and before any slot is taken.
+  no progress, for `blocks_cooldown`, cheaply and before any slot is taken. `_concluded` starts the same
+  cooldown for a response whose Resource the requester rejected (`REJECTED`) with nothing sent (`_sent_any`:
+  `Response.sent`, else the Resource's `get_progress()`).
+- `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
+  one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
+  for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
+  nothing for; `_over_rate` counts them and logs at most once a minute.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
   caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
   (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
@@ -351,7 +358,17 @@ and in total, never persisted.
   (`_budget_share_left` cuts the budget, or refuses).
   `RequestServer.traffic` and `PeerClient.traffic` share one `Traffic`.
 - `network/guards.py` also rejects, on `rnfs.dht` links only (recognised by the link's destination or owner
-  name `rnfs.dht.<hex>`), any Resource advertisement with more than one segment.
+  name `rnfs.dht.<hex>`), any Resource advertisement with more than one segment or with metadata.
+- `guards.install()` also replaces `RNS.Link.response_resource_concluded` and `RNS.Link.receive` (class
+  attributes; RNS looks both up on the link). On `rnfs.dht` links, `guarded_response_resource_concluded` reads
+  a completed response Resource's data (an open file, rewound for RNS) and `guarded_receive` decrypts a
+  response packet larger than `PACKET_CHECK_SIZE` (RNS's default MTU), and both pass it to
+  `protocol.response_refusal`, which walks msgpack headers (`_array_at`, `_bin_at`) without building
+  objects: `[16-byte bin, response]`, the response `True`, `False`, `nil`, a `/find` answer or at most
+  `MAX_BLOCKS_CIDS` (26) entries of `bin` up to `MAX_BLOCK_SIZE` or `nil`, and nothing after it. A refused
+  response is handed to `Link.handle_response` as `None`, which every parser refuses, so the request fails as
+  malformed; refusals are logged at most once a minute. `guarded_receive` drops a response packet on an
+  incoming `rnfs.dht` link without decrypting it. Everything else goes to RNS's own methods unchanged.
 - `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
   instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
   RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in

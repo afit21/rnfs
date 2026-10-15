@@ -113,8 +113,28 @@ Serving `/blocks` under load:
   `max_incoming_links`, on `rnfs.dht` and the LXMF delivery destination. When it is full the oldest one on the
   busiest interface is closed. RNS keeps such links (each with a thread) for at least 366 s and rnfs only saw
   links once established, so a flood of link requests could exhaust the node's memory or threads.
+- A link (and its identity) that rejects a `/blocks` response's advertisement, so that none of it is sent,
+  cools down for `blocks_cooldown` as after a response that made no progress. A rejected Resource frees its
+  slot at once, so a requester could have the node build a response, reject it and ask again in a loop (a
+  response of up to 128 KiB on a link with no rate estimate, about 1 ms of CPU each); now it gets one per
+  cooldown. No honest requester rejects a response.
+- Each incoming link may send 2000 requests at once and 2000 a second after that. Requests over the limit are
+  refused before anything is parsed, and after 4 refusals (one more a second) dropped unanswered. RNS has
+  already decoded a request and started a thread for it by then, so this only removes rnfs's share of a
+  flood's cost (about 40% of the node's CPU per request, measured); honest requesters, which wait for their
+  answers, stay far below it.
 - Known limit: many unidentified links that each hold a slot for one grace, then sit out their cooldown, can
   still deny the fast pool over a shared interface (specification section 10).
+
+Fetching from other nodes:
+- On `rnfs.dht` links a response's msgpack headers are checked before RNS decodes it, and one that can't be
+  an rnfs response is refused: the request fails as for a malformed response. RNS decoded every response
+  whole first, and a response of one-byte empty arrays or maps cost about 70 times its size in memory (a
+  1 MiB response: ~70 MB and ~0.3 s of CPU). The check reads only headers, so it costs the same for any size.
+  Response packets are checked when larger than RNS's default MTU (links that negotiated a larger one), and a
+  response packet arriving on an incoming `rnfs.dht` link, which has no requests, is dropped unread. Resources
+  carrying metadata, which RNS also decodes first and rnfs never sends, are refused on `rnfs.dht` links.
+  Other destinations (LXMF) are unaffected.
 
 DHT and names:
 - A full provider store keeps a tenth of its room as a newcomer pool, with random eviction inside it, so a

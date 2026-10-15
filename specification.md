@@ -120,7 +120,8 @@ pass a `max_response_size` just above their largest honest answer.
 - Field types: keys, node IDs and names are 16-byte `bin`; CIDs are binary CIDs as `bin`; blocks are `bin`;
   `max_bytes` is a non-negative integer; `pin` is a boolean; every `/name` response field is `bin`.
 - Any request of another shape, or one refused under the limits below, is answered `False` at once — never
-  left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered.
+  left unanswered, except a request over `MAX_REQUEST_SIZE`, which RNS drops unanswered, and a flood over the
+  per-link request rate (below), which after a few refusals is dropped unanswered.
 - Every request fits in one packet: at most `min(Link.get_mdu(), MAX_REQUEST_SIZE)` bytes including RNS's
   request framing (~28 bytes). Batch sizes are computed from that (e.g. 22 keys per `/provide` at the default
   MTU, counting both lists). A `/provide` carries at most 55 keys, counting both lists (the most that fit
@@ -130,6 +131,15 @@ pass a `max_response_size` just above their largest honest answer.
 - Requests are at most `MAX_REQUEST_SIZE` (`Destination.set_max_request_size`).
 - Per link: at most `MAX_REQUESTS_PER_LINK` requests in progress, of which at most one is `/blocks`.
   Requesters MUST stay within this.
+- **Request rate per link.** RNS decrypts and decodes every request packet and starts a thread for it before
+  any handler runs, so nothing in rnfs stops that work; a node SHOULD at least keep a flood from costing it
+  the handler's work and an answer. rnfs takes a token from a per-link bucket (2000 requests, refilled at 2000
+  a second) before parsing anything. A request over it is answered `False` while the link has refusals left
+  (4, one more a second), so a requester that gets there backs off as from any refusal, and dropped
+  unanswered after that. An honest requester waits for its answers, `MAX_REQUESTS_PER_LINK` at a time, so it
+  stays far below this over a real network (over loopback a 10,000-key `/provide` runs at about 900 requests
+  a second). Measured over real RNS, the limit cuts the node's CPU per flood request by about 40% (the rest is
+  RNS's own work), so the flood rate one link needs to saturate the node about doubles.
 - At most `max_blocks_responses` `/blocks` responses are in progress in total, split between two pools:
   responses on slow links (`max_blocks_responses` // 2 slots) and on other links (the rest), so each pool
   has at least one slot. A response stays in the pool it started in, even if its link's class changes. Each
@@ -153,7 +163,9 @@ pass a `max_response_size` just above their largest honest answer.
   - A response that makes **no progress** is cancelled and its budget charge refunded: one with nothing sent,
     once its grace plus `deadline_slack` has passed; any response with no progress for `stall_timeout`.
   - **Cooldown.** A link (and its identity, if it identified) whose response was displaced or cancelled for
-    making no progress is refused new `/blocks` for `blocks_cooldown`. The refusal is answered at once, before
+    making no progress, or whose response Resource it rejected before any of it was sent (no honest requester
+    does: otherwise one could have the node build a response, reject it and ask again in a loop), is refused
+    new `/blocks` for `blocks_cooldown`. The refusal is answered at once, before
     any slot is reserved or block read.
   - A handler gets no direct handle on the response Resource RNS sends for it. Responses are tracked through
     the link's outgoing Resources (`Link.outgoing_resources`, matched by `request_id`) and cancelled with
@@ -180,8 +192,19 @@ pass a `max_response_size` just above their largest honest answer.
   (rnfs requests always fit one packet), or whose transfer size exceeds its data size or `MAX_RESPONSE_SIZE`
   by more than the encryption overhead (rnfs: 128 bytes). RNS checks those limits per segment, so on
   `rnfs.dht` links (either end) a node SHOULD also reject any advertisement of more than one segment: every
-  rnfs response fits one (`MAX_RESPONSE_SIZE`). Other protocols' Resources in the same process (LXMF) are
-  not affected.
+  rnfs response fits one (`MAX_RESPONSE_SIZE`). On `rnfs.dht` links it SHOULD also reject one with metadata,
+  which RNS decodes as the Resource completes and rnfs responses never carry. Other protocols' Resources in
+  the same process (LXMF) are not affected.
+- RNS decodes a whole response with msgpack before handing it over, and one-byte empty arrays or maps decode
+  to some 70 times their size in objects (a 1 MiB response: ~70 MB and ~0.3 s of CPU). So on `rnfs.dht`
+  links a node SHOULD check a response's msgpack headers before RNS decodes it, without building objects, and
+  refuse one that can't be an rnfs response: anything but `[request_id, response]` with a 16-byte `bin`
+  request ID and a response that is `True`, `False`, `nil`, a `/find` answer, or a list of at most 26 entries
+  (the most CIDs a `/blocks` request can carry), each a `bin` of at most `MAX_BLOCK_SIZE` or `nil`, with
+  nothing after it. rnfs checks responses sent as a Resource, and those sent as one packet larger than RNS's
+  default MTU (only links that negotiated a larger MTU carry them; smaller ones decode to little). A refused
+  response fails its request as a malformed one does. A responder sends no requests, so a response packet on
+  an incoming `rnfs.dht` link is dropped unread.
 - `max_upload_rate` caps bytes sent for `/blocks` on a link once it has a rate estimate. RNS paces a Resource
   by its receiver, so the cap is applied between responses: the response budget uses the lower of the rate
   estimate and `max_upload_rate`, and the next response on that link starts no sooner than
@@ -841,9 +864,9 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress; requester stall detection (2, 3, 7) |
-| Request flooding, link exhaustion | Request size, per-link and global limits; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
-| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes (3, 7, 13) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress or was rejected unsent; requester stall detection (2, 3, 7) |
+| Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
+| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked (9) |
@@ -893,6 +916,11 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
+- RNS decrypts and decodes every request packet and starts a thread for it before rnfs sees it, so a link
+  sending requests as fast as its interface carries them still costs the node that work (about 0.14 ms of CPU
+  each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
+  `/blocks` responses only after RNS has received them can be made to build one per cooldown per link, and
+  RNS spends a key exchange on every new link.
 - Any web page can make the local gateway fetch content (a plain request to `127.0.0.1` passes the Host
   check), and can time responses to guess what is cached. The gateway's own limits (section 11) bound the
   airtime this costs: `gateway_fetches`, and no `?format=` response (raw block or archive) at all for a web
