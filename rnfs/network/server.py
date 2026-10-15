@@ -51,6 +51,10 @@ GRACE_BASE = 3.0  # seconds: handling at both ends and a round trip on a fast li
 # sized to Link.MDU), so it takes at most this long per hop at the interface's bitrate
 ADVERTISEMENT_BITS = 500 * 8
 MAX_GRACE_HOPS = 32  # the requester can raise the hop count it reports; the grace is capped anyway
+# What may be queued ahead of an advertisement on the node's own slow radio, per other response on that interface:
+# one window of parts (RNS.Resource.WINDOW_MAX_SLOW, 10, of at most one 500-byte packet each). With the radio's
+# default flow control off, RNS hands packets to the device at once, so when one actually leaves can't be read
+QUEUED_WINDOW_BITS = 10 * 500 * 8
 # Progress floor on a directly connected link: 1/1000 of the interface's bitrate (1.25 kB/s on a 10 Mbit/s TCP
 # interface). Far below what an honest transfer gets from a direct neighbour, but a requester trickling below it
 # loses its protection. Behind more hops the path may be much slower than our interface, so only the
@@ -137,11 +141,14 @@ def link_path(link) -> tuple[object | None, float | None, int | None]:
     RNS 1.5.6 dependency: Link.attached_interface (the interface the link request arrived on), Interface.bitrate
     (the node's own configuration, or the interface's own guess) and Link.expected_hops (the hop count of the
     requester's RTT packet, which the requester can raise but transport nodes only increase). Read with
-    defaults, so a changed RNS falls back to the conservative values the callers use for unknowns.
+    defaults, so a changed RNS falls back to the conservative values the callers use for unknowns. Attached to a
+    shared instance, every link arrives on the local interface to it, whose bitrate (1 Gbit/s) says nothing
+    about the path, so the bitrate is unknown (via_shared_instance).
     """
     interface = getattr(link, "attached_interface", None)
     bitrate = getattr(interface, "bitrate", None)
-    if type(bitrate) not in (int, float) or not math.isfinite(bitrate) or bitrate <= 0:
+    if type(bitrate) not in (int, float) or not math.isfinite(bitrate) or bitrate <= 0 \
+            or via_shared_instance(interface):
         bitrate = None
     hops = getattr(link, "expected_hops", None)
     if type(hops) is not int or hops < 0:
@@ -149,16 +156,46 @@ def link_path(link) -> tuple[object | None, float | None, int | None]:
     return interface, bitrate, hops
 
 
-def response_grace(bitrate: float | None, hops: int | None, config: Config) -> float:
+def via_shared_instance(interface) -> bool:
+    """Whether interface is a local one between RNS instances on this machine: the client end of the connection
+    to a shared instance (or, in the instance, a local client's), not a link to the network.
+
+    RNS 1.5.6 dependency: Transport.interface_to_shared_instance tells the interface to the shared instance by
+    its is_connected_to_shared_instance attribute (LocalClientInterface sets it; the spawned server-side ends set
+    it False). The class names are a fallback.
+    """
+    return interface is not None and (hasattr(interface, "is_connected_to_shared_instance")
+                                      or type(interface).__name__ in rates.LOCAL_INTERFACE_TYPES)
+
+
+def fast_path(link) -> bool:
+    """Whether RNS raised the link's MTU above rates.SLOW_MTU, which it does only if every interface on the path
+    autoconfigures its MTU (from 62.5 kbit/s up, Interface.optimise_mtu) or has a fixed one: no LoRa or other
+    KISS radio on it. A requester can lower its link's MTU, never raise it past what the path allows."""
+    try:
+        mtu = link.get_mtu()
+    except Exception:
+        return False
+    return type(mtu) is int and mtu > rates.SLOW_MTU
+
+
+def response_grace(bitrate: float | None, hops: int | None, config: Config, fast: bool = False,
+                   queued_bits: float = 0) -> float:
     """Seconds a new response is protected from displacement before it must show progress (section 3).
 
-    Enough for the advertisement to reach the requester and its first part request to come back over hops hops
-    at the receiving interface's bitrate (unmeasured_bitrate if unknown), plus GRACE_BASE, at most
-    deadline_slack. E.g. 3 hops at 1 kbit/s: 3 + 2 × 3 × 4 s = 27 s; any hop count over TCP: about 3 s.
+    Enough for the advertisement to reach the requester and its first part request to come back over hops hops,
+    plus GRACE_BASE, at most deadline_slack. The first hop is priced at the receiving interface's bitrate; the
+    others, which may be much slower, at slow_bitrate on a fast path (fast_path) and unmeasured_bitrate
+    otherwise, as is an unknown bitrate. queued_bits is what may be queued ahead of the advertisement on the
+    node's own interface. E.g. 1 hop at 1 kbit/s: 3 + 2 × 4 s = 11 s; 3 hops behind a TCP interface with a LoRa
+    segment, or anything at an unknown bitrate off a fast path: deadline_slack; any hop count on a fast path
+    over TCP: 3-5 s.
     """
-    rate = bitrate if bitrate else config.unmeasured_bitrate
+    beyond = config.slow_bitrate if fast else config.unmeasured_bitrate
+    rate = bitrate if bitrate else beyond
     hops = min(max(1, hops or 1), MAX_GRACE_HOPS)
-    return min(config.deadline_slack, GRACE_BASE + 2 * hops * ADVERTISEMENT_BITS / rate)
+    one_way = ADVERTISEMENT_BITS / rate + (hops - 1) * ADVERTISEMENT_BITS / min(rate, beyond)
+    return min(config.deadline_slack, GRACE_BASE + 2 * one_way + queued_bits / rate)
 
 
 def progress_floor(bitrate: float | None, hops: int | None, config: Config) -> float:
@@ -804,7 +841,8 @@ class RequestServer:
             rate = self.rates.get(link_id)
             slow = rates.link_is_slow(link, rate, self.config)
             interface, bitrate, hops = link_path(link)
-            grace = response_grace(bitrate, hops, self.config)
+            fast = fast_path(link)
+            grace = response_grace(bitrate, hops, self.config, fast, self._queued_bits(interface, bitrate))
             # Until it is handed to RNS, the grace also covers the pacing wait
             response, displaced = self.pools.reserve(SLOW_POOL if slow else FAST_POOL, link_id, request_id,
                                                      grace=min(self.config.deadline_slack, grace + wait),
@@ -881,6 +919,13 @@ class RequestServer:
                     self._finish(response)  # frees the pool slot and the link's /blocks slot exactly once
                 else:
                     self.incoming.finish_request(link_id, blocks=True)
+
+    def _queued_bits(self, interface, bitrate: float | None) -> float:
+        """What may be queued ahead of a new response's advertisement on the node's own interface, if it is a slow
+        one (below slow_bitrate): a window of parts for each response in flight on it (QUEUED_WINDOW_BITS)."""
+        if interface is None or not bitrate or bitrate >= self.config.slow_bitrate:
+            return 0
+        return QUEUED_WINDOW_BITS * sum(1 for r in self.pools.responses() if r.interface is interface)
 
     @staticmethod
     def _pace(response: Response, wait: float):
