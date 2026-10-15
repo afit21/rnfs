@@ -40,8 +40,8 @@ class ReadmeTest(unittest.TestCase):
 
     def test_checking_a_download_mentions_attestations(self):
         text = read(os.path.join(REPO, "README.md"))
-        section = text[text.index("### Checking a download"):]
-        section = section[:section.index("\n### ", 1)]
+        # The section, at whatever heading level, up to the next heading
+        section = re.search(r"^#+ Checking a download\n(.*?)(?=^#)", text, re.M | re.S).group(1)
         self.assertIn("gh attestation verify", section)
         self.assertIn("--repo afit21/rnfs", section)
 
