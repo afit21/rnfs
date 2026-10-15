@@ -34,7 +34,7 @@ import signal
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
@@ -69,6 +69,10 @@ INBOX_PER_SENDER = 50  # messages kept from one sender not in lxmf_auto_fetch_fr
 # dropped only for each other's. Others' new records come from a node-wide token bucket, since identities are free
 UNTRUSTED_INTERVAL = 60.0  # seconds per token
 UNTRUSTED_BURST = 32
+# ... and before that from a small allowance per sender, so one sender can't keep the node-wide bucket empty
+SENDER_INTERVAL = 900.0  # seconds per token
+SENDER_BURST = 4
+SENDER_ALLOWANCES = 256  # senders whose allowance is remembered, least recently seen forgotten (back to full)
 MAX_ENTRY_BYTES = 16 * 1024  # an inbox record as JSON: links beyond it are dropped, then text is cut
 MAX_INBOX_BYTES = 4 * 1024 * 1024  # every inbox record as JSON (held in memory, rewritten on change)
 OUTBOX_LIMIT = 200
@@ -752,6 +756,7 @@ class LxmfFeature(features.Feature):
         self._untrusted_tokens = float(UNTRUSTED_BURST)
         self._untrusted_at: float | None = None
         self._untrusted_dry = False  # logged (notice) that the bucket ran dry; verbose until a token is taken
+        self._sender_tokens: OrderedDict[bytes, tuple[float, float]] = OrderedDict()  # sender -> (tokens, when)
         self._auto_wanted = threading.Condition()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -1073,9 +1078,9 @@ class LxmfFeature(features.Feature):
         auto = sender in self.auto_fetch_from
         if auto:
             entry["auto"] = [{"state": "queued"} for _ in entry["links"]]
-        if not self.trusted(message.source) and not self._untrusted_token():
-            _log(f"message {message_hash} from {sender} not kept: too many new messages from senders not in "
-                 f"contacts, lxmf_accept_from or lxmf_auto_fetch_from",
+        if not self.trusted(message.source) and not self._untrusted_token(message.source):
+            _log(f"message {message_hash} from {sender} not kept: too many new messages from this sender, or from "
+                 f"senders not in contacts, lxmf_accept_from or lxmf_auto_fetch_from",
                  LOG_VERBOSE if self._untrusted_dry else LOG_NOTICE)
             self._untrusted_dry = True
             return None
@@ -1120,11 +1125,19 @@ class LxmfFeature(features.Feature):
         except ValueError:
             return False
 
-    def _untrusted_token(self) -> bool:
-        """Take a token for a new record from a sender not trusted (UNTRUSTED_BURST, then one per
-        UNTRUSTED_INTERVAL, node-wide); False if there is none."""
+    def _untrusted_token(self, source: bytes) -> bool:
+        """Take a token for a new record from source, a sender not trusted: first from its own allowance
+        (SENDER_BURST, then one per SENDER_INTERVAL), then from the node-wide bucket (UNTRUSTED_BURST, then one
+        per UNTRUSTED_INTERVAL); False, taking neither, if either has none."""
         now = self.clock()
         with self._lock:
+            tokens, at = self._sender_tokens.pop(source, (float(SENDER_BURST), now))
+            tokens = min(float(SENDER_BURST), tokens + max(0.0, now - at) / SENDER_INTERVAL)
+            self._sender_tokens[source] = (tokens, now)
+            while len(self._sender_tokens) > SENDER_ALLOWANCES:
+                self._sender_tokens.popitem(last=False)
+            if tokens < 1:
+                return False
             if self._untrusted_at is not None:
                 self._untrusted_tokens = min(float(UNTRUSTED_BURST), self._untrusted_tokens
                                              + max(0.0, now - self._untrusted_at) / UNTRUSTED_INTERVAL)
@@ -1132,6 +1145,7 @@ class LxmfFeature(features.Feature):
             if self._untrusted_tokens < 1:
                 return False
             self._untrusted_tokens -= 1
+            self._sender_tokens[source] = (tokens - 1, now)
             self._untrusted_dry = False
             return True
 
@@ -1955,7 +1969,8 @@ class LxmfNetwork:
             elif message.unverified_reason == self.LXMF.LXMessage.SOURCE_UNKNOWN and message.packed:
                 # Unsigned as far as we can tell: anyone can send these claiming any source, so the queue
                 # keeps what it holds (the newest is dropped) unless a trusted sender is claimed, a claimed
-                # sender gets only HOLD_PER_SENDER places, and path requests are rate limited
+                # sender gets only HOLD_PER_SENDER places (its newest taking the oldest's), and path requests
+                # are rate limited
                 source, packed = bytes(message.source_hash), bytes(message.packed)
                 if not self.feature.accepts(source):
                     # received() would ignore it: holding it would only let forged sources fill the queue
@@ -1965,8 +1980,8 @@ class LxmfNetwork:
                 with self._lock:
                     queued = self._hold(source, packed, message.method)
                 if not queued:
-                    _log(f"dropped a message from unknown sender {source.hex()}: already held, "
-                         f"{HOLD_PER_SENDER} held from it, or {HOLD_LIMIT} held", LOG_VERBOSE)
+                    _log(f"dropped a message from unknown sender {source.hex()}: already held, or {HOLD_LIMIT} held",
+                         LOG_VERBOSE)
                     return
                 self._request_path(source)
                 _log(f"holding a message from {source.hex()} until its identity is known", LOG_VERBOSE)
@@ -1978,17 +1993,21 @@ class LxmfNetwork:
 
     def _hold(self, source: bytes, packed: bytes, method) -> bool:
         """Hold a message claiming source until its identity is known (lock held); False if it is dropped: the
-        same message is held, HOLD_PER_SENDER claiming source are, or HOLD_LIMIT are. A message claiming a
-        trusted sender (feature.trusted) then takes the place of the newest held for the untrusted sender
-        holding the most."""
+        same message is held, or HOLD_LIMIT are. When HOLD_PER_SENDER claiming source are held, it takes the
+        place of the oldest of them, so forgeries sent first can't keep the real sender's message out. A message
+        claiming a trusted sender (feature.trusted) takes the place of the newest held for the untrusted sender
+        holding the most when the queue is full."""
         if any(p == packed for _, p, _ in self._held):
             return False
         claims: dict[bytes, int] = {}
         for _, p, _ in self._held:
             claims[p[ID_LENGTH:2 * ID_LENGTH]] = claims.get(p[ID_LENGTH:2 * ID_LENGTH], 0) + 1
         if claims.get(source, 0) >= HOLD_PER_SENDER:
-            return False
-        if len(self._held) >= HOLD_LIMIT:
+            oldest = next(item for item in self._held if item[1][ID_LENGTH:2 * ID_LENGTH] == source)
+            self._held = [item for item in self._held if item is not oldest]
+            _log(f"dropped the oldest held message from unknown sender {source.hex()} for a newer one",
+                 LOG_VERBOSE)
+        elif len(self._held) >= HOLD_LIMIT:
             if not self.feature.trusted(source):
                 return False
             others = [item for item in reversed(self._held)

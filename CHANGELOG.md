@@ -179,11 +179,27 @@ DHT and names:
   each group, and asked a batch at a time. Another batch is asked while no answer reaches the sequence already
   known or only one keeper answered, at most 3 batches (2 on slow nodes, where a second `/name` is spent only
   if there's no known sequence to check the first answer against).
+- Keeper queries can no longer be steered by identities that only answer `/find`. Keepers are ranked on the
+  routing table as it stood when the query started, so nodes the lookup meets don't rank above keepers recorded
+  here; the search ends early only once two established servers (in the table for `provider_seniority` and
+  healthy) listed keepers, and records stored here count as a source only if an established publisher stored
+  one; each batch first takes keepers listed by a source no earlier pick was listed by; and when the node knows
+  no sequence for the name, only answers from established keepers settle it. Unknown keepers get a budget of
+  `alpha` path requests of their own, which `/find` replies naming unknown nodes can no longer use up. On a slow
+  node a query is still at most two `/name` requests; a fast node may ask up to 9 keepers, and its lookup may
+  run to completion, where established servers are scarce (a young network).
+- A full newcomer pool in the provider store evicts from the publisher holding the most pooled records instead
+  of at random, so a flood of new identities leaves an honest newcomer about a fair share of the pool (16 of its
+  100 records against 600 identities, where it used to keep 1). A newcomer whose last record the pool evicted
+  keeps its first-seen time (at most `max_records / 100` of them), so it still ages into a full share.
 - Gateway and LXMF auto-fetch name resolves can no longer be rolled back by flooding announces of new names
   and replaying an old one: an announce of a name the node isn't resolving or keeping only takes the table
   place of another name that was only heard, and the highest sequence of each name resolved this way is saved
   in `state/name-floor.json` (up to 4 × `name_table_size` names), so no older record is accepted after table
   churn or a restart.
+- The name floor is saved by the resolve that raises it (at most every 5 s), where a crash up to a minute after a
+  resolve used to lose it, and names resolved in the last 7 days are kept past 4 × `name_table_size`, up to
+  8 ×, so that many resolves of other names no longer let a replayed old record of a recent one back in.
 - The specification no longer claims that a node's names can't be linked to it or to each other: the node
   keeps its own names and provides their targets under its node ID, so its names are linked to it, as
   providing content reveals the provider in IPFS. Behaviour is unchanged.
@@ -230,6 +246,12 @@ LXMF:
   message not holding pins out of the inbox, including contacts' messages and auto-fetches that had failed.
 - New inbox messages from senders not trusted are rate limited node-wide: 32 at once, then one a minute. The
   README now recommends setting `lxmf_accept_from`.
+- Each sender not trusted also has an allowance of its own, 4 new inbox messages at once, then one per 15
+  minutes, spent before the node-wide limit, so one sender writing once a minute can no longer keep every
+  other stranger's messages out.
+- A message from a sender whose identity isn't known yet, arriving when 8 held messages already claim that
+  sender, now takes the place of the oldest of them instead of being dropped, so forgeries sent first can't
+  keep the sender's real message out.
 - Messages from senders whose identity isn't known yet: at most 8 of the 32 held may claim one sender, a held
   message is dropped 30 s after an unanswered path request instead of waiting 2 minutes, a message claiming
   a trusted sender takes the place of one held for an unknown sender, and trusted senders get path requests

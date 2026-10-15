@@ -86,6 +86,7 @@ class Lookup:
         self._refused_unknown: set[bytes] = set()  # unknown IDs over the budget
         self._reported: set[bytes] = set()  # providers already passed to on_provider, in any run
         self._listing: set[bytes] = set()  # nodes whose reply listed a provider, in any run
+        self._listed_by: dict[bytes, set[bytes]] = {}  # provider -> nodes whose reply listed it, in any run
         self._last_known: dict[bytes, int] = {}  # the nodes the last run knew of and hadn't seen fail
         self._last_queried: set[bytes] = set()  # the nodes the last run queried
         self._wake: queue.Queue | None = None
@@ -151,6 +152,16 @@ class Lookup:
         providers vouched for by several nodes from those one node listed."""
         with self._lock:
             return len(self._listing)
+
+    def listing_nodes(self) -> list[bytes]:
+        """The nodes that have answered with at least one provider (in any run)."""
+        with self._lock:
+            return list(self._listing)
+
+    def listers(self, provider: bytes) -> set[bytes]:
+        """The nodes whose replies listed provider (in any run), so a caller can tell who vouches for it."""
+        with self._lock:
+            return set(self._listed_by.get(provider, ()))
 
     def closest_answered(self) -> list[bytes]:
         """The k closest nodes that answered in any run so far, closest first."""
@@ -247,6 +258,8 @@ class Lookup:
             if providers:
                 with self._lock:
                     self._listing.add(node_id)
+                    for provider in providers:  # at most k per reply, from nodes that answered
+                        self._listed_by.setdefault(provider, set()).add(node_id)
             for new_id in nodes:
                 if new_id not in known and new_id not in queried and self._usable(new_id):
                     known[new_id] = self._distance(new_id)

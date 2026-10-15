@@ -640,7 +640,8 @@ The inbox keeps at most 500 messages (4 MiB in all), and at most 50 from any one
 Senders you've named (in `lxmf_accept_from`, in `lxmf_auto_fetch_from`, or as an LXMF contact with
 `rnfs contacts add NICK ADDRESS --kind lxmf`) are trusted. Anyone can make new LXMF addresses for free, so
 messages from everyone else can only push out each other's, and at most 32 new ones are kept in a burst,
-then one a minute; while a flood lasts, a stranger's message may not be kept. If you only expect links from
+then one a minute, and at most 4 from any one of them at once, then one per 15 minutes (so one sender can't use
+up the rest's); while a flood from many addresses lasts, a stranger's message may not be kept. If you only expect links from
 people you know, set `lxmf_accept_from` to their addresses: messages from anyone else are then ignored, and
 nobody can crowd them out.
 

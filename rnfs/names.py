@@ -5,11 +5,14 @@ A name is the hash of an `rnfs.name` destination whose RNS identity is the name'
 any validly signed announce, including a replayed old one, so the highest sequence seen is persisted for every
 name this node publishes or resolves for the user, and lower sequences are never accepted from any source.
 Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
-names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor.
+names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
+within seconds of a resolve raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten only past a
+hard bound.
 
 Every RNS call goes through `RnsNetwork`, so tests swap in a fake and run without Reticulum.
 """
 import json
+import math
 import os
 import re
 import threading
@@ -38,7 +41,11 @@ STATE_FILE = "names.json"
 STATE_VERSION = 1
 FLOOR_FILE = "name-floor.json"
 FLOOR_VERSION = 1
-FLOOR_FACTOR = 4  # the floor holds up to this many times name_table_size names, so it outlasts table churn
+FLOOR_FACTOR = 4  # the floor holds up to this many times name_table_size names, so it outlasts table churn ...
+FLOOR_KEEP_AGE = 7 * 24 * 3600.0  # ... except that names resolved this recently (seconds) are kept past that ...
+FLOOR_HARD_FACTOR = 2  # ... up to this many times as many in all (the file stays a few MB at the defaults)
+FLOOR_SAVE_INTERVAL = 5.0  # seconds: a resolve raising the floor saves it at once, or this long after the last save
+FLOOR_TOUCH_SAVE = 3600.0  # a resolve that only renews a floor entry's time marks it for the next save after this
 PIN_SOURCE_PREFIX = "name:"
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
@@ -237,12 +244,15 @@ class NameManager:
         # name this node isn't resolving and doesn't know may only take the place of one of these, so a flood of
         # new names can't push out the names it resolved
         self._heard_only: OrderedDict[bytes, None] = OrderedDict()
-        # Highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), least recently resolved
-        # first, at most FLOOR_FACTOR × name_table_size: saved, so such a resolve never goes back after table churn
-        # or a restart
-        self._floor: OrderedDict[bytes, int] = OrderedDict()
+        # Highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), and when it was last
+        # resolved (wall clock), least recently resolved first; at most FLOOR_FACTOR × name_table_size, more (up to
+        # FLOOR_HARD_FACTOR times that) while those resolved within FLOOR_KEEP_AGE need the room. Saved, so such a
+        # resolve never goes back after table churn or a restart
+        self._floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
         self._floor_path = os.path.join(config.state_dir, FLOOR_FILE)
         self._floor_dirty = False
+        self._floor_saved_at = float("-inf")  # monotonic time of the last floor save
+        self._floor_timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
         self._held_dirty = False  # heard times changed without a save
 
         self._destinations: dict[str, object] = {}
@@ -503,6 +513,9 @@ class NameManager:
             for events in self._waiters.values():
                 for event in events:
                     event.set()
+            if self._floor_timer is not None:
+                self._floor_timer.cancel()
+                self._floor_timer = None
             self._save()
             self._save_floor()
 
@@ -693,7 +706,7 @@ class NameManager:
         if it is free or held by another name that was only heard."""
         held_here = name in self._held
         current = self._record(name, touch=False)
-        floor = None if held_here else self._floor.get(name)
+        floor = None if held_here or name not in self._floor else self._floor[name][0]
         if floor is not None and sequence < floor:
             log(f"refused record {sequence} for name {name.hex()}: already resolved {floor}", LOG_VERBOSE)
             return False
@@ -738,8 +751,8 @@ class NameManager:
         self._table[name] = record
         self._touch(name)
         floor = self._floor.get(name)
-        if floor is not None and record.sequence > floor:
-            self._floor[name] = record.sequence
+        if floor is not None and record.sequence > floor[0]:
+            self._floor[name] = (record.sequence, floor[1])
             self._floor_dirty = True
         if len(self._table) > limit:  # name_table_size 0: nothing is kept
             self._drop_from_table(name)
@@ -758,18 +771,52 @@ class NameManager:
 
     def _resolved(self, name: bytes, sequence: int):
         """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
-        floor for later resolves (least recently resolved forgotten first)."""
+        floor for later resolves (_trim_floor says which are forgotten). A floor raised (or a new one) is saved at
+        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little."""
         self._heard_only.pop(name, None)
+        now = self._clock()
         previous = self._floor.pop(name, None)
-        self._floor[name] = sequence if previous is None else max(previous, sequence)
-        if self._floor[name] != previous:
+        self._floor[name] = (sequence if previous is None else max(previous[0], sequence), now)
+        trimmed = self._trim_floor()
+        if previous is None or self._floor[name][0] != previous[0] or trimmed:
             self._floor_dirty = True
-        while len(self._floor) > self._floor_size():
+            self._save_floor_soon()
+        elif not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
+            self._floor_dirty = True  # only its time renewed: saved with the next change or by announce_due
+
+    def _trim_floor(self) -> bool:
+        """Forget the least recently resolved names over FLOOR_FACTOR × name_table_size, but not those resolved
+        within FLOOR_KEEP_AGE unless the floor holds FLOOR_HARD_FACTOR times that. True if any went."""
+        size = self._floor_size()
+        now = self._clock()
+        trimmed = False
+        while len(self._floor) > size:
+            _, at = next(iter(self._floor.values()))
+            if len(self._floor) <= FLOOR_HARD_FACTOR * size and now - at < FLOOR_KEEP_AGE:
+                break
             self._floor.popitem(last=False)
-            self._floor_dirty = True
+            trimmed = True
+        return trimmed
+
+    def _save_floor_soon(self):
+        """Save the floor now if the last save was FLOOR_SAVE_INTERVAL ago, else once it is (a timer)."""
+        wait = self._floor_saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
+        if wait <= 0:
+            self._save_floor()
+        elif self._floor_timer is None:
+            timer = threading.Timer(wait, self._save_floor_later)
+            timer.daemon = True
+            self._floor_timer = timer
+            timer.start()
+
+    def _save_floor_later(self):
+        """The timer's save."""
+        with self._lock:
+            self._floor_timer = None
+            self._save_floor()
 
     def _floor_size(self) -> int:
-        """How many names the floor holds at most."""
+        """How many names the floor holds, past which only names resolved within FLOOR_KEEP_AGE are kept."""
         return FLOOR_FACTOR * max(0, self.config.name_table_size)
 
     # RNS destinations; callers hold the lock
@@ -912,29 +959,33 @@ class NameManager:
     def _load_floor(self):
         """Read the floor of names resolved without persist. A damaged file is moved aside and the node starts
         without it (it only bounds rollback of gateway and auto-fetch resolves); entries that don't parse are
-        skipped."""
+        skipped. An entry without a valid resolve time (written before they were kept) counts as resolved long
+        ago, and one in the future as now."""
         state = read_json(self._floor_path, shape=lambda value: isinstance(value, dict)
                           and value.get("version") == FLOOR_VERSION and isinstance(value.get("floor"), list))
         if state is None:
             return
+        now = self._clock()
         for entry in state["floor"]:
             try:
-                name_hex, sequence = entry
+                name_hex, sequence, *at = entry
                 name = parse_name(name_hex)
             except (TypeError, ValueError):
                 continue
+            at = at[0] if len(at) == 1 and type(at[0]) in (int, float) and math.isfinite(at[0]) else 0.0
             if type(sequence) is int and 0 <= sequence <= MAX_SEQUENCE and name not in self._held:
-                self._floor.pop(name, None)
-                self._floor[name] = sequence
-        while len(self._floor) > self._floor_size():
-            self._floor.popitem(last=False)
+                earlier = self._floor.pop(name, None)  # listed twice (a damaged file): the higher sequence holds
+                self._floor[name] = (max(sequence, earlier[0] if earlier else 0), min(float(at), now))
+        self._trim_floor()
 
     def _save_floor(self):
-        """Write the floor atomically, least recently resolved first, if it changed. Saved by announce_due (at
-        least every minute while running) and stop(), not on every resolve, since it holds thousands of names."""
+        """Write the floor atomically, least recently resolved first, as [name, sequence, resolved], if it
+        changed. Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds thousands
+        of names), announce_due (at least every minute while running) and stop()."""
         if not self._floor_dirty:
             return
-        state = {"version": FLOOR_VERSION, "floor": [[name.hex(), sequence] for name, sequence in self._floor.items()]}
+        state = {"version": FLOOR_VERSION,
+                 "floor": [[name.hex(), sequence, int(at)] for name, (sequence, at) in self._floor.items()]}
         os.makedirs(self.config.state_dir, exist_ok=True)
         try:
             fsutil.write_atomic(self._floor_path, json.dumps(state, separators=(",", ":")).encode())
@@ -942,6 +993,7 @@ class NameManager:
             log(f"could not save {self._floor_path}: {e}", LOG_WARNING)
             return
         self._floor_dirty = False
+        self._floor_saved_at = self._monotonic()
 
     def _save(self):
         """Write published and held records atomically."""

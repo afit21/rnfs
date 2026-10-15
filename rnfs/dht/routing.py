@@ -196,12 +196,21 @@ class RoutingTable:
         or silent over 2 × announce_interval, 3 not in the table. Ranks keepers (section 9)."""
         with self._lock:
             entry = self._find(node_id)
-            if entry is None:
-                return 3
+            return 3 if entry is None else self._standing(entry, min_age, self.clock())
+
+    def standings(self, min_age: float) -> dict[bytes, int]:
+        """standing() of every node in the table now (those left out stand at 3), so a caller can rank nodes
+        on the table as it was before a lookup: nodes the lookup adds by answering don't gain rank from it."""
+        with self._lock:
             now = self.clock()
-            if self._stale(entry, now):
-                return 2
-            return 0 if now - entry.first_seen >= min_age else 1
+            return {entry.node_id: self._standing(entry, min_age, now)
+                    for bucket in self._buckets for entry in bucket.values()}
+
+    def _standing(self, entry: _Entry, min_age: float, now: float) -> int:
+        """standing() of a node in the table. Caller holds the lock."""
+        if self._stale(entry, now):
+            return 2
+        return 0 if now - entry.first_seen >= min_age else 1
 
     def contains(self, node_id: bytes) -> bool:
         """True if node_id is in the table."""

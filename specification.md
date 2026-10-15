@@ -502,7 +502,8 @@ big-endian integer; "closest" means smallest distance.
 **Lookups.** Query the `alpha` closest known nodes not yet queried with `/find`, merge the nodes they return,
 and repeat.
 - A returned node or provider ID with no known identity (`Identity.recall` fails) costs a path request; at most
-  `alpha` such IDs are tried per lookup.
+  `alpha` such IDs are tried per lookup. (A keeper query asks unknown keepers from a budget of its own, also
+  `alpha`, so nodes named in `/find` replies can't use it up, section 9.)
 - Nodes that fail to answer are dropped from the lookup and counted in the routing table.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
@@ -566,13 +567,18 @@ and repeat.
 - A node keeps at most `max_records`, a tenth of them in a *newcomer pool*. When the rest is full, a
   publisher first seen before the most recent one there evicts a record of that most recent publisher (the
   one it stored least recently), so a flood of new identities can't displace older publishers. Any other
-  publisher (one not seen before, or the most recent one) stores into the pool, evicting a pooled record
-  chosen at random when the pool is full, but never one of its own: so a new publisher can always store
-  something, and a flood churns only the pool. A pooled record leaves the pool when it is republished while
-  the rest has room. The node's own records are always accepted.
+  publisher (one not seen before, or the most recent one) stores into the pool. A full pool evicts the
+  record pooled first of a publisher holding the most pooled records (one chosen at random if several hold
+  as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
+  always store something, a flood churns only the pool, and the pool is shared out evenly between
+  publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
+  republished while the rest has room. The node's own records are always accepted.
 - First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
   (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
-  oldest departure forgotten first), so a publisher that was away for a while isn't new again.
+  oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer
+  whose last record a full pool evicted keeps its first-seen time too, so a flood can't keep it new forever
+  (rnfs: at most `max_records / 100` such newcomers, at least 10; when more, the one first seen most recently
+  is forgotten).
 - A node SHOULD limit how many records one publisher holds, its own excepted (rnfs: `max_records / 100`, at
   least 10, once the publisher has been seen for `provider_seniority`, and a tenth of that, at least 10,
   before), so one identity can't fill the store and a fresh one gets little.
@@ -794,20 +800,29 @@ the name through the network and asks keepers (below), since the key's earlier r
 - To refresh, call `Transport.request_path(name)`, wait up to `path_timeout`, then read
   `Identity.recall_app_data(name)`.
 - If the path request heard nothing within `path_timeout` (or always, with `keeper_query = always`), ask
-  keepers (below). Storing a provider record is free, so neither a record's age nor the order a reply lists it
-  in may decide which keepers are asked:
+  keepers (below). Storing a provider record is free, and so is answering `/find`, so neither a record's age,
+  nor the order a reply lists it in, nor how many nodes list it may decide which keepers are asked. Standing
+  is read from the routing table as it was when the query started: a node the lookup meets doesn't gain rank
+  from answering it, and one that fails a query meanwhile loses rank. An *established* node is one that was
+  in the table for over `provider_seniority` then, and hasn't failed a query since last heard nor been silent
+  for 2 × `announce_interval`.
   - Find providers of the name's key (section 6). Providers recorded locally are candidates, never a reason
-    to skip the search, which runs until 3 × `alpha` are known and more than one source listed some (this
-    node's own records count as one source), or until the lookup is complete.
-  - Rank the candidates by routing-table seniority, as providers are (section 6): servers in the routing table
-    for over `provider_seniority` that haven't failed a query since last heard nor been silent for
-    2 × `announce_interval` first, then other such servers, then servers that failed a query or went silent
-    (an owner that has left), then IDs not in the table; at random within each group.
+    to skip the search, which runs until 3 × `alpha` are known and two established sources listed some, or
+    until the lookup is complete. A source is a node whose `/find` answer listed providers, or this node if
+    it holds a record stored by an established publisher.
+  - Rank the candidates by routing-table seniority, as providers are (section 6): established servers first,
+    then other servers in the table, then servers that failed a query or went silent (an owner that has
+    left), then IDs not in the table; at random within each group.
   - Ask them with `/name`, a batch of `alpha` at a time, and offer every verifying record to the sequence
-    rules, so the highest valid sequence wins. Ask another batch while no answer reaches the highest sequence
-    already known for the name (from an announce, an earlier resolve or a kept record), or while fewer than two
-    keepers have answered; at most 3 batches. A slow node (`alpha` 1) asks at most 2 batches, and asks the
-    second for want of a second answer only when it knows no sequence to compare the first against.
+    rules, so the highest valid sequence wins. Each batch takes first, in rank order, candidates listed by a
+    source no earlier candidate of the query was listed by (this node holding a record, an established node,
+    or, counted as one source, none of these), then the rest in rank order. A candidate whose identity isn't
+    known (each costs a path request) is asked within a budget of `alpha` such candidates per query, apart
+    from the lookup's (section 6). Ask another batch while no answer reaches the highest sequence already
+    known for the name (from an announce, an earlier resolve or a kept record), or while fewer than two
+    keepers have answered; when no sequence is known, only established keepers' answers count toward those
+    two. At most 3 batches. A slow node (`alpha` 1) asks at most 2 batches, and asks the second for want of a
+    second answer only when it knows no sequence to compare the first against.
 
   A keeper query (a DHT lookup plus a few requests) costs roughly ten to twenty times the airtime of a
   resolve a path response answers, so `always` SHOULD NOT be used on slow links.
@@ -826,8 +841,9 @@ what prevent rollback.
 - For names resolved without being persisted (gateway, auto-fetch), the node SHOULD persist the highest
   sequence it returned, as a floor below which no record of that name is accepted, so such a resolve never
   goes back after table churn or a restart. The record itself isn't persisted. (rnfs: up to
-  4 × `name_table_size` names, least recently resolved forgotten first, saved at least every minute and at
-  shutdown.)
+  4 × `name_table_size` names, least recently resolved forgotten first, except that names resolved in the
+  last 7 days are kept up to 8 × `name_table_size`; saved by a resolve that raises the floor, at most every
+  5 s, otherwise at least every minute and at shutdown.)
 - Records from keepers are subject to the same persisted-sequence and no-rollback rules as announces.
 - A record this node keeps (below) is a floor for resolving that name: it MUST be offered to the sequence
   rules at startup and on every resolve, so an older validly signed announce is never accepted for a kept
@@ -913,9 +929,9 @@ as is cheap. Rules live in the sections referenced.
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
-| Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked (9) |
+| Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
-| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
+| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
 | Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
 | Republishing and retries draining airtime | Small `keep_max_names`; slower, jittered republishing of name keys; paced lookups on slow nodes; follow backoff (6, 9) |
@@ -955,7 +971,12 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   make that key hard to find (a Sybil attack); it can't forge data. `get <cid> --from <node ID>` bypasses
   the DHT when a provider is known.
 - Patient attackers that keep identities alive for days defeat the preference for old records and long-known
-  providers.
+  providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
+  answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
+  sequence or reaches a keeper they don't list (one recorded locally, or listed by another established node).
+- A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
+  newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
+  while fewer than the bounded number of newcomers first seen before it were evicted too.
 - Bans are evaded by switching identity; they only make an attacker pay for a new one.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
@@ -1346,9 +1367,10 @@ unreserved, pct-encoded: as in RFC 3986
 - A message is accepted only once LXMF has validated its signature with the sender's identity. A message from
   a sender whose identity isn't known yet is held while a path request fetches it, then validated: at most
   32, at most 8 claiming one sender, for up to 2 minutes, and only 30 seconds after its path request was sent
-  (or after it arrived, if later) if no answer has made the identity known. When 32 are held, a further one
-  is dropped, so held ones are not pushed out, unless it claims a trusted sender: then it takes the place of
-  the newest message held for the untrusted sender holding the most. The source of such a message is
+  (or after it arrived, if later) if no answer has made the identity known. A ninth message claiming one
+  sender takes the place of the oldest of its 8, so forgeries sent first can't keep the sender's real message
+  out. When 32 are held, a further one is dropped, so held ones are not pushed out, unless it claims a trusted
+  sender: then it takes the place of the newest message held for the untrusted sender holding the most. The source of such a message is
   unauthenticated until its identity is known, so path requests for held senders are sent at most once per
   sender per 2 minutes, and at most 3 at once, then one per 10 seconds node-wide, trusted senders first.
 - If `lxmf_accept_from` is not empty, messages from other senders (except those in `lxmf_auto_fetch_from`)
@@ -1363,8 +1385,9 @@ unreserved, pct-encoded: as in RFC 3986
   pins, a new message without any is not kept (and one with pins pushes out the oldest). A trusted sender's
   message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
   message without pins is left; a new message from an untrusted sender that would need one dropped is not
-  kept. New messages from untrusted senders are also rate limited node-wide: 32 at once, then one per minute;
-  others are not kept. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
+  kept. New messages from untrusted senders are also rate limited: each sender has an allowance of 4 at once,
+  then one per 15 minutes, and within it messages are taken from a node-wide bucket of 32 at once, then one
+  per minute; others are not kept. So one sender can't keep the node-wide bucket empty for everyone else. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
   `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many

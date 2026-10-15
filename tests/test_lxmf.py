@@ -423,7 +423,9 @@ class ReceiveTest(FeatureTestCase):
     def test_inbox_is_bounded_and_persists(self):
         feature = self.feature_node()
         feature.inbox.limit = 3
+        feature.clock = FakeClock()
         for number in range(5):
+            feature.clock.now += lxmf.SENDER_INTERVAL  # within the limits on senders not trusted (L12)
             feature.received(self.link_message(number=number))
         self.assertEqual([e["id"] for e in feature.inbox_list()], [3, 4, 5])
         feature.save()
@@ -538,7 +540,7 @@ class AutoFetchTest(FeatureTestCase):
         feature.clock = FakeClock()
         junk = Link(self.cid).uri().encode()
         for i in range(lxmf.INBOX_PER_SENDER + 5):
-            feature.clock.now += lxmf.UNTRUSTED_INTERVAL  # within the rate limit on senders not trusted (L12)
+            feature.clock.now += lxmf.SENDER_INTERVAL  # within the rate limits on senders not trusted (L12)
             feature.received(message(OTHER, junk, number=i))
         feature.received(self.link_message(source=bytes([0x54] * 16), number=1))
         senders = [e["from"] for e in feature.inbox_list()]
