@@ -99,14 +99,18 @@ def _check_free_space(path: str, needed: int, blocks_dir: str | None = None, to_
 
     If blocks_dir (where a fetch stores its blocks) is on the same filesystem, the to_fetch bytes still to be
     fetched there before the write count too: the fetch keeps the reserve, and the write-out must as well.
+    Raises OSError if the free space can't be read (a missing directory, say): unchecked, the write could fill
+    the disk.
     """
     directory = os.path.dirname(os.path.abspath(path))
     try:
         usage = shutil.disk_usage(directory)
         if blocks_dir is not None and to_fetch > 0 and os.stat(directory).st_dev == os.stat(blocks_dir).st_dev:
             needed += to_fetch
-    except OSError:
-        return  # a missing or unusable directory is reported by the write itself
+    except OSError as e:
+        # The same kind of error (FileNotFoundError, PermissionError...), saying what couldn't be done
+        message = f"can't check the free space for {directory}: {e.strerror or e}"
+        raise (OSError(e.errno, message) if e.errno is not None else OSError(message)) from None
     reserve = disk_reserve(usage.total)
     if needed > usage.free - reserve:
         raise TooLarge(f"{size(needed)} won't fit in the {size(usage.free)} free in {directory} "
