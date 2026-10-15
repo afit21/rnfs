@@ -657,6 +657,11 @@ and repeat.
   match `names.json` (pinning a recorded target again, releasing the rest), and releases `follow:` pins of
   names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
   again). A followed name's check releases every other target its source holds.
+- That release needs the state read whole. If `follow.json` or the inbox file is missing, damaged (moved
+  aside as `.damaged`) or holds a malformed entry, such pins are kept and recorded again: a `follow:` pin's
+  name is followed again, and a sender's `lxmf:` pins get a new inbox message listing them, whose removal
+  releases them. A name key file that is there but can't be read keeps its name's pins and `names.json`
+  entry; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
   running jobs (section 11), are protected as if pinned.
 

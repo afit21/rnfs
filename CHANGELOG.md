@@ -23,7 +23,8 @@ Fixes:
   until a restart, its pins queuing up and then being refused.
 - Remote pins accepted but not yet fetched survive a restart: they are saved in `state/remote_pins.json` and
   fetched again at start, unless their identity has left `remote_pin_identities`. They used to be dropped
-  silently.
+  silently. An entry of the file that isn't a pair of strings is skipped with a warning; it used to stop the
+  node from starting.
 
 Local API and privacy:
 - `GET /api/status` without the API token answers only `{"version": ...}`, enough for health checks; the node
@@ -182,9 +183,15 @@ Publishing, names and storage:
   recorded at a target no longer pinned (which `gc` deleted) and the new one pinned by `name:<alias>`, which
   `pin rm` refused and `name rm` didn't release. At start the node now makes `name:` pins match `names.json`,
   releases `follow:` pins of names no longer followed and `lxmf:` pins no saved inbox message records, which
-  a crash inside `name unfollow` or before the inbox was saved used to leave for good. A followed name's check
+  a crash inside `name unfollow` or before the inbox was saved used to leave for good. Those two are released
+  only if `follow.json` or the inbox file was read whole: when it is missing, damaged (moved aside) or has a
+  malformed entry, the pins are kept and recorded again, the `follow:` pin's name being followed again and a
+  sender's `lxmf:` pins listed in a new inbox message, whose removal releases them. A followed name's check
   releases every other target its pin source holds. A pin or unpin whose `pins.json` save fails no longer
   stays changed in memory.
+- A name key file that is there but can't be read at start (no permission, damaged) no longer counts as a
+  deleted key: the name's pins and its `names.json` entry are kept, so it is back as it was once the file can
+  be read. Its pins used to be released and its entry dropped, leaving the name at sequence 0 with no target.
 - Eviction and `gc` read the DAG nodes they walk before taking the storage lock, so serving `/blocks` no longer
   waits while the first eviction after a start reads every stored DAG node (about 0.4 s with 20 000 blocks);
   what to delete is still decided under the lock, so nothing that became reachable meanwhile is deleted.

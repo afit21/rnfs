@@ -625,9 +625,12 @@ Everything in the specification is implemented, with these simplifications and a
   features are set up, `reconcile_pins(storage.pins())` releases the pins of name keys deleted by hand
   (`release_gone()`), pins a recorded target again if its pin is missing, and releases `name:` pins nothing
   records; a key without a `names.json` entry keeps its pins until its next publish or removal (`_stale`,
-  where a release that failed with `OSError` also waits). `Storage.pin`/`unpin` undo their change in memory
-  if saving `pins.json` fails. Follow and LXMF do the same for their sources at start
-  (`_release_unfollowed`, `_release_unrecorded`). The name table marks
+  where a release that failed with `OSError` also waits). A key file that is there but can't be loaded is
+  `_unreadable`: its pins are kept and its `names.json` entry is written back as loaded. `Storage.pin`/`unpin`
+  undo their change in memory if saving `pins.json` fails. Follow and LXMF do the same for their sources at
+  start (`FollowFeature._reconcile`, `_release_unrecorded`), but release only if their file loaded whole
+  (`MessageLog.clean`); otherwise unrecorded pins are recorded again (the name followed again, or an inbox
+  message per sender listing them), so a later start keeps them too. The name table marks
   entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
   no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
   `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`), which `_offer` checks.
