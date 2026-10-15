@@ -5,7 +5,8 @@ requester re-requesting before then kept every slot. Now a response is protected
 measures from the interface and hop count its request came over, and after that only while it makes progress
 at a floor; a requester whose response was displaced or cancelled for making no progress cools down, stalled
 responses are cancelled and refunded, and a newcomer on an interface holding no slot may displace a response
-that has sent nothing from an interface holding two. These tests drive the policy (ResponsePools) and the
+that has sent nothing (and is past half its grace) from an interface holding two. The fast pool holds 16
+responses by default (test_h1_regressions); the server tests here use two fast-pool slots. These tests drive the policy (ResponsePools) and the
 RequestServer over fake RNS objects and a FakeClock.
 """
 import unittest
@@ -30,15 +31,18 @@ class GraceAndFloorTest(unittest.TestCase):
         return server.response_grace(bitrate, hops, self.config)
 
     def test_grace_grows_with_hops_and_shrinks_with_bitrate(self):
-        self.assertLess(self.grace(LORA_BITRATE, 1), self.grace(LORA_BITRATE, 2))
-        self.assertLess(self.grace(LORA_BITRATE, 2), self.grace(LORA_BITRATE, 3))
-        self.assertGreater(self.grace(LORA_BITRATE, 2), self.grace(2 * LORA_BITRATE, 2))
+        unclamped = Config(deadline_slack=1000)
+        self.assertLess(server.response_grace(LORA_BITRATE, 1, unclamped),
+                        server.response_grace(LORA_BITRATE, 2, unclamped))
+        self.assertLess(server.response_grace(LORA_BITRATE, 2, unclamped),
+                        server.response_grace(LORA_BITRATE, 3, unclamped))
+        self.assertGreater(self.grace(LORA_BITRATE, 1), self.grace(2 * LORA_BITRATE, 1))
         # A ~500-byte advertisement over 3 hops at 1 kbit/s: ~4 s per hop each way, so the first part request
         # arrives after ~24 s, inside the grace
         self.assertGreater(self.grace(LORA_BITRATE, 3), 24 + 2)
-        # Over TCP the hop count hardly matters: a few seconds
+        # Over TCP, on a path RNS raised the MTU of (no slow radio on it), the hop count hardly matters
         self.assertLess(self.grace(TCP_BITRATE, 1), 5)
-        self.assertLess(self.grace(TCP_BITRATE, 30), 5)
+        self.assertLess(server.response_grace(TCP_BITRATE, 30, self.config, fast=True), 6)
 
     def test_grace_is_clamped(self):
         self.assertEqual(self.grace(LORA_BITRATE, 10), self.config.deadline_slack)
@@ -151,6 +155,7 @@ class ResponsePoolsPolicyTest(unittest.TestCase):
         a, _ = self.take(b"a")
         self.clock.now += 1
         b, _ = self.take(b"b")
+        self.clock.now += self.GRACE / 2 + 0.1  # past half their grace
         # Both within their grace and nothing sent, both from the hub: a newcomer from the hub is refused
         self.assertEqual(self.take(b"c"), (None, None))
         response, displaced = self.take(b"d", other)
@@ -179,7 +184,8 @@ class RequestServerSlotsTest(unittest.TestCase):
         self.hub = FakeInterface("TCP hub", TCP_BITRATE)
 
     def harness(self, config=None) -> ServerHarness:
-        h = ServerHarness({self.cid: self.block, self.cid2: self.block2}, config)
+        """A server with two fast-pool slots (unless config says otherwise), so a few links fill the pool."""
+        h = ServerHarness({self.cid: self.block, self.cid2: self.block2}, config or Config(fast_blocks_responses=2))
         self.server = h.server
         return h
 
@@ -269,7 +275,7 @@ class RequestServerSlotsTest(unittest.TestCase):
         self.assertIsNot(h.blocks(self.tcp(h), [self.cid], identity=RNS.Identity()), False)
 
     def test_cooldown_zero_turns_it_off(self):
-        h = self.harness(Config(blocks_cooldown=0))
+        h = self.harness(Config(blocks_cooldown=0, fast_blocks_responses=2))
         a = self.tcp(h)
         self.take(h, a)
         self.take(h, self.tcp(h))
@@ -338,6 +344,7 @@ class RequestServerSlotsTest(unittest.TestCase):
         h.tick(1)
         self.take(h, b)
         self.assertIs(h.blocks(self.tcp(h), [self.cid]), False)  # same interface: refused during the grace
+        h.tick(1)  # a is past half its grace, b not yet
         other = self.tcp(h, interface=FakeInterface("TCP to a second hub", TCP_BITRATE))
         self.assertIsNot(h.blocks(other, [self.cid]), False)
         self.assertTrue(held_a.cancelled)  # the oldest response from the crowded interface
