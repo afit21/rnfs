@@ -5,7 +5,7 @@
 
 **A decentralized file system built for [Reticulum](https://reticulum.network) & based on [IPFS](https://ipfs.tech/) (InterPlanetary File System).**
 
-Share files over LoRa radio, Wi-Fi, local networks or the internet without relying on a an authorative server for file hosting or peer lookups.
+Share files over LoRa radio, Wi-Fi, local networks or the internet without relying on a an authoritative server for file hosting or peer lookups.
 
 Access any file on RNFS by it's **'CID'**.
 
@@ -15,14 +15,22 @@ Access any file on RNFS by it's **'CID'**.
 [![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
 
+<hr>
+
+### Publish any file to a string & fetch it over Reticulum
+
+
+<img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
+
+<hr>
+
 **Contents**
 
-[Install](#install) · [Sample files](#sample-files) · [Getting started](#getting-started) ·
+[Install](#install) · [Sample files (with CIDs)](#sample-files) · [Getting started](#getting-started) ·
 [How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
 [Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
 [Tests](#tests) · [Known limitations](#known-limitations) ·
 [specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
-
 </div>
 
 ## Why Use RNFS?
@@ -44,9 +52,14 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 * ***📃 Nodes automatically split up lookup data between themselves -*** Lookup 'Kademlia' for more in depth information, however all nodes on the RNFS network will take responsibility for remembering a part of the overall 'address book' of nodes and a list of which files they host. Assignment of the information is automatic.
 * ***🌱 Automatically find seeders -*** No file of known seeders is needed, RNFS will automatically ask it's peers "who has this file". Kademlia is very efficient at doing this. In a 1 million node network, this would only take 6 hops to find a seeder.
 
-## Quick start
+# Quick start
 
-### 1 - Install
+This section covers the basics to get you using rnfs.
+
+## 1 - Install
+
+> [!WARNING]
+> If you do not already have an instance of the Reticulum installed & setup on your machine, you'll need to update your Reticulum config to connect to the public distributed backbone after running rnfs for the first time. Your Reticulum config can be found in `~/.reticulum` on linux. Refer to [reticulum.network/connect.html](https://reticulum.network/connect.html) for more info on this.
 
 Different package options available at [latest release](https://github.com/afit21/rnfs/releases/latest)
 
@@ -61,22 +74,24 @@ One liner for install script:
 
 `curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh`
 
+To install as a systemctl service, add the service flag:
+
+`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -- -service`
+
 Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-linux-flatpak)
 
 **macOS:**
 
 `pipx install https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-py3-none-any.whl` ([details](#macos)).
 
-### 2 - Start rnfs and leave it running in its own terminal:
+## 2 - Start rnfs and leave it running in its own terminal:
 
 ```sh
 rnfs daemon
 ```
 
-### 3 - Connect to other nodes. Computers on the same local network or Wi-Fi find each other automatically.
-To reach nodes further away, see [Connect to a network](#2-connect-to-a-network).
-
-### 4 - Download a file, for example one of the [sample files](#sample-files):
+## 3 - Download a file
+for example one of the [sample files](#sample-files):
 
 ```sh
 rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o manifesto.pdf
@@ -85,7 +100,7 @@ rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o man
 Or open it in your browser:
 <http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=manifesto.pdf>
 
-### 5 - Share your own file:
+## 4 - Share your own file:
 
 ```sh
 rnfs add holiday.jpg        # prints its CID: give that to anyone who should have the file
@@ -95,7 +110,7 @@ That's all you need for the basics. [Getting started](#getting-started) goes a s
 links that can change, sharing in the background), and [Commands](#commands) lists everything.
 
 
-## Install
+# Install
 
 rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file from the
 [latest release](https://github.com/afit21/rnfs/releases/latest):
@@ -112,7 +127,7 @@ places. The release also has the source archive (`rnfs-0.1.4.tar.gz`) and `SHA25
 [check your download](#checking-a-download). These links are for 0.1.4; for a newer version, take the
 same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
 
-### Windows
+## Windows
 
 Download [`rnfs-0.1.4-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-windows-x64.exe). It is a single file that
 includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
@@ -145,7 +160,7 @@ and gateway listen only on 127.0.0.1. Windows has no execute bit, so a directory
 scripts gets a different CID when added on Windows than on Linux or macOS. Windows support is newer than
 Linux and macOS support, so please report problems.
 
-### Debian and Ubuntu
+## Debian and Ubuntu
 
 For Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) and other Debian-based systems with Python 3.11
 or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [install script](#install-script)
@@ -166,7 +181,7 @@ while you're logged out: `loginctl enable-linger $USER`.
 - **Uninstall:** `systemctl --user disable --now rnfs`, then `sudo apt remove rnfs`. Your data in
   `~/.rnfs` stays.
 
-### Other Linux (Flatpak)
+## Other Linux (Flatpak)
 
 For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flathub
 `org.freedesktop.Platform` runtime:
@@ -194,7 +209,7 @@ To reach files outside your home folder, run
 
 On other architectures (e.g. a 32-bit Raspberry Pi), use the [install script](#install-script).
 
-### macOS
+## macOS
 
 Install the wheel from the release with [pipx](https://pipx.pypa.io), which gives rnfs its own environment
 and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python:
@@ -222,7 +237,7 @@ The same command works on any system with Python 3.11+, including Linux and Wind
 pipx installs Reticulum and LXMF at the newest versions rnfs allows, not the exact tested versions the
 other packages bundle.
 
-### Checking a download
+## Checking a download
 
 Each release's `SHA256SUMS` lists the checksum of every file. Download it next to your file, then:
 
@@ -244,12 +259,12 @@ logged in with `gh auth login`):
 gh attestation verify rnfs_0.1.4_amd64.deb --repo afit21/rnfs
 ```
 
-### Other ways to install
+## Other ways to install
 
 The install script installs the latest release; pipx from GitHub and a source checkout install the latest
 code from the main branch, which may be newer than the latest release.
 
-#### Install script
+### Install script
 
 Installs the latest release on any Linux distribution. You need Python 3.11 or newer with venv:
 
@@ -296,7 +311,7 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
   installed unpinned (newest), with a warning.
 
-#### pipx from GitHub
+### pipx from GitHub
 
 ```sh
 pipx install git+https://github.com/afit21/rnfs                                  # Linux, macOS
@@ -305,7 +320,7 @@ pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip         
 
 Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too.
 
-#### From source
+### From source
 
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
@@ -334,7 +349,7 @@ python3 packaging/smoke_test.py dist/rnfs
 pyserial) with the sha256 of each file PyPI has for it. `update-lock.py` with no arguments picks the newest
 versions `pyproject.toml` allows; commit the lock and the regenerated Flatpak sources together.
 
-### Reticulum and where things live
+## Reticulum and where things live
 
 rnfs uses Reticulum's own config directory, the same one `rnsd` and other RNS programs use. That is the
 first of `/etc/reticulum`, `~/.config/reticulum` or `~/.reticulum` that exists; on Windows it is
@@ -377,7 +392,7 @@ such a file is also a file somewhere else, which someone who can write to `files
 Copy a file into `files/` rather than hard linking it (or share it with `rnfs add`, which takes hard-linked
 files).
 
-## Sample files
+# Sample files
 
 Some files & Folders that I host as examples for everyone to download. Fetch them with a running daemon that is
 connected to a network ([Getting started](#getting-started)):
@@ -421,7 +436,7 @@ Or open one in your browser through the local gateway. `?filename=` sets the typ
 http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=ManifestoOftheCommunistParty.pdf
 ```
 
-## Getting started
+# Getting started
 
 ### 1. Start the daemon
 
@@ -517,7 +532,7 @@ In a browser: `http://127.0.0.1:8789/name/<name>/`. Others can `rnfs name follow
 version pinned. Back up your name key with `rnfs name export site -o site.key`, because only that key can
 update the name.
 
-## How rnfs adapts IPFS
+# How rnfs adapts IPFS
 
 rnfs follows IPFS where its design helps, uses Reticulum's own features in place of libp2p, and drops what
 only makes sense on IP networks. It is **not** compatible with IPFS. The full comparison is in
@@ -540,7 +555,7 @@ only makes sense on IP networks. It is **not** compatible with IPFS. The full co
 | Swarm keys (private networks) | Reticulum interface access codes, plus rnfs private mode (members only). |
 | DNSLink | Dropped: Reticulum has no DNS. |
 
-## Settings
+# Settings
 
 Settings go in `~/.rnfs/rnfs.toml` (or `<--dir>/rnfs.toml`). Times are in seconds, sizes in bytes and rates
 in bits/s. Command-line options override the file. An unknown setting is an error, and every setting is
@@ -671,7 +686,7 @@ nobody can crowd them out.
 | `private` | `false` | Private mode: every link identifies, links go only to `members`, only they are served, and only their provider records are kept and handed out (`daemon --private`) |
 | `members` | `[]` | Identity hashes of the members. `rnfs status` shows a node's `identity_hash` (so does `rnid -i ~/.rnfs/storage/identity`) |
 
-## Commands
+# Commands
 
 Every command except `daemon` talks to the running daemon through its local API. Two global options work
 before the command or at the end of it (after the subcommand, for groups such as `name list` or
@@ -821,7 +836,7 @@ Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
 - Pages are sandboxed: they can show files of their own content (images, scripts, style sheets), but no page
   can read gateway responses with `fetch()`. Sealed files are never decrypted by the gateway.
 
-## Example use cases
+# Example use cases
 
 **Community library over LoRa.** A few well-placed nodes run as DHT servers. The librarian keeps a
 directory of documents and maps behind a name and updates it with `dir set` / `name publish`. Each library
@@ -906,7 +921,7 @@ rnfs:name/<name>/index.html
 rnfs get <cid>/index.html --from <your node ID>   or   http://127.0.0.1:8789/name/<name>/
 ```
 
-## Running several nodes
+# Running several nodes
 
 To run several daemons on one machine, give each its own `--dir`, `--api-port`, `--gateway-port` and
 Reticulum config (`--rnsconfig`). Then connect their Reticulum instances:
@@ -923,7 +938,7 @@ rnfs --dir /tmp/a --api-port 9001 add somefile
 rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 ```
 
-## Known limitations
+# Known limitations
 
 - A name resolves only while its owner, a transport node that remembers its announce, or a keeper is
   reachable. A name can be updated about once an hour.
