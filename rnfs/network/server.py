@@ -60,6 +60,9 @@ QUEUED_WINDOW_BITS = 10 * 500 * 8
 # loses its protection. Behind more hops the path may be much slower than our interface, so only the
 # unmeasured_bitrate floor applies there
 FLOOR_FRACTION = 1 / 1000
+# A response displaced for a newcomer while making progress at less than this fraction of the rate it needs to
+# be done when it is due (Response.due) counts as making none: its requester cools down
+FAR_BEHIND = 1 / 4
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
 # Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
 # An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
@@ -221,6 +224,9 @@ class Response:
         self.started = started
         self.size: int | None = None  # packed bytes, once built
         self.deadline = float("inf")  # absolute time by which it must have finished
+        # When it should be done judging from its path: its deadline, or for one with no rate estimate on a fast
+        # path (fast_path), the deadline it would have at slow_bitrate, which every interface on that path beats
+        self.due = float("inf")
         self.sent = 0.0  # bytes sent so far, from the Resource's progress
         self.resource = None  # the RNS Resource carrying it, once found
         self.find_until = float("inf")
@@ -274,6 +280,16 @@ class Response:
         """Whether no newcomer may displace it for making no progress: within its grace, or moving."""
         return self.in_grace(now) or self.moving(now)
 
+    def needed_rate(self, now: float) -> float:
+        """Bytes per second it must send from now on to be done when it is due (0 if its size isn't known yet)."""
+        if self.size is None or self.untracked:
+            return 0.0
+        return max(0.0, self.size - self.sent) / max(min(self.due, self.deadline) - now, 1.0)
+
+    def far_behind(self, now: float) -> bool:
+        """Whether it is moving at less than FAR_BEHIND of the rate it needs to be done when it is due."""
+        return self.progress_rate(now) < FAR_BEHIND * self.needed_rate(now)
+
 
 class ResponsePools:
     """Slots for /blocks responses: max_responses // 2 for slow links, the rest for others. Thread-safe.
@@ -283,8 +299,10 @@ class ResponsePools:
     - the response making least progress among those past their grace and below their progress floor (it is
       marked idle, and its requester cools down);
     - else, if the newcomer's interface holds no slot in the pool, the oldest response with nothing sent from
-      an interface holding two or more, even within its grace;
-    - else the pool's response with the lowest throughput, if it is older than deadline_slack and past its grace.
+      an interface holding two or more that is past half its grace, at most once per grace per interface;
+    - else, if neither the newcomer's link nor its identity holds a slot in the pool, the pool's response with the
+      lowest throughput, if it is older than deadline_slack and past its grace (marked idle if it is far behind
+      the rate it needs to be done when it is due).
     Otherwise it is refused.
     """
 
@@ -294,20 +312,23 @@ class ResponsePools:
         self.deadline_slack = deadline_slack
         self.clock = clock
         self.active: dict[str, list[Response]] = {SLOW_POOL: [], FAST_POOL: []}
+        # id(interface) -> when it last lost a response to a newcomer from another interface
+        self.fairness_at: dict[int, float] = {}
         self.lock = threading.Lock()
 
     def reserve(self, pool: str, link_id: bytes, request_id: bytes, grace: float | None = None, floor: float = 0.0,
-                interface=None) -> tuple[Response | None, Response | None]:
+                interface=None, identity: bytes | None = None) -> tuple[Response | None, Response | None]:
         """Take a slot in pool: (new response, or None if refused; displaced response to cancel, or None).
 
-        grace (default deadline_slack), floor and interface are the new response's (section 3).
+        grace (default deadline_slack), floor, interface and identity (its requester's identity hash, if it
+        identified) are the new response's (section 3).
         """
         with self.lock:
             now = self.clock()
             members = self.active[pool]
             displaced = None
             if len(members) >= self.capacity[pool]:
-                displaced = self._displaceable(members, link_id, interface, now)
+                displaced = self._displaceable(members, link_id, interface, identity, now)
                 if displaced is None:
                     return None, None
                 members.remove(displaced)
@@ -315,11 +336,14 @@ class ResponsePools:
             response.grace = self.deadline_slack if grace is None else grace
             response.floor = floor
             response.interface = interface
+            response.identity = identity
             members.append(response)
             return response, displaced
 
-    def _displaceable(self, members: list[Response], link_id: bytes, interface, now: float) -> Response | None:
-        """The member a newcomer on link_id arriving on interface may displace, or None. Caller holds the lock."""
+    def _displaceable(self, members: list[Response], link_id: bytes, interface, identity: bytes | None,
+                      now: float) -> Response | None:
+        """The member a newcomer on link_id (of identity) arriving on interface may displace, or None. Caller
+        holds the lock."""
         others = [r for r in members if r.link_id != link_id]
         idle = [r for r in others if not r.protected(now)]
         if idle:
@@ -327,15 +351,35 @@ class ResponsePools:
             displaced.idle = True
             return displaced
         if interface is not None and all(r.interface is not interface for r in members):
-            held = Counter(id(r.interface) for r in members if r.interface is not None)
-            crowded = [r for r in others if r.interface is not None and held[id(r.interface)] >= 2
-                       and r.sent <= 0 and not r.untracked]
-            if crowded:
-                return min(crowded, key=lambda r: r.started)
-        slowest = min(members, key=lambda r: r.throughput(now))
-        if slowest.link_id == link_id or now - slowest.started <= self.deadline_slack or slowest.in_grace(now):
+            displaced = self._fairness_pick(others, now)
+            if displaced is not None:
+                return displaced
+        # The slowest moving response, for a newcomer holding nothing in the pool: a requester can't keep its own
+        # responses young by displacing them from its own link or identity
+        if any(r.link_id == link_id or (identity is not None and r.identity == identity) for r in members):
             return None
+        slowest = min(members, key=lambda r: r.throughput(now))
+        if now - slowest.started <= self.deadline_slack or slowest.in_grace(now):
+            return None
+        # Far behind what it needs to finish in time: no better than making no progress, so its requester cools
+        # down (else one taking a little of each response could renew its slots this way from a spare link)
+        slowest.idle = slowest.far_behind(now)
         return slowest
+
+    def _fairness_pick(self, others: list[Response], now: float) -> Response | None:
+        """For a newcomer from an interface holding no slot: the oldest response with nothing sent from an
+        interface holding two or more, once it is past half its grace and that interface hasn't lost one this
+        way within the response's grace. Caller holds the lock."""
+        self.fairness_at = {key: at for key, at in self.fairness_at.items() if now - at <= self.deadline_slack}
+        held = Counter(id(r.interface) for r in others if r.interface is not None)
+        crowded = [r for r in others if r.interface is not None and held[id(r.interface)] >= 2
+                   and r.sent <= 0 and not r.untracked and now - r.grace_start > r.grace / 2
+                   and now - self.fairness_at.get(id(r.interface), -math.inf) > r.grace]
+        if not crowded:
+            return None
+        displaced = min(crowded, key=lambda r: r.started)
+        self.fairness_at[id(displaced.interface)] = now
+        return displaced
 
     def release(self, response: Response) -> bool:
         """Free response's slot. True if it held one."""
@@ -847,9 +891,7 @@ class RequestServer:
             response, displaced = self.pools.reserve(SLOW_POOL if slow else FAST_POOL, link_id, request_id,
                                                      grace=min(self.config.deadline_slack, grace + wait),
                                                      floor=progress_floor(bitrate, hops, self.config),
-                                                     interface=interface)
-            if response is not None:
-                response.identity = identity
+                                                     interface=interface, identity=identity)
             if displaced is not None:
                 self._cancel(displaced, "made no progress; displaced by a new request" if displaced.idle
                              else "displaced by a new request")
@@ -902,6 +944,8 @@ class RequestServer:
                 return body  # nothing to track
             response.size = packed
             response.deadline = response.started + rates.response_deadline(packed, rate, self.config)
+            response.due = response.started + rates.response_deadline(
+                packed, rate or (self.config.slow_bitrate if fast else None), self.config)
             response.grace = grace
             self._restart_grace(response)
             response.find_until = self.clock() + REGISTER_WINDOW
