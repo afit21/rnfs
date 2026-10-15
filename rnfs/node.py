@@ -67,30 +67,31 @@ KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND
 
 def _make_private_dirs(config: Config):
     """Create the rnfs dir and the node's subdirectories readable by the owner only (0700; on Windows, a
-    protected access list for the user and SYSTEM, see winacl).
+    protected access list for the user and SYSTEM from the moment each is created, see winacl).
 
     They hold the node's identity, name keys and the local API token, so other local users must not read
     them; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if the
     root belongs to another user or can't be made private: its owner could swap the identity or plant a
-    config there.
+    config there. On Windows also if the root is a junction or symlink, or new but not empty.
     """
     root = config.root
-    existed = os.path.isdir(root)
+    subdirs = (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir)
+    if fsutil.IS_WINDOWS:
+        # No Unix permission bits there (st_mode always shows others allowed): an explicit access list
+        winacl.secure_rnfs_dir(root, subdirs)
+        return
     os.makedirs(root, mode=0o700, exist_ok=True)
-    # Windows has no Unix permission bits (st_mode always shows others allowed): an explicit access list there
-    winacl.secure_rnfs_dir(root, created=not existed)
-    if not fsutil.IS_WINDOWS:
-        info = os.stat(root)
-        if info.st_uid != os.geteuid():
-            raise RnfsError(f"{root} belongs to another user (uid {info.st_uid}); the rnfs dir must be your own")
-        mode = stat.S_IMODE(info.st_mode)
-        if mode & 0o077:
-            try:
-                os.chmod(root, 0o700)
-            except OSError as e:
-                raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
-            log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
-    for directory in (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir):
+    info = os.stat(root)
+    if info.st_uid != os.geteuid():
+        raise RnfsError(f"{root} belongs to another user (uid {info.st_uid}); the rnfs dir must be your own")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        try:
+            os.chmod(root, 0o700)
+        except OSError as e:
+            raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
+        log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
+    for directory in subdirs:
         os.makedirs(directory, mode=0o700, exist_ok=True)
 
 

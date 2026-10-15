@@ -10,6 +10,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field, fields
 
+from rnfs import winacl
 from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
 
 DEFAULT_API_PORT = 8788
@@ -264,6 +265,11 @@ class Config:
         path = os.path.join(os.path.expanduser(rnfs_dir), SETTINGS_FILE)
         if os.path.isfile(path):
             with open(path, "rb") as f:
+                # On Windows, owned by and private to this user: its settings pick programs rnfs runs
+                try:
+                    winacl.secure_settings(path, f.fileno())
+                except OSError as e:
+                    raise PermissionError(f"can't trust the settings file: {e}") from None
                 values.update(tomllib.load(f))
         known = {f.name for f in fields(cls)}
         unknown = values.keys() - known

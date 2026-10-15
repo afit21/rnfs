@@ -7,6 +7,7 @@ remove() retry for about a second while the file is in use; elsewhere they are p
 import errno
 import os
 import secrets
+import stat
 import sys
 import time
 
@@ -24,6 +25,11 @@ PARTIAL_PREFIX = ".partial-"
 
 # Seconds slept between attempts while Windows reports a file in use: about 1 s in all
 RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25)
+
+_REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+# Reparse tags with this bit are name surrogates: they stand for another file or directory (symlinks,
+# junctions, WSL symlinks), unlike placeholders such as OneDrive's that hold the file itself
+_REPARSE_NAME_SURROGATE = 0x20000000
 
 # Device names Windows reserves in every directory, with or without an extension (also as superscript digits)
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
@@ -175,6 +181,13 @@ def _windows_final_path(fd: int) -> str:
         if length < size:
             return strip_windows_prefix(buffer.value)
         size = length + 1  # the buffer was too small, and length is what it needs
+
+
+def is_link(st: os.stat_result) -> bool:
+    """True for a symlink, a Windows directory junction (which stat reports as a directory, yet it links) or any
+    other Windows reparse point that stands for another file (a name surrogate); st is from lstat."""
+    tag = getattr(st, "st_reparse_tag", 0)
+    return stat.S_ISLNK(st.st_mode) or tag == _REPARSE_JUNCTION or bool(tag & _REPARSE_NAME_SURROGATE)
 
 
 def is_below(path: str, root: str) -> bool:

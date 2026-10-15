@@ -220,10 +220,6 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)  # opening a FIFO for reading would otherwise wait for a writer
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-_REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
-# Reparse tags with this bit are name surrogates: they stand for another file or directory (symlinks,
-# junctions, WSL symlinks), unlike placeholders such as OneDrive's that hold the file itself
-_REPARSE_NAME_SURROGATE = 0x20000000
 # Platforms without these (not Linux or macOS) walk directories by path, checking each entry before using it
 FD_WALK = (os.open in os.supports_dir_fd and os.scandir in os.supports_fd
            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
@@ -391,11 +387,7 @@ def listed_stat(item: os.DirEntry, path: str) -> os.stat_result:
     return st
 
 
-def is_link(st: os.stat_result) -> bool:
-    """True for a symlink, a Windows directory junction (which stat reports as a directory, yet it links) or any
-    other Windows reparse point that stands for another file (a name surrogate)."""
-    tag = getattr(st, "st_reparse_tag", 0)
-    return stat.S_ISLNK(st.st_mode) or tag == _REPARSE_JUNCTION or bool(tag & _REPARSE_NAME_SURROGATE)
+is_link = fsutil.is_link  # a symlink, junction or other link-like Windows reparse point
 
 
 def close(handle: Handle):
