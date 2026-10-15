@@ -6,12 +6,15 @@ Link to it with the CID as a link variable, which NomadNet passes in the environ
 
 Anyone can open the page, so it never fetches, pins or provides anything because a visitor asked:
 - It shows a file only if this node already has it completely and pinned by the operator (pin source "user"
-  or "folder", as `rnfs pin ls` lists it), or if its CID is in the operator's allowlist file. Only
-  allowlisted CIDs are fetched if missing, with `rnfs cat` (a bounded read that pins nothing and starts no
-  job), and only allowlisted files are rendered as Micron; everything else is shown as plain text under a
-  banner saying it is third-party content.
-- Requests run one at a time (a lock file) and at most RATE_LIMIT per RATE_WINDOW seconds (a state file);
-  when either says no, the page asks the visitor to try again later.
+  or "folder", as `rnfs pin ls` lists it), or if its CID is in the operator's allowlist file. In private
+  mode (`rnfs status`), only allowlisted CIDs: the node shares its pins with members only, and the page
+  can't tell who is one. Only allowlisted CIDs are fetched if missing, with `rnfs cat` (a bounded read that
+  pins nothing and starts no job), and only allowlisted files are rendered as Micron; everything else is
+  shown as plain text under a banner saying it is third-party content.
+- Requests run one at a time (a lock file) and within rate limits (a state file): VISITOR_LIMIT per
+  RATE_WINDOW seconds for each visitor who identified to this node (NomadNet passes their identity as
+  remote_identity), RATE_LIMIT for all who didn't together, and TOTAL_LIMIT for everyone; when the lock or a
+  limit says no, the page asks the visitor to try again later.
 - Visitors see short, generic errors; the details (CLI errors, exceptions) go to a log file.
 The allowlist, lock, rate state and log live in the page's data dir, PAGE_DIR; see this page's README.
 
@@ -33,8 +36,14 @@ MAX_SIZE = 200 * 1024
 # How long one page request may wait for rnfs in all; fetching an allowlisted file over a slow link takes a while.
 TIMEOUT = 120
 
-# At most RATE_LIMIT page requests (for well-formed CIDs) in any RATE_WINDOW seconds, from all visitors together.
+# Page requests (for well-formed CIDs) in any RATE_WINDOW seconds: at most VISITOR_LIMIT from each visitor who
+# identified to this node, RATE_LIMIT from all who didn't together (nothing tells them apart: NomadNet's link_id
+# is new with every link), and TOTAL_LIMIT from everyone. Identities cost nothing to make, so the per-visitor
+# limit keeps one ordinary visitor from using up the others' requests, not a determined one: TOTAL_LIMIT still
+# bounds what the page makes rnfs do.
+VISITOR_LIMIT = 10
 RATE_LIMIT = 30
+TOTAL_LIMIT = 60
 RATE_WINDOW = 60
 
 # Pin sources that mean the operator chose to keep the file (not a contact, a follow or a remote pin).
@@ -53,6 +62,9 @@ RNFS = shutil.which("rnfs") or os.path.expanduser("~/.local/bin/rnfs")
 
 # A bare CIDv1 in base32 (rnfs's form), so nothing else (a path, a nick, an option) reaches rnfs.
 CID = re.compile(r"b[a-z2-7]{20,200}")
+
+# An RNS identity hash in hex, as NomadNet passes a visitor's in remote_identity.
+IDENTITY = re.compile(r"[0-9a-f]{32}")
 
 # How a sealed (encrypted) file starts (rnfs/content/seal.py); the page never shows one.
 SEALED_MAGIC = b"rnfs-sealed\n"
@@ -169,24 +181,40 @@ def take_lock():
     return handle
 
 
-def over_rate_limit():
-    """True if RATE_LIMIT requests already ran in the last RATE_WINDOW seconds; else count this one.
+def visitor():
+    """The identity hash of the visitor, if they identified to this node (NomadNet's remote_identity), else
+    None. NomadNet's link_id isn't used: a visitor gets a new one with every link."""
+    value = os.environ.get("remote_identity", "").strip().lower()
+    return value if IDENTITY.fullmatch(value) else None
 
-    Called with the lock held. Raises OSError if the state can't be saved, so the page fails closed.
+
+def over_rate_limit(who):
+    """True if visitor who (None: one who didn't identify) may not make another request now: VISITOR_LIMIT
+    (RATE_LIMIT for all who didn't identify) or TOTAL_LIMIT requests ran in the last RATE_WINDOW seconds.
+    Else count this one.
+
+    Called with the lock held. The state is a list of the requests' times, each with the visitor's identity
+    hash ([time, hash]) if they identified. Raises OSError if it can't be saved, so the page fails closed.
     """
     path = os.path.join(PAGE_DIR, "rate.json")
     now = time.time()
+    requests = []
     try:
         with open(path, encoding="utf-8") as f:
-            stamps = [stamp for stamp in json.load(f)
-                      if isinstance(stamp, (int, float)) and now - RATE_WINDOW < stamp <= now]
+            saved = json.load(f)
+        for entry in saved if isinstance(saved, list) else ():
+            stamp, owner = entry if isinstance(entry, list) and len(entry) == 2 else (entry, None)
+            if (isinstance(stamp, (int, float)) and now - RATE_WINDOW < stamp <= now
+                    and (owner is None or isinstance(owner, str) and IDENTITY.fullmatch(owner))):
+                requests.append((stamp, owner))
     except (OSError, ValueError, TypeError):
-        stamps = []
-    if len(stamps) >= RATE_LIMIT:
+        requests = []
+    mine = sum(owner == who for _, owner in requests)
+    if len(requests) >= TOTAL_LIMIT or mine >= (RATE_LIMIT if who is None else VISITOR_LIMIT):
         return True
-    stamps.append(now)
+    requests.append((now, who))
     with open(path + ".tmp", "w", encoding="utf-8") as f:
-        json.dump(stamps, f)
+        json.dump([stamp if owner is None else [stamp, owner] for stamp, owner in requests], f)
     os.replace(path + ".tmp", path)
     return False
 
@@ -215,6 +243,19 @@ def operator_pin(deadline, cid):
     return None
 
 
+def private_mode(deadline, cid):
+    """True unless `rnfs status` says the node isn't in private mode (an answer without it counts as private)."""
+    code, out, err = rnfs(deadline, "status")
+    if code != 0:
+        unavailable(cid, f"rnfs status failed: {err}")
+    for line in out.decode("utf-8", "replace").splitlines():
+        name, _, value = line.partition(": ")
+        if name == "private":
+            return value.strip() != "False"
+    log(f"{cid}: rnfs status didn't say whether the node is in private mode; taken as private")
+    return True
+
+
 def size_of(deadline, cid):
     """The file's size in bytes from rnfs stat, or None if it isn't known."""
     code, out, err = rnfs(deadline, "stat", cid)
@@ -235,6 +276,10 @@ def show(cid):
     if pin is None and not allowed:
         # Not this node's to share: run nothing that could fetch it (stat and cat would, and with
         # provide_strategy "roots" the node would then provide what they fetched)
+        fail(f"{cid} isn't shared on this node.")
+    if not allowed and private_mode(deadline, cid):
+        # The node shares its pins with members only, and the page can't tell who is one: only what the
+        # operator allowlisted for everyone (the same answer as for a CID it doesn't have)
         fail(f"{cid} isn't shared on this node.")
     if pin is not None and pin.get("type") == "directory":
         fail(f"{cid} is a folder, not a file.")
@@ -282,7 +327,7 @@ def main():
         fail("This page is busy with another request; try again in a moment.")
     with lock:
         try:
-            if over_rate_limit():
+            if over_rate_limit(visitor()):
                 fail("This page has had too many requests; try again in a minute.")
             show(cid)
         except subprocess.TimeoutExpired:

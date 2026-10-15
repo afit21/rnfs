@@ -359,13 +359,23 @@ Uninstalling never deletes it.
 
 The rnfs directory holds your keys and the API token, so rnfs keeps it private: readable by you only, and on
 Windows with an access list for you and SYSTEM only (also on another drive or under `C:\ProgramData`, where
-Windows would otherwise let every local user read it). A `--dir` outside your user profile still gets a
-warning on Windows, since accounts that can change its parent folder could replace it.
+Windows would otherwise let every local user read it). On Windows a new rnfs directory gets that access list
+as it is created, and the daemon refuses an rnfs directory that is a junction or symlink (give its target as
+`--dir`) and a new one that something else has already put files in. A `--dir` outside your user profile
+still gets a warning on Windows, since accounts that can change its parent folder could replace it.
+
+`rnfs.toml` and `storage/identity` must be your own: rnfs refuses to use either if it belongs to another
+account, and makes them private to you (with a warning) if others could read them. The identity must be a
+regular file, not a symlink: the daemon refuses to start otherwise.
 
 The shared folder must not be writable by accounts you don't trust. rnfs skips links inside it and checks
 every directory and file it opens there, but on Windows, where directories are walked by path, someone who
 can write to it gets a race: swapping a directory for a junction while it is scanned. The checks are made to
 win that race, but don't rely on them: keep `files/` (and anything you link it to) changeable only by you.
+Files with more than one hard link are skipped too, with a line in the log, also inside shared directories:
+such a file is also a file somewhere else, which someone who can write to `files/` could have linked there.
+Copy a file into `files/` rather than hard linking it (or share it with `rnfs add`, which takes hard-linked
+files).
 
 ## Sample files
 

@@ -220,10 +220,6 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)  # opening a FIFO for reading would otherwise wait for a writer
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-_REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
-# Reparse tags with this bit are name surrogates: they stand for another file or directory (symlinks,
-# junctions, WSL symlinks), unlike placeholders such as OneDrive's that hold the file itself
-_REPARSE_NAME_SURROGATE = 0x20000000
 # Platforms without these (not Linux or macOS) walk directories by path, checking each entry before using it
 FD_WALK = (os.open in os.supports_dir_fd and os.scandir in os.supports_fd
            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
@@ -391,11 +387,7 @@ def listed_stat(item: os.DirEntry, path: str) -> os.stat_result:
     return st
 
 
-def is_link(st: os.stat_result) -> bool:
-    """True for a symlink, a Windows directory junction (which stat reports as a directory, yet it links) or any
-    other Windows reparse point that stands for another file (a name surrogate)."""
-    tag = getattr(st, "st_reparse_tag", 0)
-    return stat.S_ISLNK(st.st_mode) or tag == _REPARSE_JUNCTION or bool(tag & _REPARSE_NAME_SURROGATE)
+is_link = fsutil.is_link  # a symlink, junction or other link-like Windows reparse point
 
 
 def close(handle: Handle):
@@ -418,21 +410,32 @@ def build_path(path: str, put: Put, warnings: list[str]) -> Built:
         close(handle)
 
 
+def hard_links(handle: Handle) -> int:
+    """How many hard links the open regular file handle has beyond one (0 for a directory)."""
+    if not isinstance(handle, int):
+        return 0
+    st = os.fstat(handle)
+    return st.st_nlink - 1 if stat.S_ISREG(st.st_mode) and st.st_nlink > 1 else 0
+
+
 def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings: list[str],
-               depth: int = 1) -> Built:
+               depth: int = 1, skip_hard_links: bool = False) -> Built:
     """Build the regular file or directory open as handle (from open_path or open_child), whose stat is st.
 
-    path is only for messages (and for directories without FD_WALK); depth as for _build_tree.
+    path is only for messages (and for directories without FD_WALK); depth as for _build_tree. With
+    skip_hard_links, files below a directory that have other hard links are skipped with a warning (the shared
+    folder: someone who may write to it could link a file of yours there that you never put in it).
     """
     if stat.S_ISDIR(st.st_mode):
-        return _build_tree(handle, path, put, warnings, depth)
+        return _build_tree(handle, path, put, warnings, depth, skip_hard_links)
     kind = dag.KIND_EXECUTABLE if is_executable(st.st_mode) else dag.KIND_FILE
     # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
     with os.fdopen(handle, "rb", closefd=False) as f:
         return build_file(f, put, kind=kind)
 
 
-def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int) -> Built:
+def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int,
+                skip_hard_links: bool = False) -> Built:
     """Build the open directory at path, which sits depth directories from the root (1 for the root)."""
     # Every directory level adds at least one DAG node, so this bounds the recursion before it gets deep
     if depth > constants.MAX_DEPTH:
@@ -459,7 +462,10 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
             warnings.append(f"skipped {shown}: it changed while being added")
             continue
         try:
-            child = build_open(handle, st, child_path, put, warnings, depth + 1)
+            if skip_hard_links and (links := hard_links(handle)):
+                warnings.append(f"skipped {shown}: {hard_link_reason(links)}")
+                continue
+            child = build_open(handle, st, child_path, put, warnings, depth + 1, skip_hard_links)
         except Changed:
             # A directory walked by path, swapped when it was listed (see list_directory)
             warnings.append(f"skipped {shown}: it changed while being added")
@@ -469,6 +475,12 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
         entries.append(Entry(item.name, child.cid, child.size, child.kind))
         child_height = max(child_height, child.height)
     return build_directory(entries, put, child_height)
+
+
+def hard_link_reason(links: int) -> str:
+    """Why a file with links other hard links is skipped (shared folder)."""
+    return (f"it has {links} other hard link{'s' if links > 1 else ''}, so it is also a file elsewhere that may "
+            f"not be meant for sharing")
 
 
 def add_path(path: str, put: Put, wrap_it: bool = False) -> tuple[Built, list[str]]:

@@ -6,11 +6,16 @@ so a new file just inherits its directory's access list: under the user's profil
 Administrators and SYSTEM, but elsewhere (another drive, C:\\ProgramData) it usually lets every local user read
 the API token, the node's identity and the name keys. So on Windows:
 
-- the daemon gives a new rnfs dir a protected DACL (nothing inherited from its parent) that grants full control
-  to the current user and SYSTEM only, inherited by everything created below it, and gives an existing one
-  that lets anyone else in the same DACL (which Windows passes on to what is below it);
+- the daemon creates a new rnfs dir and its subdirectories with a protected DACL (nothing inherited from the
+  parent) that grants full control to the current user and SYSTEM only, inherited by everything created below
+  it. The DACL is part of the CreateDirectoryW call, so there is no moment when the parent's DACL applies and
+  another account could put a file in it; a dir that is new yet not empty is refused all the same. An existing
+  rnfs dir that lets anyone else in gets the same DACL (which Windows passes on to what is below it), and one
+  that is a junction or symlink is refused;
 - the API token, identity and name key files get that DACL explicitly when written (fsutil.write_atomic's
-  private), and an existing identity file that lets others in is tightened as on POSIX;
+  private); an existing identity or settings file (rnfs.toml) is checked through the handle it is read from
+  before use: one owned by another account is refused, one that lets others in is tightened, and a DACL that
+  can't be read or tightened stops rnfs;
 - every CLI command checks the token file's DACL before trusting it, and the daemon the rnfs dir's at start.
 
 A DACL counts as private if it allows nobody but the current user, SYSTEM and Administrators (who can read any
@@ -45,6 +50,11 @@ CONTAINER_INHERIT = 0x2
 INHERIT_ONLY = 0x8
 FILE_ALL_ACCESS = 0x001F01FF
 ACL_REVISION = 2
+# Security descriptor control bits (winnt.h)
+SE_DACL_PRESENT = 0x0004
+SE_DACL_PROTECTED = 0x1000
+SE_SELF_RELATIVE = 0x8000
+_DESCRIPTOR_HEADER = 20  # SECURITY_DESCRIPTOR_RELATIVE: revision, padding, control, four offsets
 
 
 class Ace(NamedTuple):
@@ -123,6 +133,14 @@ def private_acl(user_sid: str, directory: bool) -> bytes:
     return struct.pack("<BBHHH", ACL_REVISION, 0, 8 + len(entries), 2, 0) + entries
 
 
+def private_descriptor(user_sid: str, directory: bool) -> bytes:
+    """A self-relative security descriptor whose DACL is private_acl, marked protected (nothing inherited from
+    the parent), with no owner or group (the creating process's defaults apply), for CreateDirectoryW."""
+    acl = private_acl(user_sid, directory)
+    control = SE_SELF_RELATIVE | SE_DACL_PRESENT | SE_DACL_PROTECTED
+    return struct.pack("<BBHIIII", 1, 0, control, 0, 0, 0, _DESCRIPTOR_HEADER) + acl
+
+
 def _name(sid: str) -> str:
     """A SID for messages, with the name of a well-known group."""
     return f"{_NAMES[sid]} ({sid})" if sid in _NAMES else sid
@@ -171,6 +189,7 @@ class _Windows:
     PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
     TOKEN_QUERY = 0x8
     TOKEN_USER = 1
+    ERROR_ALREADY_EXISTS = 183
 
     def __init__(self):
         import ctypes
@@ -202,6 +221,15 @@ class _Windows:
         self.local_free = kernel32.LocalFree
         self.local_free.argtypes = (p,)
         self.local_free.restype = p
+
+        class SecurityAttributes(ctypes.Structure):
+            """SECURITY_ATTRIBUTES (minwinbase.h)."""
+            _fields_ = (("nLength", wintypes.DWORD), ("lpSecurityDescriptor", p), ("bInheritHandle", wintypes.BOOL))
+
+        self.SecurityAttributes = SecurityAttributes
+        self.create_directory = kernel32.CreateDirectoryW
+        self.create_directory.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes))
+        self.create_directory.restype = wintypes.BOOL
         self._user_sid: str | None = None
 
     def _error(self, code: int, path: str | None = None) -> OSError:
@@ -266,6 +294,20 @@ class _Windows:
         if code != 0:
             raise self._error(code, path)
 
+    def create_private_dir(self, path: str) -> bool:
+        """Create the directory path with the protected DACL of private_acl from the start (CreateDirectoryW
+        with it in its SECURITY_ATTRIBUTES); False if something already exists at path. Raises OSError."""
+        ctypes = self.ctypes
+        descriptor = ctypes.create_string_buffer(private_descriptor(self.user_sid(), True))
+        attributes = self.SecurityAttributes(ctypes.sizeof(self.SecurityAttributes),
+                                             ctypes.cast(descriptor, ctypes.c_void_p), False)
+        if self.create_directory(path, ctypes.byref(attributes)):
+            return True
+        code = ctypes.get_last_error()
+        if code == self.ERROR_ALREADY_EXISTS:
+            return False
+        raise self._error(code, path)
+
 
 backend = None  # the _Windows backend, made at first use; tests replace it with a fake
 
@@ -288,6 +330,20 @@ def make_private(path: str, directory: bool = False):
         acl.set_private(path, directory)
 
 
+def make_private_dir(path: str) -> bool:
+    """Create the directory path (its parent must exist), on Windows with a protected DACL for the current user
+    and SYSTEM only from the start, elsewhere with mode 0700; False if something already exists at path.
+    Raises OSError."""
+    acl = _backend() if fsutil.IS_WINDOWS else None
+    if acl is not None:
+        return acl.create_private_dir(path)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        return False
+    return True
+
+
 def check_private(path: str, fd: int | None = None) -> str | None:
     """On Windows, why the file open as fd (or at path) isn't private to the current user, or None if it is (and
     always None elsewhere). Raises OSError if its DACL can't be read."""
@@ -297,17 +353,18 @@ def check_private(path: str, fd: int | None = None) -> str | None:
     return problem(acl.read(path, fd), acl.user_sid())
 
 
-def tighten(path: str, directory: bool = False) -> str | None:
+def tighten(path: str, directory: bool = False, fd: int | None = None) -> str | None:
     """On Windows, make an existing path private if its DACL lets others in; what was wrong (None if nothing).
 
-    Raises PermissionError if it belongs to someone else (its owner could open it again), OSError if it can't
-    be read or set.
+    With fd (path opened for reading), the owner and DACL checked, before and after, are the open file's, so a
+    file swapped in at path after the open can't pass for it. Raises PermissionError if it belongs to someone
+    else (its owner could open it again) or is still not private, OSError if its DACL can't be read or set.
     """
     acl = _backend() if fsutil.IS_WINDOWS else None
     if acl is None:
         return None
     user = acl.user_sid()
-    dacl = acl.read(path)
+    dacl = acl.read(path, fd)
     reason = owner_problem(dacl, user)
     if reason is not None:
         raise PermissionError(f"{path}: {reason}")
@@ -315,10 +372,22 @@ def tighten(path: str, directory: bool = False) -> str | None:
     if reason is None:
         return None
     acl.set_private(path, directory)
-    after = problem(acl.read(path), user)
+    after = problem(acl.read(path, fd), user)
     if after is not None:
         raise PermissionError(f"{path} is still not private after setting its access list: {after}")
     return reason
+
+
+def secure_settings(path: str, fd: int):
+    """On Windows, check the settings file (rnfs.toml) open as fd before its settings are used: one that another
+    account owns is refused, one that lets others in is made private (with a warning, as they could have
+    changed it). Its settings choose the Reticulum config, and with it programs rnfs starts, and the API port
+    the CLI sends its token to. Raises PermissionError or OSError if it can't be trusted."""
+    reason = tighten(path, fd=fd)
+    if reason is not None:
+        from rnfs.log import LOG_WARNING, log
+        log(f"the settings file {path} was accessible to other users ({reason}); made it private to you and "
+            f"SYSTEM. Check that its settings are yours", LOG_WARNING)
 
 
 def outside_profile(path: str) -> bool:
@@ -331,29 +400,59 @@ def outside_profile(path: str) -> bool:
     return not fsutil.is_below(os.path.realpath(path), os.path.realpath(profile))
 
 
-def secure_rnfs_dir(root: str, created: bool):
-    """On Windows, the rnfs dir's part of node._make_private_dirs: a protected owner-only DACL on a new root,
-    an existing one tightened if others may access it, and a warning for a root outside the user's profile.
+def secure_rnfs_dir(root: str, subdirs: tuple[str, ...] = ()):
+    """On Windows, node._make_private_dirs: create the rnfs dir root and subdirs (below it) private from the
+    start, or check and tighten an existing root, and warn about a root outside the user's profile.
 
-    Raises RnfsError if root belongs to another account or can't be made private.
+    A new root is created with the protected owner-only DACL in the same call (make_private_dir), and must
+    then be empty: anything in it was put there by someone else. An existing one is made private if others
+    may access it. A root that is a junction, symlink or other link-like reparse point is refused, as the
+    access list checked and set would be its target's. Missing subdirectories get the same DACL when created.
+
+    Raises RnfsError if root is a link, belongs to another account, can't be made private, or was found
+    non-empty when new.
     """
     if not fsutil.IS_WINDOWS:
         return
     from rnfs.errors import RnfsError
     from rnfs.log import LOG_NOTICE, LOG_WARNING, log
+    path = os.path.abspath(root)
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        created = make_private_dir(path)
+        if fsutil.is_link(os.lstat(path)):
+            raise RnfsError(f"the rnfs dir {root} is a junction or symlink; rnfs uses only a real directory there "
+                            f"(give its target as --dir)")
         if created:
-            make_private(root, directory=True)
-            reason = check_private(root)
+            entries = os.listdir(path)
+            if entries:
+                raise RnfsError(f"the rnfs dir {root} was just created, yet it already holds {len(entries)} "
+                                f"entries (e.g. {entries[0]!r}) that someone else put there; delete it and "
+                                f"keep it in a folder only you can change")
+            reason = check_private(path)
             if reason is not None:
                 raise PermissionError(f"{root} is still not private after setting its access list: {reason}")
         else:
-            reason = tighten(root, directory=True)
+            reason = tighten(path, directory=True)
             if reason is not None:
                 log(f"made {root} private to you and SYSTEM ({reason})", LOG_NOTICE)
+        for directory in subdirs:
+            _make_private_below(path, os.path.abspath(directory))
     except OSError as e:
         raise RnfsError(f"couldn't make the rnfs dir {root} private to you: {e}") from None
     if outside_profile(root):
         log(f"the rnfs dir {root} is outside your user profile. rnfs has made it private to you, but accounts "
             f"that can change its parent folder could replace it: keep it in a folder only you can change",
             LOG_WARNING)
+
+
+def _make_private_below(root: str, directory: str):
+    """Create directory (below root) and any missing directories between root and it with make_private_dir.
+    Raises OSError (FileExistsError if something other than a directory is in the way)."""
+    path = root
+    for part in os.path.relpath(directory, root).split(os.sep):
+        if part == ".":
+            continue
+        path = os.path.join(path, part)
+        if not make_private_dir(path) and not os.path.isdir(path):
+            raise FileExistsError(f"{path} is in the way of a directory")

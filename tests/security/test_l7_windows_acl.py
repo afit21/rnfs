@@ -43,12 +43,14 @@ SHARED = Dacl(USER, [allow(SYSTEM), allow(ADMINISTRATORS), allow(USER), allow(US
 
 
 class FakeAcl:
-    """A winacl backend: a DACL per file, set_private's calls, and `inherited` for files never set."""
+    """A winacl backend: a DACL per file, set_private's and create_private_dir's calls, and `inherited` for files
+    never set."""
 
     def __init__(self, inherited: Dacl = SHARED):
         self.inherited = inherited
         self.dacls: dict[tuple[int, int], Dacl] = {}
         self.set_calls: list[tuple[str, bool]] = []
+        self.created: list[str] = []
         self.read_fds: list[int | None] = []
 
     @staticmethod
@@ -67,6 +69,16 @@ class FakeAcl:
     def set_private(self, path: str, directory: bool):
         self.set_calls.append((path, directory))
         self.dacls[self.key(path)] = Dacl(USER, winacl.parse_acl(winacl.private_acl(USER, directory)))
+
+    def create_private_dir(self, path: str) -> bool:
+        """mkdir with the private DACL from the start; False if path exists."""
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            return False
+        self.created.append(path)
+        self.dacls[self.key(path)] = Dacl(USER, winacl.parse_acl(winacl.private_acl(USER, True)))
+        return True
 
     def set(self, path: str, dacl: Dacl):
         """Give path dacl, as someone else (or an older rnfs) left it."""
@@ -175,7 +187,10 @@ class RnfsDirTest(WindowsTestCase):
 
     def test_new_dir_gets_a_protected_dacl(self):
         node_module._make_private_dirs(Config(rnfs_dir=self.root))
-        self.assertEqual(self.acl.set_calls, [(self.root, True)])
+        # Created with it (CreateDirectoryW's security attributes), never set afterwards
+        self.assertEqual(self.acl.created, [self.root, *(os.path.join(self.root, name)
+                                                         for name in ("state", "blocks", "storage", "names"))])
+        self.assertEqual(self.acl.set_calls, [])
         self.assertTrue(self.private(self.root))
         self.assertEqual(self.messages(), "")
 

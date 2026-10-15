@@ -1,8 +1,8 @@
 """I2 (fix): the identity file's permission tightening followed symlinks, so a symlink put at the identity path got
-another file's permissions changed. Now a symlink there is left alone (with a warning) and a regular file is changed
-through a descriptor opened with O_NOFOLLOW.
+another file's permissions changed. Now a symlink there stops the node (I2-R1: it used to be loaded with a warning)
+and a regular file is checked and changed through a descriptor opened with O_NOFOLLOW, which the key is read from.
 
-load_or_create_identity is run on a symlink to a loose file holding a key (it still loads, the target's mode is
+load_or_create_identity is run on a symlink to a loose file holding a key (refused, the target's mode is
 unchanged), on a loose regular file (still tightened), and with the path swapped for a symlink between the lstat
 and the open (the open refuses it, nothing is changed).
 """
@@ -40,11 +40,9 @@ class IdentitySymlinkTest(unittest.TestCase):
 
     def test_symlink_target_is_not_changed(self):
         os.symlink(self.other, self.path)
-        with mock.patch.object(identity_module, "log") as log:
-            loaded = load_or_create_identity(self.path)
-        self.assertEqual(loaded.hash, self.identity.hash)  # still the user's choice to link it
+        with self.assertRaisesRegex(identity_module.IdentityFileError, "is a symlink"):
+            load_or_create_identity(self.path)
         self.assertEqual(mode_of(self.other), 0o644, "the permission fix followed the symlink")
-        self.assertIn("is a symlink", log.call_args.args[0])
 
     def test_loose_regular_file_is_still_tightened(self):
         os.rename(self.other, self.path)
@@ -55,10 +53,10 @@ class IdentitySymlinkTest(unittest.TestCase):
     def test_symlink_swapped_in_after_the_check_is_not_followed(self):
         os.symlink(self.other, self.path)
         regular = os.stat(self.other)  # what lstat would have seen before the swap
-        with mock.patch("os.lstat", return_value=regular), mock.patch.object(identity_module, "log") as log:
-            identity_module._restrict_permissions(self.path)
+        with mock.patch("os.lstat", return_value=regular), \
+                self.assertRaisesRegex(identity_module.IdentityFileError, "can't use the identity file"):
+            load_or_create_identity(self.path)
         self.assertEqual(mode_of(self.other), 0o644, "the permission fix followed the symlink")
-        self.assertIn("could not restrict", log.call_args.args[0])
 
 
 if __name__ == "__main__":

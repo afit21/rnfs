@@ -155,6 +155,11 @@ def fake_rnfs(node, calls, timeout_on=()):
                 return _Completed(0, (node.pin_add(words[2])["cid"] + "\n").encode("utf-8"))
             if words[0] == "cat":
                 return cat(words[1], words[2:])
+            if words == ["status"]:
+                from rnfs.cli import print_fields
+                with contextlib.redirect_stdout(io.StringIO()) as printed:
+                    print_fields(node.status())
+                return _Completed(0, printed.getvalue().encode("utf-8"))
             if words[:3] == ["pin", "ls", "--json"]:
                 return _Completed(0, json.dumps(node.pin_ls(*words[3:4])).encode("utf-8"))
         except ValueError as error:  # e.g. "<target> is not a directory", which the page keys off

@@ -280,11 +280,17 @@ and says why). The daemon writes a new random
 token to `<rnfs dir>/api_token` (mode 0600, in the 0700 rnfs dir) at each start and the CLI reads it, so other
 local users and processes can't drive the API. `_make_private_dirs` refuses to start (RnfsError) if the rnfs dir
 belongs to another user or can't be made 0700. On Windows (`rnfs/winacl.py`), mode bits set no ACL, so a new
-rnfs dir gets a protected DACL allowing only the user and SYSTEM (inherited below it), an existing one that
-allows anyone else is given it, and one owned by another account is refused; the token, identity and name key
+rnfs dir and its subdirectories are created with a protected DACL allowing only the user and SYSTEM (inherited
+below it) in the CreateDirectoryW call itself (`winacl.make_private_dir`, a self-relative descriptor built by
+`private_descriptor`), so the parent's DACL never applies to them; a new root that already holds anything, and
+a root that is a junction or symlink (`fsutil.is_link` on its lstat), are refused. An existing one that allows
+anyone else is given the DACL, and one owned by another account is refused; the token, identity and name key
 files get the same DACL before they are renamed into place (`fsutil.write_atomic(private=True)`), and
-`read_token` checks the opened token's DACL (Administrators tolerated). A `--dir` outside `%USERPROFILE%` is
-warned about. The advapi32 calls are behind `winacl.backend`, which tests replace with a fake. A response to a request with
+`read_token` checks the opened token's DACL (Administrators tolerated). `rnfs.toml` (`Config.load`,
+`winacl.secure_settings`) and the identity (`network/identity.py`) are checked through the handle they are
+read from (`winacl.tighten(fd=...)`): another account's is refused, a loose one tightened with a warning, and
+a failure is fatal. A `--dir` outside `%USERPROFILE%` is warned about. The advapi32 and kernel32 calls are
+behind `winacl.backend`, which tests replace with a fake. A response to a request with
 `X-Rnfs-Challenge: <32 hex>` carries `X-Rnfs-Proof: cli.api_proof(token, port, challenge)` (HMAC-SHA256 of
 `rnfs api proof <port> <challenge>`); `ApiClient.verify_daemon` checks it with `GET /api/status` before first
 sending the token. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
@@ -636,8 +642,14 @@ Everything in the specification is implemented, with these simplifications and a
   at least `busy_delay`). A `Fetch` exiting with an error (or cancelled) closes the links of its requests still
   in flight. In private mode, incoming links not identified as a member's are closed first to make room.
 - The shared-folder scan and `add` walk directories by file descriptor (`O_NOFOLLOW`, `O_NONBLOCK`, type and
-  inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. Hard links inside the
-  shared folder are real entries and are shared.
+  inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. The scan (not `add`)
+  skips regular files whose opened descriptor has `st_nlink > 1` (`builder.hard_links`, `build_open`'s
+  `skip_hard_links`); such a file's signature is marked, so it is imported once its other links are gone.
+- The identity file (`network/identity.py`) is opened with `O_NOFOLLOW | O_NONBLOCK` after an lstat that must
+  show a regular file, not a link; the descriptor must be that same regular file (device and inode), owned by
+  the user, and is tightened through `fchmod` if loose. The key is read from it (`RNS.Identity.from_bytes`),
+  never by path again. Anything else raises `IdentityFileError` (an RnfsError), which stops the daemon with
+  its message.
 - `get` (`walker.write_out`) skips and reports names the destination filesystem refuses to create (EINVAL,
   ENAMETOOLONG, EILSEQ: e.g. `?` on FAT, long names on eCryptfs) rather than failing the whole write-out.
 - On Windows (`rnfs/fsutil.py`, `IS_WINDOWS`): there is no execute bit, so `add` records every file as kind 0
