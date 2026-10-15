@@ -290,6 +290,17 @@ class Response:
         """Whether it is moving at less than FAR_BEHIND of the rate it needs to be done when it is due."""
         return self.progress_rate(now) < FAR_BEHIND * self.needed_rate(now)
 
+    def commitment(self, now: float) -> int:
+        """Budget bytes it may still send that haven't been charged (upload_budget, section 3): its uncharged rest
+        while it is within its grace; after that, at most what it sends at its progress rate before its deadline,
+        and nothing if it is below its floor (or has sent nothing)."""
+        rest = max(0, self.cost - self.charged)
+        if self.in_grace(now):
+            return rest
+        if not self.moving(now):
+            return 0
+        return int(min(rest, self.progress_rate(now) * max(0.0, self.deadline - now)))
+
 
 class ResponsePools:
     """Slots for /blocks responses: max_responses // 2 for slow links, the rest (or fast_responses, if more) for
@@ -1100,14 +1111,15 @@ class RequestServer:
 
     def _committed(self, response: Response | None = None) -> int:
         """Budget bytes the responses in flight (other than response) are committed to send but haven't been
-        charged: each one's unsent rest while it is within its grace or has sent something. A response past its
-        grace with nothing sent (one its requester isn't fetching) commits nothing."""
+        charged (Response.commitment): each one's unsent rest while it is within its grace, and after that what
+        it can send at its progress rate before its deadline. One past its grace with nothing sent (its requester
+        isn't fetching it) or crawling below its floor commits nothing, so a few such responses can't hold
+        admission while spending nothing."""
         if self.airtime.bucket is None:
             return 0
         now = self.clock()
-        return sum(max(0, other.cost - other.charged) for other in self.pools.responses()
-                   if other is not response and not other.finished and not other.settled and other.cost
-                   and (other.in_grace(now) or other.sent > 0))
+        return sum(other.commitment(now) for other in self.pools.responses()
+                   if other is not response and not other.finished and not other.settled and other.cost)
 
     def _charge_progress(self, response: Response):
         """Charge upload_budget for what response has sent since it was last charged."""
