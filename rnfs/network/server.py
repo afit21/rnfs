@@ -292,7 +292,8 @@ class Response:
 
 
 class ResponsePools:
-    """Slots for /blocks responses: max_responses // 2 for slow links, the rest for others. Thread-safe.
+    """Slots for /blocks responses: max_responses // 2 for slow links, the rest (or fast_responses, if more) for
+    others. Thread-safe.
 
     Each pool competes only with itself. When a pool is full, a new response may displace (section 3), never
     a response on its own link:
@@ -306,9 +307,11 @@ class ResponsePools:
     Otherwise it is refused.
     """
 
-    def __init__(self, max_responses: int, deadline_slack: float, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, max_responses: int, deadline_slack: float, clock: Callable[[], float] = time.monotonic,
+                 fast_responses: int | None = None):
         """Empty pools."""
-        self.capacity = {SLOW_POOL: max_responses // 2, FAST_POOL: max_responses - max_responses // 2}
+        slow = max_responses // 2
+        self.capacity = {SLOW_POOL: slow, FAST_POOL: max(max_responses - slow, fast_responses or 0)}
         self.deadline_slack = deadline_slack
         self.clock = clock
         self.active: dict[str, list[Response]] = {SLOW_POOL: [], FAST_POOL: []}
@@ -633,7 +636,8 @@ class RequestServer:
         self.config = config
         self.backend = backend
         self.clock = clock
-        self.pools = ResponsePools(config.max_blocks_responses, config.deadline_slack, clock)
+        self.pools = ResponsePools(config.max_blocks_responses, config.deadline_slack, clock,
+                                   config.fast_blocks_responses)
         self.incoming = IncomingLinks(config.max_incoming_links, clock)
         self.pacer = UploadPacer(clock)
         self.cooldowns = Cooldowns(config.blocks_cooldown, clock)
