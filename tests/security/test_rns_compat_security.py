@@ -4,7 +4,10 @@ present in the installed RNS.
 server.py's displacement protection measures a per-response grace from the receiving interface's bitrate and
 the requester's hop count, read through server.link_path(). Those are RNS object attributes that the version
 number doesn't promise to keep, so, like tests/test_rns_compat.py (another session's file, not edited here),
-this checks each one and fails naming what changed rather than letting the grace silently fall back.
+this checks each one and fails naming what changed rather than letting the grace silently fall back. The
+follow-up also relies on how RNS marks the local interface to a shared instance (whose bitrate says nothing about
+a link's path), on RNS raising a link's MTU only across interfaces that configure theirs, and on how a Resource's
+advertisement and parts reach a slow radio.
 
 guards.limit_half_open replaces a destination's incoming_link_request and reads Destination.links and each
 link's status, attached_interface and request_time, and closes links with Link.teardown(); those are checked
@@ -93,6 +96,69 @@ class RnsSlotFairnessInternalsTest(unittest.TestCase):
         self.assertEqual((interface, bitrate, hops), (None, None, None))
         self.assertEqual(server.response_grace(None, None, config), config.deadline_slack)
         self.assertEqual(server.progress_floor(None, None, config), config.unmeasured_bitrate / 8)
+
+
+class RnsGracePathInternalsTest(unittest.TestCase):
+    """What the H1 follow-up (shared instances, multi-hop paths, the node's own slow radio) relies on: how RNS
+    marks the interface to a shared instance, when it raises a link's MTU, and how it queues a Resource's parts."""
+
+    def test_interface_to_a_shared_instance_is_told_by_its_attribute(self):
+        # server.via_shared_instance tells the local interface to a shared instance the way RNS does
+        self.assertIn("hasattr(interface,'is_connected_to_shared_instance')",
+                      _normal_source(RNS.Transport.interface_to_shared_instance))
+        from RNS.Interfaces import LocalInterface
+        self.assertIn("self.is_connected_to_shared_instance=True",
+                      _normal_source(LocalInterface.LocalClientInterface.connect))
+        self.assertEqual({LocalInterface.LocalClientInterface.__name__, LocalInterface.LocalServerInterface.__name__},
+                         set(server.rates.LOCAL_INTERFACE_TYPES))
+        # Packets from the shared instance have a hop taken off, so a direct neighbour's link has expected_hops 1
+        self.assertIn("elifTransport.interface_to_shared_instance(packet.receiving_interface):packet.hops-=1",
+                      _normal_source(RNS.Transport._inbound))
+
+    def test_link_path_gives_a_shared_instance_link_no_bitrate(self):
+        from RNS.Interfaces.LocalInterface import LocalClientInterface
+        interface = LocalClientInterface.__new__(LocalClientInterface)
+        interface.bitrate = 1_000_000_000
+        interface.is_connected_to_shared_instance = True
+
+        class _Link:
+            attached_interface = interface
+            expected_hops = 1
+
+        self.assertEqual(server.link_path(_Link()), (interface, None, 1))
+
+    def test_link_mtu_is_raised_only_across_interfaces_that_configure_theirs(self):
+        # server.fast_path: a link's MTU above 500 means every interface on the path autoconfigures its MTU
+        # (at 62.5 kbit/s and up) or has a fixed one; transport nodes drop the MTU signalling otherwise
+        self.assertIn("elifnotoutbound_interface.AUTOCONFIGURE_MTUandnotoutbound_interface.FIXED_MTU:",
+                      _normal_source(RNS.Transport._inbound))
+        self.assertIn("ifpacket.receiving_interface.AUTOCONFIGURE_MTUorpacket.receiving_interface.FIXED_MTU:",
+                      _normal_source(RNS.Transport._inbound))
+        from RNS.Interfaces.KISSInterface import KISSInterface
+        from RNS.Interfaces.RNodeInterface import RNodeInterface
+        for radio in (RNodeInterface, KISSInterface):
+            self.assertFalse(radio.AUTOCONFIGURE_MTU or radio.FIXED_MTU, radio.__name__)
+        interface = Interface.__new__(Interface)
+        interface.AUTOCONFIGURE_MTU = True
+        for bitrate, mtu in ((62_499, None), (62_500, 1024)):
+            interface.bitrate = bitrate
+            interface.optimise_mtu()
+            self.assertEqual(interface.HW_MTU, mtu, bitrate)
+        self.assertTrue(callable(RNS.Link.get_mtu))
+
+    def test_parts_queue_on_a_slow_radio_without_rns_knowing_when_they_leave(self):
+        # server.QUEUED_WINDOW_BITS: one window of parts on a slow link (WINDOW_MAX_SLOW) of one packet each
+        self.assertEqual(RNS.Resource.WINDOW_MAX_SLOW, 10)
+        self.assertEqual(server.QUEUED_WINDOW_BITS, RNS.Resource.WINDOW_MAX_SLOW * RNS.Reticulum.MTU * 8)
+        # RNS registers an outgoing Resource (where rnfs restarts its grace) right after handing its
+        # advertisement to the interface; an RNode's flow control is off unless configured, so the packet goes
+        # to the device at once and RNS can't tell when it is on the air
+        source = _normal_source(RNS.Resource._Resource__advertise_job)
+        self.assertLess(source.index("self.advertisement_packet.send()"),
+                        source.index("self.link.register_outgoing_resource(self)"))
+        from RNS.Interfaces.RNodeInterface import RNodeInterface
+        self.assertIn("flow_control=c.as_bool('flow_control')if'flow_control'incelseFalse",
+                      _normal_source(RNodeInterface.__init__))
 
 
 class RnsHalfOpenLinkInternalsTest(unittest.TestCase):
