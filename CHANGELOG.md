@@ -54,6 +54,12 @@ Fixes:
   those nodes reach. Until a restart, which cleared it.
 - `import` pins the roots an archive supplies with one save of the pins; if that save fails, none of them is
   pinned (before, those ahead of the failure were).
+- A second daemon started on an rnfs dir already in use loaded and saved the same state, announced the same
+  node ID and rotated the first one's debug log before stopping on "address already in use". It now stops at
+  once, saying which process uses the directory: the daemon holds a lock on `<rnfs dir>/daemon.lock`.
+- The debug log no longer says a provider "cancelled" a `/blocks` response that may have been lost in transit:
+  the requester can't tell those apart. The provider now logs a response whose transfer RNS gave up on (lost
+  in transit, or its link closed), where before only the ones it cancelled itself were logged.
 
 Faster:
 - `add`, the shared folder and `import` write blocks on up to 16 threads, so the sync to disk each block needs

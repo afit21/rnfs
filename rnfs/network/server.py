@@ -1204,6 +1204,7 @@ class RequestServer:
         with self.lock:
             # The Resource's callback, the monitor and the next request may all notice; handle it once
             first, response.concluded = not response.concluded, True
+            cancelled = response.finished  # finished before its Resource concluded: _cancel did it, and logged why
         status = getattr(resource, "status", None)
         if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
@@ -1213,6 +1214,11 @@ class RequestServer:
             # at once (section 3)
             log("a /blocks response was rejected with nothing sent: its requester cools down", LOG_VERBOSE)
             self.cooldowns.add(response.link_id, response.identity)
+        elif first and not cancelled and status in (RNS.Resource.FAILED, RNS.Resource.CORRUPT):
+            # Not cancelled here: RNS gave up on the transfer, so the requester sees it stop arriving
+            log(f"a /blocks response ({size(response.size or 0)}) failed after {size(int(response.sent))} sent: "
+                f"{'its link closed' if getattr(link, 'status', None) == RNS.Link.CLOSED else 'lost in transit'}",
+                LOG_DEBUG)
         self._finish(response)  # charges what was sent: all of a completed Resource
 
     @staticmethod

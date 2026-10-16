@@ -1,8 +1,9 @@
 """Tests for fsutil: replace and remove retried while Windows reports a file in use, atomic writes, Windows
-name rules."""
+name rules, the lock a daemon holds on its rnfs dir."""
 import errno
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,21 @@ from unittest import mock
 
 from rnfs import fsutil
 from tests.support import CAN_SYMLINK, POSIX_MODES
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# A process holding fsutil.lock_exclusive(argv[1]): it prints "locked", then keeps it until its stdin closes
+HOLD_LOCK = ("import sys; from rnfs import fsutil; fsutil.lock_exclusive(sys.argv[1]); print('locked', flush=True); "
+             "sys.stdin.read()")
+
+
+def hold_lock(path: str) -> subprocess.Popen:
+    """Start a process holding the lock on path, once it holds it."""
+    holder = subprocess.Popen([sys.executable, "-c", HOLD_LOCK, path], cwd=ROOT, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True)
+    if holder.stdout.readline().strip() != "locked":
+        holder.kill()
+        raise AssertionError("the lock holder didn't lock")
+    return holder
 
 
 def in_use(failures: int, real):
@@ -311,6 +327,60 @@ class SafeDefaultNameTest(unittest.TestCase):
         self.assertEqual(fsutil.printable("plain été"), "plain été")
         self.assertEqual(fsutil.printable("a\x1b[31mb\x07"), "a\\x1b[31mb\\x07")
         self.assertEqual(fsutil.printable(5), "5")
+
+
+
+class LockTest(unittest.TestCase):
+    """lock_exclusive and lock_holder, across processes as daemons use them."""
+
+    def setUp(self):
+        """A lock file path in a temporary directory."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, "daemon.lock")
+
+    def lock(self) -> int:
+        """Take the lock in this process (released before the directory is removed)."""
+        fd = fsutil.lock_exclusive(self.path)
+        self.addCleanup(os.close, fd)
+        return fd
+
+    def test_a_second_process_is_refused_until_the_first_lets_go(self):
+        """While another process holds the lock, taking it raises BlockingIOError and lock_holder names that
+        process; once it exits, the lock is free and names this one."""
+        holder = hold_lock(self.path)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fsutil.lock_exclusive(self.path)
+            self.assertEqual(fsutil.lock_holder(self.path), holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        self.lock()
+        self.assertEqual(fsutil.lock_holder(self.path), os.getpid())
+
+    def test_a_killed_holder_releases_it(self):
+        """A process that dies without letting go (a crash, kill -9) releases the lock with it."""
+        holder = hold_lock(self.path)
+        holder.kill()
+        holder.wait(30)
+        holder.stdin.close()
+        holder.stdout.close()
+        self.lock()
+
+    @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX permission bits")
+    def test_lock_file_is_private(self):
+        """The lock file is created readable by its owner only."""
+        self.lock()
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_holder_of_a_file_without_a_process_id_is_unknown(self):
+        """lock_holder gives None for a missing or unreadable lock file."""
+        self.assertIsNone(fsutil.lock_holder(self.path))
+        with open(self.path, "w", encoding="ascii") as f:
+            f.write("not a pid")
+        self.assertIsNone(fsutil.lock_holder(self.path))
 
 
 if __name__ == "__main__":

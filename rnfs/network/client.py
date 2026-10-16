@@ -211,8 +211,9 @@ class PeerClient:
             self.links.close_link(peer)
             return BlocksResult(STALLED, unsent=wanted, reason=exchange.stalled)
         if exchange.cancelled:
-            # The responder gave the slot to another request or ran out of time: like a refusal, not a stall
-            log(f"{name} cancelled its /blocks response", LOG_VERBOSE)
+            # The responder gave the slot to another request or ran out of time, or the transfer was lost in
+            # transit: like a refusal, not a stall
+            log(f"{name}'s /blocks response stopped arriving (cancelled by it, or lost in transit)", LOG_VERBOSE)
             return BlocksResult(BUSY, unsent=wanted, reason="cancelled")
         if not exchange.answered:
             log(f"no answer from {name} to /blocks", LOG_VERBOSE)

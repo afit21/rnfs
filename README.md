@@ -371,6 +371,7 @@ Uninstalling never deletes it.
 | `names/` | name keys (back them up: `rnfs name export`) |
 | `files/` | the shared folder: anything put here is added, pinned and shared automatically |
 | `api_token` | the running daemon's API token |
+| `daemon.lock` | locked by the daemon using the directory, so a second one on it stops at once |
 
 The rnfs directory holds your keys and the API token, so rnfs keeps it private: readable by you only, and on
 Windows with an access list for you and SYSTEM only (also on another drive or under `C:\ProgramData`, where

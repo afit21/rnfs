@@ -484,5 +484,40 @@ class TokenTest(CliTestCase):
         self.assertNotEqual(proof, cli.api_proof("token", 8788, "cd" * 16))
 
 
+
+class DaemonLockTest(unittest.TestCase):
+    """A second daemon on an rnfs dir another daemon holds (its daemon.lock) stops before touching anything."""
+
+    def test_second_daemon_stops_at_once(self):
+        """With the lock held, `rnfs daemon` exits with an error naming the holder, before writing state or
+        rotating the debug log."""
+        from rnfs.config import Config
+        from rnfs.node import _make_private_dirs
+        from tests.test_fsutil import hold_lock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rnfs_dir = os.path.join(tmp.name, "rnfs")
+        _make_private_dirs(Config(rnfs_dir=rnfs_dir))  # as the first daemon left it
+        debug_log = os.path.join(rnfs_dir, "debug.log")
+        with open(debug_log, "w", encoding="utf-8") as f:
+            f.write("the first daemon's log\n")
+        holder = hold_lock(os.path.join(rnfs_dir, cli.LOCK_FILE))
+        try:
+            result = subprocess.run([sys.executable, "rnfs.py", "--dir", rnfs_dir, "--api-port", str(free_port()),
+                                     "daemon", "--gateway-port", str(free_port()), "--debug-log"],
+                                    cwd=ROOT, capture_output=True, timeout=60, encoding="utf-8", errors="replace")
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"another rnfs daemon (process {holder.pid}) is using", result.stderr)
+        with open(debug_log, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "the first daemon's log\n")
+        self.assertFalse(os.path.exists(debug_log + ".1"))
+        self.assertFalse(os.path.exists(os.path.join(rnfs_dir, "state", "rnfs.db")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -82,7 +82,9 @@ class Exchange:
         self.last_progress = self.sent_at
         self.response_started: float | None = None  # when the first part of a Resource response arrived
         self.stalled: str | None = None  # why the requester gave up waiting, if it did
-        self.cancelled = False  # the responder cancelled the response Resource (e.g. displaced it)
+        # The response Resource left the link unfinished: the responder cancelled it (e.g. displaced it), or RNS
+        # lost it in transit; the requester can't tell which
+        self.cancelled = False
         self.receipt = None  # the RNS RequestReceipt, once sent
 
     # RNS callbacks: they run on RNS threads, so they only record and never block
@@ -539,7 +541,7 @@ class LinkPool:
         if exchange.stalled:
             why = exchange.stalled
         elif exchange.cancelled:
-            why = "it cancelled its response"
+            why = "its response stopped arriving (the responder cancelled it, or it was lost in transit)"
         elif not peer.is_active():
             why = "the link " + (close_reason(peer.link) if peer.link is not None else "closed")
         elif getattr(exchange.receipt, "status", None) == RECEIPT_FAILED:

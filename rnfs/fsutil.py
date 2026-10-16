@@ -53,6 +53,48 @@ def replace(src: str, dst: str):
     _retrying(os.replace, src, dst)
 
 
+LOCK_OFFSET = 1 << 30  # Windows: the byte locked, far past what the lock file holds, so its text stays readable
+
+
+def lock_exclusive(path: str) -> int:
+    """Open path (created 0600 if missing) and lock it for this process, without waiting; the descriptor, whose
+    lock lasts until it is closed or the process ends (also by a crash), with this process's ID written in the
+    file. Raises BlockingIOError if another process holds the lock, OSError if path can't be opened.
+
+    POSIX: flock (advisory: only processes that lock it too are kept out). Windows: msvcrt.locking of one byte at
+    LOCK_OFFSET, past the text.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | O_NOFOLLOW | O_BINARY, 0o600)
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as e:  # PermissionError (EACCES) when another process holds it
+                raise BlockingIOError(errno.EAGAIN, f"{path} is locked by another process") from e
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # BlockingIOError when another process holds it
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def lock_holder(path: str) -> int | None:
+    """The process ID lock_exclusive() wrote in path, or None if it can't be read."""
+    try:
+        with open(path, "rb") as f:
+            text = f.read(32)
+        return int(text.strip())
+    except (OSError, ValueError):
+        return None
+
+
 def rename_new(src: str, dst: str):
     """Rename src (a file or directory) to dst, which must not exist: FileExistsError if it does.
 

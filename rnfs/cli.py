@@ -1,7 +1,8 @@
 """rnfs command line (specification section 11).
 
-`daemon` runs a node with its API and gateway; every other command is one request to a running daemon's
-local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
+`daemon` runs a node with its API and gateway, holding a lock on <rnfs dir>/daemon.lock from before it touches
+anything there, so a second daemon on the same rnfs dir stops at once; every other command is one request to a
+running daemon's local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
 are resolved to absolute paths here, since the daemon reads and writes them itself.
 
 Client commands authenticate with the token the daemon writes to <rnfs dir>/api_token at each start
@@ -27,6 +28,7 @@ from rnfs.config import DEFAULT_API_PORT, Config
 DEFAULT_DIR = Config.rnfs_dir
 COPY_SIZE = 64 * 1024
 TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every other command
+LOCK_FILE = "daemon.lock"  # in the rnfs directory; locked by the daemon using it, so a second one can't start
 # Before sending the token, the CLI makes whatever listens on the API port prove it knows it (api_proof)
 CHALLENGE_HEADER = "X-Rnfs-Challenge"
 PROOF_HEADER = "X-Rnfs-Proof"
@@ -291,11 +293,22 @@ def run_daemon(args):
     except (ValueError, TypeError, OSError) as e:
         fail(f"invalid settings: {e}")
 
+    # Before anything uses the rnfs dir (made private first, as the node would make it): a second daemon on it
+    # would load and save the same state, announce the same node ID and rotate the first one's debug log
+    lock_path = os.path.join(config.root, LOCK_FILE)
+    try:
+        _make_private_dirs(config)
+        lock = fsutil.lock_exclusive(lock_path)  # noqa: F841 - held until the process exits
+    except BlockingIOError:
+        holder = fsutil.lock_holder(lock_path)
+        fail(f"another rnfs daemon{f' (process {holder})' if holder else ''} is using {config.root}; stop it first, "
+             "or give this one another --dir")
+    except (RnfsError, OSError) as e:
+        fail(f"can't lock {lock_path}: {e}")
+
     if config.debug_log:
-        # Before the node, so it has Reticulum starting (interfaces connecting or not); in the rnfs dir made
-        # private first, as the node would make it
+        # Before the node, so it has Reticulum starting (interfaces connecting or not)
         try:
-            _make_private_dirs(config)
             debug = debuglog.start(config)
         except (RnfsError, OSError) as e:
             fail(f"can't write the debug log: {e}")

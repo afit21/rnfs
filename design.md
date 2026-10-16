@@ -320,7 +320,10 @@ answers only `{"version"}` (health checks, and `verify_daemon`, which reads only
 the token with every other request, `rnfs status` included (without a readable token it prints the version
 and says why). The daemon writes a new random
 token to `<rnfs dir>/api_token` (mode 0600, in the 0700 rnfs dir) at each start and the CLI reads it, so other
-local users and processes can't drive the API. `_make_private_dirs` refuses to start (RnfsError) if the rnfs dir
+local users and processes can't drive the API. Before anything else uses the rnfs dir (the debug log, the
+node), the daemon locks `<rnfs dir>/daemon.lock` (`fsutil.lock_exclusive`: `flock`, or `msvcrt.locking` of a byte
+past the text on Windows; the file holds its process ID) and keeps the lock until it exits, so a second daemon
+on the same dir stops at once, naming the first (`lock_holder`). `_make_private_dirs` refuses to start (RnfsError) if the rnfs dir
 belongs to another user or can't be made 0700. On Windows (`rnfs/winacl.py`), mode bits set no ACL, so a new
 rnfs dir and its subdirectories are created with a protected DACL allowing only the user and SYSTEM (inherited
 below it) in the CreateDirectoryW call itself (`winacl.make_private_dir`, a self-relative descriptor built by
@@ -575,8 +578,8 @@ Free text that may hold lone surrogates (file names, LXMF records, cache paths) 
 (`statedb.dump`). Rows that fail the checks the JSON loaders applied are dropped at load with a warning and
 deleted. The JSON files of 0.1.4 and earlier, once imported, stay as `<name>.migrated`. Elsewhere:
 `storage/identity`, `storage/lxmf_identity` (0600), `names/<alias>` (name keys), `lxmf/` (LXMF's ratchets,
-delivered-message IDs, stamp costs), `api_token` (while the daemon runs). Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`)
-or `.rnfs-job-<id>.partial` (get jobs) until renamed; a failed, cancelled or shut-down job removes its partial,
+delivered-message IDs, stamp costs), `api_token` (while the daemon runs), `daemon.lock` (locked while it runs).
+Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`) or `.rnfs-job-<id>.partial` (get jobs) until renamed; a failed, cancelled or shut-down job removes its partial,
 and a resumed job removes one left by a crash.
 
 ## Tests
