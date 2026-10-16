@@ -268,13 +268,17 @@ def run_daemon(args):
     import faulthandler
     import signal
     import threading
+    import time
+    import traceback
 
     import RNS
 
+    from rnfs import debuglog
     from rnfs.api import ApiServer
     from rnfs.errors import RnfsError
     from rnfs.gateway import GatewayServer
-    from rnfs.node import RnfsNode
+    from rnfs.log import LOG_ERROR, LOG_NOTICE
+    from rnfs.node import RnfsNode, _make_private_dirs
 
     try:
         config = Config.load(args.dir, reticulum_dir=args.rnsconfig,
@@ -282,13 +286,26 @@ def run_daemon(args):
                              bootstrap_nodes=args.bootstrap, verbosity=args.verbose or None,
                              dht_mode=args.dht_mode, slow=args.slow, private=args.private,
                              provide_strategy=args.provide_strategy,
-                             gateway_scripts=False if args.no_gateway_scripts else None)
+                             gateway_scripts=False if args.no_gateway_scripts else None,
+                             debug_log=args.debug_log)
     except (ValueError, TypeError, OSError) as e:
         fail(f"invalid settings: {e}")
+
+    if config.debug_log:
+        # Before the node, so it has Reticulum starting (interfaces connecting or not); in the rnfs dir made
+        # private first, as the node would make it
+        try:
+            _make_private_dirs(config)
+            debug = debuglog.start(config)
+        except (RnfsError, OSError) as e:
+            fail(f"can't write the debug log: {e}")
+        print(f"rnfs: writing the debug log {debug.path}", flush=True)
 
     try:
         node = RnfsNode(config)
     except (RnfsError, OSError) as e:  # e.g. an rnfs dir that isn't private, or an unreadable state file
+        if debuglog.current() is not None:  # inside the except: with its traceback
+            debuglog.current().write(LOG_ERROR, "rnfs", f"couldn't start the node: {e!r}", traceback.format_exc())
         if RNS.Reticulum.get_instance() is None:
             fail(str(e))
         print(f"rnfs: {printable(str(e))}", file=sys.stderr, flush=True)
@@ -301,6 +318,8 @@ def run_daemon(args):
             server.stop()
         node.stop()
         print(f"rnfs: {printable(message)}", file=sys.stderr, flush=True)
+        if debuglog.current() is not None:
+            debuglog.current().note(f"stopped: {message}", LOG_ERROR)
         RNS.exit(1)  # ends with os._exit, so the message is printed first
 
     try:
@@ -319,6 +338,10 @@ def run_daemon(args):
         server.start()
     print(f"rnfs node {node.node_id.hex()}, API on http://127.0.0.1:{api.port}, "
           f"gateway on http://127.0.0.1:{gateway.port}", flush=True)
+    debug = debuglog.current()
+    if debug is not None:
+        debug.note(f"started: API on port {api.port}, gateway on port {gateway.port}", LOG_NOTICE)
+        debug.note(debuglog.status_line(node), LOG_NOTICE)
     # `kill -USR1 <pid>` prints every thread's stack, for debugging hangs. Windows has no SIGUSR1
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
@@ -331,13 +354,22 @@ def run_daemon(args):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), lambda *_: stopping.set())
     # Python runs handlers in the main thread, and on Windows a wait isn't interrupted for them: wake each second
+    status_due = time.monotonic() + debuglog.STATUS_INTERVAL
     while not stopping.wait(1):
-        pass
+        if debug is not None and time.monotonic() >= status_due:
+            status_due = time.monotonic() + debuglog.STATUS_INTERVAL
+            try:
+                debug.note(debuglog.status_line(node), LOG_NOTICE)
+            except Exception as e:  # noqa: BLE001 - a status line mustn't stop the daemon
+                debug.note(f"status line failed: {e!r}", LOG_ERROR)
 
     for server in servers:
         server.stop()
     remove_token(token_file, api.token)
     node.stop()
+    if debug is not None:
+        debug.note("stopped", LOG_NOTICE)
+        debuglog.stop()
     # RNS.exit() ends with os._exit, which would lose log lines still buffered when stdout is a file
     sys.stdout.flush()
     sys.stderr.flush()
@@ -725,6 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--private", action="store_true", default=None, help="private mode: members only")
     daemon.add_argument("--provide-strategy", choices=["pinned", "roots"])
     daemon.add_argument("--no-gateway-scripts", action="store_true", help="don't let gateway pages run scripts")
+    daemon.add_argument("--debug-log", action="store_true", default=None,
+                        help="also write every message, gateway request and RNS message to <rnfs dir>/debug.log")
     daemon.add_argument("-v", "--verbose", action="count", default=0,
                         help="log more detail: -v for every DHT query, -vv for RNS debug output")
 

@@ -188,16 +188,16 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
     with storage.protect() as session:
         for root in roots:
             session.add(root)  # keeps blocks already stored below the roots until they're pinned
-        for cid, block in records:
-            if not storage.has(cid):
-                storage.check_disk(len(block))  # the same reserve fetches leave free (StorageFull)
-            try:
-                session.put(cid, block)  # verifies, even a block already stored
-            except ValueError:
-                bad += 1
-                continue
-            supplied.add(cid)
-            stored += 1
+        with session.writer() as put:
+            for cid, block in records:
+                if not storage.has(cid):
+                    storage.check_disk(len(block))  # the same reserve fetches leave free (StorageFull)
+                if not cid.verify(block):  # even a block already stored; the writer stores it later
+                    bad += 1
+                    continue
+                put(cid, block)
+                supplied.add(cid)
+                stored += 1
         complete, incomplete = [], []
         held: set[Cid] = set()  # complete roots the archive didn't wholly supply
         for root in roots:
@@ -208,11 +208,11 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
                 continue
             if blocks <= supplied:
                 complete.append(root)
-                if pin_source is not None:
-                    storage.pin(root, pin_source)
             else:
                 incomplete.append(root)
                 held.add(root)
+        if pin_source is not None:
+            storage.pin_many(complete, pin_source)  # still protected; pins.json is saved once for them all
     if bad:
         log(f"import: skipped {bad} blocks that didn't match their CIDs", LOG_WARNING)
     for root in incomplete:

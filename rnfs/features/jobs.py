@@ -395,12 +395,12 @@ class JobsFeature(Feature):
             states = [job.state for job in self._jobs.values()]
         return {"jobs_running": states.count(RUNNING), "jobs_queued": states.count(QUEUED)}
 
-    def _schedule(self):
-        """Start queued jobs, oldest first, while fewer than max_jobs run."""
+    def _schedule(self) -> bool:
+        """Start queued jobs, oldest first, while fewer than max_jobs run; True if any started (and were saved)."""
         starting = []
         with self._lock:
             if not self._started or self._stop_event.is_set():
-                return
+                return False
             running = sum(1 for job in self._jobs.values() if job.state == RUNNING)
             for job in self._jobs.values():
                 if running >= self.max_jobs:
@@ -416,6 +416,7 @@ class JobsFeature(Feature):
             thread.start()
         if starting:
             self._save_quietly()
+        return bool(starting)
 
     def _run(self, job: Job):
         """Run a job to its end on this thread, then start the next."""
@@ -516,8 +517,8 @@ class JobsFeature(Feature):
         if state in FINISHED:
             job.ended.set()
             _log(f"job {job.id} ({job.kind} {job.target}) {state}" + (f": {error}" if error else ""))
-        self._save_quietly()
-        self._schedule()
+        if not self._schedule():  # starting the next saves this outcome with it
+            self._save_quietly()
 
     # Operations (API)
 
@@ -551,8 +552,8 @@ class JobsFeature(Feature):
             self._protect(job)
             self._jobs[job_id] = job
         _log(f"job {job_id} queued: {kind} {target}" + (f" to {output}" if output else ""))
-        self._save_quietly()
-        self._schedule()
+        if not self._schedule():  # else saved as it started
+            self._save_quietly()
         return job.to_dict()
 
     def _job(self, job_id: str) -> Job:

@@ -25,7 +25,7 @@ import RNS
 
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_REQUESTS_PER_LINK
-from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name
+from rnfs.log import LOG_DEBUG, LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, protocol, rates
 
 POLL_INTERVAL = 0.25  # how often a waiting request checks its link, progress and stall conditions
@@ -34,6 +34,27 @@ ESTABLISH_GRACE = 5  # seconds past RNS's own establishment timeout before givin
 DEADLINE_FACTOR = 2  # a request other than /blocks may take this many times RNS's own request timeout
 # What RNS adds to rtt × traffic_timeout_factor for its request timeout (Link.request with timeout=None)
 RESPONSE_GRACE = protocol.REQUEST_TIMEOUT_WITHOUT_RTT
+# Why RNS closed a link (Link.teardown_reason), for the log
+CLOSE_REASONS = {RNS.Link.TIMEOUT: "timed out", RNS.Link.INITIATOR_CLOSED: "closed by this node",
+                 RNS.Link.DESTINATION_CLOSED: "closed by the other node"}
+RECEIPT_FAILED = RNS.RequestReceipt.FAILED  # a request RNS gave up on
+
+
+def close_reason(link) -> str:
+    """Why link closed, as the log says it."""
+    return CLOSE_REASONS.get(getattr(link, "teardown_reason", None), "closed")
+
+
+def path_description(node_id: bytes) -> str:
+    """How far RNS's path to node_id goes and through which interface, for the log ("" if it can't tell)."""
+    try:
+        hops = RNS.Transport.hops_to(node_id)
+        interface = RNS.Transport.next_hop_interface(node_id)
+    except Exception:
+        return ""
+    if hops >= RNS.Transport.PATHFINDER_M:
+        return ""
+    return f"{hops} hop{'s' if hops != 1 else ''}" + (f" via {interface}" if interface is not None else "")
 
 
 class Exchange:
@@ -253,10 +274,11 @@ class LinkPool:
         if not RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
             return False
+        log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
 
         identity = self._recall(node_id)
         if identity is None:
-            log(f"have a path to {name} but not its identity")
+            log(f"have a path to {name} but not its identity (none after {self.config.path_timeout:g}s)")
             return False
 
         destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, DHT_ASPECT)
@@ -276,15 +298,19 @@ class LinkPool:
             """Forget the link; RNS runs this synchronously inside teardown, so it only takes our lock."""
             self._forget(peer)
             settled.set()
-            log(f"link to {name} closed", LOG_VERBOSE)
+            log(f"link to {name} {close_reason(closed_link)}", LOG_VERBOSE)
 
         log(f"connecting to {name}", LOG_VERBOSE)
+        started = time.monotonic()
         link = RNS.Link(destination, established_callback=lambda _: settled.set(), closed_callback=on_closed)
         peer.link = link
         timeout = getattr(link, "establishment_timeout", None) or self.config.path_timeout
         settled.wait(timeout + ESTABLISH_GRACE)
         if link.status != RNS.Link.ACTIVE:
-            log(f"could not connect to {name}")
+            route = path_description(node_id)
+            why = (close_reason(link) if link.status == RNS.Link.CLOSED
+                   else f"not established within {time.monotonic() - started:.0f}s")
+            log(f"could not connect to {name}: {why}" + (f" ({route})" if route else ""))
             link.teardown()
             peer.mark_closed()
             return False
@@ -448,42 +474,70 @@ class LinkPool:
                 return exchange
             exchange.receipt = receipt
             exchange.sent_at = exchange.last_progress = self.clock()
-
-            reported = 0.0
-            missing_since = None
-            while not exchange.done.wait(POLL_INTERVAL):
-                if not peer.is_active():
-                    break
-                # A response Resource cancelled by the responder never fails the receipt (RNS ignores the
-                # timeout once a response is being received), so notice that it's gone from the link
-                if exchange.response_started is not None and not exchange.answered:
-                    if self._receiving(peer.link, getattr(receipt, "request_id", None)):
-                        missing_since = None
-                    elif missing_since is None:
-                        missing_since = self.clock()
-                    elif self.clock() - missing_since > CANCEL_GRACE:
-                        exchange.cancelled = True
-                        break
-                if on_progress is not None and exchange.progress > reported:
-                    reported = exchange.progress
-                    on_progress(reported)
-                if watchdog is not None:
-                    reason = watchdog(exchange, self.clock())
-                    if reason:
-                        exchange.stalled = reason
-                        break
-                if deadline is not None and self.clock() - exchange.sent_at > deadline:
-                    # Only reachable while RNS is receiving a response Resource: otherwise its own timeout
-                    # fails the request first. Honest answers to these requests fit one packet.
-                    exchange.stalled = f"no answer within {deadline:.0f}s"
-                    log(f"{node_name(peer.node_id)} took over {deadline:.0f}s to answer {path}; giving up",
-                        LOG_VERBOSE)
-                    break
-            if exchange.answered and on_progress is not None and reported < 1.0:
-                on_progress(1.0)
+            try:
+                self._wait(peer, path, exchange, receipt, deadline, watchdog, on_progress)
+            finally:
+                self._log_outcome(peer, path, exchange)
             return exchange
         finally:
             peer.release(blocks)
+
+    def _wait(self, peer: PeerLink, path: str, exchange: Exchange, receipt, deadline: float | None,
+              watchdog: Callable[[Exchange, float], str | None] | None, on_progress: Callable[[float], None] | None):
+        """request()'s wait for the outcome of a request sent."""
+        reported = 0.0
+        missing_since = None
+        while not exchange.done.wait(POLL_INTERVAL):
+            if not peer.is_active():
+                break
+            # A response Resource cancelled by the responder never fails the receipt (RNS ignores the
+            # timeout once a response is being received), so notice that it's gone from the link
+            if exchange.response_started is not None and not exchange.answered:
+                if self._receiving(peer.link, getattr(receipt, "request_id", None)):
+                    missing_since = None
+                elif missing_since is None:
+                    missing_since = self.clock()
+                elif self.clock() - missing_since > CANCEL_GRACE:
+                    exchange.cancelled = True
+                    break
+            if on_progress is not None and exchange.progress > reported:
+                reported = exchange.progress
+                on_progress(reported)
+            if watchdog is not None:
+                reason = watchdog(exchange, self.clock())
+                if reason:
+                    exchange.stalled = reason
+                    break
+            if deadline is not None and self.clock() - exchange.sent_at > deadline:
+                # Only reachable while RNS is receiving a response Resource: otherwise its own timeout
+                # fails the request first. Honest answers to these requests fit one packet.
+                exchange.stalled = f"no answer within {deadline:.0f}s"
+                log(f"{node_name(peer.node_id)} took over {deadline:.0f}s to answer {path}; giving up",
+                    LOG_VERBOSE)
+                break
+        if exchange.answered and on_progress is not None and reported < 1.0:
+            on_progress(1.0)
+
+    def _log_outcome(self, peer: PeerLink, path: str, exchange: Exchange):
+        """Log, at LOG_DEBUG, how a request sent ended: answered (in what time, how large) or why not."""
+        name = node_name(peer.node_id)
+        took = self.clock() - exchange.sent_at
+        if exchange.answered:
+            answer = "refused" if exchange.response is False else "answered"
+            log(f"{name} {answer} {path} in {took:.2f}s"
+                + (f" ({size(exchange.response_size)})" if exchange.response_size else ""), LOG_DEBUG)
+            return
+        if exchange.stalled:
+            why = exchange.stalled
+        elif exchange.cancelled:
+            why = "it cancelled its response"
+        elif not peer.is_active():
+            why = "the link " + (close_reason(peer.link) if peer.link is not None else "closed")
+        elif getattr(exchange.receipt, "status", None) == RECEIPT_FAILED:
+            why = "RNS gave up on it (timed out, or the response failed or was too large)"
+        else:
+            why = "no outcome"
+        log(f"{path} to {name} not answered after {took:.1f}s: {why}", LOG_DEBUG)
 
     @staticmethod
     def request_deadline(peer: PeerLink) -> float:

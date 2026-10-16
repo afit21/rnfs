@@ -11,8 +11,8 @@ import RNS
 from RNS.vendor import umsgpack
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, PIN_PATH,
-                            PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE,
+                            PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
@@ -59,6 +59,36 @@ class BudgetTest(unittest.TestCase):
 
     def test_max_bytes(self):
         self.assertEqual(server.blocks_budget(5000, 1e9, None, 60), 5000)
+
+    def test_block_over_the_budget_isnt_read(self):
+        (c1, b1), (c2, _), (c3, b3) = block_of(40_000, 1), block_of(10, 2), block_of(30_000, 3)
+        held, reads = {c1: b1, c3: b3}, []
+
+        def read(cid):
+            """A served block, noting the read."""
+            reads.append(cid)
+            return held.get(cid)
+        sizes = {cid: len(block) for cid, block in held.items()}
+        self.assertEqual(server.select_blocks([c1, c2, c3], read, 60_000, sizes.get), [b1, None])
+        self.assertEqual(reads, [c1, c2])
+        # The first served block is read whatever its size
+        reads.clear()
+        self.assertEqual(server.select_blocks([c3, c1], read, 0, sizes.get), [b3])
+        self.assertEqual(reads, [c3])
+
+    def test_sizes_leave_the_entries_unchanged(self):
+        rng = random.Random(3)
+        for trial in range(300):
+            blocks = [block_of(rng.choice([0, 10, 1000, 40_000, 100 * KIB, rng.randrange(1, 128 * KIB)]), i)
+                      for i in range(rng.randrange(0, 12))]
+            held = {cid: block for cid, block in blocks if rng.random() < 0.8}
+            # A size may be unknown (None), and is never given for a block that isn't served
+            sizes = {cid: len(block) for cid, block in held.items() if rng.random() < 0.8}
+            cids = [cid for cid, _ in blocks]
+            limit = rng.choice([0, 1000, 60_000, CHUNK_SIZE, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD])
+            with self.subTest(trial=trial):
+                self.assertEqual(server.select_blocks(cids, held.get, limit, sizes.get),
+                                 server.select_blocks(cids, held.get, limit))
 
 
 class ResponsePoolsTest(unittest.TestCase):
@@ -459,6 +489,66 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(self.server.pools.responses(), [])
         self.assertEqual(self.server.incoming.in_progress(link.link_id), (0, 0))
         self.assertEqual(self.server.rates.get(link.link_id), 50_000)
+
+    def test_backend_sizes_spare_reading_the_block_over_the_budget(self):
+        link = self.connect(b"a")
+        self.server.rates.record(link.link_id, 64 * KIB, 8000 * 8)  # slow: room for two 100 KiB blocks
+        reads = []
+        served = self.backend.served_block
+        self.backend.served_block = lambda cid: reads.append(cid) or served(cid)
+        self.backend.served_block_size = lambda cid: len(self.backend.blocks[cid])
+        cids = [cid for cid, _ in self.big]
+        self.assertEqual(self.blocks(link, cids), [block for _, block in self.big[:2]])
+        self.assertEqual(reads, cids[:2])
+
+    def test_idle_monitor_waits_for_a_handover(self):
+        waits = []
+
+        class Wake:
+            """Records the monitor's waits; the second one stops it."""
+
+            def wait(_, timeout=None):
+                """Note the timeout."""
+                waits.append(timeout)
+                if len(waits) == 2:
+                    self.server.stop_event.set()
+
+            def clear(_):
+                """Nothing to clear."""
+
+            def set(_):
+                """Nothing to wake."""
+        self.server.wake = Wake()
+        self.server._monitor_loop()
+        self.assertEqual(waits, [None, None])  # no response handed to RNS: nothing to look at
+        # A response handed over, its Resource not found yet: soon
+        self.server.stop_event.clear()
+        waits.clear()
+        self.blocks(self.connect(b"a"))
+        self.server._monitor_loop()
+        self.assertEqual(waits, [server.MONITOR_FAST_TICK, server.MONITOR_FAST_TICK])
+
+    def test_idle_monitor_wakes_for_a_handover_and_stops_promptly(self):
+        passes = []
+        check = self.server.check_responses
+        self.server.check_responses = lambda: passes.append(1) or check()
+        self.server.monitor.start()
+        self.addCleanup(self.server.monitor.join, 5)
+        self.addCleanup(self.server.stop)
+        deadline = time.monotonic() + 5
+        while not passes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(2 * server.MONITOR_TICK)
+        self.assertEqual(len(passes), 1)  # idle: no ticks
+        self.blocks(self.connect(b"a"))
+        while len(passes) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(len(passes), 2)
+        self.server._finish(self.server.pools.responses()[0])
+        time.sleep(2 * server.MONITOR_FAST_TICK)  # idle again
+        self.server.stop()
+        self.server.monitor.join(1)
+        self.assertFalse(self.server.monitor.is_alive())
 
     def test_fast_transfer_concluded_before_the_monitor_looks(self):
         link = self.connect(b"a")

@@ -204,6 +204,26 @@ class TerminationTest(LookupTestCase):
         self.assertEqual(sorted(result), [a, b])
         self.assertEqual(sorted(net.queried), [a, b])  # each queried once
 
+    def test_reports_each_query_and_how_the_run_ended(self):
+        net = self.network()
+        a, b, gone = ident(1), ident(2), ident(3)
+        net.add(a, knows=[b, gone])
+        net.add(b, knows=[a])
+        reports: list[str] = []
+        lock = threading.Lock()
+
+        def report(text):
+            """Collect reports (query threads report too)."""
+            with lock:
+                reports.append(text)
+
+        self.lookup(net, ident(100), [a], report=report).find_closest()
+        key = ident(100).hex()
+        self.assertTrue(reports[0].startswith(f"lookup for {key}: 1 start nodes"), reports[0])
+        self.assertTrue(any(f"<{a.hex()}> answered in" in text for text in reports), reports)
+        self.assertTrue(any(f"<{gone.hex()}> failed after" in text for text in reports), reports)
+        self.assertIn("asked 3, 2 answered, 1 failed", reports[-1])
+
     def test_no_start_nodes(self):
         net = self.network()
         self.assertEqual(self.lookup(net, ident(5), []).find_closest(), [])

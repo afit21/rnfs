@@ -1,6 +1,8 @@
 """Tests for CIDs (specification section 4): binary and written forms, validation, DHT keys."""
 import base64
+import copy
 import hashlib
+import pickle
 import unittest
 
 from RNS.vendor import umsgpack
@@ -50,6 +52,27 @@ class CidTest(unittest.TestCase):
         self.assertEqual(len(raw.key), ID_LENGTH)
         self.assertEqual(raw.key, hashlib.sha256(raw.binary).digest()[:16])
         self.assertNotEqual(raw.key, node.key)  # identical bytes, different codecs, different keys
+
+    def test_written_form_and_key_are_memoised(self):
+        value = Cid.for_block(RAW, b"hello world")
+        self.assertEqual(str(value), HELLO_WORLD)
+        self.assertIs(str(value), str(value))  # computed once
+        self.assertEqual(value.key, hashlib.sha256(value.binary).digest()[:ID_LENGTH])
+        self.assertIs(value.key, value.key)
+        # Memoising changes nothing a CID is compared, hashed or copied by
+        fresh = Cid.from_bytes(value.binary)
+        self.assertEqual(fresh, value)
+        self.assertEqual(hash(fresh), hash(value))
+        self.assertEqual({fresh: 1}[value], 1)
+        self.assertEqual(repr(fresh), repr(value))
+        self.assertEqual(repr(value), f"Cid({HELLO_WORLD})")
+        self.assertEqual(Cid.parse(HELLO_WORLD), value)
+        for copied in (copy.copy(value), copy.deepcopy(fresh), pickle.loads(pickle.dumps(value))):
+            self.assertEqual(copied, value)
+            self.assertEqual(hash(copied), hash(value))
+            self.assertEqual(str(copied), HELLO_WORLD)
+            self.assertEqual(copied.key, value.key)
+            self.assertEqual(copied.codec, RAW)
 
     def test_verify(self):
         value = Cid.for_block(RAW, b"real")

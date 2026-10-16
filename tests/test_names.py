@@ -1,4 +1,5 @@
 """Tests for mutable names (specification section 9), with RNS's network side replaced by fakes."""
+import json
 import os
 import stat
 import tempfile
@@ -621,6 +622,83 @@ class ResolveTest(NamesTestCase):
         """Names must be 16 bytes."""
         with self.assertRaises(ValueError):
             self.manager.resolve(b"short", persist=False)
+
+
+class FloorSaveTest(NamesTestCase):
+    """name-floor.json is written outside the manager's lock, in order, and a failed write is tried again."""
+
+    def setUp(self):
+        """A started manager."""
+        super().setUp()
+        self.manager.start()
+        self.addCleanup(self.manager.stop)
+        self.path = os.path.join(self.config.state_dir, names.FLOOR_FILE)
+
+    def resolve_for_gateway(self, i: int, sequence: int = 1):
+        """Resolve other_name(i), just announced at sequence, without persist (so it goes in the floor)."""
+        self.network.announce(other_name(i), encode_record(sequence, CID_A), self.clock.now)
+        self.assertEqual(self.manager.resolve(other_name(i), persist=False, max_age=60)["sequence"], sequence)
+
+    def saved(self) -> list:
+        """The floor entries in the file."""
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)["floor"]
+
+    def test_file_content(self):
+        self.resolve_for_gateway(1, sequence=7)
+        self.clock.now += 0.5
+        self.resolve_for_gateway(2)
+        self.manager.stop()
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), json.dumps({"version": 1, "floor": [
+                [other_name(1).hex(), 7, 1_000_000], [other_name(2).hex(), 1, 1_000_000]]},
+                separators=(",", ":")).encode())
+
+    def test_written_without_the_lock(self):
+        real_write = fsutil.write_atomic
+        free = []
+
+        def write(path, data, *args, **kwargs):
+            """The floor's write: another thread can take the manager's lock meanwhile."""
+            if path == self.path:
+                lock = self.manager._lock
+                thread = threading.Thread(target=lambda: free.append(lock.acquire(timeout=5)) or lock.release())
+                thread.start()
+                thread.join()
+            return real_write(path, data, *args, **kwargs)
+
+        with mock.patch.object(names.fsutil, "write_atomic", write):
+            self.resolve_for_gateway(1)
+        self.assertEqual(free, [True])
+        self.assertEqual([entry[0] for entry in self.saved()], [other_name(1).hex()])
+
+    def test_saves_never_land_out_of_order(self):
+        """A save that copies the floor while another is still writing it isn't overwritten by the older copy."""
+        real_write = fsutil.write_atomic
+        second = []
+
+        def write(path, data, *args, **kwargs):
+            """The first save's write: meanwhile another resolve raises the floor and saves it."""
+            if path == self.path and not second:
+                self.clock.now += names.FLOOR_SAVE_INTERVAL
+                second.append(threading.Thread(target=self.resolve_for_gateway, args=(2,)))
+                second[0].start()
+                second[0].join(0.2)
+            return real_write(path, data, *args, **kwargs)
+
+        with mock.patch.object(names.fsutil, "write_atomic", write):
+            self.resolve_for_gateway(1)
+            second[0].join(5)
+        self.assertEqual([entry[0] for entry in self.saved()], [other_name(1).hex(), other_name(2).hex()])
+
+    def test_failed_save_is_tried_again_at_once(self):
+        with mock.patch.object(names.fsutil, "write_atomic", side_effect=OSError("disk full")):
+            self.resolve_for_gateway(1)
+        self.assertFalse(os.path.exists(self.path))
+        self.resolve_for_gateway(2)  # within FLOOR_SAVE_INTERVAL of the failed save, which doesn't count
+        self.assertEqual([entry[0] for entry in self.saved()], [other_name(1).hex(), other_name(2).hex()])
+        self.resolve_for_gateway(3)  # but the save that worked does
+        self.assertEqual(len(self.saved()), 2)
 
 
 if __name__ == "__main__":

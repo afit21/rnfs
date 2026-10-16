@@ -14,7 +14,8 @@
 Pins and cache records are persisted as JSON under state_dir: pins at once, cache records (which change on
 every fetch) by save(), which the node calls periodically and at shutdown. Thread-safe: one lock guards the
 indexes; long walks run outside it: completeness walks are discarded if blocks were deleted meanwhile, and
-eviction and gc read the DAG nodes they will walk beforehand (_warm), deciding what to delete under the lock.
+eviction, gc and the size queries read the DAG nodes they will walk beforehand (_warm), deciding what to delete
+(or counting) under the lock.
 """
 import json
 import os
@@ -22,6 +23,7 @@ import re
 import shutil
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
@@ -43,6 +45,10 @@ MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least rec
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
 DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
 DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
+# Blocks a Session.writer() writes at once: each is synced to disk before its rename, and syncs that overlap
+# share the filesystem's journal commits (about 9x the speed of one at a time on an SSD)
+WRITE_THREADS = 16
+WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB of 64 KiB chunks)
 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
@@ -160,6 +166,64 @@ class Session:
         self.add(cid)  # first, so an eviction between storing and protecting can't take it
         self._storage._put(cid, block, protected=True)
 
+    @contextmanager
+    def writer(self) -> Iterator[Callable[[Cid, bytes], None]]:
+        """A put for adds and imports: `with session.writer() as put:`. Each block is protected at once, as by
+        put(), and stored on one of WRITE_THREADS threads; every one is stored (or the first error raised)
+        before the with block ends, so nothing is pinned before its blocks are. Callers hand it only blocks
+        that match their CIDs (a mismatch is raised, but later): a block just built from, or checked."""
+        writer = _Writer(self)
+        try:
+            yield writer.put
+        except BaseException:
+            writer.close(raise_error=False)  # the body's error is the one raised; what it queued is still stored
+            raise
+        writer.close()
+
+
+class _Writer:
+    """Session.writer()'s threads: at most WRITE_QUEUE blocks waiting, the first error kept for the caller."""
+
+    def __init__(self, session: Session):
+        """A writer storing blocks for session."""
+        self._session = session
+        self._pool = ThreadPoolExecutor(WRITE_THREADS, thread_name_prefix="rnfs-write")
+        self._room = threading.Semaphore(WRITE_QUEUE)
+        self._error: BaseException | None = None
+
+    def put(self, cid: Cid, block: bytes):
+        """Protect cid and queue its block (waiting while WRITE_QUEUE are queued); raises an earlier block's
+        error, so an add stops at the first one."""
+        self._raise()
+        self._session.add(cid)  # first, as in Session.put
+        self._room.acquire()
+        try:
+            self._pool.submit(self._write, cid, block)
+        except BaseException:
+            self._room.release()
+            raise
+
+    def _write(self, cid: Cid, block: bytes):
+        """Store one block on a writer thread, keeping the first error."""
+        try:
+            self._session._storage._put(cid, block, protected=True)
+        except BaseException as e:
+            if self._error is None:
+                self._error = e
+        finally:
+            self._room.release()
+
+    def _raise(self):
+        """Raise the first error a block met, if any."""
+        if self._error is not None:
+            raise self._error
+
+    def close(self, raise_error: bool = True):
+        """Wait for every block queued to be stored, then raise the first error (if raise_error)."""
+        self._pool.shutdown(wait=True)
+        if raise_error:
+            self._raise()
+
 
 class Storage:
     """Blocks plus pins, cached fetches, protection and eviction."""
@@ -183,6 +247,7 @@ class Storage:
         self._steps: dict[Cid, dict[str, tuple[Cid, bool] | None]] = {}
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
         self._generation = 0  # incremented whenever blocks are deleted, invalidating walks in progress
+        self._cache_generation = 0  # incremented whenever cache records are removed or retargeted
         self._cache_dirty = False  # cache records changed since the last save()
         # False only when nothing has happened since the last collection that could leave a block unreached,
         # so eviction over max_storage with nothing to evict needn't walk everything again
@@ -319,19 +384,31 @@ class Storage:
 
     def pin(self, cid: Cid, source: str):
         """Pin cid with source (it lasts while any source holds it). Fetching it is the caller's job."""
+        self.pin_many([cid], source)
+
+    def pin_many(self, cids, source: str):
+        """Pin each of cids with source, as pin() does, saving pins once for them all. If the save fails none of
+        them is newly pinned, and the error is raised."""
         check_source(source)
         with self._lock:
-            sources = self._pins.setdefault(cid, set())
-            if source not in sources:
-                sources.add(source)
-                try:
-                    self._save_pins()
-                except BaseException:
-                    # Not saved (a full or failing disk): not pinned, so memory says what pins.json does
+            added = []
+            for cid in cids:
+                sources = self._pins.setdefault(cid, set())
+                if source not in sources:
+                    sources.add(source)
+                    added.append(cid)
+            if not added:
+                return
+            try:
+                self._save_pins()
+            except BaseException:
+                # Not saved (a full or failing disk): not pinned, so memory says what pins.json does
+                for cid in added:
+                    sources = self._pins[cid]
                     sources.discard(source)
                     if not sources:
                         del self._pins[cid]
-                    raise
+                raise
 
     def unpin(self, cid: Cid, source: str) -> bool:
         """Release source's hold on cid; True if it held it. Blocks go at the next evict() or gc()."""
@@ -365,6 +442,11 @@ class Storage:
         with self._lock:
             return cid in self._pins
 
+    def pin_count(self) -> int:
+        """Number of pinned CIDs."""
+        with self._lock:
+            return len(self._pins)
+
     # Cache
 
     def record_fetch(self, root: Cid, names: list[str] | tuple[str, ...], target: Cid) -> set[Cid]:
@@ -377,6 +459,7 @@ class Storage:
             previous = self._cache.get(key)
             if previous is not None and previous != target:
                 self._maybe_garbage = True
+                self._cache_generation += 1
             self._cache[key] = target
             self._cache.move_to_end(key)
             self._cache_dirty = True
@@ -391,6 +474,7 @@ class Storage:
         if dropped:
             self._maybe_garbage = True
             self._cache_dirty = True
+            self._cache_generation += 1
         return dropped
 
     def touch(self, root: Cid, names: list[str] | tuple[str, ...]) -> bool:
@@ -412,6 +496,13 @@ class Storage:
         """Targets of every cached fetch."""
         with self._lock:
             return set(self._cache.values())
+
+    def cache_generation(self) -> int:
+        """A count that grows whenever cache records are removed or lead somewhere new (eviction, gc, the
+        MAX_CACHE_RECORDS cap, a fetch recorded again with another target); while it is unchanged,
+        cached_targets() has only gained members."""
+        with self._lock:
+            return self._cache_generation
 
     # Protection
 
@@ -482,12 +573,15 @@ class Storage:
     def _children(self, cid: Cid) -> tuple[Cid, ...] | None:
         """CIDs listed by a stored DAG node; none for raw, missing or invalid blocks; None if the node is
         damaged, as its children are unknown (lock held)."""
-        if cid not in self._links:
+        listed = self._links.get(cid)
+        if listed is None:
+            if cid.is_raw or cid not in self._sizes:
+                return ()  # not memoised: a raw block never lists anything, and a missing node may be stored later
             node = self._node(cid)
             if node is DAMAGED:
                 return None  # not memoised: verify() removes it, or a fetch replaces it
-            self._links[cid] = self._listed(node)
-        return self._links[cid]
+            listed = self._links[cid] = self._listed(node)
+        return listed
 
     def _reach(self, roots, known: set[Cid] | frozenset[Cid] = frozenset(),
                damaged: set[Cid] | None = None) -> set[Cid]:
@@ -546,7 +640,7 @@ class Storage:
         """
         with self._lock:
             links = dict(self._links)
-            steps = {cid: dict(names) for cid, names in self._steps.items()}
+            steps = {cid: dict(names) for cid, names in self._steps.items()} if paths else {}
         found_links: dict[Cid, tuple[Cid, ...]] = {}
         found_steps: dict[tuple[Cid, str], tuple[Cid, bool] | None] = {}
         seen: set[Cid] = set()
@@ -687,6 +781,7 @@ class Storage:
             self._cache.popitem(last=False)
         if evicted:
             self._cache_dirty = True
+            self._cache_generation += 1
         dead = {cid for cid in self._sizes if cid not in live}
         deleted, freed = self._delete(dead)
         self._maybe_garbage = deleted != dead  # anything deferred is collected on a later pass
@@ -757,6 +852,9 @@ class Storage:
 
     def pinned_bytes(self) -> int:
         """Bytes of stored blocks reachable from pins."""
+        with self._lock:
+            pins = set(self._pins)
+        self._warm(pins, [])  # the DAG nodes are read without the lock, as in gc()
         with self._lock:
             return sum(self._sizes[cid] for cid in self._reach(self._pins))
 
@@ -843,6 +941,7 @@ class Storage:
             if self._cache:
                 self._cache.clear()
                 self._cache_dirty = True
+                self._cache_generation += 1
             deleted, freed = self._collect()
             incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
             return {"removed_blocks": len(deleted), "freed_bytes": freed, "incomplete": incomplete,
@@ -855,7 +954,8 @@ class Storage:
         """
         with self._lock:
             cids = list(self._sizes)
-            before = self._complete_sets(self._targets())
+            targets = self._targets()
+        before = self._complete_sets(targets)  # without the lock, as in evict(); dag_blocks checks for deletions
         bad = []
         for cid in cids:
             if self.blocks.verify(cid):
@@ -888,6 +988,7 @@ class Storage:
 
     def dag_bytes(self, cid: Cid) -> int:
         """Bytes of the stored blocks of cid's DAG (each block once), as far as its stored nodes reach."""
+        self._warm({cid}, [])  # the DAG nodes are read without the lock, as in gc()
         with self._lock:
             return sum(self._sizes[block] for block in self._reach({cid}))
 
@@ -902,6 +1003,7 @@ class Storage:
         "blocks" counts distinct blocks known from stored nodes, so it is exact only once all DAG nodes are
         stored; "size" is None until the root is.
         """
+        self._warm({cid}, [])  # the DAG nodes are read without the lock, as in gc()
         with self._lock:
             known = {cid}
             stack = [cid]

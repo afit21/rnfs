@@ -1275,6 +1275,7 @@ setting.
 | `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |
 | `verbosity` | 0 | Extra logging: 1 per-query detail, 2 RNS debug output |
+| `debug_log` | off | Also write every log message (at every level), RNS's own, and each gateway request to a debug log file in the rnfs dir, readable by its owner only. Local only: nothing in it is sent |
 | `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket charged for bytes sent, at most half of it per requester in flight (section 3) |
 | `serve_interfaces` | empty (all) | Serve `/blocks` only on these RNS interfaces (names or prefixes, case-insensitive; a spawned interface also matches its parent's name) |
 | `no_serve_interfaces` | empty | Never serve `/blocks` on these interfaces; takes precedence over `serve_interfaces` |

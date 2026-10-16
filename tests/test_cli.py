@@ -87,6 +87,8 @@ class ParsingTest(unittest.TestCase):
                          ("client", "yes", True, 2, 0))
         args = cli.build_parser().parse_args(["daemon"])
         self.assertEqual((args.bootstrap, args.private, args.dht_mode), (None, None, None))
+        self.assertIsNone(args.debug_log)  # rnfs.toml's debug_log then decides
+        self.assertTrue(cli.build_parser().parse_args(["daemon", "--debug-log"]).debug_log)
 
     def test_every_spec_command_parses(self):
         cid = str(Cid.for_block(RAW, b""))

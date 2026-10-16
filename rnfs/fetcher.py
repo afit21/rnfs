@@ -64,10 +64,12 @@ import threading
 import time
 from collections import OrderedDict, deque
 from contextlib import contextmanager
+from itertools import islice
 from typing import Callable, Iterator
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
+from rnfs.constants import (CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE,
+                            MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD)
 from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage, read_json, write_json
@@ -863,23 +865,29 @@ class Fetch:
                 busy_providers += 1
 
     def _take_batch(self, pending: deque, node_id: bytes, wanted: dict[Cid, list[Expect]]) -> list[Cid]:
-        """The next CIDs to ask node_id for: what its budget and one request packet can hold, at least one.
+        """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
+        hold, at least one.
 
         Under a DAG limit, only what the room it leaves can take for sure (_room), but at least one CID when no
         request is in flight: so a fetch downloads at most about one block beyond the limit.
         """
         budget = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
+        # However large max_bytes is, the responder's budget is at most this (server.blocks_budget, section 7)
+        carried = min(budget, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+        # The client sends what fits its link's packet and returns the rest: the open link's MDU, else the
+        # largest request any link allows (test fakes may not know links). Whether a prefix fits only gets
+        # worse as it grows, so one count covers every batch taken from the front of pending
+        link_mdu = getattr(self.client, "link_mdu", None)
+        mdu = (link_mdu(node_id) if link_mdu is not None else None) or MAX_REQUEST_SIZE
+        fit = max(1, protocol.blocks_batch_size(budget, list(islice(pending, MAX_BATCH)), mdu))
         room = self._room(wanted)
         batch: list[Cid] = []
         total = 0
-        while pending and len(batch) < MAX_BATCH:
+        while pending and len(batch) < fit:
             cid = pending[0]
             known = wanted[cid][0].size if cid.is_raw else None
             guess = known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
-            if batch and total + guess > budget:
-                break
-            # The largest request any link allows; the client sends what fits its link and returns the rest
-            if batch and protocol.blocks_batch_size(budget, batch + [cid], MAX_REQUEST_SIZE) <= len(batch):
+            if batch and total + guess > carried:
                 break
             if room is not None:
                 room = self._reserve(cid, wanted, room)
@@ -905,6 +913,9 @@ class Fetch:
                 result = self.client.blocks(node_id, cids, on_progress=progress)
             except Exception as e:
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
+            if result.elapsed is not None:
+                # When it actually went out: opening the link or waiting for its /blocks slot isn't its time
+                sent_at = max(sent_at, self.fetcher.clock() - result.elapsed)
             self._events.put(("result", node_id, cids, result, sent_at, rate))
 
         threading.Thread(target=work, name="rnfs-fetch", daemon=True).start()

@@ -25,7 +25,7 @@ import RNS
 
 from rnfs import __version__, features, fsutil, winacl
 from rnfs.config import Config
-from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, MODE_SERVER, PARTIAL_SUFFIX
+from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
@@ -38,7 +38,7 @@ from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, describe
 from rnfs.mesh import RnsPaths
-from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
+from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
 from rnfs.names import NameManager, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, rates
@@ -53,7 +53,7 @@ PROVIDERS_FILE = "providers.json"
 REMOTE_PINS_FILE = "remote_pins.json"  # remote pins accepted and not yet fetched: [[source, cid], ...] in order
 FETCHED_FILE = "fetched.json"  # cached targets fetched for the user (not the gateway): the roots strategy's
 SAVE_INTERVAL = 300.0  # seconds between saves of provider records
-STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records and invalid roots, when they changed
+STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched targets and invalid roots, when changed
 ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the block (msgpack framing, CID)
 EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else triggers one
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
@@ -210,6 +210,12 @@ class NodeBackend:
             self.node.refresh_soon()
         return block
 
+    def served_block_size(self, cid: Cid) -> int | None:
+        """The stored length of the block served_block(cid) would return, or None if it isn't served."""
+        if not self.node.publisher.serves(cid):
+            return None
+        return self.node.storage.block_size(cid)
+
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept a /pin from an allowed identity (the server checked remote_pin_identities)."""
         return self.node.remote_pin(identity_hash, cid, pin)
@@ -320,6 +326,8 @@ class RnfsNode:
                 self._fetched.add(Cid.parse(text))
             except (ValueError, TypeError):
                 continue
+        self._fetched_dirty = False  # changed since last saved (by _save_state: maintenance, gc and stop)
+        self._fetched_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         # Remote source -> CIDs waiting or being fetched for it, in the order accepted (fetched one at a time)
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
@@ -392,8 +400,10 @@ class RnfsNode:
             self.links.close_all()
 
     def _save_state(self):
-        """Save cache records and invalid roots if they changed (each change isn't written at once)."""
-        for save in (self.storage.save, self.fetcher.save, *(f.save for f in self.features.values())):
+        """Save cache records, fetched targets and invalid roots if they changed (each change isn't written at
+        once)."""
+        for save in (self.storage.save, self._save_fetched, self.fetcher.save,
+                     *(f.save for f in self.features.values())):
             try:
                 save()
             except OSError as e:
@@ -402,11 +412,19 @@ class RnfsNode:
     # DHT wiring
 
     def _lookup(self, key: bytes) -> Lookup:
-        """A lookup for key starting from the routing table, counting answers and failures in it."""
-        return Lookup(key, self.routing.closest(key), self.client.find, self.node_id,
+        """A lookup for key starting from the routing table, counting answers and failures in it.
+
+        It starts from the closest nodes that haven't failed since last heard or gone silent (those a /find
+        reply would give), with others only to make up K, so departed nodes don't take its first queries.
+        """
+        start = self.routing.closest(key, for_reply=True)
+        if len(start) < K:
+            start += [n for n in self.routing.closest(key) if n not in start][:K - len(start)]
+        return Lookup(key, start, self.client.find, self.node_id,
                       alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
                       timeout=self.config.lookup_timeout, is_known=self._is_known,
-                      on_answer=self._answered, on_failure=self.routing.failed, exclude=self.routing.is_banned)
+                      on_answer=self._answered, on_failure=self.routing.failed, exclude=self.routing.is_banned,
+                      report=lambda text: log(text, LOG_DEBUG))
 
     def _answered(self, node_id: bytes):
         """A node answered /find, proving it is a reachable server."""
@@ -561,9 +579,11 @@ class RnfsNode:
 
     def _make_room(self, nbytes: int):
         """Evict cached fetches so nbytes more fit in max_storage, withdrawing targets no longer complete."""
+        before = self.storage.cache_generation()
         if self.storage.evict(nbytes):
             self.publisher.refresh()
-        self._prune_fetched()
+        if self.storage.cache_generation() != before:  # else no cached target went, and there's nothing to prune
+            self._prune_fetched()
 
     def maintain(self, now: float, last: dict) -> None:
         """One maintenance pass: shared folder, provider records, storage. last holds when each ran."""
@@ -616,7 +636,7 @@ class RnfsNode:
             if self._fetched <= cached:
                 return
             self._fetched &= cached
-            write_json(self._fetched_path, sorted(str(cid) for cid in self._fetched))
+            self._fetched_dirty = True
 
     def _note_fetched(self, target: Cid):
         """Remember a cached target fetched for the user."""
@@ -624,7 +644,23 @@ class RnfsNode:
             if target in self._fetched:
                 return
             self._fetched.add(target)
-            write_json(self._fetched_path, sorted(str(cid) for cid in self._fetched))
+            self._fetched_dirty = True
+
+    def _save_fetched(self):
+        """Save the fetched targets if they changed. With the cache records they're intersected with, which are
+        saved in the same pass: a crash loses at most what changed since the last pass, as for those."""
+        with self._fetched_save_lock:
+            with self._lock:
+                if not self._fetched_dirty:
+                    return
+                value = sorted(str(cid) for cid in self._fetched)
+                self._fetched_dirty = False
+            try:
+                write_json(self._fetched_path, value)
+            except BaseException:
+                with self._lock:
+                    self._fetched_dirty = True
+                raise
 
     # Fetching
 
@@ -686,11 +722,12 @@ class RnfsNode:
                 built, warnings = builder.add_path(path, builder.NO_PUT, wrap)
             else:
                 with self.storage.protect() as session:
-                    if recipients:
-                        built = node_content.add_sealed_path(path, session.put, wrap, recipients, seal_name)
-                        warnings = []
-                    else:
-                        built, warnings = builder.add_path(path, session.put, wrap)
+                    with session.writer() as put:
+                        if recipients:
+                            built = node_content.add_sealed_path(path, put, wrap, recipients, seal_name)
+                            warnings = []
+                        else:
+                            built, warnings = builder.add_path(path, put, wrap)
                     node_content.keep_added(self, built.cid, pin)
                 if pin:
                     self.pin_names.record(built.cid, os.path.abspath(path))
@@ -709,7 +746,8 @@ class RnfsNode:
                 built = builder.add_stream(stream, builder.NO_PUT, size, name)
             else:
                 with self.storage.protect() as session:
-                    built = builder.add_stream(stream, session.put, size, name)
+                    with session.writer() as put:
+                        built = builder.add_stream(stream, put, size, name)
                     node_content.keep_added(self, built.cid, pin)
                 if pin:
                     self.pin_names.record(built.cid, name or seal_name or "(stdin)")
@@ -1268,7 +1306,7 @@ class RnfsNode:
                 "identity_hash": identity.hash.hex() if (identity := getattr(self, "identity", None)) else None,
                 "dht_mode": self.config.dht_mode, "slow": self.slow,
                 "private": self.config.private, "known_nodes": self.routing.node_count(),
-                "records": self.records.record_count(), "pins": len(self.storage.pins()),
+                "records": self.records.record_count(), "pins": self.storage.pin_count(),
                 "provided": len(self.publisher.provided()), "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()),

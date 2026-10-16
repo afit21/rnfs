@@ -1,16 +1,18 @@
 """Tests for fetching targets (rnfs/fetcher.py; specification sections 6 and 7) over a fake client and lookup."""
 import os
 import shutil
+import random
 import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from unittest import mock
 
 import RNS
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE
+from rnfs.constants import CHUNK_SIZE, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
 from rnfs.content import builder, dag, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
@@ -20,6 +22,7 @@ from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs import fetcher as fetcher_module
 from rnfs.fetcher import Fetcher
+from rnfs.network import protocol, server
 from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
 
 OWN = bytes(16)
@@ -374,6 +377,117 @@ class PacingTest(FetcherTest):
         # Only provider, waiting out the pacing: the fetch neither gives up nor reruns the lookup
         self.result(OK, sent_at=self.now - 40, rate=50_000)
         self.assertTrue(self.fetch._waiting_for_busy())
+
+    def sent(self, elapsed: float | None):
+        """Send P1 a request that spends 30 s opening the link, then 40 s from sending it to its answer (reported
+        as elapsed), and handle the result it queues."""
+        cid = self.built.cid
+        self.client.rate = 50_000
+
+        def answer(cids):
+            """Open the link, then send and get the answer."""
+            self.now += 30 + 40
+            return BlocksResult(OK, blocks={cid: self.network[cid]}, elapsed=elapsed)
+        self.client.behaviour[P1] = answer
+        self.fetch._send(P1, [cid])
+        _, node_id, cids, result, sent_at, rate = self.fetch._events.get(timeout=5)
+        self.fetch._handle(node_id, cids, result, False, {}, {}, set(), sent_at, rate)
+
+    def test_pacing_counts_from_when_the_request_was_sent(self):
+        self.sent(40)
+        # As long again as the request took once sent: not the link opening before it
+        self.assertEqual(self.provider.busy_until, self.now + 40)
+        self.assertEqual(self.provider.pacing_until, self.now - 40 + 4 * 40)
+        self.assertEqual(self.provider.pacing_retry, 5)
+
+    def test_pacing_without_a_send_time_counts_the_whole_call(self):
+        self.sent(None)
+        self.assertEqual(self.provider.busy_until, self.now + 70)
+        self.assertEqual(self.provider.pacing_until, self.now - 70 + 4 * 70)
+
+
+def old_take_batch(fetch, pending, node_id, wanted, mdu):
+    """Fetch._take_batch as it was, packing each prefix in turn to see if it fits, with the cap on the bytes
+    reserved that it has now: the reference the single count over pending must match."""
+    budget = fetcher_module.rates.requester_max_bytes(fetch.client.rate_estimate(node_id), fetch.config)
+    carried = min(budget, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+    room = fetch._room(wanted)
+    batch, total = [], 0
+    while pending and len(batch) < fetcher_module.MAX_BATCH:
+        cid = pending[0]
+        known = wanted[cid][0].size if cid.is_raw else None
+        guess = known if known is not None else (CHUNK_SIZE if cid.is_raw else fetcher_module.DAG_NODE_GUESS)
+        if batch and total + guess > carried:
+            break
+        if batch and protocol.blocks_batch_size(budget, batch + [cid], mdu) <= len(batch):
+            break
+        if room is not None:
+            room = fetch._reserve(cid, wanted, room)
+            if not fetch._fits(room) and (batch or fetch._in_flight):
+                break
+        batch.append(pending.popleft())
+        total += guess
+    return batch
+
+
+class BatchTest(FetcherTest):
+    """What one request asks for: no more than a response can carry, or the provider's link can send."""
+
+    def setUp(self):
+        """An open fetch, and the expectations of 40 raw chunks of 64 KiB."""
+        super().setUp()
+        self.fetch = self.fetcher.open(self.file(b"root").cid).__enter__()
+        self.addCleanup(self.fetch.__exit__, None, None, None)
+        self.chunks = [walker.Expect(Cid.for_block(RAW, bytes([i]) * 8), CHUNK_SIZE, walker.FILE_TYPES, 2)
+                       for i in range(40)]
+        self.wanted = {expect.cid: [expect] for expect in self.chunks}
+
+    def take(self) -> list[Cid]:
+        """The batch for P1 from every chunk."""
+        return self.fetch._take_batch(deque(self.wanted), P1, self.wanted)
+
+    def test_capped_at_what_a_response_carries(self):
+        # At 1 Gbit/s max_bytes asks for ~7.5 GB, but a response carries at most MAX_RESPONSE_SIZE less overhead
+        self.client.rate = 1e9
+        batch = self.take()
+        max_bytes = fetcher_module.rates.requester_max_bytes(self.client.rate, self.config)
+        served = server.select_blocks(batch, lambda cid: bytes(CHUNK_SIZE),
+                                      server.blocks_budget(max_bytes, self.client.rate, None, 60))
+        self.assertEqual(len(batch), (MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD) // CHUNK_SIZE)
+        self.assertEqual(len(served), len(batch))  # every CID reserved comes back
+
+    def test_sized_to_the_open_links_packet(self):
+        self.client.rate = 1e9
+        self.wanted = {expect.cid: [walker.Expect(expect.cid, 10, walker.FILE_TYPES, 2)] for expect in self.chunks}
+        max_bytes = fetcher_module.rates.requester_max_bytes(self.client.rate, self.config)
+        # No link known: the largest request any link allows
+        self.assertEqual(len(self.take()), protocol.blocks_batch_size(max_bytes, list(self.wanted), MAX_REQUEST_SIZE))
+        self.client.link_mdu = lambda node_id: None
+        self.assertEqual(len(self.take()), protocol.blocks_batch_size(max_bytes, list(self.wanted), MAX_REQUEST_SIZE))
+        self.client.link_mdu = lambda node_id: 431
+        self.assertEqual(len(self.take()), protocol.blocks_batch_size(max_bytes, list(self.wanted), 431))
+        self.assertLess(len(self.take()), protocol.blocks_batch_size(max_bytes, list(self.wanted), MAX_REQUEST_SIZE))
+
+    def test_one_count_matches_packing_each_prefix(self):
+        rng = random.Random(7)
+        for trial in range(300):
+            expects = []
+            for i in range(rng.randrange(0, 45)):
+                if rng.random() < 0.7:
+                    size = rng.choice([None, 0, 10, 1000, CHUNK_SIZE, rng.randrange(1, CHUNK_SIZE)])
+                    expects.append(walker.Expect(Cid.for_block(RAW, rng.randbytes(8)), size, walker.FILE_TYPES, 2))
+                else:
+                    expects.append(walker.Expect(Cid.for_block(DAG, rng.randbytes(8)), None, walker.ANY_TYPES, 2))
+            wanted = {expect.cid: [expect] for expect in expects}
+            self.client.rate = rng.choice([None, 1200, 50_000, 1e6, 1e9, rng.uniform(1, 1e10)])
+            mdu = rng.choice([None, 0, 120, 300, 431, 1000, 1500, 9000])
+            self.client.link_mdu = lambda node_id: mdu
+            self.fetch.max_dag_bytes = rng.choice([None, None, 0, CHUNK_SIZE, 5 * MAX_BLOCK_SIZE])
+            with self.subTest(trial=trial):
+                old, new = deque(wanted), deque(wanted)
+                expected = old_take_batch(self.fetch, old, P1, wanted, mdu or MAX_REQUEST_SIZE)
+                self.assertEqual(self.fetch._take_batch(new, P1, wanted), expected)
+                self.assertEqual(list(new), list(old))
 
 
 class ValidityTest(FetcherTest):

@@ -142,6 +142,13 @@ def encode(node: Node) -> bytes:
     raise TypeError(f"not a DAG node: {node!r}")
 
 
+# The big-endian lengths and integers after a msgpack type byte, by type byte (struct formats compiled once)
+_ARRAY_LENGTHS = {0xDC: struct.Struct(">H"), 0xDD: struct.Struct(">I")}
+_UINTS = {0xCC: struct.Struct(">B"), 0xCD: struct.Struct(">H"), 0xCE: struct.Struct(">I"), 0xCF: struct.Struct(">Q")}
+_BIN_LENGTHS = {0xC4: struct.Struct(">B"), 0xC5: struct.Struct(">H"), 0xC6: struct.Struct(">I")}
+_STR_LENGTHS = {0xD9: struct.Struct(">B"), 0xDA: struct.Struct(">H"), 0xDB: struct.Struct(">I")}
+
+
 class _Reader:
     """Reads the handful of msgpack forms a DAG node may contain, rejecting every other form."""
 
@@ -161,21 +168,29 @@ class _Reader:
 
     def _byte(self) -> int:
         """The next byte."""
-        return self._take(1)[0]
+        pos = self.pos
+        if pos >= len(self.data):
+            raise InvalidDag("DAG node is truncated")
+        self.pos = pos + 1
+        return self.data[pos]
 
-    def _length(self, size_format: str) -> int:
-        """A big-endian length or integer of the given struct format."""
-        return struct.unpack(size_format, self._take(struct.calcsize(size_format)))[0]
+    def _length(self, size_format: struct.Struct) -> int:
+        """A big-endian length or integer of the given compiled struct format."""
+        end = self.pos + size_format.size
+        if end > len(self.data):
+            raise InvalidDag("DAG node is truncated")
+        value = size_format.unpack_from(self.data, self.pos)[0]
+        self.pos = end
+        return value
 
     def array(self) -> int:
         """An array header; returns its length."""
         tag = self._byte()
         if 0x90 <= tag <= 0x9F:
             return tag & 0x0F
-        if tag == 0xDC:
-            return self._length(">H")
-        if tag == 0xDD:
-            return self._length(">I")
+        size_format = _ARRAY_LENGTHS.get(tag)
+        if size_format is not None:
+            return self._length(size_format)
         raise InvalidDag(f"expected a msgpack array, found type byte 0x{tag:02x}")
 
     def uint(self) -> int:
@@ -183,26 +198,26 @@ class _Reader:
         tag = self._byte()
         if tag <= 0x7F:
             return tag
-        formats = {0xCC: ">B", 0xCD: ">H", 0xCE: ">I", 0xCF: ">Q"}
-        if tag in formats:
-            return self._length(formats[tag])
+        size_format = _UINTS.get(tag)
+        if size_format is not None:
+            return self._length(size_format)
         raise InvalidDag(f"expected a non-negative msgpack integer, found type byte 0x{tag:02x}")
 
     def bin(self) -> bytes:
         """A bin."""
         tag = self._byte()
-        formats = {0xC4: ">B", 0xC5: ">H", 0xC6: ">I"}
-        if tag not in formats:
+        size_format = _BIN_LENGTHS.get(tag)
+        if size_format is None:
             raise InvalidDag(f"expected msgpack bin, found type byte 0x{tag:02x}")
-        return bytes(self._take(self._length(formats[tag])))
+        return bytes(self._take(self._length(size_format)))
 
     def text(self) -> str:
         """A str holding valid UTF-8."""
         tag = self._byte()
         if 0xA0 <= tag <= 0xBF:
             length = tag & 0x1F
-        elif tag in (0xD9, 0xDA, 0xDB):
-            length = self._length({0xD9: ">B", 0xDA: ">H", 0xDB: ">I"}[tag])
+        elif tag in _STR_LENGTHS:
+            length = self._length(_STR_LENGTHS[tag])
         else:
             raise InvalidDag(f"expected msgpack str, found type byte 0x{tag:02x}")
         try:

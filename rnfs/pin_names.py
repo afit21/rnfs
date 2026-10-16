@@ -64,4 +64,4 @@ class PinNames:
 
     def _save(self):
         """Write the names atomically (called with the lock held)."""
-        write_json(self.path, {str(cid): name for cid, name in sorted(self._names.items(), key=lambda i: str(i[0]))})
+        write_json(self.path, dict(sorted((str(cid), name) for cid, name in self._names.items())))

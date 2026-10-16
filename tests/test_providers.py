@@ -423,6 +423,44 @@ class PersistenceTest(unittest.TestCase):
         with open(self.path, encoding="utf-8") as f:
             self.assertEqual(len(json.load(f)["records"]), 2)
 
+    def test_save_writes_the_whole_state(self):
+        """The file has every publisher, record (pooled or not), departure and eviction, in the store's order."""
+        store = ProviderStore(20, self.path, clock=self.clock, seniority=DAY)
+        for publisher in (1, 2):
+            for i in range(9):
+                store.store(ident(100 * publisher + i), ident(publisher))
+                self.clock.now += 1
+        for publisher in (3, 4, 5):  # the main part is full: newcomers share the pool, and 5 evicts 3 or 4
+            store.store(ident(1000 + publisher), ident(publisher))
+            self.clock.now += 1
+        store.store(ident(101), ident(1))  # refreshed in place
+        store.withdraw(ident(100), ident(1))
+        self.clock.now += DAY
+        store.withdraw(ident(1005), ident(5))  # 5 departs, seen for long enough to be remembered
+        with store._lock:
+            expected = {
+                "version": 1,
+                "publishers": {p.hex(): e.first_seen for p, e in store._publishers.items()},
+                "records": [[k.hex(), p.hex(), r.first_stored, r.last_stored, int(r.pooled)]
+                            for k, held in store._records.items() for p, r in held.items()],
+                "departed": [[p.hex(), seen, left] for p, (seen, left) in store._departed.items()],
+                "evicted": [[p.hex(), seen, left] for p, (seen, left) in store._evicted.items()],
+            }
+        self.assertTrue(all(expected[section] for section in ("departed", "evicted")))
+        self.assertIn(1, [record[4] for record in expected["records"]])
+        store.save()
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), json.dumps(expected, separators=(",", ":")).encode())
+
+    def test_failed_save_is_tried_again(self):
+        store = self.open()
+        store.store(KEY, ident(1))
+        with mock.patch.object(fsutil, "write_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                store.save()
+        store.save()
+        self.assertEqual(self.open().providers(KEY), [ident(1)])
+
     def test_corrupt_file_starts_empty(self):
         os.makedirs(os.path.dirname(self.path))
         with open(self.path, "w", encoding="utf-8") as f:

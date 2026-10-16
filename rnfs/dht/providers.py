@@ -618,22 +618,26 @@ class ProviderStore:
             with self._lock:
                 if not self._dirty:
                     return
+                # Only copied under the lock (records change in place); converted and written without it
+                publishers = [(publisher, entry.first_seen) for publisher, entry in self._publishers.items()]
+                records = [(key, publisher, record.first_stored, record.last_stored, record.pooled)
+                           for key, held in self._records.items() for publisher, record in held.items()]
+                departures = list(self._departed.items())
+                evictions = list(self._evicted.items())
+                self._dirty = False
+            try:
                 state = {
                     "version": _STATE_VERSION,
-                    "publishers": {publisher.hex(): entry.first_seen
-                                   for publisher, entry in self._publishers.items()},
-                    "records": [[key.hex(), publisher.hex(), record.first_stored, record.last_stored,
-                                 int(record.pooled)]
-                                for key, records in self._records.items() for publisher, record in records.items()],
+                    "publishers": {publisher.hex(): first_seen for publisher, first_seen in publishers},
+                    "records": [[key.hex(), publisher.hex(), first_stored, last_stored, int(pooled)]
+                                for key, publisher, first_stored, last_stored, pooled in records],
                     "departed": [[publisher.hex(), first_seen, departed]
-                                 for publisher, (first_seen, departed) in self._departed.items()],
+                                 for publisher, (first_seen, departed) in departures],
                     "evicted": [[publisher.hex(), first_seen, evicted]
-                                for publisher, (first_seen, evicted) in self._evicted.items()],
+                                for publisher, (first_seen, evicted) in evictions],
                 }
-                self._dirty = False
-            directory = os.path.dirname(os.path.abspath(self.state_path))
-            os.makedirs(directory, exist_ok=True)
-            try:
+                directory = os.path.dirname(os.path.abspath(self.state_path))
+                os.makedirs(directory, exist_ok=True)
                 fsutil.write_atomic(self.state_path, json.dumps(state, separators=(",", ":")).encode(), mode=0o600)
             except BaseException:
                 with self._lock:

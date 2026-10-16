@@ -122,6 +122,14 @@ class StrictDecodingTest(unittest.TestCase):
             with self.subTest(reason):
                 self.assertInvalid(block)
 
+    def test_rejects_every_truncation(self):
+        # str8, bin8 and uint64 headers, and fixarray, fixstr and fixint ones
+        block = pack([2, [["n" * 40, CHUNK.binary, 2**40, 0], ["o", NODE.binary, 7, 2]]])
+        dag.decode(block)
+        for end in range(len(block)):
+            with self.subTest(end=end):
+                self.assertInvalid(block[:end])
+
     def test_rejects_invalid_utf8(self):
         block = pack([2, [["ab", CHUNK.binary, 1, 0]]]).replace(b"\xa2ab", b"\xa2\xff\xfe")
         self.assertInvalid(block)

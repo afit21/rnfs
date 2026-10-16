@@ -80,6 +80,38 @@ class BucketTest(RoutingTestCase):
         self.assertEqual(self.table.closest(key), expected)
         self.assertEqual(len(self.table.closest(key, count=3)), 3)
 
+    def test_closest_matches_ranking_every_node(self):
+        """Walking buckets from the key's gives exactly what sorting the whole table by distance gives."""
+        rng = random.Random(3)
+        for _ in range(60):
+            own = rng.randbytes(ID_LENGTH)
+            own_value = int.from_bytes(own, "big")
+            table = RoutingTable(own, self.config, clock=self.clock)
+            # Random IDs fill the far buckets; IDs sharing a prefix with own reach the near ones, some left empty
+            ids = [rng.randbytes(ID_LENGTH) for _ in range(rng.randrange(0, 300))]
+            for bucket in rng.sample(range(BUCKET_COUNT), rng.randrange(0, BUCKET_COUNT)):
+                for _ in range(rng.randrange(1, K + 3)):
+                    ids.append((own_value ^ (1 << bucket) ^ rng.getrandbits(bucket)).to_bytes(ID_LENGTH, "big"))
+            for n in ids:
+                table.heard(n)
+            stored = table.nodes()
+            # Some go silent or fail a query, so replies leave them out
+            self.clock.now += 2 * ANNOUNCE + 1
+            for n in stored:
+                if rng.random() < 0.5:
+                    table.heard(n)
+                    if rng.random() < 0.3:
+                        table.failed(n)
+            live = [n for n in stored if table.standing(n, 0) < 2]
+            keys = [own, rng.randbytes(ID_LENGTH)] + rng.sample(stored, min(3, len(stored)))
+            keys += [(own_value ^ rng.getrandbits(rng.randrange(1, 129))).to_bytes(ID_LENGTH, "big") for _ in range(3)]
+            for key in keys:
+                for count in (0, 1, 3, K, len(stored) + 5):
+                    expected = sorted(stored, key=lambda n: distance(n, key))[:count]
+                    self.assertEqual(table.closest(key, count), expected)
+                    expected = sorted(live, key=lambda n: distance(n, key))[:count]
+                    self.assertEqual(table.closest(key, count, for_reply=True), expected)
+
 
 class ReplacementTest(RoutingTestCase):
     """A full bucket keeps its nodes unless the least recently heard has stopped answering or gone silent."""

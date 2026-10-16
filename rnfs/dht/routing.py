@@ -171,13 +171,24 @@ class RoutingTable:
         silent over 2 × announce_interval, so departed nodes stay out of replies without a table refresh.
         """
         check_id(key)
+        # Distances to key rank whole buckets: those in key's own bucket b are under 2^b, those in every bucket
+        # below it in [2^b, 2^(b+1)), and those in a bucket i above it in [2^i, 2^(i+1)). So the buckets are
+        # walked in that order and only those needed for count are sorted, not the whole table (this answers
+        # /find requests). key is own_id: b is -1, and the buckets rank in order from 0
+        b = distance(self.own_id, key).bit_length() - 1
+        walk = ([[b]] if b >= 0 else []) + [range(max(b, 0))] + [[i] for i in range(b + 1, BUCKET_COUNT)]
+        groups: list[list[bytes]] = []
+        found = 0
         with self._lock:
             now = self.clock()
-            # The key's bucket may be sparse or empty, so rank every node rather than one bucket
-            entries = [e for bucket in self._buckets for e in bucket.values()
-                       if not (for_reply and self._stale(e, now))]
-        entries.sort(key=lambda e: distance(e.node_id, key))
-        return [e.node_id for e in entries[:count]]
+            for indices in walk:
+                group = [e.node_id for i in indices for e in self._buckets[i].values()
+                         if not (for_reply and self._stale(e, now))]
+                groups.append(group)
+                found += len(group)
+                if 0 < count <= found:
+                    break
+        return [n for group in groups for n in sorted(group, key=lambda node_id: distance(node_id, key))][:count]
 
     def seniority(self, node_id: bytes) -> float | None:
         """Seconds since node_id was first seen (kept across a short absence), or None if not in the table."""

@@ -28,9 +28,10 @@ from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
                             MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
+from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
 from rnfs.network.identity import node_id_for_identity
+from rnfs.network.links import close_reason
 from rnfs import mesh
 
 SLOW_POOL = "slow"
@@ -96,6 +97,10 @@ class Backend(Protocol):
     def served_block(self, cid: Cid) -> bytes | None:
         """cid's block if it's in the DAG of a CID this node provides, re-verified; else None."""
 
+    def served_block_size(self, cid: Cid) -> int | None:
+        """Optional (looked up with getattr): the stored length of the block served_block(cid) would return, or
+        None if it isn't served (or isn't known). Lets /blocks stop at the block over its budget unread."""
+
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept (True) or refuse a /pin from the identity with this 16-byte hash."""
 
@@ -117,15 +122,22 @@ def blocks_budget(max_bytes: int, rate_estimate: float | None, upload_cap: float
     return min(limit, rates.transfer_bytes(response_target, rate))
 
 
-def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], limit: int) -> list[bytes | None]:
+def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], limit: int,
+                  served_size: Callable[[Cid], int | None] | None = None) -> list[bytes | None]:
     """Response entries for cids: each block or None, stopping before the first block over the budget.
 
-    The first served block is always included, even if it alone exceeds limit.
+    The first served block is always included, even if it alone exceeds limit. served_size(cid), if given, is
+    the length of the block served_block(cid) would return (None if unknown): the block over the budget is then
+    left out without being read and hashed.
     """
     entries: list[bytes | None] = []
     total = 0
     served_any = False
     for cid in cids:
+        if served_any and served_size is not None:
+            known = served_size(cid)
+            if known is not None and total + known > limit:
+                break
         block = served_block(cid)
         if block is None:
             entries.append(None)
@@ -710,6 +722,9 @@ class RequestServer:
         RNS calls this on its packet-handling thread, so it only does quick work.
         """
         self._track(link)
+        log(f"incoming link {RNS.prettyhexrep(link.link_id)} established"
+            + (f" on {link.attached_interface}" if getattr(link, "attached_interface", None) is not None else ""),
+            LOG_DEBUG)
         # Private mode: outsiders' links are closed first, so they can't push members' idle links out
         keep = self._member_links() if self.config.private else frozenset()
         admitted, victim = self.incoming.admit(link.link_id, keep)
@@ -748,6 +763,9 @@ class RequestServer:
     def _link_closed(self, link):
         """Forget a closed link and free everything its responses held."""
         link_id = link.link_id
+        opened = getattr(link, "activated_at", None)
+        log(f"incoming link {RNS.prettyhexrep(link_id)} {close_reason(link)}"
+            + (f" after {time.time() - opened:.0f}s" if isinstance(opened, (int, float)) else ""), LOG_DEBUG)
         with self.lock:
             self.links.pop(link_id, None)
             self.watched.discard(link_id)
@@ -930,7 +948,8 @@ class RequestServer:
                     log("refused /blocks: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
                     return False
                 limit = min(limit, max(0, share - RESPONSE_OVERHEAD))
-            entries = select_blocks(cids, self.backend.served_block, limit)
+            entries = select_blocks(cids, self.backend.served_block, limit,
+                                    getattr(self.backend, "served_block_size", None))
             body = protocol.encode_blocks_response(entries)
             packed = protocol.packed_response_size(request_id, body)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
@@ -1030,7 +1049,8 @@ class RequestServer:
                 if getattr(resource, "status", 0) >= RNS.Resource.COMPLETE:
                     self._concluded(response, link, resource)
                     break
-                time.sleep(0.01)
+                # Its Resource's callback finishes it as the proof is processed (_hook); the status is a backup
+                response.done.wait(0.01)
             if not response.finished:
                 return False
         return True
@@ -1320,12 +1340,14 @@ class RequestServer:
         return True
 
     def _monitor_loop(self):
-        """Run check_responses until stopped."""
+        """Run check_responses until stopped; with no response handed to RNS, wait for one (or stop)."""
         while not self.stop_event.is_set():
             try:
                 searching = self.check_responses()
+                # check_responses only looks at responses handed to RNS, and each handover sets wake
+                idle = not any(r.size is not None and not r.finished for r in self.pools.responses())
             except Exception as e:
                 log(f"error tracking /blocks responses: {e}", LOG_WARNING)
-                searching = False
-            self.wake.wait(MONITOR_FAST_TICK if searching else MONITOR_TICK)
+                searching = idle = False
+            self.wake.wait(None if idle else MONITOR_FAST_TICK if searching else MONITOR_TICK)
             self.wake.clear()

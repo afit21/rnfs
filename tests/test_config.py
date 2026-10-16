@@ -19,7 +19,7 @@ class ValidateTest(unittest.TestCase):
 
     def test_flags_must_be_booleans(self):
         # "false" and "no" are non-empty strings, which would read as true: scripts on, private mode on
-        for name in ("gateway_scripts", "private", "default_bootstrap"):
+        for name in ("gateway_scripts", "private", "default_bootstrap", "debug_log"):
             for value in ("false", "no", 0, 1, None):
                 self.assert_invalid(**{name: value})
             Config(**{name: False}).validate()

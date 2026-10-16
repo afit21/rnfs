@@ -184,7 +184,8 @@ class SharedFolder:
         warnings: list[str] = []
         try:
             with self.storage.protect() as session:
-                built = builder.build_open(handle, st, path, session.put, warnings, skip_hard_links=True)
+                with session.writer() as put:
+                    built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True)
                 self.storage.pin(built.cid, FOLDER)
         except (OSError, ValueError, RnfsError) as e:
             self._failed[name] = sig

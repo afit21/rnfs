@@ -129,9 +129,15 @@ class Publisher:
         self.retry_interval = retry_interval
         self._state_path = None if state_dir is None else os.path.join(state_dir, STATE_FILE)
         self._lock = threading.RLock()
+        self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._wake = threading.Event()
         self._provided: frozenset[Cid] = frozenset()
         self._served: frozenset[Cid] = frozenset()
+        # What _compute last built, and from what, so a refresh that changed nothing needn't build it again: the
+        # served set from each provided CID's dag_blocks (memoised by storage, so the same object while its DAG
+        # stays complete), and the DhtKeys from the keys the key sources returned
+        self._served_from: tuple[dict[Cid, frozenset[Cid]], frozenset[Cid]] = ({}, frozenset())
+        self._keys_from: tuple[set[bytes], frozenset[DhtKey]] = (set(), frozenset())
         self._published: dict[Cid, tuple[float, list[bytes]]] = {}  # CID -> (when, nodes that recorded it)
         # Other nodes that may still hold our record of a CID (earlier rounds' closest nodes, or a round cut
         # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
@@ -204,16 +210,19 @@ class Publisher:
                 continue
 
     def save(self):
-        """Persist the publish state (atomic)."""
+        """Persist the publish state (atomic). Called without the lock: it is written outside it."""
         if self._state_path is None:
             return
-        with self._lock:
-            value = {"published": {str(cid): [when, [n.hex() for n in nodes]]
-                                   for cid, (when, nodes) in self._published.items()},
-                     "earlier": {str(cid): {n.hex(): when for n, when in nodes.items()}
-                                 for cid, nodes in self._earlier.items() if nodes},
-                     "withdraw": {node.hex(): sorted(k.hex() for k in keys)
-                                  for node, keys in self._withdrawals.items() if keys}}
+        # Saves come from refresh(), the publish loop and stop(): one at a time, or a snapshot taken before the
+        # other's could be written last
+        with self._save_lock:
+            with self._lock:
+                value = {"published": {str(cid): [when, [n.hex() for n in nodes]]
+                                       for cid, (when, nodes) in self._published.items()},
+                         "earlier": {str(cid): {n.hex(): when for n, when in nodes.items()}
+                                     for cid, nodes in self._earlier.items() if nodes},
+                         "withdraw": {node.hex(): sorted(k.hex() for k in keys)
+                                      for node, keys in self._withdrawals.items() if keys}}
             write_json(self._state_path, value)
 
     # The provide set
@@ -233,25 +242,40 @@ class Publisher:
         return cid in self._served  # a frozenset swapped whole, so reading it needs no lock
 
     def _compute(self) -> tuple[frozenset[Cid], frozenset[Cid]]:
-        """(provided CIDs, blocks they reach) from storage and the strategy."""
+        """(provided CIDs, blocks they reach) from storage and the strategy. Lock held.
+
+        The served set and the DhtKeys are those of the last call when what they are built from hasn't changed
+        (most refreshes): the same complete CIDs with the same dag_blocks objects, and the same keys. CIDs only
+        added since add their blocks to it; only one gone or changed builds it again.
+        """
         candidates = set(self.storage.pins())
         if self.config.provide_strategy == "roots":
             candidates |= self.storage.cached_targets() & set(self.cached_eligible())
-        provided = set()
-        served: set[Cid] = set()
+        dags: dict[Cid, frozenset[Cid]] = {}
         for cid in candidates:
             try:
-                blocks = self.storage.dag_blocks(cid)  # memoised; raises unless complete
+                dags[cid] = self.storage.dag_blocks(cid)  # memoised; raises unless complete
             except (NotFound, InvalidDag):
                 continue
-            provided.add(cid)
-            served |= blocks
+        keys: set[bytes] = set()
         for source in list(self._key_sources):
             try:
-                provided |= {DhtKey(key) for key in source()}
+                keys |= {bytes(key) for key in source()}  # as DhtKey takes them
             except Exception as e:  # noqa: BLE001 - a broken feature mustn't stop CIDs being provided
                 log(f"a provided-key source failed: {e!r}", LOG_ERROR)
-        return frozenset(provided), frozenset(served)
+        last_dags, served = self._served_from
+        new = [blocks for cid, blocks in dags.items() if last_dags.get(cid) is not blocks]
+        if len(dags) - len(new) < len(last_dags):  # one went, or its blocks changed: built again
+            blocks_reached: set[Cid] = set()
+            for blocks in dags.values():
+                blocks_reached |= blocks
+            served = frozenset(blocks_reached)
+        elif new:  # only some added (a pin or a fetch)
+            served = served.union(*new)
+        self._served_from = (dags, served)
+        if keys != self._keys_from[0]:
+            self._keys_from = (keys, frozenset(DhtKey(key) for key in keys))
+        return frozenset(dags) | self._keys_from[1], served
 
     def refresh(self):
         """Recompute what is provided (after pins, fetches, evictions); withdraw what no longer is, at once."""
@@ -282,17 +306,18 @@ class Publisher:
         there again, deleting the fresh record (section 6). Those nodes may still hold a record of it, so they
         join its earlier nodes, to be withdrawn from should it stop being provided again.
         """
-        self.providers.store(cid.key, self.own_id)  # refresh() withdrew it when it stopped being provided
+        key = cid.key
+        self.providers.store(key, self.own_id)  # refresh() withdrew it when it stopped being provided
         now = self.clock()
         cancelled = False
-        for node_id, keys in list(self._withdrawals.items()):
-            if cid.key in keys:
-                keys.discard(cid.key)
-                if not keys:
-                    del self._withdrawals[node_id]
-                earlier = self._earlier.setdefault(cid, {})
-                earlier[node_id] = max(now, earlier.get(node_id, now))
-                cancelled = True
+        for node_id in [node_id for node_id, keys in self._withdrawals.items() if key in keys]:
+            keys = self._withdrawals[node_id]
+            keys.discard(key)
+            if not keys:
+                del self._withdrawals[node_id]
+            earlier = self._earlier.setdefault(cid, {})
+            earlier[node_id] = max(now, earlier.get(node_id, now))
+            cancelled = True
         return cancelled
 
     # Publishing

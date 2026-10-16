@@ -2,6 +2,55 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## Unreleased
+
+Performance work, and a debug log. No wire-format, CID or state-file changes: these nodes and 0.1.4 nodes work
+together, and each reads the other's `<rnfs dir>`.
+
+Added:
+- A debug log file, for diagnosing problems: `debug_log = true` in `rnfs.toml`, or `rnfs daemon --debug-log`,
+  writes `<rnfs dir>/debug.log`. It begins with the daemon's version (then the Python, RNS and LXMF versions,
+  the platform and the settings changed from the defaults), and has every rnfs message at every level whatever
+  `verbosity` is; Reticulum's own messages, such as an interface that can't connect; each gateway request,
+  numbered, with the headers that decide it, what was decided (stored or fetched, type, range) and its status,
+  size and time; errors with tracebacks, and threads that die; and a status line every 5 minutes (counts,
+  open links, each interface up or down). New detail, at debug level: each DHT lookup's queries (which node
+  answered or failed, and how the lookup ended), the path to each node (hops, interface), why a link closed or
+  couldn't be established, each request's outcome or why it went unanswered, and incoming links. The file is
+  readable by its owner only and never sent; each start keeps the previous run's as `debug.log.1`, and past
+  16 MiB the file moves there too, so the two stay under 32 MiB.
+
+Fixes:
+- `gc` (and eviction) could delete blocks of a complete pin. `stat` of a DAG only partly stored remembered the
+  nodes it didn't find as listing nothing, so once the rest was fetched and pinned, collection didn't see what
+  those nodes reach. Until a restart, which cleared it.
+- `import` pins the roots an archive supplies with one save of `pins.json`; if that save fails, none of them is
+  pinned (before, those ahead of the failure were).
+
+Faster:
+- `add`, the shared folder and `import` write blocks on up to 16 threads, so the sync to disk each block needs
+  before its rename overlaps (about 11x on an SSD: 64 MB added at 165–190 MB/s, from 13–17). Every block is
+  still synced before it is named, and before anything pins it.
+- A CID's written form and DHT key are computed once. They showed up in every save of `pins.json`,
+  `pin_names.json`, `published.json` and in `pin ls`.
+- `fetched.json` is saved with the cache records (every 30 s, at `gc` and at stop), not rewritten and synced
+  under the node's lock on each fetch. Jobs save `jobs.json` once per change, not twice.
+- State files written in full (`published.json`, `providers.json`, `name-floor.json`) are written outside the
+  publisher, provider-store and names locks, from a copy taken under them, so `/find`, `/provide`, resolves and
+  name announces don't wait for the write. `verify` and the size queries (`stat`, quotas, pinned bytes) read DAG
+  nodes without the storage lock, as eviction and `gc` already did.
+- Recomputing what is provided reuses the last result when no provided DAG changed (about 30 ms to 5 ms at
+  5000 pins).
+- The DHT routing table finds the closest nodes by walking buckets, not by sorting every node (about 350 µs to
+  4 µs per `/find` on a full table). Lookups start from nodes that haven't failed or gone silent, with the
+  others only to make up K, as `/find` replies do.
+- Fetches: a slow provider is paced by how long its response took from when the request was sent, not counting
+  opening the link or waiting for the link's `/blocks` slot. A request reserves only what one response can carry,
+  sized to the open link's packet size, so idle providers get the rest; and the batch is sized in one pass.
+- Serving `/blocks` no longer reads and hashes the block it then leaves out for the budget; finished responses
+  are noticed at once rather than within 10 ms; the response monitor sleeps while nothing is being sent.
+- DAG nodes decode about 15% faster (struct formats compiled once), accepting and rejecting exactly as before.
+
 ## 0.1.4
 
 Security release from the fifth audit: fixes for denial of service against `/blocks` serving, unbounded downloads,

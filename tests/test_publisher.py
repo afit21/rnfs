@@ -2,7 +2,9 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -12,7 +14,8 @@ from rnfs.content import builder
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.dht.providers import ProviderStore
-from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, STATE_FILE, Publisher
+from rnfs import publisher as publisher_module
+from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, STATE_FILE, DhtKey, Publisher
 from tests.support import FakeClock
 
 OWN = bytes(16)
@@ -355,6 +358,99 @@ class PublisherTest(unittest.TestCase):
         for block in self.storage.dag_blocks(cid):
             self.assertTrue(self.publisher.serves(block))
         self.assertFalse(self.publisher.serves(Cid.for_block(RAW, b"other")))
+
+    def test_refresh_builds_the_sets_again_only_when_they_change(self):
+        """Each refresh provides and serves exactly the complete candidates' DAGs and the sources' keys; when
+        none of them changed, the same served set is kept rather than built again."""
+        keys: set[bytes] = set()
+        self.publisher.add_key_source(lambda: keys)
+        self.eligible = set()
+
+        def check():
+            """The publisher's sets are those of storage and the key source now."""
+            self.publisher.refresh()
+            candidates = set(self.storage.pins()) | (self.storage.cached_targets() & self.eligible)
+            dags = {cid: self.storage.dag_blocks(cid) for cid in candidates if self.storage.is_complete(cid)}
+            self.assertEqual(self.publisher.provided(), set(dags))
+            self.assertEqual(self.publisher.provided_keys(), keys)
+            self.assertEqual(self.publisher._served, frozenset().union(*dags.values()))
+            return self.publisher._served
+
+        a = self.pinned(os.urandom(100_000))
+        served = check()
+        self.assertIs(check(), served)  # nothing changed
+        b = self.pinned(os.urandom(100_000))  # added
+        self.assertIsNot(check(), served)
+        keys.add(bytes([9]) * 16)
+        served = check()
+        self.assertIn(DhtKey(bytes([9]) * 16), self.publisher._provided)
+        self.assertIs(check(), served)
+        # A pin whose DAG is missing a block isn't provided until the block is stored
+        blocks: dict[Cid, bytes] = {}
+        partial = builder.build_bytes(os.urandom(100_000), lambda cid, block: blocks.setdefault(cid, block)).cid
+        missing = next(cid for cid in blocks if cid.is_raw)
+        for cid, block in blocks.items():
+            if cid != missing:
+                self.storage.put(cid, block)
+        self.storage.pin(partial, USER)
+        self.assertIs(check(), served)
+        self.storage.put(missing, blocks[missing])
+        self.assertIsNot(check(), served)
+        self.storage.unpin(a, USER)  # gone
+        served = check()
+        self.assertFalse(self.publisher.serves(a))
+        # A cached target the roots strategy provides, until it is evicted
+        self.config.provide_strategy = "roots"
+        fetched = builder.build_bytes(b"fetched", self.storage.put)
+        self.storage.record_fetch(fetched.cid, [], fetched.cid)
+        self.eligible.add(fetched.cid)
+        self.assertIsNot(check(), served)
+        self.storage.gc()
+        check()
+        keys.clear()
+        check()
+        self.assertEqual(self.publisher.provided(), {b, partial})
+
+    def test_refresh_withdraws_what_isnt_provided_when_the_sets_are_unchanged(self):
+        """State loaded at startup is withdrawn even when the provided set is the same as before (empty)."""
+        cid = self.pinned(b"once provided")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.storage.unpin(cid, USER)
+        restarted = self.make_publisher()
+        restarted.refresh()
+        self.assertEqual(restarted.provided(), set())
+        restarted.publish_due()
+        self.assertEqual(self.withdrawn(), {N1: {cid.key}, N2: {cid.key}})
+
+    def test_saved_without_the_lock_and_in_order(self):
+        """published.json is written outside the lock, and a save that snapshots meanwhile lands last."""
+        a, b = self.pinned(b"a"), self.pinned(b"b")
+        self.publisher.refresh()
+        real_write = publisher_module.write_json
+        free, second = [], []
+
+        def write(path, value):
+            """The first save's write: another thread takes the lock, then unpins b and saves."""
+            if not second:
+                lock = self.publisher._lock
+                thread = threading.Thread(target=lambda: free.append(lock.acquire(timeout=5)) or lock.release())
+                thread.start()
+                thread.join()
+                self.storage.unpin(b, USER)
+                second.append(threading.Thread(target=self.publisher.refresh))
+                second[0].start()
+                second[0].join(0.2)
+            real_write(path, value)
+
+        with mock.patch.object(publisher_module, "write_json", write):
+            self.publisher.publish_due()
+            second[0].join(5)
+        self.assertEqual(free, [True])
+        with open(os.path.join(self.state, STATE_FILE), encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(set(saved["published"]), {str(a)})
+        self.assertEqual(saved["withdraw"], {N1.hex(): [b.key.hex()], N2.hex(): [b.key.hex()]})
 
 
 if __name__ == "__main__":

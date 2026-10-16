@@ -8,6 +8,7 @@ fetcher.py   fetching targets from providers
 publisher.py provide strategy, publishing and withdrawal in the DHT
 node.py      RnfsNode, which ties the above together into a running node and offers the facade
 api.py       local HTTP API; gateway.py the HTTP gateway
+debuglog.py  the debug log file (debug_log)
 cli.py       command line: run a daemon, or talk to one through its API
 """
 

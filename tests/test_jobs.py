@@ -191,6 +191,24 @@ class JobsTest(JobsBase):
         self.assertFalse(os.path.exists(self.out("cancelled")))
         self.assertEqual(self.b.storage._sessions, [])  # its protection is released
 
+    def test_submit_saves_once_whether_the_job_starts_or_waits(self):
+        self.b.config.max_jobs = 1
+        first, second = self.share(b"first"), self.share(b"second")
+        self.net.gate.clear()
+        path = os.path.join(self.b.config.state_dir, jobs.JOBS_FILE)
+        from rnfs.content import storage
+        with mock.patch.object(storage, "write_json", wraps=storage.write_json) as write:
+            started = self.jobs.submit("get", first, self.out("first"))["id"]
+            self.assertEqual(write.call_count, 1)  # saved as it started, not also before
+            queued = self.jobs.submit("get", second, self.out("second"))["id"]
+            self.assertEqual(write.call_count, 2)  # nothing started, so saved as queued
+        with open(path, encoding="utf-8") as f:
+            saved = {job["id"]: job["state"] for job in json.load(f)["jobs"]}
+        self.assertEqual(saved, {started: "running", queued: "queued"})
+        self.net.gate.set()
+        self.assertEqual(self.finished(started)["state"], "done")
+        self.assertEqual(self.finished(queued)["state"], "done")
+
     def test_cancel_queued_job_and_concurrency_limit(self):
         self.b.config.max_jobs = 1
         cids = [self.share(f"file {i}".encode()) for i in range(3)]

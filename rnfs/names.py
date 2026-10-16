@@ -253,6 +253,9 @@ class NameManager:
         self._floor_dirty = False
         self._floor_saved_at = float("-inf")  # monotonic time of the last floor save
         self._floor_timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
+        # Floor saves write without self._lock, one at a time, so an older snapshot never lands last. Taken before
+        # self._lock, never while holding it
+        self._floor_save_lock = threading.Lock()
         self._held_dirty = False  # heard times changed without a save
 
         self._destinations: dict[str, object] = {}
@@ -517,7 +520,7 @@ class NameManager:
                 self._floor_timer.cancel()
                 self._floor_timer = None
             self._save()
-            self._save_floor()
+        self._save_floor()
 
     def announce_due(self) -> float:
         """Re-announce every name whose announce_interval has passed; seconds until the next is due."""
@@ -528,11 +531,12 @@ class NameManager:
                     self._announce(alias)
             if self._held_dirty:
                 self._save()
-            if self._floor_dirty:
-                self._save_floor()
             if not self._next_announce:
-                return self.config.announce_interval
-            return max(0.0, min(self._next_announce.values()) - now)
+                wait = self.config.announce_interval
+            else:
+                wait = max(0.0, min(self._next_announce.values()) - now)
+        self._save_floor()
+        return wait
 
     def run(self, stop_event: threading.Event):
         """The re-announce loop, for a thread of its own; returns once stop_event is set."""
@@ -577,6 +581,7 @@ class NameManager:
 
         # Again: the bounded table may have evicted it meanwhile, letting a replayed announce in
         self._offer_kept(name)
+        save_floor = False
         with self._lock:
             self._absorb_recalled(name)
             record = self._record(name, touch=True)
@@ -587,9 +592,12 @@ class NameManager:
                 self._held[name] = record
                 self._save()
             elif name not in self._held:
-                self._resolved(name, record.sequence)
-            return {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
-                    "age": max(0.0, self._clock() - record.heard)}
+                save_floor = self._resolved(name, record.sequence)
+            result = {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
+                      "age": max(0.0, self._clock() - record.heard)}
+        if save_floor:
+            self._save_floor()
+        return result
 
     def _offer_kept(self, name: bytes):
         """Offer the signed record keepers hold for name, so it is a floor no replayed announce gets under.
@@ -769,10 +777,11 @@ class NameManager:
         self._table.pop(name, None)
         self._heard_only.pop(name, None)
 
-    def _resolved(self, name: bytes, sequence: int):
+    def _resolved(self, name: bytes, sequence: int) -> bool:
         """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
         floor for later resolves (_trim_floor says which are forgotten). A floor raised (or a new one) is saved at
-        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little."""
+        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little. True if the caller
+        is to save it now, once it has released the lock."""
         self._heard_only.pop(name, None)
         now = self._clock()
         previous = self._floor.pop(name, None)
@@ -780,9 +789,10 @@ class NameManager:
         trimmed = self._trim_floor()
         if previous is None or self._floor[name][0] != previous[0] or trimmed:
             self._floor_dirty = True
-            self._save_floor_soon()
-        elif not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
+            return self._save_floor_soon()
+        if not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
             self._floor_dirty = True  # only its time renewed: saved with the next change or by announce_due
+        return False
 
     def _trim_floor(self) -> bool:
         """Forget the least recently resolved names over FLOOR_FACTOR × name_table_size, but not those resolved
@@ -798,22 +808,24 @@ class NameManager:
             trimmed = True
         return trimmed
 
-    def _save_floor_soon(self):
-        """Save the floor now if the last save was FLOOR_SAVE_INTERVAL ago, else once it is (a timer)."""
+    def _save_floor_soon(self) -> bool:
+        """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
+        has released the lock; else it is saved once it is (a timer)."""
         wait = self._floor_saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
         if wait <= 0:
-            self._save_floor()
-        elif self._floor_timer is None:
+            return True
+        if self._floor_timer is None:
             timer = threading.Timer(wait, self._save_floor_later)
             timer.daemon = True
             self._floor_timer = timer
             timer.start()
+        return False
 
     def _save_floor_later(self):
         """The timer's save."""
         with self._lock:
             self._floor_timer = None
-            self._save_floor()
+        self._save_floor()
 
     def _floor_size(self) -> int:
         """How many names the floor holds, past which only names resolved within FLOOR_KEEP_AGE are kept."""
@@ -981,19 +993,32 @@ class NameManager:
     def _save_floor(self):
         """Write the floor atomically, least recently resolved first, as [name, sequence, resolved], if it
         changed. Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds thousands
-        of names), announce_due (at least every minute while running) and stop()."""
-        if not self._floor_dirty:
-            return
-        state = {"version": FLOOR_VERSION,
-                 "floor": [[name.hex(), sequence, int(at)] for name, (sequence, at) in self._floor.items()]}
-        os.makedirs(self.config.state_dir, exist_ok=True)
-        try:
-            fsutil.write_atomic(self._floor_path, json.dumps(state, separators=(",", ":")).encode())
-        except OSError as e:
-            log(f"could not save {self._floor_path}: {e}", LOG_WARNING)
-            return
-        self._floor_dirty = False
-        self._floor_saved_at = self._monotonic()
+        of names), announce_due (at least every minute while running) and stop().
+
+        Called without the lock: only the copy is taken under it, so resolves and announces needn't wait for
+        the write. The save counts from when the copy was taken; a failed one is retried by the next."""
+        with self._floor_save_lock:
+            with self._lock:
+                if not self._floor_dirty:
+                    return
+                floor = list(self._floor.items())
+                saved_at, self._floor_saved_at = self._floor_saved_at, self._monotonic()
+                self._floor_dirty = False
+            saved = False
+            try:
+                state = {"version": FLOOR_VERSION,
+                         "floor": [[name.hex(), sequence, int(at)] for name, (sequence, at) in floor]}
+                os.makedirs(self.config.state_dir, exist_ok=True)
+                try:
+                    fsutil.write_atomic(self._floor_path, json.dumps(state, separators=(",", ":")).encode())
+                    saved = True
+                except OSError as e:
+                    log(f"could not save {self._floor_path}: {e}", LOG_WARNING)
+            finally:
+                if not saved:
+                    with self._lock:
+                        self._floor_dirty = True
+                        self._floor_saved_at = saved_at
 
     def _save(self):
         """Write published and held records atomically."""

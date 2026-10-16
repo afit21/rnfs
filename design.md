@@ -18,7 +18,15 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire.
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
-  `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`.
+  `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set
+  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel.
+- `rnfs/debuglog.py` — the debug log file (`debug_log`, `daemon --debug-log`), `<rnfs dir>/debug.log` (0600),
+  started by the daemon before the node: version first, then every rnfs message (warnings and errors logged in
+  an `except` block with their traceback), RNS's own log lines (copied from `RNS.logdest = LOG_CALLBACK`, which
+  still prints them), threads that die (`threading.excepthook`), a status line every 5 minutes (`status_line`:
+  the node's status, open links, each interface up or down), and gateway requests, numbered (`tag`). Each start
+  and every 16 MiB moves the file to `debug.log.1`. Lookups report their queries through `Lookup(report=)` (dht
+  stays free of RNS), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
 - `rnfs/fsutil.py` — the one platform switch (`IS_WINDOWS`), `O_BINARY`, and `replace`/`remove` that retry for
   about a second on Windows while another handle holds the file; `rename_new` (rename onto a path that must not
   exist; atomic through `renameat2(RENAME_NOREPLACE)` on Linux or a hard link, else check then rename);
@@ -45,6 +53,7 @@ internally.
 rnfs.py, rnfs/__main__.py   entry points (python3 rnfs.py, python3 -m rnfs); the installed command is rnfs.cli:main
 rnfs/
   constants.py config.py errors.py log.py          shared foundation
+  debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
@@ -128,10 +137,16 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `storage.py` — `Storage(blocks_dir, state_dir, max_storage)`, thread-safe:
 - blocks: `has(cid)`, `get(cid, verify=False) -> bytes | None` (with `verify`, a block no longer matching its
   CID is deleted), `put(cid, block)` (verifies, even a block already stored; atomic, the file fsynced),
-  `used_bytes()`. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
+  `used_bytes()`. Adds, the shared folder and archive import store through `with session.writer() as put:`,
+  which writes blocks on up to 16 threads (`WRITE_THREADS`, at most 32 queued) so their fsyncs overlap, and
+  has stored every one, or raised the first error, before the block exits: nothing is pinned before its blocks
+  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
   cache records, so they never refer to block names a power loss could undo.
-- pins: `pin(cid, source)`, `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]`, `is_complete(cid)`.
+- pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
+  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]`, `pin_count()`, `is_complete(cid)`.
 - cache: `record_fetch(root, names, target)` (keeps the path's nodes and the target's DAG), LRU touched on use.
+  `cache_generation()` grows whenever records are removed or retargeted, so the node prunes its fetched
+  targets only then.
 - protection: `with storage.protect() as session:` — blocks stored or listed in `session.add(cid)` are kept as
   if pinned until the block exits (fetches, adds, imports in progress).
 - `check_disk(nbytes)` raises `StorageFull` when storing `nbytes` would leave less than the disk reserve
@@ -142,7 +157,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
   memos; completeness via `dag_blocks`), then decide and delete under the lock from the pins, sessions and
   records current then, so `get` (and `/blocks` serving) waits only for that in-memory walk and the deletions,
-  and a block that became reachable meanwhile is kept. `pins.json` is still written under the lock on every
+  and a block that became reachable meanwhile is kept. The size queries (`pinned_bytes`, `dag_bytes`,
+  `source_usage`, `stat`) read their DAG nodes the same way first. `_links` memoises only stored DAG nodes: a
+  node not stored yet may be stored later, and a raw block lists nothing. `pins.json` is still written under the lock on every
   pin and unpin: a pin must be on disk when `pin()` returns (names' crash consistency and `rnfs pin add`
   depend on it), and before a collection can delete what an `unpin()` released.
 - `verify() -> stats` re-checks every block, deleting bad ones.
@@ -194,6 +211,7 @@ can tell who vouches for its candidates.
 `server.py` — `RequestServer(destination, config, backend)`. `backend` provides:
 `is_dht_server() -> bool`, `find(key) -> (providers, nodes)`, `provide(publisher_id, keys, withdrawn) -> bool`,
 `served_block(cid) -> bytes | None` (only blocks in the DAG of a currently provided CID, re-verified),
+optionally `served_block_size(cid) -> int | None` (so `/blocks` stops at the block over its budget unread),
 `remote_pin(identity_hash, cid, pin) -> bool`, `is_member(identity_hash) -> bool` (private mode).
 `NodeBackend.find` leaves out providers `RnfsNode.excluded_provider` rejects: banned, and in private mode
 non-members (`_is_member_publisher`: this node, a publisher whose `/provide` the server let through as a member
@@ -205,7 +223,8 @@ node also drops non-members' records at start (`ProviderStore.retain`).
 link, batched; the keys the node may have recorded: every key, or those of the batches up to and including the
 first refused or unanswered one), `blocks(node_id, cids, on_progress=None) -> BlocksResult` (status OK / BUSY /
 FAILED / STALLED; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None,
-`.unsent` cut by the budget, `.bad` hash mismatches), `pin(node_id, cid, pin) -> bool`, `ping(node_id) -> float |
+`.unsent` cut by the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which the fetcher
+paces by), `link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`, `ping(node_id) -> float |
 None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht` destination of the identity
 RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if that identity is on
 `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
@@ -475,6 +494,7 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting) |
+| `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
 | `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits ≤ 2 s |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
 | `rnfs-follow` | follow | every check and fetch, one at a time |
@@ -487,14 +507,17 @@ Locks are taken in this order, never the reverse: `names._lock` → `publisher._
 `publisher.refresh()`, while holding the names lock; `Publisher.refresh` recomputes what is provided under its
 own lock, reading the node's fetched targets (`node._lock`) and walking the pins' DAGs (`storage._lock`); the
 node reads storage under its lock (`_prune_fetched`). This is how the code behaves today, not a design goal.
-Slow work that runs while a lock is held:
+State files written in full are written outside these locks, from a copy taken under them, one save at a time
+behind a save lock taken first (`Storage.save`, `Publisher.save`, `ProviderStore.save`, the name floor,
+`fetched.json`, `remote_pins.json`), so an older copy never lands last. Slow work that runs while a lock is
+held:
 
-- `Publisher.refresh` walks every pin's DAG (memoised) under the publisher lock, behind the names lock when a
-  name changes, so an RNS thread delivering a name announce can wait behind a full recompute.
-- `Storage.evict`, `gc` and `verify` check every pin and cached target for completeness (`dag_blocks`,
-  memoised, reading blocks from disk) under the storage lock; `evict` and `gc` also delete blocks under it.
-  `verify` re-reads the blocks themselves outside it.
-- `RnfsNode._note_fetched` and `_prune_fetched` write `fetched.json`, synced to disk, under the node lock.
+- `Publisher.refresh` checks every pin's DAG (`dag_blocks`, memoised) under the publisher lock, behind the
+  names lock when a name changes. It builds the set of blocks served again only when a provided CID went or its
+  DAG's blocks changed (CIDs only added are unioned in), so a refresh that changed nothing doesn't recompute it.
+- `Storage.evict` and `gc` decide what to delete, and delete it, under the storage lock (after reading the DAG
+  nodes outside it); `verify` checks completeness and re-reads the blocks outside it.
+- `pins.json` is written, synced to disk, under the storage lock on every pin and unpin (see `storage.py`).
 
 ## State files
 
@@ -697,8 +720,8 @@ Everything in the specification is implemented, with these simplifications and a
   (`release_gone()`), pins a recorded target again if its pin is missing, and releases `name:` pins nothing
   records; a key without a `names.json` entry keeps its pins until its next publish or removal (`_stale`,
   where a release that failed with `OSError` also waits). A key file that is there but can't be loaded is
-  `_unreadable`: its pins are kept and its `names.json` entry is written back as loaded. `Storage.pin`/`unpin`
-  undo their change in memory if saving `pins.json` fails. Follow and LXMF do the same for their sources at
+  `_unreadable`: its pins are kept and its `names.json` entry is written back as loaded. `Storage.pin`/`pin_many`/
+  `unpin` undo their change in memory if saving `pins.json` fails. Follow and LXMF do the same for their sources at
   start (`FollowFeature._reconcile`, `_release_unrecorded`), but release only if their file loaded whole
   (`MessageLog.clean`); otherwise unrecorded pins are recorded again (the name followed again, or an inbox
   message per sender listing them), so a later start keeps them too. The name table marks

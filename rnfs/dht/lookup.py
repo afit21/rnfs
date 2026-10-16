@@ -38,6 +38,15 @@ def _never(node_id: bytes) -> bool:
     return False
 
 
+def _quiet(text: str) -> None:
+    """Default report: says nothing."""
+
+
+def _name(node_id: bytes) -> str:
+    """A node ID as the log writes it (RNS.prettyhexrep's form, without loading RNS)."""
+    return f"<{node_id.hex()}>"
+
+
 def _valid_id(node_id) -> bool:
     """True if node_id has the shape of a node ID."""
     return isinstance(node_id, bytes) and len(node_id) == ID_LENGTH
@@ -54,6 +63,8 @@ class Lookup:
       even after the run that sent it has returned, so the node can update its routing table.
     - `exclude(id)`: IDs to ignore in replies, as nodes and as providers (banned nodes).
     - `timeout`: the time budget, starting at the first run; later runs share it.
+    - `report(text)`: told each run's start and end, and each query's outcome (the node logs them at
+      LOG_DEBUG, for the debug log); called from the running thread and the query threads.
 
     A Lookup may be run again (find_providers after every provider failed): each run re-queries the nodes,
     so /find replies give a fresh random half of providers, within the same deadline and unknown-ID budget.
@@ -64,7 +75,8 @@ class Lookup:
                  alpha: int = 3, beta: int = 3, k: int = K, timeout: float = 600,
                  is_known: Callable[[bytes], bool] = _always, on_answer: NodeCallback = _ignore,
                  on_failure: NodeCallback = _ignore, exclude: Callable[[bytes], bool] = _never,
-                 clock: Callable[[], float] = time.monotonic, poll_interval: float = _POLL_INTERVAL):
+                 clock: Callable[[], float] = time.monotonic, poll_interval: float = _POLL_INTERVAL,
+                 report: Callable[[str], None] = _quiet):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -79,6 +91,7 @@ class Lookup:
         self.exclude = exclude
         self.clock = clock
         self.poll_interval = poll_interval
+        self.report = report
         self.deadline: float | None = None
         self._failed: set[bytes] = set()  # didn't answer: dropped for the rest of the lookup
         self._answered: set[bytes] = set()  # answered in any run
@@ -186,6 +199,8 @@ class Lookup:
             self.deadline = self.clock() + self.timeout
         results: queue.Queue = queue.Queue()
         self._wake = results
+        self.report(f"lookup for {self.key.hex()}" + (" (providers)" if on_provider is not None else "")
+                    + f": {len(self._start_nodes)} start nodes, {max(0.0, self.deadline - self.clock()):.0f}s left")
         try:
             return self._iterate(results, on_provider, should_stop)
         finally:
@@ -207,14 +222,19 @@ class Lookup:
         window = max(self.alpha, self.beta)
         self._last_known = known  # live: find_closest reads them once the run ends
         self._last_queried = queried
+        started = self.clock()
+        why = "stopped"
 
         while True:
             if on_provider is not None and should_stop():
+                why = "enough providers"
                 break
             if self.clock() >= self.deadline:
+                why = "out of time"
                 break
             ranked = sorted(known, key=known.__getitem__)
             if ranked and all(node_id in answered for node_id in ranked[:self.beta]):
+                why = "complete"
                 break  # the beta closest known nodes have all answered: complete
 
             # Keep up to alpha queries in flight, to the closest nodes not yet queried. Only nodes ranked
@@ -232,10 +252,12 @@ class Lookup:
                 self._send(node_id, results)
                 in_flight += 1
             if in_flight == 0:
+                why = "no node left to ask"
                 break  # every known node was queried and nothing new turned up
 
             wait = min(self.deadline - self.clock(), self.poll_interval)
             if wait <= 0:
+                why = "out of time"
                 break
             try:
                 item = results.get(timeout=wait)
@@ -270,16 +292,27 @@ class Lookup:
                     self._reported.add(provider)
                     found.append(provider)
                     on_provider(provider)
+        failed = len(queried & self._failed)
+        self.report(f"lookup for {self.key.hex()}: {why} after {self.clock() - started:.1f}s; asked {len(queried)}, "
+                    f"{len(answered)} answered, {failed} failed, {in_flight} still out"
+                    + (f"; {len(found)} new providers" if on_provider is not None else ""))
         return found
 
     def _send(self, node_id: bytes, results: queue.Queue):
         """Query node_id on a worker thread, which reports the outcome and queues it for the run."""
         def work():
             """Run the blocking query, report it, and hand the cleaned reply to the run."""
+            started = self.clock()
             try:
                 reply = self._clean(self.query(node_id, self.key))
-            except Exception:
+            except Exception as e:
                 reply = None  # one broken node must not abort the lookup
+                self.report(f"lookup for {self.key.hex()}: asking {_name(node_id)} raised {e!r}")
+            else:
+                took = self.clock() - started
+                self.report(f"lookup for {self.key.hex()}: {_name(node_id)} " + (
+                    f"failed after {took:.1f}s" if reply is None
+                    else f"answered in {took:.1f}s: {len(reply[0])} providers, {len(reply[1])} nodes"))
             try:
                 (self.on_failure if reply is None else self.on_answer)(node_id)
             except Exception:

@@ -38,9 +38,13 @@ Behaviour:
 - Connections are limited as for the API (rnfs/api.py): the request must arrive within request_timeout, at
   most max_connections are served at once (more get a 503 carrying the headers above), and a response write
   may block response_timeout, so clients that stop reading can't hold every slot for ever.
+- With the debug log (rnfs/debuglog.py), each request is numbered and logged there with the headers that decide
+  how it is served (DEBUG_HEADERS), then its status, bytes written and time; what the gateway decided on the way
+  (name resolutions, stored or fetched, index or listing, type and range) is logged at LOG_DEBUG.
 """
 import codecs
 import html
+import itertools
 import mimetypes
 import re
 import threading
@@ -49,11 +53,12 @@ from collections import OrderedDict
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from rnfs.api import LocalServer, TimedHandler, error_status, host_allowed, loggable, parse_hex_id, raw_response
+from rnfs import debuglog
 from rnfs import gateway_formats  # --- content ---
 from rnfs.content.cid import Cid
 from rnfs.content.seal import is_sealed  # --- content ---
 from rnfs.errors import NotFound
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, log
+from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, log
 
 CSP_SCRIPTS = ("sandbox allow-scripts allow-forms allow-popups; "
                "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'")
@@ -70,6 +75,10 @@ ERROR_MESSAGES = {400: "invalid request", 413: "too large for this node's downlo
                   422: "invalid content: it breaks the rnfs format's rules", 503: "the node is busy; try again shortly",
                   507: "not enough free disk space on this node", 500: "internal error; see the rnfs daemon's log"}
 RANGE_NUMBER = re.compile(r"[0-9]{1,18}")  # ASCII digits only (str.isdigit() takes "¹²³"), and below 2**63
+# Request headers the debug log shows: those that decide how a request is answered
+DEBUG_HEADERS = ("Host", "Range", "If-Range", "If-None-Match", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+                 "User-Agent")
+_request_numbers = itertools.count(1)  # the debug log's numbers for gateway requests
 
 # Types some platforms' mimetypes tables lack or get wrong (on Windows, mimetypes also reads the registry,
 # which installed software edits), so the commonest web types are fixed here too
@@ -256,6 +265,24 @@ class NameCache:
                 self.entries.popitem(last=False)
 
 
+class _CountingWriter:
+    """A response stream counting the bytes written to it, for the debug log; otherwise the stream itself."""
+
+    def __init__(self, stream):
+        """Count what is written to stream."""
+        self._stream = stream
+        self.count = 0
+
+    def write(self, data) -> int:
+        """Write data and count it."""
+        written = self._stream.write(data)
+        self.count += len(data)
+        return written
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class GatewayServer(LocalServer):
     """The gateway for node (an RnfsNode, or anything with its facade methods), using config's gateway settings."""
 
@@ -278,6 +305,7 @@ class GatewayHandler(TimedHandler):
     names: NameCache = None
     server_version = "rnfs"
     sys_version = ""
+    status_sent: int | None = None  # the response's status, once sent (for the debug log)
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
@@ -292,6 +320,11 @@ class GatewayHandler(TimedHandler):
         }, b"too many gateway connections; try again shortly\n")
 
     # Responses
+
+    def send_response(self, code: int, message: str | None = None):
+        """Send the status line, noting the status."""
+        self.status_sent = code
+        super().send_response(code, message)
 
     def end_headers(self):
         """Add the headers every response carries, then end the headers."""
@@ -351,6 +384,24 @@ class GatewayHandler(TimedHandler):
         self.dispatch()
 
     def dispatch(self):
+        """Serve the request (handle_request); with the debug log, logged there with its outcome."""
+        debug = debuglog.current()
+        if debug is None:
+            return self.handle_request()
+        number = next(_request_numbers)
+        started = time.monotonic()
+        self.wfile = _CountingWriter(self.wfile)
+        shown = ", ".join(f"{name}: {self.headers[name]}" for name in DEBUG_HEADERS if self.headers.get(name) is not None)
+        with debug.tag(f"gateway #{number}"):
+            debug.note(f"gateway {self.command} {self.path}" + (f" ({shown})" if shown else ""))
+            try:
+                self.handle_request()
+            finally:
+                debug.note(f"gateway answered {self.status_sent or 'nothing'}: {self.wfile.count} bytes written "
+                           f"(headers included) in {(time.monotonic() - started) * 1000:.0f} ms"
+                           + (", holding a gateway_fetches slot" if self.slot else ""))
+
+    def handle_request(self):
         """Check the request, serve it, and turn every failure into a response carrying the common headers."""
         self.close_connection = True
         self.headers_sent = False
@@ -363,8 +414,10 @@ class GatewayHandler(TimedHandler):
             self.request_read()  # GET and HEAD have no body
             self.serve()
         except GatewayError as e:
+            log(f"gateway refused {loggable(self.path)} with {e.status}: {e}", LOG_DEBUG)
             self.respond_error(e.status, str(e), e.headers)
         except NotFound as e:
+            log(f"gateway: {loggable(self.path)} not found: {e}", LOG_DEBUG)
             self.respond_error(404, str(e) or "not found", {})
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
@@ -432,6 +485,10 @@ class GatewayHandler(TimedHandler):
         target = "/".join([root, *names])
         if self.limited() and not self.node.is_local(target):
             self.need_network()
+        if debuglog.current() is not None:
+            log(f"gateway: {target} is " + ("stored here" if self.node.is_local(target) else "not all stored here; "
+                                            "fetching what it needs") + (", for a web page" if self.limited() else ""),
+                LOG_DEBUG)
         info = self.node.info(target, for_gateway=True)
         etag = f'"{info["cid"]}"'
         if immutable and etag_matches(self.headers.get("If-None-Match"), etag):
@@ -471,10 +528,14 @@ class GatewayHandler(TimedHandler):
             self.need_network()
             cid = self.node.name_resolve(name, for_gateway=True)["cid"]
             self.names.put(name, cid)
+            log(f"gateway resolved name {name} to {cid}", LOG_DEBUG)
+        else:
+            log(f"gateway: name {name} is {cid} (resolved within {NAME_CACHE_TIME:g} s)", LOG_DEBUG)
         return cid
 
     def send_not_modified(self, cid: str):
         """304 for a cached immutable response."""
+        log(f"gateway: {cid} not modified", LOG_DEBUG)
         self.send_response(304)
         self.send_header("ETag", f'"{cid}"')
         self.send_header("Cache-Control", IMMUTABLE)
@@ -494,7 +555,9 @@ class GatewayHandler(TimedHandler):
                 index_target = f"{target}/{INDEX}"
                 if self.limited() and not self.node.is_local(index_target):
                     self.need_network()  # the directory may be stored without its index.html
+                log(f"gateway: serving {index_target}", LOG_DEBUG)
                 return self.serve_file(index_target, entry["size"], INDEX, cache)
+        log(f"gateway: listing {target} ({len(entries)} entries)", LOG_DEBUG)
         title = "/" + "/".join([segments[1], segments[2], *names]) + "/"
         self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, bool(names)), cache)
 
@@ -518,6 +581,7 @@ class GatewayHandler(TimedHandler):
         else:
             status, start, length = 206, byte_range[0], byte_range[1] - byte_range[0] + 1
             headers["Content-Range"] = f"bytes {byte_range[0]}-{byte_range[1]}/{size}"
+        log(f"gateway: {target} as {content_type}, {length} bytes from byte {start} of {size}", LOG_DEBUG)
 
         if self.command == "HEAD":
             return self.send_stream(status, content_type, length, headers, iter(()))
