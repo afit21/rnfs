@@ -520,7 +520,8 @@ class RnfsNode:
                         alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
                         timeout=self.config.lookup_timeout, is_known=self._is_known,
                         on_answer=self._answered, on_failure=self.routing.failed,
-                        exclude=lambda node_id: node_id in contacted or self.routing.is_banned(node_id))
+                        exclude=lambda node_id: node_id in contacted or self.routing.is_banned(node_id),
+                        report=lambda text: log(text, LOG_DEBUG))
         lookup.find_closest()
         log(f"joined the DHT: {plural(self.routing.node_count(), 'server')} known", LOG_NOTICE)
 
