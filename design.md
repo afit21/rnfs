@@ -22,8 +22,8 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel.
 - `rnfs/debuglog.py` — the debug log file (`debug_log`, `daemon --debug-log`), `<rnfs dir>/debug.log` (0600),
   started by the daemon before the node: version first, then every rnfs message (warnings and errors logged in
-  an `except` block with their traceback), RNS's own log lines (copied from `RNS.logdest = LOG_CALLBACK`, which
-  still prints them), threads that die (`threading.excepthook`), a status line every 5 minutes (`status_line`:
+  an `except` block with their traceback), RNS's own log lines at Info or more severe (`RNS_LEVEL`; copied from
+  `RNS.logdest = LOG_CALLBACK`, which still prints all of them), threads that die (`threading.excepthook`), a status line every 5 minutes (`status_line`:
   the node's status, open links, each interface up or down), and gateway requests, numbered (`tag`). Each start
   and every 16 MiB moves the file to `debug.log.1`. Lookups report their queries through `Lookup(report=)` (dht
   stays free of RNS), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.

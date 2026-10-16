@@ -5,8 +5,10 @@
   is moved there too and a new one begun, also with the version first, so the two hold at most 2 × MAX_SIZE.
 - Every rnfs message at every level, whatever verbosity the console shows (rnfs.log hands each one here), with
   the thread that logged it, and, for a warning or error logged while handling an exception, its traceback.
-- Reticulum's own messages at its loglevel (interfaces failing to connect, paths, links), copied from its log
-  output, which still goes to the console as before; threads that die of an exception; and a status line every
+- Reticulum's own messages at Info and more severe (RNS_LEVEL) that its loglevel lets through: interfaces
+  failing to connect, sockets dropping and reconnecting. Its Verbose and Debug detail (handshakes, ratchets,
+  table cleaning, other nodes' announces) isn't copied, and rnfs logs what matters of links itself. The console
+  still gets all of RNS's output as before. Also threads that die of an exception, and a status line every
   STATUS_INTERVAL: the node's counts, its open links and each interface's state.
 - Gateway requests (rnfs/gateway.py) are numbered, and the lines logged on a request's thread carry its number.
 
@@ -31,6 +33,7 @@ from rnfs.fsutil import printable
 DEBUG_LOG_FILE = "debug.log"
 MAX_SIZE = 16 * 1024 * 1024  # bytes per file; the one before is kept as debug.log.1
 STATUS_INTERVAL = 300.0  # seconds between status lines
+RNS_LEVEL = 4  # RNS.LOG_INFO: Reticulum's own messages this severe or more are copied
 # RNS's loglevels by number, named as its log lines name them
 LEVEL_NAMES = {0: "Critical", 1: "Error", 2: "Warning", 3: "Notice", 4: "Info", 5: "Verbose", 6: "Debug",
                7: "Pathing", 8: "Extra"}
@@ -168,9 +171,11 @@ def _rns_output(logstring: str):
         return
     match = _RNS_LINE.fullmatch(logstring)
     if match and match.group(1) in _LEVEL_NUMBERS:
-        debug.write(_LEVEL_NUMBERS[match.group(1)], "RNS", match.group(2))
+        level = _LEVEL_NUMBERS[match.group(1)]
+        if level <= RNS_LEVEL:
+            debug.write(level, "RNS", match.group(2))
     else:
-        debug.write(rnfs_log.LOG_INFO, "RNS", logstring)
+        debug.write(rnfs_log.LOG_INFO, "RNS", logstring)  # a format without levels: kept, as it can't be told
 
 
 def start(config) -> DebugLog:

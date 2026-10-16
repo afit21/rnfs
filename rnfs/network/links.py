@@ -34,15 +34,24 @@ ESTABLISH_GRACE = 5  # seconds past RNS's own establishment timeout before givin
 DEADLINE_FACTOR = 2  # a request other than /blocks may take this many times RNS's own request timeout
 # What RNS adds to rtt × traffic_timeout_factor for its request timeout (Link.request with timeout=None)
 RESPONSE_GRACE = protocol.REQUEST_TIMEOUT_WITHOUT_RTT
-# Why RNS closed a link (Link.teardown_reason), for the log
-CLOSE_REASONS = {RNS.Link.TIMEOUT: "timed out", RNS.Link.INITIATOR_CLOSED: "closed by this node",
-                 RNS.Link.DESTINATION_CLOSED: "closed by the other node"}
+# Link.teardown_reason: a timeout, or which end closed it (the one that opened it, or the other)
+LINK_TIMEOUT, INITIATOR_CLOSED, DESTINATION_CLOSED = (RNS.Link.TIMEOUT, RNS.Link.INITIATOR_CLOSED,
+                                                       RNS.Link.DESTINATION_CLOSED)
 RECEIPT_FAILED = RNS.RequestReceipt.FAILED  # a request RNS gave up on
 
 
 def close_reason(link) -> str:
-    """Why link closed, as the log says it."""
-    return CLOSE_REASONS.get(getattr(link, "teardown_reason", None), "closed")
+    """Why link closed, as the log says it: timed out, or closed by this node or the other. RNS names the end
+    that closed it by its role, so for a link the other node opened (link.initiator false) they swap."""
+    reason = getattr(link, "teardown_reason", None)
+    if reason == LINK_TIMEOUT:
+        return "timed out"
+    ours = INITIATOR_CLOSED if getattr(link, "initiator", True) else DESTINATION_CLOSED
+    if reason == ours:
+        return "closed by this node"
+    if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
+        return "closed by the other node"
+    return "closed"
 
 
 def path_description(node_id: bytes) -> str:

@@ -600,7 +600,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `max_records` | `100000` | Provider records stored for others |
 | `ban_time` | `3600` | How long a node that sent a bad block is ignored |
 | `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |
-| `debug_log` | `false` | Also write `<rnfs dir>/debug.log` for diagnosing problems (`daemon --debug-log`): it begins with the daemon's version, then has every rnfs message at every level whatever `verbosity` is (which nodes are asked, which fail and why, links that fail or close), Reticulum's own messages (interfaces that can't connect), each gateway request with its outcome, errors with tracebacks, and a status line every 5 minutes. It names what you fetched and browsed, so it is readable by you only and never sent anywhere; each start keeps the previous run's as `debug.log.1`, and the two stay under 32 MiB |
+| `debug_log` | `false` | Also write `<rnfs dir>/debug.log` for diagnosing problems (`daemon --debug-log`): it begins with the daemon's version, then has every rnfs message at every level whatever `verbosity` is (which nodes are asked, which fail and why, links that fail or close), Reticulum's own messages at Info and above (interfaces that can't connect or drop; not its debug detail), each gateway request with its outcome, errors with tracebacks, and a status line every 5 minutes. It names what you fetched and browsed, so it is readable by you only and never sent anywhere; each start keeps the previous run's as `debug.log.1`, and the two stay under 32 MiB |
 
 **Storage**
 

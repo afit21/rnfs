@@ -11,7 +11,8 @@ Added:
 - A debug log file, for diagnosing problems: `debug_log = true` in `rnfs.toml`, or `rnfs daemon --debug-log`,
   writes `<rnfs dir>/debug.log`. It begins with the daemon's version (then the Python, RNS and LXMF versions,
   the platform and the settings changed from the defaults), and has every rnfs message at every level whatever
-  `verbosity` is; Reticulum's own messages, such as an interface that can't connect; each gateway request,
+  `verbosity` is; Reticulum's own messages at Info and more severe, such as an interface that can't connect or a
+  socket that drops (its Verbose and Debug detail stays on the console only); each gateway request,
   numbered, with the headers that decide it, what was decided (stored or fetched, type, range) and its status,
   size and time; errors with tracebacks, and threads that die; and a status line every 5 minutes (counts,
   open links, each interface up or down). New detail, at debug level: each DHT lookup's queries (which node

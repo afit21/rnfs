@@ -143,6 +143,18 @@ class MessagesTest(DebugLogTestCase):
         self.assertEqual(len(self.logged("an rnfs line")), 1)  # by rnfs.log's sink, not again as RNS output
         self.assertIn("rnfs: an rnfs line", self.logged("an rnfs line")[0])
 
+    def test_rns_detail_below_info_isnt_copied(self):
+        RNS.loglevel = RNS.LOG_DEBUG
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            RNS.log("Cleaning known destinations at background priority...", RNS.LOG_DEBUG)
+            RNS.log("Link establishment timed out", RNS.LOG_VERBOSE)
+            RNS.log("Reconnected socket for TCPInterface[backbone]", RNS.LOG_INFO)
+        self.assertIn("Cleaning known destinations", out.getvalue())  # the console is as before
+        self.assertFalse(self.logged("Cleaning known destinations"))
+        self.assertFalse(self.logged("Link establishment timed out"))
+        self.assertTrue(self.logged("RNS: Reconnected socket"))
+
     def test_a_thread_that_dies_is_logged(self):
         def die():
             """Raise in a thread."""
