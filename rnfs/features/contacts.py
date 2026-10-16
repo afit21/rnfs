@@ -11,7 +11,8 @@
   or probe the address book). Wherever the CLI takes a node ID (`get --from`, `ping`, `pin remote`), a node
   contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf"), and trusts
   senders that has(address, "lxmf") finds.
-- Stored in <state dir>/contacts.json (atomic, UTF-8), at most MAX_CONTACTS entries.
+- Stored in the state database's contacts table (rnfs.statedb), each change written at once, durably; at most
+  MAX_CONTACTS entries.
 
 No RNS at module level (the CLI imports this module).
 """
@@ -26,10 +27,8 @@ from rnfs.features._common import LOG_INFO, LOG_WARNING
 from rnfs.fsutil import printable
 
 NAME = "contacts"
-CONTACTS_FILE = "contacts.json"
-STATE_VERSION = 1
 KINDS = ("name", "node", "lxmf")
-MAX_CONTACTS = 10_000  # an address book is typed in by hand; this only bounds the state file
+MAX_CONTACTS = 10_000  # an address book is typed in by hand; this only bounds the saved state
 EXPAND_AGE = 60.0  # seconds a nick's resolved CID is reused when a target starts with a contact's nick
 _NICK = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 _HEX_ID = re.compile(r"[0-9a-f]{32}")
@@ -70,40 +69,70 @@ def check_kind(kind) -> str:
     return kind
 
 
+def import_contacts(value, tx) -> int:
+    """Import contacts.json (statedb.migrate): its contacts replace the contacts table, each checked as rnfs 0.1.4
+    loaded it (a malformed one is logged and skipped), at most MAX_CONTACTS. Anything but an object with a
+    "contacts" object imports nothing. Returns the number imported."""
+    tx.execute("DELETE FROM contacts")
+    entries = value.get("contacts") if isinstance(value, dict) else None
+    if not isinstance(entries, dict):
+        return 0
+    count = 0
+    for nick, entry in entries.items():
+        try:
+            check_nick(nick)
+            tx.execute("INSERT INTO contacts (nick, kind, id) VALUES (?, ?, ?)",
+                       (nick, check_kind(entry["kind"]), parse_hex(entry["id"])))
+            count += 1
+        except (KeyError, TypeError, ValueError):
+            ContactsFeature._log(f"ignoring malformed contact {nick!r} in contacts.json", LOG_WARNING)
+        if count >= MAX_CONTACTS:
+            break
+    return count
+
+
 class ContactsFeature(Feature):
     """The address book. Thread-safe."""
 
     name = NAME
 
     def __init__(self, node):
-        """Load the address book from the state dir."""
+        """Load the address book from the state database."""
+        from rnfs import statedb
         super().__init__(node)
-        import os
-        self._path = os.path.join(node.config.state_dir, CONTACTS_FILE)
         self._lock = threading.Lock()
         self._contacts: dict[str, tuple[str, bytes]] = {}  # nick -> (kind, hash)
         self._nicks: dict[tuple[str, bytes], int] = {}  # (kind, hash) -> how many nicks name it, for has()
+        self._dirty: set[str] = set()  # nicks changed (or deleted) whose save failed, written with the next
         # name -> (CID, monotonic time of the resolve that found it), reused for EXPAND_AGE
         self._expanded: dict[bytes, tuple[str, float]] = {}
-        self._load()
+        self._db = statedb.connect(node.config.state_dir)
+        try:
+            self._load()
+        except BaseException:
+            self.close()
+            raise
 
     # State
 
     def _load(self):
-        """Read contacts.json, skipping malformed entries (it is our own file, but may be edited by hand)."""
-        from rnfs.content.storage import read_json
-        state = read_json(self._path)
-        entries = state.get("contacts") if isinstance(state, dict) else None
-        if not isinstance(entries, dict):
-            return
-        for nick, entry in entries.items():
+        """Read the contacts table, by nick; malformed rows are logged and deleted, as are any past MAX_CONTACTS."""
+        bad = []
+        for nick, kind, ident in self._db.query("SELECT nick, kind, id FROM contacts ORDER BY nick"):
+            if len(self._contacts) >= MAX_CONTACTS:
+                bad.append((nick,))  # never added (the address book is full): dropped, as from contacts.json
+                continue
             try:
                 check_nick(nick)
-                self._set(nick, (check_kind(entry["kind"]), parse_hex(entry["id"])))
-            except (KeyError, TypeError, ValueError):
-                self._log(f"ignoring malformed contact {nick!r} in {self._path}", LOG_WARNING)
-            if len(self._contacts) >= MAX_CONTACTS:
-                break
+                if not isinstance(ident, bytes) or len(ident) != 16:
+                    raise ValueError("not a 16-byte hash")
+                self._set(nick, (check_kind(kind), ident))
+            except (TypeError, ValueError):
+                self._log(f"ignoring malformed contact {nick!r}", LOG_WARNING)
+                bad.append((nick,))
+        if bad:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM contacts WHERE nick = ?", bad)
 
     def _set(self, nick: str, value: tuple[str, bytes] | None):
         """Set or (None) delete a contact, keeping _nicks in step (lock held, or loading)."""
@@ -116,12 +145,20 @@ class ContactsFeature(Feature):
             self._contacts[nick] = value
             self._nicks[value] = self._nicks.get(value, 0) + 1
 
-    def _save(self):
-        """Write contacts.json atomically (lock held)."""
-        from rnfs.content.storage import write_json
-        write_json(self._path, {"version": STATE_VERSION,
-                                "contacts": {nick: {"kind": kind, "id": ident.hex()}
-                                             for nick, (kind, ident) in sorted(self._contacts.items())}})
+    def _save(self, nick: str):
+        """Write nick's row, and those of earlier changes whose save failed, durably (lock held). If it fails they
+        are written with the next change."""
+        self._dirty.add(nick)
+        rows = [(other, *self._contacts[other]) for other in self._dirty if other in self._contacts]
+        gone = [(other,) for other in self._dirty if other not in self._contacts]
+        with self._db.transaction(durable=True) as tx:
+            tx.executemany("DELETE FROM contacts WHERE nick = ?", gone)
+            tx.executemany("INSERT OR REPLACE INTO contacts (nick, kind, id) VALUES (?, ?, ?)", rows)
+        self._dirty.clear()
+
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        self._db.close()
 
     @staticmethod
     def _log(message: str, level: int = LOG_INFO):
@@ -144,7 +181,7 @@ class ContactsFeature(Feature):
             if nick not in self._contacts and len(self._contacts) >= MAX_CONTACTS:
                 raise ValueError(f"the address book is full ({MAX_CONTACTS} contacts)")
             self._set(nick, (kind, ident))
-            self._save()
+            self._save(nick)
         self._log(f"added {nick}: {kind} {ident.hex()}")
         return {"nick": nick, "kind": kind, "id": ident.hex()}
 
@@ -155,7 +192,7 @@ class ContactsFeature(Feature):
             if nick not in self._contacts:
                 raise NotFound(f"no contact {nick}")
             self._set(nick, None)
-            self._save()
+            self._save(nick)
 
     def list(self) -> list[dict]:
         """Every contact, by nick."""

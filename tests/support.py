@@ -1,9 +1,15 @@
 """Shared test helpers (not a test module): what the platform running the tests can do, for skipping tests that need
 POSIX features, and small doubles and helpers several test modules use."""
+import json
 import os
 import socket
+import sqlite3
 import tempfile
 import time
+from contextlib import contextmanager
+from unittest import mock
+
+from rnfs import statedb
 
 # Unix permission bits (modes, umask, the execute bit): Windows has none, and its st_mode is synthesised
 POSIX_MODES = os.name != "nt"
@@ -69,3 +75,43 @@ def wait_for(condition, timeout: float = 10.0, what: str | None = None, interval
     if not result and what is not None:
         raise AssertionError(f"timed out waiting for {what}")
     return result
+
+
+# The state database (rnfs.statedb)
+
+
+def state_rows(state_dir: str, sql: str, params=()) -> list[tuple]:
+    """The rows a read of the state database in state_dir gives, through a connection of its own (closed again),
+    so it sees only what was committed: for tests checking what a store saved."""
+    conn = sqlite3.connect(os.path.join(state_dir, statedb.DB_FILE))
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def state_execute(state_dir: str, sql: str, params=()):
+    """Run one write on the state database in state_dir and commit it, through a connection of its own: for tests
+    planting rows a store must reject at load."""
+    conn = sqlite3.connect(os.path.join(state_dir, statedb.DB_FILE))
+    try:
+        with conn:
+            conn.execute(sql, params)
+    finally:
+        conn.close()
+
+
+def write_legacy(state_dir: str, name: str, value=None, text: str | None = None) -> str:
+    """Write a JSON state file as rnfs 0.1.4 did (value as JSON, or text as is) into state_dir; its path."""
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text if text is not None else json.dumps(value))
+    return path
+
+
+@contextmanager
+def failing_commits(error: str = "disk I/O error"):
+    """Within the with block, every state database commit fails as a full or failing disk makes it fail."""
+    with mock.patch.object(statedb._Database, "_commit", side_effect=sqlite3.OperationalError(error)):
+        yield

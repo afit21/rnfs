@@ -53,7 +53,7 @@ class PlainTextTest(unittest.TestCase):
         """An offline node that has the hostile file pinned (source user), and the page's data dir."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.node, _ = helpers.make_nodes(self.tmp.name)
+        _, self.node, _ = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.node.stop)
         self.cid = self.node.add_stream(io.BytesIO(HOSTILE.encode("utf-8")))["cid"]
         self.data_dir = os.path.join(self.tmp.name, "page-data")

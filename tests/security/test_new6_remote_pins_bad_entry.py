@@ -5,9 +5,12 @@ outside it: a source that is a JSON list or object is unhashable, so the TypeErr
 and _start_threads, and the node failed to start. The fixed node skips such entries (with a log line) and
 resumes the rest.
 
+The pins waiting now live in the state database: a remote_pins.json from an earlier version is imported at the
+first start, skipping malformed entries the same way, and malformed rows in the database are skipped at load.
+
 The pinning node is an offline node; a provider joined to it by tests.test_node's NetClient holds the content.
-The file is written as a damaged or hand-edited one might be, and the node is started the way RnfsNode.__init__
-starts it (_start_threads).
+The file (or row) is written as a damaged or hand-edited one might be, and the node is started the way
+RnfsNode.__init__ starts it (_start_threads).
 """
 import io
 import json
@@ -22,8 +25,8 @@ from rnfs import node as node_module
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import remote_source
-from rnfs.node import REMOTE_PINS_FILE, RnfsNode
-from tests.support import wait_for
+from rnfs.node import RnfsNode
+from tests.support import state_execute, wait_for
 from tests.test_names import FakeNetwork
 from tests.test_node import A_ID, B_ID, NetClient
 
@@ -65,12 +68,19 @@ class RemotePinsBadEntryTest(unittest.TestCase):
         self.addCleanup(node.stop)
         return node
 
-    def start_with(self, entries) -> RnfsNode:
-        """Write entries as B's remote_pins.json, then open B and start it as RnfsNode.__init__ does."""
+    def start_with(self, entries=None, rows=()) -> RnfsNode:
+        """Write entries as B's remote_pins.json (from an earlier version) or rows into its remote_pins table, then
+        open B and start it as RnfsNode.__init__ does."""
         state_dir = Config(rnfs_dir=os.path.join(self.tmp.name, "b")).state_dir
         os.makedirs(state_dir, exist_ok=True)
-        with open(os.path.join(state_dir, REMOTE_PINS_FILE), "w", encoding="utf-8") as f:
-            json.dump(entries, f)
+        if entries is not None:
+            with open(os.path.join(state_dir, "remote_pins.json"), "w", encoding="utf-8") as f:
+                json.dump(entries, f)
+        if rows:
+            self.open("b", B_ID).stop()  # creates the database
+            for position, (source, cid) in enumerate(rows):
+                state_execute(state_dir, "INSERT INTO remote_pins (position, source, cid) VALUES (?, ?, ?)",
+                              (position, source, cid))
         node = self.open("b", B_ID)
         node.routing.heard(A_ID)
         try:
@@ -89,8 +99,19 @@ class RemotePinsBadEntryTest(unittest.TestCase):
                                     [SOURCE, str(self.cid)]])
         self.assertTrue(wait_for(lambda: SOURCE in node.storage.pins().get(self.cid, set()), 15),
                         "the good remote pin wasn't resumed")
-        self.assertTrue(any("4 malformed entries" in message and REMOTE_PINS_FILE in message
+        self.assertTrue(any("4 malformed entries" in message and "remote_pins.json" in message
                             for message in logged), logged)
+
+    def test_malformed_rows_are_skipped(self):
+        """Rows whose source isn't text or whose CID isn't a binary CID are skipped and logged; the good one is
+        still fetched."""
+        logged = []
+        with mock.patch.object(node_module, "log", side_effect=lambda message, *args: logged.append(message)):
+            node = self.start_with(rows=[(SOURCE, str(self.cid)), (SOURCE, self.cid.binary[:-1]),
+                                         (SOURCE.encode(), self.cid.binary), (SOURCE, self.cid.binary)])
+        self.assertTrue(wait_for(lambda: SOURCE in node.storage.pins().get(self.cid, set()), 15),
+                        "the good remote pin wasn't resumed")
+        self.assertTrue(any("3 malformed remote pins" in message for message in logged), logged)
 
 
 if __name__ == "__main__":

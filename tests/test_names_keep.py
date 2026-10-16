@@ -12,6 +12,7 @@ from unittest import mock
 import RNS
 from RNS.vendor import umsgpack
 
+from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content.cid import RAW, Cid
 from rnfs.features import keepers
@@ -23,7 +24,7 @@ from rnfs.network import server
 from rnfs.node import RnfsNode
 from rnfs.publisher import DhtKey
 
-from tests.support import FakeClock
+from tests.support import FakeClock, failing_commits, state_execute, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 from tests.test_server import FakeBackend, FakeDestination, FakeLink
@@ -164,12 +165,18 @@ class KeeperStoreTest(unittest.TestCase):
         """A store in a temporary directory."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.path = os.path.join(self.tmp.name, "keepers.json")
+        self.state = self.tmp.name
         self.identity = RNS.Identity()
         self.name = name_for_identity(self.identity)
 
+    def open(self, max_names: int = 10) -> KeeperStore:
+        """A store over the state directory (closed before the directory is removed)."""
+        store = KeeperStore(self.state, max_names)
+        self.addCleanup(store.close)
+        return store
+
     def test_only_kept_names_store_newer_records(self):
-        store = KeeperStore(self.path, 10)
+        store = self.open()
         self.assertFalse(store.offer(signed(self.identity, 1, CID1)))  # not kept
         store.keep(self.name, USER)
         self.assertTrue(store.offer(signed(self.identity, 2, CID1)))
@@ -178,22 +185,71 @@ class KeeperStoreTest(unittest.TestCase):
         self.assertEqual(store.provided_keys(), {name_key(self.name)})
 
     def test_persisted_and_reverified(self):
-        store = KeeperStore(self.path, 10)
+        store = self.open()
         store.keep(self.name, USER)
         store.offer(signed(self.identity, 5, CID2))
         store.save()
-        again = KeeperStore(self.path, 10)
+        again = self.open()
         self.assertEqual((again.get(self.name).sequence, again.reasons(self.name)), (5, {USER}))
-        # A record damaged on disk is dropped rather than served
-        with open(self.path, encoding="utf-8") as f:
-            text = f.read()
+        # A record damaged on disk is dropped rather than served, and from its row; the name stays kept
+        (text,), = state_rows(self.state, "SELECT record FROM keepers")
         record_hex = again.get(self.name).signature.hex()
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write(text.replace(record_hex, "00" * 64))
-        self.assertIsNone(KeeperStore(self.path, 10).get(self.name))
+        state_execute(self.state, "UPDATE keepers SET record = ?", (text.replace(record_hex, "00" * 64),))
+        damaged = self.open()
+        self.assertIsNone(damaged.get(self.name))
+        self.assertEqual(damaged.reasons(self.name), {USER})
+        self.assertEqual(state_rows(self.state, "SELECT reasons, record FROM keepers"), [('["user"]', None)])
+
+    def test_saves_write_only_the_names_changed(self):
+        """A save writes the rows of the names kept, released or given a record since the last save."""
+        store = self.open()
+        other = bytes([1] * 16)
+        store.keep(self.name, USER)
+        store.keep(other, USER)
+        store.save()
+        self.assertEqual(sorted(state_rows(self.state, "SELECT name, reasons, record FROM keepers")),
+                         sorted([(self.name, '["user"]', None), (other, '["user"]', None)]))
+        state_execute(self.state, "UPDATE keepers SET reasons = '[\"follow\", \"user\"]' WHERE name = ?", (other,))
+        store.offer(signed(self.identity, 1, CID1))
+        store.keep(self.name, "follow")
+        store.save()
+        rows = {name: (reasons, record) for name, reasons, record in
+                state_rows(self.state, "SELECT name, reasons, record FROM keepers")}
+        self.assertEqual(rows[other], ('["follow", "user"]', None))  # not changed here: not written
+        self.assertEqual(rows[self.name], ('["follow", "user"]', statedb.dump(
+            [field.hex() for field in store.get(self.name).wire()])))
+        store.release(self.name, USER)
+        store.release(self.name, "follow")
+        store.save()
+        self.assertEqual(state_rows(self.state, "SELECT name FROM keepers"), [(other,)])
+
+    def test_failed_save_is_tried_again(self):
+        """A save that fails changes nothing saved; the next save writes what it would have."""
+        store = self.open()
+        store.keep(self.name, USER)
+        with failing_commits():
+            with self.assertRaises(OSError):
+                store.save()
+        self.assertEqual(state_rows(self.state, "SELECT name FROM keepers"), [])
+        self.assertEqual(store.reasons(self.name), {USER})
+        store.save()
+        self.assertEqual(self.open().reasons(self.name), {USER})
+
+    def test_malformed_rows_are_dropped_and_deleted(self):
+        """Rows whose name, reasons or record don't parse, or with no known reason, are dropped and deleted."""
+        store = self.open()
+        store.keep(self.name, USER)
+        store.save()
+        for row in ((b"short", '["user"]', None), ("0" * 32, '["user"]', None), (bytes([2] * 16), '["nobody"]', None),
+                    (bytes([3] * 16), "{not json", None), (bytes([4] * 16), "5", None),
+                    (bytes([5] * 16), '["user"]', '["zz"]'), (bytes([6] * 16), '["user"]', "7")):
+            state_execute(self.state, "INSERT INTO keepers (name, reasons, record) VALUES (?, ?, ?)", row)
+        again = self.open()
+        self.assertEqual(again.names(), [self.name])
+        self.assertEqual(state_rows(self.state, "SELECT name FROM keepers"), [(self.name,)])
 
     def test_bound_excludes_own_names(self):
-        store = KeeperStore(self.path, 1)
+        store = self.open(1)
         store.keep(bytes([1] * 16), USER)
         with self.assertRaises(ValueError):
             store.keep(bytes([2] * 16), USER)
@@ -202,7 +258,7 @@ class KeeperStoreTest(unittest.TestCase):
         self.assertEqual(store.count(), 2)
 
     def test_release_drops_record_with_last_reason(self):
-        store = KeeperStore(self.path, 10)
+        store = self.open()
         store.keep(self.name, USER)
         store.keep(self.name, "follow")
         store.offer(signed(self.identity, 1, CID1))
@@ -426,11 +482,18 @@ class KeeperNodesTest(unittest.TestCase):
         cid2 = self.publish(b"version two")
         self.a.records.store(cid2.key, A_ID)
         self.b.names.offer(self.name, 2, cid2, 0.0)
-        with mock.patch.object(follow, "_save", side_effect=OSError(28, "No space left on device")):
+        # Only the follow feature's commits fail: its pins are saved
+        failure = statedb.StateDbError("database or disk is full")
+        with mock.patch.object(follow._db, "transaction", side_effect=failure):
             self.assertTrue(follow.check(self.name, network=False))
         pins = self.b.storage.pins()
         self.assertEqual(pins.get(cid2), {follow_source(self.name)})
         self.assertNotIn(cid1, pins)
+        # The name's new target is written by the next save, whichever name it is for
+        state = self.b.config.state_dir
+        self.assertEqual(state_rows(state, "SELECT pinned FROM follow WHERE name = ?", (self.name,)), [(cid1.binary,)])
+        follow.follow(bytes([1] * 16))
+        self.assertEqual(state_rows(state, "SELECT pinned FROM follow WHERE name = ?", (self.name,)), [(cid2.binary,)])
 
     def test_keeper_records_below_the_known_sequence_are_refused(self):
         # L28: a keeper serving an old (validly signed) record can't make this node keep and re-serve it

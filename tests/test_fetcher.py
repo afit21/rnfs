@@ -24,6 +24,7 @@ from rnfs import fetcher as fetcher_module
 from rnfs.fetcher import Fetcher
 from rnfs.network import protocol, server
 from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
+from tests.support import failing_commits, state_execute, state_rows
 
 OWN = bytes(16)
 P1, P2, P3, P4 = (bytes([i]) * 16 for i in (1, 2, 3, 4))
@@ -130,6 +131,7 @@ class FetcherTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.config = Config(rnfs_dir=self.tmp.name, max_parallel_providers=3, slow="no")
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
         self.routing = RoutingTable(OWN, self.config)
         self.client = FakeClient()
         self.network: dict[Cid, bytes] = {}
@@ -144,8 +146,10 @@ class FetcherTest(unittest.TestCase):
             lookup = FakeLookup(self.runs)
             self.lookups.append(lookup)
             return lookup
-        return Fetcher(self.storage, self.client, self.config, OWN, self.routing, make_lookup, slow,
-                       os.path.join(self.tmp.name, "state"), busy_delay=0.01)
+        fetcher = Fetcher(self.storage, self.client, self.config, OWN, self.routing, make_lookup, slow,
+                          os.path.join(self.tmp.name, "state"), busy_delay=0.01)
+        self.addCleanup(fetcher.close)
+        return fetcher
 
     def put(self, cid: Cid, block: bytes):
         """Builder callback storing into the network."""
@@ -526,6 +530,7 @@ class ValidityTest(FetcherTest):
                 f.write(damage)
         # As after a restart, whose scan records the damaged files' lengths
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
         self.fetcher = self.make_fetcher()
         self.runs.append([P1])
         self.fetch_all(built.cid)
@@ -877,19 +882,45 @@ class LimitTest(FetcherTest):
         self.assertFalse(self.fetcher.is_invalid(own.cid))
 
     def test_invalid_roots_are_capped_and_saved_in_batches(self):
-        writes = []
-        real = fetcher_module.write_json
+        state = os.path.join(self.tmp.name, "state")
         with mock.patch.object(fetcher_module, "MAX_INVALID", 3), \
-                mock.patch.object(fetcher_module, "write_json", lambda *a: (writes.append(a), real(*a))):
+                mock.patch.object(self.fetcher._db, "transaction", wraps=self.fetcher._db.transaction) as writes:
             roots = [Cid.for_block(RAW, b"%d" % i) for i in range(5)]
             for root in roots:
                 self.fetcher.mark_invalid(root)
-            self.assertEqual(writes, [])
+            self.assertEqual(writes.call_count, 0)
+            self.assertEqual(state_rows(state, "SELECT cid FROM invalid"), [])
             self.fetcher.save()
             self.fetcher.save()
-            self.assertEqual(len(writes), 1)
+            self.assertEqual(writes.call_count, 1)
             self.assertEqual([self.fetcher.is_invalid(r) for r in roots], [False, False, True, True, True])
             self.assertEqual([self.make_fetcher().is_invalid(r) for r in roots], [False, False, True, True, True])
+            # The oldest goes when another is marked; only the change is written
+            self.fetcher.mark_invalid(roots[0])
+            self.fetcher.save()
+            self.assertEqual([self.make_fetcher().is_invalid(r) for r in roots], [True, False, False, True, True])
+            self.assertEqual(state_rows(state, "SELECT cid FROM invalid ORDER BY position"),
+                             [(roots[3].binary,), (roots[4].binary,), (roots[0].binary,)])
+
+    def test_failed_invalid_save_is_tried_again(self):
+        root = Cid.for_block(RAW, b"bad")
+        self.fetcher.mark_invalid(root)
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.fetcher.save()
+        self.fetcher.save()
+        self.assertTrue(self.make_fetcher().is_invalid(root))
+
+    def test_invalid_rows_are_skipped_and_deleted(self):
+        root = Cid.for_block(RAW, b"bad")
+        self.fetcher.mark_invalid(root)
+        self.fetcher.save()
+        state = os.path.join(self.tmp.name, "state")
+        state_execute(state, "INSERT INTO invalid (cid, position) VALUES (?, 7)", (str(root),))
+        fetcher = self.make_fetcher()
+        self.assertTrue(fetcher.is_invalid(root))
+        fetcher.save()
+        self.assertEqual(state_rows(state, "SELECT cid FROM invalid"), [(root.binary,)])
 
 
 MAX_BATCH_BYTES = BATCH * 80 * 1024  # what one fake response can hold at most

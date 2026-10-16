@@ -8,7 +8,7 @@ import RNS
 
 from rnfs.fsutil import printable
 
-# Warnings a result keeps (a write-out skipping 50,000 entries mustn't make a 16 MB response or jobs.json)
+# Warnings a result keeps (a write-out skipping 50,000 entries mustn't make a 16 MB response or saved job)
 MAX_WARNINGS = 100
 
 # Re-exported so callers only need this module for logging

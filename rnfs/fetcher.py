@@ -58,7 +58,6 @@ runs the fetch, from the events they queue.
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
 """
-import os
 import queue
 import threading
 import time
@@ -67,12 +66,13 @@ from contextlib import contextmanager
 from itertools import islice
 from typing import Callable, Iterator
 
+from rnfs import statedb
 from rnfs.config import Config
 from rnfs.constants import (CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE,
                             MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD)
 from rnfs.content import walker
 from rnfs.content.cid import Cid
-from rnfs.content.storage import Storage, read_json, write_json
+from rnfs.content.storage import Storage
 from rnfs.content.walker import Expect
 from rnfs.errors import InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural
@@ -86,8 +86,23 @@ WINDOW = 32  # chunks fetched ahead of what a byte-range read has written out
 POLL = 0.5  # seconds between checks while waiting for responses
 DAG_NODE_GUESS = 8 * KIB  # assumed size of a DAG node block when reserving a request's batch
 MAX_BATCH = 32  # CIDs reserved for one request at most; the client sends as many as fit one packet
-INVALID_FILE = "invalid.json"
 MAX_INVALID = 10_000  # roots remembered as invalid; past this the oldest is forgotten
+
+
+def import_invalid(value: list, tx) -> int:
+    """Import invalid.json (statedb.migrate): its roots, oldest first, replace the invalid table; one that doesn't
+    parse is skipped, as rnfs 0.1.4 did, and only the newest MAX_INVALID are kept. Returns the number imported."""
+    tx.execute("DELETE FROM invalid")
+    roots: OrderedDict[Cid, None] = OrderedDict()
+    for text in value:
+        try:
+            roots[Cid.parse(text)] = None
+        except (ValueError, TypeError):
+            continue
+    kept = list(roots)[-MAX_INVALID:]
+    tx.executemany("INSERT INTO invalid (cid, position) VALUES (?, ?)",
+                   [(cid.binary, position) for position, cid in enumerate(kept)])
+    return len(kept)
 # The DAG byte bound (dag_bound and fetch_dag; design.md, "DAG byte bound"). Writers cut chunks of CHUNK_SIZE,
 # or with FastCDC of over 16 KiB, so a file has at most one chunk per 16 KiB of content beyond its last; each
 # costs at most 51 bytes of file node (a [cid, size] child), plus about 1/255 of that for the levels above
@@ -256,17 +271,23 @@ class Fetcher:
         # RNS's (mesh.RnsPaths.info), and without it nothing is known and ranking falls back to reply order
         self.path_info: Callable[[bytes], mesh.PathInfo] = mesh.no_path_info
         self._lock = threading.Lock()
-        self._invalid_path = None if state_dir is None else os.path.join(state_dir, INVALID_FILE)
+        self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
-        self._invalid_dirty = False
-        if self._invalid_path is not None:
-            for text in read_json(self._invalid_path) or []:
+        self._invalid_saved: set = set()  # the binary CIDs the invalid table holds
+        self._invalid_position = 0  # the next root's position in the table: after every one saved
+        if self._db is not None:
+            for binary, position in self._db.query("SELECT cid, position FROM invalid ORDER BY position"):
+                self._invalid_saved.add(binary)
+                if isinstance(position, int):
+                    self._invalid_position = max(self._invalid_position, position + 1)
                 try:
-                    self._invalid[Cid.parse(text)] = None
-                except (ValueError, TypeError):
+                    self._invalid[Cid.from_bytes(binary)] = None
+                except ValueError:
                     continue
             while len(self._invalid) > MAX_INVALID:
                 self._invalid.popitem(last=False)
+        # Changed since the last save; a row that didn't parse, or past MAX_INVALID, is deleted by the next
+        self._invalid_dirty = len(self._invalid) != len(self._invalid_saved)
 
     @property
     def max_parallel(self) -> int:
@@ -303,15 +324,29 @@ class Fetcher:
         log(f"marked {root} invalid locally", LOG_WARNING)
 
     def save(self):
-        """Persist the invalid roots if they changed (the node calls this periodically and at shutdown)."""
-        if self._invalid_path is None:
+        """Persist the invalid roots added or forgotten since the last save, if any (the node calls this
+        periodically and at shutdown)."""
+        if self._db is None:
             return
         with self._lock:
             if not self._invalid_dirty:
                 return
-            # Written under the lock, so saves can't overtake each other; it is small and rarely changes
-            write_json(self._invalid_path, [str(cid) for cid in self._invalid])
+            # Written under the lock, so saves can't overtake each other; it rarely changes
+            current = [cid.binary for cid in self._invalid]
+            added = [binary for binary in current if binary not in self._invalid_saved]
+            gone = self._invalid_saved.difference(current)
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM invalid WHERE cid = ?", [(binary,) for binary in gone])
+                tx.executemany("INSERT OR REPLACE INTO invalid (cid, position) VALUES (?, ?)",
+                               [(binary, self._invalid_position + n) for n, binary in enumerate(added)])
+            self._invalid_position += len(added)
+            self._invalid_saved = set(current)
             self._invalid_dirty = False
+
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        if self._db is not None:
+            self._db.close()
 
 
 class Fetch:

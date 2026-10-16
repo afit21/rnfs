@@ -12,10 +12,13 @@ startup_announce_delay and every announce_interval. LXMF keeps its router state 
   --propagate, or automatically when direct delivery fails and lxmf_propagation_node is set. A propagation
   node only announcing itself is used only when the user asks (--nearest): it could be anyone's. The outbox
   records each message's state.
-- Receiving: messages with rnfs links go to a bounded inbox (state/lxmf_inbox.json). Links from senders in
-  lxmf_auto_fetch_from are fetched and pinned with source `lxmf:<sender>`, within lxmf_auto_fetch_quota per
-  sender; removing the message from the inbox releases those pins, and a message holding pins is never
-  dropped to make room for others. lxmf_accept_from restricts senders.
+- Receiving: messages with rnfs links go to a bounded inbox. Links from senders in lxmf_auto_fetch_from are
+  fetched and pinned with source `lxmf:<sender>`, within lxmf_auto_fetch_quota per sender; removing the
+  message from the inbox releases those pins, and a message holding pins is never dropped to make room for
+  others. lxmf_accept_from restricts senders.
+- The inbox and outbox are kept in the state database (rnfs.statedb, the lxmf_messages table) and saved in
+  batches, each save writing the records changed since the last; outbox messages still unfinished at a start
+  are marked failed (LXMF doesn't persist its outbound queue).
 - Messages waiting at lxmf_propagation_node are downloaded every lxmf_sync_interval.
 
 Everything received is untrusted: fields are parsed strictly and capped, text is capped and escaped when
@@ -74,8 +77,10 @@ SENDER_INTERVAL = 900.0  # seconds per token
 SENDER_BURST = 4
 SENDER_ALLOWANCES = 256  # senders whose allowance is remembered, least recently seen forgotten (back to full)
 MAX_ENTRY_BYTES = 16 * 1024  # an inbox record as JSON: links beyond it are dropped, then text is cut
-MAX_INBOX_BYTES = 4 * 1024 * 1024  # every inbox record as JSON (held in memory, rewritten on change)
+MAX_INBOX_BYTES = 4 * 1024 * 1024  # every inbox record as JSON (held in memory; a save writes those changed)
 OUTBOX_LIMIT = 200
+INBOX, OUTBOX = "inbox", "outbox"  # the MessageLog boxes: the lxmf_messages table's box, and their meta store
+MAX_ID = 2 ** 63 - 2  # largest record id: the next id must still fit SQLite's integers
 AUTO_QUEUE_LIMIT = 64  # auto-fetches waiting (taken round-robin by sender); more are skipped
 DELIVERY_LIMIT_KB = 256  # largest LXMF message accepted (LXMF's delivery_limit, in kB); also caps PN downloads
 HOLD_LIMIT = 32  # messages from senders not known yet, held while their identity is requested; more are dropped
@@ -419,60 +424,127 @@ def message_text(text: str | None, links: list[Link]) -> str:
 
 
 def _json_bytes(value) -> int:
-    """Bytes value takes as UTF-8 JSON, as MessageLog writes it."""
+    """Bytes value takes as UTF-8 JSON, as the state database stores a record (statedb.dump)."""
     return len(json.dumps(value, ensure_ascii=False).encode("utf-8", "backslashreplace"))
 
 
-def _write_json(path: str, value):
-    """Write value as UTF-8 JSON (non-ASCII as is, not as 6-byte escapes) to path atomically and durably: a
-    power loss leaves the old or the new file whole (an emptied inbox would leave lxmf: pins nothing releases)."""
-    from rnfs.content.storage import write_json
-    write_json(path, value, ensure_ascii=False)
+def _records(entries: list, limit: int, max_bytes: int | None, valid) -> tuple[list[dict], int]:
+    """The records a log keeps of entries (loaded from the database, or a JSON file), oldest first, and how many
+    were malformed: not a dict with an id (an int, 1 to MAX_ID) no earlier record has, that valid() accepts if
+    given. Of the others, the oldest past limit are dropped, then the oldest past max_bytes as JSON (one is kept
+    whatever its size)."""
+    kept, seen, bad = [], set(), 0
+    for entry in entries:
+        if isinstance(entry, dict) and type(entry.get("id")) is int and 0 < entry["id"] <= MAX_ID \
+                and entry["id"] not in seen and (valid is None or valid(entry)):
+            kept.append(entry)
+            seen.add(entry["id"])
+        else:
+            bad += 1
+    kept = kept[-limit:]
+    sizes = [_json_bytes(e) for e in kept]
+    total, first = sum(sizes), 0
+    while max_bytes is not None and len(kept) - first > 1 and total > max_bytes:
+        total -= sizes[first]
+        first += 1
+    return kept[first:], bad
+
+
+def _next_id(saved, entries: list[dict]) -> int:
+    """The id the next record gets: the saved next id (if it is an int that fits), past every record's."""
+    return max([saved if type(saved) is int and saved <= MAX_ID else 1] + [e["id"] + 1 for e in entries])
+
+
+def _import_log(box: str, value, tx, limit: int, max_bytes: int | None, valid, file: str) -> int:
+    """Import a message log file of rnfs 0.1.4 (statedb.migrate): its records replace box's, checked and bounded
+    as it loaded them, and it is clean only if every record was read. Returns the number of records imported."""
+    from rnfs import statedb
+    tx.execute("DELETE FROM lxmf_messages WHERE box = ?", (box,))
+    entries, clean, next_id = [], False, 1
+    if isinstance(value, dict):
+        messages = value.get("messages")
+        entries, bad = _records(messages if isinstance(messages, list) else [], limit, max_bytes, valid)
+        bad += not isinstance(messages, list)
+        if bad:
+            _log(f"dropped {bad} malformed record(s) from {file}", LOG_WARNING)
+        clean = not bad
+        next_id = _next_id(value.get("next_id"), entries)
+    tx.executemany("INSERT INTO lxmf_messages (box, id, record) VALUES (?, ?, ?)",
+                   [(box, entry["id"], statedb.dump(entry)) for entry in entries])
+    statedb.set_meta(tx, box, "next_id", next_id)
+    statedb.set_meta(tx, box, "clean", int(clean))
+    return len(entries)
+
+
+def import_inbox(value, tx) -> int:
+    """Import lxmf_inbox.json (statedb.migrate); the number of records imported."""
+    return _import_log(INBOX, value, tx, INBOX_LIMIT, MAX_INBOX_BYTES, _valid_inbox_entry, "lxmf_inbox.json")
+
+
+def import_outbox(value, tx) -> int:
+    """Import lxmf_outbox.json (statedb.migrate); the number of records imported."""
+    return _import_log(OUTBOX, value, tx, OUTBOX_LIMIT, None, _valid_outbox_entry, "lxmf_outbox.json")
 
 
 class MessageLog:
-    """A bounded list of message records with stable ids, saved atomically as UTF-8 JSON. Thread-safe.
+    """A bounded list of message records with stable ids, kept in the state database (rnfs.statedb) as one row
+    per record in its box: a save writes the records added, changed or removed since the last. Thread-safe.
 
     At most limit records and max_bytes of JSON are kept. To make room, the oldest record protect() is false
     for is dropped; a protected one only when every other is protected too. add() may also name records that
-    are dropped only for each other's (reserved). valid() checks records loaded from the file (malformed ones
-    are dropped; clean says whether the file was there and every record in it was read).
+    are dropped only for each other's (reserved). valid() checks records loaded (malformed ones are dropped;
+    clean says whether the box was saved whole, or imported from a whole file, and every record was read).
     """
 
-    def __init__(self, path: str, limit: int, max_bytes: int | None = None, protect=None, valid=None):
-        """Load path if it exists (malformed records are dropped)."""
-        self.path = path
+    def __init__(self, state_dir: str, box: str, limit: int, max_bytes: int | None = None, protect=None,
+                 valid=None):
+        """Load box's records from the state database in state_dir (malformed ones are dropped). Close it when
+        done."""
+        from rnfs import statedb
+        self.box = box
         self.limit = limit
         self.max_bytes = max_bytes
         self.protect = protect or (lambda entry: False)
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
-        self._dirty = False
+        self._dirty: set[int] = set()  # ids of records added, changed or removed since the last save
         self._next_id = 1
         self._entries: list[dict] = []
         self._sizes: dict[int, int] = {}  # id -> bytes as JSON
-        from rnfs.content.storage import read_json
-        stored = read_json(path)  # a damaged file is moved aside and gives None, as a missing one does
-        self.clean = False  # the file was there and every record in it was read
-        if isinstance(stored, dict):
-            entries = stored.get("messages")
-            bad, seen = 0 if isinstance(entries, list) else 1, set()
-            for entry in entries if isinstance(entries, list) else []:
-                if isinstance(entry, dict) and type(entry.get("id")) is int and entry["id"] > 0 \
-                        and entry["id"] not in seen and (valid is None or valid(entry)):
-                    self._entries.append(entry)
-                    seen.add(entry["id"])
-                else:
-                    bad += 1
-            if bad:
-                _log(f"dropped {bad} malformed record(s) from {path}", LOG_WARNING)
-            self.clean = not bad
-            self._entries = self._entries[-limit:]
-            self._sizes = {e["id"]: _json_bytes(e) for e in self._entries}
-            while self.max_bytes is not None and len(self._entries) > 1 and sum(self._sizes.values()) > max_bytes:
-                self._sizes.pop(self._entries.pop(0)["id"], None)
-            next_id = stored.get("next_id")
-            self._next_id = max([next_id if type(next_id) is int else 1] + [e["id"] + 1 for e in self._entries])
+        self.clean = False  # the box was saved whole and every record in it was read
+        self._db = statedb.connect(state_dir)
+        try:
+            self._load(valid)
+        except BaseException:
+            self._db.close()
+            raise
+
+    def _load(self, valid):
+        """Read the box's records, oldest first, bounded as rnfs 0.1.4 read its file; rows dropped are deleted (and
+        the box isn't clean if one was malformed, until the next save)."""
+        from rnfs import statedb
+        rows = self._db.query("SELECT id, record FROM lxmf_messages WHERE box = ? ORDER BY id", (self.box,))
+        loaded = []
+        for row_id, text in rows:
+            try:
+                entry = statedb.load(text)
+            except (TypeError, ValueError):
+                entry = None
+            # A record whose id isn't its row's is malformed too
+            loaded.append(entry if isinstance(entry, dict) and entry.get("id") == row_id else None)
+        self._entries, bad = _records(loaded, self.limit, self.max_bytes, valid)
+        if bad:
+            _log(f"dropped {bad} malformed record(s) from the {self.box}", LOG_WARNING)
+        self.clean = self._db.meta(self.box, "clean") == 1 and not bad
+        self._sizes = {e["id"]: _json_bytes(e) for e in self._entries}
+        self._next_id = _next_id(self._db.meta(self.box, "next_id"), self._entries)
+        kept = {e["id"] for e in self._entries}
+        gone = [(self.box, row_id) for row_id, _ in rows if row_id not in kept]
+        if gone:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM lxmf_messages WHERE box = ? AND id = ?", gone)
+                if bad:
+                    statedb.set_meta(tx, self.box, "clean", 0)
 
     def add(self, entry: dict, per_from: int | None = None, reserved=None) -> tuple[int | None, list[dict]]:
         """Append entry with a new id; returns the id (None if entry itself was dropped: every other record is
@@ -482,6 +554,9 @@ class MessageLog:
         (trusted senders' records, so new identities can't push them out)."""
         reserved = reserved or (lambda record: False)
         with self._lock:
+            if self._next_id > MAX_ID:  # only a hand-edited next id gets here: refused, so saves keep working
+                _log(f"the {self.box} has used every record id; refusing a new record", LOG_ERROR)
+                return None, []
             entry["id"] = self._next_id
             self._next_id += 1
             self._entries.append(entry)
@@ -509,7 +584,7 @@ class MessageLog:
             self._entries = [e for e in self._entries if id(e) not in gone]
             for e in dropped:
                 self._sizes.pop(e["id"], None)
-            self._dirty = True
+            self._dirty.update(e["id"] for e in [entry, *dropped])  # a refused entry still took an id
             return (None if id(entry) in gone else entry["id"]), [e for e in dropped if e is not entry]
 
     def _over(self, dropped: list[dict]) -> bool:
@@ -548,7 +623,7 @@ class MessageLog:
                 if entry["id"] == entry_id:
                     entry.update(values)
                     self._sizes[entry_id] = _json_bytes(entry)
-                    self._dirty = True
+                    self._dirty.add(entry_id)
                     return True
         return False
 
@@ -561,7 +636,7 @@ class MessageLog:
                 self._entries = [e for e in self._entries if id(e) not in gone]
                 for e in removed:
                     self._sizes.pop(e["id"], None)
-                self._dirty = True
+                self._dirty.update(e["id"] for e in removed)
             return removed
 
     def entries(self) -> list[dict]:
@@ -575,19 +650,31 @@ class MessageLog:
             return len(self._entries)
 
     def save(self):
-        """Write the log if it changed (atomic; raises OSError)."""
+        """Write the records added, changed or removed since the last save, if any, and the next id, in one
+        transaction; the box is then clean. Raises OSError (they are written by the next save)."""
+        from rnfs import statedb
         with self._save_lock:
             with self._lock:
                 if not self._dirty:
                     return
-                snapshot = {"next_id": self._next_id, "messages": [dict(e) for e in self._entries]}
-                self._dirty = False
+                dirty, self._dirty = self._dirty, set()
+                rows = [(self.box, e["id"], statedb.dump(e)) for e in self._entries if e["id"] in dirty]
+                gone = [(self.box, entry_id) for entry_id in dirty.difference(e["id"] for e in self._entries)]
+                next_id = self._next_id
             try:
-                _write_json(self.path, snapshot)
-            except OSError:
+                with self._db.transaction() as tx:
+                    tx.executemany("DELETE FROM lxmf_messages WHERE box = ? AND id = ?", gone)
+                    tx.executemany("INSERT OR REPLACE INTO lxmf_messages (box, id, record) VALUES (?, ?, ?)", rows)
+                    statedb.set_meta(tx, self.box, "next_id", next_id)
+                    statedb.set_meta(tx, self.box, "clean", 1)
+            except BaseException:
                 with self._lock:
-                    self._dirty = True
+                    self._dirty |= dirty
                 raise
+
+    def close(self):
+        """Release the state database."""
+        self._db.close()
 
 
 def _str_or_none(value) -> bool:
@@ -739,10 +826,13 @@ class LxmfFeature(features.Feature):
         self.off_reason = "LXMF has not been started"
         self.accept_from = {parse_address(a).hex() for a in config.lxmf_accept_from}
         self.auto_fetch_from = {parse_address(a).hex() for a in config.lxmf_auto_fetch_from}
-        self.inbox = MessageLog(os.path.join(config.state_dir, "lxmf_inbox.json"), INBOX_LIMIT, MAX_INBOX_BYTES,
-                                protect=_holds_pins, valid=_valid_inbox_entry)
-        self.outbox = MessageLog(os.path.join(config.state_dir, "lxmf_outbox.json"), OUTBOX_LIMIT,
-                                 valid=_valid_outbox_entry)
+        self.inbox = MessageLog(config.state_dir, INBOX, INBOX_LIMIT, MAX_INBOX_BYTES, protect=_holds_pins,
+                                valid=_valid_inbox_entry)
+        try:
+            self.outbox = MessageLog(config.state_dir, OUTBOX, OUTBOX_LIMIT, valid=_valid_outbox_entry)
+        except BaseException:
+            self.inbox.close()
+            raise
         for entry in self.outbox.entries():
             if entry.get("state") not in FINAL_STATES and not self._propagated_sent(entry):
                 # LXMF doesn't persist its outbound queue
@@ -767,9 +857,10 @@ class LxmfFeature(features.Feature):
         few seconds, so a crash can leave a pin whose message is gone or still queued; nothing else would release
         it (`pin rm` releases only the user's pins). A queued link is fetched and pinned again at start().
 
-        Only if the inbox file was read whole: when it is missing, damaged (moved aside) or had a malformed record,
-        such a pin may be one a lost message held. Then each sender's unrecorded pins are kept and recorded in a
-        new inbox message, so they are kept at later starts too and removing that message releases them."""
+        Only if the saved inbox was read whole (clean): when it was never saved, its file was missing or damaged
+        (moved aside) when imported, or it had a malformed record, such a pin may be one a lost message held.
+        Then each sender's unrecorded pins are kept and recorded in a new inbox message, so they are kept at
+        later starts too and removing that message releases them."""
         from rnfs.content.storage import LXMF_PREFIX
         recorded = {(entry.get("from"), result.get("cid")) for entry in self.inbox.entries()
                     for result in entry.get("auto") or [] if isinstance(result, dict) and result.get("state") == "pinned"}
@@ -798,12 +889,12 @@ class LxmfFeature(features.Feature):
         if _HEX32.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
             _log(f"keeping {listed}, pinned for {sender!r}, which isn't an LXMF address", LOG_WARNING)
             return
-        _log(f"the inbox file is missing, damaged or incomplete: keeping {listed}, pinned for a message from "
+        _log(f"the saved inbox is missing, damaged or incomplete: keeping {listed}, pinned for a message from "
              f"{sender} it no longer has, in a new inbox message (remove it to release them)", LOG_WARNING)
         links = [Link(cid) for cid in cids]
         entry = {"hash": "", "from": sender, "display_name": None, "sent": None, "received": time.time(),
                  "title": "", "method": "unknown", "links": [link.to_json() for link in links],
-                 "text": "Restored by rnfs at start: the inbox file was missing or damaged, and these links were "
+                 "text": "Restored by rnfs at start: the saved inbox was missing or damaged, and these links were "
                          "pinned for a message from this sender that it no longer has. Remove this message to "
                          "release them.",
                  "auto": [{"state": "pinned", "cid": str(cid)} for cid in cids]}
@@ -870,6 +961,11 @@ class LxmfFeature(features.Feature):
         """Save the inbox and outbox if they changed."""
         self.inbox.save()
         self.outbox.save()
+
+    def close(self):
+        """Release the state database."""
+        self.inbox.close()
+        self.outbox.close()
 
     def status(self) -> dict:
         """The LXMF address (None when off) and the number of inbox messages."""
@@ -1192,7 +1288,7 @@ class LxmfFeature(features.Feature):
         """The root CID and path a link names, resolving a name (falling back to the CID it was sent with).
 
         persist False (auto-fetch): the name's record goes only into the bounded table, so names arriving
-        unasked don't grow names.json; its sequence still goes into the bounded, saved floor, so a later
+        unasked don't grow the held records; its sequence still goes into the bounded, saved floor, so a later
         auto-fetch of the name never resolves to an older record."""
         if link.name is None:
             return link.cid, list(link.path)

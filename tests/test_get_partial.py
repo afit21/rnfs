@@ -20,6 +20,7 @@ class GetPartialTest(unittest.TestCase):
         self.dir = tmp.name
         self.node = RnfsNode.offline(Config(rnfs_dir=os.path.join(self.dir, "node")), b"\x01" * 16,
                                      client=mock.Mock(), names_network=mock.Mock())
+        self.addCleanup(self.node.stop)
         src = os.path.join(self.dir, "src")
         os.makedirs(os.path.join(src, "sub"))
         for i in range(5):

@@ -7,3 +7,9 @@ dist/
 venv/
 .flatpak-builder/
 build-dir/
+# Left by test and lint runs
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/

@@ -41,7 +41,9 @@ class FolderSwapTest(unittest.TestCase):
         with open(os.path.join(self.drop, "sub", "harmless.txt"), "wb") as f:
             f.write(b"hi")
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
         self.folder = SharedFolder(self.files, self.storage, os.path.join(self.tmp.name, "state"))
+        self.addCleanup(self.folder.close)
 
     def swap(self, path: str):
         """What the attacker does: move the directory at path aside and put a link to the private one there."""

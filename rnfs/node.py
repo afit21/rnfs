@@ -2,8 +2,9 @@
 facade that the API, gateway and CLI call (design.md, "Node facade").
 
 Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), the node's
-identity and its rnfs.dht destination, then the routing table, provider records, storage, shared folder,
-fetcher, publisher and names; the request server answers through NodeBackend. Background threads: the
+identity and its rnfs.dht destination, then the state database (rnfs.statedb, which imports the JSON state files
+of earlier versions first), the routing table, provider records, storage, shared folder, fetcher, publisher and
+names; the request server answers through NodeBackend. Background threads: the
 announcer, the join (bootstrap nodes, then a lookup for our own ID, repeated while too few servers are
 known), the publish loop, the name re-announce loop and
 maintenance (shared-folder scans, provider record expiry and saves, max_storage enforcement).
@@ -23,7 +24,7 @@ from typing import BinaryIO, Iterator
 
 import RNS
 
-from rnfs import __version__, features, fsutil, winacl
+from rnfs import __version__, features, fsutil, statedb, winacl
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, seal, walker
@@ -31,7 +32,7 @@ from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content import chunker as content_chunker
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, USER, Storage, disk_reserve, read_json, remote_source, write_json
+from rnfs.content.storage import FOLDER, USER, Storage, disk_reserve, remote_source
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
@@ -49,9 +50,6 @@ from rnfs.network.links import LinkPool
 from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 
-PROVIDERS_FILE = "providers.json"
-REMOTE_PINS_FILE = "remote_pins.json"  # remote pins accepted and not yet fetched: [[source, cid], ...] in order
-FETCHED_FILE = "fetched.json"  # cached targets fetched for the user (not the gateway): the roots strategy's
 SAVE_INTERVAL = 300.0  # seconds between saves of provider records
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched targets and invalid roots, when changed
 ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the block (msgpack framing, CID)
@@ -63,6 +61,43 @@ BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many 
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
+
+
+def import_fetched(value: list, tx) -> int:
+    """Import fetched.json (statedb.migrate): its targets replace the fetched table; one that doesn't parse is
+    skipped, as rnfs 0.1.4 did. Returns the number imported."""
+    tx.execute("DELETE FROM fetched")
+    cids = set()
+    for text in value:
+        try:
+            cids.add(Cid.parse(text))
+        except (ValueError, TypeError):
+            continue
+    tx.executemany("INSERT INTO fetched (cid) VALUES (?)", [(cid.binary,) for cid in cids])
+    return len(cids)
+
+
+def import_remote_pins(value: list, tx) -> int:
+    """Import remote_pins.json (statedb.migrate): its [source, cid] pairs, in order, replace the remote_pins
+    table; malformed ones are counted in a warning and skipped, as rnfs 0.1.4 did. Which sources are still
+    allowed, duplicates and REMOTE_PIN_QUEUE are left to the load (_load_remote_pins). Returns the number
+    imported."""
+    tx.execute("DELETE FROM remote_pins")
+    count = malformed = 0
+    for entry in value:
+        try:
+            source, text = entry
+            if not isinstance(source, str) or not isinstance(text, str):
+                raise TypeError("not a pair of strings")  # a list or dict source can't even be looked up
+            tx.execute("INSERT INTO remote_pins (position, source, cid) VALUES (?, ?, ?)",
+                       (count, source, Cid.parse(text).binary))
+        except (ValueError, TypeError):
+            malformed += 1
+            continue
+        count += 1
+    if malformed:
+        log(f"skipped {malformed} malformed entr{'y' if malformed == 1 else 'ies'} in remote_pins.json", LOG_WARNING)
+    return count
 
 
 def _make_private_dirs(config: Config):
@@ -252,8 +287,8 @@ class RnfsNode:
                                            APP_NAME, DHT_ASPECT)
         slow = rates.is_slow_node(config, self.reticulum)
         self.links = LinkPool(self.identity, config)
-        self._setup(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
-                    names_network=None, is_known=_rns_is_known)
+        self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
+                             names_network=None, is_known=_rns_is_known)
         # mesh: hops and next-hop interfaces rank providers; one set of traffic counters for client and server
         self.paths = RnsPaths(self.reticulum)
         self.fetcher.path_info = self.paths.info
@@ -278,9 +313,19 @@ class RnfsNode:
         """
         node = cls.__new__(cls)
         node.reticulum = node.links = node.server = node.announcer = node.announce_handler = None
-        node._setup(config, node_id, client, slow, names_network=names_network, is_known=lambda node_id: True)
+        node._setup_or_close(config, node_id, client, slow, names_network=names_network,
+                             is_known=lambda node_id: True)
         node.joined.set()
         return node
+
+    def _setup_or_close(self, *args, **kwargs):
+        """_setup, releasing the state database references taken so far if it raises (a store refusing to
+        start), so a caller in the same process can try again or remove the directory."""
+        try:
+            self._setup(*args, **kwargs)
+        except BaseException:
+            self._close_state()
+            raise
 
     def _setup(self, config: Config, node_id: bytes, client, slow: bool, names_network, is_known):
         """Everything that doesn't need Reticulum itself."""
@@ -299,10 +344,12 @@ class RnfsNode:
             except ValueError as e:
                 log(f"ignoring bootstrap node: {e}", LOG_WARNING)
         _make_private_dirs(config)
+        # First, so the JSON state files of earlier versions are imported before any store loads its state
+        self._db = statedb.connect(config.state_dir)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
-        self.records = ProviderStore(config.max_records, os.path.join(config.state_dir, PROVIDERS_FILE),
-                                     own_id=node_id, seniority=config.provider_seniority)
+        self.records = ProviderStore(config.max_records, config.state_dir, own_id=node_id,
+                                     seniority=config.provider_seniority)
         if config.private:
             # Records stored while the node was public, or from a member removed since, are never handed out
             removed = self.records.retain(self._is_member_publisher)
@@ -319,20 +366,21 @@ class RnfsNode:
         self.backend = NodeBackend(self)
 
         self._lock = threading.Lock()
-        self._fetched_path = os.path.join(config.state_dir, FETCHED_FILE)
         self._fetched: set[Cid] = set()
-        for text in read_json(self._fetched_path, shape=lambda value: isinstance(value, list)) or []:
+        self._fetched_saved: set = set()  # what the fetched table holds
+        for (binary,) in self._db.query("SELECT cid FROM fetched"):
+            self._fetched_saved.add(binary)
             try:
-                self._fetched.add(Cid.parse(text))
-            except (ValueError, TypeError):
+                self._fetched.add(Cid.from_bytes(binary))
+            except ValueError:
                 continue
-        self._fetched_dirty = False  # changed since last saved (by _save_state: maintenance, gc and stop)
+        # Changed since last saved (by _save_state: maintenance, gc and stop); a row that didn't parse is deleted
+        self._fetched_dirty = len(self._fetched) != len(self._fetched_saved)
         self._fetched_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         # Remote source -> CIDs waiting or being fetched for it, in the order accepted (fetched one at a time)
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
         self._remote_workers: set[str] = set()  # remote sources with a thread fetching their pins
-        self._remote_pins_path = os.path.join(config.state_dir, REMOTE_PINS_FILE)  # those waiting, for a restart
         self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
         self._remote_pins_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._refresh_wanted = threading.Event()
@@ -344,7 +392,7 @@ class RnfsNode:
         for cls in features.feature_classes():
             self.features[cls.name] = cls(self)
         # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
-        # name pins are made to match names.json, which a crash inside a publish can leave them disagreeing with
+        # name pins are made to match the names state, which a crash inside a publish can leave them disagreeing with
         self.names.reconcile_pins(self.storage.pins())
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
@@ -396,8 +444,22 @@ class RnfsNode:
         self._save_remote_pins()
         self.publisher.save()
         self._save_state()
+        self._close_state()
         if self.links is not None:
             self.links.close_all()
+
+    def _close_state(self):
+        """Release every store's reference to the state database, once everything is saved; the last closes it.
+        After a _setup that failed, only the stores it made."""
+        names = ("records", "storage", "shared_folder", "pin_names", "fetcher", "publisher", "names")
+        stores = [getattr(self, name) for name in names if hasattr(self, name)]
+        for store in (*stores, *getattr(self, "features", {}).values(), getattr(self, "_db", None)):
+            if store is None:
+                continue
+            try:
+                store.close()
+            except Exception as e:  # noqa: BLE001 - release the rest
+                log(f"closing state failed: {e!r}", LOG_ERROR)
 
     def _save_state(self):
         """Save cache records, fetched targets and invalid roots if they changed (each change isn't written at
@@ -648,20 +710,25 @@ class RnfsNode:
             self._fetched_dirty = True
 
     def _save_fetched(self):
-        """Save the fetched targets if they changed. With the cache records they're intersected with, which are
-        saved in the same pass: a crash loses at most what changed since the last pass, as for those."""
+        """Save the fetched targets added or forgotten since the last save, if any. With the cache records they're
+        intersected with, which are saved in the same pass: a crash loses at most what changed since the last
+        pass, as for those."""
         with self._fetched_save_lock:
             with self._lock:
                 if not self._fetched_dirty:
                     return
-                value = sorted(str(cid) for cid in self._fetched)
+                current = {cid.binary for cid in self._fetched}
                 self._fetched_dirty = False
+            added, gone = current - self._fetched_saved, self._fetched_saved - current
             try:
-                write_json(self._fetched_path, value)
+                with self._db.transaction() as tx:
+                    tx.executemany("DELETE FROM fetched WHERE cid = ?", [(binary,) for binary in gone])
+                    tx.executemany("INSERT OR IGNORE INTO fetched (cid) VALUES (?)", [(binary,) for binary in added])
             except BaseException:
                 with self._lock:
                     self._fetched_dirty = True
                 raise
+            self._fetched_saved = current
 
     # Fetching
 
@@ -991,7 +1058,7 @@ class RnfsNode:
 
         A source's pins are fetched one at a time, so each is checked against its quota with the earlier ones
         counted; one with REMOTE_PIN_QUEUE pins waiting is refused (False), and so is one whose fetch thread
-        can't be started. Accepted pins are saved (remote_pins.json) until fetched, and resumed at the next
+        can't be started. Accepted pins are saved (the remote_pins table) until fetched, and resumed at the next
         start if the node stops first.
         """
         source = remote_source(identity_hash)
@@ -1080,11 +1147,14 @@ class RnfsNode:
             with self._lock:
                 if not self._remote_pins_dirty:
                     return
-                waiting = [[source, str(cid)] for source, cids in self._remote_reserved.items() for cid in cids
+                waiting = [(source, cid) for source, cids in self._remote_reserved.items() for cid in cids
                            if (source, cid) not in self._remote_released]
                 self._remote_pins_dirty = False
             try:
-                write_json(self._remote_pins_path, waiting)
+                with self._db.transaction() as tx:  # a few rows (at most REMOTE_PIN_QUEUE per source): rewritten
+                    tx.execute("DELETE FROM remote_pins")
+                    tx.executemany("INSERT INTO remote_pins (position, source, cid) VALUES (?, ?, ?)",
+                                   [(position, source, cid.binary) for position, (source, cid) in enumerate(waiting)])
             except OSError as e:
                 with self._lock:
                     self._remote_pins_dirty = True  # try again next time
@@ -1092,22 +1162,21 @@ class RnfsNode:
 
     def _load_remote_pins(self) -> list[tuple[str, Cid]]:
         """Remote pins saved as waiting, oldest first, from identities still on remote_pin_identities (at most
-        REMOTE_PIN_QUEUE each); others are dropped. Caller holds no lock (it reads a file)."""
+        REMOTE_PIN_QUEUE each); others are dropped. Caller holds no lock (it reads the database)."""
         allowed = {remote_source(h.strip().strip("<>")) for h in self.config.remote_pin_identities}
         try:
-            saved = read_json(self._remote_pins_path, shape=lambda value: isinstance(value, list)) or []
+            saved = self._db.query("SELECT source, cid FROM remote_pins ORDER BY position")
         except OSError as e:
             log(f"reading the remote pins waiting failed: {e!r}", LOG_ERROR)
             return []
         pins: dict[tuple[str, Cid], None] = {}
         counts: dict[str, int] = {}
         malformed = 0
-        for entry in saved:
+        for source, binary in saved:
             try:
-                source, text = entry
-                if not isinstance(source, str) or not isinstance(text, str):
-                    raise TypeError("not a pair of strings")  # a list or dict source can't even be looked up
-                cid = Cid.parse(text)
+                if not isinstance(source, str):
+                    raise TypeError("not a string")
+                cid = Cid.from_bytes(binary)
             except (ValueError, TypeError):
                 malformed += 1
                 continue
@@ -1116,7 +1185,7 @@ class RnfsNode:
             counts[source] = counts.get(source, 0) + 1
             pins[(source, cid)] = None
         if malformed:
-            log(f"skipped {malformed} malformed entr{'y' if malformed == 1 else 'ies'} in {self._remote_pins_path}",
+            log(f"skipped {malformed} malformed remote pin{'' if malformed == 1 else 's'} saved as waiting",
                 LOG_WARNING)
         return list(pins)
 

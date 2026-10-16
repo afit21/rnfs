@@ -1,10 +1,10 @@
 """NEW-6 (publisher half): records stored during a publish round cut short by a crash were never withdrawn.
 
-Where a round stored a CID was only written to published.json at the round's end, so after a crash mid-round
-nothing listed those nodes, and when the CID later stopped being provided they kept the record for up to
-PROVIDER_TTL (section 6 SHOULD: withdraw from nodes of a round cut short). These tests crash a round from the fake
-client after some nodes accepted, restart the publisher on the same state directory, stop providing the CID, and
-check that every node saved as accepted (every SAVE_EVERY_NODES nodes or SAVE_EVERY_SECONDS) gets a withdrawal.
+Where a round stored a CID was only saved at the round's end, so after a crash mid-round nothing listed those
+nodes, and when the CID later stopped being provided they kept the record for up to PROVIDER_TTL (section 6
+SHOULD: withdraw from nodes of a round cut short). These tests crash a round from the fake client after some
+nodes accepted, restart the publisher on the same state directory, stop providing the CID, and check that every
+node saved as accepted (every SAVE_EVERY_NODES nodes or SAVE_EVERY_SECONDS) gets a withdrawal.
 """
 import os
 import tempfile
@@ -71,14 +71,17 @@ class CrashCutRoundTest(unittest.TestCase):
         self.state = os.path.join(self.tmp.name, "state")
         self.config = Config(rnfs_dir=self.tmp.name, republish_interval=1000)
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), self.state, 10**9)
+        self.addCleanup(self.storage.close)
         self.clock = FakeClock(1_000_000.0)
         self.cid = builder.build_bytes(b"some content", self.storage.put).cid
         self.storage.pin(self.cid, USER)
 
     def publisher(self, client, nodes) -> Publisher:
-        """A publisher on the shared state directory whose lookups find nodes."""
-        return Publisher(OWN, self.config, self.storage, ProviderStore(1000, None), client,
-                         lambda key: FakeLookup(nodes), False, self.state, clock=self.clock)
+        """A publisher on the shared state directory whose lookups find nodes (closed when the test ends)."""
+        publisher = Publisher(OWN, self.config, self.storage, ProviderStore(1000, None), client,
+                              lambda key: FakeLookup(nodes), False, self.state, clock=self.clock)
+        self.addCleanup(publisher.close)
+        return publisher
 
     def crash_then_unpin(self, nodes, crash_at: int, step: float = 0.0) -> set[bytes]:
         """Crash the first round before request crash_at; restart, unpin, publish; the nodes withdrawn from."""

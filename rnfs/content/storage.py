@@ -11,13 +11,15 @@
   pins alone fill it. The hard bound is the disk: check_disk() refuses blocks that would leave less than
   DISK_RESERVE free on the filesystem holding the blocks.
 
-Pins and cache records are persisted as JSON under state_dir: pins at once, cache records (which change on
-every fetch) by save(), which the node calls periodically and at shutdown. Thread-safe: one lock guards the
+Pins and cache records are persisted in the state database (rnfs.statedb), and only read from it at startup:
+each pin and release at once, as one row inserted or deleted and committed durably (after the blocks it keeps
+are synced), and cache records (which change on every fetch) by save(), which the node calls periodically and
+at shutdown, writing only the records changed since the last save. Thread-safe: one lock guards the
 indexes; long walks run outside it: completeness walks are discarded if blocks were deleted meanwhile, and
 eviction, gc and the size queries read the DAG nodes they will walk beforehand (_warm), deciding what to delete
 (or counting) under the lock.
 """
-import json
+import itertools
 import os
 import re
 import shutil
@@ -27,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
-from rnfs import fsutil
+from rnfs import statedb
 from rnfs.constants import MAX_BLOCK_SIZE, MIB
 from rnfs.content import dag, walker
 from rnfs.content.blockstore import BlockStore
@@ -39,8 +41,6 @@ from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
 USER, FOLDER = "user", "folder"
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
 LXMF_PREFIX = "lxmf:"
-PINS_FILE = "pins.json"
-CACHE_FILE = "cache.json"
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
 DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
@@ -90,59 +90,47 @@ def remote_source(identity_hash: bytes | str) -> str:
     return REMOTE_PREFIX + text
 
 
-def write_json(path: str, value, ensure_ascii: bool = True):
-    """Write value as JSON to path atomically and durably (temporary file synced to disk, then renamed), readable
-    by its owner only. With ensure_ascii False, non-ASCII characters are written as UTF-8 rather than escaped."""
-    # backslashreplace: a lone surrogate, which ensure_ascii False leaves as is, is written as its JSON escape
-    data = json.dumps(value, ensure_ascii=ensure_ascii).encode("utf-8", "backslashreplace")
-    fsutil.write_atomic(path, data, mode=0o600)  # the rename is retried on Windows while read_json has path open
-
-
-def read_json(path: str, shape: Callable[[object], bool] | None = None):
-    """The JSON value in path, or None if it doesn't exist. A damaged file (not JSON, failing shape if given,
-    or a directory) is moved aside, not lost, and gives None. Raises OSError if path can't be read: a transient
-    or permission error isn't damage, and starting without the file could lose what it records (pins)."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            value = json.load(f)  # an empty file, as a crash can leave, is a ValueError too
-    except FileNotFoundError:
-        return None
-    except ValueError as e:
-        problem = str(e)
-    except OSError:
-        if not os.path.isdir(path):  # Windows reports opening a directory as PermissionError
-            raise
-        problem = "it is a directory"
-    else:
-        if shape is None or shape(value):
-            return value
-        problem = "unexpected structure"
-    try:
-        aside = _move_aside(path)
-    except OSError as moving:
-        # A read-only state dir: start without it rather than not at all
-        log(f"storage: {path} is damaged ({problem}) and couldn't be moved aside ({moving}); starting without it",
-            LOG_ERROR)
-        return None
-    log(f"storage: {path} is damaged ({problem}); moved to {aside} and starting without it", LOG_ERROR)
-    return None
-
-
-def _move_aside(path: str) -> str:
-    """Rename path to path.damaged, or path.damaged.<n> so an earlier damaged copy is kept; the new path."""
-    for n in range(1000):
-        aside = path + ".damaged" + (f".{n}" if n else "")
+def import_pins(value: dict, tx) -> int:
+    """Import pins.json (statedb.migrate): its pins replace the pins table, each record checked as rnfs 0.1.4
+    loaded it (an invalid one is logged and skipped). Returns the number of pins imported."""
+    tx.execute("DELETE FROM pins")
+    count = 0
+    for text, sources in value.get("pins", {}).items():
         try:
-            fsutil.rename_new(path, aside)
-            return aside
-        except FileExistsError:
+            cid = Cid.parse(text)
+            if not isinstance(sources, list):
+                raise TypeError("sources aren't a list")
+            for source in sources:
+                check_source(source)
+            # Inside the try: a source SQLite can't store (a lone surrogate) is an invalid record too
+            tx.executemany("INSERT OR IGNORE INTO pins (cid, source) VALUES (?, ?)",
+                           [(cid.binary, source) for source in sources])
+        except (ValueError, TypeError):
+            log(f"storage: ignoring invalid pin record {text!r}", LOG_ERROR)
             continue
-    raise FileExistsError(f"too many damaged copies of {path}")
+        count += bool(sources)
+    return count
 
 
-def shaped(key: str, kind: type) -> Callable[[object], bool]:
-    """A read_json shape: an object whose key, if present, holds a kind."""
-    return lambda value: isinstance(value, dict) and isinstance(value.get(key, kind()), kind)
+def import_cache(value: dict, tx) -> int:
+    """Import cache.json (statedb.migrate): its records, least recently used first, replace the cache table, each
+    checked as rnfs 0.1.4 loaded it. Returns the number of records imported."""
+    tx.execute("DELETE FROM cache")
+    records: OrderedDict[tuple[Cid, tuple[str, ...]], Cid] = OrderedDict()
+    for record in value.get("fetches", []):
+        try:
+            root, names, target = record
+            if not isinstance(names, list):
+                raise TypeError("names aren't a list")
+            for name in names:
+                dag.check_name(name)
+            records[(Cid.parse(root), tuple(names))] = Cid.parse(target)  # a repeated key keeps its first place
+        except (ValueError, TypeError):
+            log(f"storage: ignoring invalid cache record {record!r}", LOG_ERROR)
+    tx.executemany("INSERT INTO cache (root, path, target, used) VALUES (?, ?, ?, ?)",
+                   [(root.binary, statedb.dump(list(names)), target.binary, used)
+                    for used, ((root, names), target) in enumerate(records.items())])
+    return len(records)
 
 
 class Session:
@@ -233,7 +221,7 @@ class Storage:
         self._lock = threading.RLock()
         self.blocks = BlockStore(blocks_dir)
         self.state_dir = os.path.expanduser(state_dir)
-        os.makedirs(self.state_dir, mode=0o700, exist_ok=True)
+        self._db = statedb.connect(self.state_dir)
         self.max_storage = max_storage
         self._save_lock = threading.Lock()  # keeps cache saves in order without holding _lock while writing
 
@@ -248,64 +236,97 @@ class Storage:
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
         self._generation = 0  # incremented whenever blocks are deleted, invalidating walks in progress
         self._cache_generation = 0  # incremented whenever cache records are removed or retargeted
-        self._cache_dirty = False  # cache records changed since the last save()
+        # Cache records changed (or removed) since the last save(); every one is among the most recently used
+        self._cache_dirty: set[tuple[Cid, tuple[str, ...]]] = set()
+        self._cache_used = 0  # the cache table's next used value: larger than every one saved
         # False only when nothing has happened since the last collection that could leave a block unreached,
         # so eviction over max_storage with nothing to evict needn't walk everything again
         self._maybe_garbage = True
         self._reported_damaged: set[Cid] = set()  # damaged DAG nodes already logged as stopping collection
-        self._load()
+        try:
+            self._load()
+        except BaseException:
+            self._db.close()
+            raise
 
     # Persistence
 
     def _load(self):
-        """Load pins and cache records, skipping entries that don't parse."""
-        pins = read_json(os.path.join(self.state_dir, PINS_FILE), shaped("pins", dict)) or {}
-        for text, sources in pins.get("pins", {}).items():
+        """Load pins and cache records; rows that don't parse are logged and deleted, as are cache records past
+        MAX_CACHE_RECORDS."""
+        bad_pins = []
+        for binary, source in self._db.query("SELECT cid, source FROM pins"):
             try:
-                cid = Cid.parse(text)
-                if not isinstance(sources, list):
-                    raise TypeError("sources aren't a list")
-                for source in sources:
-                    check_source(source)
-                if sources:
-                    self._pins[cid] = set(sources)
+                cid = Cid.from_bytes(binary)
+                check_source(source)
             except (ValueError, TypeError):
-                log(f"storage: ignoring invalid pin record {text!r}", LOG_ERROR)
-        cache = read_json(os.path.join(self.state_dir, CACHE_FILE), shaped("fetches", list)) or {}
-        for record in cache.get("fetches", []):
+                log(f"storage: ignoring invalid pin record {binary!r} {source!r}", LOG_ERROR)
+                bad_pins.append((binary, source))
+                continue
+            self._pins.setdefault(cid, set()).add(source)
+        bad_cache = []
+        for root, path, target, used in self._db.query("SELECT root, path, target, used FROM cache ORDER BY used"):
             try:
-                root, names, target = record
+                names = statedb.load(path)
                 if not isinstance(names, list):
                     raise TypeError("names aren't a list")
                 for name in names:
                     dag.check_name(name)
-                self._cache[(Cid.parse(root), tuple(names))] = Cid.parse(target)
+                key = (Cid.from_bytes(root), tuple(names))
+                self._cache[key] = Cid.from_bytes(target)
             except (ValueError, TypeError):
-                log(f"storage: ignoring invalid cache record {record!r}", LOG_ERROR)
+                log(f"storage: ignoring invalid cache record {root!r} {path!r}", LOG_ERROR)
+                bad_cache.append((root, path))
+                continue
+            if isinstance(used, int):
+                self._cache_used = max(self._cache_used, used + 1)
+        capped = [(root.binary, statedb.dump(list(names))) for root, names in
+                  list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
         self._cap_cache()
+        self._cache_dirty.clear()
+        if bad_pins or bad_cache or capped:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?", bad_pins)
+                tx.executemany("DELETE FROM cache WHERE root = ? AND path = ?", bad_cache + capped)
 
-    def _save_pins(self):
-        """Persist pins (called with the lock held)."""
-        value = {"pins": {str(cid): sorted(sources) for cid, sources in self._pins.items()}}
+    def _save_pins(self, source: str, added=(), removed=()):
+        """Persist source's new pins of added and releases of removed, durably (called with the lock held)."""
         self.blocks.sync()  # so pins saved never outlast the blocks they keep
-        write_json(os.path.join(self.state_dir, PINS_FILE), value)
+        with self._db.transaction(durable=True) as tx:
+            tx.executemany("INSERT OR IGNORE INTO pins (cid, source) VALUES (?, ?)",
+                           [(cid.binary, source) for cid in added])
+            tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?", [(cid.binary, source) for cid in removed])
 
     def save(self):
-        """Persist cache records, least recently used first, if they changed since the last save."""
+        """Persist the cache records changed since the last save, least recently used first."""
         with self._save_lock:
             with self._lock:
                 if not self._cache_dirty:
                     return
-                value = {"fetches": [[str(root), list(names), str(target)]
-                                     for (root, names), target in self._cache.items()]}
-                self._cache_dirty = False
+                dirty, self._cache_dirty = self._cache_dirty, set()
+                # The records changed since the last save are the most recently used (each change moved its
+                # record to the end), so those still cached are the last ones, in order
+                kept = sum(1 for key in dirty if key in self._cache)
+                changed = list(itertools.islice(reversed(self._cache.items()), kept))[::-1]
+                rows = [(root.binary, statedb.dump(list(names)), target.binary, self._cache_used + n)
+                        for n, ((root, names), target) in enumerate(changed)]
+                self._cache_used += len(rows)
+                gone = [(root.binary, statedb.dump(list(names))) for root, names in dirty if
+                        (root, names) not in self._cache]
             try:
                 self.blocks.sync()
-                write_json(os.path.join(self.state_dir, CACHE_FILE), value)
+                with self._db.transaction() as tx:
+                    tx.executemany("DELETE FROM cache WHERE root = ? AND path = ?", gone)
+                    tx.executemany("INSERT OR REPLACE INTO cache (root, path, target, used) VALUES (?, ?, ?, ?)",
+                                   rows)
             except BaseException:
                 with self._lock:
-                    self._cache_dirty = True
+                    self._cache_dirty |= dirty
                 raise
+
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        self._db.close()
 
     # Blocks
 
@@ -400,9 +421,9 @@ class Storage:
             if not added:
                 return
             try:
-                self._save_pins()
+                self._save_pins(source, added=added)
             except BaseException:
-                # Not saved (a full or failing disk): not pinned, so memory says what pins.json does
+                # Not saved (a full or failing disk): not pinned, so memory says what the database does
                 for cid in added:
                     sources = self._pins[cid]
                     sources.discard(source)
@@ -421,9 +442,9 @@ class Storage:
                 del self._pins[cid]
                 self._maybe_garbage = True
             try:
-                self._save_pins()
+                self._save_pins(source, removed=[cid])
             except BaseException:
-                self._pins.setdefault(cid, set()).add(source)  # still pinned, as pins.json says
+                self._pins.setdefault(cid, set()).add(source)  # still pinned, as the database says
                 raise
             return True
 
@@ -462,7 +483,7 @@ class Storage:
                 self._cache_generation += 1
             self._cache[key] = target
             self._cache.move_to_end(key)
-            self._cache_dirty = True
+            self._cache_dirty.add(key)
             dropped = self._cap_cache()
             return dropped - set(self._cache.values())
 
@@ -470,10 +491,11 @@ class Storage:
         """Drop the least recently used records past MAX_CACHE_RECORDS; their targets (lock held)."""
         dropped = set()
         while len(self._cache) > MAX_CACHE_RECORDS:
-            dropped.add(self._cache.popitem(last=False)[1])
+            key, target = self._cache.popitem(last=False)
+            dropped.add(target)
+            self._cache_dirty.add(key)
         if dropped:
             self._maybe_garbage = True
-            self._cache_dirty = True
             self._cache_generation += 1
         return dropped
 
@@ -484,7 +506,7 @@ class Storage:
             if key not in self._cache:
                 return False
             self._cache.move_to_end(key)
-            self._cache_dirty = True
+            self._cache_dirty.add(key)
             return True
 
     def cached_fetches(self) -> list[tuple[Cid, tuple[str, ...], Cid]]:
@@ -778,9 +800,8 @@ class Storage:
             return set(), 0, 0
         evicted = len(records) - keep
         for _ in range(evicted):
-            self._cache.popitem(last=False)
+            self._cache_dirty.add(self._cache.popitem(last=False)[0])
         if evicted:
-            self._cache_dirty = True
             self._cache_generation += 1
         dead = {cid for cid in self._sizes if cid not in live}
         deleted, freed = self._delete(dead)
@@ -939,8 +960,8 @@ class Storage:
             before = self._with_memoised(before)
             uncached = set(self._cache.values())
             if self._cache:
+                self._cache_dirty.update(self._cache)
                 self._cache.clear()
-                self._cache_dirty = True
                 self._cache_generation += 1
             deleted, freed = self._collect()
             incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
@@ -1016,3 +1037,4 @@ class Storage:
             local_bytes = sum(self._sizes[c] for c in local)
         return {"size": self.content_size(cid), "blocks": len(known), "local_blocks": len(local),
                 "local_bytes": local_bytes}
+

@@ -6,13 +6,13 @@ import threading
 import unittest
 from unittest import mock
 
-from rnfs import fsutil
+from rnfs import fsutil, statedb
 from rnfs.content import builder, dag, storage as storage_module, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content.storage import FOLDER, USER, Storage, check_source, name_source, remote_source
 from rnfs.errors import NotFound, StorageFull
-from tests.support import POSIX_MODES
+from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
 
 IDENTITY = "0123456789abcdef0123456789abcdef"
 
@@ -27,8 +27,10 @@ class StorageTest(unittest.TestCase):
         self.storage = self.open()
 
     def open(self, max_storage: int = 10**9) -> Storage:
-        """(Re)open storage over the same directories."""
-        return Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), max_storage)
+        """(Re)open storage over the same directories (closed before the directory is removed)."""
+        storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), max_storage)
+        self.addCleanup(storage.close)
+        return storage
 
     def add(self, data: bytes) -> builder.Built:
         """Store a file."""
@@ -227,15 +229,55 @@ class PinTest(StorageTest):
         a, b, c = (self.add(b"%d" % i).cid for i in range(3))
         self.storage.pin(a, USER)
         self.storage.pin(b, FOLDER)
-        failure = OSError(28, "No space left on device")
         for pin in (lambda: self.storage.pin_many([a, b, c], USER), lambda: self.storage.pin(c, USER)):
-            with mock.patch.object(storage_module, "write_json", side_effect=failure):
+            with failing_commits("database or disk is full"):
                 with self.assertRaises(OSError):
                     pin()
-            # Memory says what pins.json does
+            # Memory says what the database does
             self.assertEqual(self.storage.pins(), {a: {"user"}, b: {"folder"}})
             self.assertEqual(self.open().pins(), self.storage.pins())
             self.assertEqual(self.storage.pin_count(), 2)
+
+    def test_failed_save_keeps_the_pin(self):
+        cid = self.add(b"x").cid
+        self.storage.pin(cid, USER)
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.storage.unpin(cid, USER)
+        self.assertEqual(self.storage.pins(), {cid: {"user"}})  # still pinned, as the database says
+        self.assertEqual(self.open().pins(), {cid: {"user"}})
+
+    def test_a_pin_is_one_row(self):
+        a, b = self.add(b"a").cid, self.add(b"b").cid
+        self.storage.pin(a, USER)
+        self.storage.pin(a, FOLDER)
+        self.storage.pin(b, USER)
+        state = os.path.join(self.tmp.name, "state")
+        self.assertEqual(sorted(state_rows(state, "SELECT cid, source FROM pins")),
+                         sorted([(a.binary, "user"), (a.binary, "folder"), (b.binary, "user")]))
+        self.storage.unpin(a, USER)
+        self.assertEqual(sorted(state_rows(state, "SELECT cid, source FROM pins")),
+                         sorted([(a.binary, "folder"), (b.binary, "user")]))
+
+    def test_invalid_rows_are_skipped_and_deleted(self):
+        cid = self.add(b"x").cid
+        self.storage.pin(cid, USER)
+        self.storage.record_fetch(cid, [], cid)
+        self.storage.save()
+        state = os.path.join(self.tmp.name, "state")
+        # A truncated CID, a CID in text form, an unknown source; a path that isn't a list of DAG names
+        for row in ((cid.binary[:-1], "user"), (str(cid), "user"), (cid.binary, "users")):
+            state_execute(state, "INSERT INTO pins (cid, source) VALUES (?, ?)", row)
+        for path in ('"ab"', '["a/b"]', "{not json"):
+            state_execute(state, "INSERT INTO cache (root, path, target, used) VALUES (?, ?, ?, 99)",
+                          (cid.binary, path, cid.binary))
+        state_execute(state, "INSERT INTO cache (root, path, target, used) VALUES (?, '[]', ?, 98)",
+                      (b"\x01\x02", cid.binary))
+        storage = self.open()
+        self.assertEqual(storage.pins(), {cid: {"user"}})
+        self.assertEqual(storage.cached_fetches(), [(cid, (), cid)])
+        self.assertEqual(state_rows(state, "SELECT cid, source FROM pins"), [(cid.binary, "user")])
+        self.assertEqual(state_rows(state, "SELECT root, path FROM cache"), [(cid.binary, "[]")])
 
     def test_pin_count(self):
         self.assertEqual(self.storage.pin_count(), 0)
@@ -300,6 +342,8 @@ class PinTest(StorageTest):
 
     @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
     def test_unmovable_damaged_state_doesnt_stop_startup(self):
+        # The database is open already (setUp's storage), so only moving the damaged file aside fails; a state
+        # directory that is read-only from the start stops startup (test_statedb), since nothing could be saved
         state = os.path.join(self.tmp.name, "state")
         with open(os.path.join(state, "pins.json"), "w", encoding="utf-8") as f:
             f.write("{not json")
@@ -310,46 +354,34 @@ class PinTest(StorageTest):
     @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
     def test_unreadable_state_stops_startup_rather_than_losing_pins(self):
         cid = self.add(b"precious").cid
-        self.storage.pin(cid, USER)
-        path = os.path.join(self.tmp.name, "state", "pins.json")
+        state = os.path.join(self.tmp.name, "state")
+        path = write_legacy(state, "pins.json", {"pins": {str(cid): ["user"]}})
         os.chmod(path, 0)  # or EIO, EMFILE: not damage, and starting without pins would let gc delete them
-        self.addCleanup(os.chmod, path, 0o600)
-        with self.assertRaises(PermissionError):
-            self.open()
-        os.chmod(path, 0o600)
+        try:
+            with self.assertRaises(PermissionError):
+                self.open()
+            self.assertTrue(os.path.exists(path))  # not imported, not moved: read at the next start
+        finally:
+            os.chmod(path, 0o600)
         self.assertEqual(self.open().pins(), {cid: {"user"}})
 
     def test_block_names_are_synced_before_pins_and_cache_records(self):
         calls = []
+        real_commit = statedb._Database._commit
+
+        def commit(database, conn):
+            """Note the commit and which rows it writes, then commit."""
+            calls.append("commit " + ",".join(table for table in ("pins", "cache") if conn.execute(
+                f"SELECT count(*) FROM {table}").fetchone()[0]))
+            real_commit(database, conn)
+
         with mock.patch.object(self.storage.blocks, "sync", lambda: calls.append("blocks")), \
-                mock.patch.object(storage_module, "write_json", lambda path, value: calls.append(os.path.basename(path))):
+                mock.patch.object(statedb._Database, "_commit", commit):
             cid = self.add(b"x").cid
             self.storage.pin(cid, USER)
             self.storage.record_fetch(cid, [], cid)
             self.storage.save()
-        self.assertEqual(calls, ["blocks", "pins.json", "blocks", "cache.json"])
-
-    @unittest.skipIf(fsutil.IS_WINDOWS, "Windows can't sync a directory")
-    def test_state_is_synced_before_and_after_the_rename(self):
-        events = []
-        real_fsync, real_replace = os.fsync, fsutil.replace
-        with mock.patch("os.fsync", side_effect=lambda fd: (events.append("fsync"), real_fsync(fd))[1]), \
-                mock.patch.object(fsutil, "replace", lambda *a: (events.append("rename"), real_replace(*a))[1]):
-            storage_module.write_json(os.path.join(self.tmp.name, "state", "x.json"), {"a": 1})
-        self.assertEqual(events, ["fsync", "rename", "fsync"])
-
-    def test_state_file_format(self):
-        path = os.path.join(self.tmp.name, "state", "x.json")
-        value = {"é": ["\ud800", 1]}  # a lone surrogate is written as its escape either way
-        for ensure_ascii, expected in ((True, b'{"\\u00e9": ["\\ud800", 1]}'),
-                                       (False, b'{"\xc3\xa9": ["\\ud800", 1]}')):
-            with self.subTest(ensure_ascii=ensure_ascii):
-                storage_module.write_json(path, value, ensure_ascii=ensure_ascii)
-                with open(path, "rb") as f:
-                    self.assertEqual(f.read(), expected)
-                if POSIX_MODES:
-                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-        self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["x.json"])  # no temporary file left
+        self.assertEqual(calls, ["blocks", "commit pins", "blocks", "commit pins,cache"])
 
     @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX permission bits")
     def test_state_dir_is_private(self):
@@ -530,17 +562,30 @@ class EvictionTest(StorageTest):
         self.assertEqual(self.storage.used_bytes(), 0)
 
     def test_cache_records_saved_in_batches_and_capped(self):
-        path = os.path.join(self.tmp.name, "state", "cache.json")
+        state = os.path.join(self.tmp.name, "state")
         with mock.patch.object(storage_module, "MAX_CACHE_RECORDS", 3):
             built = [self.add(b"%d" % i) for i in range(5)]
             dropped = set()
             for b in built:
                 dropped |= self.storage.record_fetch(b.cid, [], b.cid)
             self.storage.touch(built[2].cid, [])
-            self.assertFalse(os.path.exists(path))  # not rewritten on every fetch
+            self.assertEqual(state_rows(state, "SELECT * FROM cache"), [])  # not written on every fetch
             self.assertEqual(dropped, {built[0].cid, built[1].cid})
             self.storage.save()
             self.assertEqual([t for _, _, t in self.open().cached_fetches()], [built[3].cid, built[4].cid, built[2].cid])
+            # A later save writes only the records changed since: here the one touched
+            query = "SELECT root, path, used FROM cache"
+            before = {(root, path): used for root, path, used in state_rows(state, query)}
+            self.storage.touch(built[3].cid, [])
+            self.storage.save()
+            after = {(root, path): used for root, path, used in state_rows(state, query)}
+            self.assertEqual({key for key in after if after[key] != before[key]}, {(built[3].cid.binary, "[]")})
+            self.assertEqual([t for _, _, t in self.open().cached_fetches()],
+                             [built[4].cid, built[2].cid, built[3].cid])
+            # Evicted and cleared records are deleted
+            self.storage.gc()
+            self.storage.save()
+            self.assertEqual(state_rows(state, "SELECT * FROM cache"), [])
 
     def test_verify(self):
         root, a, b = self.tree()
@@ -730,6 +775,7 @@ class SizeTest(StorageTest):
         root, a, b = self.tree()
         blocks = {cid: self.storage.get(cid) for cid in self.blocks_of(root.cid)}
         self.storage = Storage(os.path.join(self.tmp.name, "blocks2"), os.path.join(self.tmp.name, "state2"), 10**9)
+        self.addCleanup(self.storage.close)
         self.storage.put(root.cid, blocks[root.cid])
         self.storage.pin(root.cid, USER)
         self.assertEqual(self.storage.stat(root.cid)["local_blocks"], 1)  # a's and b's nodes aren't stored yet

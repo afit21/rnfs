@@ -49,7 +49,9 @@ class HardLinkTest(unittest.TestCase):
         with open(self.secret, "wb") as f:
             f.write(SECRET)
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
         self.folder = SharedFolder(self.files, self.storage, os.path.join(self.tmp.name, "state"))
+        self.addCleanup(self.folder.close)
         self.secret_cid = builder.add_path(self.secret, builder.NO_PUT)[0].cid
         log = mock.patch.object(shared_folder, "log")
         self.log = log.start()

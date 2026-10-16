@@ -41,6 +41,9 @@ class Feature:
     def save(self):
         """Save state that is written in batches (called periodically and at stop)."""
 
+    def close(self):
+        """Release the state database, once the node has saved everything at shutdown (after stop and save)."""
+
     def status(self) -> dict:
         """Fields added to `rnfs status`."""
         return {}

@@ -178,6 +178,7 @@ class KeyCadenceTest(unittest.TestCase):
         from rnfs.content.storage import Storage
         config = Config(rnfs_dir=self.tmp.name, **settings)
         storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.addCleanup(storage.close)  # its state database, before the directory goes (Windows)
         self.clock = FakeClock(1_000_000.0)
         self.client = FakeClient()
         publisher = Publisher(bytes(16), config, storage, ProviderStore(10_000, None), self.client,

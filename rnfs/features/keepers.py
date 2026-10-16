@@ -30,7 +30,8 @@ A name resolves through RNS only while its owner is online or a transport node s
   asked again every announce_interval, at most MAX_PENDING at a time, round robin.
 - **A floor.** Kept records are offered to NameManager at startup and on every resolve, so a replayed older
   announce is never accepted for a kept name, even after a restart or name table eviction.
-- State: <state dir>/keepers.json (atomic; records re-verified at load).
+- State: the keepers table of the state database (rnfs.statedb), the names changed since the last save written
+  in batches (records re-verified at load).
 
 No RNS at module level (the CLI imports this module): it is imported inside functions.
 """
@@ -50,8 +51,6 @@ from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE
 NAME = "keepers"
 NAME_PATH = "/name"
 KEY_DOMAIN = b"rnfs-name"
-KEEPERS_FILE = "keepers.json"
-STATE_VERSION = 1
 # Field sizes of an RNS announce (RNS.Identity: KEYSIZE, NAME_HASH_LENGTH, random hash, RATCHETSIZE, SIGLENGTH)
 PUBLIC_KEY_LENGTH = 64
 NAME_HASH_LENGTH = 10
@@ -244,60 +243,115 @@ class KeeperClient:
 # The store
 
 
+def _checked(name, reasons, fields) -> tuple[set[str], SignedRecord | None] | None:
+    """A kept name's reasons and re-verified record (None if it has none, or it doesn't verify) from its saved
+    form, or None if the entry is dropped: not a name, or no known reason. Raises AttributeError, KeyError,
+    TypeError or ValueError if it is malformed (dropped too)."""
+    reasons = {reason for reason in reasons if reason in REASONS}
+    if len(name) != ID_LENGTH or not reasons:
+        return None
+    record = None
+    if fields is not None:
+        record = parse_signed(name, [bytes.fromhex(field) for field in fields])
+    return reasons, record
+
+
+def _row(name: bytes, reasons: set[str], record: SignedRecord | None) -> tuple:
+    """A kept name's row in the keepers table."""
+    from rnfs import statedb
+    return (name, statedb.dump(sorted(reasons)),
+            statedb.dump([field.hex() for field in record.wire()]) if record is not None else None)
+
+
+def import_keepers(value, tx) -> int:
+    """Import keepers.json (statedb.migrate): its names replace the keepers table, each entry checked as rnfs 0.1.4
+    loaded it (a malformed one is skipped; a record that doesn't verify is dropped, its name kept). Returns the
+    number of names imported."""
+    tx.execute("DELETE FROM keepers")
+    entries = value.get("names") if isinstance(value, dict) else None
+    names = set()
+    for name_hex, entry in entries.items() if isinstance(entries, dict) else ():
+        try:
+            name = bytes.fromhex(name_hex)
+            checked = _checked(name, entry["reasons"], entry.get("record"))
+            if checked is None:
+                continue
+            # A name repeated in another case is the same name: the last entry wins, as it did in memory
+            tx.execute("INSERT OR REPLACE INTO keepers (name, reasons, record) VALUES (?, ?, ?)",
+                       _row(name, *checked))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        names.add(name)
+    return len(names)
+
+
 class KeeperStore:
     """Kept names, why each is kept, and the newest signed record of each. Thread-safe."""
 
-    def __init__(self, path: str, max_names: int):
-        """Load path; at most max_names names kept for others (own names not counted)."""
-        self.path = path
+    def __init__(self, state_dir: str, max_names: int):
+        """Load the kept names from the state database in state_dir; at most max_names names kept for others
+        (own names not counted). Close it when done."""
+        from rnfs import statedb
         self.max_names = max_names
         self._lock = threading.Lock()
         self._reasons: dict[bytes, set[str]] = {}
         self._records: dict[bytes, SignedRecord] = {}
-        self.dirty = False
+        self._dirty: set[bytes] = set()  # names changed (or released) since the last save
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
-        self._load()
+        self._db = statedb.connect(state_dir)
+        try:
+            self._load()
+        except BaseException:
+            self._db.close()
+            raise
 
     def _load(self):
-        """Read the state file, re-verifying every record (a damaged entry is dropped, not trusted)."""
-        from rnfs.content.storage import read_json
-        state = read_json(self.path)
-        entries = state.get("names") if isinstance(state, dict) else None
-        if not isinstance(entries, dict):
-            return
-        for name_hex, entry in entries.items():
+        """Read the kept names, re-verifying every record: a malformed row is dropped (deleted), not trusted, and
+        a record that doesn't verify is dropped from its row."""
+        from rnfs import statedb
+        gone, unverified = [], []
+        for name, reasons, fields in self._db.query("SELECT name, reasons, record FROM keepers"):
             try:
-                name = bytes.fromhex(name_hex)
-                reasons = {reason for reason in entry["reasons"] if reason in REASONS}
-                if len(name) != ID_LENGTH or not reasons:
-                    continue
-                record = None
-                if entry.get("record") is not None:
-                    record = parse_signed(name, [bytes.fromhex(field) for field in entry["record"]])
+                if type(name) is not bytes:
+                    raise TypeError("not a name")
+                checked = _checked(name, statedb.load(reasons), statedb.load(fields) if fields is not None else None)
             except (AttributeError, KeyError, TypeError, ValueError):
+                checked = None
+            if checked is None:
+                gone.append(name)
                 continue
-            self._reasons[name] = reasons
+            self._reasons[name], record = checked
             if record is not None:
                 self._records[name] = record
+            elif fields is not None:
+                unverified.append(name)
+        if gone or unverified:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM keepers WHERE name = ?", [(name,) for name in gone])
+                tx.executemany("UPDATE keepers SET record = NULL WHERE name = ?", [(name,) for name in unverified])
 
     def save(self):
-        """Write the state file atomically if anything changed."""
-        from rnfs.content.storage import write_json
+        """Write the names changed since the last save, if any."""
         with self._save_lock:
             with self._lock:
-                if not self.dirty:
+                if not self._dirty:
                     return
-                state = {"version": STATE_VERSION,
-                         "names": {name.hex(): {"reasons": sorted(reasons),
-                                                "record": ([field.hex() for field in self._records[name].wire()]
-                                                           if name in self._records else None)}
-                                   for name, reasons in sorted(self._reasons.items())}}
-                self.dirty = False
+                dirty, self._dirty = self._dirty, set()
+                rows = [_row(name, self._reasons[name], self._records.get(name))
+                        for name in sorted(dirty) if name in self._reasons]
+                gone = [(name,) for name in dirty if name not in self._reasons]
             try:
-                write_json(self.path, state)
-            except OSError:
-                self.dirty = True  # try again at the next save
+                with self._db.transaction() as tx:
+                    tx.executemany("DELETE FROM keepers WHERE name = ?", gone)
+                    tx.executemany("INSERT OR REPLACE INTO keepers (name, reasons, record) VALUES (?, ?, ?)", rows)
+            except BaseException:
+                with self._lock:
+                    self._dirty |= dirty  # tried again at the next save
                 raise
+
+    def close(self):
+        """Release the state database."""
+        self._db.close()
 
     def _others(self) -> int:
         """Names kept for others (lock held)."""
@@ -312,7 +366,7 @@ class KeeperStore:
             if reasons is None and reason != OWN and self._others() >= self.max_names:
                 raise ValueError(f"already keeping {self.max_names} names (keep_max_names)")
             self._reasons.setdefault(name, set()).add(reason)
-            self.dirty = True
+            self._dirty.add(name)
             return True
 
     def release(self, name: bytes, reason: str) -> bool:
@@ -325,7 +379,7 @@ class KeeperStore:
             if not reasons:
                 del self._reasons[name]
                 self._records.pop(name, None)
-            self.dirty = True
+            self._dirty.add(name)
             return True
 
     def offer(self, record: SignedRecord) -> bool:
@@ -334,7 +388,7 @@ class KeeperStore:
             if record.name not in self._reasons or not record.newer_than(self._records.get(record.name)):
                 return False
             self._records[record.name] = record
-            self.dirty = True
+            self._dirty.add(record.name)
             return True
 
     def get(self, name: bytes) -> SignedRecord | None:
@@ -374,7 +428,7 @@ class KeepersFeature(Feature):
     def __init__(self, node):
         """Load kept names, hook into names and the publisher; no network."""
         super().__init__(node)
-        self.store = KeeperStore(os.path.join(node.config.state_dir, KEEPERS_FILE), node.config.keep_max_names)
+        self.store = KeeperStore(node.config.state_dir, node.config.keep_max_names)
         links = getattr(node, "links", None)
         # Offline test nodes have no LinkPool: their fake client may answer name_record itself
         self.client = KeeperClient(links) if links is not None else node.client
@@ -414,6 +468,10 @@ class KeepersFeature(Feature):
     def save(self):
         """Save kept records if they changed."""
         self.store.save()
+
+    def close(self):
+        """Release the state database."""
+        self.store.close()
 
     def status(self) -> dict:
         """Names kept."""

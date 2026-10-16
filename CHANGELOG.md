@@ -4,8 +4,35 @@
 
 ## Unreleased
 
-Performance work, and a debug log. No wire-format, CID or state-file changes: these nodes and 0.1.4 nodes work
-together, and each reads the other's `<rnfs dir>`.
+Performance work, a debug log, and state kept in one SQLite database. No wire-format or CID changes: these
+nodes and 0.1.4 nodes work together. The upgrade of an `<rnfs dir>` is automatic and one-way (an older version
+can't read it afterwards).
+
+Changed:
+- State is kept in one SQLite database, `<rnfs dir>/state/rnfs.db` (Python's standard `sqlite3`; no new
+  dependency), instead of 17 JSON files. At the first start the JSON files of 0.1.4 or 0.1.3 (pins, cache
+  records, pin names, fetched targets, remote pins waiting, invalid roots, publish state, provider records,
+  names and the name floor, the shared folder, jobs, keepers, follows, contacts, the LXMF inbox and outbox) are
+  imported, each in one transaction, with every check the old loaders applied, and kept as `<name>.migrated`
+  (a node that skips versions upgrades the same way). A damaged file is moved aside as `.damaged` as before; an
+  unreadable `pins.json` or a damaged `names.json` still stops startup. Nothing changes on the network: request
+  paths, messages, CIDs, DAG bytes, provider and name records are as before.
+- Saves write only what changed: a pin or release is one row, about 2.5 ms whatever the number of pins
+  (before: `pins.json` rewritten whole, 5 ms at 100 pins and 14 ms at 20 000); a provider-records save writes
+  the records changed since the last one (one change at 100 000 records: 0.02 ms, from 155 ms); a cache save
+  the records touched (0.02 ms, from 13 ms at 10 000 records). Startup with 20 000 pins and 100 000 provider
+  records loads in 350 ms, from 460.
+- Pins, names, jobs and the other state saved on each change are on disk when the change returns, as before.
+  State saved in batches (cache records, fetched targets, invalid roots, remote pins waiting, provider records,
+  publish state, the name floor, keepers, the LXMF inbox and outbox) is no longer synced to disk at each save:
+  a power loss (not a crash) may lose the last of those saves as well as what changed since, never part of
+  one, and never one without every earlier save.
+- A `providers.json` that can't be parsed is now kept as `.damaged` (before, the node started without its records
+  and overwrote it). Node IDs and keys in `published.json` must be 16 bytes (rnfs never wrote others).
+- The database and its `-wal` and `-shm` files are readable by their owner only. rnfs refuses to start on a
+  damaged database (it runs SQLite's `quick_check` at startup) or one written by a newer version, and says how
+  to recover: the `.migrated` files are kept for that. A state directory it can't write to now stops startup
+  too, saying so (before, the node started and every save failed).
 
 Added:
 - A debug log file, for diagnosing problems: `debug_log = true` in `rnfs.toml`, or `rnfs daemon --debug-log`,
@@ -25,20 +52,20 @@ Fixes:
 - `gc` (and eviction) could delete blocks of a complete pin. `stat` of a DAG only partly stored remembered the
   nodes it didn't find as listing nothing, so once the rest was fetched and pinned, collection didn't see what
   those nodes reach. Until a restart, which cleared it.
-- `import` pins the roots an archive supplies with one save of `pins.json`; if that save fails, none of them is
+- `import` pins the roots an archive supplies with one save of the pins; if that save fails, none of them is
   pinned (before, those ahead of the failure were).
 
 Faster:
 - `add`, the shared folder and `import` write blocks on up to 16 threads, so the sync to disk each block needs
   before its rename overlaps (about 11x on an SSD: 64 MB added at 165–190 MB/s, from 13–17). Every block is
   still synced before it is named, and before anything pins it.
-- A CID's written form and DHT key are computed once. They showed up in every save of `pins.json`,
-  `pin_names.json`, `published.json` and in `pin ls`.
-- `fetched.json` is saved with the cache records (every 30 s, at `gc` and at stop), not rewritten and synced
-  under the node's lock on each fetch. Jobs save `jobs.json` once per change, not twice.
-- State files written in full (`published.json`, `providers.json`, `name-floor.json`) are written outside the
-  publisher, provider-store and names locks, from a copy taken under them, so `/find`, `/provide`, resolves and
-  name announces don't wait for the write. `verify` and the size queries (`stat`, quotas, pinned bytes) read DAG
+- A CID's written form and DHT key are computed once. They showed up in every save of the pins, pin names and
+  publish state, and in `pin ls`.
+- The targets fetched for the user (for `roots`) are saved with the cache records (every 30 s, at `gc` and at
+  stop), not rewritten and synced under the node's lock on each fetch. Jobs are saved once per change, not twice.
+- The publish state, provider records and name floor are written outside the publisher, provider-store and
+  names locks, from a copy taken under them, so `/find`, `/provide`, resolves and name announces don't wait for
+  the write. `verify` and the size queries (`stat`, quotas, pinned bytes) read DAG
   nodes without the storage lock, as eviction and `gc` already did.
 - Recomputing what is provided reuses the last result when no provided DAG changed (about 30 ms to 5 ms at
   5000 pins).

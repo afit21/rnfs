@@ -20,6 +20,7 @@ from rnfs.features import contacts
 from rnfs.features.contacts import check_nick, is_nick, node_arg
 from rnfs.node import RnfsNode
 
+from tests.support import failing_commits, state_execute, state_rows, write_legacy
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -94,7 +95,18 @@ class ContactsNodeTest(unittest.TestCase):
         self.addCleanup(node.stop)
         return node
 
+    def reopen(self) -> contacts.ContactsFeature:
+        """B's address book loaded again from its state, closed when the test ends."""
+        book = contacts.ContactsFeature(self.b)
+        self.addCleanup(book.close)
+        return book
+
+    def rows(self) -> list[tuple]:
+        """What B's contacts table holds, by nick."""
+        return state_rows(self.b.config.state_dir, "SELECT nick, kind, id FROM contacts ORDER BY nick")
+
     def test_add_list_remove_persist(self):
+        """Contacts are saved as added and removed, and loaded again."""
         self.book.add("alice", self.name.hex(), "name")
         self.book.add("anode", "<" + A_ID.hex().upper() + ">", "node")
         self.assertEqual(self.book.list(), [{"nick": "alice", "kind": "name", "id": self.name.hex()},
@@ -103,13 +115,11 @@ class ContactsNodeTest(unittest.TestCase):
         self.assertIsNone(self.book.lookup("anode", "lxmf"))
         self.assertIsNone(self.book.lookup("nobody"))
         self.assertIsNone(self.book.lookup("Bad Nick"))
-        again = contacts.ContactsFeature(self.b)
-        self.assertEqual(again.list(), self.book.list())
+        self.assertEqual(self.reopen().list(), self.book.list())
         self.book.remove("anode")
         with self.assertRaises(NotFound):
             self.book.remove("anode")
-        with open(os.path.join(self.b.config.state_dir, contacts.CONTACTS_FILE), encoding="utf-8") as f:
-            self.assertEqual(list(json.load(f)["contacts"]), ["alice"])
+        self.assertEqual(self.rows(), [("alice", "name", self.name)])
 
     def test_invalid_input(self):
         for nick, ident, kind in (("Alice", self.name.hex(), "name"), ("alice", "xyz", "name"),
@@ -118,13 +128,38 @@ class ContactsNodeTest(unittest.TestCase):
                 self.book.add(nick, ident, kind)
 
     def test_malformed_file_entries_skipped(self):
-        path = os.path.join(self.b.config.state_dir, contacts.CONTACTS_FILE)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "contacts": {"ok": {"kind": "node", "id": A_ID.hex()},
-                                                  "BAD": {"kind": "node", "id": A_ID.hex()},
-                                                  "worse": {"kind": "spaceship", "id": A_ID.hex()},
-                                                  "worst": "nope"}}, f)
-        self.assertEqual([c["nick"] for c in contacts.ContactsFeature(self.b).list()], ["ok"])
+        """contacts.json's malformed entries are skipped when it is imported."""
+        write_legacy(self.b.config.state_dir, "contacts.json",
+                     {"version": 1, "contacts": {"ok": {"kind": "node", "id": A_ID.hex()},
+                                                 "BAD": {"kind": "node", "id": A_ID.hex()},
+                                                 "worse": {"kind": "spaceship", "id": A_ID.hex()},
+                                                 "worst": "nope"}})
+        self.assertEqual([c["nick"] for c in self.reopen().list()], ["ok"])
+
+    def test_malformed_rows_deleted(self):
+        """Rows that aren't a valid contact, and any past MAX_CONTACTS, are skipped at load and deleted."""
+        self.book.add("ok", A_ID.hex(), "node")
+        self.book.add("zed", B_ID.hex(), "node")
+        for nick, kind, ident in (("BAD", "node", A_ID), ("worse", "spaceship", A_ID), ("short", "node", b"\x01"),
+                                  ("text", "node", A_ID.hex()), ("ab" * 16, "node", A_ID)):
+            state_execute(self.b.config.state_dir, "INSERT INTO contacts (nick, kind, id) VALUES (?, ?, ?)",
+                          (nick, kind, ident))
+        with mock.patch.object(contacts, "MAX_CONTACTS", 1):
+            self.assertEqual([c["nick"] for c in self.reopen().list()], ["ok"])
+        self.assertEqual(self.rows(), [("ok", "node", A_ID)])
+
+    def test_failed_save_is_written_with_the_next_change(self):
+        """A change whose commit failed raises and stays in memory, as before; the next change saves it too."""
+        with failing_commits(), self.assertRaises(OSError):
+            self.book.add("anode", A_ID.hex(), "node")
+        self.assertEqual(self.book.lookup("anode", "node"), A_ID)
+        self.assertEqual(self.rows(), [])
+        self.book.add("bnode", B_ID.hex(), "node")
+        self.assertEqual(self.rows(), [("anode", "node", A_ID), ("bnode", "node", B_ID)])
+        with failing_commits(), self.assertRaises(OSError):
+            self.book.remove("anode")
+        self.book.remove("bnode")
+        self.assertEqual(self.rows(), [])
 
     def test_kind_detection(self):
         self.assertEqual(self.book.add("alice", self.name.hex())["kind"], "name")  # a record B holds

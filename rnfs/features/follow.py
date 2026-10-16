@@ -13,11 +13,12 @@
 - One background thread does every check and fetch, one at a time, so following many names never runs more
   than one transfer. Fetches obey the usual limits (max_download_size, the DAG byte bound of the new
   target's declared size, disk reserve); a followed target is a pin, so it is provided.
-- Followed names count against keep_max_names. State: <state dir>/follow.json (atomic).
+- Followed names count against keep_max_names. State: the follow table of the state database (rnfs.statedb),
+  each change committed durably as it is made (the rows of the names it changes), and a meta value saying it
+  was saved whole ("clean"), which the reconcile at start needs.
 
 No RNS at module level (the CLI imports this module).
 """
-import os
 import threading
 import time
 
@@ -30,8 +31,6 @@ from rnfs.features.keepers import FOLLOW, name_subcommands, parse_name_arg
 from rnfs.fsutil import printable
 
 NAME = "follow"
-FOLLOW_FILE = "follow.json"
-STATE_VERSION = 1
 SOURCE_PREFIX = "follow:"
 RETRY_INTERVAL = 300.0  # seconds before a failed check or fetch is first tried again; doubles per failure
 FAR_FUTURE = float("inf")
@@ -49,6 +48,31 @@ def follow_source(name: bytes) -> str:
     return SOURCE_PREFIX + name.hex()
 
 
+def import_follow(value, tx) -> int:
+    """Import follow.json (statedb.migrate): its names replace the follow table, each entry checked as rnfs 0.1.4
+    loaded it (a malformed one is skipped). The state is clean only if every entry was read, as the reconcile at
+    start needs (FollowFeature._reconcile). Returns the number of names imported."""
+    from rnfs import statedb
+    tx.execute("DELETE FROM follow")
+    entries = value.get("names") if isinstance(value, dict) else None
+    clean, names = isinstance(entries, dict), set()
+    for name_hex, entry in entries.items() if isinstance(entries, dict) else ():
+        try:
+            name = bytes.fromhex(name_hex)
+            pinned = Cid.parse(entry["pinned"]) if entry.get("pinned") is not None else None
+            if len(name) != ID_LENGTH:
+                raise ValueError("not a name")
+            # A name repeated in another case is the same name: the last entry wins, as it did in memory
+            tx.execute("INSERT OR REPLACE INTO follow (name, pinned) VALUES (?, ?)",
+                       (name, pinned.binary if pinned is not None else None))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            clean = False
+            continue
+        names.add(name)
+    statedb.set_meta(tx, NAME, "clean", int(clean))
+    return len(names)
+
+
 def _log(message: str, level: int = LOG_VERBOSE):
     """Log with this feature's prefix."""
     _common.log(f"follow: {message}", level)
@@ -61,10 +85,12 @@ class FollowFeature(Feature):
 
     def __init__(self, node):
         """Load followed names; no network."""
+        from rnfs import statedb
         super().__init__(node)
-        self._path = os.path.join(node.config.state_dir, FOLLOW_FILE)
+        self._db = statedb.connect(node.config.state_dir)
         self._lock = threading.Lock()
         self._pinned: dict[bytes, Cid | None] = {}  # followed name -> target pinned for it (complete)
+        self._unsaved: set[bytes] = set()  # names a failed save didn't write: the next save writes them too
         self._state: dict[bytes, str] = {}  # name -> what the last check did, for `following`
         self._due: dict[bytes, tuple[float, bool]] = {}  # name -> (monotonic time, use the network)
         self._failures: dict[bytes, int] = {}  # name -> checks failed in a row (for the retry backoff)
@@ -74,37 +100,41 @@ class FollowFeature(Feature):
         self._thread: threading.Thread | None = None
         self._keepers = node.feature("keepers")
         self._keepers.add_listener(self._changed)
-        self._reconcile(self._load())
+        try:
+            self._reconcile(self._load())
+        except BaseException:
+            self._db.close()
+            raise
 
     # State
 
     def _load(self) -> bool:
-        """Read follow.json, skipping malformed entries; True if it was there and every entry was read."""
-        from rnfs.content.storage import read_json
-        state = read_json(self._path)  # a damaged file is moved aside and gives None, as a missing one does
-        entries = state.get("names") if isinstance(state, dict) else None
-        if not isinstance(entries, dict):
-            return False
-        clean = True
-        for name_hex, entry in entries.items():
+        """Read the followed names, skipping malformed rows (deleted); True if the state was saved whole (its
+        clean meta value: never saved, or follow.json missing, damaged or with a malformed entry when it was
+        imported, isn't) and every row was read."""
+        from rnfs import statedb
+        clean = self._db.meta(NAME, "clean") == 1
+        bad = []
+        for name, pinned in self._db.query("SELECT name, pinned FROM follow"):
             try:
-                name = bytes.fromhex(name_hex)
-                pinned = Cid.parse(entry["pinned"]) if entry.get("pinned") is not None else None
-            except (AttributeError, KeyError, TypeError, ValueError):
-                clean = False
-                continue
-            if len(name) == ID_LENGTH:
-                self._pinned[name] = pinned
-            else:
-                clean = False
+                if type(name) is not bytes or len(name) != ID_LENGTH:
+                    raise ValueError("not a name")
+                self._pinned[name] = Cid.from_bytes(pinned) if pinned is not None else None
+            except (TypeError, ValueError):
+                bad.append(name)
+        if bad:
+            clean = False
+            with self._db.transaction(durable=True) as tx:  # and not clean, until the next save
+                tx.executemany("DELETE FROM follow WHERE name = ?", [(name,) for name in bad])
+                statedb.set_meta(tx, NAME, "clean", 0)
         return clean
 
     def _reconcile(self, clean: bool):
-        """Make the follow pins match follow.json. If it was read whole (clean), release follow pins of names it
-        doesn't list: a crash inside unfollow, after follow.json was saved, leaves one that nothing else would
-        release (`pin rm` releases only the user's pins). Otherwise (missing, damaged or with a malformed entry)
-        such a pin is the record of a name still followed: follow it again, so it is kept, checked and can be
-        unfollowed."""
+        """Make the follow pins match the saved names. If they were read whole (clean), release follow pins of
+        names they don't list: a crash inside unfollow, after the name was deleted, leaves one that nothing else
+        would release (`pin rm` releases only the user's pins). Otherwise (never saved, follow.json missing or
+        damaged when imported, or a malformed entry) such a pin is the record of a name still followed: follow it
+        again, so it is kept, checked and can be unfollowed."""
         held: dict[bytes, set[Cid]] = {}
         for cid, sources in self.node.storage.pins().items():
             for source in sources:
@@ -122,12 +152,12 @@ class FollowFeature(Feature):
             for name, cids in sorted(held.items()):
                 # One target is its pin; several (a crash during a check) are sorted out by its next check
                 self._pinned[name] = next(iter(cids)) if len(cids) == 1 else None
-                _log(f"{FOLLOW_FILE} is missing, damaged or incomplete: following name {name.hex()} again, "
+                _log(f"the followed names are missing, damaged or incomplete: following name {name.hex()} again, "
                      f"as its pin of {', '.join(sorted(str(cid) for cid in cids))} shows", LOG_WARNING)
             try:
-                self._save()
-            except OSError as e:  # the pins are kept; follow.json is rebuilt again at the next start
-                _log(f"saving {FOLLOW_FILE} failed: {e}", LOG_ERROR)
+                self._save(*held)
+            except OSError as e:  # the pins are kept; the names are followed again at the next start
+                _log(f"saving the followed names failed: {e}", LOG_ERROR)
             return
         for name, cids in held.items():
             source = follow_source(name)
@@ -138,12 +168,23 @@ class FollowFeature(Feature):
                 except OSError as e:  # e.g. a read-only state directory: tried again at the next start
                     _log(f"could not release {cid}: {e}", LOG_ERROR)
 
-    def _save(self):
-        """Write follow.json atomically (lock held)."""
-        from rnfs.content.storage import write_json
-        write_json(self._path, {"version": STATE_VERSION,
-                                "names": {name.hex(): {"pinned": str(cid) if cid is not None else None}
-                                          for name, cid in sorted(self._pinned.items())}})
+    def _save(self, *names: bytes):
+        """Persist the entries of names, and of any a failed save left unsaved, durably, and mark the state clean
+        (lock held). Raises OSError; the names are then written by the next save."""
+        from rnfs import statedb
+        names = self._unsaved.union(names)
+        try:
+            with self._db.transaction(durable=True) as tx:
+                tx.executemany("DELETE FROM follow WHERE name = ?",
+                               [(name,) for name in names if name not in self._pinned])
+                tx.executemany("INSERT OR REPLACE INTO follow (name, pinned) VALUES (?, ?)",
+                               [(name, self._pinned[name].binary if self._pinned[name] is not None else None)
+                                for name in sorted(names) if name in self._pinned])
+                statedb.set_meta(tx, NAME, "clean", 1)
+        except BaseException:
+            self._unsaved = names
+            raise
+        self._unsaved = set()
 
     # Lifecycle
 
@@ -161,6 +202,10 @@ class FollowFeature(Feature):
         self._stop.set()
         self._wake.set()
 
+    def close(self):
+        """Release the state database."""
+        self._db.close()
+
     def status(self) -> dict:
         """Names followed."""
         with self._lock:
@@ -174,7 +219,7 @@ class FollowFeature(Feature):
         with self._lock:
             if name not in self._pinned:
                 self._pinned[name] = None
-                self._save()
+                self._save(name)
                 _log(f"following name {name.hex()}", LOG_NOTICE)
             self._failures.pop(name, None)  # asked again by the user: start the backoff afresh
             self._due[name] = (time.monotonic(), True)
@@ -191,7 +236,7 @@ class FollowFeature(Feature):
             self._state.pop(name, None)
             self._failures.pop(name, None)
             self._resolved.discard(name)
-            self._save()
+            self._save(name)
         # Every target its source holds: a crash during an earlier check may have left more than the one recorded
         source = follow_source(name)
         for cid in self.node.storage.pinned_by(source) | ({pinned} if pinned is not None else set()):
@@ -269,9 +314,9 @@ class FollowFeature(Feature):
                         previous = self._pinned[name]
                         self._pinned[name] = target
                         try:
-                            self._save()
-                        except OSError as e:  # the pins are right; follow.json catches up with the next save
-                            _log(f"saving {FOLLOW_FILE} failed: {e}", LOG_ERROR)
+                            self._save(name)
+                        except OSError as e:  # the pins are right; the next save writes the name too
+                            _log(f"saving the followed names failed: {e}", LOG_ERROR)
         except RnfsError as e:
             self._set_state(name, f"fetch of {target} failed: {e}")
             _log(f"fetching {target} for name {name.hex()} failed: {e}", LOG_WARNING)
@@ -279,7 +324,7 @@ class FollowFeature(Feature):
         if not followed:
             return True  # unfollowed while fetching: nothing was pinned
         # The old target is released only now that the new one is complete, with any other the source holds (a
-        # crash between pinning and saving follow.json leaves the target pinned but not recorded)
+        # crash between pinning and saving the name leaves the target pinned but not recorded)
         for cid in self.node.storage.pinned_by(source) | ({previous} if previous is not None else set()):
             if cid != target:
                 self.node.storage.unpin(cid, source)

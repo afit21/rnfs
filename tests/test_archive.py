@@ -12,6 +12,7 @@ from rnfs.content.cid import EMPTY_DIRECTORY, RAW, Cid
 from rnfs.content.dag import DirectoryNode, Entry
 from rnfs.content.storage import USER, Storage
 from rnfs.errors import StorageFull, TooLarge
+from tests.support import failing_commits
 
 
 class ArchiveTest(unittest.TestCase):
@@ -31,8 +32,11 @@ class ArchiveTest(unittest.TestCase):
              Entry("c", self.other.cid, 5, 0)], put)
 
     def storage(self, name: str) -> Storage:
-        """Storage under the temporary directory."""
-        return Storage(os.path.join(self.tmp.name, name, "blocks"), os.path.join(self.tmp.name, name, "state"), 10**9)
+        """Storage under the temporary directory (closed before the directory is removed)."""
+        storage = Storage(os.path.join(self.tmp.name, name, "blocks"), os.path.join(self.tmp.name, name, "state"),
+                          10**9)
+        self.addCleanup(storage.close)
+        return storage
 
     def export(self, roots) -> bytes:
         """Export roots from the source."""
@@ -84,7 +88,7 @@ class ArchiveTest(unittest.TestCase):
 
     def test_failed_pin_save_pins_no_root(self):
         data = self.export([self.root.cid, self.other.cid])
-        with mock.patch("rnfs.content.storage.write_json", side_effect=OSError(28, "No space left on device")):
+        with failing_commits("database or disk is full"):
             with self.assertRaises(OSError):
                 archive.import_archive(io.BytesIO(data), self.destination)
         self.assertEqual(self.destination.pins(), {})

@@ -36,7 +36,7 @@ class IndexPageFullRunTest(unittest.TestCase):
         """One offline node and a page data dir."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.node, _ = helpers.make_nodes(self.tmp.name)
+        _, self.node, _ = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.node.stop)
         self.data_dir = os.path.join(self.tmp.name, "page-data")
 

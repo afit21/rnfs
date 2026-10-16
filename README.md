@@ -367,7 +367,7 @@ Uninstalling never deletes it.
 | `storage/identity` | the node's RNS identity; your node ID comes from it |
 | `storage/lxmf_identity` | a separate identity for your LXMF address |
 | `blocks/` | stored blocks |
-| `state/` | pins, cache records, provider records, names' sequences, jobs, kept and followed names, contacts, LXMF inbox and outbox |
+| `state/rnfs.db` | pins, cache records, provider records, names' sequences, jobs, kept and followed names, contacts, LXMF inbox and outbox (one SQLite database; an older version's JSON files there are imported at the first start and kept as `*.migrated`) |
 | `names/` | name keys (back them up: `rnfs name export`) |
 | `files/` | the shared folder: anything put here is added, pinned and shared automatically |
 | `api_token` | the running daemon's API token |

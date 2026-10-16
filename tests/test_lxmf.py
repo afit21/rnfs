@@ -13,6 +13,7 @@ from unittest import mock
 
 import RNS
 
+from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content import storage as storage_module
 from rnfs.content.cid import Cid
@@ -22,7 +23,7 @@ from rnfs.features import lxmf
 from rnfs.features.lxmf import FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE, Incoming, Link, MessageLog
 from rnfs.node import RnfsNode
 
-from tests.support import FakeClock
+from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -194,32 +195,60 @@ class MessageLogTest(unittest.TestCase):
     """The bounded, persistent message log behind the inbox and outbox."""
 
     def setUp(self):
-        """A temporary state file."""
+        """A temporary state directory."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.path = os.path.join(self.tmp.name, "log.json")
+        self.state = self.tmp.name
+
+    def open(self, limit: int = 10, box: str = lxmf.INBOX, **settings) -> MessageLog:
+        """A log of box in the state directory (closed before the directory is removed)."""
+        log = MessageLog(self.state, box, limit, **settings)
+        self.addCleanup(log.close)
+        return log
+
+    def rows(self, box: str = lxmf.INBOX) -> dict:
+        """The saved records of box: id -> record text."""
+        return dict(state_rows(self.state, "SELECT id, record FROM lxmf_messages WHERE box = ?", (box,)))
 
     def test_bounded_oldest_dropped(self):
-        log = MessageLog(self.path, 3)
+        """Past the limit the oldest record is dropped."""
+        log = self.open(3)
         dropped = [log.add({"text": f"m{i}"})[1] for i in range(5)]
         self.assertEqual([e["id"] for e in log.entries()], [3, 4, 5])
         self.assertEqual([[e["text"] for e in d] for d in dropped], [[], [], [], ["m0"], ["m1"]])
 
     def test_persistence(self):
-        log = MessageLog(self.path, 10)
+        """Records are saved as UTF-8 JSON, one row each; ids are never reused; a lower limit keeps the newest."""
+        log = self.open()
         log.add({"text": "héllo ✓"})
         second, _ = log.add({"text": "two"})
         log.remove(second)
         log.save()
-        with open(self.path, encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["messages"][0]["text"], "héllo ✓")
-        again = MessageLog(self.path, 10)
+        self.assertEqual(self.rows(), {1: '{"text": "héllo ✓", "id": 1}'})
+        again = self.open()
         self.assertEqual([e["text"] for e in again.entries()], ["héllo ✓"])
+        self.assertTrue(again.clean)
         self.assertEqual(again.add({})[0], 3)  # ids are never reused
-        self.assertEqual(MessageLog(self.path, 1).entries()[0]["id"], 1)  # a lower limit keeps the newest
+        self.assertEqual(self.open(1).entries()[0]["id"], 1)  # a lower limit keeps the newest
+
+    def test_records_round_trip_exactly(self):
+        """Lone surrogates, non-BMP and other non-ASCII characters, key order and nested values come back as
+        they were saved."""
+        log = self.open()
+        records = [{"title": "\udc80 lone", "text": "emoji \U0001F600 and \ud83d alone", "display_name": "名前 \udfff",
+                    "links": [{"uri": "rnfs:x", "size": 3}], "auto": [{"state": "pinned", "cid": "c"}], "sent": 1.5},
+                   {"z": None, "a": [1, [2, {"b": "\x00\n"}]], "text": "\U0010FFFF"}]
+        for record in records:
+            log.add(dict(record))
+        log.save()
+        loaded = self.open().entries()
+        self.assertEqual(loaded, [{**record, "id": n} for n, record in enumerate(records, 1)])
+        self.assertEqual([list(e) for e in loaded], [list(record) + ["id"] for record in records])
+        self.assertEqual([lxmf._json_bytes(e) for e in loaded], [lxmf._json_bytes(e) for e in log.entries()])
 
     def test_update_find_remove_all(self):
-        log = MessageLog(self.path, 10)
+        """Records are updated, found by a field and removed (all of them for None)."""
+        log = self.open()
         first, _ = log.add({"hash": "aa"})
         log.add({"hash": "bb"})
         self.assertTrue(log.update(first, state="x"))
@@ -229,49 +258,125 @@ class MessageLogTest(unittest.TestCase):
         self.assertEqual(len(log.remove(None)), 2)
         self.assertEqual(len(log), 0)
 
+    def test_a_save_writes_only_the_records_changed(self):
+        """A save writes the records added, changed or removed since the last, with the next id."""
+        log = self.open()
+        for n in range(3):
+            log.add({"n": n})
+        log.save()
+        state_execute(self.state, "UPDATE lxmf_messages SET record = '{\"n\": 0, \"id\": 1, \"mark\": 1}' "
+                                  "WHERE box = 'inbox' AND id = 1")
+        log.update(2, n=20)
+        log.remove(3)
+        log.add({"n": 4})
+        log.save()
+        self.assertEqual(self.rows(), {1: '{"n": 0, "id": 1, "mark": 1}', 2: '{"n": 20, "id": 2}',
+                                       4: '{"n": 4, "id": 4}'})
+        self.assertEqual(state_rows(self.state, "SELECT key, value FROM meta WHERE store = 'inbox' ORDER BY key"),
+                         [("clean", 1), ("next_id", 5)])
+        log.save()  # nothing changed: nothing written
+        self.assertEqual(state_rows(self.state, "SELECT value FROM meta WHERE store = 'inbox' AND key = 'next_id'"),
+                         [(5,)])
+
+    def test_boxes_are_apart(self):
+        """The inbox and outbox share the table, each with its rows and next id."""
+        inbox, outbox = self.open(), self.open(box=lxmf.OUTBOX)
+        inbox.add({"to": "in"})
+        inbox.add({"to": "in"})
+        outbox.add({"to": "out"})
+        inbox.save()
+        outbox.save()
+        self.assertEqual([e["to"] for e in self.open(box=lxmf.OUTBOX).entries()], ["out"])
+        self.assertEqual(self.open(box=lxmf.OUTBOX).add({})[0], 2)
+        self.assertEqual(len(self.open().entries()), 2)
+
     def test_saves_never_land_out_of_order(self):
-        # L13: a save that took its snapshot first can't be written after a later one
+        """L13: a save that took its snapshot first can't be written after a later one; adding doesn't wait for
+        a slow save."""
         import threading
-        log = MessageLog(self.path, 10)
+        log = self.open()
         log.add({"n": 1})
-        write = lxmf._write_json
+        commit = statedb._Database._commit
         entered, gate = threading.Event(), threading.Event()
 
-        def slow(path, value):
-            """The first save stalls in its write until released."""
+        def slow(database, conn):
+            """The first save stalls in its commit until released."""
             if threading.current_thread().name == "first":
                 entered.set()
                 gate.wait(5)
-            write(path, value)
+            commit(database, conn)
 
-        with mock.patch.object(lxmf, "_write_json", side_effect=slow):
+        with mock.patch.object(statedb._Database, "_commit", slow):
             first = threading.Thread(target=log.save, name="first")
             first.start()
             entered.wait(5)
-            log.add({"n": 2})
+            log.add({"n": 2})  # doesn't wait for the save
             threading.Timer(0.2, gate.set).start()
             log.save()  # waits for the first save, then writes the newer records
             first.join(5)
-        with open(self.path, encoding="utf-8") as f:
-            self.assertEqual([e["n"] for e in json.load(f)["messages"]], [1, 2])
+        self.assertEqual([e["n"] for e in self.open().entries()], [1, 2])
 
-    def test_writes_are_synced(self):
-        # L18: the file is fsynced before it replaces the old one (and its directory after, where possible)
-        log = MessageLog(self.path, 10)
+    def test_a_failed_save_is_tried_again(self):
+        """L18: a save is one transaction: if it fails nothing of it is written (the records saved before stay
+        whole), and the next save writes what it would have."""
+        log = self.open()
         log.add({"n": 1})
-        with mock.patch.object(lxmf.os, "fsync", wraps=os.fsync) as fsync:
-            log.save()
-        self.assertGreaterEqual(fsync.call_count, 1 if os.name == "nt" else 2)
+        log.save()
+        log.update(1, n=10)
+        log.add({"n": 2})
+        with failing_commits():
+            with self.assertRaises(OSError):
+                log.save()
+        self.assertEqual(self.rows(), {1: '{"n": 1, "id": 1}'})
+        self.assertEqual([e["n"] for e in log.entries()], [10, 2])  # memory keeps them
+        log.save()
+        self.assertEqual([e["n"] for e in self.open().entries()], [10, 2])
 
-    def test_damaged_and_malformed(self):
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("{not json")
-        self.assertEqual(MessageLog(self.path, 10).entries(), [])
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump({"next_id": "x", "messages": [{"id": 4}, {"id": "5"}, {"id": 0}, "junk", {"id": True}]}, f)
-        log = MessageLog(self.path, 10)
-        self.assertEqual([e["id"] for e in log.entries()], [4])
-        self.assertEqual(log.add({})[0], 5)
+    def test_malformed_rows_are_dropped_and_deleted(self):
+        """Rows that aren't JSON, a dict with a positive integer id (up to MAX_ID) equal to the row's, or that
+        valid() refuses are dropped and deleted; the box is then not clean until the next save."""
+        log = self.open()
+        log.add({"n": 1})
+        log.save()
+        for row_id, text in ((5, '{"id": "5"}'), (6, '{"id": 7}'), (8, "{not json"), (9, '"junk"'),
+                             (10, '{"id": true}'), (11, '{"id": 11, "bad": 1}'), ("x12", '{"id": 12}')):
+            state_execute(self.state, "INSERT INTO lxmf_messages (box, id, record) VALUES ('inbox', ?, ?)",
+                          (row_id, text))
+        state_execute(self.state, "INSERT INTO lxmf_messages (box, id, record) VALUES ('inbox', ?, ?)",
+                      (lxmf.MAX_ID + 1, '{"id": %d}' % (lxmf.MAX_ID + 1)))
+        state_execute(self.state, "UPDATE meta SET value = 'x' WHERE store = 'inbox' AND key = 'next_id'")
+        log = self.open(valid=lambda entry: "bad" not in entry)
+        self.assertEqual([e["id"] for e in log.entries()], [1])
+        self.assertFalse(log.clean)
+        self.assertEqual(list(self.rows()), [1])
+        self.assertEqual(log.add({})[0], 2)  # a next id that isn't an integer is ignored
+        again = self.open()
+        self.assertFalse(again.clean)  # not saved since
+        log.save()
+        self.assertTrue(self.open().clean)
+
+    def test_unsaved_state_is_not_clean(self):
+        """A box never saved, or whose clean value is missing, isn't clean."""
+        self.assertFalse(self.open().clean)
+        log = self.open()
+        log.add({"n": 1})
+        log.save()
+        self.assertTrue(self.open().clean)
+        state_execute(self.state, "DELETE FROM meta WHERE store = 'inbox' AND key = 'clean'")
+        self.assertFalse(self.open().clean)
+        self.assertEqual(len(self.open().entries()), 1)
+
+    def test_bounds_at_load_delete_rows(self):
+        """Rows past the limit or the byte bound at load are deleted; that doesn't make the box unclean."""
+        log = self.open()
+        for n in range(5):
+            log.add({"text": "x" * 100})
+        log.save()
+        bounded = self.open(3, max_bytes=250)
+        self.assertEqual([e["id"] for e in bounded.entries()], [4, 5])
+        self.assertTrue(bounded.clean)
+        self.assertEqual(sorted(self.rows()), [4, 5])
+        self.assertEqual(self.open().add({})[0], 6)
 
 
 class FakeLxmf:
@@ -354,11 +459,20 @@ class FeatureTestCase(unittest.TestCase):
     def feature_node(self, network=None, **settings):
         """Node B with the lxmf feature attached to a stand-in network (jobs left out unless a test adds it)."""
         self.b = self.make_node("b", B_ID, **settings)
-        self.b.features.pop("jobs", None)
+        jobs = self.b.features.pop("jobs", None)
+        if jobs is not None:
+            jobs.close()  # the node no longer closes it at stop
         self.feature = self.b.feature("lxmf")
         self.network = network or FakeLxmf()
         self.feature.attach(self.network)
         return self.feature
+
+    def reloaded(self) -> lxmf.LxmfFeature:
+        """B's lxmf feature built again from the saved state, as at a restart (closed before the directory is
+        removed)."""
+        again = lxmf.LxmfFeature(self.b)
+        self.addCleanup(again.close)
+        return again
 
     def link_message(self, link=None, number=1, source=SENDER, text=b"have a look"):
         """A message carrying link in its field and its text."""
@@ -429,7 +543,7 @@ class ReceiveTest(FeatureTestCase):
             feature.received(self.link_message(number=number))
         self.assertEqual([e["id"] for e in feature.inbox_list()], [3, 4, 5])
         feature.save()
-        again = lxmf.LxmfFeature(self.b)
+        again = self.reloaded()
         self.assertEqual([e["id"] for e in again.inbox_list()], [3, 4, 5])
 
     def test_inbox_rm(self):
@@ -720,6 +834,7 @@ class SendTest(FeatureTestCase):
         contacts = mock.Mock()
         contacts.lookup.side_effect = lambda nick, kind=None: SENDER if nick == "alice" and kind in ("lxmf", None) \
             else (OTHER if nick == "bob" else None)
+        self.addCleanup(self.b.features["contacts"].close)  # the node closes the stand-in instead
         self.b.features["contacts"] = contacts
         feature.send("alice", str(self.cid))
         self.assertEqual(self.network.sent[0][0], SENDER)
@@ -737,8 +852,10 @@ class SendTest(FeatureTestCase):
         feature = self.feature_node()
         feature.send(SENDER.hex(), str(self.cid))
         feature.save()
-        again = lxmf.LxmfFeature(self.b)
+        again = self.reloaded()
         self.assertEqual(again.outbox_list()[0]["state"], "failed")
+        again.save()
+        self.assertEqual(self.reloaded().outbox_list()[0]["state"], "failed")
 
 
 class DisabledTest(FeatureTestCase):
@@ -945,8 +1062,7 @@ class AuditFixesTest(FeatureTestCase):
         self.assertLessEqual(sum(sizes), 20_000)
         self.assertEqual(feature.inbox_list()[-1]["id"], 20)
         feature.save()
-        with open(feature.inbox.path, encoding="utf-8") as f:
-            raw = f.read()
+        raw = "".join(text for text, in state_rows(self.b.config.state_dir, "SELECT record FROM lxmf_messages"))
         self.assertIn("é", raw)
         self.assertNotIn("\\u00e9", raw)
 
@@ -974,22 +1090,39 @@ class AuditFixesTest(FeatureTestCase):
         self.assertNotIn("\x1b", out.getvalue())
         self.assertNotIn("\x07", out.getvalue())
 
+    GOOD_IN = {"id": 2, "hash": "aa", "from": SENDER.hex(), "links": [], "auto": None, "text": "t"}
+    GOOD_OUT = {"id": 3, "hash": "bb", "to": SENDER.hex(), "state": "delivered", "method": "direct", "links": [],
+                "text": ""}
+    BAD = {"id": 1, "links": "x", "auto": 5, "from": 3, "state": []}
+
     def test_malformed_records_are_dropped_at_load(self):
-        # BG-L8 (PoC poc_state_shapes.py)
+        """BG-L8 (PoC poc_state_shapes.py): records of the wrong shape in the files of rnfs 0.1.4 are dropped
+        when they are imported."""
+        state = Config(rnfs_dir=os.path.join(self.tmp.name, "b")).state_dir
+        for name, good, wrong in (("lxmf_inbox.json", self.GOOD_IN, {"auto": [1]}),
+                                  ("lxmf_outbox.json", self.GOOD_OUT, {"state": ["x"]})):
+            write_legacy(state, name, {"messages": [self.BAD, {**good, **wrong, "id": 7}, good, good], "next_id": "x"})
         self.b = self.make_node("b", B_ID)
-        state = self.b.config.state_dir
-        good_in = {"id": 2, "hash": "aa", "from": SENDER.hex(), "links": [], "auto": None, "text": "t"}
-        good_out = {"id": 3, "hash": "bb", "to": SENDER.hex(), "state": "delivered", "method": "direct",
-                    "links": [], "text": ""}
-        bad = {"id": 1, "links": "x", "auto": 5, "from": 3, "state": []}
-        for name, good, wrong in (("lxmf_inbox.json", good_in, {"auto": [1]}),
-                                  ("lxmf_outbox.json", good_out, {"state": ["x"]})):
-            with open(os.path.join(state, name), "w", encoding="utf-8") as f:
-                json.dump({"messages": [bad, {**good, **wrong, "id": 7}, good, good], "next_id": "x"}, f)
-        feature = lxmf.LxmfFeature(self.b)
+        feature = self.b.feature("lxmf")
         self.assertEqual([e["id"] for e in feature.inbox_list()], [2])
         self.assertEqual([e["id"] for e in feature.outbox_list()], [3])
+        self.assertFalse(feature.inbox.clean)
         self.assertEqual(feature.inbox_rm(None), 1)
+
+    def test_malformed_rows_are_dropped_at_load(self):
+        """BG-L8 for the database: rows of the wrong shape are dropped and deleted."""
+        self.b = self.make_node("b", B_ID)
+        state = self.b.config.state_dir
+        for box, good, wrong in ((lxmf.INBOX, self.GOOD_IN, {"auto": [1]}),
+                                 (lxmf.OUTBOX, self.GOOD_OUT, {"state": ["x"]})):
+            for record in (self.BAD, {**good, **wrong, "id": 7}, good):
+                state_execute(state, "INSERT INTO lxmf_messages (box, id, record) VALUES (?, ?, ?)",
+                              (box, record["id"], json.dumps(record)))
+        feature = self.reloaded()
+        self.assertEqual([e["id"] for e in feature.inbox_list()], [2])
+        self.assertEqual([e["id"] for e in feature.outbox_list()], [3])
+        self.assertEqual(state_rows(state, "SELECT box, id FROM lxmf_messages ORDER BY box, id"),
+                         [(lxmf.INBOX, 2), (lxmf.OUTBOX, 3)])
 
     def test_privacy_defaults(self):
         feature = self.feature_node(lxmf_send_from_hint=False)
@@ -1006,11 +1139,11 @@ class RestartAndCancelTest(FeatureTestCase):
     def restarted(self) -> lxmf.LxmfFeature:
         """B's lxmf feature saved, then loaded again and started on a stand-in network (no threads run)."""
         self.feature.save()
-        again = lxmf.LxmfFeature(self.b)
+        again = self.reloaded()
         with mock.patch.object(lxmf, "LxmfNetwork", return_value=FakeLxmf()), \
                 mock.patch.object(again, "_run"), mock.patch.object(again, "_run_auto_fetch"):
             again.start()
-        self.addCleanup(again.stop)
+        self.addCleanup(again.stop)  # before it is closed
         return again
 
     def test_queued_auto_fetches_survive_a_restart(self):
@@ -1130,13 +1263,18 @@ class MessageLogBoundsTest(unittest.TestCase):
     """MessageLog's protection of pin holders and its byte bound."""
 
     def setUp(self):
-        """A temporary state file."""
+        """A temporary state directory."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.path = os.path.join(self.tmp.name, "log.json")
+
+    def open(self, limit: int, **settings) -> MessageLog:
+        """An inbox log in the state directory (closed before the directory is removed)."""
+        log = MessageLog(self.tmp.name, lxmf.INBOX, limit, **settings)
+        self.addCleanup(log.close)
+        return log
 
     def test_protected_entries_stay(self):
-        log = MessageLog(self.path, 3, protect=lambda e: e.get("keep", False))
+        log = self.open(3, protect=lambda e: e.get("keep", False))
         log.add({"keep": True})
         for i in range(5):
             log.add({"text": f"m{i}"})
@@ -1151,7 +1289,7 @@ class MessageLogBoundsTest(unittest.TestCase):
         self.assertEqual((entry_id, [e["id"] for e in dropped]), (10, [1]))
 
     def test_per_from_and_bytes(self):
-        log = MessageLog(self.path, 100, max_bytes=1000)
+        log = self.open(100, max_bytes=1000)
         for i in range(5):
             log.add({"from": "a", "text": str(i)}, per_from=2)
         self.assertEqual([e["text"] for e in log.entries()], ["3", "4"])

@@ -1,10 +1,8 @@
 """Tests for the provide strategy, batched publishing, republishing and withdrawal (rnfs/publisher.py)."""
-import json
 import os
 import tempfile
 import threading
 import unittest
-from unittest import mock
 
 import RNS
 
@@ -14,9 +12,9 @@ from rnfs.content import builder
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.dht.providers import ProviderStore
-from rnfs import publisher as publisher_module
-from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, STATE_FILE, DhtKey, Publisher
-from tests.support import FakeClock
+from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
+from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
+from tests.test_providers import recorded_writes, rows_written
 
 OWN = bytes(16)
 N1, N2, N3 = (bytes([i]) * 16 for i in (1, 2, 3))
@@ -73,6 +71,7 @@ class PublisherTest(unittest.TestCase):
         self.state = os.path.join(self.tmp.name, "state")
         self.config = Config(rnfs_dir=self.tmp.name, republish_interval=1000)
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), self.state, 10**9)
+        self.addCleanup(self.storage.close)
         self.records = ProviderStore(1000, None)
         self.client = FakeClient()
         self.clock = FakeClock(1_000_000.0)
@@ -82,15 +81,39 @@ class PublisherTest(unittest.TestCase):
         self.on_lookup = lambda key: None
         self.publisher = self.make_publisher()
 
-    def make_publisher(self, slow: bool = False) -> Publisher:
-        """A publisher sharing this test's state directory."""
+    def make_publisher(self, slow: bool = False, state: str | None = None) -> Publisher:
+        """A publisher sharing this test's state directory (or on state), closed when the test ends."""
         def make_lookup(key):
             """Remember the key; find self.nodes."""
             self.lookups.append(key)
             self.on_lookup(key)
             return FakeLookup(self.nodes)
-        return Publisher(OWN, self.config, self.storage, self.records, self.client, make_lookup, slow, self.state,
-                         cached_eligible=lambda: self.eligible, clock=self.clock, retry_interval=30)
+        publisher = Publisher(OWN, self.config, self.storage, self.records, self.client, make_lookup, slow,
+                              state or self.state, cached_eligible=lambda: self.eligible, clock=self.clock,
+                              retry_interval=30)
+        self.addCleanup(publisher.close)
+        return publisher
+
+    def saved(self) -> dict:
+        """The publisher's tables: {"published": {item: (at, nodes)}, "earlier": {(item, node): at},
+        "withdraw": {node: {key, ...}}}."""
+        withdraw: dict[bytes, set[bytes]] = {}
+        for node, key in state_rows(self.state, "SELECT node, key FROM withdrawals"):
+            withdraw.setdefault(node, set()).add(key)
+        return {"published": {item: (at, nodes) for item, at, nodes in
+                              state_rows(self.state, "SELECT item, at, nodes FROM published")},
+                "earlier": {(item, node): at for item, node, at in
+                            state_rows(self.state, "SELECT item, node, at FROM published_earlier")},
+                "withdraw": withdraw}
+
+    def held(self, publisher: Publisher) -> dict:
+        """What publisher holds in memory, shaped as saved() reads the tables."""
+        with publisher._lock:
+            return {"published": {str(item): (at, b"".join(nodes))
+                                  for item, (at, nodes) in publisher._published.items()},
+                    "earlier": {(str(item), node): at for item, nodes in publisher._earlier.items()
+                                for node, at in nodes.items()},
+                    "withdraw": {node: set(keys) for node, keys in publisher._withdrawals.items() if keys}}
 
     def withdrawn(self) -> dict[bytes, set[bytes]]:
         """The keys withdrawn from each node by the calls made so far."""
@@ -340,17 +363,71 @@ class PublisherTest(unittest.TestCase):
         publisher.refresh()
         self.assertEqual(publisher.next_due(), SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)  # at most a full round's wait
 
-    def test_state_of_the_wrong_shape_is_ignored(self):
+    def test_legacy_state_of_the_wrong_shape_is_ignored(self):
+        """published.json of the wrong shape is moved aside, and entries of the wrong shape (or with node IDs or
+        keys not ID_LENGTH bytes) are skipped: nothing is imported, so the CID is due."""
         cid = self.pinned(b"shape")
-        for value in ([], {"published": []}, {"published": {str(cid): 5}, "withdraw": []},
-                      {"published": {str(cid): [10**400, []]}}, {"published": {str(cid): [1, "0101"]}},
-                      {"earlier": {str(cid): []}, "withdraw": {N1.hex(): "ab"}}):
+        for n, value in enumerate(([], {"published": []}, {"published": {str(cid): 5}, "withdraw": []},
+                                   {"published": {str(cid): [10**400, []]}}, {"published": {str(cid): [1, "0101"]}},
+                                   {"published": {str(cid): [1, ["0101"]]}},
+                                   {"earlier": {str(cid): []}, "withdraw": {N1.hex(): "ab"}},
+                                   {"earlier": {str(cid): {"01": 1}}, "withdraw": {N1.hex(): ["ab"]}})):
             with self.subTest(value=value):
-                with open(os.path.join(self.state, STATE_FILE), "w", encoding="utf-8") as f:
-                    json.dump(value, f)
-                publisher = self.make_publisher()
+                state = os.path.join(self.tmp.name, f"legacy {n}")  # each its own: a file is imported once
+                path = write_legacy(state, "published.json", value)
+                publisher = self.make_publisher(state=state)
                 publisher.refresh()
                 self.assertEqual(publisher.next_due(), 0)  # nothing loaded: due
+                self.assertFalse(os.path.exists(path))
+                for table in ("published", "published_earlier", "withdrawals"):
+                    self.assertEqual(state_rows(state, f"SELECT * FROM {table}"), [])
+                publisher.close()
+
+    def test_malformed_rows_are_skipped_and_deleted(self):
+        """Rows that don't parse are skipped, the rest loaded; the load deletes those whose item doesn't parse,
+        and the next save the others, so the tables hold what memory does."""
+        a, b = self.pinned(b"a"), self.pinned(b"b")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.publisher.close()
+        rows = [("INSERT INTO published (item, at, nodes) VALUES (?, ?, ?)", ("not an item", 1, N1)),
+                ("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", (str(b), "yesterday", N1)),
+                ("INSERT INTO published (item, at, nodes) VALUES (?, ?, ?)", ("key:abcd", 1, N1)),  # 2 bytes
+                ("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", (str(a), b"short", 1)),
+                ("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", (str(a), N3, "x")),
+                ("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", ("bad", N3, 1)),
+                ("INSERT INTO withdrawals (node, key) VALUES (?, ?)", (b"short", a.key)),
+                ("INSERT INTO withdrawals (node, key) VALUES (?, ?)", (N3, "text"))]
+        for sql, row in rows:
+            state_execute(self.state, sql, row)
+        publisher = self.make_publisher()
+        publisher.refresh()
+        self.assertEqual(set(publisher._published), {a})  # b's row was replaced by the malformed one
+        self.assertEqual(publisher._withdrawals, {})
+        self.assertEqual(self.saved()["published"].keys(), {str(a), str(b)})  # parsed items wait for the save
+        publisher.save()
+        self.assertEqual(self.saved(), self.held(publisher))
+
+    def test_times_clamped_and_earlier_nodes_expired_at_load_are_saved(self):
+        """A last-published time in the future loads as now, and earlier nodes past PROVIDER_TTL are dropped;
+        the next save writes both."""
+        cid = self.pinned(b"ahead")
+        self.publisher.refresh()
+        self.clock.now += 10**6
+        self.publisher.publish_due()
+        self.nodes = [N3]
+        self.clock.now += 1000
+        self.publisher.publish_due()  # N1, N2 earlier now
+        self.clock.now -= 10**6
+        restarted = self.make_publisher()
+        self.assertEqual(restarted._published[cid][0], self.clock.now)
+        restarted.save()
+        self.assertEqual(self.saved()["published"], {str(cid): (self.clock.now, N3)})
+        self.clock.now += 10**6 + PROVIDER_TTL
+        restarted = self.make_publisher()
+        self.assertEqual(restarted._earlier, {})
+        restarted.save()
+        self.assertEqual(self.saved()["earlier"], {})
 
     def test_served_blocks_are_the_provided_dags(self):
         cid = self.pinned(os.urandom(200_000))
@@ -424,14 +501,13 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(self.withdrawn(), {N1: {cid.key}, N2: {cid.key}})
 
     def test_saved_without_the_lock_and_in_order(self):
-        """published.json is written outside the lock, and a save that snapshots meanwhile lands last."""
+        """The publish state is written outside the lock, and a save that snapshots meanwhile lands last."""
         a, b = self.pinned(b"a"), self.pinned(b"b")
         self.publisher.refresh()
-        real_write = publisher_module.write_json
         free, second = [], []
 
-        def write(path, value):
-            """The first save's write: another thread takes the lock, then unpins b and saves."""
+        def unpin_and_save():
+            """Before the first save writes: another thread takes the lock, then unpins b and saves."""
             if not second:
                 lock = self.publisher._lock
                 thread = threading.Thread(target=lambda: free.append(lock.acquire(timeout=5)) or lock.release())
@@ -441,16 +517,45 @@ class PublisherTest(unittest.TestCase):
                 second.append(threading.Thread(target=self.publisher.refresh))
                 second[0].start()
                 second[0].join(0.2)
-            real_write(path, value)
 
-        with mock.patch.object(publisher_module, "write_json", write):
+        with recorded_writes(self.publisher._db, before=unpin_and_save):
             self.publisher.publish_due()
             second[0].join(5)
         self.assertEqual(free, [True])
-        with open(os.path.join(self.state, STATE_FILE), encoding="utf-8") as f:
-            saved = json.load(f)
+        saved = self.saved()
         self.assertEqual(set(saved["published"]), {str(a)})
-        self.assertEqual(saved["withdraw"], {N1.hex(): [b.key.hex()], N2.hex(): [b.key.hex()]})
+        self.assertEqual(saved["withdraw"], {N1: {b.key}, N2: {b.key}})
+
+    def test_save_writes_only_what_changed(self):
+        """With many CIDs published, unpinning one writes its rows and its nodes' withdrawals only."""
+        cids = [self.pinned(b"cid %d" % i) for i in range(50)]
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.assertEqual(self.saved(), self.held(self.publisher))
+        with recorded_writes(self.publisher._db) as transactions:
+            self.storage.unpin(cids[0], USER)
+            self.publisher.refresh()
+        self.assertEqual(len(transactions), 1)
+        # Its published row and earlier rows deleted (one item: 2), N1's and N2's withdrawals deleted and written (4)
+        self.assertEqual(rows_written(transactions), 6)
+        self.assertEqual(self.saved(), self.held(self.publisher))
+        with recorded_writes(self.publisher._db) as transactions:
+            self.publisher.save()
+        self.assertEqual(transactions, [])  # nothing changed since
+
+    def test_failed_save_is_written_next_time(self):
+        """A round whose save fails raises (the loop logs it); the next save writes what it held."""
+        cid = self.pinned(b"failing disk")
+        self.publisher.refresh()
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.publisher.publish_due()
+        self.assertEqual(self.saved()["published"], {})
+        self.publisher.save()
+        self.assertEqual(set(self.saved()["published"]), {str(cid)})
+        restarted = self.make_publisher()
+        restarted.refresh()
+        self.assertEqual(restarted.publish_due()["published"], [])
 
 
 if __name__ == "__main__":

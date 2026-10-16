@@ -165,25 +165,29 @@ class PersistenceTest(unittest.TestCase):
     """The pool and remembered first-seen times survive a restart."""
 
     def test_round_trip(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "providers.json")
-            clock = FakeClock(1_700_000_000.0)
-            store = ProviderStore(100, path, clock=clock, rng=random.Random(1), seniority=DAY)
-            gone = ident(9)
-            store.store(ident(1), gone)
-            clock.now += 2 * DAY
-            store.withdraw(ident(1), gone)
-            for n in range(10):  # 90 outside the pool, then the last 10 pooled
-                for i in range(10):
-                    store.store(ident(100 * (n + 1) + i), ident(10 + n))
-            store.save()
-            loaded = ProviderStore(100, path, clock=clock, rng=random.Random(1), seniority=DAY)
-            self.assertEqual(loaded.record_count(), 100)
-            self.assertEqual(loaded.allowance(gone), loaded.max_per_publisher)
-            # Pooled records stay pooled: a newcomer evicts one of them, not a record outside the pool
-            self.assertTrue(loaded.store(ident(5), ident(99)))
-            self.assertEqual(sum(len(loaded.providers(ident(100 * (n + 1) + i))) for n in range(9) for i in range(10)),
-                             90)
+        """A restarted store keeps which records are pooled and a departed publisher's first-seen time."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = os.path.join(directory.name, "state")
+        clock = FakeClock(1_700_000_000.0)
+        store = ProviderStore(100, state, clock=clock, rng=random.Random(1), seniority=DAY)
+        self.addCleanup(store.close)
+        gone = ident(9)
+        store.store(ident(1), gone)
+        clock.now += 2 * DAY
+        store.withdraw(ident(1), gone)
+        for n in range(10):  # 90 outside the pool, then the last 10 pooled
+            for i in range(10):
+                store.store(ident(100 * (n + 1) + i), ident(10 + n))
+        store.save()
+        loaded = ProviderStore(100, state, clock=clock, rng=random.Random(1), seniority=DAY)
+        self.addCleanup(loaded.close)
+        self.assertEqual(loaded.record_count(), 100)
+        self.assertEqual(loaded.allowance(gone), loaded.max_per_publisher)
+        # Pooled records stay pooled: a newcomer evicts one of them, not a record outside the pool
+        self.assertTrue(loaded.store(ident(5), ident(99)))
+        self.assertEqual(sum(len(loaded.providers(ident(100 * (n + 1) + i))) for n in range(9) for i in range(10)),
+                         90)
 
 
 class PerPublisherCapTest(unittest.TestCase):

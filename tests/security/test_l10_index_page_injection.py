@@ -47,7 +47,7 @@ class LineInjectionTest(unittest.TestCase):
         """One offline node holding the crafted directory."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.node, _ = helpers.make_nodes(self.tmp.name)
+        _, self.node, _ = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.node.stop)
 
     def pin_crafted_directory(self, entry_name: str) -> str:

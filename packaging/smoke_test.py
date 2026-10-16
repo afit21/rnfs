@@ -8,12 +8,16 @@ Runs `--version` and `--help`, then starts `daemon` with a temporary --dir and a
 (no shared instance, so a running rnsd isn't touched; one TCP server interface on 127.0.0.1 and nothing that
 reaches the network), on free ports, polls `status` until the daemon answers, checks the TCP interface is
 listening (which proves RNS found its dynamically loaded interface modules, the part a frozen build can
-miss), stops the daemon the way Ctrl+C would and checks it exits. Exits non-zero on any failure.
-Uses only the standard library, so any Python 3 can run it.
+miss), adds a file, stops the daemon the way Ctrl+C would and checks it exits. The state database must then
+hold the pin, and a JSON state file of rnfs 0.1.4 placed in the directory beforehand must have been imported
+into it (which proves the build has sqlite3 and the modules the migration imports by name). Exits non-zero on
+any failure. Uses only the standard library, so any Python 3 can run it.
 """
+import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -80,6 +84,14 @@ def main():
             interface_port = free_port()
             f.write(RETICULUM_CONFIG.format(port=interface_port))
         ports = ["--dir", rnfs_dir, "--api-port", str(free_port())]
+        # A state file as rnfs 0.1.4 wrote it, which the daemon imports into its state database at startup
+        state_dir = os.path.join(rnfs_dir, "state")
+        os.makedirs(state_dir, mode=0o700)
+        with open(os.path.join(state_dir, "pin_names.json"), "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        added = os.path.join(tmp, "added.txt")
+        with open(added, "w", encoding="utf-8") as f:
+            f.write("smoke test")
         log_path = os.path.join(tmp, "daemon.log")
         with open(log_path, "w", encoding="utf-8") as log:
             daemon = subprocess.Popen(
@@ -104,6 +116,7 @@ def main():
                 sys.exit(f"smoke test: RNS's TCP interface isn't listening on {interface_port} ({e}): "
                          "were RNS's interface modules bundled?")
             print(f"RNS TCP interface listening on 127.0.0.1:{interface_port}")
+            run(command, "add", *ports, added)
         finally:
             if daemon.poll() is None:
                 daemon.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
@@ -122,7 +135,26 @@ def main():
                 print("--- daemon log ---\n" + log.read().rstrip() + "\n------------------")
         if not stopped_cleanly:
             sys.exit("smoke test: daemon didn't stop cleanly")
+        check_state(state_dir)
     print("smoke test passed")
+
+
+def check_state(state_dir: str):
+    """Exit unless the state database holds a pin and records pin_names.json as imported."""
+    path = os.path.join(state_dir, "rnfs.db")
+    if not os.path.isfile(path):
+        sys.exit(f"smoke test: no state database at {path}")
+    conn = sqlite3.connect(path)
+    try:
+        pins = conn.execute("SELECT count(*) FROM pins").fetchone()[0]
+        migrated = [row[0] for row in conn.execute("SELECT file FROM migrated")]
+    finally:
+        conn.close()
+    print(f"state database: {pins} pin(s), imported {migrated}")
+    if pins < 1:
+        sys.exit("smoke test: the file added isn't pinned in the state database")
+    if migrated != ["pin_names.json"] or not os.path.exists(os.path.join(state_dir, "pin_names.json.migrated")):
+        sys.exit("smoke test: pin_names.json wasn't imported into the state database")
 
 
 if __name__ == "__main__":

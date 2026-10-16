@@ -1,17 +1,3 @@
-# 0.1.3
-
-## Default Bootstrap Node List
-DEFAULT_BOOTSTRAP_NODES global variable: node IDs of official, always-on DHT servers, giving new nodes a first contact when no announces reach them (e.g. behind a LoRa access point)
-* Used in the startup join alongside `bootstrap_nodes` (the user's own are tried first), as IPFS does
-* Used again, with backoff, whenever fewer than about 3 servers are known, so isolated nodes and small islands rejoin
-* Tried in random order, with their own path-request budget, so one offline node doesn't block the rest
-* Skipped in private mode, or when a setting turns them off
-* After the join they are ordinary DHT servers, with no extra trust
-
-# 0.1.4
-
-Big fabel 5.5 audit and valnerability patch
-
 # 0.1.5
 
 ## CID denylist

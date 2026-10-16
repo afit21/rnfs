@@ -3,7 +3,8 @@
 Every top-level file and directory in it is imported as with `add` (copied into the block store) and
 pinned with source "folder"; a changed or removed entry releases its old pin. Entries are recognised as
 unchanged by a signature of path, size, modification time and execute bit (recursively for directories),
-remembered across restarts, so unchanged entries aren't hashed again.
+remembered across restarts (the state database's shared_folder table, rnfs.statedb: after a scan that changed
+any, the entries changed are written durably), so unchanged entries aren't hashed again.
 """
 import hashlib
 import json
@@ -11,15 +12,29 @@ import os
 import stat
 import threading
 
-from rnfs import constants
+from rnfs import constants, statedb
 from rnfs.content import builder
 from rnfs.content.builder import display_path
 from rnfs.content.cid import Cid
-from rnfs.content.storage import FOLDER, Storage, read_json, shaped, write_json
+from rnfs.content.storage import FOLDER, Storage
 from rnfs.errors import RnfsError
 from rnfs.log import LOG_INFO, LOG_WARNING, log
 
-STATE_FILE = "shared_folder.json"
+
+def import_entries(value: dict, tx) -> int:
+    """Import shared_folder.json (statedb.migrate): its entries replace the shared_folder table; one that doesn't
+    parse is skipped, as rnfs 0.1.4 did. Returns the number imported."""
+    tx.execute("DELETE FROM shared_folder")
+    count = 0
+    for name, record in value.get("entries", {}).items():
+        try:
+            # Inside the try: a signature SQLite can't store (a lone surrogate) is an invalid record too
+            tx.execute("INSERT OR REPLACE INTO shared_folder (name, signature, cid) VALUES (?, ?, ?)",
+                       (statedb.dump(name), str(record[0]), Cid.parse(record[1]).binary))
+        except (ValueError, TypeError, LookupError):
+            continue
+        count += 1
+    return count
 
 
 def signature(path: str) -> str:
@@ -74,26 +89,40 @@ class SharedFolder:
     """Keeps the shared folder's entries imported and pinned with source "folder"."""
 
     def __init__(self, directory: str, storage: Storage, state_dir: str | None = None):
-        """Track directory (created if missing at the first scan); the signature cache lives in state_dir."""
+        """Track directory (created if missing at the first scan); the signature cache lives in state_dir's
+        state database (not kept without one)."""
         self.directory = os.path.expanduser(directory)
         self.storage = storage
-        self._state_path = os.path.join(os.path.expanduser(state_dir), STATE_FILE) if state_dir else None
+        self._db = statedb.connect(os.path.expanduser(state_dir)) if state_dir else None
         self._lock = threading.Lock()
         self._known: dict[str, tuple[str, Cid]] = {}  # entry name -> (signature, CID) of its last import
+        self._saved: dict[str, tuple[str, Cid]] = {}  # what the shared_folder table holds
         self._failed: dict[str, str] = {}  # entry name -> signature that failed to import, not retried until it changes
         self._warned: set[str] = set()  # skipped entries already warned about
-        self._load()
+        try:
+            self._load()
+        except BaseException:
+            self.close()
+            raise
 
     def _load(self):
-        """Load the signature cache, ignoring anything that doesn't parse."""
-        if self._state_path is None:
+        """Load the signature cache; a row that doesn't parse is logged and deleted."""
+        if self._db is None:
             return
-        value = read_json(self._state_path, shaped("entries", dict)) or {}
-        for name, record in value.get("entries", {}).items():
+        bad = []
+        for text, sig, binary in self._db.query("SELECT name, signature, cid FROM shared_folder"):
             try:
-                self._known[name] = (str(record[0]), Cid.parse(record[1]))
-            except (ValueError, TypeError, LookupError):
-                continue
+                name = statedb.load(text)
+                if not isinstance(name, str) or not isinstance(sig, str):
+                    raise TypeError("not a string")
+                self._known[name] = (sig, Cid.from_bytes(binary))
+            except (ValueError, TypeError):
+                log(f"shared folder: ignoring invalid saved entry {text!r}", LOG_WARNING)
+                bad.append((text,))
+        self._saved = dict(self._known)
+        if bad:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM shared_folder WHERE name = ?", bad)
 
     def names(self) -> dict[Cid, str]:
         """CID → the shared-folder entry name it was imported from, for `pin ls`."""
@@ -101,11 +130,21 @@ class SharedFolder:
             return {cid: name for name, (_, cid) in self._known.items()}
 
     def _save(self):
-        """Persist the signature cache."""
-        if self._state_path is None:
+        """Persist the entries of the signature cache that differ from what the table holds, durably (lock held)."""
+        if self._db is None:
             return
-        os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
-        write_json(self._state_path, {"entries": {name: [sig, str(cid)] for name, (sig, cid) in self._known.items()}})
+        changed = [(statedb.dump(name), sig, cid.binary) for name, (sig, cid) in self._known.items()
+                   if self._saved.get(name) != (sig, cid)]
+        gone = [(statedb.dump(name),) for name in self._saved if name not in self._known]
+        with self._db.transaction(durable=True) as tx:
+            tx.executemany("DELETE FROM shared_folder WHERE name = ?", gone)
+            tx.executemany("INSERT OR REPLACE INTO shared_folder (name, signature, cid) VALUES (?, ?, ?)", changed)
+        self._saved = dict(self._known)
+
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        if self._db is not None:
+            self._db.close()
 
     def scan(self) -> set[Cid]:
         """Import new and changed entries, release the pins of changed and removed ones; returns the folder's pins."""

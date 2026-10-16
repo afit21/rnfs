@@ -4,12 +4,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from rnfs import fsutil
+from rnfs import fsutil, statedb
 from rnfs.content import builder, shared_folder
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.shared_folder import SharedFolder
 from rnfs.content.storage import FOLDER, USER, Storage
-from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES
+from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES, state_execute, state_rows, write_legacy
 from tests.test_builder import swap_on_open, within
 
 SECRET = b"private key"
@@ -23,12 +23,21 @@ class SharedFolderTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.files = os.path.join(self.tmp.name, "files")
-        self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.state = os.path.join(self.tmp.name, "state")
+        self.storage = Storage(os.path.join(self.tmp.name, "blocks"), self.state, 10**9)
+        self.addCleanup(self.storage.close)
         self.folder = self.open()
 
     def open(self) -> SharedFolder:
-        """A SharedFolder with its state under the temporary directory."""
-        return SharedFolder(self.files, self.storage, os.path.join(self.tmp.name, "state"))
+        """A SharedFolder with its state under the temporary directory, closed when the test ends."""
+        folder = SharedFolder(self.files, self.storage, self.state)
+        self.addCleanup(folder.close)
+        return folder
+
+    def rows(self) -> dict:
+        """What the shared_folder table holds: entry name -> (signature, CID)."""
+        return {statedb.load(name): (sig, Cid.from_bytes(cid))
+                for name, sig, cid in state_rows(self.state, "SELECT name, signature, cid FROM shared_folder")}
 
     def write(self, relative: str, data: bytes) -> str:
         """Write a file in the folder, creating directories."""
@@ -43,11 +52,66 @@ class SharedFolderTest(unittest.TestCase):
         return builder.add_path(os.path.join(self.files, relative), builder.NO_PUT)[0].cid
 
     def test_state_of_the_wrong_shape_is_moved_aside(self):
-        path = self.folder._state_path
-        for content in ('["a"]', '{"entries": ["a"]}', '{"entries": {"a": {"0": 1}, "b": 5}}'):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            self.assertEqual(self.open().names(), {}, content)  # records that don't parse are skipped too
+        """A shared_folder.json of the wrong shape is moved aside when imported; records that don't parse are
+        skipped."""
+        for content, damaged in (('["a"]', True), ('{"entries": ["a"]}', True),
+                                 ('{"entries": {"a": {"0": 1}, "b": 5, "c": ["sig", "not a cid"]}}', False)):
+            path = write_legacy(self.state, "shared_folder.json", text=content)
+            self.assertEqual(self.open().names(), {}, content)
+            self.assertEqual(os.path.exists(path + ".damaged"), damaged, content)
+            if damaged:
+                os.remove(path + ".damaged")
+
+    def test_entries_are_saved_as_they_change(self):
+        """A scan writes the entries it changed and deletes the removed ones; a store without a state
+        directory keeps nothing."""
+        path = self.write("a.txt", b"a")
+        self.write("b.txt", b"b")
+        self.folder.scan()
+        self.assertEqual(self.rows(), self.folder._known)
+        self.assertEqual(set(self.rows()), {"a.txt", "b.txt"})
+        os.remove(path)
+        self.folder.scan()
+        self.assertEqual(set(self.rows()), {"b.txt"})
+        unsaved = SharedFolder(os.path.join(self.tmp.name, "other"), self.storage)
+        self.addCleanup(unsaved.close)
+        self.write(os.path.join("..", "other", "c.txt"), b"c")
+        self.assertEqual(len(unsaved.scan()), 1)
+        self.assertEqual(set(self.rows()), {"b.txt"})
+
+    def test_names_that_are_not_unicode_round_trip(self):
+        """An entry name with a lone surrogate (a file name that isn't UTF-8) is saved and loaded as it was."""
+        odd = "caf\udce9"
+        cid = Cid.for_block(RAW, b"x")
+        with self.folder._lock:
+            self.folder._known = {odd: ("sig", cid)}
+            self.folder._save()
+        self.assertEqual(self.open().names(), {cid: odd})
+
+    def test_damaged_rows_are_deleted(self):
+        """Rows that don't parse are skipped at load and deleted; the others are kept."""
+        self.write("a.txt", b"a")
+        self.folder.scan()
+        cid = self.cid_of("a.txt").binary
+        for name, sig, binary in (("not json", "sig", cid), ('"b"', b"sig", cid), ('"c"', "sig", b"not a cid"),
+                                  ("7", "sig", cid)):
+            state_execute(self.state, "INSERT INTO shared_folder (name, signature, cid) VALUES (?, ?, ?)",
+                          (name, sig, binary))
+        self.assertEqual(self.open().names(), {self.cid_of("a.txt"): "a.txt"})
+        self.assertEqual(set(self.rows()), {"a.txt"})
+
+    def test_failed_save_is_written_with_the_next_change(self):
+        """A scan whose commit failed raises, keeps what it found in memory, as before, and the next scan that
+        changes something saves it too."""
+        self.write("a.txt", b"a")
+        with mock.patch.object(self.folder._db, "transaction", side_effect=statedb.StateDbError("disk I/O error")):
+            with self.assertRaises(OSError):
+                self.folder.scan()
+        self.assertEqual(self.folder.names(), {self.cid_of("a.txt"): "a.txt"})
+        self.assertEqual(self.rows(), {})
+        self.write("b.txt", b"b")
+        self.folder.scan()
+        self.assertEqual(set(self.rows()), {"a.txt", "b.txt"})
 
     def test_creates_missing_directory(self):
         self.assertEqual(self.folder.scan(), set())

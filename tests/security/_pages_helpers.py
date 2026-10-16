@@ -33,8 +33,9 @@ DISPLAY_PAGE = os.path.join(PAGES_DIR, "display-mu-file", "index.mu")
 INDEX_PAGE = os.path.join(PAGES_DIR, "file-index-node", "index.mu")
 
 
-def make_nodes(tmp, settings=None):
-    """A provider node A and a victim node B joined by a NetClient, as tests.test_node does."""
+def make_nodes(tmp, settings=None, test=None):
+    """A provider node A and a victim node B joined by a NetClient, as tests.test_node does; stopped (which
+    closes their state databases) when test, a TestCase, cleans up."""
     net = NetClient()
     net.sender = B_ID
     nodes = {}
@@ -44,6 +45,8 @@ def make_nodes(tmp, settings=None):
         node = RnfsNode.offline(config, node_id, net, FakeNetwork())
         net.nodes[node_id] = node
         nodes[name] = node
+        if test is not None:
+            test.addCleanup(node.stop)
     nodes["b"].routing.heard(A_ID)
     return net, nodes["a"], nodes["b"]
 

@@ -212,7 +212,7 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
                 incomplete.append(root)
                 held.add(root)
         if pin_source is not None:
-            storage.pin_many(complete, pin_source)  # still protected; pins.json is saved once for them all
+            storage.pin_many(complete, pin_source)  # still protected; the pins are saved once for them all
     if bad:
         log(f"import: skipped {bad} blocks that didn't match their CIDs", LOG_WARNING)
     for root in incomplete:

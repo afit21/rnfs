@@ -1,0 +1,1 @@
+{"version": 1, "contacts": {"alice": {"kind": "name", "id": "bcc7900726de195e4cc4b09e67f02966"}, "bob": {"kind": "lxmf", "id": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"}, "relay.1": {"kind": "node", "id": "10101010101010101010101010101010"}}}

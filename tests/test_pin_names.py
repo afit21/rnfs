@@ -1,6 +1,5 @@
 """`pin ls` names: where each pin came from on this machine, or what a pinned directory holds."""
 import io
-import json
 import os
 import tempfile
 import unittest
@@ -10,7 +9,8 @@ from rnfs.cli import display_name
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
-from rnfs.pin_names import PinNames
+from rnfs.pin_names import MAX_NAME_LENGTH, PinNames
+from tests.support import failing_commits, state_execute, state_rows, write_legacy
 
 
 class PinNamesStoreTest(unittest.TestCase):
@@ -24,21 +24,62 @@ class PinNamesStoreTest(unittest.TestCase):
         self.cid = Cid.for_block("raw", b"x")
         self.other = Cid.for_block("raw", b"y")
 
-    def test_record_prune_and_persist(self):
+    def open(self) -> PinNames:
+        """A store on the state directory, closed when the test ends."""
         names = PinNames(self.dir)
+        self.addCleanup(names.close)
+        return names
+
+    def rows(self) -> dict:
+        """What the pin_names table holds: CID -> stored name text."""
+        return {Cid.from_bytes(cid): name for cid, name in state_rows(self.dir, "SELECT cid, name FROM pin_names")}
+
+    def test_record_prune_and_persist(self):
+        """Names are kept across a restart, a later pin add keeps the first, and pruned ones are deleted."""
+        names = self.open()
         names.record(self.cid, "/home/u/a.txt")
         names.record_if_unknown(self.cid, "bafy.../a.txt")  # a later pin add keeps the local path
         names.record(self.other, "(stdin)")
-        self.assertEqual(PinNames(self.dir).get(self.cid), "/home/u/a.txt")
+        self.assertEqual(self.open().get(self.cid), "/home/u/a.txt")
         names.prune({self.cid})
-        again = PinNames(self.dir)
+        self.assertEqual(self.rows(), {self.cid: '"/home/u/a.txt"'})
+        again = self.open()
         self.assertEqual((again.get(self.cid), again.get(self.other)), ("/home/u/a.txt", None))
 
+    def test_names_that_are_not_unicode_round_trip(self):
+        """A name with a lone surrogate is saved and loaded as it was; a long one is cut to MAX_NAME_LENGTH."""
+        names = self.open()
+        odd = "/home/u/caf\udce9"  # a file name that isn't UTF-8, as os.fsdecode gives it
+        names.record(self.cid, odd)
+        names.record(self.other, "x" * (MAX_NAME_LENGTH + 10))
+        again = self.open()
+        self.assertEqual((again.get(self.cid), again.get(self.other)), (odd, "x" * MAX_NAME_LENGTH))
+
     def test_damaged_file_is_ignored(self):
-        with open(os.path.join(self.dir, "pin_names.json"), "w", encoding="utf-8") as f:
-            json.dump({"not a cid": "x", str(self.cid): 5, str(self.other): "ok"}, f)
-        names = PinNames(self.dir)
+        """pin_names.json's entries that don't parse are skipped when it is imported; the rest are kept."""
+        write_legacy(self.dir, "pin_names.json", {"not a cid": "x", str(self.cid): 5, str(self.other): "ok"})
+        names = self.open()
         self.assertEqual((names.get(self.cid), names.get(self.other)), (None, "ok"))
+
+    def test_damaged_rows_are_deleted(self):
+        """Rows that don't parse are skipped at load and deleted; the others are kept."""
+        self.open().record(self.other, "ok")
+        for cid, name in ((b"not a cid", '"x"'), (self.cid.binary, "not json"), (self.cid.binary + b"!", "5")):
+            state_execute(self.dir, "INSERT INTO pin_names (cid, name) VALUES (?, ?)", (cid, name))
+        names = self.open()
+        self.assertEqual((names.get(self.cid), names.get(self.other)), (None, "ok"))
+        self.assertEqual(self.rows(), {self.other: '"ok"'})
+
+    def test_failed_save_is_written_with_the_next_change(self):
+        """A change whose commit failed stays in memory, as before, and is saved with the next change."""
+        names = self.open()
+        names.record(self.cid, "first")
+        with failing_commits(), self.assertRaises(OSError):
+            names.prune(set())
+        self.assertIsNone(names.get(self.cid))  # forgotten in memory, as before
+        self.assertEqual(self.rows(), {self.cid: '"first"'})
+        names.record(self.other, "second")
+        self.assertEqual(self.rows(), {self.other: '"second"'})
 
 
 class PinLsNamesTest(unittest.TestCase):

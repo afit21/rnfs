@@ -686,6 +686,11 @@ and repeat.
 - Blocks are stored in `<rnfs dir>/blocks/`, one file per CID, written atomically after verification, and
   synced to disk before any pin or cache record that refers to them is saved, so a power loss can't leave a
   pin without its blocks or an empty file under a CID name.
+- rnfs keeps the rest of its state (pins, cache records, names, provider records, jobs, ...) in one SQLite
+  database, `<rnfs dir>/state/rnfs.db`, readable by its owner only. The JSON state files earlier versions wrote
+  under `<rnfs dir>/state/` are imported into it at the first start, each once and whole, and kept as
+  `<name>.migrated`; the upgrade is one-way. A damaged database, or one written by a newer version, stops the
+  node rather than being started over.
 
 **Pins.**
 - Pins are recursive: a pinned CID keeps every block of its DAG.
@@ -696,16 +701,17 @@ and repeat.
 - `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
   a followed name's newer target once that is complete; removing the LXMF messages that hold it.
-- Pins are saved at once; the state that records why a source holds a pin (`names.json`, `follow.json`, the
-  LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes `name:` pins
-  match `names.json` (pinning a recorded target again, releasing the rest), and releases `follow:` pins of
+- Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
+  names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
+  `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
+  `follow:` pins of
   names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
   again). A followed name's check releases every other target its source holds.
-- That release needs the state read whole. If `follow.json` or the inbox file is missing, damaged (moved
-  aside as `.damaged`) or holds a malformed entry, such pins are kept and recorded again: a `follow:` pin's
-  name is followed again, and a sender's `lxmf:` pins get a new inbox message listing them, whose removal
-  releases them. A name key file that is there but can't be read keeps its name's pins and `names.json`
-  entry; only a missing key file counts as a removed name.
+- That release needs the state read whole. If the followed names or the inbox were never saved (or were
+  imported from a file that was damaged and moved aside as `.damaged`), or hold a malformed entry, such pins
+  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `lxmf:` pins get a new
+  inbox message listing them, whose removal releases them. A name key file that is there but can't be read
+  keeps its name's pins and records; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
   running jobs (section 11), are protected as if pinned.
 
@@ -759,7 +765,7 @@ could have linked in. It is imported at the next scan after its other links are 
   refuse `/pin` from a source with many pins waiting (rnfs: 64).
 - The requester learns that a remote pin is complete when the node shows up as a provider (`providers`).
 - `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
-  pins waiting (`state/remote_pins.json`, about once a second and at stop) and resumes them after a restart,
+  pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
 
@@ -1166,7 +1172,7 @@ optionally from one node), `pin` (fetch a target completely and pin it with sour
 `cancelled`. Its result, when done, MUST be what the equivalent API call returns (`POST /api/get`,
 `/api/pin/add`, `/api/export`), and its error, when failed, the message that call would have reported.
 - At most `max_jobs` jobs run at once; queued jobs MUST be started oldest first.
-- Jobs MUST be persisted in the state directory, written atomically. When the node starts, jobs that were
+- Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
   queued or running MUST be queued again. A resumed job MUST NOT fetch again blocks that are still stored.
 - While a job is queued or running, the blocks stored below its root MUST be kept as if pinned, including
   across a restart, so a resumed job continues where it stopped. A failed or cancelled job's blocks are

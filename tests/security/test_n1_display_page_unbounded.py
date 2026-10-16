@@ -42,7 +42,7 @@ class UnboundedPinTest(unittest.TestCase):
         """A provider serving the bomb DAG and a victim that serves the page."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.provider, self.victim = helpers.make_nodes(self.tmp.name)
+        _, self.provider, self.victim = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.provider.stop)
         self.addCleanup(self.victim.stop)
         self.root, blocks = helpers.bomb_dag(fanout=5, children=3000)

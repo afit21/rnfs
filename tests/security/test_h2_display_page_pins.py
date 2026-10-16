@@ -50,7 +50,7 @@ class PageTestCase(unittest.TestCase):
         """Two offline nodes joined by a NetClient, and the page's data dir."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.provider, self.victim = helpers.make_nodes(self.tmp.name)
+        _, self.provider, self.victim = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.provider.stop)
         self.addCleanup(self.victim.stop)
         self.data_dir = os.path.join(self.tmp.name, "page-data")

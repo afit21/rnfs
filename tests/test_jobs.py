@@ -13,7 +13,7 @@ from unittest import mock
 
 import RNS
 
-from rnfs import cli
+from rnfs import cli, statedb
 from rnfs.api import ApiServer
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
@@ -21,7 +21,7 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.features import jobs
 from rnfs.node import RnfsNode
-from tests.support import real, wait_for
+from tests.support import failing_commits, real, state_execute, state_rows, wait_for, write_legacy
 from tests.test_api import FakeNode
 from tests.test_names import FakeNetwork
 from tests.test_node import A_ID, B_ID, NetClient
@@ -116,6 +116,11 @@ class JobsBase(unittest.TestCase):
         self.assertTrue(wait_for(lambda: self.jobs.get(job_id)["state"] in jobs.FINISHED, timeout), self.jobs.get(job_id))
         return self.jobs.get(job_id)
 
+    def saved(self, name: str = "b") -> list[dict]:
+        """The job records node name's jobs table holds, oldest first."""
+        rows = state_rows(os.path.join(self.tmp.name, name, "state"), "SELECT record FROM jobs ORDER BY position")
+        return [statedb.load(record) for (record,) in rows]
+
 
 class JobsTest(JobsBase):
     """B fetching from A through jobs."""
@@ -192,18 +197,16 @@ class JobsTest(JobsBase):
         self.assertEqual(self.b.storage._sessions, [])  # its protection is released
 
     def test_submit_saves_once_whether_the_job_starts_or_waits(self):
+        """A submitted job is saved once: as it starts, or as queued when it can't start yet."""
         self.b.config.max_jobs = 1
         first, second = self.share(b"first"), self.share(b"second")
         self.net.gate.clear()
-        path = os.path.join(self.b.config.state_dir, jobs.JOBS_FILE)
-        from rnfs.content import storage
-        with mock.patch.object(storage, "write_json", wraps=storage.write_json) as write:
+        with mock.patch.object(self.jobs._db, "transaction", wraps=self.jobs._db.transaction) as write:
             started = self.jobs.submit("get", first, self.out("first"))["id"]
             self.assertEqual(write.call_count, 1)  # saved as it started, not also before
             queued = self.jobs.submit("get", second, self.out("second"))["id"]
             self.assertEqual(write.call_count, 2)  # nothing started, so saved as queued
-        with open(path, encoding="utf-8") as f:
-            saved = {job["id"]: job["state"] for job in json.load(f)["jobs"]}
+        saved = {job["id"]: job["state"] for job in self.saved()}
         self.assertEqual(saved, {started: "running", queued: "queued"})
         self.net.gate.set()
         self.assertEqual(self.finished(started)["state"], "done")
@@ -238,6 +241,7 @@ class JobsTest(JobsBase):
         self.assertEqual(self.jobs.clear(ids[4]), 1)
         self.assertEqual(self.jobs.clear(), 2)
         self.assertEqual(self.jobs.list(), [])
+        self.assertEqual(self.saved(), [])  # forgotten jobs are deleted
 
     def test_recently_finished_jobs_outlive_the_cap(self):
         # A CLI following a fast job asks for it once it ends: a small cap mustn't have forgotten it already
@@ -278,10 +282,10 @@ class JobsTest(JobsBase):
         self.a.records.store(Cid.parse(cid).key, A_ID)
         self.b.stop()
         output = self.out("dir-out")
-        path = os.path.join(self.tmp.name, "b", "state", jobs.JOBS_FILE)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"jobs": [{"id": "0123abcd", "kind": "get", "target": cid, "output": output,
-                                 "state": "running", "created": 1.0}]}, f)
+        # As rnfs 0.1.4 left it (imported at the restart), a record without the fields it can do without
+        write_legacy(os.path.join(self.tmp.name, "b", "state"), "jobs.json",
+                     {"jobs": [{"id": "0123abcd", "kind": "get", "target": cid, "output": output,
+                                "state": "running", "created": 1.0}]})
         partial = os.path.join(self.tmp.name, ".rnfs-job-0123abcd.partial")
         os.makedirs(os.path.join(partial, "sub"))
         with open(os.path.join(partial, "sub", "f.txt"), "wb") as f:
@@ -367,7 +371,8 @@ class JobsTest(JobsBase):
         self.assertEqual(warnings[-1], f"... and {5000 - log.MAX_WARNINGS} more warnings")
         self.assertEqual(job["result"]["warnings_total"], 5000)
         self.jobs.save()
-        self.assertLess(os.path.getsize(os.path.join(self.b.config.state_dir, jobs.JOBS_FILE)), 20_000)
+        (record,) = state_rows(self.b.config.state_dir, "SELECT record FROM jobs WHERE id = ?", (job["id"],))[0]
+        self.assertLess(len(record), 20_000)
 
     # Persistence and resume
 
@@ -380,9 +385,7 @@ class JobsTest(JobsBase):
         self.assertTrue(wait_for(lambda: self.net.waiting > 0 and not self.net.gate.is_set()))
         self.assertTrue(wait_for(lambda: self.jobs.get(job["id"])["done_bytes"] == 2 * CHUNK_SIZE))
         self.b.stop()  # the running job is interrupted and saved as queued
-        with open(os.path.join(self.b.config.state_dir, jobs.JOBS_FILE), encoding="utf-8") as f:
-            saved = json.load(f)["jobs"]
-        self.assertEqual([(r["id"], r["state"]) for r in saved], [(job["id"], "queued")])
+        self.assertEqual([(r["id"], r["state"]) for r in self.saved()], [(job["id"], "queued")])
         fetched = {c for c in self.net.requested[:3]}
         self.net.gate.set()
 
@@ -405,32 +408,72 @@ class JobsTest(JobsBase):
             self.assertEqual(f.read(), data)
 
     def test_finished_jobs_survive_restart(self):
+        """Finished jobs are loaded again after a restart, oldest first."""
         cid = self.b.add_stream(io.BytesIO(b"kept"))["cid"]
         job_id = self.finished(self.jobs.submit("pin", cid)["id"])["id"]
+        other = self.finished(self.jobs.submit("pin", cid)["id"])["id"]
         self.b.stop()
         b2 = self.make_node("b", B_ID)
         job = b2.feature("jobs").get(job_id)
         self.assertEqual((job["state"], job["result"]), ("done", {"cid": cid}))
+        self.assertEqual([j["id"] for j in b2.feature("jobs").list()], [job_id, other])
 
     def test_damaged_jobs_file_records_skipped(self):
-        path = os.path.join(self.tmp.name, "c", "state", jobs.JOBS_FILE)
-        os.makedirs(os.path.dirname(path))
+        """jobs.json's malformed records are skipped when it is imported, and a repeated id keeps the first."""
         cid = str(Cid.for_block(RAW, b"c"))
         good = {"id": "0123abcd", "kind": "pin", "target": cid, "state": "running", "created": 1.0}
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"jobs": [good, {"id": "nothex!!", "kind": "pin", "target": cid, "state": "queued"},
-                                {**good, "id": "0123abce", "kind": "get", "output": "relative"}, "junk"]}, f)
+        write_legacy(os.path.join(self.tmp.name, "c", "state"), "jobs.json",
+                     {"jobs": [good, {"id": "nothex!!", "kind": "pin", "target": cid, "state": "queued"},
+                               {**good, "id": "0123abce", "kind": "get", "output": "relative"}, "junk",
+                               {**good, "state": "done"}]})
         c = self.make_node("c", bytes([0xC] * 16))
         self.assertEqual([(j["id"], j["state"]) for j in c.feature("jobs").list()], [("0123abcd", "queued")])
 
     def test_jobs_file_of_the_wrong_shape_is_moved_aside(self):
-        path = os.path.join(self.tmp.name, "c", "state", jobs.JOBS_FILE)
-        os.makedirs(os.path.dirname(path))
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"jobs": {"not": "a list"}}, f)
+        """A jobs.json of the wrong shape is moved aside when imported, and the node starts without it."""
+        path = write_legacy(os.path.join(self.tmp.name, "c", "state"), "jobs.json", {"jobs": {"not": "a list"}})
         c = self.make_node("c", bytes([0xC] * 16))
         self.assertEqual(c.feature("jobs").list(), [])
         self.assertTrue(os.path.exists(path + ".damaged"))
+
+    def test_damaged_rows_are_deleted(self):
+        """Rows whose record isn't a valid job (or another job's, or with no position) are skipped at load and
+        deleted; the others load in order."""
+        cid = str(Cid.for_block(RAW, b"c"))
+        c = self.make_node("c", bytes([0xC] * 16))
+        state = c.config.state_dir
+        c.stop()
+        good = {"id": "0123abcd", "kind": "pin", "target": cid, "state": "done", "created": 1.0}
+        for job_id, position, record in (("0123abce", 1, "not json"), ("0123abcf", 2, statedb.dump(good)),
+                                         ("0123abd0", 3, statedb.dump({**good, "id": "0123abd0", "kind": "x"})),
+                                         ("0123abd1", "x", statedb.dump({**good, "id": "0123abd1"})),
+                                         ("0123abcd", 9, statedb.dump(good)),
+                                         ("0123abd2", 5, statedb.dump({**good, "id": "0123abd2"}))):
+            state_execute(state, "INSERT INTO jobs (id, position, record) VALUES (?, ?, ?)", (job_id, position, record))
+        c = self.make_node("c", bytes([0xC] * 16))
+        self.assertEqual([j["id"] for j in c.feature("jobs").list()], ["0123abd2", "0123abcd"])
+        self.assertEqual([r["id"] for r in self.saved("c")], ["0123abd2", "0123abcd"])
+
+    def test_a_save_writes_only_the_jobs_changed(self):
+        """A save rewrites only the jobs whose record changed since the last; new ones go after the others."""
+        first = self.finished(self.jobs.submit("pin", self.b.add_stream(io.BytesIO(b"1"))["cid"])["id"])["id"]
+        self.assertTrue(wait_for(lambda: [r["state"] for r in self.saved()] == ["done"]))  # its outcome saved
+        state_execute(self.b.config.state_dir, "UPDATE jobs SET record = ? WHERE id = ?",
+                      (statedb.dump({**self.saved()[0], "error": "planted"}), first))
+        second = self.finished(self.jobs.submit("pin", self.b.add_stream(io.BytesIO(b"2"))["cid"])["id"])["id"]
+        self.assertTrue(wait_for(lambda: [r["state"] for r in self.saved()] == ["done", "done"]))
+        self.assertEqual([(r["id"], r["error"]) for r in self.saved()], [(first, "planted"), (second, None)])
+
+    def test_failed_save_leaves_the_job_to_the_next(self):
+        """A job whose save failed (logged, not raised) is still saved by the next save."""
+        self.b.config.max_jobs = 0  # stays queued
+        cid = self.b.add_stream(io.BytesIO(b"later"))["cid"]
+        with failing_commits():
+            job_id = self.jobs.submit("pin", cid)["id"]
+        self.assertEqual(self.saved(), [])
+        self.assertTrue(self.jobs._dirty)
+        self.jobs.save()
+        self.assertEqual([(r["id"], r["state"]) for r in self.saved()], [(job_id, "queued")])
 
     def test_huge_numbers_in_a_record_are_ignored(self):
         cid = str(Cid.for_block(RAW, b"c"))

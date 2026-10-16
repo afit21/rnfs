@@ -40,12 +40,31 @@ Node IDs, DHT keys and names are 16-byte `bytes`. Identity hashes (for `members`
 pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lxmf_*` settings, pin source
 `lxmf:<address>`) are `lxmf.delivery` destination hashes, all written as 32 hex characters.
 
-Persistent state is JSON (or msgpack) under `config.state_dir`, written atomically and durably
-(`storage.write_json`: temp file fsynced, `os.replace`, then the directory synced). `storage.read_json(path,
-shape)` treats only a file that isn't JSON, fails `shape` or is a directory as damaged: it is moved to
-`.damaged` (`.damaged.1`, … keeping earlier copies) and the node starts without it; any other `OSError` stops
-startup, since starting without `pins.json` would lose every pin. Everything shared between threads locks
-internally.
+- `rnfs/statedb.py` — the state database, `<rnfs dir>/state/rnfs.db` (standard `sqlite3`, WAL mode,
+  `busy_timeout`; created 0600, which SQLite copies to its `-wal` and `-shm` files; on Windows the state
+  directory's access list covers them). `connect(state_dir)` hands each store a reference (`StateDb`) to one
+  shared connection per directory, the last `close()` closing it; opening runs `quick_check` and refuses a
+  damaged database, or one whose `user_version` is past the schema steps this code knows (`SCHEMA`, applied
+  one transaction each), saying what to do. `transaction(durable)` is the only way to write: `durable` commits
+  with `synchronous=FULL` (on disk when it returns), otherwise `NORMAL` (a power loss may lose the last commits,
+  never part of one or one without those before it); a sqlite failure raises `StateDbError`, an `OSError`.
+  Text that may hold lone surrogates (file names, remote strings) goes through `dump`/`load` (JSON text);
+  sequences are decimal text, since they pass SQLite's 64-bit integers. Without `_sqlite3` the daemon stops
+  with a message saying so.
+
+Persistent state lives in the state database. Each store keeps its state in memory, which is all reads use,
+loads it once at startup (checking every row as the JSON loaders checked every record: a malformed row is
+logged, skipped and deleted) and then writes only what changed: a pin is one row inserted or deleted, batched
+stores write the records changed since their last save. At every `connect`, `statedb.migrate` first imports
+the JSON state files of 0.1.4 and earlier (`LEGACY`): each through its owner's importer, which checks every
+record as the old loader did, in one transaction that also records the file in the `migrated` table; then the
+file is renamed `<name>.migrated` and the directory synced. A file the table already lists (a crash between
+the commit and the rename) is only renamed, so none is imported twice or by half. The files are read with
+`statedb.read_json(path, shape)`, which treats only a file that isn't JSON, fails `shape` or is a directory as
+damaged: it is moved to `.damaged` (`.damaged.1`, … keeping earlier copies) and the node starts without it; any
+other `OSError` stops startup, since starting without `pins.json` would lose every pin (`names.json` stops it
+when damaged too, as it always did: starting afresh would allow rollback). Everything shared between threads
+locks internally.
 
 ## Layout and ownership
 
@@ -55,6 +74,7 @@ rnfs/
   constants.py config.py errors.py log.py          shared foundation
   debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
+  statedb.py          the state database, <rnfs dir>/state/rnfs.db: schema, transactions, JSON state migration
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
     dag.py            DAG node encoding, strict decoding, names (section 5)
@@ -159,9 +179,12 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   records current then, so `get` (and `/blocks` serving) waits only for that in-memory walk and the deletions,
   and a block that became reachable meanwhile is kept. The size queries (`pinned_bytes`, `dag_bytes`,
   `source_usage`, `stat`) read their DAG nodes the same way first. `_links` memoises only stored DAG nodes: a
-  node not stored yet may be stored later, and a raw block lists nothing. `pins.json` is still written under the lock on every
-  pin and unpin: a pin must be on disk when `pin()` returns (names' crash consistency and `rnfs pin add`
-  depend on it), and before a collection can delete what an `unpin()` released.
+  node not stored yet may be stored later, and a raw block lists nothing. A pin's or unpin's row is still
+  committed durably under the lock: a pin must be on disk when `pin()` returns (names' crash consistency and
+  `rnfs pin add` depend on it), and before a collection can delete what an `unpin()` released. If the commit
+  fails, `pin`/`pin_many`/`unpin` undo their change in memory and raise. Cache records track the keys changed
+  since the last `save()`; those still cached are always the most recently used, so a save writes them with
+  new `used` values (the table's LRU order) and deletes the others.
 - `verify() -> stats` re-checks every block, deleting bad ones.
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
@@ -335,7 +358,7 @@ possible future way to let pages read their own DAG.
   decrypting only the covering segments), `parse_recipient`. AES-256-CBC and HKDF come from
   `RNS.Cryptography`, HMAC/SHA-256 from the standard library: no new dependency.
 - `node_content.py` — `keep_added` (a `user` pin, or for `--no-pin` a cached fetch recorded in
-  `fetched.json` for the roots strategy), `seal_recipients` (`RNS.Identity.recall` by destination hash, then
+  the fetched targets for the roots strategy), `seal_recipients` (`RNS.Identity.recall` by destination hash, then
   identity hash; the node's own identity; contacts), `open_sealed` over a Fetch's `read_range`,
   `sealed_info`, `write_sealed`, `block`, `export_stream`, and the API option parser `add_options`.
 - `gateway_formats.py` — `?format=raw|archive`; `archive.archive_size` gives the exact length, so the archive
@@ -503,13 +526,14 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 The API and gateway run one thread per connection, capped (32 and 64).
 
 Locks are taken in this order, never the reverse: `names._lock` → `publisher._lock` → `node._lock` →
-`storage._lock`. `NameManager.publish`, `remove` and `release_gone` pin and unpin, and so call
+`storage._lock` → the state database's lock (`statedb`, innermost: a store opens a transaction only once it
+holds every lock the change needs, and inside it takes no other lock and does no network I/O). `NameManager.publish`, `remove` and `release_gone` pin and unpin, and so call
 `publisher.refresh()`, while holding the names lock; `Publisher.refresh` recomputes what is provided under its
 own lock, reading the node's fetched targets (`node._lock`) and walking the pins' DAGs (`storage._lock`); the
 node reads storage under its lock (`_prune_fetched`). This is how the code behaves today, not a design goal.
-State files written in full are written outside these locks, from a copy taken under them, one save at a time
-behind a save lock taken first (`Storage.save`, `Publisher.save`, `ProviderStore.save`, the name floor,
-`fetched.json`, `remote_pins.json`), so an older copy never lands last. Slow work that runs while a lock is
+Batched saves write outside these locks, from the changes collected under them, one save at a time behind a
+save lock taken first (`Storage.save`, `Publisher.save`, `ProviderStore.save`, the name floor, the fetched
+targets, the remote pins waiting), so an older snapshot never lands last. Slow work that runs while a lock is
 held:
 
 - `Publisher.refresh` checks every pin's DAG (`dag_blocks`, memoised) under the publisher lock, behind the
@@ -517,26 +541,41 @@ held:
   DAG's blocks changed (CIDs only added are unioned in), so a refresh that changed nothing doesn't recompute it.
 - `Storage.evict` and `gc` decide what to delete, and delete it, under the storage lock (after reading the DAG
   nodes outside it); `verify` checks completeness and re-reads the blocks outside it.
-- `pins.json` is written, synced to disk, under the storage lock on every pin and unpin (see `storage.py`).
+- Every pin and unpin commits its row durably (`synchronous=FULL`, after the blocks are synced) under the
+  storage lock (see `storage.py`).
 
 ## State files
 
-Under `<rnfs dir>/state/`, JSON written atomically from a temp file synced to disk: `pins.json`, `cache.json`
-(storage); `pin_names.json` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin
-list); `providers.json` (provider records); `published.json` (publisher: last rounds, earlier rounds' nodes,
-pending withdrawals); `fetched.json` (targets fetched for the user, for `roots`); `remote_pins.json` (remote pins accepted and
-not yet fetched, `[[source, cid], ...]` in order); `names.json` (sequences, name
-table); `name-floor.json` (`[[name, sequence, resolved], ...]`: highest sequence of names resolved for the
-gateway or auto-fetch and when, at most 4 × `name_table_size`, or 8 × for names resolved within 7 days; saved by
-a resolve raising it, at most every 5 s, and by the re-announce loop when changed; entries without the time load
-as resolved long ago); `invalid.json` (invalid roots); `shared_folder.json`; `jobs.json` (results keep at most 100 warnings
-plus `warnings_total`; older results are capped at load); `keepers.json` (records re-verified at load);
-`follow.json`; `contacts.json`; `lxmf_inbox.json` (500 messages, 4 MiB, 50 per non-auto-fetch sender, 16 KiB per
-record) and `lxmf_outbox.json` (200; unfinished messages are marked failed at a restart), both UTF-8 JSON with
-non-ASCII characters written as is. Elsewhere: `storage/identity`, `storage/lxmf_identity` (0600),
-`names/<alias>` (name keys), `lxmf/` (LXMF's ratchets, delivered-message IDs, stamp costs), `api_token` (while
-the daemon runs). Malformed records in feature state files (wrong types, duplicate IDs) are dropped at load
-with a warning. Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`)
+`<rnfs dir>/state/rnfs.db` (rnfs/statedb.py), one table set per store; "FULL" commits are on disk when the
+change returns, "NORMAL" ones are batched saves a power loss may lose the last of:
+- storage: `pins` (one row per source; each pin and release FULL, after the blocks are synced) and `cache`
+  (cached fetches, LRU order in `used`, at most 10 000; NORMAL every 30 s and at stop, changed records only);
+- `pin_names` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin list; FULL);
+- node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
+  pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
+  `invalid` (invalid roots, oldest first; with the cache records);
+- `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
+  withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
+- `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
+  stop, changed rows only);
+- `names_published`, `names_held` (sequences as decimal text, up to 2^64 − 1; FULL, changed rows only; a
+  malformed row stops startup, as a malformed `names.json` did, since skipping it could allow rollback) and
+  `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at
+  most 4 × `name_table_size`, or 8 × for names resolved within 7 days; NORMAL, saved by a resolve raising it, at
+  most every 5 s, and by the re-announce loop when changed);
+- `shared_folder` (FULL); `jobs` (record per job in creation order; FULL, including progress saves; results keep
+  at most 100 warnings plus `warnings_total`, older results capped at load); `keepers` (records re-verified at
+  load; NORMAL); `follow` (FULL); `contacts` (FULL); `lxmf_messages` (inbox: 500 messages, 4 MiB, 50 per
+  non-auto-fetch sender, 16 KiB per record; outbox 200, unfinished messages marked failed at a restart; NORMAL,
+  changed messages only; ids and `next_id` stay below 2^63);
+- `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
+  requires; each box's `next_id`) and `migrated` (JSON files imported).
+
+Free text that may hold lone surrogates (file names, LXMF records, cache paths) is stored as JSON text
+(`statedb.dump`). Rows that fail the checks the JSON loaders applied are dropped at load with a warning and
+deleted. The JSON files of 0.1.4 and earlier, once imported, stay as `<name>.migrated`. Elsewhere:
+`storage/identity`, `storage/lxmf_identity` (0600), `names/<alias>` (name keys), `lxmf/` (LXMF's ratchets,
+delivered-message IDs, stamp costs), `api_token` (while the daemon runs). Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`)
 or `.rnfs-job-<id>.partial` (get jobs) until renamed; a failed, cancelled or shut-down job removes its partial,
 and a resumed job removes one left by a crash.
 
@@ -545,8 +584,11 @@ and a resumed job removes one left by a crash.
 The commands CI runs the tests with are in `.github/workflows/tests.yml`. Feature tests live in their own files
 (`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`, `test_seal.py`, `test_chunker.py`,
 `test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and `test_e2e.py` has a marked block per
-feature. CI (`.github/workflows/tests.yml`) runs them on Linux, macOS and Windows; `packaging/smoke_test.py`
-checks a built package (`--version`, `--help`, daemon and status).
+feature. The state database has `test_statedb.py`, each store's migration a `test_migrate_*.py`, and
+`test_upgrade_014.py` loads `tests/fixtures/rnfs-0.1.4/`, a node directory 0.1.4 wrote (its `generate.py`
+writes it again). CI runs them on Linux, macOS and Windows; `packaging/smoke_test.py` checks a built package
+(`--version`, `--help`, daemon and status, an add, and that the state database holds the pin and imported a
+0.1.4 state file).
 
 ## Status
 
@@ -565,8 +607,8 @@ Everything in the specification is implemented, with these simplifications and a
 - Withdrawals are sent once, with any provides due for the same node. One that fails isn't retried, since the
   record expires after `PROVIDER_TTL`. A CID is withdrawn from the nodes of its last round and from nodes of
   earlier rounds, or of a round cut short, that may still hold its record (`Publisher._earlier`, persisted in
-  `published.json`, forgotten after `PROVIDER_TTL`). Each node that accepts a key is added there as its
-  `/provide` returns, and `published.json` is saved every 10 nodes or 30 s of a round
+  `published_earlier`, forgotten after `PROVIDER_TTL`). Each node that accepts a key is added there as its
+  `/provide` returns, and the publish state is saved every 10 nodes or 30 s of a round
   (`SAVE_EVERY_NODES`, `SAVE_EVERY_SECONDS`), so a crash loses at most that much of where a round stored.
   A round stopped before every node was sent its keys leaves its CIDs due, and persisted times later than now
   are clamped to now.
@@ -641,7 +683,7 @@ Everything in the specification is implemented, with these simplifications and a
   (and a sealed file's write-out) counts what it still has to fetch too (the verified size less the bytes of
   the target's DAG already stored). If the destination's free space can't be read, the check raises the
   `OSError` (same errno, saying so) instead of letting the write go ahead unchecked.
-- Roots found invalid are remembered in `state/invalid.json` (at most 10 000, oldest dropped), and there is
+- Roots found invalid are remembered in the state database's `invalid` table (at most 10 000, oldest dropped), and there is
   no command to clear them. Cache records are capped at 10 000 (LRU). Both are saved every 30 s and at stop.
 - A remote pin's usage is the larger of its content size and its DAG's block bytes. It is dropped once the
   root block shows the quota would be exceeded, or once the blocks fetched exceed it. A source's remote pins
@@ -649,7 +691,7 @@ Everything in the specification is implemented, with these simplifications and a
   at most 64 (`REMOTE_PIN_QUEUE`) may be waiting or fetching, and further `/pin`s are refused. A worker leaves
   `_remote_workers` in the same critical section in which it finds its queue empty, so a `/pin` arriving as it
   exits starts a new one; if `Thread.start()` fails the pin is given back and refused. The pins waiting are
-  saved to `state/remote_pins.json` by maintenance (when changed) and at stop, and `_resume_remote_pins` queues
+  saved to the `remote_pins` table by maintenance (when changed; rewritten whole, a few rows) and at stop, and `_resume_remote_pins` queues
   them again at start (skipping those already pinned or whose identity left `remote_pin_identities`); workers
   wait for the first join before fetching, and a fetch cut short by stopping stays queued.
 - Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks at a time ahead of what has been
@@ -712,23 +754,23 @@ Everything in the specification is implemented, with these simplifications and a
   where one current answer is enough once a sequence is known). On a slow node that is still at most two
   `/name`; a fast node with no known sequence and no established keepers asks all 3 batches (up to 9), and the
   lookup runs to completion unless two established nodes list keepers.
-- **Names.** A key imported, or found without an entry in `names.json`, is marked `imported`: its first publish
+- **Names.** A key imported, or found without a `names_published` row, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins
-  the new target, saves `names.json` (the commit point; a failed save rolls the record back and releases the
-  new pin) and only then releases the old target, so `names.json`'s target is pinned at every step. Once the
+  the new target, saves its row (the commit point; a failed commit rolls the record back and releases the
+  new pin) and only then releases the old target, so the saved target is pinned at every step. Once the
   features are set up, `reconcile_pins(storage.pins())` releases the pins of name keys deleted by hand
   (`release_gone()`), pins a recorded target again if its pin is missing, and releases `name:` pins nothing
-  records; a key without a `names.json` entry keeps its pins until its next publish or removal (`_stale`,
+  records; a key without a saved record keeps its pins until its next publish or removal (`_stale`,
   where a release that failed with `OSError` also waits). A key file that is there but can't be loaded is
-  `_unreadable`: its pins are kept and its `names.json` entry is written back as loaded. `Storage.pin`/`pin_many`/
-  `unpin` undo their change in memory if saving `pins.json` fails. Follow and LXMF do the same for their sources at
-  start (`FollowFeature._reconcile`, `_release_unrecorded`), but release only if their file loaded whole
-  (`MessageLog.clean`); otherwise unrecorded pins are recorded again (the name followed again, or an inbox
+  `_unreadable`: its pins are kept and its row is never touched by saves. `Storage.pin`/`pin_many`/
+  `unpin` undo their change in memory if the commit fails. Follow and LXMF do the same for their sources at
+  start (`FollowFeature._reconcile`, `_release_unrecorded`), but release only if their state loaded whole (the
+  `clean` meta value, set by every save; `MessageLog.clean`); otherwise unrecorded pins are recorded again (the name followed again, or an inbox
   message per sender listing them), so a later start keeps them too. The name table marks
   entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with
   no waiting resolve, of a name without a kept record, may only evict one of those. A resolve with
   `persist=False` (gateway, LXMF auto-fetch) raises the name's floor (`_floor`: name -> (sequence, wall time
-  last resolved), in resolve order), which `_offer` checks. A raise (or a new name) saves `name-floor.json`
+  last resolved), in resolve order), which `_offer` checks. A raise (or a new name) saves the floor
   at once if the last save was `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`;
   renewing only the time marks it for the next save after an hour. `_trim_floor` drops the least recently
   resolved past `FLOOR_FACTOR` × `name_table_size`, but stops at one resolved within `FLOOR_KEEP_AGE` (7 days)

@@ -1,16 +1,17 @@
-"""Tests for the provider record store: TTL, republishing, withdrawal, eviction, replies and persistence."""
-import json
+"""Tests for the provider record store: TTL, republishing, withdrawal, eviction, replies and persistence (the
+state database's provider tables)."""
 import os
 import random
 import tempfile
 import threading
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest import mock
 
-from rnfs import fsutil
 from rnfs.constants import DAY, ID_LENGTH, K, PROVIDER_TTL
 from rnfs.dht.providers import MIN_PER_PUBLISHER, ProviderStore
-from tests.support import FakeClock
+from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
 
 
 def ident(n: int) -> bytes:
@@ -318,31 +319,102 @@ class PublisherLimitTest(StoreTestCase):
         self.assertLess(len(asked), 100)
 
 
+class Recorder:
+    """A transaction's connection that records what each executemany writes or deletes."""
+
+    def __init__(self, tx, writes: list):
+        """Forward to tx, recording into writes."""
+        self.tx = tx
+        self.writes = writes
+
+    def execute(self, sql, params=()):
+        """Run one statement, recording it with its one row."""
+        self.writes.append((sql, [params]))
+        return self.tx.execute(sql, params)
+
+    def executemany(self, sql, rows):
+        """Run a statement for each row, recording them."""
+        rows = list(rows)
+        self.writes.append((sql, rows))
+        return self.tx.executemany(sql, rows)
+
+
+@contextmanager
+def recorded_writes(db, before=None) -> Iterator[list]:
+    """Within the with block, each transaction of the StateDb reference db appends the list of its statements, as
+    (sql, rows), to the list yielded; before(), if given, is called as each one is about to open."""
+    transactions: list[list] = []
+    real = db.transaction
+
+    @contextmanager
+    def transaction(durable: bool = False):
+        """The real transaction, recorded."""
+        if before is not None:
+            before()
+        with real(durable) as tx:
+            transactions.append([])
+            yield Recorder(tx, transactions[-1])
+
+    with mock.patch.object(db, "transaction", transaction):
+        yield transactions
+
+
+def rows_written(transactions: list[list]) -> int:
+    """How many rows the statements recorded by recorded_writes wrote or deleted."""
+    return sum(len(rows) for statements in transactions for _, rows in statements)
+
+
+def saved(state_dir: str) -> dict:
+    """The provider tables in state_dir, shaped as held() gives a store's state."""
+    return {
+        "publishers": dict(state_rows(state_dir, "SELECT publisher, first_seen FROM provider_publishers")),
+        "records": {(key, publisher): (first, last, pooled) for key, publisher, first, last, pooled in state_rows(
+            state_dir, "SELECT key, publisher, first_stored, last_stored, pooled FROM provider_records")},
+        "departed": {publisher: (seen, at) for publisher, seen, at in state_rows(
+            state_dir, "SELECT publisher, first_seen, at FROM provider_departed")},
+        "evicted": {publisher: (seen, at) for publisher, seen, at in state_rows(
+            state_dir, "SELECT publisher, first_seen, at FROM provider_evicted")},
+    }
+
+
+def held(store: ProviderStore) -> dict:
+    """What store holds in memory: publishers' first-seen times, records with every field, departures and
+    evictions."""
+    with store._lock:
+        return {
+            "publishers": {publisher: entry.first_seen for publisher, entry in store._publishers.items()},
+            "records": {(key, publisher): (record.first_stored, record.last_stored, int(record.pooled))
+                        for key, records in store._records.items() for publisher, record in records.items()},
+            "departed": dict(store._departed),
+            "evicted": dict(store._evicted),
+        }
+
+
 class PersistenceTest(unittest.TestCase):
-    """Records and first-seen times survive a restart; the file is replaced atomically."""
+    """Records and first-seen times survive a restart; saves write only what changed, in order."""
 
     def setUp(self):
-        """A temporary state directory."""
+        """A temporary state directory (removed after the stores on it are closed)."""
         self.directory = tempfile.TemporaryDirectory()
-        self.path = os.path.join(self.directory.name, "state", "providers.json")
+        self.addCleanup(self.directory.cleanup)
+        self.state = os.path.join(self.directory.name, "state")
         self.clock = FakeClock(1_700_000_000.0)
 
-    def tearDown(self):
-        """Remove the state directory."""
-        self.directory.cleanup()
-
-    def open(self) -> ProviderStore:
-        """A store at self.path."""
-        return ProviderStore(100, self.path, clock=self.clock)
+    def open(self, max_records: int = 100, **settings) -> ProviderStore:
+        """A store on self.state, closed when the test ends."""
+        store = ProviderStore(max_records, self.state, clock=self.clock, **settings)
+        self.addCleanup(store.close)
+        return store
 
     def test_round_trip(self):
+        """Records and first-seen times are saved, and loaded by the next store."""
         store = self.open()
         store.store(KEY, ident(1))
         self.clock.now += 5
         store.store(KEY, ident(2))
         store.store(ident(7), ident(2))
         store.save()
-        self.assertEqual(os.listdir(os.path.dirname(self.path)), ["providers.json"])  # no temp files left
+        self.assertEqual(len(state_rows(self.state, "SELECT * FROM provider_records")), 3)
 
         self.clock.now += 100
         loaded = self.open()
@@ -352,28 +424,34 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(loaded.first_seen(ident(2)), store.first_seen(ident(2)))
 
     def test_first_seen_order_survives_restart(self):
-        store = ProviderStore(3, self.path, clock=self.clock)
+        """A publisher seen first still evicts the newest one's records after a restart."""
+        store = self.open(3)
         store.store(ident(100), ident(1))
         self.clock.now += 1
         store.store(ident(101), ident(2))
         store.store(ident(102), ident(2))
         store.save()
-        loaded = ProviderStore(3, self.path, clock=self.clock)
+        loaded = self.open(3)
         self.assertTrue(loaded.store(ident(103), ident(1)))  # evicts a record of ident(2), the newest
         self.assertEqual(loaded.record_count(), 3)
         self.assertEqual(len(loaded.providers(ident(101)) + loaded.providers(ident(102))), 1)
 
     def test_limits_applied_on_load_keeping_oldest(self):
-        store = ProviderStore(100, self.path, clock=self.clock, max_per_publisher=100)
+        """A smaller per-publisher limit at load keeps the oldest records; the next save deletes the rest."""
+        store = self.open(max_per_publisher=100)
         for i in range(30):
             store.store(ident(100 + i), ident(1))
             self.clock.now += 1
         store.save()
-        loaded = ProviderStore(100, self.path, clock=self.clock, max_per_publisher=10)
+        loaded = self.open(max_per_publisher=10)
         self.assertEqual(loaded.record_count(), 10)
         self.assertEqual([len(loaded.providers(ident(100 + i))) for i in range(30)], [1] * 10 + [0] * 20)
+        loaded.save()
+        self.assertEqual(saved(self.state), held(loaded))
+        self.assertEqual(len(saved(self.state)["records"]), 10)
 
     def test_expired_records_dropped_on_load(self):
+        """Records expired by the time of the load aren't loaded, and the next save deletes their rows."""
         store = self.open()
         store.store(KEY, ident(1))
         store.save()
@@ -381,8 +459,11 @@ class PersistenceTest(unittest.TestCase):
         loaded = self.open()
         self.assertEqual(loaded.record_count(), 0)
         self.assertIsNone(loaded.first_seen(ident(1)))
+        loaded.save()
+        self.assertEqual(saved(self.state), {"publishers": {}, "records": {}, "departed": {}, "evicted": {}})
 
     def test_future_times_clamped_on_load(self):
+        """Times saved while the clock ran ahead load as now, and are saved so."""
         # Saved while the clock ran a year ahead; once corrected, records still expire a TTL from now
         self.clock.now += 365 * DAY
         store = self.open()
@@ -392,40 +473,92 @@ class PersistenceTest(unittest.TestCase):
         loaded = self.open()
         self.assertEqual(loaded.first_seen(ident(1)), self.clock.now)
         self.assertEqual(loaded.providers(KEY), [ident(1)])
+        loaded.save()
+        self.assertEqual(saved(self.state)["records"], {(KEY, ident(1)): (self.clock.now, self.clock.now, 0)})
         self.clock.now += PROVIDER_TTL
         self.assertEqual(loaded.expire(), 1)
 
-    def test_out_of_range_numbers_start_empty(self):
-        os.makedirs(os.path.dirname(self.path))
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "publishers": {ident(1).hex(): 10 ** 400}, "records": []}, f)
+    def test_times_clamped_at_expiry_are_saved(self):
+        """Times expire() brings back to now (records, first-seen times, departures) are saved so."""
+        store = self.open(seniority=DAY)
+        store.store(KEY, ident(1))
+        self.clock.now += 2 * DAY
+        store.store(ident(7), ident(2))
+        store.withdraw(KEY, ident(1))  # departs, remembered
+        store.save()
+        self.clock.now -= 3 * DAY
+        store.expire()
+        with recorded_writes(store._db) as transactions:
+            store.save()
+        self.assertEqual(saved(self.state), held(store))
+        now = self.clock.now
+        self.assertEqual(saved(self.state)["records"], {(ident(7), ident(2)): (now, now, 0)})
+        self.assertEqual(saved(self.state)["departed"], {ident(1): (now, now)})
+        # The record, publisher and departure, the departure deleted from both its tables first
+        self.assertEqual(rows_written(transactions), 5)
+
+    def test_malformed_rows_are_ignored_and_deleted(self):
+        """Rows of the wrong type or length, or of a publisher without a row, load as nothing; the next save
+        deletes them, keeping the rest."""
+        store = self.open(seniority=DAY)
+        store.store(KEY, ident(1))
+        store.store(KEY, ident(2))
+        self.clock.now += 2 * DAY
+        store.withdraw(KEY, ident(2))  # departs, remembered
+        store.save()
+        store.close()
+        records = ("INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
+                   " VALUES (?, ?, ?, ?, ?)")
+        now = self.clock.now
+        for sql, row in ((records, (b"short", ident(1), now, now, 0)),
+                         (records, ("text key 16 long", ident(1), now, now, 0)),
+                         (records, (ident(8), ident(1), "yesterday", now, 0)),
+                         (records, (ident(9), ident(1), now, now, "pooled")),
+                         (records, (ident(10), ident(3), now, now, 0)),  # ident(3) has no publisher row
+                         ("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)", (ident(4), "x")),
+                         ("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)", (b"x", now)),
+                         ("INSERT INTO provider_departed (publisher, first_seen, at) VALUES (?, ?, ?)", (b"y", 1, now)),
+                         ("INSERT INTO provider_evicted (publisher, first_seen, at) VALUES (?, ?, ?)",
+                          (ident(5), now, "x"))):
+            state_execute(self.state, sql, row)
+        loaded = self.open(seniority=DAY)
+        self.assertEqual(loaded.providers(KEY), [ident(1)])
+        self.assertEqual(loaded.record_count(), 1)
+        self.assertEqual(loaded.allowance(ident(2)), loaded.max_per_publisher)
+        loaded.save()
+        self.assertEqual(saved(self.state), held(loaded))
+        self.assertEqual(len(saved(self.state)["records"]), 1)
+
+    def test_legacy_file_with_out_of_range_numbers_is_set_aside(self):
+        """providers.json with a number no float holds (which made rnfs 0.1.4 start empty) is moved aside."""
+        write_legacy(self.state, "providers.json",
+                     {"version": 1, "publishers": {ident(1).hex(): 10 ** 400}, "records": []})
         self.assertEqual(self.open().record_count(), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
 
     def test_saves_never_land_out_of_order(self):
-        # A save that snapshots while another is still writing must not be overwritten by the older snapshot
+        """A save that snapshots while another is still writing doesn't land first, overwritten by the older."""
         store = self.open()
         store.store(KEY, ident(1))
-        real_replace = fsutil.replace
         second = []
 
-        def slow_replace(source, target):
-            """The first save's rename: meanwhile another thread stores and saves."""
+        def refresh_and_save():
+            """Before the first save writes: refresh its record, and save from another thread."""
             if not second:
-                store.store(ident(7), ident(2))
+                self.clock.now += 5
+                store.store(KEY, ident(1))
                 second.append(threading.Thread(target=store.save))
                 second[0].start()
                 second[0].join(0.2)
-            real_replace(source, target)
 
-        with mock.patch.object(fsutil, "replace", slow_replace):
+        with recorded_writes(store._db, before=refresh_and_save):
             store.save()
             second[0].join(5)
-        with open(self.path, encoding="utf-8") as f:
-            self.assertEqual(len(json.load(f)["records"]), 2)
+        self.assertEqual(saved(self.state)["records"], {(KEY, ident(1)): (self.clock.now - 5, self.clock.now, 0)})
 
-    def test_save_writes_the_whole_state(self):
-        """The file has every publisher, record (pooled or not), departure and eviction, in the store's order."""
-        store = ProviderStore(20, self.path, clock=self.clock, seniority=DAY)
+    def test_saved_tables_are_the_whole_state(self):
+        """The tables hold every publisher, record (pooled or not), departure and eviction, as memory does."""
+        store = self.open(20, seniority=DAY)
         for publisher in (1, 2):
             for i in range(9):
                 store.store(ident(100 * publisher + i), ident(publisher))
@@ -437,44 +570,109 @@ class PersistenceTest(unittest.TestCase):
         store.withdraw(ident(100), ident(1))
         self.clock.now += DAY
         store.withdraw(ident(1005), ident(5))  # 5 departs, seen for long enough to be remembered
-        with store._lock:
-            expected = {
-                "version": 1,
-                "publishers": {p.hex(): e.first_seen for p, e in store._publishers.items()},
-                "records": [[k.hex(), p.hex(), r.first_stored, r.last_stored, int(r.pooled)]
-                            for k, held in store._records.items() for p, r in held.items()],
-                "departed": [[p.hex(), seen, left] for p, (seen, left) in store._departed.items()],
-                "evicted": [[p.hex(), seen, left] for p, (seen, left) in store._evicted.items()],
-            }
-        self.assertTrue(all(expected[section] for section in ("departed", "evicted")))
-        self.assertIn(1, [record[4] for record in expected["records"]])
+        expected = held(store)
+        self.assertTrue(expected["departed"] and expected["evicted"])
+        self.assertIn(1, [pooled for _, _, pooled in expected["records"].values()])
         store.save()
-        with open(self.path, "rb") as f:
-            self.assertEqual(f.read(), json.dumps(expected, separators=(",", ":")).encode())
+        self.assertEqual(saved(self.state), expected)
+
+    def test_save_writes_only_what_changed(self):
+        """With a thousand records saved, refreshing one and withdrawing another writes two rows."""
+        store = self.open(2000)
+        for i in range(1000):
+            store.store(ident(100 + i), ident(1 + i % 10))
+        store.save()
+        self.clock.now += 10
+        store.store(ident(100), ident(1))
+        store.withdraw(ident(101), ident(2))
+        with recorded_writes(store._db) as transactions:
+            store.save()
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(rows_written(transactions), 2)
+        self.assertEqual(saved(self.state), held(store))
 
     def test_failed_save_is_tried_again(self):
+        """A save whose commit fails raises, and the next save writes what it held."""
         store = self.open()
         store.store(KEY, ident(1))
-        with mock.patch.object(fsutil, "write_atomic", side_effect=OSError("disk full")):
+        with failing_commits():
             with self.assertRaises(OSError):
                 store.save()
         store.save()
         self.assertEqual(self.open().providers(KEY), [ident(1)])
 
-    def test_corrupt_file_starts_empty(self):
-        os.makedirs(os.path.dirname(self.path))
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("{not json")
+    def test_corrupt_legacy_file_starts_empty(self):
+        """providers.json that isn't JSON is moved aside, and the store starts empty."""
+        write_legacy(self.state, "providers.json", text="{not json")
         self.assertEqual(self.open().record_count(), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
 
     def test_save_only_when_changed(self):
+        """A save with nothing changed opens no transaction."""
         store = self.open()
-        store.save()
-        self.assertFalse(os.path.exists(self.path))
-        store.store(KEY, ident(1))
-        store.save()
-        with open(self.path, encoding="utf-8") as f:
-            self.assertEqual(len(json.load(f)["records"]), 1)
+        with recorded_writes(store._db) as transactions:
+            store.save()
+            self.assertEqual(transactions, [])
+            store.store(KEY, ident(1))
+            store.save()
+            store.save()
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(len(saved(self.state)["records"]), 1)
+
+    def test_random_operations_are_saved_and_loaded_exactly(self):
+        """Many random stores, withdrawals, batches, expiries, retains and saves (some failing) with every limit
+        reached: a store loaded from the tables holds exactly what the first one holds, and so do the tables."""
+        rng = random.Random(7)
+        own = ident(1)
+        settings = {"max_per_key": 6, "own_id": own, "seniority": DAY, "rng": random.Random(1)}
+        store = self.open(60, **settings)
+        publishers = [ident(1 + n) for n in range(40)]
+        keys = [ident(1000 + n) for n in range(30)]
+
+        def check():
+            """Expire, save, and load another store from the tables: it, and they, hold what store does."""
+            store.expire()
+            store.save()
+            loaded = ProviderStore(60, self.state, clock=self.clock, **settings)
+            try:
+                self.assertEqual(held(loaded), held(store))
+                self.assertEqual(saved(self.state), held(store))
+                self.assertFalse(loaded._dirty_records or loaded._dirty_publishers or loaded._dirty_gone)
+            finally:
+                loaded.close()
+
+        failed = 0
+        for _ in range(4000):
+            action = rng.random()
+            publisher = rng.choice(publishers)
+            if action < 0.4:
+                store.store(rng.choice(keys), publisher)
+            elif action < 0.55:
+                store.withdraw(rng.choice(keys), publisher)
+            elif action < 0.65:
+                store.provide(publisher, rng.sample(keys, rng.randrange(1, 12)), rng.sample(keys, rng.randrange(3)))
+            elif action < 0.8:
+                self.clock.now += rng.choice((1, 60, 3600))
+            elif action < 0.83:
+                self.clock.now += rng.choice((DAY, 3 * DAY, PROVIDER_TTL))
+                store.expire()
+            elif action < 0.85:
+                banned = set(rng.sample(publishers, 3))
+                store.retain(lambda p: p not in banned)
+            elif action < 0.95:
+                store.save()
+            elif action < 0.97:
+                with failing_commits():
+                    try:
+                        store.save()
+                    except OSError:
+                        failed += 1
+            elif action < 0.98:
+                check()
+        self.assertGreater(failed, 10)
+        self.assertGreater(store._count, 0)
+        self.assertTrue(store._departed or store._evicted)
+        check()
 
 
 class ThreadSafetyTest(StoreTestCase):

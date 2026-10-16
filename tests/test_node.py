@@ -1,6 +1,5 @@
 """Tests for RnfsNode's facade and backend (rnfs/node.py), on offline nodes with a fake network client."""
 import io
-import json
 import os
 import random
 import shutil
@@ -24,7 +23,7 @@ from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES, wait_for
+from tests.support import POSIX_MODES, failing_commits, state_rows, wait_for
 from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
@@ -481,11 +480,10 @@ class SecurityTest(NodeTest):
         cid = self.a.add_stream(io.BytesIO(b"cached"))["cid"]
         self.advertise(cid)
         b"".join(self.b.read(cid))
-        path = os.path.join(self.b.config.state_dir, "cache.json")
-        self.assertFalse(os.path.exists(path))  # not rewritten on every fetch
+        state = self.b.config.state_dir
+        self.assertEqual(state_rows(state, "SELECT target FROM cache"), [])  # not written on every fetch
         self.b.stop()
-        with open(path, encoding="utf-8") as f:
-            self.assertIn(cid, f.read())
+        self.assertEqual(state_rows(state, "SELECT target FROM cache"), [(Cid.parse(cid).binary,)])
 
     def test_remote_pin_quota_counts_dag_blocks(self):
         self.a.config.remote_pin_quota = 50_000
@@ -650,23 +648,31 @@ class RestartTest(NodeTest):
         cid = self.a.add_stream(io.BytesIO(b"fetched for the user"))["cid"]
         self.advertise(cid)
         self.b.get(cid, os.path.join(self.tmp.name, "out"))
-        path = os.path.join(self.b.config.state_dir, node_module.FETCHED_FILE)
-        self.assertFalse(os.path.exists(path))  # not written on each fetch, under the node's lock...
-        self.b._save_state()  # ...but by the next state save (maintenance, gc and stop)
-        with open(path, encoding="utf-8") as f:
-            self.assertEqual(json.load(f), [cid])
+        state = self.b.config.state_dir
+        self.assertEqual(state_rows(state, "SELECT cid FROM fetched"), [])  # not written on each fetch, under the
+        self.b._save_state()  # node's lock, but by the next state save (maintenance, gc and stop)
+        self.assertEqual(state_rows(state, "SELECT cid FROM fetched"), [(Cid.parse(cid).binary,)])
         self.b = self.restart(self.b, "b", B_ID)
         self.assertEqual(self.b._eligible_targets(), {Cid.parse(cid)})
         self.assertIn(Cid.parse(cid), self.b.publisher.provided())
 
     def test_failed_fetched_save_is_tried_again(self):
-        self.b._note_fetched(Cid.for_block(RAW, b"target"))
-        with mock.patch.object(node_module, "write_json", side_effect=OSError("disk full")):
+        target = Cid.for_block(RAW, b"target")
+        self.b._note_fetched(target)
+        with failing_commits("database or disk is full"):
             with self.assertRaises(OSError):
                 self.b._save_fetched()
         self.b._save_fetched()
-        with open(os.path.join(self.b.config.state_dir, node_module.FETCHED_FILE), encoding="utf-8") as f:
-            self.assertEqual(json.load(f), [str(Cid.for_block(RAW, b"target"))])
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM fetched"), [(target.binary,)])
+        # Only the change is written: one forgotten target is one row deleted
+        self.b._note_fetched(Cid.for_block(RAW, b"other"))
+        self.b._save_fetched()
+        with self.b._lock:
+            self.b._fetched.discard(target)
+            self.b._fetched_dirty = True
+        self.b._save_fetched()
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM fetched"),
+                         [(Cid.for_block(RAW, b"other").binary,)])
 
 
 class MakeRoomTest(NodeTest):

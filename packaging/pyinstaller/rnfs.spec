@@ -40,7 +40,9 @@ def required(package: str) -> str:
 VERSION = rnfs_version()
 
 hiddenimports = (
-    collect_submodules("rnfs")  # rnfs.features loads feature modules by name with importlib
+    # rnfs.features loads feature modules by name with importlib, and rnfs.statedb its migration's importers
+    collect_submodules("rnfs")
+    + ["sqlite3"]  # the state database; imported inside a function, so named here (PyInstaller adds _sqlite3)
     + collect_submodules(required("RNS"))
     + collect_submodules(required("LXMF"))
     + collect_submodules("serial")  # pyserial: Serial, KISS and RNode interfaces

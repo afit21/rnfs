@@ -1,16 +1,15 @@
 """R-2: a name key file that exists but can't be read at start was treated as deleted, releasing the name's pin
-and dropping its names.json record.
+and dropping its saved record (then in names.json).
 
-NameManager skipped a key file RNS couldn't load (no permission, damaged), so its alias had no key; the
-names.json entry then counted as a key "deleted by hand" (release_gone() released the pin and the save dropped
-the entry) and reconcile_pins released any pin of an alias with no key. Once the file could be read again the
-name was back with no target and sequence 0. The fixed manager treats only a missing key file as removed: an
-unreadable one keeps its pins, and its names.json entry is written back unchanged by every save.
+NameManager skipped a key file RNS couldn't load (no permission, damaged), so its alias had no key; its saved
+record then counted as a key "deleted by hand" (release_gone() released the pin and the save dropped the record)
+and reconcile_pins released any pin of an alias with no key. Once the file could be read again the name was back
+with no target and sequence 0. The fixed manager treats only a missing key file as removed: an unreadable one
+keeps its pins, and every save leaves its names_published row as it is.
 
 Offline node (RnfsNode.offline over tests.test_names' FakeNetwork), restarted on the same directory.
 """
 import io
-import json
 import os
 import tempfile
 import unittest
@@ -20,6 +19,7 @@ import RNS
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
+from tests.support import state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import A_ID, NetClient
 
@@ -49,9 +49,8 @@ class UnreadableNameKeyTest(unittest.TestCase):
         self.node.names.create("site")
         self.node.names.publish("site", self.cid)
         self.key = self.node.names._key_path("site")
-        self.state = os.path.join(self.config.state_dir, "names.json")
         self.recorded = self.published()["site"]
-        self.assertEqual(self.recorded["sequence"], 1)
+        self.assertEqual(self.recorded, ("1", self.cid.binary, 0))
 
     def open(self) -> RnfsNode:
         """The node, opened (again) on its directory."""
@@ -68,9 +67,9 @@ class UnreadableNameKeyTest(unittest.TestCase):
         return self.node
 
     def published(self) -> dict:
-        """names.json's published entries."""
-        with open(self.state, encoding="utf-8") as f:
-            return json.load(f)["published"]
+        """The names_published rows: alias -> (sequence, cid, imported)."""
+        rows = state_rows(self.config.state_dir, "SELECT alias, sequence, cid, imported FROM names_published")
+        return {alias: tuple(rest) for alias, *rest in rows}
 
     def check_kept(self, make_unreadable, make_readable):
         """While the key can't be read the pin and record stay (across a save); once readable, the name is back."""
@@ -79,7 +78,7 @@ class UnreadableNameKeyTest(unittest.TestCase):
         # R-2: fails until only a missing key file counts as a removed name
         self.assertEqual(node.storage.pinned_by("name:site"), {self.cid},
                          "an unreadable key file released the name's pin")
-        node.names.create("other")  # saves names.json
+        node.names.create("other")  # saves the records
         self.assertEqual(self.published().get("site"), self.recorded, "the name's record was dropped")
         make_readable()
         node = self.restart()

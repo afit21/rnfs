@@ -70,10 +70,12 @@ class PacingTest(unittest.TestCase):
 
         config = Config(rnfs_dir=self.tmp, slow="yes")
         storage = Storage(os.path.join(self.tmp, "blocks"), os.path.join(self.tmp, "state"), 10**9)
+        self.addCleanup(storage.close)
         requester_rate = None
         client = mock.Mock(rate_estimate=lambda node_id: requester_rate)
         fetcher = Fetcher(storage, client, config, OWN, RoutingTable(OWN, config), lambda key: None,
                           state_dir=os.path.join(self.tmp, "state"), clock=clock)
+        self.addCleanup(fetcher.close)
         refusals = 0
         with fetcher.open(built.cid, from_node=PROVIDER) as fetch:
             provider = fetch._providers[PROVIDER]
