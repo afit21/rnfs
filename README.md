@@ -28,6 +28,7 @@ Access any file on RNFS by it's **'CID'**.
 
 [Install](#install) · [Sample files (with CIDs)](#sample-files) · [Getting started](#getting-started) ·
 [How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
+[Building apps on rnfs](#building-apps-on-rnfs) · [Keeping content off your node](#keeping-content-off-your-node) ·
 [Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
 [Tests](#tests) · [Known limitations](#known-limitations) ·
 [specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
@@ -613,6 +614,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `scan_interval` | `60` | How often the shared folder `files/` is scanned |
 | `remote_pin_identities` | `[]` | Identity hashes allowed to ask this node to pin (`pin remote add`); a node's is the `identity_hash` in its `rnfs status`. Pins accepted and not yet fetched are resumed after a restart |
 | `remote_pin_quota` | `1073741824` (1 GiB) | Storage each of those identities may use |
+| `deny_lists` | `[]` | Deny lists to apply, each `"<cid>[/path]"` or `"name/<name>[/path]"` (follows the name): see "Keeping content off your node" |
 
 **Transfers**
 
@@ -761,10 +763,12 @@ also shared from your node (see `provide_strategy`).
 |---|---|
 | `rnfs pin add TARGET [--background]` | Fetch completely and pin (share) |
 | `rnfs pin rm CID` | Remove your pin |
-| `rnfs pin ls [CID] [--json]` | Pins, their sources (`user`, `folder`, `name:…`, `remote:…`, `follow:…`, `lxmf:…`), whether each is a sealed file (`(sealed)`; `"sealed": true`, `false`, or `null` if not stored enough to tell) and where each came from: the local path you added it from (`~/notes.txt`, `(stdin)`, `archive …`, the target given to `pin add`), the shared-folder file name, or for a directory its single entry's name or entry count. These names are kept only on your machine, sealed files' too (their sealed name is what others can't read): anything that publishes a pin list must leave sealed entries out; pins made before this was added show none for plain files |
+| `rnfs pin ls [CID] [--json]` | Pins, their sources (`user`, `folder`, `name:…`, `remote:…`, `follow:…`, `lxmf:…`, `deny`), whether each is a sealed file (`(sealed)`; `"sealed": true`, `false`, or `null` if not stored enough to tell) and where each came from: the local path you added it from (`~/notes.txt`, `(stdin)`, `archive …`, the target given to `pin add`), the shared-folder file name, or for a directory its single entry's name or entry count. These names are kept only on your machine, sealed files' too (their sealed name is what others can't read): anything that publishes a pin list must leave sealed entries out; pins made before this was added show none for plain files |
 | `rnfs pin remote add NODE_ID CID` / `rnfs pin remote rm NODE_ID CID` | Ask another node to pin or unpin (it must list your identity in `remote_pin_identities`) |
 | `rnfs gc` | Evict every cached download |
 | `rnfs verify` | Re-check every stored block against its CID |
+| `rnfs deny add ENTRY…` / `rnfs deny rm ENTRY…` | Add CIDs or file hashes (`sha256:<hex>`) to your local deny list, or remove them |
+| `rnfs deny ls` | Your local deny list, then each `deny_lists` list: the version in use, its entry count and state |
 
 **Background jobs**
 
@@ -837,6 +841,65 @@ Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
   yourself fetches what isn't stored first.
 - Pages are sandboxed: they can show files of their own content (images, scripts, style sheets), but no page
   can read gateway responses with `fetch()`. Sealed files are never decrypted by the gateway.
+
+# Building apps on rnfs
+
+Apps talk to a running daemon through its local API, as the CLI does. `rnfs.apiclient` (standard library only,
+and it doesn't load Reticulum, so it starts fast) finds the rnfs directory and API token as the CLI does, makes
+whatever listens on the API port prove it knows the token before sending it, and raises a typed error for each
+failure:
+
+```python
+from rnfs.apiclient import Client, DaemonNotRunning, NotFound
+
+api = Client()  # the daemon using ~/.rnfs/; Client("/srv/rnfs") for another rnfs dir
+try:
+    cid = api.add_path("/home/me/photos")["cid"]
+    api.name_publish("photos", cid)
+    with api.cat(f"{cid}/cat.jpg") as stream, open("cat.jpg", "wb") as out:
+        for chunk in stream:
+            out.write(chunk)
+    print(api.name_resolve("ab" * 16)["cid"])
+except DaemonNotRunning:
+    print("start it with: rnfs daemon")
+except NotFound as e:
+    print(e)
+```
+
+It has methods for status, adding (a path or a stream), fetching and `cat`, pins, names and jobs; `get()` and
+`post()` reach every other endpoint (`rnfs/api.py` lists them). The module's docstring is the reference. Run
+the app as the daemon's user: only it can read the token.
+
+# Keeping content off your node
+
+If you run a public gateway or a provider node, a deny list keeps chosen content off it. Entries are CIDs and
+file hashes (`sha256:` and the 64 hex digits of a file's SHA-256, as `sha256sum` prints it):
+
+```sh
+rnfs deny add bafkreidhtnhwyqkmbhxvp2mrery66f4kpdsfbxew3qrfqrbtwbs6zb5zce
+rnfs deny add sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+rnfs deny ls
+```
+
+To use a list someone maintains, put its CID in `deny_lists` in `rnfs.toml`, or `name/<name>` to follow the
+updates of a list published under a name. A list is a text file with one entry per line; `#` starts a comment.
+
+```toml
+deny_lists = ["name/3f2a9c7e1b4d5a6f8e0c1d2b3a4f5e6d/denylist.txt"]
+```
+
+A denied CID is never fetched, read, stored or served by your node, whether it is the content asked for or
+anywhere inside it, and nothing holding it is provided (records already published are withdrawn). `get`,
+`cat`, the gateway (status 451), `pin add`, remote pins, followed names and LXMF auto-fetch all refuse it. When
+an entry is added, cached downloads holding it are deleted and pins made for other nodes (`pin remote`) are
+released; your own pins are kept, but not served or read, and the log names each one so you can `rnfs pin rm`
+it.
+
+A file hash is only known once the file has been downloaded, so it stops `get`, `cat` and the gateway from
+handing the file out (they check before writing or sending anything, which makes them fetch the whole file
+first) and `add` or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served.
+Deny the CID to stop that. Lists larger than 4 MiB, with over 100 000 entries, or with a line that isn't an
+entry are refused, and the previous version stays in use.
 
 # Example use cases
 

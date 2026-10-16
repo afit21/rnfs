@@ -18,7 +18,8 @@ from collections.abc import Callable
 
 # Module paths, in start order. A feature may use the features before it
 FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs.features.keepers",
-                               "rnfs.features.follow", "rnfs.features.contacts", "rnfs.features.lxmf"]
+                               "rnfs.features.follow", "rnfs.features.contacts", "rnfs.features.lxmf",
+                               "rnfs.features.deny"]
 
 ApiRoute = Callable[[object], None]  # handler(api_handler)
 

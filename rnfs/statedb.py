@@ -119,6 +119,12 @@ SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
         "CREATE TABLE lxmf_messages (box TEXT NOT NULL, id INTEGER NOT NULL, record TEXT NOT NULL,"
         " PRIMARY KEY (box, id)) WITHOUT ROWID",
     )),
+    ("denylist", (
+        # entry: canonical text (a CID's written form, or "sha256:" and 64 lowercase hex digits); ASCII
+        "CREATE TABLE deny_entries (entry TEXT PRIMARY KEY, added REAL NOT NULL) WITHOUT ROWID",
+        # source: a deny_lists setting as written (dump()ed); cid: the list version it last accepted
+        "CREATE TABLE deny_lists (source TEXT PRIMARY KEY, cid BLOB NOT NULL, accepted REAL NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

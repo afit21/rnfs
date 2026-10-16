@@ -6,8 +6,8 @@ any validly signed announce, including a replayed old one, so the highest sequen
 name this node publishes or resolves for the user, and lower sequences are never accepted from any source.
 Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
 names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
-within seconds of a resolve raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten only past a
-hard bound.
+within seconds of a resolve or an announce raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten
+only past a hard bound.
 
 State lives in the state database (rnfs.statedb), read only at startup. The records of names published here and
 of names resolved for the user (names_published, names_held) are saved at once and durably, each save writing only
@@ -392,6 +392,7 @@ class NameManager:
         self._floor_dirty = False  # a floor save is due
         self._floor_saved_at = float("-inf")  # monotonic time of the last floor save
         self._floor_timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
+        self._closed = False  # close() has run: no floor timer is started
         # Floor saves write without self._lock, one at a time, so an older snapshot never lands last. Taken before
         # self._lock, never while holding it
         self._floor_save_lock = threading.Lock()
@@ -670,6 +671,7 @@ class NameManager:
     def close(self):
         """Release the state database, once stop() has saved everything (idempotent)."""
         with self._lock:
+            self._closed = True
             if self._floor_timer is not None:
                 self._floor_timer.cancel()
                 self._floor_timer = None
@@ -892,7 +894,8 @@ class NameManager:
         return True
 
     def _store(self, name: bytes, record: Record, held_here: bool, unasked: bool = False) -> bool:
-        """Put record in the persisted map or the bounded table, making room in the table. False if an unasked
+        """Put record in the persisted map or the bounded table, making room in the table, and raise the name's
+        floor to it (saved by the timer, since callers hold the lock, some on RNS's thread). False if an unasked
         record found no room (every place is a name resolved or kept here)."""
         if held_here:
             self._held[name] = record
@@ -916,6 +919,7 @@ class NameManager:
             self._floor[name] = (record.sequence, floor[1])
             self._floor_changed.add(name)
             self._floor_dirty = True
+            self._save_floor_soon(inline=False)
         if len(self._table) > limit:  # name_table_size 0: nothing is kept
             self._drop_from_table(name)
         return True
@@ -967,14 +971,15 @@ class NameManager:
             trimmed = True
         return trimmed
 
-    def _save_floor_soon(self) -> bool:
+    def _save_floor_soon(self, inline: bool = True) -> bool:
         """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
-        has released the lock; else it is saved once it is (a timer)."""
+        has released the lock; else it is saved once it is (a timer). Without inline, a save due now is the
+        timer's too, started at once."""
         wait = self._floor_saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
-        if wait <= 0:
+        if wait <= 0 and inline:
             return True
-        if self._floor_timer is None:
-            timer = threading.Timer(wait, self._save_floor_later)
+        if self._floor_timer is None and not self._closed:
+            timer = threading.Timer(max(0.0, wait), self._save_floor_later)
             timer.daemon = True
             self._floor_timer = timer
             timer.start()

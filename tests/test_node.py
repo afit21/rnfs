@@ -711,6 +711,29 @@ class LookupStartTest(NodeTest):
         self.assertIn(failed, start)  # fewer than K healthy: made up from the rest
         self.assertEqual(len(start), K - 1)
 
+    def test_unreliable_nodes_start_lookups_only_to_make_up_k(self):
+        """A node whose queries keep failing, though it keeps announcing, starts lookups only after every other."""
+        rng = random.Random(8)
+        others = [bytes(rng.getrandbits(8) for _ in range(16)) for _ in range(K + 1)]
+        for node_id in others:
+            self.assertTrue(self.b.routing.heard(node_id))
+        dead = others[0]
+        for _ in range(self.b.config.max_failures):
+            self.b.routing.heard(dead)  # announces don't clear its failures
+            self.b.routing.failed(dead)
+        self.b.routing.heard(dead)
+        lookup = self.b._lookup(dead)
+        self.assertNotIn(dead, lookup._start_nodes)
+        self.assertEqual(len(lookup._start_nodes), K)
+        self.assertTrue(lookup.unreliable(dead))
+        for node_id in others[1:4]:
+            self.b.routing.remove(node_id)
+        start = self.b._lookup(dead)._start_nodes
+        self.assertEqual(start[-1], dead)  # fewer than K others: made up with it, last
+        self.assertEqual(len(start), K - 1)
+        self.b._answered(dead)
+        self.assertFalse(self.b.routing.unreliable(dead))
+
 
 class JoinTest(NodeTest):
     """Joining: bootstrap nodes first (the user's, then the defaults), then a lookup; again while too few."""

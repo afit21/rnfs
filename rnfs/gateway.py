@@ -25,7 +25,8 @@ Behaviour:
   `Origin: null` would let every site's sandboxed iframe or data: page read the gateway. Per-CID origins
   (a subdomain per root) would be the way to let pages read their own DAG, and are possible future work.
 - A GatewayError (the gateway's own refusals) or NotFound says what went wrong. Every other error (a 400,
-  413, 422, 503 or 507 from the node, or a 500) gets only a fixed message for its status: a node error's text
+  413, 422, 503 or 507 from the node, 451 for content the deny list blocks, or a 500) gets only a fixed
+  message for its status: a node error's text
   can name local paths, disk space or limits. The detail goes to the log (500: as an error; others verbose).
 - Requests that aren't the user's own navigation (Sec-Fetch-Site present and not "none") may hold at most
   gateway_fetches network fetches or name resolutions at a time; over that, 503 with Retry-After.
@@ -72,6 +73,7 @@ NAME_CACHE_SIZE = 1000
 INDEX = "index.html"
 # What an error from the node says on the gateway, by status: never its own text (see the module docstring)
 ERROR_MESSAGES = {400: "invalid request", 413: "too large for this node's download limits",
+                  451: "unavailable: this node's deny list blocks this content",
                   422: "invalid content: it breaks the rnfs format's rules", 503: "the node is busy; try again shortly",
                   507: "not enough free disk space on this node", 500: "internal error; see the rnfs daemon's log"}
 RANGE_NUMBER = re.compile(r"[0-9]{1,18}")  # ASCII digits only (str.isdigit() takes "¹²³"), and below 2**63

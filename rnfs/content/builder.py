@@ -12,14 +12,19 @@ A file with one chunk is just that raw block, an empty file is a zero-byte raw b
 directory is [2, []].
 
 Builders hand every block to a `put(cid, block)` callback, so they don't depend on Storage; a no-op
-callback (NO_PUT) gives only-hash mode. Files are streamed, one chunk in memory at a time.
+callback (NO_PUT) gives only-hash mode. Files are streamed, one chunk in memory at a time. Within
+`with checking(check):` each file's whole-content SHA-256 is passed to check (the deny list's file hashes),
+which may raise to stop the build before the file's root node is stored.
 """
 import errno
+import hashlib
 import io
 import os
 import stat
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import BinaryIO, Callable, Iterable
+from typing import BinaryIO, Callable, Iterable, Iterator
 
 from rnfs import constants, fsutil
 from rnfs.content import chunker, dag
@@ -111,6 +116,21 @@ def _put_node(node: dag.Node, put: Put) -> Cid:
     return cid
 
 
+# What build_file passes each file's content SHA-256 to in this thread/context (checking), if anything
+_check: ContextVar[Callable[[bytes], None] | None] = ContextVar("rnfs_file_check", default=None)
+
+
+@contextmanager
+def checking(check: Callable[[bytes], None] | None) -> Iterator[None]:
+    """Within the block, build_file calls check(digest) with each file's content SHA-256 once it is read, before
+    the file's root node is stored; check may raise to stop the build. None checks nothing."""
+    token = _check.set(check)
+    try:
+        yield
+    finally:
+        _check.reset(token)
+
+
 def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = dag.KIND_FILE) -> Built:
     """Build a file from everything read from stream, or exactly size bytes of it (ValueError if it ends early)."""
 
@@ -120,11 +140,17 @@ def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = 
         return Child(_put_node(node, put), node.size), _height(pairs)
 
     levels = _Levels(make_group, constants.MAX_CHILDREN)
+    check = _check.get()
+    digest = hashlib.sha256() if check is not None else None
     # Fixed CHUNK_SIZE pieces unless `add --chunker fastcdc` selected content-defined chunks (chunker.using)
     for chunk in chunker.chunks(stream, size):
         cid = Cid.for_block(RAW, chunk)
+        if digest is not None:
+            digest.update(chunk)
         put(cid, chunk)
         levels.add(Child(cid, len(chunk)), 0)
+    if check is not None:
+        check(digest.digest())
 
     level, pairs = levels.finish()
     if level == 0 and not pairs:

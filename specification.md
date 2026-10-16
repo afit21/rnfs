@@ -505,6 +505,22 @@ and repeat.
   `alpha` such IDs are tried per lookup. (A keeper query asks unknown keepers from a budget of its own, also
   `alpha`, so nodes named in `/find` replies can't use it up, section 9.)
 - Nodes that fail to answer are dropped from the lookup and counted in the routing table.
+- **Unreliable nodes.** An announce shows a node is alive, not that a link to it can be established: a far
+  node whose announces keep arriving may never accept a link, and each query to it then costs RNS's whole
+  link establishment timeout (about 6 s per hop). A node SHOULD keep counting the failed queries of such a
+  node however often it is heard, also when it isn't in the routing table (it is named in other nodes'
+  replies), and SHOULD NOT let it hold lookups open. In rnfs a node whose last `max_failures` queries all
+  failed is *unreliable* until it answers one:
+  - it starts lookups, is queried, counts for termination and is in a lookup's result only after every other
+    node known, so it is asked (and waited for) only when the lookup has too few others;
+  - it is asked again 5 minutes after it became unreliable, doubling with each further failure up to an
+    hour, by one lookup at a time, if it would otherwise rank among the nodes the lookup queries. That query
+    is sent on top of the `alpha` in flight and nothing waits for its answer; an answer makes it reliable
+    again.
+
+  Its queries aren't shortened: on a long radio path a link may take the whole timeout to establish, and
+  only an answer shows the node is back. Its routing-table entry, `/find` replies and the join's count of
+  live servers are unchanged.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
   answered, or once every known node has been queried without finding new ones.
@@ -695,8 +711,9 @@ and repeat.
 **Pins.**
 - Pins are recursive: a pinned CID keeps every block of its DAG.
 - A pin is held by one or more *sources*: `user`, `folder`, `name:<alias>`, `remote:<identity>`,
-  `follow:<name>` (the latest target of a followed name, section 9) and `lxmf:<address>` (links auto-fetched
-  from that LXMF sender, section 13); names, identities and addresses are 32 hex characters. It lasts while
+  `follow:<name>` (the latest target of a followed name, section 9), `lxmf:<address>` (links auto-fetched
+  from that LXMF sender, section 13) and `deny` (the deny lists in use, below); names, identities and
+  addresses are 32 hex characters. It lasts while
   any source holds it.
 - `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
@@ -768,6 +785,39 @@ could have linked in. It is imported at the next scan after its other links are 
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
+
+**Deny lists.** A node MAY refuse chosen content, so operators of public gateways and provider nodes can keep it
+off their node. Nothing on the wire changes.
+- Entries are CIDs and file hashes, `sha256:<64 hex digits>`: the SHA-256 of a file's whole content. A deny
+  list is UTF-8 text, one entry per line; blank lines and everything after `#` are ignored. The entries in use
+  are those of the local list (`deny add|rm`) and of every source in `deny_lists`: `<cid>[/path]`, a fixed
+  list, or `name/<name>[/path]`, one that follows the name.
+- A list is untrusted input. One over 4 MiB or 100 000 entries, not UTF-8, with a line that isn't an entry, or
+  that is a directory, is refused with a warning, and its source keeps the version it had. A version in use
+  stays pinned (source `deny`), so a restart applies it before anything is fetched or provided; the version
+  a newer one replaces is released. rnfs checks a name source every 10 minutes from the record held, through
+  the network only when nothing was heard for 2 × `announce_interval`; a failed check is retried after 5
+  minutes, doubling up to `announce_interval`.
+- A denied CID is never fetched or read, whether it is the root or anywhere in the DAG being fetched, stored
+  here or not: `get`, `cat`, `ls`, `stat`, `pin add`, `dir set`, `export`, the gateway, remote pins, followed
+  names, LXMF auto-fetch and jobs fail, saying the content is on the deny list (the API and the gateway answer
+  `451`). It is never stored (an add or import holding it fails and pins nothing), never served (`/blocks`
+  answers it as a block not held), and nothing whose DAG holds it is provided: records already published are
+  withdrawn. A `/pin` of it is refused.
+- When the entries change, and at start: cached fetches reaching a denied block are dropped, and the blocks
+  nothing else reaches deleted; remote pins reaching one are released, as they are kept for others, and their
+  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `lxmf:`, `deny`) are kept,
+  stored but neither served, provided nor read, with a warning naming each, until they are removed. Every
+  deletion and release is logged.
+- A file's hash is only known once its content is read, so file-hash entries are checked where content is
+  assembled: before `get` writes a file out (nothing is left), before `cat` or the gateway sends any of a file
+  (so a range fetches the whole file first; its hash is then remembered; the gateway's `?format=raw` and
+  `?format=archive` too), and as `add`, the shared folder or `import` read it (the add or import fails). By then the file's blocks have been downloaded. A file-hash entry
+  doesn't stop those blocks being fetched (by `pin add`, `export` to a file, a remote pin or a followed name), stored,
+  served or provided: deny the CID for that. A file of one block has its content's hash as its CID's digest,
+  so either entry stops it; a sealed file matches by its sealed bytes, as stored, not by what it decrypts to.
+- Provider records other nodes store here for a denied CID are kept and handed out as usual (`/find` sees
+  only keys).
 
 ## 9. Names
 
@@ -850,8 +900,8 @@ what prevent rollback.
   sequence it returned, as a floor below which no record of that name is accepted, so such a resolve never
   goes back after table churn or a restart. The record itself isn't persisted. (rnfs: up to
   4 × `name_table_size` names, least recently resolved forgotten first, except that names resolved in the
-  last 7 days are kept up to 8 × `name_table_size`; saved by a resolve that raises the floor, at most every
-  5 s, otherwise at least every minute and at shutdown.)
+  last 7 days are kept up to 8 × `name_table_size`; saved within 5 s of a resolve, announce or keeper record
+  raising the floor, otherwise at least every minute and at shutdown.)
 - Records from keepers are subject to the same persisted-sequence and no-rollback rules as announces.
 - A record this node keeps (below) is a floor for resolving that name: it MUST be offered to the sequence
   rules at startup and on every resolve, so an older validly signed announce is never accepted for a kept
@@ -940,6 +990,7 @@ as is cheap. Rules live in the sections referenced.
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
 | Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
+| Unwanted content on a public gateway or provider node | Deny lists: denied CIDs never fetched, stored, served or provided, anywhere in a DAG; file hashes checked where content is assembled; lists size-capped and checked before use (8) |
 | Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
 | Republishing and retries draining airtime | Small `keep_max_names`; slower, jittered republishing of name keys; paced lookups on slow nodes; follow backoff (6, 9) |
@@ -1058,6 +1109,7 @@ are local conveniences, not part of the protocol.
 | `export <cid>[/path] -o file [--background]`, `import file` | Archives |
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
+| `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
 | `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, LXMF address (only the version without a readable API token) |
@@ -1079,8 +1131,9 @@ gateway can never reach the API.
 - Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
   `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
-  SYSTEM); the CLI reads it from there and refuses a file other users can access. Every local process, of every user, can connect to `127.0.0.1`, and the API reads and writes
-  files as the daemon's user, so only users who can read the rnfs directory may use it. Web pages can't
+  SYSTEM); clients (the CLI, and apps through rnfs's client library `rnfs.apiclient`) read it from there and
+  refuse a file other users can access. Every local process, of every user, can connect to `127.0.0.1`, and
+  the API reads and writes files as the daemon's user, so only users who can read the rnfs directory may use it. Web pages can't
   learn the token, and the custom header needs a CORS preflight, which fails: this also blocks cross-site
   requests. `GET /api/status` stays open for health checks and the proof check below, but without the
   token it MUST say no more than the daemon's version (rnfs: `{"version": ...}`); the full status (node ID,
@@ -1096,8 +1149,9 @@ gateway can never reach the API.
   anything else stops the daemon with an error.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
-  Before it first sends the token, the CLI checks this proof with a `GET /api/status`, so a program another
-  user runs on the port while the daemon is down learns neither the token nor a name key being imported.
+  Before it first sends the token, a client SHOULD check this proof with a `GET /api/status` (the CLI and
+  `rnfs.apiclient` do), so a program another user runs on the port while the daemon is down learns neither the
+  token nor a name key being imported.
 - The API never sends CORS headers.
 - Both servers SHOULD time-limit reading a request (rnfs: 15 s for the request line, headers and small
   bodies; 60 s between reads of an upload), but not the node's work, and SHOULD cap concurrent
@@ -1143,8 +1197,8 @@ gateway can never reach the API.
   form-action 'self'`. Pages run in an opaque origin and can't load resources from other servers;
   navigation and WebRTC can still reveal the viewer. A node MAY disable scripts (`gateway_scripts`).
 - The gateway's own refusals (a bad path or CID, a method other than GET or HEAD, a `409` or `416`…) and a `404`
-  say what went wrong. Any other error from the node (`400`, `413`, `422`, `503`, `507` or `500`) gets only a
-  fixed message for its status; the details, which may name local paths, disk space or limits, go to the log.
+  say what went wrong. Any other error from the node (`400`, `413`, `422`, `451` for content the deny list
+  refuses, `503`, `507` or `500`) gets only a fixed message for its status; the details, which may name local paths, disk space or limits, go to the log.
 - No response carries `Access-Control-*` headers, whatever the request's `Origin` or `Referer`. Pages run in an
   opaque origin, so they can load files of their own DAG as subresources (images, scripts, style sheets,
   frames) but can't read gateway responses with `fetch()` or `XMLHttpRequest`, and neither can other web
@@ -1298,6 +1352,7 @@ setting.
 | `lxmf_accept_from` | empty: everyone | LXMF addresses whose messages are kept |
 | `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`lxmf:<address>`) |
 | `lxmf_auto_fetch_quota` | 1 GiB per sender | Storage the pins of one auto-fetch sender may use |
+| `deny_lists` | empty | Deny-list sources: `<cid>[/path]` or `name/<name>[/path]`, each a file (section 8) |
 
 ## 13. rnfs URIs and LXMF
 

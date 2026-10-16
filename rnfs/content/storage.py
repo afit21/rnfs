@@ -1,11 +1,14 @@
 """Storage: blocks, pins, cached fetches, protection and eviction (specification section 8). No RNS dependency.
 
-- Pins are recursive and held by sources: "user", "folder", "name:<alias>", "remote:<identity hash>". A pin
-  lasts while any source holds it. Pins are never evicted.
+- Pins are recursive and held by sources: "user", "folder", "name:<alias>", "remote:<identity hash>", "deny" (the
+  deny lists' own blocks), and the features' "follow:" and "lxmf:". A pin lasts while any source holds it. Pins
+  are never evicted.
 - Cache is everything else. Each cached fetch is recorded as root + path + target, which keeps the path's
   nodes and the target's DAG; fetches are evicted least recently used first when storage exceeds
   max_storage, and gc() evicts them all.
 - Blocks of fetches, adds and imports in progress are protected as if pinned, by a protection session.
+- A block the deny list (`deny`, rnfs.denylist) denies is never stored: put() raises Denied. drop_denied() drops
+  the cached fetches that reach one, and denied_roots() says which pins do.
 - A block is deleted only if no pin, session or remaining cached fetch reaches it.
 - max_storage is soft: no fetch is refused for it, and storage may exceed it while fetches run or when
   pins alone fill it. The hard bound is the disk: check_disk() refuses blocks that would leave less than
@@ -29,16 +32,17 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
-from rnfs import statedb
+from rnfs import denylist, statedb
 from rnfs.constants import MAX_BLOCK_SIZE, MIB
 from rnfs.content import dag, walker
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, IndexNode
-from rnfs.errors import InvalidDag, NotFound, StorageFull
+from rnfs.errors import Denied, InvalidDag, NotFound, StorageFull
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
 
 USER, FOLDER = "user", "folder"
+DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
 LXMF_PREFIX = "lxmf:"
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
@@ -63,7 +67,7 @@ def disk_reserve(total: int) -> int:
 
 def check_source(source: str):
     """Raise ValueError unless source is a valid pin source."""
-    if source in (USER, FOLDER):
+    if source in (USER, FOLDER, DENY):
         return
     if isinstance(source, str) and source.startswith(NAME_PREFIX) and len(source) > len(NAME_PREFIX):
         return
@@ -243,6 +247,7 @@ class Storage:
         # so eviction over max_storage with nothing to evict needn't walk everything again
         self._maybe_garbage = True
         self._reported_damaged: set[Cid] = set()  # damaged DAG nodes already logged as stopping collection
+        self.deny = denylist.NONE  # what put() refuses; the node sets its DenyList
         try:
             self._load()
         except BaseException:
@@ -356,7 +361,7 @@ class Storage:
 
     def put(self, cid: Cid, block: bytes):
         """Store a block after verifying it (atomic, durable). Raises ValueError if it doesn't match or is too
-        large, even when the block is already stored.
+        large, even when the block is already stored, and Denied if the deny list denies it.
 
         A block stored outside a protection session is cache that no record reaches: the first to go.
         """
@@ -364,6 +369,8 @@ class Storage:
 
     def _put(self, cid: Cid, block: bytes, protected: bool):
         """Store a block; protected if a session already lists it, so it can't be garbage."""
+        if self.deny.denies(cid):
+            raise Denied(f"{cid} is on this node's deny list")
         with self._lock:
             stored = cid in self._sizes
         if stored:
@@ -846,6 +853,58 @@ class Storage:
             elif not all(block in self._sizes for block in result):
                 raise NotFound(f"a block of {cid} was deleted")
         return result
+
+    def collect(self) -> int:
+        """Delete every block nothing reaches (what an add or import refused left behind); how many."""
+        with self._lock:
+            roots = self._roots() | set(self._cache.values())
+            paths = [key for key in self._cache if key[1]]
+        self._warm(roots, paths)
+        with self._lock:
+            deleted, _ = self._collect()
+            return len(deleted)
+
+    def denied_roots(self, roots, denied: frozenset[bytes]) -> set[Cid]:
+        """Those of roots that are, or reach through stored DAG nodes, a block whose binary CID is in denied."""
+        roots = set(roots)
+        if not denied or not roots:
+            return set()
+        self._warm(roots, [])
+        with self._lock:
+            return {root for root in roots
+                    if root.binary in denied or any(cid.binary in denied for cid in self._reach([root]))}
+
+    def drop_denied(self, denied: frozenset[bytes]) -> dict:
+        """Drop every cached fetch whose root, path or target's stored DAG holds a block whose binary CID is in
+        denied, then delete every block nothing reaches, as gc() does for every fetch.
+
+        Returns {"uncached": set[Cid] targets no longer cached, "removed_blocks", "freed_bytes",
+        "incomplete": set[Cid] no longer complete}.
+        """
+        with self._lock:
+            records = dict(self._cache)
+            targets = self._targets()
+        if not denied or not records:
+            return {"uncached": set(), "removed_blocks": 0, "freed_bytes": 0, "incomplete": set()}
+        before = self._complete_sets(targets)
+        self._warm(set(records.values()) | {root for root, _ in records}, [key for key in records if key[1]])
+        with self._lock:
+            before = self._with_memoised(before)
+            dropped = [key for key, target in self._cache.items()
+                       if any(cid.binary in denied
+                              for cid in {key[0], target} | self._path_cids(*key) | self._reach([target]))]
+            uncached = set()
+            for key in dropped:
+                uncached.add(self._cache.pop(key))
+                self._cache_dirty.add(key)
+            uncached -= set(self._cache.values())
+            if dropped:
+                self._cache_generation += 1
+                self._maybe_garbage = True
+            deleted, freed = self._collect() if dropped else (set(), 0)
+            incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
+            return {"uncached": uncached, "removed_blocks": len(deleted), "freed_bytes": freed,
+                    "incomplete": incomplete}
 
     def is_complete(self, cid: Cid) -> bool:
         """True if every block of cid's DAG is stored and the DAG is valid."""

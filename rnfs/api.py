@@ -44,12 +44,13 @@ Security:
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
   health checks and the CLI's proof check below, but without the token it answers only `{"version": ...}`:
   the node and identity hashes, LXMF address and traffic counters need the token like everything else.
-- A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.cli.api_proof>` in its
-  response, which only a server knowing the token can make. Before it first sends the token, the CLI makes
-  whatever listens on the port prove this (with a status request), so another local user listening there
-  while the daemon is down learns neither the token nor a name key being imported.
-- Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, InvalidDag 422,
-  Busy 503, StorageFull 507, other errors 500.
+- A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.apiclient.api_proof>` in its
+  response, which only a server knowing the token can make. Before it first sends the token, a client
+  (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
+  so another local user listening there while the daemon is down learns neither the token nor a name key being
+  imported.
+- Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, Denied 451 (the deny
+  list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500.
 
 Connections (both this API and the gateway, through LocalServer):
 - The request line, headers and any JSON body must arrive within request_timeout of connecting, else the
@@ -73,13 +74,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from rnfs import __version__, fsutil
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
-from rnfs.cli import CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
 from rnfs.config import _HEX_ID  # exactly 32 hex digits, as names.parse_name and identity lists are checked
 from rnfs.content.cid import Cid
-from rnfs.errors import Busy, InvalidDag, NotFound, StorageFull, TooLarge
+from rnfs.errors import Busy, Denied, InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.log import LOG_ERROR, log
 
-API_HEADER = "X-Rnfs-Api"
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
 CHALLENGE = re.compile(r"[0-9a-f]{32}")  # what the CLI sends in X-Rnfs-Challenge
@@ -87,7 +87,7 @@ CHUNK_SIZE_LINE = re.compile(rb"[0-9A-Fa-f]{1,16}")  # a chunk size: hex digits 
 MAX_TRAILER_LINES = 32
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500
-ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (InvalidDag, 422), (Busy, 503),
+ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), (InvalidDag, 422), (Busy, 503),
                   (StorageFull, 507)]
 
 

@@ -126,6 +126,8 @@ class Config:
     lxmf_accept_from: list[str] = field(default_factory=list)  # LXMF addresses (hex); empty: everyone
     lxmf_auto_fetch_from: list[str] = field(default_factory=list)  # senders whose links are fetched and pinned
     lxmf_auto_fetch_quota: int = 1 * GIB  # per sender in lxmf_auto_fetch_from
+    # --- deny lists (rnfs/features/deny.py) ---
+    deny_lists: list[str] = field(default_factory=list)  # deny-list sources: <cid>[/path] or name/<name>[/path]
 
     # Paths
 
@@ -214,6 +216,9 @@ class Config:
         # lxmf
         from rnfs.features import lxmf  # here, like mesh: only needed once settings are checked
         lxmf.validate_settings(self)
+        # deny lists
+        from rnfs.features import deny
+        deny.validate_settings(self)
         for slow_node in (False, True):
             if self.effective_republish_interval(slow_node) >= PROVIDER_TTL / 2:
                 raise ValueError("republish_interval must be less than PROVIDER_TTL / 2")

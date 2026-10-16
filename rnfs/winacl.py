@@ -1,7 +1,7 @@
 """Owner-only access on Windows: an explicit, protected DACL for the rnfs dir and its secret files (audit L7).
 
 POSIX systems get this from mode bits (a 0700 rnfs dir, 0600 key and token files, checked by
-node._make_private_dirs and cli.read_token), and there everything here does nothing. Windows ignores mode bits,
+node._make_private_dirs and apiclient.read_token), and there everything here does nothing. Windows ignores mode bits,
 so a new file just inherits its directory's access list: under the user's profile that is the user,
 Administrators and SYSTEM, but elsewhere (another drive, C:\\ProgramData) it usually lets every local user read
 the API token, the node's identity and the name keys. So on Windows:

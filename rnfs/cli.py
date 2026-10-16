@@ -5,33 +5,27 @@ anything there, so a second daemon on the same rnfs dir stops at once; every oth
 running daemon's local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
 are resolved to absolute paths here, since the daemon reads and writes them itself.
 
-Client commands authenticate with the token the daemon writes to <rnfs dir>/api_token at each start
-(specification section 11), so only users who can read the rnfs directory can use the daemon. They send it
-only once the program on the API port has proved it knows it (api_proof), since while the daemon is down
-any local user could listen there.
+Client commands talk to the daemon through rnfs.apiclient, the library companion apps use too: it reads the token
+the daemon writes to <rnfs dir>/api_token at each start (specification section 11), so only users who can read
+the rnfs directory can use the daemon, and sends it only once the program on the API port has proved it knows it
+(api_proof), since while the daemon is down any local user could listen there. Any error it raises exits with its
+message.
 """
 import argparse
 import errno
-import hashlib
-import hmac
 import http.client
 import json
 import os
-import secrets
 import stat
 import sys
-from urllib.parse import urlencode
 
-from rnfs import __version__, fsutil, winacl
+from rnfs import __version__, apiclient, fsutil
+from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
 from rnfs.config import DEFAULT_API_PORT, Config
 
-DEFAULT_DIR = Config.rnfs_dir
-COPY_SIZE = 64 * 1024
-TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every other command
+DEFAULT_DIR = apiclient.DEFAULT_DIR
+COPY_SIZE = apiclient.COPY_SIZE
 LOCK_FILE = "daemon.lock"  # in the rnfs directory; locked by the daemon using it, so a second one can't start
-# Before sending the token, the CLI makes whatever listens on the API port prove it knows it (api_proof)
-CHALLENGE_HEADER = "X-Rnfs-Challenge"
-PROOF_HEADER = "X-Rnfs-Proof"
 
 
 # text with control characters escaped, so names from other people's DAGs can't drive the terminal
@@ -46,11 +40,6 @@ def warn(message: str):
 def fail(message: str):
     """Exit with status 1 and an error message on stderr."""
     sys.exit(f"rnfs: {printable(message)}")
-
-
-def token_path(rnfs_dir: str) -> str:
-    """Where the daemon using rnfs_dir keeps its API token."""
-    return os.path.join(os.path.expanduser(rnfs_dir), TOKEN_FILE)
 
 
 def write_token(path: str, token: str):
@@ -73,159 +62,72 @@ def remove_token(path: str, token: str):
         pass  # already gone, or unreadable: nothing of ours to clean up
 
 
-def api_proof(token: str, port: int, challenge: str) -> str:
-    """The daemon's answer to a challenge: HMAC-SHA256, keyed by the API token, of the challenge and the port
-    it listens on (so a program on another port can't pass on the daemon's answer)."""
-    return hmac.new(token.encode(), f"rnfs api proof {port} {challenge}".encode(), hashlib.sha256).hexdigest()
-
-
 def read_token(path: str) -> str:
-    """The daemon's API token from path; exits with an explanation if it can't be used."""
+    """The daemon's API token from path (apiclient.read_token); exits with an explanation if it can't be used."""
     try:
-        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | fsutil.O_BINARY)
-    except FileNotFoundError:
-        fail(f"no API token at {path}: is the daemon running, with this --dir?")
-    except PermissionError:
-        fail(f"can't read the API token at {path}: permission denied. Is the daemon running as another user?")
-    except OSError as e:
-        fail(f"can't read the API token at {path}: {e}")
-    with os.fdopen(fd, "rb") as f:
-        mode = stat.S_IMODE(os.fstat(f.fileno()).st_mode)
-        # Windows has no Unix permission bits to check, but an access list (of the very file opened)
-        if not fsutil.IS_WINDOWS and mode & 0o077:
-            fail(f"{path} is accessible to other users (mode {mode:04o}), so its token can't be trusted; "
-                 f"restart the daemon to make a new one")
-        try:
-            reason = winacl.check_private(path, f.fileno())
-        except OSError as e:
-            fail(f"can't check who may read the API token at {path}: {e}")
-        if reason is not None:
-            fail(f"{path} is accessible to other users ({reason}), so its token can't be trusted; "
-                 f"restart the daemon to make a new one")
-        token = f.read(1024).decode("ascii", "replace").strip()
-    if not token:
-        fail(f"the API token file {path} is empty; restart the daemon")
-    return token
+        return apiclient.read_token(path)
+    except apiclient.ApiError as e:
+        fail(str(e))
 
 
-class ApiClient:
-    """Talks to the daemon's API on 127.0.0.1:port, exiting with a friendly message on any error.
+class ApiClient(apiclient.Client):
+    """The library's client for the CLI: talks to the daemon's API on 127.0.0.1:port, exiting with a friendly
+    message on any error.
 
     token_file is read on the first request: every request carries the token but the proof check's status
     request (status without the token says only the daemon's version, for health checks).
     """
 
     def __init__(self, port: int, token_file: str):
-        self.port = port
-        self.token_file = token_file
-        self.token: str | None = None
+        """A client of the daemon on port whose token is in token_file."""
+        super().__init__(port=port, token_file=token_file)
 
-    def request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
-                body=None, length: int | None = None, extra_headers: dict | None = None,
-                authenticated: bool = True) -> http.client.HTTPResponse:
-        """Send a request and return the successful response; exits on errors.
-
-        body may be bytes or a file; a file without length is sent chunked. Unless authenticated is False (the
-        proof check), the token is sent, once the daemon has proved it knows it.
-        """
-        url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
-        # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
-        headers = {"Host": f"127.0.0.1:{self.port}", **(extra_headers or {})}
-        if authenticated:
-            if self.token is None:
-                token = read_token(self.token_file)
-                self.verify_daemon(token)
-                self.token = token
-            headers["X-Rnfs-Api"] = self.token
-        if json_body is not None:
-            body = json.dumps(json_body).encode()
-            headers["Content-Type"] = "application/json"
-        elif body is not None:
-            headers["Content-Type"] = "application/octet-stream"
-            if length is not None:
-                headers["Content-Length"] = str(length)
-        connection = http.client.HTTPConnection("127.0.0.1", self.port)  # no timeout: fetches can take hours
+    def request(self, *args, **kwargs) -> http.client.HTTPResponse:
+        """Client.request (the successful response), exiting on errors."""
         try:
-            connection.request(method, url, body=body, headers=headers)
-            response = connection.getresponse()
-        except ConnectionRefusedError:
-            fail(f"no daemon is running on API port {self.port}. Start one with: rnfs daemon")
-        except (http.client.HTTPException, ConnectionError) as e:
-            fail(f"the daemon dropped the connection ({e!r}); see its log")
-        except OSError as e:
-            fail(f"can't reach the daemon on API port {self.port}: {e}")
-        if response.status >= 400:
-            data = response.read()
-            try:
-                message = json.loads(data)["error"]
-            except (ValueError, KeyError, TypeError):
-                message = f"HTTP {response.status} {response.reason}"
-            fail(message)
-        return response
+            return super().request(*args, **kwargs)
+        except apiclient.ApiError as e:
+            fail(str(e))
 
-    def verify_daemon(self, token: str):
-        """Exit unless whatever listens on the API port proves it knows token, before the token (or a name key)
-        is sent to it: while the daemon is down, any local user could be listening on its port."""
-        challenge = secrets.token_hex(16)
-        response = self.request("GET", "/api/status", extra_headers={CHALLENGE_HEADER: challenge},
-                                authenticated=False)
-        read_all(response)
-        proof = (response.getheader(PROOF_HEADER) or "").strip().encode("ascii", "replace")
-        if not hmac.compare_digest(proof, api_proof(token, self.port, challenge).encode()):
-            fail(f"what listens on API port {self.port} couldn't prove it knows the API token in {self.token_file}, "
-                 f"so nothing was sent to it: it may be another program, or a daemon using another --dir "
-                 f"(or one started before an upgrade: restart it)")
-
-    def call(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
-             body=None, length: int | None = None, authenticated: bool = True):
-        """Send a request and return its decoded JSON response."""
-        response = self.request(method, path, params, json_body, body, length, authenticated=authenticated)
+    def call(self, *args, **kwargs):
+        """Client.call (the decoded JSON response), exiting on errors."""
         try:
-            return json.loads(read_all(response))
-        except ValueError:
-            fail("the daemon sent an invalid response")
-
-    def get(self, path: str, /, **params):
-        """GET path with query parameters; JSON response."""
-        return self.call("GET", path, params=params)
-
-    def post(self, path: str, /, **fields):
-        """POST path with a JSON body; JSON response."""
-        return self.call("POST", path, json_body=fields)
+            return super().call(*args, **kwargs)
+        except apiclient.ApiError as e:
+            fail(str(e))
 
 
 def read_all(response: http.client.HTTPResponse) -> bytes:
     """A response's whole body, failing if it is shorter than its Content-Length (the daemon hit an error)."""
     try:
-        data = response.read()
-    except http.client.IncompleteRead:
-        fail("the response was cut short; see the daemon's log")
-    return data
+        return apiclient.read_all(response)
+    except apiclient.ApiError as e:
+        fail(str(e))
 
 
-def copy_response(response: http.client.HTTPResponse, out, progress=None):
-    """Copy a response body to out, failing if it ends before its Content-Length.
+def copy_response(stream: apiclient.Stream, out, progress=None):
+    """Copy a streamed response body to out, failing if it ends before its Content-Length.
 
     progress (jobs.StreamProgress) is called with the bytes copied so far and Content-Length, and closed at the end.
     """
-    expected = response.getheader("Content-Length")
-    copied = 0
+    expected = stream.response.getheader("Content-Length")
+    error = None
     while True:
         try:
-            chunk = response.read(COPY_SIZE)
-        except http.client.IncompleteRead:
-            chunk = b""
+            chunk = stream.read(COPY_SIZE)
+        except apiclient.ApiError as e:
+            error = e
+            break
         if not chunk:
             break
         out.write(chunk)
-        copied += len(chunk)
         if progress is not None:
-            progress(copied, expected)
+            progress(stream.received, expected)
     if progress is not None:
         progress.close()
     out.flush()
-    if expected is not None and copied != int(expected):
-        fail(f"the transfer stopped after {copied} of {expected} bytes; see the daemon's log")
+    if error is not None:
+        fail(str(error))
 
 
 def client(args) -> ApiClient:
@@ -233,9 +135,9 @@ def client(args) -> ApiClient:
     port = args.api_port
     if port is None:
         try:
-            port = Config.load(args.dir).api_port
-        except (ValueError, TypeError, OSError) as e:  # TypeError: a badly typed setting validate() missed
-            fail(f"can't read the settings in {args.dir}: {e}")
+            port = apiclient.api_port(args.dir)
+        except apiclient.ApiError as e:
+            fail(str(e))
     return ApiClient(port if port is not None else DEFAULT_API_PORT, token_path(args.dir))
 
 
@@ -500,16 +402,14 @@ def run_get(args):
 
 def run_cat(args):
     """Write a file, or part of one, to stdout."""
-    response = client(args).request("GET", "/api/cat", params={"target": args.target, "offset": args.offset,
-                                                                "length": args.length,
-                                                                "raw": 1 if getattr(args, "raw", False) else None,
-                                                                "block": 1 if getattr(args, "block", False) else None})
+    stream = client(args).cat(args.target, offset=args.offset, length=args.length, raw=getattr(args, "raw", False),
+                              block=getattr(args, "block", False))
     progress = None
     if sys.stderr.isatty() and not sys.stdout.isatty():  # into a file or pipe, watched from a terminal
         from rnfs.features import jobs
         progress = jobs.StreamProgress(sys.stderr)
     try:
-        copy_response(response, sys.stdout.buffer, progress)
+        copy_response(stream, sys.stdout.buffer, progress)
     except OSError as e:
         # Windows reports a pipe whose reader has gone as EINVAL rather than EPIPE
         if not (isinstance(e, BrokenPipeError) or (fsutil.IS_WINDOWS and e.errno == errno.EINVAL)):
@@ -521,7 +421,7 @@ def run_cat(args):
 
 def run_ls(args):
     """List a directory: kind, size, CID and name (last, since names can contain spaces)."""
-    for entry in client(args).get("/api/ls", target=args.target)["entries"]:
+    for entry in client(args).ls(args.target):
         name = printable(entry["name"]) + ("/" if entry["kind"] == "directory" else "")
         print(f"{printable(entry['kind']):<10} {printable(entry['size']):>12} {printable(entry['cid'])} {name}")
 
@@ -536,7 +436,7 @@ def print_fields(result: dict):
 
 def run_stat(args):
     """Print a target's size, block count and local holdings."""
-    print_fields(client(args).get("/api/stat", target=args.target))
+    print_fields(client(args).stat(args.target))
 
 
 def run_dir_set(args):
@@ -564,7 +464,7 @@ def run_pin_add(args):
 
 def run_pin_rm(args):
     """Remove the user pin of a CID."""
-    client(args).post("/api/pin/rm", cid=args.cid)
+    client(args).pin_rm(args.cid)
 
 
 def display_name(name: str) -> str:
@@ -577,7 +477,7 @@ def display_name(name: str) -> str:
 
 def run_pin_ls(args):
     """List pins with their sources and, when known, where each came from (or what it holds)."""
-    pins = client(args).get("/api/pin/ls", cid=args.cid)["pins"]
+    pins = client(args).pin_ls(args.cid)
     if args.json:
         print(json.dumps(pins, indent=2))
         return
@@ -639,7 +539,7 @@ def run_ping(args):
 
 def run_name_create(args):
     """Create a name key; print the name."""
-    print(printable(client(args).post("/api/name/create", alias=args.alias)["name"]))
+    print(printable(client(args).name_create(args.alias)["name"]))
 
 
 def run_name_rm(args):
@@ -683,20 +583,20 @@ def run_name_import(args):
 
 def run_name_list(args):
     """List this node's names: alias, name, CID and sequence."""
-    for entry in client(args).get("/api/name/list")["names"]:
+    for entry in client(args).name_list():
         print("\t".join(printable(value) for value in (entry["alias"], entry["name"], entry.get("cid") or "-",
                                                           entry.get("sequence", 0))))
 
 
 def run_name_publish(args):
     """Point a name at a target."""
-    result = client(args).post("/api/name/publish", alias=args.alias, target=args.target)
+    result = client(args).name_publish(args.alias, args.target)
     print(printable(f"published {result['cid']} as {result['name']} (sequence {result['sequence']})"))
 
 
 def run_name_resolve(args):
     """Print the CID a name points at."""
-    print(printable(client(args).get("/api/name/resolve", name=args.name)["cid"]))
+    print(printable(client(args).name_resolve(args.name)["cid"]))
 
 
 # Archives and status
@@ -732,7 +632,7 @@ def run_status(args):
         print_fields(api.call("GET", "/api/status", authenticated=False))
         warn(f"no readable API token at {api.token_file}: the daemon only says its version without it")
         return
-    print_fields(api.get("/api/status"))
+    print_fields(api.status())
 
 
 # Parser

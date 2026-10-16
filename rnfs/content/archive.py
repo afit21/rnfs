@@ -5,7 +5,7 @@ An archive is a msgpack stream: ["rnfs-archive", 1, [root CID, ...]], then [cid,
 every root's DAG, depth-first from each root, each block once. CIDs are binary.
 """
 import struct
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from RNS.vendor import umsgpack
 
@@ -170,7 +170,8 @@ def read_archive(stream: BinaryIO):
     return roots, records()
 
 
-def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = USER) -> dict:
+def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = USER,
+                   check: Callable[[list[Cid]], None] | None = None) -> dict:
     """Import an archive into storage, verifying every block, and pin each root it supplies with pin_source.
 
     A root is supplied, and pinned, only if every block of its DAG was in this archive and matched its CID; a
@@ -180,6 +181,8 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
     count, "bad": count of blocks that didn't match their CID (skipped)}. Raises ValueError for a stream that
     isn't an archive or lists more than MAX_ROOTS roots, StorageFull for a block that would leave less than the
     disk reserve free (Storage.check_disk); blocks read before a malformed record or a full disk are kept as cache.
+    Raises Denied for a block the deny list denies (storage.put), and whatever check(complete roots) raises: it
+    runs before they are pinned (the deny list's file hashes), and nothing is pinned then.
     """
     roots, records = read_archive(stream)
     # Every verified CID in the archive; no larger than the storage's own index of the same blocks
@@ -211,6 +214,8 @@ def import_archive(stream: BinaryIO, storage: Storage, pin_source: str | None = 
             else:
                 incomplete.append(root)
                 held.add(root)
+        if check is not None:
+            check(complete)
         if pin_source is not None:
             storage.pin_many(complete, pin_source)  # still protected; the pins are saved once for them all
     if bad:

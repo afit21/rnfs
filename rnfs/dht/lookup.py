@@ -6,6 +6,11 @@ and merges the nodes each reply returns. It is complete once the `beta` closest 
 answered, or once every known node has been queried without finding new ones; it never runs past its
 `lookup_timeout` budget. Queries are blocking calls run on worker threads, so a slow or hung node never
 holds the caller past the deadline.
+
+Nodes whose recent queries all failed (the routing table's `unreliable`) rank after every other node, so a
+lookup asks and waits for them only when it has too few others. One whose retry is due (`may_retry`) is asked
+again on top of the `alpha` queries if it would otherwise rank among the closest, and nothing waits for that
+answer: a node that never establishes a link costs a lookup no time, yet one that comes back is found.
 """
 import queue
 import threading
@@ -65,6 +70,8 @@ class Lookup:
     - `timeout`: the time budget, starting at the first run; later runs share it.
     - `report(text)`: told each run's start and end, and each query's outcome (the node logs them at
       LOG_DEBUG, for the debug log); called from the running thread and the query threads.
+    - `unreliable(id)`: nodes to avoid, checked when a run learns of them; `may_retry(id)`: True if an
+      unreliable node is due to be asked again, claiming that retry (both the routing table's).
 
     A Lookup may be run again (find_providers after every provider failed): each run re-queries the nodes,
     so /find replies give a fresh random half of providers, within the same deadline and unknown-ID budget.
@@ -76,7 +83,8 @@ class Lookup:
                  is_known: Callable[[bytes], bool] = _always, on_answer: NodeCallback = _ignore,
                  on_failure: NodeCallback = _ignore, exclude: Callable[[bytes], bool] = _never,
                  clock: Callable[[], float] = time.monotonic, poll_interval: float = _POLL_INTERVAL,
-                 report: Callable[[str], None] = _quiet):
+                 report: Callable[[str], None] = _quiet, unreliable: Callable[[bytes], bool] = _never,
+                 may_retry: Callable[[bytes], bool] = _never):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -92,6 +100,8 @@ class Lookup:
         self.clock = clock
         self.poll_interval = poll_interval
         self.report = report
+        self.unreliable = unreliable
+        self.may_retry = may_retry
         self.deadline: float | None = None
         self._failed: set[bytes] = set()  # didn't answer: dropped for the rest of the lookup
         self._answered: set[bytes] = set()  # answered in any run
@@ -102,6 +112,7 @@ class Lookup:
         self._listed_by: dict[bytes, set[bytes]] = {}  # provider -> nodes whose reply listed it, in any run
         self._last_known: dict[bytes, int] = {}  # the nodes the last run knew of and hadn't seen fail
         self._last_queried: set[bytes] = set()  # the nodes the last run queried
+        self._last_doubtful: set[bytes] = set()  # the nodes the last run knew of as unreliable and not answered
         self._wake: queue.Queue | None = None
         self._lock = threading.Lock()
         self._start_nodes = [n for n in dict.fromkeys(start_nodes) if self._usable(n)]
@@ -114,12 +125,14 @@ class Lookup:
         As the spec says, these are the closest nodes known, not only those that answered: termination
         guarantees just the beta closest answered, and the stores sent to the rest show which are
         reachable. Left out: nodes that failed or were still not answering at the deadline, and
-        unqueried IDs whose identity isn't known (contacting them costs a path request).
+        unqueried IDs whose identity isn't known (contacting them costs a path request). Unreliable nodes
+        come after every other, so stores are sent to them only to make up k.
         """
         self._run(None, lambda: False)
         candidates = [n for n in self._last_known
                       if n in self._answered or (n not in self._last_queried and self.is_known(n))]
-        return sorted(candidates, key=self._distance)[:self.k]
+        doubtful = self._last_doubtful
+        return sorted(candidates, key=lambda n: (n in doubtful, self._distance(n)))[:self.k]
 
     def find_providers(self, on_provider: NodeCallback, should_stop: Callable[[], bool] = lambda: False
                        ) -> list[bytes]:
@@ -215,13 +228,24 @@ class Lookup:
         for node_id in list(self._start_nodes) + self.closest_answered():
             if self._usable(node_id):
                 known[node_id] = self._distance(node_id)
+        # Known nodes that were unreliable when found and haven't answered: ranked after every other
+        doubtful = {node_id for node_id in known if self.unreliable(node_id)}
         queried: set[bytes] = set()
         answered: set[bytes] = set()
+        retrying: set[bytes] = set()  # unreliable nodes asked again on top of alpha, which nothing waits for
+        passed: set[bytes] = set()  # unreliable nodes whose retry wasn't due (or needs a path request)
         found: list[bytes] = []
         in_flight = 0
+        retried = 0
         window = max(self.alpha, self.beta)
         self._last_known = known  # live: find_closest reads them once the run ends
         self._last_queried = queried
+        self._last_doubtful = doubtful
+
+        def rank(node_id: bytes) -> tuple[bool, int]:
+            """Sort key: reliable nodes (and those that answered) first, then by distance."""
+            return node_id in doubtful, known[node_id]
+
         started = self.clock()
         why = "stopped"
 
@@ -232,16 +256,20 @@ class Lookup:
             if self.clock() >= self.deadline:
                 why = "out of time"
                 break
-            ranked = sorted(known, key=known.__getitem__)
+            ranked = sorted(known, key=rank)
             if ranked and all(node_id in answered for node_id in ranked[:self.beta]):
                 why = "complete"
                 break  # the beta closest known nodes have all answered: complete
+            for node_id in ranked[:window]:
+                if node_id in retrying:  # a retry the lookup now needs: waited for like any query
+                    retrying.discard(node_id)
+                    in_flight += 1
 
             # Keep up to alpha queries in flight, to the closest nodes not yet queried. Only nodes ranked
             # within the closest max(alpha, beta) known can affect completion, so farther ones aren't
             # queried while nearer queries are pending: on slow networks every query costs airtime.
             while in_flight < self.alpha:
-                ranked = sorted(known, key=known.__getitem__)[:window]
+                ranked = sorted(known, key=rank)[:window]
                 node_id = next((n for n in ranked if n not in queried), None)
                 if node_id is None:
                     break
@@ -251,6 +279,18 @@ class Lookup:
                     continue
                 self._send(node_id, results)
                 in_flight += 1
+            # An unreliable node that distance alone would rank among them is asked again once its retry is
+            # due: only an answer shows it is back. On top of alpha, since nothing waits for it
+            for node_id in sorted(known, key=known.__getitem__)[:window]:
+                if node_id not in doubtful or node_id in queried or node_id in passed:
+                    continue
+                if self.is_known(node_id) and self.may_retry(node_id):
+                    queried.add(node_id)
+                    retrying.add(node_id)
+                    retried += 1
+                    self._send(node_id, results)
+                else:
+                    passed.add(node_id)
             if in_flight == 0:
                 why = "no node left to ask"
                 break  # every known node was queried and nothing new turned up
@@ -265,8 +305,11 @@ class Lookup:
                 continue
             if item is _STOP:
                 continue
-            in_flight -= 1
             node_id, reply = item
+            if node_id in retrying:
+                retrying.discard(node_id)
+            else:
+                in_flight -= 1
             if reply is None:
                 with self._lock:
                     self._failed.add(node_id)
@@ -274,6 +317,7 @@ class Lookup:
                 continue
 
             answered.add(node_id)
+            doubtful.discard(node_id)
             with self._lock:
                 self._answered.add(node_id)
             providers, nodes = reply
@@ -285,6 +329,8 @@ class Lookup:
             for new_id in nodes:
                 if new_id not in known and new_id not in queried and self._usable(new_id):
                     known[new_id] = self._distance(new_id)
+                    if self.unreliable(new_id):
+                        doubtful.add(new_id)
             if on_provider is not None:
                 for provider in providers:
                     if provider in self._reported or provider == self.own_id or self.exclude(provider):
@@ -295,6 +341,7 @@ class Lookup:
         failed = len(queried & self._failed)
         self.report(f"lookup for {self.key.hex()}: {why} after {self.clock() - started:.1f}s; asked {len(queried)}, "
                     f"{len(answered)} answered, {failed} failed, {in_flight} still out"
+                    + (f", retried {retried} unreliable ({len(retrying)} still out)" if retried else "")
                     + (f"; {len(found)} new providers" if on_provider is not None else ""))
         return found
 

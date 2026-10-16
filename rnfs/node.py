@@ -12,6 +12,7 @@ maintenance (shared-folder scans, provider record expiry and saves, max_storage 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
 """
+import hashlib
 import os
 import random
 import secrets
@@ -20,11 +21,11 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Callable, Iterator
 
 import RNS
 
-from rnfs import __version__, features, fsutil, statedb, winacl
+from rnfs import __version__, denylist, features, fsutil, statedb, winacl
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, seal, walker
@@ -32,11 +33,11 @@ from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content import chunker as content_chunker
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, USER, Storage, disk_reserve, remote_source
+from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_reserve, remote_source
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
-from rnfs.errors import InvalidDag, NotFound, RnfsError, TooLarge
+from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, describe
 from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
@@ -60,6 +61,7 @@ REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetche
 BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many have answered
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
+DENY_RETRY = 60.0  # seconds before maintenance applies a deny-list change again after applying it failed
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
 
@@ -236,8 +238,9 @@ class NodeBackend:
         return self.node.records.provide(publisher_id, keys, withdrawn) == len(keys)
 
     def served_block(self, cid: Cid) -> bytes | None:
-        """cid's block if it's in the DAG of a provided CID, re-checked so a damaged block isn't sent."""
-        if not self.node.publisher.serves(cid):
+        """cid's block if it's in the DAG of a provided CID, re-checked so a damaged block isn't sent. None for a
+        denied one, as for any block not held: the answer's format is unchanged."""
+        if self.node.deny.denies(cid) or not self.node.publisher.serves(cid):
             return None
         block = self.node.storage.get(cid, verify=True)
         if block is None:
@@ -247,7 +250,7 @@ class NodeBackend:
 
     def served_block_size(self, cid: Cid) -> int | None:
         """The stored length of the block served_block(cid) would return, or None if it isn't served."""
-        if not self.node.publisher.serves(cid):
+        if self.node.deny.denies(cid) or not self.node.publisher.serves(cid):
             return None
         return self.node.storage.block_size(cid)
 
@@ -356,6 +359,10 @@ class RnfsNode:
             if removed:
                 log(f"private mode: dropped {plural(removed, 'provider record')} of non-members", LOG_NOTICE)
         self.storage = Storage(config.blocks_dir, config.state_dir, config.max_storage)
+        # Before anything is fetched or provided: the fetcher and the publisher check it through storage.deny
+        self.deny = denylist.DenyList(config.state_dir)
+        self.storage.deny = self.deny
+        self.deny.reload(self._read_deny_list)
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
         self.fetcher = Fetcher(self.storage, client, config, node_id, self.routing, self._lookup, slow,
@@ -384,6 +391,10 @@ class RnfsNode:
         self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
         self._remote_pins_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._refresh_wanted = threading.Event()
+        # Taken first (before the publisher's and storage's locks): one deny-list change applied at a time
+        self._deny_lock = threading.Lock()
+        self._deny_applied: frozenset[bytes] | None = None  # the denied CIDs _apply_deny last applied
+        self._deny_retry_at = 0.0  # monotonic time before which maintenance doesn't retry a failed _apply_deny
         self.stop_event = threading.Event()
         self.joined = threading.Event()
         self.threads: list[threading.Thread] = []
@@ -397,6 +408,8 @@ class RnfsNode:
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
         self.publisher.refresh()
+        # Changes apply at once; what the list denied at start, maintenance applies first
+        self.deny.add_listener(self._apply_deny)
 
     def feature(self, name: str) -> "features.Feature":
         """The feature called name (rnfs.features). Raises KeyError if it isn't loaded."""
@@ -451,7 +464,7 @@ class RnfsNode:
     def _close_state(self):
         """Release every store's reference to the state database, once everything is saved; the last closes it.
         After a _setup that failed, only the stores it made."""
-        names = ("records", "storage", "shared_folder", "pin_names", "fetcher", "publisher", "names")
+        names = ("records", "storage", "deny", "shared_folder", "pin_names", "fetcher", "publisher", "names")
         stores = [getattr(self, name) for name in names if hasattr(self, name)]
         for store in (*stores, *getattr(self, "features", {}).values(), getattr(self, "_db", None)):
             if store is None:
@@ -477,20 +490,23 @@ class RnfsNode:
         """A lookup for key starting from the routing table, counting answers and failures in it.
 
         It starts from the closest nodes that haven't failed since last heard or gone silent (those a /find
-        reply would give), with others only to make up K, so departed nodes don't take its first queries.
+        reply would give), with others only to make up K, so departed nodes don't take its first queries;
+        unreliable ones (queries failing however often they announce) only if still short of K.
         """
-        start = self.routing.closest(key, for_reply=True)
-        if len(start) < K:
-            start += [n for n in self.routing.closest(key) if n not in start][:K - len(start)]
+        fresh = self.routing.closest(key, 2 * K, for_reply=True)
+        nearest = fresh + [n for n in self.routing.closest(key, 2 * K) if n not in fresh]
+        reliable = [n for n in nearest if not self.routing.unreliable(n)]
+        start = (reliable + [n for n in nearest if n not in reliable])[:K]
         return Lookup(key, start, self.client.find, self.node_id,
                       alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
                       timeout=self.config.lookup_timeout, is_known=self._is_known,
                       on_answer=self._answered, on_failure=self.routing.failed, exclude=self.routing.is_banned,
-                      report=lambda text: log(text, LOG_DEBUG))
+                      report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
+                      may_retry=self.routing.may_retry)
 
     def _answered(self, node_id: bytes):
         """A node answered /find, proving it is a reachable server."""
-        if self.routing.heard(node_id):
+        if self.routing.answered(node_id):
             self.publisher.wake()  # a CID that found no nodes may now be publishable
 
     def _heard_server(self, node_id: bytes):
@@ -583,7 +599,8 @@ class RnfsNode:
                         timeout=self.config.lookup_timeout, is_known=self._is_known,
                         on_answer=self._answered, on_failure=self.routing.failed,
                         exclude=lambda node_id: node_id in contacted or self.routing.is_banned(node_id),
-                        report=lambda text: log(text, LOG_DEBUG))
+                        report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
+                        may_retry=self.routing.may_retry)
         lookup.find_closest()
         log(f"joined the DHT: {plural(self.routing.node_count(), 'server')} known", LOG_NOTICE)
 
@@ -653,7 +670,8 @@ class RnfsNode:
         if now - last.get("scan", float("-inf")) >= self.config.scan_interval:
             last["scan"] = now
             try:
-                self.shared_folder.scan()
+                with builder.checking(self._hash_check()):
+                    self.shared_folder.scan()
                 self.publisher.refresh()
             except Exception as e:
                 log(f"shared folder scan failed: {e!r}", LOG_ERROR)
@@ -672,7 +690,95 @@ class RnfsNode:
         if self._refresh_wanted.is_set():
             self._refresh_wanted.clear()
             self.publisher.refresh()
+        if self.deny.cids is not self._deny_applied and time.monotonic() >= self._deny_retry_at:
+            self._apply_deny()
         self._save_remote_pins()
+
+    # Deny list (rnfs/denylist.py; its sources: rnfs/features/deny.py)
+
+    def _read_deny_list(self, cid: Cid) -> bytes | None:
+        """A deny list's bytes from storage (None if it isn't wholly stored). Raises ValueError for one over
+        denylist.MAX_LIST_BYTES, or that is a directory."""
+        if not self.storage.is_complete(cid):
+            return None
+        expect = walker.root_expect(cid)
+        get = self.storage.getter()
+        if walker.size_of(expect, get(expect)) > denylist.MAX_LIST_BYTES:
+            raise ValueError(f"it is over {denylist.MAX_LIST_BYTES // 1024} KiB")
+        return b"".join(walker.read_range(expect, get))
+
+    def _hash_check(self):
+        """What builder.checking takes for an add or import: raises Denied for a file whose content hash is
+        denied; None while the deny list has no file hashes (so nothing is hashed)."""
+        if not self.deny.hashes:
+            return None
+
+        def check(digest: bytes):
+            """Raise Denied if a file with this content hash is denied."""
+            if self.deny.denies_hash(digest):
+                raise Denied(f"a file with SHA-256 {digest.hex()} is on this node's deny list")
+        return check
+
+    def _check_file(self, expect: walker.Expect, read: Callable[[walker.Expect], Iterator[bytes]]):
+        """Raise Denied if file expect's content hashes to a deny-list entry, before any of it is written out or
+        sent. read(expect) gives its bytes, read only if the hash isn't known yet (a one-block file's CID is
+        it; others are remembered by the deny list)."""
+        if not self.deny.hashes:
+            return
+        digest = expect.cid.digest if expect.cid.is_raw else self.deny.known_hash(expect.cid)
+        if digest is None:
+            hasher = hashlib.sha256()
+            for data in read(expect):
+                hasher.update(data)
+            digest = hasher.digest()
+            self.deny.remember_hash(expect.cid, digest)
+        if self.deny.denies_hash(digest):
+            raise Denied(f"{expect.cid} is a file whose SHA-256 ({digest.hex()}) is on this node's deny list")
+
+    def _apply_deny(self):
+        """Bring what is provided, cached and pinned in line with the deny list's CIDs, after a change and at
+        start: stop providing (and withdraw) what reaches a denied block; drop cached fetches that do, deleting
+        what nothing else reaches; release remote pins that do, which are held for others. Other pins are the
+        user's: kept, but never served, provided or read while denied, with a warning naming each."""
+        with self._deny_lock:
+            denied = self.deny.cids
+            if denied is self._deny_applied:
+                return
+            try:
+                self._apply_denied(denied)
+            except BaseException:
+                self._deny_retry_at = time.monotonic() + DENY_RETRY  # maintenance tries again (logged by the caller)
+                raise
+            self._deny_applied = denied
+
+    def _apply_denied(self, denied: frozenset[bytes]):
+        """_apply_deny's work, for the denied binary CIDs. Lock held."""
+        self.publisher.refresh()
+        if denied:
+            dropped = self.storage.drop_denied(denied)
+            if dropped["uncached"]:
+                log(f"deny list: dropped {plural(len(dropped['uncached']), 'cached fetch')} holding denied content, "
+                    f"deleting {plural(dropped['removed_blocks'], 'block')} ({size(dropped['freed_bytes'])})",
+                    LOG_WARNING)
+                self._prune_fetched()
+            pins = self.storage.pins()
+            released = False
+            for cid in sorted(self.storage.denied_roots(pins, denied)):
+                for source in sorted(source for source in pins[cid] if source.startswith(REMOTE_PREFIX)):
+                    if self.storage.unpin(cid, source):
+                        released = True
+                        log(f"deny list: released the remote pin of {cid} for {source}: it holds denied content",
+                            LOG_WARNING)
+                kept = sorted(source for source in pins[cid] if not source.startswith(REMOTE_PREFIX))
+                if kept:
+                    log(f"deny list: pin {cid} ({', '.join(kept)}) holds denied content: it stays stored, but isn't "
+                        f"served, provided or read. Remove the pin (rnfs pin rm, or what made it) to delete it",
+                        LOG_WARNING)
+            if released:
+                removed = self.storage.collect()
+                if removed:
+                    log(f"deny list: deleted {plural(removed, 'block')} only released remote pins held", LOG_WARNING)
+            self.publisher.refresh()
 
     def _maintenance_loop(self):
         """Run maintain() about once a second until stopped."""
@@ -789,7 +895,7 @@ class RnfsNode:
             if only_hash:
                 built, warnings = builder.add_path(path, builder.NO_PUT, wrap)
             else:
-                with self.storage.protect() as session:
+                with self._refusing(), self.storage.protect() as session:
                     with session.writer() as put:
                         if recipients:
                             built = node_content.add_sealed_path(path, put, wrap, recipients, seal_name)
@@ -813,7 +919,7 @@ class RnfsNode:
             if only_hash:
                 built = builder.add_stream(stream, builder.NO_PUT, size, name)
             else:
-                with self.storage.protect() as session:
+                with self._refusing(), self.storage.protect() as session:
                     with session.writer() as put:
                         built = builder.add_stream(stream, put, size, name)
                     node_content.keep_added(self, built.cid, pin)
@@ -830,6 +936,17 @@ class RnfsNode:
         """Fetch the target's DAG, then write its archive to start(exact length), the stream to write to (None
         writes nothing: HEAD). The gateway's ?format=archive (rnfs/node_content.py)."""
         return node_content.export_stream(self, target, start, for_gateway)
+
+    @contextmanager
+    def _refusing(self) -> Iterator[None]:
+        """Around an add or import: files whose content hash is denied stop it (builder.checking), and when the
+        deny list stops it, the blocks it stored are deleted once nothing reaches them."""
+        try:
+            with builder.checking(self._hash_check()):
+                yield
+        except Denied:
+            self.storage.collect()
+            raise
 
     def _added(self, built: builder.Built):
         """After adding: log, provide it, and enforce max_storage."""
@@ -868,11 +985,15 @@ class RnfsNode:
                 _check_free_space(output, content, self.config.blocks_dir, to_fetch)
                 sealed = None if raw else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:  # decrypted as it is fetched (rnfs/content/seal.py)
+                    self._check_file(expect, fetch.read_range)  # its stored (sealed) bytes, as others hold them
                     written = node_content.write_sealed(sealed, partial, self.config.blocks_dir, to_fetch)
                     result = {"cid": str(expect.cid), "warnings": [], **written}
                 else:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
-                    warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries)
+                    # Each file is checked before it is written while the deny list has file hashes
+                    check = {"check": lambda file: self._check_file(file, lambda e: walker.read_range(e, fetch.get))
+                             } if self.deny.hashes else {}
+                    warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries, **check)
                     # Every skipped entry is a warning: keep a response (and a job's saved result) small
                     result = {"cid": str(expect.cid), **cap_warnings(warnings)}
             fsutil.rename_new(partial, output)
@@ -907,6 +1028,9 @@ class RnfsNode:
             """Fetch and yield, window by window; closing it ends the fetch."""
             with self._fetching(root, names, from_node, for_gateway) as fetch:
                 expect = fetch.resolve()
+                if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == "file":
+                    # The whole file is fetched and hashed (once: then remembered) before any of it is sent
+                    self._check_file(expect, fetch.read_range)
                 sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:
                     yield from sealed.read(offset, length)
@@ -1073,6 +1197,9 @@ class RnfsNode:
                 log(f"released remote pin of {cid} for {source}", LOG_NOTICE)
                 self.publisher.refresh()
             return True
+        if self.deny.denies(cid):
+            log(f"refused remote pin of {cid} for {source}: it is on this node's deny list", LOG_WARNING)
+            return False
         with self._lock:
             reserved = self._remote_reserved.setdefault(source, {})
             if cid in reserved:
@@ -1360,8 +1487,16 @@ class RnfsNode:
             stream = open(path, "rb")
         except FileNotFoundError:
             raise NotFound(f"no such file: {path}") from None
-        with stream:
-            stats = archive.import_archive(stream, self.storage)
+        def check(roots: list[Cid]):
+            """Refuse the import if a file the roots hold has a denied content hash."""
+            if self.deny.hashes:
+                get = self.storage.getter()
+                for root in roots:
+                    for file in walker.iter_files(walker.root_expect(root), get):
+                        self._check_file(file, lambda e: walker.read_range(e, get))
+
+        with stream, self._refusing():
+            stats = archive.import_archive(stream, self.storage, check=check)
         for root in stats.get("complete", []):
             self.pin_names.record_if_unknown(root, f"archive {os.path.abspath(path)}")
         self.publisher.refresh()

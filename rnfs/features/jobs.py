@@ -535,13 +535,15 @@ class JobsFeature(Feature):
     def _fetch_to(self, job: Job, path: str) -> dict:
         """node.get of the job's target to path: from its from node, then (fallback_dht) by DHT discovery."""
         from rnfs import fetcher
-        from rnfs.errors import RnfsError, StorageFull, TooLarge
+        from rnfs.errors import Denied, RnfsError, StorageFull, TooLarge
         from_node = bytes.fromhex(job.from_node) if job.from_node else None
         try:
             return self.node.get(job.target, path, from_node=from_node)
         except RnfsError as e:
-            # Cancelled must stop the job; the content's size and the node's storage don't depend on the source
-            if from_node is None or not job.fallback_dht or isinstance(e, (fetcher.Cancelled, TooLarge, StorageFull)):
+            # Cancelled must stop the job; the content's size, the node's storage and its deny list don't depend
+            # on the source
+            if from_node is None or not job.fallback_dht or isinstance(e, (fetcher.Cancelled, TooLarge, StorageFull,
+                                                                           Denied)):
                 raise
             _log(f"job {job.id}: getting {job.target} from {job.from_node} failed ({e}); trying the DHT",
                  LOG_NOTICE)

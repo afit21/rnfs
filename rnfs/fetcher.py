@@ -49,7 +49,9 @@ fetch: one
 that isn't being pinned evicts other cached fetches to make room for each response, and goes over
 max_storage if nothing is evictable (the node evicts again once it ends). What refuses a fetch, pinned or
 not, with StorageFull is the disk: its remaining size, and then each response, must leave the disk reserve
-free (Storage.check_disk).
+free (Storage.check_disk). A CID the deny list denies (rnfs.denylist; the storage's) ends a fetch with Denied
+where it is met, root or child, stored or not, before it is asked for or read; a complete stored DAG is checked
+whole, since fetch_dag doesn't walk it.
 
 Requests are spread over up to max_parallel_providers providers (1 on slow nodes), one /blocks request in
 flight per provider. Request threads only call the client; all fetch state is changed by the thread that
@@ -74,7 +76,7 @@ from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
 from rnfs.content.walker import Expect
-from rnfs.errors import InvalidDag, NotFound, RnfsError, TooLarge
+from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 from rnfs.network import client as peer_client
 from rnfs.network import protocol, rates
@@ -300,12 +302,20 @@ class Fetcher:
 
         Raises InvalidDag if root was found invalid before. Its traversals raise StorageFull if what they
         would store doesn't fit on the disk (never because of max_storage).
+        Raises Denied if the deny list denies root; its traversals raise Denied at the first denied CID they meet,
+        stored or not, before fetching or reading it.
         """
         if self.is_invalid(root):
             error = InvalidDag(f"{root} was found to be an invalid DAG")
             error.root = root
             raise error
+        self.check_denied(root)
         return Fetch(self, root, list(names), from_node, pinned)
+
+    def check_denied(self, cid: Cid):
+        """Raise Denied if the deny list (the storage's) denies cid."""
+        if self.storage.deny.denies(cid):
+            raise Denied(f"{cid} is on this node's deny list")
 
     def is_invalid(self, root: Cid) -> bool:
         """True if root was marked invalid locally."""
@@ -506,8 +516,12 @@ class Fetch:
             self._declared = (self._declared or 0) + size
             if self.observer is not None:
                 self.observer.total(size)
-            # The root's own DAG, already complete, was checked from the same expectation when it was memoised
+            # The root's own DAG, already complete, was checked from the same expectation when it was memoised;
+            # its blocks aren't met again, so the deny list is checked against them here
             if target == walker.root_expect(self.root) and self.storage.is_complete(target.cid):
+                denied = self.storage.deny.cids
+                if denied and any(cid.binary in denied for cid in self.storage.dag_blocks(target.cid)):
+                    raise Denied(f"{target.cid} holds a block on this node's deny list")
                 return
             # What is stored already needn't fit again (its DAG nodes make this an estimate)
             self.check_disk(target, size - self.storage.dag_bytes(target.cid))
@@ -651,6 +665,7 @@ class Fetch:
         children: dict[Expect, list[Expect]] = {}
         wanted: dict[Cid, list[Expect]] = {}
         for expect in dict.fromkeys(expects):
+            self.fetcher.check_denied(expect.cid)  # before fetching or reading it, stored or not
             walker.check_cid(expect)  # before fetching a block that can't be right
             checked = self._check_stored(expect)
             if checked is None:

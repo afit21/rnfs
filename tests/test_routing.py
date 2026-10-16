@@ -5,7 +5,8 @@ import unittest
 
 from rnfs.config import Config
 from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
-from rnfs.dht.routing import RoutingTable, distance
+from rnfs.dht import routing
+from rnfs.dht.routing import AVOID_AFTER, AVOID_MAX, RoutingTable, distance
 from tests.support import FakeClock
 
 OWN_ID = bytes(ID_LENGTH)
@@ -252,6 +253,92 @@ class ReplyFilterTest(RoutingTestCase):
         self.assertEqual((self.table.live_count(), self.table.node_count()), (1, 3))
         self.table.heard(failing)  # hearing it again makes it live
         self.assertEqual(self.table.live_count(), 2)
+
+
+class UnreliableTest(RoutingTestCase):
+    """Nodes whose queries keep failing are unreliable however often they announce, until one is answered."""
+
+    def fail(self, n: bytes, times: int):
+        """Count times failed queries for n, hearing its announce before each, as a far node that keeps
+        announcing but never connects is heard."""
+        for _ in range(times):
+            self.table.heard(n)
+            self.table.failed(n)
+
+    def test_announces_do_not_reset_the_count(self):
+        """A node heard before every failure is unreliable after max_failures of them, and stays in the table."""
+        n = node_id(42)
+        self.fail(n, 2)
+        self.assertFalse(self.table.unreliable(n))
+        self.fail(n, 1)
+        self.assertTrue(self.table.unreliable(n))
+        self.table.heard(n)
+        self.assertTrue(self.table.unreliable(n))
+        self.assertTrue(self.table.contains(n))  # the table's own failure count was reset by the announce
+
+    def test_nodes_outside_the_table_count_too(self):
+        """A node only named in replies (never in the table) is remembered as unreliable."""
+        n = node_id(42)
+        for _ in range(3):
+            self.assertFalse(self.table.failed(n))
+        self.assertFalse(self.table.contains(n))
+        self.assertTrue(self.table.unreliable(n))
+
+    def test_retried_after_a_doubling_backoff(self):
+        """may_retry is True once the backoff has passed, for one caller; each failure doubles it up to AVOID_MAX."""
+        n = node_id(42)
+        self.fail(n, 3)
+        self.assertFalse(self.table.may_retry(n))
+        self.clock.now += AVOID_AFTER
+        self.assertTrue(self.table.may_retry(n))
+        self.assertFalse(self.table.may_retry(n))  # claimed: another lookup doesn't retry it too
+        self.fail(n, 1)
+        self.clock.now += 2 * AVOID_AFTER - 1
+        self.assertFalse(self.table.may_retry(n))
+        self.clock.now += 1
+        self.assertTrue(self.table.may_retry(n))
+        self.fail(n, 20)
+        self.clock.now += AVOID_MAX - 1
+        self.assertFalse(self.table.may_retry(n))
+        self.clock.now += 1
+        self.assertTrue(self.table.may_retry(n))
+
+    def test_an_answer_restores_it(self):
+        """answered() makes the node reliable again: no retry needed, and failures count from zero."""
+        n = node_id(42)
+        self.fail(n, 5)
+        self.assertFalse(self.table.answered(n))  # already in the table
+        self.assertFalse(self.table.unreliable(n))
+        self.clock.now += AVOID_MAX
+        self.assertFalse(self.table.may_retry(n))
+        self.fail(n, 2)
+        self.assertFalse(self.table.unreliable(n))
+
+    def test_answered_adds_like_heard(self):
+        """answered() adds a node not yet in the table, as hearing it would."""
+        n = node_id(42)
+        self.assertTrue(self.table.answered(n))
+        self.assertTrue(self.table.contains(n))
+        self.assertFalse(self.table.answered(OWN_ID))
+
+    def test_reliable_nodes_are_unaffected(self):
+        """Fewer than max_failures failures in a row leave a node reliable, with no retry to claim."""
+        n = node_id(42)
+        self.fail(n, 2)
+        self.assertFalse(self.table.unreliable(n))
+        self.assertFalse(self.table.may_retry(n))
+        self.assertFalse(self.table.unreliable(node_id(43)))
+
+    def test_memory_is_bounded(self):
+        """At most MAX_UNRELIABLE nodes are remembered; the least recently failed is forgotten first."""
+        old = routing.MAX_UNRELIABLE
+        routing.MAX_UNRELIABLE = 4
+        self.addCleanup(setattr, routing, "MAX_UNRELIABLE", old)
+        ids = [node_id(100 + i) for i in range(5)]
+        for n in ids:
+            self.fail(n, 3)
+        self.assertFalse(self.table.unreliable(ids[0]))
+        self.assertTrue(all(self.table.unreliable(n) for n in ids[1:]))
 
 
 class BanTest(RoutingTestCase):

@@ -4,9 +4,9 @@
 
 ## Unreleased
 
-Performance work, a debug log, and state kept in one SQLite database. No wire-format or CID changes: these
-nodes and 0.1.4 nodes work together. The upgrade of an `<rnfs dir>` is automatic and one-way (an older version
-can't read it afterwards).
+Performance work, a debug log, state kept in one SQLite database, deny lists, and a client library for apps. No
+wire-format or CID changes: these nodes and 0.1.4 nodes work together. The upgrade of an `<rnfs dir>` is
+automatic and one-way (an older version can't read it afterwards).
 
 Changed:
 - State is kept in one SQLite database, `<rnfs dir>/state/rnfs.db` (Python's standard `sqlite3`; no new
@@ -47,8 +47,31 @@ Added:
   couldn't be established, each request's outcome or why it went unanswered, and incoming links. The file is
   readable by its owner only and never sent; each start keeps the previous run's as `debug.log.1`, and past
   16 MiB the file moves there too, so the two stay under 32 MiB.
+- `rnfs.apiclient`, a client library of the local API for companion apps: it finds the rnfs directory, port and
+  token as the CLI does, makes whatever listens on the API port prove it knows the token before sending it,
+  raises a typed error for each failure, and has methods for status, add, fetch and `cat` (streamed), pins,
+  names and jobs. Standard library only; it doesn't load Reticulum. The CLI now uses it, with the same output.
+  See "Building apps on rnfs" in the README.
+- Deny lists, to keep chosen content off a node (a public gateway or provider node): `rnfs deny add|rm|ls` edits a
+  local list of CIDs and file hashes (`sha256:<hex>`), and `deny_lists` in `rnfs.toml` names lists to apply, by
+  CID or `name/<name>` (followed as the name changes; each version is checked, at most 4 MiB and 100 000
+  entries, and pinned while in use). A denied CID is never fetched, read, stored, served or provided, as a root
+  or anywhere inside a DAG; the API and gateway answer 451. Records already published are withdrawn, cached
+  copies are deleted and remote pins holding it released; your own pins are kept but not served or read, and
+  the log names them. File hashes are checked where a file is assembled (`get`, `cat`, the gateway, `add`,
+  `import`), after its blocks have been downloaded. Nothing changes on the network: a peer asking for a denied
+  block is told it isn't held.
 
 Fixes:
+- A far node that keeps announcing but never accepts a link cost every lookup its connection timeout (60 s or
+  more at 9–10 hops), and held lookups open long after they had their answer: its announces reset the failure
+  count that would have dropped it, and other nodes kept naming it in their replies once it was dropped. A node
+  whose last 3 (`max_failures`) queries failed is now asked only when a lookup has too few others, whatever
+  its announces; it is asked again after 5 minutes, doubling up to an hour, without the lookup waiting for
+  its answer, and an answer restores it. Nothing changes on the network.
+- A gateway or LXMF auto-fetch resolve that found a higher sequence for a name it had resolved before raised
+  the name's floor without saving it until the next re-announce pass (up to a minute later) or shutdown, and
+  so did an announce raising it with no resolve. Every raise is now saved within 5 s, as documented.
 - `gc` (and eviction) could delete blocks of a complete pin. `stat` of a DAG only partly stored remembered the
   nodes it didn't find as listing nothing, so once the rest was fetched and pinned, collection didn't see what
   those nodes reach. Until a restart, which cleared it.

@@ -433,8 +433,33 @@ def unsafe_name_reason(name: str) -> str | None:
     return fsutil.unsafe_name_reason(name)  # in fsutil so the CLI can check names without loading RNS
 
 
-def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str]:
+def iter_files(expect: Expect, get: Get) -> Iterator[Expect]:
+    """The expectation of every file in a DAG (expect itself if it is a file), each distinct one once."""
+    block = get(expect)
+    if not isinstance(decode_checked(expect, block), (DirectoryNode, IndexNode)):
+        yield expect
+        return
+    seen: set[Expect] = set()
+    memo: dict[Expect, dag.Node] = {}
+    stack = [expect]
+    while stack:
+        directory = stack.pop()
+        for entry, child in _directory_entries(directory, get, memo):
+            if child in seen:
+                continue
+            seen.add(child)
+            if entry.kind == dag.KIND_DIRECTORY:
+                stack.append(child)
+            else:
+                yield child
+
+
+def write_out(expect: Expect, get: Get, dest: str, max_entries: int,
+              check: Callable[[Expect], None] | None = None) -> list[str]:
     """Write the file or directory expect names to dest, which must not exist yet. Returns warnings.
+
+    check(file expect), if given, runs before each file is created and may raise to stop the write-out (the
+    deny list's file hashes); what was written stays for the caller to remove.
 
     Entries whose names the local filesystem would read as a path, or can't represent (it refuses to create
     them), are skipped and reported, as are names that collide on this filesystem (e.g. case-insensitive ones). Kind 1 entries
@@ -450,6 +475,8 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
     block = get(expect)
     node = decode_checked(expect, block)
     if not isinstance(node, (DirectoryNode, IndexNode)):
+        if check is not None:
+            check(expect)
         with open(dest, "xb") as out:
             _write_file(expect, get, out, small, block)
         return warnings
@@ -470,6 +497,8 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
                 warnings.append(f"skipped {entry_shown!r}: {reason}")
                 continue
             path = os.path.join(where, entry.name)
+            if check is not None and entry.kind != dag.KIND_DIRECTORY:
+                check(child)
             try:
                 if entry.kind == dag.KIND_DIRECTORY:
                     os.mkdir(path)

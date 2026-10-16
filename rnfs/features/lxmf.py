@@ -1456,7 +1456,7 @@ class LxmfFeature(features.Feature):
         or when the message is removed."""
         from rnfs import fetcher
         from rnfs.content.storage import LXMF_PREFIX
-        from rnfs.errors import InvalidDag, RnfsError, StorageFull, TooLarge
+        from rnfs.errors import Denied, InvalidDag, RnfsError, StorageFull, TooLarge
         entry = self.inbox.get(entry_id)
         if entry is None:
             return
@@ -1485,7 +1485,7 @@ class LxmfFeature(features.Feature):
         except fetcher.Cancelled:
             _log(f"auto-fetch of inbox #{entry_id} link {index + 1} stopped", LOG_VERBOSE)
             return  # still "queued" if the node is stopping: fetched at the next start
-        except TooLarge as e:
+        except (TooLarge, Denied) as e:
             result = {"state": "refused", "error": str(e)}
         except (RnfsError, ValueError, KeyError, IndexError, TypeError) as e:
             result = {"state": "failed", "error": str(e) or type(e).__name__}

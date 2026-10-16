@@ -2,7 +2,8 @@
 
 - **What is provided** (provide_strategy): `pinned` provides every complete pin; `roots` also every complete
   fetched target while it is cached (the node says which cached targets qualify: gateway fetches never do).
-  Only these CIDs' DAGs are served to /blocks (section 7).
+  Only these CIDs' DAGs are served to /blocks (section 7). A CID whose DAG holds a block the deny list (the
+  storage's) denies is never provided: a change to the list takes effect at the next refresh().
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. For
   each due CID the K closest nodes are found; keys are grouped by node, and each node gets its keys (and any
   withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed
@@ -209,6 +210,9 @@ class Publisher:
         # stays complete), and the DhtKeys from the keys the key sources returned
         self._served_from: tuple[dict[Cid, frozenset[Cid]], frozenset[Cid]] = ({}, frozenset())
         self._keys_from: tuple[set[bytes], frozenset[DhtKey]] = (set(), frozenset())
+        # CID -> (deny list's CID set, dag_blocks object, whether one of them is denied), so each DAG is checked
+        # against the deny list once per change of either
+        self._denied_dags: dict[Cid, tuple[frozenset[bytes], frozenset[Cid], bool]] = {}
         self._published: dict[Cid, tuple[float, list[bytes]]] = {}  # CID -> (when, nodes that recorded it)
         # Other nodes that may still hold our record of a CID (earlier rounds' closest nodes, or a round cut
         # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
@@ -398,6 +402,10 @@ class Publisher:
                 dags[cid] = self.storage.dag_blocks(cid)  # memoised; raises unless complete
             except (NotFound, InvalidDag):
                 continue
+        denied = self.storage.deny.cids
+        if denied:
+            dags = {cid: blocks for cid, blocks in dags.items() if not self._denied(cid, blocks, denied)}
+        self._denied_dags = {cid: checked for cid, checked in self._denied_dags.items() if cid in candidates}
         keys: set[bytes] = set()
         for source in list(self._key_sources):
             try:
@@ -417,6 +425,14 @@ class Publisher:
         if keys != self._keys_from[0]:
             self._keys_from = (keys, frozenset(DhtKey(key) for key in keys))
         return frozenset(dags) | self._keys_from[1], served
+
+    def _denied(self, cid: Cid, blocks: frozenset[Cid], denied: frozenset[bytes]) -> bool:
+        """True if one of blocks (cid's DAG) is in denied, the deny list's binary CIDs; memoised. Lock held."""
+        checked = self._denied_dags.get(cid)
+        if checked is None or checked[0] is not denied or checked[1] is not blocks:
+            checked = (denied, blocks, any(block.binary in denied for block in blocks))
+            self._denied_dags[cid] = checked
+        return checked[2]
 
     def refresh(self):
         """Recompute what is provided (after pins, fetches, evictions); withdraw what no longer is, at once."""

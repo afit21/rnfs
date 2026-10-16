@@ -14,7 +14,7 @@ from rnfs.config import Config
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import NotFound, RnfsError
 from rnfs.names import NameManager, encode_record, parse_record
-from tests.support import POSIX_MODES, FakeClock, failing_commits, state_execute, state_rows
+from tests.support import POSIX_MODES, FakeClock, failing_commits, state_execute, state_rows, wait_for
 
 _saved_loglevel = RNS.loglevel
 
@@ -808,6 +808,49 @@ class FloorSaveTest(NamesTestCase):
         self.manager.announce_due()
         self.assertEqual(conn.total_changes - before, 1)
         self.assertEqual(self.rows("SELECT sequence FROM name_floor WHERE name = ?", (other_name(6),)), [("2",)])
+
+    def saved_sequence(self, i: int) -> list[tuple]:
+        """The sequence column of other_name(i)'s name_floor row (empty if it has none)."""
+        return self.rows("SELECT sequence FROM name_floor WHERE name = ?", (other_name(i),))
+
+    def test_a_raise_found_by_a_resolve_is_saved_soon(self):
+        """A name in the table resolved again for the gateway, whose refresh hears a higher sequence, has the raise
+        saved within FLOOR_SAVE_INTERVAL (the announce raised the floor before the resolve compared with it)."""
+        self.resolve_for_gateway(1)
+        self.assertEqual(self.saved_sequence(1), [("1",)])
+        self.clock.now += names.FLOOR_SAVE_INTERVAL
+        self.network.on_request_path = lambda name: self.network.announce(name, encode_record(2, CID_B),
+                                                                          self.clock.now)
+        self.assertEqual(self.manager.resolve(other_name(1), persist=False)["sequence"], 2)
+        wait_for(lambda: self.saved_sequence(1) == [("2",)], timeout=names.FLOOR_SAVE_INTERVAL,
+                 what="the raised floor to be saved")
+
+    def test_a_raise_by_an_announce_is_saved_soon(self):
+        """An announce raising the floor of a name in the table, with no resolve, is saved within
+        FLOOR_SAVE_INTERVAL too, not at the next re-announce pass."""
+        self.resolve_for_gateway(1)
+        self.clock.now += names.FLOOR_SAVE_INTERVAL
+        self.network.announce(other_name(1), encode_record(3, CID_B), self.clock.now)
+        wait_for(lambda: self.saved_sequence(1) == [("3",)], timeout=names.FLOOR_SAVE_INTERVAL,
+                 what="the raised floor to be saved")
+
+    def test_a_raise_soon_after_a_save_waits_for_the_interval(self):
+        """A raise within FLOOR_SAVE_INTERVAL of the last save is saved by the timer once the interval has passed."""
+        with mock.patch.object(names, "FLOOR_SAVE_INTERVAL", 0.5):
+            self.resolve_for_gateway(1)
+            self.network.announce(other_name(1), encode_record(4, CID_B), self.clock.now)
+            self.assertEqual(self.saved_sequence(1), [("1",)])
+            self.assertIsNotNone(self.manager._floor_timer)
+            wait_for(lambda: self.saved_sequence(1) == [("4",)], timeout=5, what="the timer's save")
+
+    def test_no_timer_after_close(self):
+        """A raise offered once the manager is closed (a keeper's late answer) starts no save."""
+        self.resolve_for_gateway(1)
+        self.manager.stop()
+        self.manager.close()
+        self.clock.now += names.FLOOR_SAVE_INTERVAL
+        self.manager.offer(other_name(1), 5, CID_B, self.clock.now)
+        self.assertIsNone(self.manager._floor_timer)
 
     def test_written_without_the_lock(self):
         """The floor's commit runs without the manager's lock: resolves and announces needn't wait for it."""

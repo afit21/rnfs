@@ -26,3 +26,7 @@ class StorageFull(RnfsError):
 
 class Busy(RnfsError):
     """A local limit (e.g. gateway_fetches) is reached; try again later."""
+
+
+class Denied(RnfsError):
+    """The content is on this node's deny list (section 8): it isn't fetched, read, stored, served or provided."""
