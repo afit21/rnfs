@@ -21,11 +21,10 @@ import sys
 
 from rnfs import __version__, apiclient, fsutil
 from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
-from rnfs.config import DEFAULT_API_PORT, Config
+from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
 
 DEFAULT_DIR = apiclient.DEFAULT_DIR
 COPY_SIZE = apiclient.COPY_SIZE
-LOCK_FILE = "daemon.lock"  # in the rnfs directory; locked by the daemon using it, so a second one can't start
 
 
 # text with control characters escaped, so names from other people's DAGs can't drive the terminal
@@ -70,7 +69,7 @@ def read_token(path: str) -> str:
         fail(str(e))
 
 
-class ApiClient(apiclient.Client):
+class ApiClient(apiclient.ApiConnection):
     """The library's client for the CLI: talks to the daemon's API on 127.0.0.1:port, exiting with a friendly
     message on any error.
 
@@ -83,14 +82,14 @@ class ApiClient(apiclient.Client):
         super().__init__(port=port, token_file=token_file)
 
     def request(self, *args, **kwargs) -> http.client.HTTPResponse:
-        """Client.request (the successful response), exiting on errors."""
+        """ApiConnection.request (the successful response), exiting on errors."""
         try:
             return super().request(*args, **kwargs)
         except apiclient.ApiError as e:
             fail(str(e))
 
     def call(self, *args, **kwargs):
-        """Client.call (the decoded JSON response), exiting on errors."""
+        """ApiConnection.call (the decoded JSON response), exiting on errors."""
         try:
             return super().call(*args, **kwargs)
         except apiclient.ApiError as e:
@@ -138,7 +137,7 @@ def client(args) -> ApiClient:
             port = apiclient.api_port(args.dir)
         except apiclient.ApiError as e:
             fail(str(e))
-    return ApiClient(port if port is not None else DEFAULT_API_PORT, token_path(args.dir))
+    return ApiClient(port, token_path(args.dir))
 
 
 def port_number(text: str, minimum: int = 1) -> int:
@@ -182,7 +181,7 @@ def run_daemon(args):
     from rnfs.errors import RnfsError
     from rnfs.gateway import GatewayServer
     from rnfs.log import LOG_ERROR, LOG_NOTICE
-    from rnfs.node import RnfsNode, _make_private_dirs
+    from rnfs.node import DirInUse, RnfsNode, lock_rnfs_dir
 
     try:
         config = Config.load(args.dir, reticulum_dir=args.rnsconfig,
@@ -199,12 +198,10 @@ def run_daemon(args):
     # would load and save the same state, announce the same node ID and rotate the first one's debug log
     lock_path = os.path.join(config.root, LOCK_FILE)
     try:
-        _make_private_dirs(config)
-        lock = fsutil.lock_exclusive(lock_path)  # noqa: F841 - held until the process exits
-    except BlockingIOError:
-        holder = fsutil.lock_holder(lock_path)
-        fail(f"another rnfs daemon{f' (process {holder})' if holder else ''} is using {config.root}; stop it first, "
-             "or give this one another --dir")
+        lock = lock_rnfs_dir(config)  # held until the process exits
+    except DirInUse as e:
+        fail(f"another rnfs daemon{f' (process {e.holder})' if e.holder else ''} is using {config.root}; stop it "
+             "first, or give this one another --dir")
     except (RnfsError, OSError) as e:
         fail(f"can't lock {lock_path}: {e}")
 
@@ -213,6 +210,7 @@ def run_daemon(args):
         try:
             debug = debuglog.start(config)
         except (RnfsError, OSError) as e:
+            fsutil.unlock(lock)  # fail() raises SystemExit, which an in-process caller (a test) may catch
             fail(f"can't write the debug log: {e}")
         print(f"rnfs: writing the debug log {debug.path}", flush=True)
 
@@ -222,6 +220,7 @@ def run_daemon(args):
         if debuglog.current() is not None:  # inside the except: with its traceback
             debuglog.current().write(LOG_ERROR, "rnfs", f"couldn't start the node: {e!r}", traceback.format_exc())
         if RNS.Reticulum.get_instance() is None:
+            fsutil.unlock(lock)  # as above
             fail(str(e))
         print(f"rnfs: {printable(str(e))}", file=sys.stderr, flush=True)
         RNS.exit(1)  # Reticulum has started: ends with os._exit, so its threads don't keep the process

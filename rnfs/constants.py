@@ -54,4 +54,7 @@ DEFAULT_BOOTSTRAP_NODES = (
     "bddad1ec2f4a4a6112d3d42afabfd94a",  # Broken Hill, Australia
     "24770a7a9221b97d583905a839bc4fce",  # Central US (Google Cloud)
     "4a8dec339ac23f9a6f423b6ee0a84c16",  # Madrid, Spain (Google Cloud)
+    "4ac0af1cb64587d1e71103a1733e91de",  # Johannesburg, South Africa (Google Cloud)
+    "8ce2903ad6aaee3128c6494647b5496f",  # Montreal, Canada (Google Cloud)
+    "3c7a4a76eec780fbe56ed6e13184981c",  # Stockholm, Sweden (Google Cloud)
 )

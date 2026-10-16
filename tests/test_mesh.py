@@ -390,7 +390,7 @@ class PeerClientCountingTest(unittest.TestCase):
     """PeerClient.blocks counts outcomes and verified bytes per provider."""
 
     def test_counts_outcomes(self):
-        links = types.SimpleNamespace(lock=threading.Lock(), shared={})
+        links = types.SimpleNamespace(shared_peer=lambda node_id: None)
         client = PeerClient(links, Config())
         cid, data = block_of(1000, 1)
         results = iter([BlocksResult(OK, blocks={cid: data}), BlocksResult(BUSY), BlocksResult(FAILED)])

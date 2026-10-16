@@ -45,8 +45,8 @@ class Internal(NamedTuple):
 
 INTERNALS = [
     # Resource advertisements and the guard on them
-    Internal("network/guards.py", "ResourceAdvertisement fields t d u l i q p, after a pack/unpack round trip",
-             lambda: _advertisement_round_trip()),
+    Internal("network/guards.py", "ResourceAdvertisement fields t d u l i q p x c, after a pack/unpack round "
+             "trip", lambda: _advertisement_round_trip()),
     Internal("network/guards.py", "Resource.accept(advertisement_packet, callback, progress_callback, request_id) "
              "and Resource.reject(advertisement_packet), called by Link as RNS.Resource.accept/reject",
              lambda: (_params(_original_accept(), "advertisement_packet", "callback", "progress_callback",
@@ -68,12 +68,24 @@ INTERNALS = [
              "expand_name builds it", lambda: _dht_link_names()),
 
     # Responses: the server follows the Resources RNS sends them in
-    Internal("network/server.py, node.py", "Resource.AUTO_COMPRESS_MAX_SIZE, copied by every Resource at creation "
-             "into max_decompressed_size and auto_compress_limit",
+    Internal("network/guards.py", "Resource.AUTO_COMPRESS_MAX_SIZE, copied by every Resource at creation into "
+             "max_decompressed_size and auto_compress_limit; Resource.accept returning the Resource, whose "
+             "max_decompressed_size assemble() decompresses at most",
              lambda: (_has(RNS.Resource, "AUTO_COMPRESS_MAX_SIZE"),
                       _assigns(RNS.Resource.__init__, max_decompressed_size="Resource.AUTO_COMPRESS_MAX_SIZE",
                                auto_compress_limit="Resource.AUTO_COMPRESS_MAX_SIZE"),
+                      _source(_original_accept(), "return resource"),
                       _source(RNS.Resource.assemble, "max_length=self.max_decompressed_size"))),
+    Internal("network/server.py", "Destination.register_request_handler(path, response_generator, allow, "
+             "auto_compress), and Link.handle_request passing the handler's auto_compress to both response "
+             "Resources",
+             lambda: (_params(RNS.Destination.register_request_handler, "path", "response_generator", "allow",
+                              "auto_compress"),
+                      _source(RNS.Link.handle_request, "auto_compress = request_handler[4]",
+                              "RNS.Resource(file_handle, self, metadata=metadata, request_id=request_id, "
+                              "is_response=True, auto_compress=auto_compress)",
+                              "RNS.Resource(packed_response, self, request_id=request_id, is_response=True, "
+                              "auto_compress=auto_compress)"))),
     Internal("network/server.py", "Link.register_outgoing_resource(resource), looked up on the link (and so "
              "replaceable per link) when a Resource is advertised",
              lambda: (_params(RNS.Link.register_outgoing_resource, "resource"),
@@ -113,6 +125,11 @@ INTERNALS = [
                               "progress_callback", "timeout", "max_response_size"),
                       _source(RNS.Link.request, "timeout = self.rtt * self.traffic_timeout_factor + "
                               "RNS.Resource.RESPONSE_MAX_GRACE_TIME * 1.125"))),
+    Internal("network/links.py", "Link.request sending a request as one packet if it packs to at most Link.mdu "
+             "bytes (else as a Resource), and Link.get_mdu() returning mdu on an active link",
+             lambda: (_source(RNS.Link.request, "if len(packed_request) <= self.mdu:",
+                              "RNS.Packet(self, packed_request, RNS.Packet.DATA, context=RNS.Packet.REQUEST)"),
+                      _source(RNS.Link.get_mdu, "if self.status == Link.ACTIVE: return self.mdu"))),
     Internal("network/links.py", "RequestReceipt link, response_size, get_response() and get_progress()",
              lambda: (_assigns(RNS.RequestReceipt.__init__, "link", "response_size"),
                       _has(RNS.RequestReceipt, "get_response", "get_progress"))),
@@ -344,18 +361,30 @@ class _Remembered:
 
 
 def _advertisement_round_trip():
-    """Advertisements as Resource.advertise packs them and Link.receive unpacks them, through guards.refusal."""
-    for is_response in (True, False):
+    """Advertisements as Resource.advertise packs them and Link.receive unpacks them, through guards.refusal:
+    in the daemon's scope with no link, and on an rnfs.dht link for the compressed and metadata flags."""
+    dht = types.SimpleNamespace(destination=_destination("rnfs", "dht", direction=RNS.Destination.OUT))
+    cases = (({"is_response": True}, None, None),
+             ({"is_response": False}, None, "requests are never sent as Resources"),
+             ({"compressed": True}, dht, "rnfs Resources are never compressed"),
+             ({"has_metadata": True}, dht, "rnfs responses carry no metadata"))
+    for overrides, link, refused in cases:
         resource = types.SimpleNamespace(
             size=100_052, total_size=100_000, parts=[None], hash=os.urandom(32), random_hash=os.urandom(4),
             original_hash=os.urandom(32), hashmap=os.urandom(4), compressed=False, encrypted=True, split=True,
-            has_metadata=False, segment_index=2, total_segments=3, request_id=os.urandom(16), is_response=is_response)
+            has_metadata=False, segment_index=2, total_segments=3, request_id=os.urandom(16), is_response=True)
+        if link is not None:  # one segment, so only the flag under test is refused
+            resource.split, resource.segment_index, resource.total_segments = False, 1, 1
+        vars(resource).update(overrides)
         adv = RNS.ResourceAdvertisement.unpack(RNS.ResourceAdvertisement(resource).pack())
-        fields = {name: getattr(adv, name, None) for name in "tdulipq"}
-        _true(fields == {"t": 100_052, "d": 100_000, "u": not is_response, "l": 3, "i": 2, "p": is_response,
-                         "q": resource.request_id}, f"unpacked as {fields}")
-        _true(guards.refusal(adv) == (None if is_response else "requests are never sent as Resources"),
-              f"guards.refusal: {guards.refusal(adv)}")
+        fields = {name: getattr(adv, name, None) for name in "tdulipqxc"}
+        expected = {"t": 100_052, "d": 100_000, "u": not resource.is_response, "l": resource.total_segments,
+                    "i": resource.segment_index, "p": resource.is_response, "q": resource.request_id,
+                    "x": resource.has_metadata, "c": resource.compressed}
+        _true(fields == expected, f"unpacked as {fields}")
+        with mock.patch.object(guards, "_scope", guards.PROCESS):  # whatever scope another test left
+            reason = guards.refusal(adv, link)
+        _true(reason == refused, f"guards.refusal: {reason}")
 
 
 def _dht_link_names():

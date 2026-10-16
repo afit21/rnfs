@@ -1,16 +1,23 @@
 """RnfsNode: one running rnfs node, wiring Reticulum to the DHT, storage, fetching and publishing, and the
 facade that the API, gateway and CLI call (design.md, "Node facade").
 
-Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), the node's
-identity and its rnfs.dht destination, then the state database (rnfs.statedb, which imports the JSON state files
-of earlier versions first), the routing table, provider records, storage, shared folder, fetcher, publisher and
-names; the request server answers through NodeBackend. Background threads: the
-announcer, the join (bootstrap nodes, then a lookup for our own ID, repeated while too few servers are
-known), the publish loop, the name re-announce loop and
-maintenance (shared-folder scans, provider record expiry and saves, max_storage enforcement).
+Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), or for a node
+embedded in another program (rnfs.Node) the program's running instance, then the node's identity and its
+rnfs.dht destination, then the state database (rnfs.statedb, which imports the JSON state files of earlier
+versions first), the routing table, provider records, storage, the deny list (its accepted lists read back from
+storage), shared folder, fetcher, publisher, names and the features (rnfs.features); the request server answers
+through NodeBackend. Background threads: the announcer, the join (bootstrap nodes, then a lookup for our own ID,
+repeated while too few servers are known), the publish loop, the name re-announce loop, the features' own, a
+worker per source with remote pins waiting, and maintenance (shared-folder scans, provider record expiry and
+saves, max_storage enforcement, periodic state saves, publisher refreshes asked for, deny-list changes retried,
+the remote pins waiting saved).
 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
+
+The daemon owns its process, so its Resource guards cover every link and RNS's compression is off process-wide
+(network/guards.py, PROCESS); an embedded node scopes both to its rnfs.dht links (DHT) and leaves the host
+program's Reticulum running when it stops. Neither ever stops Reticulum: the daemon calls RNS.exit() itself.
 """
 import hashlib
 import os
@@ -26,7 +33,7 @@ from typing import BinaryIO, Callable, Iterator
 import RNS
 
 from rnfs import __version__, denylist, features, fsutil, statedb, winacl
-from rnfs.config import Config
+from rnfs.config import LOCK_FILE, Config
 from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MODE_SERVER, PARTIAL_SUFFIX
 from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
@@ -130,6 +137,31 @@ def _make_private_dirs(config: Config):
         log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
     for directory in subdirs:
         os.makedirs(directory, mode=0o700, exist_ok=True)
+
+
+class DirInUse(RnfsError):
+    """Another daemon or embedded node holds the rnfs dir's lock; holder is its process ID, if known."""
+
+    def __init__(self, message: str, holder: int | None):
+        """The error, naming holder."""
+        super().__init__(message)
+        self.holder = holder
+
+
+def lock_rnfs_dir(config: Config) -> int:
+    """Make the rnfs dir private (as the node would) and lock <rnfs dir>/daemon.lock without waiting, before
+    anything else uses the dir: two nodes on one dir would load and save the same state and announce the same
+    node ID. The open descriptor, whose lock lasts until it is closed or the process ends. Raises DirInUse if
+    another process, or another node in this one, holds it; RnfsError or OSError if the dir can't be made
+    private or the file locked. The daemon and rnfs.Node both lock through here."""
+    _make_private_dirs(config)
+    path = os.path.join(config.root, LOCK_FILE)
+    try:
+        return fsutil.lock_exclusive(path)
+    except BlockingIOError:
+        holder = fsutil.lock_holder(path)
+        raise DirInUse(f"another rnfs daemon or node{f' (process {holder})' if holder else ''} is using "
+                       f"{config.root}; stop it first, or use another rnfs dir", holder) from None
 
 
 def _check_free_space(path: str, needed: int, blocks_dir: str | None = None, to_fetch: int = 0):
@@ -269,19 +301,27 @@ class NodeBackend:
 
 
 class RnfsNode:
-    """A running node. Only one per process: RNS.Reticulum is a singleton, and rnfs changes a process-wide
-    RNS setting (section 3)."""
+    """A running node. Only one per process: RNS.Reticulum is a singleton, and the guards are installed once
+    (network/guards.py)."""
 
-    def __init__(self, config: Config):
-        """Start Reticulum and every service of the node, then announce, join and publish in the background."""
+    def __init__(self, config: Config, reticulum: "RNS.Reticulum | None" = None, embedded: bool = False):
+        """Start every service of the node, then announce, join and publish in the background.
+
+        The daemon starts Reticulum here. An embedded node (rnfs.Node, embedded) uses reticulum, the host
+        program's running instance, or starts one if there is none; its guards cover only rnfs.dht links.
+        """
         config.validate()
         _make_private_dirs(config)  # before Reticulum and the identity, which write under it
-        # Refuse compressed Resources and stop compressing ours (section 3); the server sets it too
-        RNS.Resource.AUTO_COMPRESS_MAX_SIZE = 0
-        guards.install()  # reject oversized Resource advertisements before RNS allocates for them
+        self.embedded = embedded
+        # Reject oversized, compressed and request Resource advertisements before RNS allocates for them; in the
+        # daemon on every link, with RNS's compression off process-wide (section 3)
+        guards.install(guards.DHT if embedded else guards.PROCESS)
+        if reticulum is None and embedded:
+            reticulum = RNS.Reticulum.get_instance()
         # By default this is RNS's own config directory, the one rnsd uses: attaching to a shared instance needs
         # its RPC key, which RNS derives from the transport identity stored in that directory (section 3)
-        self.reticulum = RNS.Reticulum(configdir=config.reticulum_root, verbosity=config.verbosity or None)
+        self.reticulum = reticulum if reticulum is not None else \
+            RNS.Reticulum(configdir=config.reticulum_root, verbosity=config.verbosity or None)
         log(f"Reticulum config in {RNS.Reticulum.configdir}"
             + (", attached to a shared instance" if self.reticulum.is_connected_to_shared_instance else ""))
         _warn_unused_reticulum_config(config)
@@ -290,8 +330,24 @@ class RnfsNode:
                                            APP_NAME, DHT_ASPECT)
         slow = rates.is_slow_node(config, self.reticulum)
         self.links = LinkPool(self.identity, config)
-        self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
-                             names_network=None, is_known=_rns_is_known)
+        self.server = self.announcer = self.announce_handler = None  # made below; stop() skips those not made
+        try:
+            self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
+                                 names_network=None, is_known=_rns_is_known)
+        except BaseException:
+            if embedded:
+                self._release_destination()  # the host's Reticulum runs on: a later node registers it again
+            raise
+        try:
+            self._start_network(config, slow)
+        except BaseException:
+            if embedded:
+                self.stop()  # nothing of this node is left in the host's process (the daemon exits instead)
+            raise
+
+    def _start_network(self, config: Config, slow: bool):
+        """The services that need Reticulum, once the node is set up: paths, the request server, announces, names
+        and the background threads."""
         # mesh: hops and next-hop interfaces rank providers; one set of traffic counters for client and server
         self.paths = RnsPaths(self.reticulum)
         self.fetcher.path_info = self.paths.info
@@ -316,6 +372,7 @@ class RnfsNode:
         """
         node = cls.__new__(cls)
         node.reticulum = node.links = node.server = node.announcer = node.announce_handler = None
+        node.embedded = False
         node._setup_or_close(config, node_id, client, slow, names_network=names_network,
                              is_known=lambda node_id: True)
         node.joined.set()
@@ -368,12 +425,14 @@ class RnfsNode:
         self.fetcher = Fetcher(self.storage, client, config, node_id, self.routing, self._lookup, slow,
                                config.state_dir, after_store=self._enforce_storage, make_room=self._make_room)
         self.publisher = Publisher(node_id, config, self.storage, self.records, client, self._lookup, slow,
-                                   config.state_dir, cached_eligible=self._eligible_targets)
+                                   config.state_dir, cached_eligible=self._eligible_targets,
+                                   generation=self._provide_generation)
         self.names = NameManager(config, _NamePins(self), network=names_network)
         self.backend = NodeBackend(self)
 
         self._lock = threading.Lock()
         self._fetched: set[Cid] = set()
+        self._fetched_changes = 0  # incremented whenever _fetched changes (_provide_generation)
         self._fetched_saved: set = set()  # what the fetched table holds
         for (binary,) in self._db.query("SELECT cid FROM fetched"):
             self._fetched_saved.add(binary)
@@ -449,17 +508,35 @@ class RnfsNode:
             self.announce_handler.deregister()
         if self.server is not None:
             self.server.stop()
-        self.names.stop()
+        try:
+            self.names.stop()  # saves the names state
+        except OSError as e:  # stopping goes on: the rest is saved, the state closed and the links too
+            log(f"saving state failed: {e!r}", LOG_ERROR)
         deadline = time.monotonic() + timeout
         for thread in self.threads:
             thread.join(max(0.0, deadline - time.monotonic()))
-        self.records.save()
-        self._save_remote_pins()
-        self.publisher.save()
+        for save in (self.records.save, self._save_remote_pins, self.publisher.save):
+            try:
+                save()
+            except OSError as e:
+                log(f"saving state failed: {e!r}", LOG_ERROR)
         self._save_state()
         self._close_state()
         if self.links is not None:
             self.links.close_all()
+        if self.embedded:
+            self._release_destination()
+
+    def _release_destination(self):
+        """An embedded node's last step: RNS stops answering for its rnfs.dht destination and the links to it
+        are closed, while the host program's Reticulum keeps running, so a node started later in the process
+        can register it again. (The daemon's process ends with RNS.exit() instead.)"""
+        try:
+            RNS.Transport.deregister_destination(self.destination)
+            for link in list(getattr(self.destination, "links", None) or []):
+                link.teardown()
+        except Exception as e:  # noqa: BLE001 - stopping goes on
+            log(f"releasing the rnfs.dht destination failed: {e!r}", LOG_ERROR)
 
     def _close_state(self):
         """Release every store's reference to the state database, once everything is saved; the last closes it.
@@ -475,9 +552,9 @@ class RnfsNode:
                 log(f"closing state failed: {e!r}", LOG_ERROR)
 
     def _save_state(self):
-        """Save cache records, fetched targets and invalid roots if they changed (each change isn't written at
-        once)."""
-        for save in (self.storage.save, self._save_fetched, self.fetcher.save,
+        """Save cache records, fetched targets, invalid roots and remembered file hashes if they changed (each
+        change isn't written at once)."""
+        for save in (self.storage.save, self._save_fetched, self.fetcher.save, self.deny.save,
                      *(f.save for f in self.features.values())):
             try:
                 save()
@@ -497,10 +574,15 @@ class RnfsNode:
         nearest = fresh + [n for n in self.routing.closest(key, 2 * K) if n not in fresh]
         reliable = [n for n in nearest if not self.routing.unreliable(n)]
         start = (reliable + [n for n in nearest if n not in reliable])[:K]
+        return self._new_lookup(key, start, self.routing.is_banned)
+
+    def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool]) -> Lookup:
+        """A Lookup for key from start, wired to the routing table (answers, failures, unreliable nodes and
+        retries) and the client, leaving out the nodes exclude rejects: _lookup's and the join's."""
         return Lookup(key, start, self.client.find, self.node_id,
                       alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
                       timeout=self.config.lookup_timeout, is_known=self._is_known,
-                      on_answer=self._answered, on_failure=self.routing.failed, exclude=self.routing.is_banned,
+                      on_answer=self._answered, on_failure=self.routing.failed, exclude=exclude,
                       report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
                       may_retry=self.routing.may_retry)
 
@@ -594,13 +676,8 @@ class RnfsNode:
             log("no DHT servers known yet: waiting for announces", LOG_VERBOSE)
             return
         # The bootstrap nodes contacted already answered (or failed) a /find for this key: not asked again
-        lookup = Lookup(self.node_id, start, self.client.find, self.node_id,
-                        alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
-                        timeout=self.config.lookup_timeout, is_known=self._is_known,
-                        on_answer=self._answered, on_failure=self.routing.failed,
-                        exclude=lambda node_id: node_id in contacted or self.routing.is_banned(node_id),
-                        report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
-                        may_retry=self.routing.may_retry)
+        lookup = self._new_lookup(self.node_id, start,
+                                  lambda node_id: node_id in contacted or self.routing.is_banned(node_id))
         lookup.find_closest()
         log(f"joined the DHT: {plural(self.routing.node_count(), 'server')} known", LOG_NOTICE)
 
@@ -797,6 +874,12 @@ class RnfsNode:
         with self._lock:
             return set(self._fetched)
 
+    def _provide_generation(self) -> tuple[int, int]:
+        """What the publisher's provide set is computed from, as counts that grow with every change: storage's
+        pins, cached targets and blocks (Storage.changes), and the targets fetched for the user."""
+        with self._lock:
+            return self.storage.changes(), self._fetched_changes
+
     def _prune_fetched(self):
         """Forget fetched targets that are no longer cached."""
         with self._lock:
@@ -805,6 +888,7 @@ class RnfsNode:
             if self._fetched <= cached:
                 return
             self._fetched &= cached
+            self._fetched_changes += 1
             self._fetched_dirty = True
 
     def _note_fetched(self, target: Cid):
@@ -813,6 +897,7 @@ class RnfsNode:
             if target in self._fetched:
                 return
             self._fetched.add(target)
+            self._fetched_changes += 1
             self._fetched_dirty = True
 
     def _save_fetched(self):
@@ -1008,11 +1093,14 @@ class RnfsNode:
         """
         root, names = self._parse_target(target, for_gateway)
         with self._fetching(root, names, from_node, for_gateway) as fetch:
-            expect = fetch.resolve()
-            block = fetch.get(expect)
-            info = {"cid": str(expect.cid), "type": walker.kind_of(expect, block),
-                    "size": walker.size_of(expect, block), "executable": expect.kind == dag.KIND_EXECUTABLE}
-            return info if for_gateway or raw else node_content.sealed_info(self, fetch, expect, info)
+            return self._info(fetch, fetch.resolve(), for_gateway or raw)
+
+    def _info(self, fetch: Fetch, expect: walker.Expect, stored: bool) -> dict:
+        """info() of a resolved target; with stored, a sealed file's as stored (its ciphertext size)."""
+        block = fetch.get(expect)
+        info = {"cid": str(expect.cid), "type": walker.kind_of(expect, block),
+                "size": walker.size_of(expect, block), "executable": expect.kind == dag.KIND_EXECUTABLE}
+        return info if stored else node_content.sealed_info(self, fetch, expect, info)
 
     def read(self, target: str, offset: int = 0, length: int | None = None, for_gateway: bool = False,
              from_node: bytes | None = None, raw: bool = False) -> Iterator[bytes]:
@@ -1027,17 +1115,49 @@ class RnfsNode:
         def generate() -> Iterator[bytes]:
             """Fetch and yield, window by window; closing it ends the fetch."""
             with self._fetching(root, names, from_node, for_gateway) as fetch:
-                expect = fetch.resolve()
-                if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == "file":
-                    # The whole file is fetched and hashed (once: then remembered) before any of it is sent
-                    self._check_file(expect, fetch.read_range)
-                sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
-                if sealed is not None:
-                    yield from sealed.read(offset, length)
-                    return
-                yield from fetch.read_range(expect, offset, length)
+                yield from self._read(fetch, fetch.resolve(), offset, length, for_gateway, raw)
 
         return generate()
+
+    def read_file(self, target: str, offset: int = 0, length: int | None = None, from_node: bytes | None = None,
+                  raw: bool = False) -> tuple[dict, Iterator[bytes]]:
+        """info() and read() in one fetch, which resolves the target once: (its info, a lazy iterator of its bytes
+        in [offset, offset + length) cut to the size info gives). The iterator reads only once next() is called
+        on it, after the caller has checked the info (a directory's raises ValueError); close it when done, read
+        or not: that ends the fetch (GET /api/cat)."""
+        root, names = self._parse_target(target)
+        if offset < 0 or (length is not None and length < 0):
+            raise ValueError("offset and length must be non-negative")
+
+        def generate() -> Iterator:
+            """The info, then the bytes; closed before reading them, the fetch ends as info()'s does."""
+            with self._fetching(root, names, from_node) as fetch:
+                expect = fetch.resolve()
+                info = self._info(fetch, expect, raw)
+                try:
+                    yield info
+                except GeneratorExit:
+                    return
+                if info["type"] != "file":
+                    raise ValueError(f"{target} is a directory")
+                available = max(info["size"] - offset, 0)
+                yield from self._read(fetch, expect, offset, available if length is None else min(length, available),
+                                      False, raw)
+
+        chunks = generate()
+        return next(chunks), chunks
+
+    def _read(self, fetch: Fetch, expect: walker.Expect, offset: int, length: int | None, for_gateway: bool,
+              raw: bool) -> Iterator[bytes]:
+        """read() of a resolved target, in fetch."""
+        if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == "file":
+            # The whole file is fetched and hashed (once: then remembered) before any of it is sent
+            self._check_file(expect, fetch.read_range)
+        sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
+        if sealed is not None:
+            yield from sealed.read(offset, length)
+            return
+        yield from fetch.read_range(expect, offset, length)
 
     def ls(self, target: str, for_gateway: bool = False) -> list[dict]:
         """A directory's entries in name order (fetching its directory and index nodes only)."""

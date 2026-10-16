@@ -240,6 +240,7 @@ class Storage:
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
         self._generation = 0  # incremented whenever blocks are deleted, invalidating walks in progress
         self._cache_generation = 0  # incremented whenever cache records are removed or retargeted
+        self._changes = 0  # incremented with each block stored, pin, release and new cache record (changes())
         # Cache records changed (or removed) since the last save(); every one is among the most recently used
         self._cache_dirty: set[tuple[Cid, tuple[str, ...]]] = set()
         self._cache_used = 0  # the cache table's next used value: larger than every one saved
@@ -383,6 +384,7 @@ class Storage:
             if cid not in self._sizes:
                 self._sizes[cid] = len(block)
                 self._used += len(block)
+                self._changes += 1
                 if not protected:
                     self._maybe_garbage = True
 
@@ -427,6 +429,7 @@ class Storage:
                     added.append(cid)
             if not added:
                 return
+            self._changes += 1
             try:
                 self._save_pins(source, added=added)
             except BaseException:
@@ -445,6 +448,7 @@ class Storage:
             if sources is None or source not in sources:
                 return False
             sources.discard(source)
+            self._changes += 1
             if not sources:
                 del self._pins[cid]
                 self._maybe_garbage = True
@@ -485,7 +489,9 @@ class Storage:
         key = (root, tuple(names))
         with self._lock:
             previous = self._cache.get(key)
-            if previous is not None and previous != target:
+            if previous is None:
+                self._changes += 1
+            elif previous != target:
                 self._maybe_garbage = True
                 self._cache_generation += 1
             self._cache[key] = target
@@ -532,6 +538,12 @@ class Storage:
         cached_targets() has only gained members."""
         with self._lock:
             return self._cache_generation
+
+    def changes(self) -> int:
+        """A count that grows with every block stored or deleted, pin or release, and cache record added, removed
+        or retargeted: while it is unchanged, so are pins(), cached_targets() and every dag_blocks() answer."""
+        with self._lock:
+            return self._changes + self._generation + self._cache_generation
 
     # Protection
 

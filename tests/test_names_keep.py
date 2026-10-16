@@ -525,6 +525,19 @@ class KeeperNodesTest(unittest.TestCase):
         self.assertEqual(again.feature("follow").following()[0]["pinned"], str(cid1))
         self.assertIn("follow", again.feature("keepers").store.reasons(self.name))
 
+    def test_failed_construction_releases_the_state_database(self):
+        """A constructor that raises after opening its store closes it: the node never closes a feature it
+        didn't get."""
+        node = self.a
+        database = statedb._open[statedb._key(node.config.state_dir)]
+        before = database.references
+        with mock.patch.object(node.names, "keepers", node.names.keepers), \
+                mock.patch.object(node.publisher, "add_key_source"), \
+                mock.patch.object(keepers.KeepersFeature, "sync_own", side_effect=ValueError("no key")), \
+                self.assertRaises(ValueError):
+            keepers.KeepersFeature(node)
+        self.assertEqual(database.references, before)
+
 
 class NameRequestServerTest(unittest.TestCase):
     """/name registered on the request server through Feature.requests: limits and private mode apply."""

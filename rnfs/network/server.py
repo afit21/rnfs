@@ -70,10 +70,11 @@ COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered 
 # that many per round trip. Over real RNS on loopback (the shortest round trip there is), a 10,000-key /provide
 # (182 requests, one at a time) ran at ~900 a second and two threads sending /find back to back at 2,100-3,600;
 # the busiest link in the end-to-end tests saw 13 in a second. So the limit binds only on a link sending faster
-# than any rnfs requester over a real network (or a tight loop like that last one, slowed to the rate). Requests over it are answered False while the link has refusals
-# left (OVER_RATE_REFUSALS, one more a second), so a requester that gets there backs off as from any refusal,
-# and dropped unanswered after that. RNS has already decrypted and decoded each request and started its thread
-# by then; what the limit saves is the handler's work and the answer (about 40% of a /find's cost to the node)
+# than any rnfs requester over a real network (or a tight loop like that last one, slowed to the rate).
+# Requests over it are answered False while the link has refusals left (OVER_RATE_REFUSALS, one more a
+# second), so a requester that gets there backs off as from any refusal, and dropped unanswered after that.
+# RNS has already decrypted and decoded each request and started its thread by then; what the limit saves is
+# the handler's work and the answer (about 40% of a /find's cost to the node)
 REQUEST_BURST = 2000
 REQUEST_RATE = 2000.0
 OVER_RATE_REFUSALS = 2 * MAX_REQUESTS_PER_LINK
@@ -106,6 +107,10 @@ class Backend(Protocol):
 
     def is_member(self, identity_hash: bytes) -> bool:
         """In private mode, True if the identity with this 16-byte hash is a member."""
+
+    def feature_requests(self) -> dict:
+        """Optional (looked up with getattr): request paths added by features, {path: handler(data,
+        remote_identity)}, served within the same per-link limits; a path rnfs serves itself is ignored."""
 
 
 # Pure policy
@@ -681,10 +686,9 @@ class RequestServer:
         self.over_rate_logged_at: float | None = None
         self.over_rate_logged = 0
 
-        # Process-wide: refuses compressed incoming Resources (RNS decompresses at most this many bytes, so
-        # any compressed payload fails) and stops RNS compressing outgoing ones (section 3)
-        RNS.Resource.AUTO_COMPRESS_MAX_SIZE = 0
-        # Process-wide: reject request Resources and advertisements whose transfer outgrows their size
+        # Reject request Resources, compressed ones and advertisements whose transfer outgrows their size: on
+        # every link in the daemon, which also turns RNS's compression off process-wide, or on rnfs.dht links
+        # in an embedded node (guards.install, in the scope the node set)
         guards.install()
         # Links that never finish their handshake are kept in a bucket of their own, below max_incoming_links
         guards.limit_half_open(destination, config.max_incoming_links)
@@ -793,7 +797,9 @@ class RequestServer:
     # Handlers
 
     def _guarded(self, handler):
-        """Wrap handler so an unexpected error answers False rather than leaving the requester waiting."""
+        """Wrap handler with the link's rate limit (over it: False, or None, which RNS doesn't answer), the
+        private-mode membership check (False for a non-member), and an answer of False for an unexpected error
+        rather than leaving the requester waiting."""
         def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
             """RNS's six-argument request handler signature."""
             # First, before any parsing: the link's rate limit. None: RNS sends no answer

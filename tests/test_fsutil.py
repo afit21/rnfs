@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -342,7 +343,7 @@ class LockTest(unittest.TestCase):
     def lock(self) -> int:
         """Take the lock in this process (released before the directory is removed)."""
         fd = fsutil.lock_exclusive(self.path)
-        self.addCleanup(os.close, fd)
+        self.addCleanup(fsutil.unlock, fd)
         return fd
 
     def test_a_second_process_is_refused_until_the_first_lets_go(self):
@@ -375,12 +376,78 @@ class LockTest(unittest.TestCase):
         self.lock()
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
+    def test_unlock_frees_it_at_once(self):
+        """unlock() releases the lock and closes the descriptor: the lock can be taken again right away (another
+        descriptor of the file in this process is refused while it is held)."""
+        fd = fsutil.lock_exclusive(self.path)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fsutil.lock_exclusive(self.path)
+        finally:
+            with mock.patch("os.close", wraps=os.close) as close:
+                fsutil.unlock(fd)
+        close.assert_called_once_with(fd)
+        self.lock()
+
     def test_holder_of_a_file_without_a_process_id_is_unknown(self):
         """lock_holder gives None for a missing or unreadable lock file."""
         self.assertIsNone(fsutil.lock_holder(self.path))
         with open(self.path, "w", encoding="ascii") as f:
             f.write("not a pid")
         self.assertIsNone(fsutil.lock_holder(self.path))
+
+
+
+class WindowsLockTest(unittest.TestCase):
+    """lock_exclusive and unlock on Windows, over a stand-in msvcrt that records each locking() call."""
+
+    def setUp(self):
+        """A lock file path in a temporary directory, and the Windows branch over the stand-in."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, "daemon.lock")
+        self.calls = []
+        self.error: OSError | None = None
+        msvcrt = types.SimpleNamespace(LK_UNLCK=0, LK_NBLCK=2, locking=self.locking)
+        for patcher in (mock.patch.object(fsutil, "IS_WINDOWS", True),
+                        mock.patch.dict(sys.modules, {"msvcrt": msvcrt})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def locking(self, fd: int, mode: int, nbytes: int):
+        """msvcrt.locking: record (mode, nbytes, the file position), then raise self.error if set."""
+        self.calls.append((mode, nbytes, os.lseek(fd, 0, os.SEEK_CUR)))
+        if self.error is not None:
+            raise self.error
+
+    def test_one_byte_past_the_text_is_locked_then_unlocked(self):
+        """The byte at LOCK_OFFSET is locked without waiting, and unlock() unlocks that byte before closing."""
+        fd = fsutil.lock_exclusive(self.path)
+        self.assertEqual(fsutil.lock_holder(self.path), os.getpid())
+        with mock.patch("os.close", wraps=os.close) as close:
+            fsutil.unlock(fd)
+        close.assert_called_once_with(fd)
+        self.assertEqual(self.calls, [(2, 1, fsutil.LOCK_OFFSET), (0, 1, fsutil.LOCK_OFFSET)])
+
+    def test_only_a_lock_conflict_means_another_holder(self):
+        """EACCES (or EDEADLOCK) is BlockingIOError; any other error is raised as it is. The file is closed."""
+        for error, expected in ((PermissionError(errno.EACCES, "Permission denied"), BlockingIOError),
+                                (OSError(errno.EDEADLK, "Resource deadlock avoided"), BlockingIOError),
+                                (OSError(errno.EINVAL, "Invalid argument"), OSError)):
+            self.error = error
+            with self.subTest(error=error), mock.patch("os.close", wraps=os.close) as close:
+                with self.assertRaises(OSError) as caught:
+                    fsutil.lock_exclusive(self.path)
+                self.assertIs(type(caught.exception), expected)
+                close.assert_called_once()
+
+    def test_unlock_closes_even_if_unlocking_fails(self):
+        """A failed unlock is left to the close."""
+        fd = fsutil.lock_exclusive(self.path)
+        self.error = PermissionError(errno.EACCES, "Permission denied")
+        with mock.patch("os.close", wraps=os.close) as close:
+            fsutil.unlock(fd)
+        close.assert_called_once_with(fd)
 
 
 if __name__ == "__main__":

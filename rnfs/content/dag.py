@@ -9,8 +9,14 @@ beyond its bundled msgpack.
 Writers produce exactly what umsgpack.packb produces: str as str, bytes as bin, shortest headers.
 Readers accept nothing else: the decoder below understands only the few msgpack forms a node can
 contain, and a node must re-encode to identical bytes, which rules out non-shortest headers.
+
+Decoding is a pure function of the block's bytes and nodes are immutable, so decode() remembers the nodes of
+the blocks it decoded last (MEMO_BLOCKS of them, MEMO_BYTES of blocks): a read walks the same file and
+directory nodes many times (a cat of 64 KiB from a large file decoded its root node about twenty times).
 """
 import struct
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from RNS.vendor import umsgpack
@@ -25,6 +31,10 @@ KINDS = (KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY)
 
 MAX_SIZE = 2**64 - 1  # a size above this makes a DAG invalid
 MAX_NAME_BYTES = 255
+# decode()'s memo of nodes by block bytes, least recently used forgotten first: a node's Python objects take
+# several times its block's bytes, so this holds well under 20 MB
+MEMO_BLOCKS = 256
+MEMO_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -239,16 +249,58 @@ class _Reader:
             raise InvalidDag(f"expected an array of {count} fields, found {length}")
 
 
+class _Memo:
+    """decode()'s memo: block bytes -> node, for blocks that decoded (an invalid one is checked every time)."""
+
+    def __init__(self):
+        """Empty."""
+        self._lock = threading.Lock()
+        self._nodes: OrderedDict[bytes, Node] = OrderedDict()  # least recently used first
+        self._bytes = 0
+
+    def get(self, block: bytes) -> "Node | None":
+        """The node block decoded to, if remembered."""
+        with self._lock:
+            node = self._nodes.get(block)
+            if node is not None:
+                self._nodes.move_to_end(block)
+            return node
+
+    def put(self, block: bytes, node: Node):
+        """Remember block's node, forgetting the least recently used past MEMO_BLOCKS or MEMO_BYTES."""
+        with self._lock:
+            if block not in self._nodes:
+                self._bytes += len(block)
+            self._nodes[block] = node
+            self._nodes.move_to_end(block)
+            while len(self._nodes) > MEMO_BLOCKS or self._bytes > MEMO_BYTES:
+                forgotten, _ = self._nodes.popitem(last=False)
+                self._bytes -= len(forgotten)
+
+
+_memo = _Memo()
+
+
 def decode(block: bytes) -> Node:
     """The DAG node encoded by block, checked strictly. Raises InvalidDag for anything not exactly valid.
 
     Checks the encoding rules (types, shortest headers, no extra fields or trailing bytes), the name
     rules, sorted unique names, strictly increasing first_names, kinds and size overflow. Checks that
     need a node's context (child types, sizes against children, index bounds, depth) are walker.py's.
+    The node of a block decoded recently is remembered: the same bytes always give the same node.
     """
     if not isinstance(block, (bytes, bytearray, memoryview)):
         raise TypeError("block must be bytes")
     block = bytes(block)
+    node = _memo.get(block)
+    if node is None:
+        node = _decode(block)
+        _memo.put(block, node)
+    return node
+
+
+def _decode(block: bytes) -> Node:
+    """decode(), without the memo."""
     if len(block) > MAX_BLOCK_SIZE:
         raise InvalidDag(f"block of {len(block)} bytes exceeds MAX_BLOCK_SIZE")
     reader = _Reader(block)

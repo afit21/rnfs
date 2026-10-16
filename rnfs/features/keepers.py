@@ -428,7 +428,6 @@ class KeepersFeature(Feature):
     def __init__(self, node):
         """Load kept names, hook into names and the publisher; no network."""
         super().__init__(node)
-        self.store = KeeperStore(node.config.state_dir, node.config.keep_max_names)
         links = getattr(node, "links", None)
         # Offline test nodes have no LinkPool: their fake client may answer name_record itself
         self.client = KeeperClient(links) if links is not None else node.client
@@ -442,15 +441,20 @@ class KeepersFeature(Feature):
         # names without a record every one is asked in turn
         self._retry_cursor: bytes | None = None
         self._rng = random.Random()  # breaks ties between keepers of equal standing
-        node.names.keepers = self
-        node.publisher.add_key_source(self.store.provided_keys)
-        # Kept records are the floor for resolving: NameManager persists only names resolved by the user,
-        # so after a restart it would otherwise accept an older replayed announce of a kept name
-        for name in self.store.names():
-            kept = self.local_record(name)
-            if kept is not None:
-                node.names.offer(name, *kept)
-        self.sync_own()
+        self.store = KeeperStore(node.config.state_dir, node.config.keep_max_names)
+        try:
+            node.names.keepers = self
+            node.publisher.add_key_source(self.store.provided_keys)
+            # Kept records are the floor for resolving: NameManager persists only names resolved by the user,
+            # so after a restart it would otherwise accept an older replayed announce of a kept name
+            for name in self.store.names():
+                kept = self.local_record(name)
+                if kept is not None:
+                    node.names.offer(name, *kept)
+            self.sync_own()
+        except BaseException:
+            self.store.close()
+            raise
 
     # Lifecycle
 
@@ -707,12 +711,13 @@ class KeepersFeature(Feature):
         sources listed some (this node counts as one if an established publisher stored a record here), or
         the lookup is complete. Candidates are ranked by standing then at random (rank_keepers), and each batch
         takes first, in that order, those listed by a source no earlier pick was listed by (this node, an
-        established listing node, or, as one source, nobody established), then the rest in rank order. Unknown keepers (a path request each) get a budget of
-        alpha of their own, apart from the lookup's. Another batch is asked, up to keeper_rounds() in all,
-        while no answer reaches the highest sequence already known for the name (from an announce, a resolve
-        or a kept record), or fewer than two keepers answered (when no sequence is known, two established
-        keepers; on a slow node a second batch is asked for this only when nothing is known to compare
-        against). Each verifying record is returned; the caller keeps the highest sequence.
+        established listing node, or, as one source, nobody established), then the rest in rank order. Unknown
+        keepers (a path request each) get a budget of alpha of their own, apart from the lookup's. Another batch
+        is asked, up to keeper_rounds() in all, while no answer reaches the highest sequence already known for
+        the name (from an announce, a resolve or a kept record), or fewer than two keepers answered (when no
+        sequence is known, two established keepers; on a slow node a second batch is asked for this only when
+        nothing is known to compare against). Each verifying record is returned; the caller keeps the highest
+        sequence.
         """
         node = self.node
         key = name_key(name)

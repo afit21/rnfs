@@ -99,7 +99,7 @@ def read_full(stream: BinaryIO, want: int) -> bytes:
     return b"".join(parts)
 
 
-def _read_limited(stream: BinaryIO, want: int, remaining: int | None) -> tuple[bytes, int | None]:
+def read_limited(stream: BinaryIO, want: int, remaining: int | None) -> tuple[bytes, int | None]:
     """Up to want bytes (within remaining, if set) and the new remaining. ValueError if a sized stream ends early."""
     if remaining is not None:
         want = min(want, remaining)
@@ -115,7 +115,7 @@ def fixed_chunks(stream: BinaryIO, size: int | None = None) -> Iterator[bytes]:
     """Consecutive CHUNK_SIZE pieces (the last may be shorter, never empty): the spec's tree rule."""
     remaining = size
     while remaining is None or remaining > 0:
-        chunk, remaining = _read_limited(stream, constants.CHUNK_SIZE, remaining)
+        chunk, remaining = read_limited(stream, constants.CHUNK_SIZE, remaining)
         if not chunk:
             return
         yield chunk
@@ -131,7 +131,7 @@ def fastcdc_stream(stream: BinaryIO, size: int | None = None) -> Iterator[bytes]
     eof = False
     while True:
         if not eof and len(buffer) - start < MAX_SIZE:
-            data, remaining = _read_limited(stream, READ_SIZE, remaining)
+            data, remaining = read_limited(stream, READ_SIZE, remaining)
             eof = len(data) < READ_SIZE or remaining == 0
             buffer = buffer[start:] + data
             start = 0

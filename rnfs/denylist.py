@@ -14,7 +14,13 @@ Checks are set lookups: `cids` (binary CIDs) and `hashes` (32-byte digests) are 
 read without a lock, so /blocks serving and each block a fetch stores pay one lookup. A list is untrusted input:
 parse_list refuses one over MAX_LIST_BYTES or MAX_LIST_ENTRIES, not UTF-8, or with a line that isn't an entry,
 and its source keeps the version it had. Listeners (the node) are told after every change, outside the lock.
+
+So a file isn't read and hashed again before each send, the SHA-256 of the files checked is remembered by CID
+(at most MAX_KNOWN_HASHES, least recently used forgotten first). A CID's content never changes, so a hash
+remembered never goes stale, and they are kept across restarts in the deny_hashes table: memory is what checks
+read, and save() (the node's periodic saves and its stop) writes the rows changed since the last one, NORMAL.
 """
+import itertools
 import re
 import threading
 import time
@@ -100,10 +106,12 @@ NONE = NoDenyList()
 
 class DenyList(NoDenyList):
     """The node's deny list: the local entries and every source's accepted list, in memory, saved in the state
-    database (deny_entries, deny_lists). Thread-safe; checks take no lock."""
+    database (deny_entries, deny_lists), and the files' hashes remembered (deny_hashes). Thread-safe; checks take
+    no lock."""
 
     def __init__(self, state_dir: str, clock: Callable[[], float] = time.time):
-        """Load the local entries and the sources' accepted versions (their entries come with reload())."""
+        """Load the local entries, the sources' accepted versions (their entries come with reload()) and the
+        files' hashes remembered."""
         self.clock = clock
         self.cids: frozenset[bytes] = frozenset()
         self.hashes: frozenset[bytes] = frozenset()
@@ -111,7 +119,12 @@ class DenyList(NoDenyList):
         self._local: dict[str, tuple[bytes | None, bytes | None]] = {}  # canonical text -> (binary CID, digest)
         self._accepted: dict[str, Cid] = {}  # source -> the version it last accepted (the deny_lists table)
         self._lists: dict[str, tuple[frozenset[bytes], frozenset[bytes]]] = {}  # source -> its entries, read
-        self._known: OrderedDict[bytes, bytes] = OrderedDict()  # binary file CID -> its content's SHA-256
+        self._known: OrderedDict[bytes, bytes] = OrderedDict()  # binary file CID -> its content's SHA-256, LRU
+        # Hashes remembered, used or forgotten since the last save(); every one still known is among the most
+        # recently used
+        self._known_dirty: set[bytes] = set()
+        self._known_used = 0  # the deny_hashes table's next used value: larger than every one saved
+        self._save_lock = threading.Lock()  # keeps saves in order without holding _lock while writing
         self._listeners: list[Callable[[], None]] = []
         self._db = statedb.connect(state_dir)
         try:
@@ -121,8 +134,9 @@ class DenyList(NoDenyList):
             raise
 
     def _load(self):
-        """Read both tables; a row that doesn't parse is logged and deleted."""
-        bad_entries, bad_lists = [], []
+        """Read the tables; a row that doesn't parse is logged and deleted, as are hashes past MAX_KNOWN_HASHES
+        (the least recently used)."""
+        bad_entries, bad_lists, bad_hashes = [], [], []
         for (text,) in self._db.query("SELECT entry FROM deny_entries"):
             try:
                 canonical, binary, digest = parse_entry(text)
@@ -140,12 +154,27 @@ class DenyList(NoDenyList):
                 self._accepted[source] = Cid.from_bytes(binary)
             except (ValueError, TypeError):
                 bad_lists.append((dumped,))
-        if bad_entries or bad_lists:
-            log(f"deny list: dropped {plural(len(bad_entries) + len(bad_lists), 'invalid row')} from the state "
-                f"database", LOG_WARNING)
+        for binary, digest, used in self._db.query("SELECT cid, digest, used FROM deny_hashes ORDER BY used"):
+            try:
+                Cid.from_bytes(binary)
+                if not isinstance(digest, bytes) or len(digest) != 32 or not isinstance(used, int):
+                    raise ValueError("not a SHA-256 digest and a position")
+            except ValueError:
+                bad_hashes.append((binary,))
+                continue
+            self._known[binary] = digest
+            self._known_used = max(self._known_used, used + 1)
+        excess = list(itertools.islice(self._known, max(0, len(self._known) - MAX_KNOWN_HASHES)))
+        for binary in excess:
+            del self._known[binary]
+        bad = len(bad_entries) + len(bad_lists) + len(bad_hashes)
+        if bad:
+            log(f"deny list: dropped {plural(bad, 'invalid row')} from the state database", LOG_WARNING)
+        if bad or excess:
             with self._db.transaction() as tx:
                 tx.executemany("DELETE FROM deny_entries WHERE entry = ?", bad_entries)
                 tx.executemany("DELETE FROM deny_lists WHERE source = ?", bad_lists)
+                tx.executemany("DELETE FROM deny_hashes WHERE cid = ?", bad_hashes + [(binary,) for binary in excess])
         self._rebuild()
 
     def reload(self, read: Callable[[Cid], bytes | None]):
@@ -180,21 +209,23 @@ class DenyList(NoDenyList):
         return digest in self.hashes
 
     def known_hash(self, cid: Cid) -> bytes | None:
-        """The SHA-256 of file cid's content, if worked out before."""
+        """The SHA-256 of file cid's content, if worked out before (here or before a restart: it never changes)."""
         with self._lock:
             digest = self._known.get(cid.binary)
             if digest is not None:
                 self._known.move_to_end(cid.binary)
+                self._known_dirty.add(cid.binary)
             return digest
 
     def remember_hash(self, cid: Cid, digest: bytes):
         """Remember the SHA-256 of file cid's content (at most MAX_KNOWN_HASHES files, least recently used
-        forgotten first)."""
+        forgotten first); saved with the next save()."""
         with self._lock:
             self._known[cid.binary] = digest
             self._known.move_to_end(cid.binary)
+            self._known_dirty.add(cid.binary)
             while len(self._known) > MAX_KNOWN_HASHES:
-                self._known.popitem(last=False)
+                self._known_dirty.add(self._known.popitem(last=False)[0])
 
     # The local list
 
@@ -309,6 +340,30 @@ class DenyList(NoDenyList):
                 listener()
             except Exception as e:  # noqa: BLE001 - one listener mustn't stop the others
                 log(f"deny list: applying a change failed: {e!r}", LOG_WARNING)
+
+    def save(self):
+        """Persist the hashes remembered, used or forgotten since the last save, least recently used first
+        (NORMAL: the node's periodic saves and its stop). Raises OSError (StateDbError) if the write fails; the
+        rows are then saved by the next one."""
+        with self._save_lock:
+            with self._lock:
+                if not self._known_dirty:
+                    return
+                dirty, self._known_dirty = self._known_dirty, set()
+                # Each change moved its hash to the end, so those still known are the last ones, in order
+                kept = sum(1 for binary in dirty if binary in self._known)
+                changed = list(itertools.islice(reversed(self._known.items()), kept))[::-1]
+                rows = [(binary, digest, self._known_used + n) for n, (binary, digest) in enumerate(changed)]
+                self._known_used += len(rows)
+                gone = [(binary,) for binary in dirty if binary not in self._known]
+            try:
+                with self._db.transaction() as tx:
+                    tx.executemany("DELETE FROM deny_hashes WHERE cid = ?", gone)
+                    tx.executemany("INSERT OR REPLACE INTO deny_hashes (cid, digest, used) VALUES (?, ?, ?)", rows)
+            except BaseException:
+                with self._lock:
+                    self._known_dirty |= dirty
+                raise
 
     def close(self):
         """Release the state database (idempotent)."""

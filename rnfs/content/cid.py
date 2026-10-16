@@ -85,6 +85,7 @@ class Cid:
 
     @property
     def is_raw(self) -> bool:
+        """True for a raw block's CID."""
         return self.codec == RAW
 
     def verify(self, block: bytes) -> bool:

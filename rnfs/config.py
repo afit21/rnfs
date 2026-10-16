@@ -16,6 +16,8 @@ from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
 DEFAULT_API_PORT = 8788
 DEFAULT_GATEWAY_PORT = 8789
 SETTINGS_FILE = "rnfs.toml"
+# In the rnfs dir, locked by the daemon or embedded node using it (node.lock_rnfs_dir), so a second can't start
+LOCK_FILE = "daemon.lock"
 
 # Core settings' types and ranges, checked by Config.validate (feature settings are checked by their features)
 WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free port (printed at start)
@@ -265,9 +267,10 @@ class Config:
             raise ValueError("reticulum_dir must be a directory path")
 
     @classmethod
-    def load(cls, rnfs_dir: str = "~/.rnfs/", **overrides) -> "Config":
-        """Settings from `<rnfs_dir>/rnfs.toml` if it exists, then overrides (None values ignored), validated."""
-        values: dict = {}
+    def load(cls, rnfs_dir: str = "~/.rnfs/", defaults: dict | None = None, **overrides) -> "Config":
+        """Settings from `<rnfs_dir>/rnfs.toml` if it exists, then overrides (None values ignored), validated.
+        defaults (an embedded node's) apply where neither sets a value."""
+        values: dict = dict(defaults or {})
         path = os.path.join(os.path.expanduser(rnfs_dir), SETTINGS_FILE)
         if os.path.isfile(path):
             with open(path, "rb") as f:

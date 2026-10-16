@@ -125,6 +125,10 @@ SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
         # source: a deny_lists setting as written (dump()ed); cid: the list version it last accepted
         "CREATE TABLE deny_lists (source TEXT PRIMARY KEY, cid BLOB NOT NULL, accepted REAL NOT NULL) WITHOUT ROWID",
     )),
+    ("denylist_hashes", (
+        # Files' content SHA-256 (digest) by binary CID; used orders them (least recently used lowest)
+        "CREATE TABLE deny_hashes (cid BLOB PRIMARY KEY, digest BLOB NOT NULL, used INTEGER NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

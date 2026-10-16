@@ -187,7 +187,6 @@ def printable_size(size: int) -> str:
         if size < 1024 or unit == "GiB":
             return f"{size} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
-    return str(size)
 
 
 def listing_html(title: str, entries: list[dict], has_parent: bool) -> bytes:
@@ -213,6 +212,7 @@ class GatewayError(Exception):
     """A request the gateway answers with an error: status, message and extra headers."""
 
     def __init__(self, status: int, message: str, headers: dict | None = None):
+        """An error answered with status, message and headers (none if None)."""
         super().__init__(message)
         self.status = status
         self.headers = headers or {}
@@ -222,6 +222,7 @@ class FetchLimiter:
     """At most `limit` concurrent network fetches or name resolutions for requests that aren't navigation."""
 
     def __init__(self, limit: int):
+        """Allow limit fetches at once."""
         self.limit = limit
         self.active = 0
         self.lock = threading.Lock()
@@ -244,6 +245,7 @@ class NameCache:
     """Recent name resolutions (name → CID), reused for NAME_CACHE_TIME. LRU, at most NAME_CACHE_SIZE."""
 
     def __init__(self, clock=time.monotonic):
+        """An empty cache, aged by clock."""
         self.entries: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self.lock = threading.Lock()
         self.clock = clock
@@ -282,6 +284,7 @@ class _CountingWriter:
         return written
 
     def __getattr__(self, name):
+        """Everything else from the stream itself."""
         return getattr(self._stream, name)
 
 
@@ -601,13 +604,7 @@ class GatewayHandler(TimedHandler):
         if read_start:
             head = b"".join(self.node.read(target, offset=0, length=length, for_gateway=True))
         else:
-            stored_head = getattr(self.node, "stored_head", None)  # facades without it: only complete targets
-            if stored_head is not None:
-                head = stored_head(target, length)
-            elif self.node.is_local(target):
-                head = b"".join(self.node.read(target, offset=0, length=length, for_gateway=True))
-            else:
-                head = None
+            head = self.node.stored_head(target, length)
             if head is None:
                 return type_from_name(filename) or "application/octet-stream"
         return "application/octet-stream" if is_sealed(head) else type_from_name(filename) or sniff(head)

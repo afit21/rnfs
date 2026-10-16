@@ -16,6 +16,10 @@ would allow rollback. Floor saves (name_floor) write only the entries changed to
 power loss may lose the last of them; a malformed floor entry is dropped. The names.json and name-floor.json of
 rnfs 0.1.4 and earlier are imported once (import_names, import_floor).
 
+Watching (rnfs.Node's names.watch, GET /api/name/watch): a watched name's announces count as asked for, so a full
+table never refuses them, and record listeners are told, with the lock held, of each newer record accepted for one
+(an announce, a path response, a keeper's answer, a publish here); they only queue it.
+
 Every RNS call goes through `RnsNetwork`, so tests swap in a fake and run without Reticulum.
 """
 import json
@@ -53,6 +57,7 @@ FLOOR_SAVE_INTERVAL = 5.0  # seconds: a resolve raising the floor saves it at on
 FLOOR_TOUCH_SAVE = 3600.0  # a resolve that only renews a floor entry's time marks it for the next save after this
 PIN_SOURCE_PREFIX = "name:"
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_PARTIAL = re.compile(re.escape(fsutil.PARTIAL_PREFIX) + r"[0-9a-f]{16}")  # a key write's temp file (write_atomic)
 _DECIMAL = re.compile(r"-?[0-9]+")  # a sequence column (decimal text: sequences don't fit SQLite's integers)
 _MAX_USED = 2**62  # floor rows' used values stay below this, so the ones after them still fit SQLite's integers
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
@@ -148,6 +153,11 @@ class _Published:
     # A key imported from elsewhere (or found with no saved record: the state was lost) may already have records
     # on the network and at keepers, so its first publish asks both before choosing a sequence
     imported: bool = False
+
+    @property
+    def unsettled(self) -> bool:
+        """Imported and not yet published here: its records elsewhere are unknown."""
+        return self.imported and self.cid is None
 
 
 # State
@@ -396,7 +406,7 @@ class NameManager:
         # Floor saves write without self._lock, one at a time, so an older snapshot never lands last. Taken before
         # self._lock, never while holding it
         self._floor_save_lock = threading.Lock()
-        self._held_dirty = False  # heard times changed without a save
+        self._held_dirty = False  # held records changed without a save (heard again, or a save that failed)
 
         self._destinations: dict[str, object] = {}
         self._next_announce: dict[str, float] = {}  # alias -> monotonic time
@@ -406,6 +416,11 @@ class NameManager:
         # The keepers feature (rnfs.features.keepers), if loaded: told of heard and published records, and asked
         # for signed records when the network has none. Never called with self._lock held
         self.keepers = None
+        # Names watched (rnfs.Node's names.watch, GET /api/name/watch), and how many watches each: their announces
+        # count as asked, so a full table never refuses them. Record listeners (add_record_listener) are told of
+        # each newer record accepted for a watched name; swapped whole, so they are read without the lock
+        self._watched: dict[bytes, int] = {}
+        self._record_listeners: tuple = ()
         # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
         self._gone: list[tuple[str, Cid]] = []
         # Aliases whose key file is there but couldn't be read (permissions, damage): not names this node can
@@ -438,8 +453,9 @@ class NameManager:
             self._check_free(alias)
             identity = RNS.Identity()
             self._add_key(alias, identity, _Published(0, None))
-        log(f"created name {self._names[alias].hex()} as {alias}", LOG_NOTICE)
-        return self._names[alias]
+            name = self._names[alias]  # under the lock: a remove may follow at once
+        log(f"created name {name.hex()} as {alias}", LOG_NOTICE)
+        return name
 
     def import_key(self, alias: str, data: bytes) -> bytes:
         """Store a key exported by export_key under alias and return its name. ValueError if invalid or taken."""
@@ -490,8 +506,9 @@ class NameManager:
                     LOG_WARNING)
         log(f"removed name {name.hex()} ({alias})", LOG_NOTICE)
 
-    def release_gone(self):
-        """Release the pins of names whose key file was deleted by hand (found by the constructor).
+    def release_gone(self) -> set[tuple[str, Cid]]:
+        """Release the pins of names whose key file was deleted by hand (found by the constructor); returns the
+        (alias, CID) pins released.
 
         Not done while loading: releasing a pin recomputes what the node provides, which needs the rest of the
         node, and the features' keys (kept names), set up first.
@@ -503,6 +520,7 @@ class NameManager:
                 self._pins.unpin(cid, PIN_SOURCE_PREFIX + alias)
             if gone:
                 self._save()  # its entry is dropped only once its pin is released
+            return set(gone)
 
     def reconcile_pins(self, pins: dict[Cid, set[str]]):
         """Make the name pins (pins: every pin and its sources, as storage.pins() gives them) match the saved
@@ -514,13 +532,16 @@ class NameManager:
         release them; a pin of an alias with no key file at all is released, but one whose key file is there and
         can't be read is kept.
         """
-        self.release_gone()
+        released = self.release_gone()
         with self._lock:
             held: dict[str, set[Cid]] = {}
             for cid, sources in pins.items():
                 for source in sources:
-                    if source.startswith(PIN_SOURCE_PREFIX):
-                        held.setdefault(source[len(PIN_SOURCE_PREFIX):], set()).add(cid)
+                    if not source.startswith(PIN_SOURCE_PREFIX):
+                        continue
+                    alias = source[len(PIN_SOURCE_PREFIX):]
+                    if (alias, cid) not in released:  # pins taken before release_gone() let go of these
+                        held.setdefault(alias, set()).add(cid)
             for alias in sorted(set(held) | set(self._keys)):
                 cids = held.get(alias, set())
                 if alias in self._unreadable:
@@ -585,7 +606,7 @@ class NameManager:
             raise ValueError("publish needs a CID")
         with self._lock:
             name = self.name(alias)
-            refresh = self._published[alias].imported and self._published[alias].cid is None
+            refresh = self._published[alias].unsettled
         if refresh:
             # A freshly imported key: its previous home may have published sequences we've never heard, which
             # keepers may hold after its announces have expired (section 9: above the highest it can resolve)
@@ -596,7 +617,8 @@ class NameManager:
                     self.offer(name, sequence, kept_cid, heard)
 
         with self._lock:
-            self._identity(alias)  # removed while refreshing?
+            if self.name(alias) != name:  # NotFound if removed while refreshing
+                raise NotFound(f"name {alias} was replaced while publishing")
             self._absorb_recalled(name)
             previous = self._published[alias]
             known = self._record(name, touch=False)
@@ -624,10 +646,11 @@ class NameManager:
                 if cid != previous.cid and cid not in self._stale.get(alias, set()):
                     self._release(alias, {cid})
                 raise
-            self._drop_from_table(name)
+            self._hold(name)
             self._release(alias, ({previous.cid} | self._stale.pop(alias, set())) - {cid, None})
             self._announce(alias)
             identity = self._keys[alias]
+            self._accepted(name, self._held[name])
         log(f"published {name.hex()} ({alias}) -> {cid}, sequence {sequence}", LOG_NOTICE)
         if self.keepers is not None:
             # This node keeps its own names, so they resolve through it while the owner's announce is gone
@@ -703,6 +726,48 @@ class NameManager:
                 delay = _MAX_LOOP_WAIT
             stop_event.wait(min(delay, _MAX_LOOP_WAIT))
 
+    # Watching
+
+    def watch(self, name: bytes):
+        """Watch name: its announces count as asked, and record listeners hear of its newer records."""
+        name = _check_name(name)
+        with self._lock:
+            self._watched[name] = self._watched.get(name, 0) + 1
+            self._heard_only.pop(name, None)  # asked now: no longer the first a full table gives up
+
+    def unwatch(self, name: bytes):
+        """Undo one watch(name)."""
+        with self._lock:
+            count = self._watched.get(name, 0) - 1
+            if count > 0:
+                self._watched[name] = count
+            else:
+                self._watched.pop(name, None)
+
+    def add_record_listener(self, listener):
+        """Call listener(name, record) for each newer record accepted for a watched name (an announce, a path
+        response, a keeper's answer, or a publish here). It is called with the names lock held, on whichever
+        thread accepted the record (RNS's included), so it must only hand the record on, never block or call
+        back into rnfs."""
+        with self._lock:
+            self._record_listeners = (*self._record_listeners, listener)
+
+    def remove_record_listener(self, listener):
+        """Stop calling listener."""
+        with self._lock:
+            # ==, not is: a bound method is a new object at each access, equal to the one added
+            self._record_listeners = tuple(item for item in self._record_listeners if item != listener)
+
+    def _accepted(self, name: bytes, record: Record):
+        """A newer record was accepted for name: tell the record listeners if it is watched. Lock held."""
+        if name not in self._watched:
+            return
+        for listener in self._record_listeners:
+            try:
+                listener(name, record)
+            except Exception as e:  # noqa: BLE001 - one listener mustn't break the others, or the announce
+                log(f"record listener failed: {e!r}", LOG_ERROR)
+
     # Resolving
 
     def resolve(self, name: bytes, persist: bool, max_age: float = 0.0) -> dict | None:
@@ -721,7 +786,7 @@ class NameManager:
             fresh = held is not None and max_age > 0 and 0 <= self._clock() - held.heard < max_age
             alias = self._aliases.get(name)
             # This node's own names need no refresh, unless imported and not yet published here
-            local = alias is not None and not (self._published[alias].imported and self._published[alias].cid is None)
+            local = alias is not None and not self._published[alias].unsettled
         if not local and not fresh:
             started = self._clock()
             self._refresh(name)
@@ -743,7 +808,7 @@ class NameManager:
             if record is None:
                 return None
             if persist and name not in self._held:
-                self._drop_from_table(name)
+                self._hold(name)
                 self._held[name] = record
                 self._save()
             elif name not in self._held:
@@ -816,20 +881,21 @@ class NameManager:
 
     def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
+        name = bytes(name)
         parsed = parse_record(app_data)
         # A name kept here may take a table place like a resolved one (asked outside our lock, as always)
-        kept = parsed is not None and self.keepers is not None and self.keepers.local_record(bytes(name)) is not None
+        kept = parsed is not None and self.keepers is not None and self.keepers.local_record(name) is not None
         with self._lock:
             if parsed is not None:
-                # Unasked: not being resolved (a path response would have a waiter) nor kept
-                unasked = not kept and name not in self._waiters
-                self._offer(bytes(name), parsed[0], parsed[1], self._clock(), unasked=unasked)
+                # Unasked: not being resolved (a path response would have a waiter), kept nor watched
+                unasked = not kept and name not in self._waiters and name not in self._watched
+                self._offer(name, parsed[0], parsed[1], self._clock(), unasked=unasked)
             else:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):
                 event.set()
         if parsed is not None and self.keepers is not None:
-            self.keepers.heard(bytes(name), parsed[0], parsed[1], packet_hash)
+            self.keepers.heard(name, parsed[0], parsed[1], packet_hash)
 
     def offer(self, name: bytes, sequence: int, cid: Cid, heard: float) -> bool:
         """Apply a record whose signature the caller verified (a keeper's answer), under the sequence rules.
@@ -857,16 +923,15 @@ class NameManager:
             return record
         record = self._table.get(name)
         if record is not None and touch:
-            self._table.move_to_end(name)
-            if name in self._heard_only:
-                self._heard_only.move_to_end(name)
+            self._touch(name)
         return record
 
     def _offer(self, name: bytes, sequence: int, cid: Cid, heard: float, unasked: bool = False) -> bool:
         """Apply a validly signed record: True if it replaced the one held. Lower sequences (than the record held,
         or the floor of a name resolved before) are refused, and at an equal sequence the record already held is
         kept. unasked: an announce of a name this node isn't resolving or keeping, which takes a table place only
-        if it is free or held by another name that was only heard."""
+        if it is free or held by another name that was only heard. A held record whose save fails is logged and
+        saved by the next save."""
         held_here = name in self._held
         current = self._record(name, touch=False)
         floor = None if held_here or name not in self._floor else self._floor[name][0]
@@ -887,10 +952,18 @@ class NameManager:
                     self._touch(name)
                 return False
 
-        if not self._store(name, Record(sequence, cid, heard), held_here, unasked):
+        record = Record(sequence, cid, heard)
+        if not self._store(name, record, held_here, unasked):
             return False
         if held_here:
-            self._save()
+            try:
+                self._save()
+            except OSError as e:
+                # Held all the same, and saved by the next save (announce_due's within a minute): raising here
+                # would skip the waking, keepers and listeners, and on RNS's thread reach no one
+                log(f"could not save the record of name {name.hex()}: {e}", LOG_WARNING)
+                self._held_dirty = True
+        self._accepted(name, record)
         return True
 
     def _store(self, name: bytes, record: Record, held_here: bool, unasked: bool = False) -> bool:
@@ -931,9 +1004,18 @@ class NameManager:
             self._heard_only.move_to_end(name)
 
     def _drop_from_table(self, name: bytes):
-        """Remove name from the table (it is held now)."""
+        """Remove name from the table."""
         self._table.pop(name, None)
         self._heard_only.pop(name, None)
+
+    def _hold(self, name: bytes):
+        """name's record is held now: out of the table, and out of the floor (its held record is its floor), whose
+        row the next floor save deletes."""
+        self._drop_from_table(name)
+        if self._floor.pop(name, None) is not None:
+            del self._floor_used[name]
+            self._floor_changed.add(name)
+            self._floor_dirty = True
 
     def _resolved(self, name: bytes, sequence: int) -> bool:
         """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
@@ -1041,8 +1123,8 @@ class NameManager:
         return identity
 
     def _check_free(self, alias: str):
-        """ValueError if alias is in use (in memory or on disk)."""
-        if alias in self._keys or os.path.exists(self._key_path(alias)):
+        """ValueError if alias is in use (in memory or on disk, a dangling symlink included)."""
+        if alias in self._keys or os.path.lexists(self._key_path(alias)):
             raise ValueError(f"alias {alias} already exists")
 
     def _add_key(self, alias: str, identity: RNS.Identity, published: _Published):
@@ -1062,14 +1144,16 @@ class NameManager:
             self._open_destination(alias)
 
     def _remove_old_temps(self):
-        """Delete the temp files an interrupted write of rnfs 0.1.1 or earlier left (names.json.tmp and
-        .<alias>.tmp): it reused those names, but writes now take new ones each time."""
+        """Delete the temp files an interrupted key write left: fsutil.write_atomic's (.partial-<16 hex>), which
+        hold a private key, and those of rnfs 0.1.1 or earlier (names.json.tmp and .<alias>.tmp), which reused
+        those names. Only this node writes here (it holds the rnfs dir's lock), and not yet."""
         try:
             entries = os.listdir(self.config.names_dir)
         except OSError:
             entries = []
         old = [os.path.join(self.config.names_dir, entry) for entry in entries
-               if entry.startswith(".") and entry.endswith(".tmp") and _ALIAS.fullmatch(entry[1:-4])]
+               if (entry.startswith(".") and entry.endswith(".tmp") and _ALIAS.fullmatch(entry[1:-4]))
+               or _PARTIAL.fullmatch(entry)]
         for path in (os.path.join(self.config.state_dir, STATE_FILE + ".tmp"), *old):
             try:
                 fsutil.remove(path)
@@ -1132,7 +1216,7 @@ class NameManager:
         """Read the floor of names resolved without persist, least recently resolved first. A row that doesn't
         parse is logged and deleted (the floor only bounds rollback of gateway and auto-fetch resolves), as are
         those of names held for the user and those _trim_floor drops. A resolve time in the future (the clock was
-        corrected since) counts as now, and the next save writes it so."""
+        corrected since) counts as now, and is written so by the next floor save that has a change to write."""
         now = self._clock()
         dropped = []
         for name, sequence, resolved, used in self._db.query(

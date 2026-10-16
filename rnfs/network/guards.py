@@ -1,12 +1,20 @@
-"""Guards on RNS: process-wide ones on incoming Resource advertisements and responses (sections 3 and 10:
-oversized-response and decoding bombs), and one per destination on half-open incoming links (section 3: link
-exhaustion).
+"""Guards on RNS: on incoming Resource advertisements and responses (sections 3 and 10: oversized-response and
+decoding bombs, compression), and one per destination on half-open incoming links (section 3: link exhaustion).
+
+Their scope is set by install(scope). The daemon owns its process (PROCESS): the advertisement checks below
+cover every link, and RNS's process-wide decompression limit (Resource.AUTO_COMPRESS_MAX_SIZE) is 0, which also
+stops RNS compressing anything the process sends. A node embedded in another program (DHT: rnfs.Node) guards
+only rnfs.dht links and leaves that limit as the program has it, so the program's own requests, Resources and
+compressed transfers behave as with RNS alone; on rnfs.dht links every check still applies, and a compressed
+Resource is refused there just the same (below). rnfs never compresses what it sends on rnfs.dht links in
+either scope: responses are registered with auto_compress=False, which RNS passes to a response Resource, and
+LinkPool sends no request that wouldn't fit one packet, so no request Resource either.
 
 RNS checks Destination.set_max_request_size and a request's max_response_size only against an
 advertisement's data size (d), but receives, buffers and allocates by its transfer size (t). RNS 1.5.6 caps t
 at 3 × Resource.MAX_EFFICIENT_SIZE (~3 MiB) in ResourceAdvertisement.unpack, so a 1 KiB request or a small
-response could still cost ~3 MiB per link. rnfs runs in its own process (section 3), so it wraps
-RNS.Resource.accept once to reject, before anything is allocated:
+response could still cost ~3 MiB per link. So RNS.Resource.accept is wrapped once to reject, before anything is
+allocated (on every link with PROCESS, on rnfs.dht links only with DHT):
 - every request sent as a Resource: rnfs requests always fit in one packet;
 - any advertisement whose transfer size exceeds its data size plus encryption overhead, or exceeds
   MAX_RESPONSE_SIZE plus that overhead (the largest response rnfs accepts is one Resource segment);
@@ -15,7 +23,11 @@ RNS.Resource.accept once to reject, before anything is allocated:
   legitimate rnfs response fits one. Other destinations' Resources (LXMF's, whose messages may span
   segments) are told apart by the link's destination name, which this node chose itself;
 - on rnfs.dht links, any Resource carrying metadata: RNS decodes metadata with umsgpack as the Resource
-  completes, before anyone can look at it, and rnfs responses never have any.
+  completes, before anyone can look at it, and rnfs responses never have any;
+- on rnfs.dht links, any compressed Resource (the advertisement's compressed flag): RNS would decompress it as
+  it completes, before any rnfs check, and rnfs never compresses. Refused before any part is transferred, and
+  each accepted rnfs.dht Resource also gets a decompression limit of 0, so one that passed couldn't be
+  decompressed either.
 
 RNS also decodes a whole response with umsgpack before handing it to rnfs, and a payload of one-byte empty
 arrays or maps decodes to some 70 times its size in Python objects (1 MiB: ~70 MB and ~0.3 s of CPU). So on
@@ -55,7 +67,12 @@ from rnfs.network import protocol
 TRANSFER_OVERHEAD = 128
 MAX_TRANSFER_SIZE = MAX_RESPONSE_SIZE + TRANSFER_OVERHEAD
 
+PROCESS = "process"  # install()'s scopes: every link of the process (the daemon) ...
+DHT = "dht"  # ... or rnfs.dht links only (a node embedded in another program)
+
 _lock = threading.Lock()
+_scope = PROCESS  # what the advertisement checks cover; set by install()
+_compress_limit = None  # Resource.AUTO_COMPRESS_MAX_SIZE before a PROCESS install set it to 0, if one did
 _original_accept = None
 _original_response_resource_concluded = None
 _original_receive = None
@@ -69,7 +86,8 @@ DHT_NAME = f"{APP_NAME}.{DHT_ASPECT}"
 def is_dht_link(link) -> bool:
     """True if link (an RNS.Link, either end) belongs to rnfs.dht: its destination's name is "rnfs.dht"
     plus the identity's hex hash, as RNS.Destination.expand_name builds it."""
-    # An outgoing link has the remote destination; an incoming one has none, and our own as its owner
+    # An outgoing link has the remote destination; an incoming one ours, set (with owner) by
+    # Link.validate_request before the link is registered, so from its first packet on
     destination = getattr(link, "destination", None) or getattr(link, "owner", None)
     name = getattr(destination, "name", None)
     return isinstance(name, str) and (name == DHT_NAME or name.startswith(DHT_NAME + "."))
@@ -86,8 +104,16 @@ def _report_unsupported():
         f"incoming Resources are being refused", LOG_ERROR)
 
 
+def scope() -> str:
+    """What the advertisement checks cover: PROCESS or DHT (install())."""
+    return _scope
+
+
 def refusal(adv, link=None) -> str | None:
     """Why an unpacked ResourceAdvertisement arriving on link must be rejected, or None if it may be accepted."""
+    dht = link is not None and is_dht_link(link)
+    if not dht and _scope == DHT:
+        return None  # an embedded node's host program: its links are RNS's alone
     transfer, data = getattr(adv, "t", _ABSENT), getattr(adv, "d", _ABSENT)
     if transfer is _ABSENT or data is _ABSENT:
         # Not a malformed advertisement but an RNS that renamed the fields: every Resource is refused (failing
@@ -102,10 +128,12 @@ def refusal(adv, link=None) -> str | None:
         return f"transfer size {transfer} exceeds data size {data}"
     if transfer > MAX_TRANSFER_SIZE:
         return f"transfer size {transfer} exceeds the largest response"
-    if link is not None and is_dht_link(link) and (getattr(adv, "l", 1) != 1 or getattr(adv, "i", 1) != 1):
+    if dht and (getattr(adv, "l", 1) != 1 or getattr(adv, "i", 1) != 1):
         return f"rnfs responses are one segment, not {getattr(adv, 'l', '?')}"
-    if link is not None and is_dht_link(link) and getattr(adv, "x", False):
+    if dht and getattr(adv, "x", False):
         return "rnfs responses carry no metadata"
+    if dht and getattr(adv, "c", False):  # last: whatever else the daemon refused is logged as before
+        return "rnfs Resources are never compressed"
     return None
 
 
@@ -124,19 +152,24 @@ def _fail_pending_request(packet, adv):
 
 
 def guarded_accept(advertisement_packet, callback=None, progress_callback=None, request_id=None):
-    """RNS.Resource.accept, but rejecting advertisements refusal() objects to."""
+    """RNS.Resource.accept, but rejecting advertisements refusal() objects to. An rnfs.dht Resource accepted
+    decompresses nothing (refusal() already refused a compressed one)."""
+    link = getattr(advertisement_packet, "link", None)
     try:
         adv = RNS.ResourceAdvertisement.unpack(advertisement_packet.plaintext)
     except Exception:
         adv = None  # let RNS handle an advertisement it can't read, as it always has
-    reason = refusal(adv, getattr(advertisement_packet, "link", None)) if adv is not None else None
+    reason = refusal(adv, link) if adv is not None else None
     if reason is not None:
         log(f"rejected an incoming Resource: {reason}", LOG_WARNING)
         RNS.Resource.reject(advertisement_packet)
         _fail_pending_request(advertisement_packet, adv)
         return None
-    return _original_accept(advertisement_packet, callback=callback, progress_callback=progress_callback,
-                            request_id=request_id)
+    resource = _original_accept(advertisement_packet, callback=callback, progress_callback=progress_callback,
+                                request_id=request_id)
+    if isinstance(resource, RNS.Resource) and link is not None and is_dht_link(link):
+        resource.max_decompressed_size = 0  # what Resource.assemble decompresses at most
+    return resource
 
 
 # Responses checked before RNS decodes them
@@ -230,21 +263,44 @@ def guarded_receive(link, packet):
     return _original_receive(link, packet)
 
 
+def _wrapped(owner, name: str, guard) -> bool:
+    """True if owner.name (set on owner itself, plain or as a staticmethod) is guard."""
+    current = owner.__dict__.get(name)
+    return getattr(current, "__func__", current) is guard
+
+
 def _wrap(owner, name: str, guard, staticmethod_: bool = False):
     """Replace owner.name with guard unless it is already; the original it replaced."""
-    current = owner.__dict__.get(name)
-    if getattr(current, "__func__", current) is guard:
+    if _wrapped(owner, name, guard):
         return None
     original = getattr(owner, name)
     setattr(owner, name, staticmethod(guard) if staticmethod_ else guard)
     return original
 
 
-def install():
+def install(scope: str | None = None):
     """Wrap RNS.Resource.accept, Link.response_resource_concluded and Link.receive with the guards. Idempotent;
-    called by RequestServer and LinkPool."""
-    global _original_accept, _original_response_resource_concluded, _original_receive
+    called by the node, RequestServer and LinkPool.
+
+    scope is PROCESS (the daemon: the advertisement checks cover every link, and RNS's process-wide
+    decompression limit is set to 0, which also stops it compressing what this process sends) or DHT (an
+    embedded node: rnfs.dht links only, and the limit is left as the host program has it, or put back if a
+    PROCESS install changed it); None keeps the scope already set (PROCESS at first).
+    """
+    global _original_accept, _original_response_resource_concluded, _original_receive, _scope, _compress_limit
     with _lock:
+        if scope is not None:
+            if scope not in (PROCESS, DHT):
+                raise ValueError(f"unknown guard scope {scope!r}")
+            _scope = scope
+        if _scope == PROCESS:
+            # Refuses compressed incoming Resources (RNS decompresses at most this many bytes, so any compressed
+            # payload fails) and stops RNS compressing outgoing ones (section 3)
+            if _compress_limit is None:
+                _compress_limit = RNS.Resource.AUTO_COMPRESS_MAX_SIZE
+            RNS.Resource.AUTO_COMPRESS_MAX_SIZE = 0
+        elif _compress_limit is not None:
+            RNS.Resource.AUTO_COMPRESS_MAX_SIZE, _compress_limit = _compress_limit, None
         original = _wrap(RNS.Resource, "accept", guarded_accept, staticmethod_=True)
         if original is not None:
             _original_accept = original
@@ -258,12 +314,9 @@ def install():
 
 def installed() -> bool:
     """True if the guards are in place."""
-    def wrapped(owner, name, guard):
-        current = owner.__dict__.get(name)
-        return getattr(current, "__func__", current) is guard
-    return (wrapped(RNS.Resource, "accept", guarded_accept)
-            and wrapped(RNS.Link, "response_resource_concluded", guarded_response_resource_concluded)
-            and wrapped(RNS.Link, "receive", guarded_receive))
+    return (_wrapped(RNS.Resource, "accept", guarded_accept)
+            and _wrapped(RNS.Link, "response_resource_concluded", guarded_response_resource_concluded)
+            and _wrapped(RNS.Link, "receive", guarded_receive))
 
 
 # Half-open incoming links

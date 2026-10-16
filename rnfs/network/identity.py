@@ -152,10 +152,3 @@ def parse_node_id(hex_id: str) -> bytes:
         raise ValueError(f"node ID must be {ID_LENGTH * 2} hex characters: {hex_id}")
     return node_id
 
-
-def parse_identity_hash(hex_hash: str) -> bytes:
-    """RNS identity hash from its 32-hex-character form (members, remote_pin_identities). Raises ValueError."""
-    identity_hash = bytes.fromhex(hex_hash.strip().strip("<>"))
-    if len(identity_hash) != RNS.Identity.TRUNCATED_HASHLENGTH // 8:
-        raise ValueError(f"identity hash must be {RNS.Identity.TRUNCATED_HASHLENGTH // 4} hex characters: {hex_hash}")
-    return identity_hash

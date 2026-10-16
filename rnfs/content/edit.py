@@ -17,14 +17,9 @@ def _directory_chain(root: Cid, names: list[str], get: walker.Get) -> list[walke
     """Expectations for the root and each directory along names, in order (len(names) + 1 of them)."""
     chain = [walker.root_expect(root)]
     for i, name in enumerate(names):
-        expect = chain[-1]
-        while True:
-            child = walker.step(expect, get(expect), name)
-            if child is None:
-                raise NotFound(f"{root}/{'/'.join(names[:i + 1])} does not exist")
-            expect = child
-            if not walker.is_index_step(expect):
-                break
+        expect = walker.step_name(chain[-1], name, get)
+        if expect is None:
+            raise NotFound(f"{root}/{'/'.join(names[:i + 1])} does not exist")
         if expect.kind != dag.KIND_DIRECTORY:
             raise ValueError(f"{root}/{'/'.join(names[:i + 1])} is not a directory")
         chain.append(expect)

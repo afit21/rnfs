@@ -18,13 +18,15 @@ from rnfs.content.storage import DENY, remote_source
 from rnfs.denylist import DenyList, parse_entry, parse_list
 from rnfs.errors import Denied, NotFound
 from rnfs.features import deny as deny_feature
+from rnfs.fetcher import Fetch
 from rnfs.gateway import GatewayServer
 from rnfs.names import encode_record
 from rnfs.network import protocol
 from rnfs.network.server import select_blocks
-from tests.support import state_execute
+from tests.support import failing_commits, state_execute, state_rows
 from tests.test_api import raw_request
-from tests.test_node import A_ID, NodeTest, setUpModule, tearDownModule  # noqa: F401 - RNS's loglevel
+from tests.test_node import A_ID, B_ID, NodeTest, setUpModule, tearDownModule  # noqa: F401 - RNS's loglevel
+from tests.test_providers import recorded_writes, rows_written
 
 IDENTITY = bytes(range(16))
 
@@ -69,8 +71,8 @@ class ParseTest(unittest.TestCase):
                 parse_list(lines.encode())
 
 
-class DenyListTest(unittest.TestCase):
-    """The store: local entries and accepted lists, saved in the state database."""
+class StoreTest(unittest.TestCase):
+    """A DenyList on a state directory of its own."""
 
     def setUp(self):
         """A DenyList in a temporary state directory."""
@@ -84,6 +86,10 @@ class DenyListTest(unittest.TestCase):
         deny = DenyList(self.state_dir)
         self.addCleanup(deny.close)
         return deny
+
+
+class DenyListTest(StoreTest):
+    """The store: local entries and accepted lists, saved in the state database."""
 
     def test_local_entries_persist(self):
         """Added entries apply at once and survive a restart; removing one that isn't there adds nothing."""
@@ -145,6 +151,126 @@ class DenyListTest(unittest.TestCase):
         self.assertFalse(third.in_use("name/" + "ab" * 16))
         third.forget("name/" + "ab" * 16)
         self.assertEqual(third.accepted(), {})
+
+
+class KnownHashTest(StoreTest):
+    """Files' hashes remembered, kept across restarts in deny_hashes."""
+
+    def file(self, n: int) -> tuple[Cid, bytes]:
+        """A file's CID (a DAG node, as files of more than one chunk have) and its content's hash."""
+        return Cid.for_block(DAG, b"file %d" % n), hashlib.sha256(b"content %d" % n).digest()
+
+    def reopen(self) -> DenyList:
+        """Save and close the DenyList, then open it again on the same state directory."""
+        self.deny.save()
+        self.deny.close()
+        self.deny = self.open()
+        return self.deny
+
+    def saved(self) -> list[tuple[bytes, bytes]]:
+        """The deny_hashes rows, least recently used first."""
+        return state_rows(self.state_dir, "SELECT cid, digest FROM deny_hashes ORDER BY used")
+
+    def test_hashes_survive_a_restart(self):
+        """Hashes remembered and saved are known after a restart (a CID's content never changes); others not."""
+        files = [self.file(n) for n in range(3)]
+        for cid, digest in files:
+            self.deny.remember_hash(cid, digest)
+        again = self.reopen()
+        for cid, digest in files:
+            self.assertEqual(again.known_hash(cid), digest)
+        self.assertIsNone(again.known_hash(self.file(3)[0]))
+
+    def test_order_survives_a_restart(self):
+        """The least recently used hash, counting lookups, is still the first forgotten after a restart."""
+        with mock.patch.object(denylist, "MAX_KNOWN_HASHES", 3):
+            (a, a_digest), (b, b_digest), (c, c_digest), (d, d_digest) = (self.file(n) for n in range(4))
+            for cid, digest in ((a, a_digest), (b, b_digest), (c, c_digest)):
+                self.deny.remember_hash(cid, digest)
+            self.deny.known_hash(a)  # b is now the least recently used
+            again = self.reopen()
+            again.remember_hash(d, d_digest)
+            self.assertIsNone(again.known_hash(b))
+            self.assertEqual([again.known_hash(cid) for cid in (a, c, d)], [a_digest, c_digest, d_digest])
+            again.save()
+            self.assertEqual(self.saved(), [(a.binary, a_digest), (c.binary, c_digest), (d.binary, d_digest)])
+
+    def test_bounded_on_save_and_load(self):
+        """Saves delete the hashes forgotten past MAX_KNOWN_HASHES; a table over it (the bound lowered) keeps
+        the most recently used at load and deletes the rest."""
+        files = [self.file(n) for n in range(5)]
+        with mock.patch.object(denylist, "MAX_KNOWN_HASHES", 3):
+            for cid, digest in files[:4]:
+                self.deny.remember_hash(cid, digest)
+            self.deny.save()
+            self.assertEqual(self.saved(), [(cid.binary, digest) for cid, digest in files[1:4]])
+            self.deny.remember_hash(*files[4])
+            self.deny.save()
+            self.assertEqual(self.saved(), [(cid.binary, digest) for cid, digest in files[2:]])
+        with mock.patch.object(denylist, "MAX_KNOWN_HASHES", 2):
+            again = self.reopen()
+            self.assertEqual(self.saved(), [(cid.binary, digest) for cid, digest in files[3:]])
+            self.assertIsNone(again.known_hash(files[2][0]))
+            self.assertEqual(again.known_hash(files[4][0]), files[4][1])
+
+    def test_only_changes_are_written(self):
+        """A save writes the hashes remembered or looked up since the last one and deletes those forgotten;
+        with nothing changed it writes nothing, and lookups alone never write."""
+        files = [self.file(n) for n in range(5)]
+        for cid, digest in files[:4]:
+            self.deny.remember_hash(cid, digest)
+        with recorded_writes(self.deny._db) as transactions:
+            self.deny.save()
+            self.assertEqual(rows_written(transactions), 4)
+            self.deny.save()
+            self.assertEqual(len(transactions), 1)
+            self.deny.known_hash(files[0][0])
+            self.deny.known_hash(files[4][0])  # not known: nothing changes
+            self.assertEqual(len(transactions), 1)
+            self.deny.save()
+            self.assertEqual(rows_written(transactions[1:]), 1)
+            with mock.patch.object(denylist, "MAX_KNOWN_HASHES", 4):
+                self.deny.remember_hash(*files[4])  # forgets files[1]
+            self.deny.save()
+            self.assertEqual(rows_written(transactions[2:]), 2)
+        self.assertEqual(self.saved(), [(cid.binary, digest) for cid, digest in files[2:4] + files[:1] + files[4:]])
+
+    def test_invalid_hash_rows_are_dropped(self):
+        """Rows planted by hand that aren't a CID, a 32-byte digest and an integer position are logged (one
+        warning counting them), deleted and ignored; the valid ones are kept."""
+        cid, digest = self.file(0)
+        self.deny.remember_hash(cid, digest)
+        self.deny.save()
+        self.deny.close()
+        for row in ((b"not a cid", digest, 1), (self.file(1)[0].binary, digest[:31], 2),
+                    (self.file(2)[0].binary, "text", 3), (self.file(3)[0].binary, digest, "later")):
+            state_execute(self.state_dir, "INSERT INTO deny_hashes VALUES (?, ?, ?)", row)
+        with mock.patch("rnfs.denylist.log") as log:
+            again = self.open()
+        self.assertEqual(log.call_count, 1)
+        self.assertIn("4 invalid rows", log.call_args.args[0])
+        self.assertEqual(again.known_hash(cid), digest)
+        self.assertEqual(self.saved(), [(cid.binary, digest)])
+
+    def test_failed_save_is_saved_next_time(self):
+        """A save that fails raises OSError and keeps its changes for the next one."""
+        files = [self.file(n) for n in range(2)]
+        self.deny.remember_hash(*files[0])
+        self.deny.save()
+        self.deny.remember_hash(*files[1])
+        self.deny.known_hash(files[0][0])
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.deny.save()
+        self.assertEqual(self.saved(), [(files[0][0].binary, files[0][1])])
+        again = self.reopen()
+        self.assertEqual(self.saved(), [(cid.binary, digest) for cid, digest in reversed(files)])
+        self.assertEqual(again.known_hash(files[1][0]), files[1][1])
+
+    def test_close_is_idempotent(self):
+        """Closing twice is harmless."""
+        self.deny.close()
+        self.deny.close()
 
 
 class DenyNodeTest(NodeTest):
@@ -373,6 +499,20 @@ class FileHashTest(DenyNodeTest):
         with self.assertRaises(Denied):
             next(reader)
 
+    def test_hash_remembered_across_a_restart(self):
+        """After a restart, a file whose hash was checked before isn't read again to check it."""
+        cid, data = self.big_file()
+        self.deny(self.b, file_hash(data))
+        with self.assertRaises(Denied):
+            next(self.b.read(str(cid)))
+        self.b.stop()
+        again = self.make_node("b", B_ID)
+        again.routing.heard(A_ID)
+        with mock.patch.object(Fetch, "read_range", side_effect=AssertionError("read again")) as read:
+            with self.assertRaises(Denied):
+                next(again.read(str(cid)))
+        read.assert_not_called()
+
     def test_gateway_451(self):
         """The gateway answers 451 with a fixed message, for a denied CID and a file with a denied hash."""
         cid, data = self.big_file()
@@ -572,7 +712,7 @@ class CliTest(DenyNodeTest):
         self.server.start()
         self.addCleanup(self.server.stop)
         cli.write_token(os.path.join(self.b.config.rnfs_dir, "api_token"), self.server.token)
-        api = apiclient.Client(self.b.config.rnfs_dir, port=self.server.port)
+        api = apiclient.ApiConnection(self.b.config.rnfs_dir, port=self.server.port)
         cid = self.shared(b"denied through the API")
         with mock.patch("rnfs.node.log"):
             self.assertEqual(api.deny_add([str(cid)]), [str(cid)])

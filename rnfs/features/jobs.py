@@ -331,8 +331,6 @@ class JobsFeature(Feature):
                 _log(f"ignoring a saved job ({e})", LOG_WARNING)
                 bad.append((job_id,))
                 continue
-            if job.id in self._jobs:
-                continue
             self._saved[job.id] = (position, text)
             if job.state in ACTIVE:
                 job.state = QUEUED  # interrupted: it resumes once the node runs
@@ -399,7 +397,7 @@ class JobsFeature(Feature):
         Jobs finished less than FINISHED_GRACE ago stay regardless: the CLI following a job (or a script
         running `rnfs jobs wait`) asks for it after it ends, and a small cap mustn't make it vanish first.
         """
-        limit = getattr(self.node.config, "max_finished_jobs", 100)
+        limit = self.node.config.max_finished_jobs
         finished = [job for job in self._jobs.values() if job.state in FINISHED]
         finished.sort(key=lambda job: job.finished or job.created)
         recent = time.time() - FINISHED_GRACE

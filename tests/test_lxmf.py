@@ -1258,6 +1258,17 @@ class RestartAndCancelTest(FeatureTestCase):
         self.assertTrue(self.network.sent[1][3])
         self.assertEqual(feature._resend, {})
 
+    def test_failed_construction_releases_the_state_database(self):
+        """A constructor that raises after opening the inbox and outbox closes both: the node never closes a
+        feature it didn't get."""
+        self.feature_node()
+        database = statedb._open[statedb._key(self.b.config.state_dir)]
+        before = database.references
+        with mock.patch.object(lxmf.LxmfFeature, "_release_unrecorded", side_effect=OSError("read-only")), \
+                self.assertRaises(OSError):
+            lxmf.LxmfFeature(self.b)
+        self.assertEqual(database.references, before)
+
 
 class MessageLogBoundsTest(unittest.TestCase):
     """MessageLog's protection of pin holders and its byte bound."""

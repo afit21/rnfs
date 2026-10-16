@@ -11,11 +11,11 @@ from unittest import mock
 
 from rnfs import apiclient, cli
 from rnfs.api import ApiServer
-from rnfs.apiclient import (ApiError, AuthFailed, BadRequest, Busy, Client, ConnectionFailed, DaemonNotRunning, Denied,
-                            InvalidDag, NotFound, ServerError, SettingsError, StorageFull, TokenError, TooLarge)
+from rnfs.apiclient import (ApiConnection, ApiError, AuthFailed, BadRequest, Busy, ConnectionFailed, DaemonNotRunning,
+                            Denied, InvalidDag, NotFound, ServerError, SettingsError, StorageFull, TokenError, TooLarge)
 from rnfs.config import DEFAULT_API_PORT
 from rnfs import errors
-from tests.support import POSIX_MODES, free_port
+from tests.support import POSIX_MODES, free_port, real
 from tests.test_api import FakeNode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -70,7 +70,7 @@ class NodeWithJobs(FakeNode):
 
 
 class ClientTestCase(unittest.TestCase):
-    """Base: a NodeWithJobs behind an ApiServer, its token in <tmp>/api_token, and a Client for it."""
+    """Base: a NodeWithJobs behind an ApiServer, its token in <tmp>/api_token, and an ApiConnection for it."""
 
     def setUp(self):
         """Start the server and write its token."""
@@ -83,7 +83,7 @@ class ClientTestCase(unittest.TestCase):
         self.tmp = tmp.name
         self.token_file = os.path.join(self.tmp, "api_token")
         cli.write_token(self.token_file, self.server.token)
-        self.api = Client(self.tmp, port=self.server.port)
+        self.api = ApiConnection(self.tmp, port=self.server.port)
 
     def write(self, name: str, data: bytes) -> str:
         """A file in tmp holding data."""
@@ -111,8 +111,8 @@ class ImportTest(unittest.TestCase):
     """Apps importing the library don't pay for loading RNS."""
 
     def test_does_not_import_rns(self):
-        """Importing rnfs.apiclient and making a Client loads no RNS module."""
-        code = ("import sys; from rnfs import apiclient; apiclient.Client(port=1); "
+        """Importing rnfs.apiclient and making an ApiConnection loads no RNS module."""
+        code = ("import sys; from rnfs import apiclient; apiclient.ApiConnection(port=1); "
                 "print(any(name == 'RNS' or name.startswith('RNS.') for name in sys.modules))")
         result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, timeout=60,
                                 encoding="utf-8", errors="replace")
@@ -137,25 +137,25 @@ class DirectoryTest(unittest.TestCase):
         """The default rnfs dir is ~/.rnfs/ (the home directory on every OS) and the token is api_token in it."""
         self.assertEqual(apiclient.DEFAULT_DIR, "~/.rnfs/")
         self.assertEqual(apiclient.token_path(), os.path.join(os.path.expanduser("~/.rnfs/"), "api_token"))
-        self.assertEqual(Client(port=1).token_file, apiclient.token_path())
-        self.assertEqual(Client(self.tmp, port=1).token_file, os.path.join(self.tmp, "api_token"))
-        self.assertEqual(Client(port=1, token_file="/x/t").token_file, "/x/t")
+        self.assertEqual(ApiConnection(port=1).token_file, apiclient.token_path())
+        self.assertEqual(ApiConnection(self.tmp, port=1).token_file, os.path.join(self.tmp, "api_token"))
+        self.assertEqual(ApiConnection(port=1, token_file="/x/t").token_file, "/x/t")
 
     def test_port_from_settings(self):
         """The port is api_port in rnfs.toml, else the default; one given wins."""
-        self.assertEqual(Client(self.tmp).port, DEFAULT_API_PORT)
+        self.assertEqual(ApiConnection(self.tmp).port, DEFAULT_API_PORT)
         self.settings("api_port = 9123\n")
-        self.assertEqual(Client(self.tmp).port, 9123)
-        self.assertEqual(Client(self.tmp, port=9124).port, 9124)
+        self.assertEqual(ApiConnection(self.tmp).port, 9123)
+        self.assertEqual(ApiConnection(self.tmp, port=9124).port, 9124)
 
     def test_bad_settings(self):
         """Settings that can't be read raise SettingsError, saying why."""
         self.settings("api_port = 99999\n")
         with self.assertRaises(SettingsError) as raised:
-            Client(self.tmp)
+            ApiConnection(self.tmp)
         self.assertIn("api_port must be a whole number", str(raised.exception))
         self.assertIsNone(raised.exception.status)
-        Client(self.tmp, port=1)  # not read when the port is given
+        ApiConnection(self.tmp, port=1)  # not read when the port is given
 
 
 class OperationsTest(ClientTestCase):
@@ -166,7 +166,7 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.status()["node_id"], bytes(range(16)).hex())
         os.unlink(self.token_file)
         seen = self.tokens_seen()
-        api = Client(self.tmp, port=self.server.port)
+        api = ApiConnection(self.tmp, port=self.server.port)
         self.assertEqual(api.version(), self.api.daemon_version)
         self.assertEqual(seen, [("/api/status", None)])
 
@@ -176,7 +176,9 @@ class OperationsTest(ClientTestCase):
         os.chdir(self.tmp)
         self.addCleanup(os.chdir, ROOT)
         cid = self.api.add_path("f.bin", pin=False, chunker="fastcdc")["cid"]
-        self.assertEqual(self.node.called("add_path")[0][0], (path,))
+        sent, = self.node.called("add_path")[0][0]
+        self.assertTrue(os.path.isabs(sent))
+        self.assertEqual(real(sent), real(path))  # macOS: getcwd() is /private/var, tempfile's /var
         self.assertEqual(self.node.called("add_path")[0][1]["pin"], False)
         self.assertEqual(self.node.called("add_path")[0][1]["chunker"], "fastcdc")
         self.assertEqual(self.api.add_stream(b"hello world")["cid"], cid)
@@ -282,7 +284,7 @@ class ProofTest(ClientTestCase):
     def test_impostor_gets_neither_token_nor_body(self):
         """A listener that can't prove it knows the token gets only the challenge: AuthFailed, nothing sent."""
         received = []
-        api = Client(self.tmp, port=self.impostor(received))
+        api = ApiConnection(self.tmp, port=self.impostor(received))
         with self.assertRaises(AuthFailed) as raised:
             api.call("POST", "/api/name/import", params={"alias": "stolen"}, body=b"K" * 64)
         self.assertIn("couldn't prove it knows the API token", str(raised.exception))
@@ -306,7 +308,7 @@ class ProofTest(ClientTestCase):
         """The proof request gives the daemon's version to check_daemon, which can refuse before the token goes."""
         refused = []
 
-        class Strict(Client):
+        class Strict(ApiConnection):
             def check_daemon(self, version):
                 """Refuse every daemon, noting its version."""
                 refused.append(version)
@@ -329,7 +331,7 @@ class ErrorTest(ClientTestCase):
     def test_no_daemon(self):
         """Nothing on the port: DaemonNotRunning, with no status."""
         with self.assertRaises(DaemonNotRunning) as raised:
-            Client(self.tmp, port=free_port()).version()
+            ApiConnection(self.tmp, port=free_port()).version()
         self.assertIn("no daemon is running", str(raised.exception))
         self.assertIsNone(raised.exception.status)
 
@@ -385,7 +387,8 @@ class ErrorTest(ClientTestCase):
             """Ten bytes, then the fetch fails."""
             yield b"x" * 10
             raise errors.NotFound("provider vanished")
-        with mock.patch.object(self.node, "read", failing), mock.patch("rnfs.api.log"):
+        with mock.patch.object(self.node, "read_file", lambda *args, **kwargs: (
+                {"type": "file", "size": 100, "cid": cid}, failing())), mock.patch("rnfs.api.log"):
             stream = self.api.cat(cid)
             self.assertEqual(stream.read(10), b"x" * 10)
             with self.assertRaises(ConnectionFailed) as raised:

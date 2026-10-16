@@ -14,6 +14,8 @@
   were sent (and wait no longer than that for a slot); /blocks has the fetcher's stall detection instead.
 - A request answered False on an identified link is retried once after identifying again, since
   Link.identify() is unacknowledged.
+- A request that wouldn't fit one packet on its link isn't sent: RNS would send it as a Resource, which nodes
+  refuse (network/guards.py) and RNS may compress.
 
 Everything here blocks its caller, so never call it from an RNS callback thread.
 """
@@ -134,11 +136,6 @@ class PeerLink:
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.cond = threading.Condition()
 
-    @property
-    def link_id(self) -> bytes | None:
-        """RNS link ID, or None before the link exists."""
-        return getattr(self.link, "link_id", None)
-
     def is_active(self) -> bool:
         """True while the link is up."""
         return not self.closed and self.link is not None and self.link.status == RNS.Link.ACTIVE
@@ -213,7 +210,7 @@ class LinkPool:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sweeper: threading.Thread | None = None
-        # Process-wide: reject response advertisements whose transfer outgrows their size
+        # Reject response advertisements whose transfer outgrows their size (in the scope the node set)
         guards.install()
 
     # Opening links
@@ -368,11 +365,14 @@ class LinkPool:
         if peer.link is not None:
             peer.link.teardown()
 
+    def shared_peer(self, node_id: bytes) -> PeerLink | None:
+        """The shared link to node_id (whatever its state), or None."""
+        with self.lock:
+            return self.shared.get(node_id)
+
     def close(self, node_id: bytes):
         """Tear down the shared link to node_id, if any (e.g. after a stalled transfer)."""
-        with self.lock:
-            peer = self.shared.get(node_id)
-        self.close_link(peer)
+        self.close_link(self.shared_peer(node_id))
 
     def close_all(self):
         """Stop the idle sweeper and tear down every link."""
@@ -459,7 +459,8 @@ class LinkPool:
 
         watchdog(exchange, now) may return a reason to stop waiting (a stall). on_progress(fraction) is
         called from this thread, never an RNS one. A request other than /blocks gives up (.stalled set) once
-        request_deadline has passed since it was sent, or if it waited that long for a slot.
+        request_deadline has passed since it was sent, or if it waited that long for a slot. A request larger
+        than the link's packet MDU isn't sent (the exchange is returned unanswered).
         """
         exchange = Exchange(self.clock)
         deadline = None if blocks else self.request_deadline(peer)
@@ -471,6 +472,12 @@ class LinkPool:
             exchange.done.set()
             return exchange
         try:
+            mdu = peer.mdu()
+            if mdu is not None and protocol.request_size(path, data) > mdu:
+                # Link.request would send it as a Resource, which nodes refuse, and which RNS compresses unless
+                # the daemon's process-wide limit is set: every rnfs request fits one packet (section 3)
+                log(f"not sending {path} to {node_name(peer.node_id)}: it doesn't fit one packet", LOG_WARNING)
+                return exchange
             try:
                 # timeout=None: RNS's RTT-based request timeout (section 3)
                 receipt = peer.link.request(path, data, response_callback=exchange.on_response,

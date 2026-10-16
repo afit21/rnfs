@@ -1,4 +1,5 @@
-"""Tests for the node identity file: created owner-only and atomically, kept across restarts, loose permissions fixed."""
+"""Tests for the node identity file: created owner-only and atomically, kept across restarts, loose permissions
+fixed."""
 import os
 import stat
 import tempfile

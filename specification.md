@@ -205,10 +205,13 @@ pass a `max_response_size` just above their largest honest answer.
   reaching the node over the same interface whose handshake takes longer is cut off (RNS tells it at once, and
   it may try again), while initiators on other interfaces are not affected. Each request still costs the node
   the key exchange and a proof; RNS's own long responder timeout is the root cause.
-- rnfs neither sends nor accepts compressed Resources. Handlers are registered with `auto_compress=False`,
-  and nodes MUST set RNS's maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in
-  RNS 1.5.6) to 0, since RNS decompresses before any rnfs check runs. Setting it to 0 also stops RNS
-  compressing what the node sends.
+- rnfs neither sends nor accepts compressed Resources on `rnfs.dht` links. Handlers are registered with
+  `auto_compress=False`, requests are never sent unless they fit one packet, and a node MUST reject, before
+  accepting it, any Resource advertisement on an `rnfs.dht` link that has the compressed flag set, since RNS
+  decompresses before any rnfs check runs. A node that has its process to itself (the daemon) also sets RNS's
+  maximum decompressed Resource size (`RNS.Resource.AUTO_COMPRESS_MAX_SIZE` in RNS 1.5.6) to 0, which also
+  stops RNS compressing anything the process sends; a node embedded in another program leaves that setting to
+  the program.
 - RNS checks request and response size limits against a Resource's data size but allocates by its transfer
   size, so a node SHOULD reject, before accepting it, any incoming Resource advertisement that is a request
   (rnfs requests always fit one packet), or whose transfer size exceeds its data size or `MAX_RESPONSE_SIZE`
@@ -216,7 +219,8 @@ pass a `max_response_size` just above their largest honest answer.
   `rnfs.dht` links (either end) a node SHOULD also reject any advertisement of more than one segment: every
   rnfs response fits one (`MAX_RESPONSE_SIZE`). On `rnfs.dht` links it SHOULD also reject one with metadata,
   which RNS decodes as the Resource completes and rnfs responses never carry. Other protocols' Resources in
-  the same process (LXMF) are not affected.
+  the same process (LXMF) are not affected by these two. A node embedded in another program applies every
+  check in this item to its `rnfs.dht` links only, so the program's own links behave as with RNS alone.
 - RNS decodes a whole response with msgpack before handing it over, and one-byte empty arrays or maps decode
   to some 70 times their size in objects (a 1 MiB response: ~70 MB and ~0.3 s of CPU). So on `rnfs.dht`
   links a node SHOULD check a response's msgpack headers before RNS decodes it, without building objects, and
@@ -1112,7 +1116,7 @@ are local conveniences, not part of the protocol.
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, LXMF address (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1131,7 +1135,7 @@ gateway can never reach the API.
 - Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
   `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
-  SYSTEM); clients (the CLI, and apps through rnfs's client library `rnfs.apiclient`) read it from there and
+  SYSTEM); clients (the CLI, and apps through `rnfs.Client`, built on `rnfs.apiclient`) read it from there and
   refuse a file other users can access. Every local process, of every user, can connect to `127.0.0.1`, and
   the API reads and writes files as the daemon's user, so only users who can read the rnfs directory may use it. Web pages can't
   learn the token, and the custom header needs a CORS preflight, which fails: this also blocks cross-site
@@ -1257,6 +1261,15 @@ optionally from one node), `pin` (fetch a target completely and pin it with sour
   downloaded over the last 300 s of the run, falling while nothing arrives) and `eta`
   (`(total_bytes - done_bytes) / rate`).
 
+**Watching names.** A node MAY let local clients wait for newer records of names (rnfs: `GET /api/name/watch`,
+which rnfs.Client's `names.watch` uses). It answers from the records the node holds, under the sequence rules
+of section 9, with those above a sequence the client gives, as soon as there is one or after a wait (rnfs: at
+most 30 s), so a client that asks again with what it last received loses nothing between calls. A watched
+name's announces count as asked for (section 9: a full table makes room for them), during each call and for a
+while after it (rnfs: 60 s); watching sends nothing to the network. A node SHOULD cap the names per call
+(rnfs: 64), the calls waiting at once (rnfs: 4, so watchers can't take the API's connections; more get `503`)
+and the names watched (rnfs: 1024). `GET /api/cat` takes `from`, a node to fetch from, as `GET /api/info` does.
+
 **Contacts.** A node MAY keep a local address book of nicks for names, node IDs and LXMF addresses. A nick is
 1–32 characters of `a-z`, `0-9`, `-`, `_` and `.`, starting with a letter or digit, and not 32 hex digits, so
 it can never be read as a node ID, name or CID. Contacts are local: they are never sent to other nodes.
@@ -1335,7 +1348,7 @@ setting.
 | `default_bootstrap` | on | Also contact the default bootstrap nodes when joining; never in private mode (section 6) |
 | `reticulum_dir` | RNS's own | RNS config directory, the one `rnsd` uses by default |
 | `verbosity` | 0 | Extra logging: 1 per-query detail, 2 RNS debug output |
-| `debug_log` | off | Also write every log message (at every level), RNS's own, and each gateway request to a debug log file in the rnfs dir, readable by its owner only. Local only: nothing in it is sent |
+| `debug_log` | off | Also write every rnfs log message (at every level), RNS's own at Info and more severe, and each gateway request to a debug log file in the rnfs dir, readable by its owner only. Local only: nothing in it is sent |
 | `upload_budget` | none (unlimited) | Bytes per hour of `/blocks` responses, node-wide; a token bucket charged for bytes sent, at most half of it per requester in flight (section 3) |
 | `serve_interfaces` | empty (all) | Serve `/blocks` only on these RNS interfaces (names or prefixes, case-insensitive; a spawned interface also matches its parent's name) |
 | `no_serve_interfaces` | empty | Never serve `/blocks` on these interfaces; takes precedence over `serve_interfaces` |

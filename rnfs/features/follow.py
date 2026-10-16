@@ -26,21 +26,14 @@ from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError
 from rnfs.features import Feature, _common
-from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
+from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, RETRY_INTERVAL, retry_delay
 from rnfs.features.keepers import FOLLOW, name_subcommands, parse_name_arg
 from rnfs.fsutil import printable
 
 NAME = "follow"
 SOURCE_PREFIX = "follow:"
-RETRY_INTERVAL = 300.0  # seconds before a failed check or fetch is first tried again; doubles per failure
 FAR_FUTURE = float("inf")
 STALE_ANNOUNCES = 2  # a record not heard for this many announce_intervals is refreshed from the network
-
-
-def retry_delay(failures: int, announce_interval: float) -> float:
-    """Seconds before the next check after failures failed checks in a row: RETRY_INTERVAL doubling, at most
-    announce_interval (and never less than RETRY_INTERVAL, even with a shorter announce_interval)."""
-    return max(RETRY_INTERVAL, min(RETRY_INTERVAL * 2 ** min(failures - 1, 32), announce_interval))
 
 
 def follow_source(name: bytes) -> str:

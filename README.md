@@ -66,7 +66,7 @@ Different package options available at [latest release](https://github.com/afit2
 
 **Windows:**
 
-[`rnfs-0.1.4-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
@@ -83,7 +83,7 @@ Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-lin
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl` ([details](#macos)).
 
 ## 2 - Start rnfs and leave it running in its own terminal:
 
@@ -118,26 +118,26 @@ rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file f
 
 | System | Download | Install |
 |---|---|---|
-| Windows (64-bit) | [`rnfs-0.1.4-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-windows-x64.exe) | [Windows](#windows) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.4_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs_0.1.4_amd64.deb) or [`rnfs_0.1.4_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs_0.1.4_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
-| Other Linux (x86_64) | [`rnfs-0.1.4-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.1.4-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-py3-none-any.whl) | [macOS](#macos) |
+| Windows (64-bit) | [`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe) | [Windows](#windows) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.5_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb) or [`rnfs_0.1.5_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
+| Other Linux (x86_64) | [`rnfs-0.1.5-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.5-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl) | [macOS](#macos) |
 
 Every package includes Reticulum and LXMF, gives you one `rnfs` command, and keeps your data in the same
-places. The release also has the source archive (`rnfs-0.1.4.tar.gz`) and `SHA256SUMS`, to
-[check your download](#checking-a-download). These links are for 0.1.4; for a newer version, take the
+places. The release also has the source archive (`rnfs-0.1.5.tar.gz`) and `SHA256SUMS`, to
+[check your download](#checking-a-download). These links are for 0.1.5; for a newer version, take the
 same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
 
 ## Windows
 
-Download [`rnfs-0.1.4-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-windows-x64.exe). It is a single file that
+Download [`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe). It is a single file that
 includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
 folder, put it on your PATH as `rnfs`:
 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.1.4-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.1.5-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -168,8 +168,8 @@ or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [instal
 there instead. Pick `amd64` or `arm64` to match `dpkg --print-architecture`:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs_0.1.4_amd64.deb
-sudo apt install ./rnfs_0.1.4_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb
+sudo apt install ./rnfs_0.1.5_amd64.deb
 rnfs daemon                             # or run it in the background:
 systemctl --user enable --now rnfs      # a systemd user service; logs: journalctl --user -u rnfs -f
 ```
@@ -188,9 +188,9 @@ For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flat
 `org.freedesktop.Platform` runtime:
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.1.4-x86_64.flatpak
+flatpak install --user rnfs-0.1.5-x86_64.flatpak
 flatpak run io.github.afit21.rnfs daemon
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
 ```
@@ -218,7 +218,7 @@ and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python
 ```sh
 brew install pipx
 pipx ensurepath                 # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.1.4/rnfs-0.1.4-py3-none-any.whl     # includes Reticulum and LXMF
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl     # includes Reticulum and LXMF
 rnfs daemon
 ```
 
@@ -244,11 +244,11 @@ Each release's `SHA256SUMS` lists the checksum of every file. Download it next t
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing          # Linux
-shasum -a 256 rnfs-0.1.4-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
+shasum -a 256 rnfs-0.1.5-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
 ```
 
 ```powershell
-Get-FileHash .\rnfs-0.1.4-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
+Get-FileHash .\rnfs-0.1.5-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
 ```
 
 A matching checksum shows the download is whole, not who made it: anyone able to replace a release's files
@@ -257,7 +257,7 @@ repository's release workflow. Check it with the [GitHub CLI](https://cli.github
 logged in with `gh auth login`):
 
 ```sh
-gh attestation verify rnfs_0.1.4_amd64.deb --repo afit21/rnfs
+gh attestation verify rnfs_0.1.5_amd64.deb --repo afit21/rnfs
 ```
 
 ## Other ways to install
@@ -368,11 +368,12 @@ Uninstalling never deletes it.
 | `storage/identity` | the node's RNS identity; your node ID comes from it |
 | `storage/lxmf_identity` | a separate identity for your LXMF address |
 | `blocks/` | stored blocks |
-| `state/rnfs.db` | pins, cache records, provider records, names' sequences, jobs, kept and followed names, contacts, LXMF inbox and outbox (one SQLite database; an older version's JSON files there are imported at the first start and kept as `*.migrated`) |
+| `state/rnfs.db` | pins, cache records, provider records, names' sequences, jobs, kept and followed names, contacts, LXMF inbox and outbox, your deny list and the deny lists in use (one SQLite database; an older version's JSON files there are imported at the first start and kept as `*.migrated`) |
 | `names/` | name keys (back them up: `rnfs name export`) |
 | `files/` | the shared folder: anything put here is added, pinned and shared automatically |
 | `api_token` | the running daemon's API token |
-| `daemon.lock` | locked by the daemon using the directory, so a second one on it stops at once |
+| `daemon.lock` | locked by the daemon or `rnfs.Node` using the directory, so a second one on it stops at once |
+| `debug.log`, `debug.log.1` | with `debug_log` on: this run's debug log and the previous one's (readable by you only) |
 
 The rnfs directory holds your keys and the API token, so rnfs keeps it private: readable by you only, and on
 Windows with an access list for you and SYSTEM only (also on another drive or under `C:\ProgramData`, where
@@ -602,7 +603,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `max_records` | `100000` | Provider records stored for others |
 | `ban_time` | `3600` | How long a node that sent a bad block is ignored |
 | `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |
-| `debug_log` | `false` | Also write `<rnfs dir>/debug.log` for diagnosing problems (`daemon --debug-log`): it begins with the daemon's version, then has every rnfs message at every level whatever `verbosity` is (which nodes are asked, which fail and why, links that fail or close), Reticulum's own messages at Info and above (interfaces that can't connect or drop; not its debug detail), each gateway request with its outcome, errors with tracebacks, and a status line every 5 minutes. It names what you fetched and browsed, so it is readable by you only and never sent anywhere; each start keeps the previous run's as `debug.log.1`, and the two stay under 32 MiB |
+| `debug_log` | `false` | Also write `<rnfs dir>/debug.log` for diagnosing problems (`daemon --debug-log`): it begins with the daemon's version, then has every rnfs message at every level whatever `verbosity` is (which nodes are asked, which fail and why, links that fail or close), Reticulum's own messages at Info and above that its loglevel shows (interfaces that can't connect or drop; not its debug detail), each gateway request with its outcome, errors with tracebacks, and a status line every 5 minutes. It names what you fetched and browsed, so it is readable by you only and never sent anywhere; each start keeps the previous run's as `debug.log.1`, and the two stay under 32 MiB |
 
 **Storage**
 
@@ -710,7 +711,7 @@ node ID is expected, a node contact's nick works too.
 | Command | Description |
 |---|---|
 | `rnfs daemon [--bootstrap NODE_ID…] [--rnsconfig DIR] [--gateway-port N] [--dht-mode server\|client] [--slow yes\|no\|auto] [--private] [--provide-strategy pinned\|roots] [--no-gateway-scripts] [--debug-log] [-v\|-vv]` | Run a node with its API and gateway |
-| `rnfs status` | Node ID, identity hash (what others list in `members` and `remote_pin_identities`), known nodes, records, storage, traffic, jobs, LXMF address. Without a readable API token (another user's health check) only the daemon's version |
+| `rnfs status` | Node ID, identity hash (what others list in `members` and `remote_pin_identities`), known nodes, records, storage, traffic, jobs, deny-list entries and lists, LXMF address. Without a readable API token (another user's health check) only the daemon's version |
 | `rnfs peers [--json]` | Known nodes: DHT mode, seniority, hops, interface, link rate, last heard, traffic, bans |
 | `rnfs stats [--json]` | Traffic since start: totals, uploads refused by your limits, per interface |
 | `rnfs ping NODE_ID` | Round-trip time to a node |
@@ -844,31 +845,64 @@ Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
 
 # Building apps on rnfs
 
-Apps talk to a running daemon through its local API, as the CLI does. `rnfs.apiclient` (standard library only,
-and it doesn't load Reticulum, so it starts fast) finds the rnfs directory and API token as the CLI does, makes
-whatever listens on the API port prove it knows the token before sending it, and raises a typed error for each
-failure:
+Programs use rnfs from Python the way they use RNS. There are two classes with the same methods, objects and
+errors, so an app switches between them by changing one line:
+
+- **`rnfs.Node`** runs an rnfs node inside your program, beside the program's own Reticulum, in a directory of
+  its own. Use it when your app should have its own node: its own storage, identity and place in the DHT.
+- **`rnfs.Client`** uses the user's running daemon (`rnfs daemon`) through its local API. Use it when your app
+  should share the user's node: the content they already have, their pins and names. It never loads Reticulum,
+  so it starts fast.
+
+Nothing picks one for you: construct the one you want. **The API is provisional until rnfs 0.2**
+(`rnfs.API_STATUS`): names may still change once it has been tried in real apps.
 
 ```python
-from rnfs.apiclient import Client, DaemonNotRunning, NotFound
+import RNS, rnfs
 
-api = Client()  # the daemon using ~/.rnfs/; Client("/srv/rnfs") for another rnfs dir
-try:
-    cid = api.add_path("/home/me/photos")["cid"]
-    api.name_publish("photos", cid)
-    with api.cat(f"{cid}/cat.jpg") as stream, open("cat.jpg", "wb") as out:
-        for chunk in stream:
-            out.write(chunk)
-    print(api.name_resolve("ab" * 16)["cid"])
-except DaemonNotRunning:
-    print("start it with: rnfs daemon")
-except NotFound as e:
-    print(e)
+RNS.Reticulum()                                   # your program's Reticulum, as with any RNS app
+with rnfs.Node("~/.myapp/rnfs") as node:          # an rnfs node inside it; or: rnfs.Client()
+    added = node.add("photos/")                   # rnfs.Added: .cid, .size, .warnings
+    for entry in node.ls(added.cid):              # rnfs.Entry(name, kind, size, cid)
+        print(entry.name, entry.size)
+    with node.open(f"{added.cid}/cat.jpg") as f:  # seekable: each read fetches only the chunks it covers
+        f.seek(1_000_000)
+        data = f.read(4096)
+    site = node.names.create("site")              # rnfs.Name
+    site.publish(added.cid)
+    node.names.watch(site, lambda record: print("now", record.cid))
+    job = node.jobs.get(f"rnfs:name/{site.hex}", "/tmp/copy",
+                        on_progress=lambda job: print(job.done_bytes, "of", job.total_bytes))
+    job.wait()
 ```
 
-It has methods for status, adding (a path or a stream), fetching and `cat`, pins, names and jobs; `get()` and
-`post()` reach every other endpoint (`rnfs/api.py` lists them). The module's docstring is the reference. Run
-the app as the daemon's user: only it can read the token.
+With the daemon instead, only the `with` line changes (and `RNS.Reticulum()` isn't needed):
+
+```python
+with rnfs.Client() as node:                       # the daemon using ~/.rnfs/; rnfs.Client("/srv/rnfs") for another
+    print(node.status().node_id.hex())
+    try:
+        print(node.names.resolve("ab" * 16).cid)
+    except rnfs.NotFound:                         # the same errors from either class
+        print("not resolved")
+```
+
+- Targets are a `rnfs.Cid`, `<cid>/path`, or an `rnfs:` link (`rnfs:name/<name>/path` is resolved first).
+- Methods: `add` (a path, bytes or a binary file), `get`, `open`, `cat`, `ls`, `info`, `stat`, `pin`, `unpin`,
+  `pins`, `export`, `import_archive`; `names.create`/`list`/`resolve`/`watch`, `Name.publish`;
+  `jobs.get`/`pin`/`export` with `on_progress`, `Job.wait`/`cancel`; `deny.add`/`remove`/`list`; and the rest of
+  the CLI's operations (design.md, "Public API").
+- Callbacks run on one event thread of the instance, with no rnfs lock held. Keep them short: a slow one delays
+  the others.
+- An embedded node runs as a DHT client with LXMF off unless you say otherwise:
+  `rnfs.Node(dir, settings={"dht_mode": "server", "lxmf_enabled": True})`. It never stops your Reticulum, and
+  your program's own RNS links work as with RNS alone. A directory is used by one node at a time: never point a
+  `Node` at the daemon's `~/.rnfs/`.
+- A `Client` must run as the daemon's user (only it can read the API token).
+
+`examples/rnfs_share.py` (in the source tree and the source archive) is a runnable example using either class (`--node DIR` or `--daemon`). design.md's
+"Public API" section is the reference. Other languages use the local API's JSON endpoints directly (`rnfs/api.py`
+lists them).
 
 # Keeping content off your node
 
@@ -892,14 +926,14 @@ A denied CID is never fetched, read, stored or served by your node, whether it i
 anywhere inside it, and nothing holding it is provided (records already published are withdrawn). `get`,
 `cat`, the gateway (status 451), `pin add`, remote pins, followed names and LXMF auto-fetch all refuse it. When
 an entry is added, cached downloads holding it are deleted and pins made for other nodes (`pin remote`) are
-released; your own pins are kept, but not served or read, and the log names each one so you can `rnfs pin rm`
-it.
+released; your own pins are kept, but not served or read, and the log names each one so you can remove it
+(`rnfs pin rm`, or what made the pin: the shared-folder file, `name publish`, `name unfollow`, `inbox rm`).
 
 A file hash is only known once the file has been downloaded, so it stops `get`, `cat` and the gateway from
 handing the file out (they check before writing or sending anything, which makes them fetch the whole file
-first) and `add` or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served.
-Deny the CID to stop that. Lists larger than 4 MiB, with over 100 000 entries, or with a line that isn't an
-entry are refused, and the previous version stays in use.
+first) and `add`, the shared folder or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served.
+Deny the CID to stop that. Lists larger than 4 MiB, with over 100 000 entries, not UTF-8 text, with a line that
+isn't an entry, or that are a directory are refused, and the previous version stays in use.
 
 # Example use cases
 

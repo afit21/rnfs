@@ -17,8 +17,8 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 
-from rnfs.constants import ID_LENGTH, K
-from rnfs.dht.routing import distance
+from rnfs.constants import K
+from rnfs.dht.routing import distance, is_id
 
 # query(node_id, key) -> (provider IDs, node IDs), or None if the node didn't answer, refused, or replied
 # with garbage. May block for a long time (path request, link setup, RNS's request timeout).
@@ -50,11 +50,6 @@ def _quiet(text: str) -> None:
 def _name(node_id: bytes) -> str:
     """A node ID as the log writes it (RNS.prettyhexrep's form, without loading RNS)."""
     return f"<{node_id.hex()}>"
-
-
-def _valid_id(node_id) -> bool:
-    """True if node_id has the shape of a node ID."""
-    return isinstance(node_id, bytes) and len(node_id) == ID_LENGTH
 
 
 class Lookup:
@@ -173,12 +168,6 @@ class Lookup:
             return self.timeout
         return max(0.0, self.deadline - self.clock())
 
-    def listing_count(self) -> int:
-        """How many nodes have answered with at least one provider (in any run), so a caller can tell
-        providers vouched for by several nodes from those one node listed."""
-        with self._lock:
-            return len(self._listing)
-
     def listing_nodes(self) -> list[bytes]:
         """The nodes that have answered with at least one provider (in any run)."""
         with self._lock:
@@ -203,7 +192,7 @@ class Lookup:
 
     def _usable(self, node_id) -> bool:
         """True if node_id may be queried in this lookup."""
-        return (_valid_id(node_id) and node_id != self.own_id and node_id not in self._failed
+        return (is_id(node_id) and node_id != self.own_id and node_id not in self._failed
                 and node_id not in self._refused_unknown and not self.exclude(node_id))
 
     def _run(self, on_provider: NodeCallback | None, should_stop: Callable[[], bool]) -> list[bytes]:
@@ -378,6 +367,6 @@ class Lookup:
         if not isinstance(providers, (tuple, list)) or not isinstance(nodes, (tuple, list)):
             return None
         # A responder sends at most K of each; ignore any excess rather than let a reply bloat the lookup
-        providers = list(dict.fromkeys(p for p in providers if _valid_id(p)))[:self.k]
-        nodes = list(dict.fromkeys(n for n in nodes if _valid_id(n)))[:self.k]
+        providers = list(dict.fromkeys(p for p in providers if is_id(p)))[:self.k]
+        nodes = list(dict.fromkeys(n for n in nodes if is_id(n)))[:self.k]
         return providers, nodes

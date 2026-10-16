@@ -92,7 +92,8 @@ class WindowsTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.acl = FakeAcl()
-        for patch in (mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch.object(winacl, "backend", self.acl)):
+        for patch in (mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch.object(winacl, "backend", self.acl),
+                      mock.patch.object(winacl, "_warned_outside", set())):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -231,8 +232,9 @@ class RnfsDirTest(WindowsTestCase):
     def test_dir_outside_the_profile_is_warned_about(self):
         with mock.patch.dict(os.environ, {"USERPROFILE": os.path.join(self.tmp.name, "profile")}):
             node_module._make_private_dirs(Config(rnfs_dir=self.root))
+            node_module._make_private_dirs(Config(rnfs_dir=self.root))  # as a start does more than once
         self.assertTrue(self.private(self.root))
-        self.assertIn("is outside your user profile", self.messages())
+        self.assertEqual(self.messages().count("is outside your user profile"), 1)
 
 
 class KeyFileTest(WindowsTestCase):

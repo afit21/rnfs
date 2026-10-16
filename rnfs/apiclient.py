@@ -1,19 +1,8 @@
-"""A client of a running daemon's local API (specification section 11; rnfs/api.py), for companion apps and the CLI.
+"""The protocol layer of a running daemon's local API (specification section 11; rnfs/api.py): what rnfs.Client
+(rnfs/remote.py) and the CLI are built on. Programs use rnfs.Client, whose objects and errors are rnfs.Node's
+too; ApiConnection's dict-returning methods are its backend, and the CLI's ApiClient subclasses it.
 
-Standard library only, and it never imports RNS, so an app using it starts quickly:
-
-    from rnfs.apiclient import Client, NotFound
-
-    api = Client()  # the daemon using ~/.rnfs/, on the api_port in its rnfs.toml
-    print(api.status()["node_id"])
-    cid = api.add_path("/home/me/photos")["cid"]
-    with api.cat(f"{cid}/cat.jpg") as stream, open("cat.jpg", "wb") as out:
-        for chunk in stream:
-            out.write(chunk)
-    try:
-        print(api.name_resolve("ab" * 16)["cid"])
-    except NotFound:
-        print("not resolved")
+Standard library only, and it never imports RNS, so a program using it starts quickly.
 
 - The daemon writes a new random token to `<rnfs dir>/api_token` (mode 0600, or a private access list on
   Windows) at each start. The client reads it before its first request that needs it and sends it as
@@ -27,10 +16,12 @@ Standard library only, and it never imports RNS, so an app using it starts quick
   (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
   refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS: 400
   BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507 StorageFull, other 5xx
-  ServerError).
-- Each request opens its own connection, with no timeout unless one is given (fetches can take hours), so a
-  Client may be used from several threads. Paths are on the daemon's machine, which is this one: they are made
-  absolute here.
+  ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a subclass of the node's own
+  (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except clause catches what rnfs.Node
+  and rnfs.Client raise alike.
+- Each request opens its own connection, with no timeout unless one is given (fetches can take hours), so an
+  ApiConnection may be used from several threads. Paths are on the daemon's machine, which is this one: they are
+  made absolute here.
 """
 import hashlib
 import hmac
@@ -42,7 +33,7 @@ import stat
 import threading
 from urllib.parse import urlencode
 
-from rnfs import fsutil, winacl
+from rnfs import errors, fsutil, winacl
 from rnfs.config import DEFAULT_API_PORT, Config
 
 DEFAULT_DIR = Config.rnfs_dir
@@ -54,7 +45,7 @@ PROOF_HEADER = "X-Rnfs-Proof"
 COPY_SIZE = 64 * 1024  # what a Stream reads at a time when iterated
 
 
-class ApiError(Exception):
+class ApiError(errors.RnfsError):
     """An API call failed; str() says why. status is the HTTP status, or None if the daemon never answered."""
 
     def __init__(self, message: str, status: int | None = None):
@@ -84,31 +75,31 @@ class SettingsError(ApiError):
     """The rnfs dir's rnfs.toml couldn't be read for the API port."""
 
 
-class BadRequest(ApiError):
+class BadRequest(ApiError, ValueError):
     """400: the request's parameters were refused (the node raised ValueError)."""
 
 
-class NotFound(ApiError):
+class NotFound(ApiError, errors.NotFound):
     """404: no such content, name, pin, job or endpoint."""
 
 
-class TooLarge(ApiError):
+class TooLarge(ApiError, errors.TooLarge):
     """413: over a size limit (max_download_size, a quota, the request body)."""
 
 
-class InvalidDag(ApiError):
+class InvalidDag(ApiError, errors.InvalidDag):
     """422: the content fetched isn't a valid DAG."""
 
 
-class Denied(ApiError):
+class Denied(ApiError, errors.Denied):
     """451: the content is on the node's deny list."""
 
 
-class Busy(ApiError):
+class Busy(ApiError, errors.Busy):
     """503: the daemon is too busy (or full of connections); try again later."""
 
 
-class StorageFull(ApiError):
+class StorageFull(ApiError, errors.StorageFull):
     """507: not enough free disk space."""
 
 
@@ -238,13 +229,13 @@ def _flag(value: bool) -> int | None:
     return 1 if value else None
 
 
-class Client:
+class ApiConnection:
     """The local API of the daemon using rnfs_dir (default ~/.rnfs/), on 127.0.0.1:port (default: the api_port in
     its rnfs.toml). token_file defaults to <rnfs_dir>/api_token and is read on the first request needing it.
 
     request() and call() are the whole protocol; get() and post() call any endpoint (features' too); the other
-    methods are the main operations and the deny list, returning what the API answers (design.md, "Node
-    facade"). Every failure raises an ApiError subclass.
+    methods are the main operations, jobs, the deny list and name watching, returning what the API answers
+    (design.md, "Node facade"). Every failure raises an ApiError subclass.
     """
 
     def __init__(self, rnfs_dir: str | None = None, port: int | None = None, token_file: str | None = None,
@@ -396,11 +387,12 @@ class Client:
                           raw=raw or None, **{"from": from_node})
 
     def cat(self, target: str, offset: int | None = None, length: int | None = None, raw: bool = False,
-            block: bool = False) -> Stream:
+            block: bool = False, from_node: str | None = None) -> Stream:
         """A file's bytes (or a range of them) as they arrive. raw: a sealed file as stored; block: the CID's own
-        block, verified."""
+        block, verified; from_node a node to fetch from (a daemon that predates it ignores it)."""
         return Stream(self.request("GET", "/api/cat", params={"target": target, "offset": offset, "length": length,
-                                                             "raw": _flag(raw), "block": _flag(block)}))
+                                                             "raw": _flag(raw), "block": _flag(block),
+                                                             "from": from_node}))
 
     def info(self, target: str, from_node: str | None = None) -> dict:
         """{"cid", "type", "size", "executable"} (+ sealed-file fields) of a target."""
@@ -447,6 +439,14 @@ class Client:
         it doesn't resolve."""
         return self.get("/api/name/resolve", name=name)
 
+    def name_watch(self, names: list[str], after: list[int | None], wait: int = 0) -> list[dict]:
+        """The records held for names (hex) whose sequence is above the matching after (None: any), once there is
+        one or after wait seconds (the API caps it): [{"name", "cid", "sequence", "age"}]. NotFound from a daemon
+        that can't watch names."""
+        return self.get("/api/name/watch", names=",".join(names),
+                        after=",".join("-" if sequence is None else str(sequence) for sequence in after),
+                        wait=wait or None)["records"]
+
     # The deny list
 
     def deny(self) -> dict:
@@ -471,7 +471,7 @@ class Client:
         return self._post("/api/jobs", kind=kind, target=target, output=output, **{"from": from_node}, **options)
 
     def job(self, job_id: str, wait: int = 0) -> dict:
-        """A job's record; waits up to wait seconds (the API caps it) for it to change state or progress."""
+        """A job's record; waits up to wait seconds (the API caps it) for it to finish."""
         return self.get("/api/jobs/get", id=job_id, wait=wait or None)
 
     def jobs(self) -> list[dict]:

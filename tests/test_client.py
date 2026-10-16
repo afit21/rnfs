@@ -201,6 +201,7 @@ class PeerClientTest(unittest.TestCase):
         self.assertIsNone(self.client.rate_estimate(NODE))
 
     def test_blocks_elapsed_counts_from_sending(self):
+        """A /blocks result's elapsed time runs from sending the request, not from opening the link."""
         cid, block = block_of(100, 1)
 
         def answer(link, path, data):
@@ -211,8 +212,9 @@ class PeerClientTest(unittest.TestCase):
         fakes.FakeLink.establish_delay = 0.5
         start = time.monotonic()
         result = self.call(lambda: self.client.blocks(NODE, [cid]))
-        self.assertGreaterEqual(time.monotonic() - start, 0.6)
-        self.assertGreaterEqual(result.elapsed, 0.1)
+        # A tick short of 0.6 s and 0.1 s: before Python 3.13, time.monotonic on Windows ticks every 15.6 ms
+        self.assertGreaterEqual(time.monotonic() - start, 0.58)
+        self.assertGreaterEqual(result.elapsed, 0.08)
         self.assertLess(result.elapsed, 0.5)  # opening the link isn't counted
         self.respond(lambda link, path, data: False)
         self.assertIsNone(self.call(lambda: self.client.blocks(NODE, [cid])).elapsed)

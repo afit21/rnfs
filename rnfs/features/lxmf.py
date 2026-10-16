@@ -192,12 +192,6 @@ class Link:
     size: int | None = None  # content bytes, as the sender knew them (untrusted; fetches verify sizes)
     from_node: bytes | None = None  # the sender's rnfs node ID: a provider hint, like `get --from`
 
-    def target(self) -> str:
-        """`<cid>[/path]` for the node's facade; ValueError for a name link (resolve it first)."""
-        if self.cid is None:
-            raise ValueError("a name link has no CID until its name is resolved")
-        return "/".join([str(self.cid), *self.path])
-
     def uri(self) -> str:
         """The canonical rnfs: URI."""
         return format_uri(self)
@@ -611,11 +605,6 @@ class MessageLog:
                     return dict(entry)
         return None
 
-    def count(self, key: str, value) -> int:
-        """Number of entries whose key equals value."""
-        with self._lock:
-            return sum(1 for entry in self._entries if entry.get(key) == value)
-
     def update(self, entry_id: int, **values) -> bool:
         """Set fields of an entry; False if it no longer exists."""
         with self._lock:
@@ -833,12 +822,17 @@ class LxmfFeature(features.Feature):
         except BaseException:
             self.inbox.close()
             raise
-        for entry in self.outbox.entries():
-            if entry.get("state") not in FINAL_STATES and not self._propagated_sent(entry):
-                # LXMF doesn't persist its outbound queue
-                self.outbox.update(entry["id"], state="failed", error="the daemon stopped before it was delivered")
-        self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
-        self._release_unrecorded()
+        try:
+            for entry in self.outbox.entries():
+                if entry.get("state") not in FINAL_STATES and not self._propagated_sent(entry):
+                    # LXMF doesn't persist its outbound queue
+                    self.outbox.update(entry["id"], state="failed",
+                                       error="the daemon stopped before it was delivered")
+            self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
+            self._release_unrecorded()
+        except BaseException:
+            self.close()
+            raise
         self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
         self._told_no_pn = False  # logged once how to set a propagation node
         self._auto_queue = _RoundRobin()  # (entry id, link index) by sender

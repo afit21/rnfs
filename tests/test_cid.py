@@ -109,7 +109,8 @@ class CidTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Cid.parse(value)
                 self.assertFalse(cid_module.is_valid(value))
-        for reason, binary in {"too short": b"\x01\x55", "not bytes": "abc", "dag-pb": bytes([1, 0x70, 0x12, 0x20]) + digest}.items():
+        invalid = {"too short": b"\x01\x55", "not bytes": "abc", "dag-pb": bytes([1, 0x70, 0x12, 0x20]) + digest}
+        for reason, binary in invalid.items():
             with self.subTest(reason):
                 with self.assertRaises(ValueError):
                     Cid.from_bytes(binary)

@@ -2,17 +2,21 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 import RNS
 
+from rnfs import publisher as publisher_module
 from rnfs.config import Config
 from rnfs.constants import PROVIDER_TTL
 from rnfs.content import builder
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
+from rnfs.denylist import DenyList
 from rnfs.dht.providers import ProviderStore
-from rnfs.publisher import SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
+from rnfs.publisher import PUBLISH_LOOKUPS, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
 from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
 from tests.test_providers import recorded_writes, rows_written
 
@@ -61,6 +65,44 @@ class FakeLookup:
         return list(self.nodes)
 
 
+class Running:
+    """Counts the lookups running at once (the most ever in peak), the threads they ran on and those finished."""
+
+    def __init__(self):
+        """None run yet."""
+        self.lock = threading.Lock()
+        self.now = self.peak = self.finished = 0
+        self.threads: set[str] = set()
+
+    def __enter__(self):
+        """A lookup starts."""
+        with self.lock:
+            self.now += 1
+            self.peak = max(self.peak, self.now)
+            self.threads.add(threading.current_thread().name)
+
+    def __exit__(self, *exc):
+        """It ends."""
+        with self.lock:
+            self.now -= 1
+            self.finished += 1
+
+
+class SleepingLookup(FakeLookup):
+    """find_closest takes delay seconds, counted in running."""
+
+    def __init__(self, nodes, delay: float, running: Running):
+        """A lookup answering nodes after delay seconds."""
+        super().__init__(nodes)
+        self.delay, self.running = delay, running
+
+    def find_closest(self):
+        """The fixed nodes, once delay has passed."""
+        with self.running:
+            time.sleep(self.delay)
+        return list(self.nodes)
+
+
 class PublisherTest(unittest.TestCase):
     """A Publisher over temporary storage with fakes for the network."""
 
@@ -79,18 +121,27 @@ class PublisherTest(unittest.TestCase):
         self.eligible: set[Cid] = set()
         self.lookups: list[bytes] = []
         self.on_lookup = lambda key: None
+        self.nodes_of = lambda key: self.nodes  # the nodes a key's lookup finds
+        self.lookup_delay = None  # or key -> seconds its lookup takes (counted in self.running)
+        self.running = Running()
+        self.fetched_changes = 0  # what the node's fetched-targets change count would be (generation)
         self.publisher = self.make_publisher()
 
-    def make_publisher(self, slow: bool = False, state: str | None = None) -> Publisher:
-        """A publisher sharing this test's state directory (or on state), closed when the test ends."""
+    def make_publisher(self, slow: bool = False, state: str | None = None, generation: bool = False) -> Publisher:
+        """A publisher sharing this test's state directory (or on state), closed when the test ends; with
+        generation, one as the node makes it: storage.changes() and fetched_changes."""
         def make_lookup(key):
-            """Remember the key; find self.nodes."""
+            """Remember the key; find self.nodes_of(key), after self.lookup_delay(key) seconds if set."""
             self.lookups.append(key)
             self.on_lookup(key)
-            return FakeLookup(self.nodes)
+            if self.lookup_delay is None:
+                return FakeLookup(self.nodes_of(key))
+            return SleepingLookup(self.nodes_of(key), self.lookup_delay(key), self.running)
         publisher = Publisher(OWN, self.config, self.storage, self.records, self.client, make_lookup, slow,
                               state or self.state, cached_eligible=lambda: self.eligible, clock=self.clock,
-                              retry_interval=30)
+                              retry_interval=30,
+                              generation=(lambda: (self.storage.changes(), self.fetched_changes)) if generation
+                              else None)
         self.addCleanup(publisher.close)
         return publisher
 
@@ -542,6 +593,270 @@ class PublisherTest(unittest.TestCase):
         with recorded_writes(self.publisher._db) as transactions:
             self.publisher.save()
         self.assertEqual(transactions, [])  # nothing changed since
+
+    # Republish lookups run at once
+
+    def due_keys(self, count: int) -> list[Cid]:
+        """count complete pins, refreshed into the provided set: all due."""
+        cids = [self.pinned(b"due %d" % i) for i in range(count)]
+        self.publisher.refresh()
+        return cids
+
+    def test_lookups_run_at_once(self):
+        """A round's lookups run PUBLISH_LOOKUPS at once, on threads of their own, so a round of many keys whose
+        lookups take time finishes in a fraction of the time one at a time takes."""
+        self.due_keys(20)
+        self.lookup_delay = lambda key: 0.05  # 1 s one at a time
+        started = time.monotonic()
+        result = self.publisher.publish_due()
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(result["published"]), 20)
+        self.assertEqual(self.running.peak, PUBLISH_LOOKUPS)
+        self.assertEqual(self.running.threads, {"rnfs-publish-lookup"})
+        self.assertLess(elapsed, 0.6)  # about 20 / PUBLISH_LOOKUPS × 0.05 = 0.25 s
+        self.assertEqual(len(self.client.calls), 2)  # still one /provide per node, every key in it
+        self.assertTrue(all(len(keys) == 20 for _, keys, _ in self.client.calls))
+
+    def test_lookups_at_once_send_what_one_at_a_time_sends(self):
+        """Lookups finishing in any order, each finding its own nodes: every node gets the same /provide
+        requests, keys and withdrawals in the same order, as when the lookups run one at a time."""
+        cids = self.due_keys(20)
+        self.nodes_of = lambda key: [node for i, node in enumerate((N1, N2, N3)) if key[i] % 2] or [N1]
+        self.lookup_delay = lambda key: 0.005 + key[3] % 5 / 200  # 5-25 ms, so they finish out of order
+        gone = bytes([7]) * 16
+        rounds = []
+        for lookups in (PUBLISH_LOOKUPS, 1):
+            with self.subTest(lookups=lookups), mock.patch.object(publisher_module, "PUBLISH_LOOKUPS", lookups):
+                self.client = FakeClient()
+                self.running = Running()
+                publisher = self.make_publisher(state=os.path.join(self.tmp.name, f"state {lookups}"))
+                publisher._withdrawals = {N1: {gone}, N3: {gone}}  # as if queued earlier
+                publisher.refresh()
+                result = publisher.publish_due()
+                self.assertEqual(set(result["published"]), set(cids))
+                if lookups == 1:
+                    self.assertEqual(self.running.peak, 1)
+                else:
+                    self.assertGreater(self.running.peak, 1)
+                rounds.append((result, self.client.calls))
+        self.assertEqual(rounds[0], rounds[1])
+
+    def test_slow_nodes_look_up_one_at_a_time(self):
+        """Slow nodes keep their pacing: one lookup at a time, on the publishing thread, at most
+        SLOW_ROUND_LOOKUPS a round, and SLOW_LOOKUP_PACE per lookup before the next round."""
+        publisher = self.make_publisher(slow=True)
+        self.due_keys(20)
+        publisher.refresh()
+        self.lookup_delay = lambda key: 0.01
+        self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
+        self.assertEqual(self.running.peak, 1)
+        self.assertEqual(self.running.threads, {threading.current_thread().name})
+        self.assertEqual(publisher.next_due(), SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
+        self.assertEqual(publisher.publish_due()["published"], [])
+        self.clock.now += SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
+        self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
+
+    def test_stopped_round_keeps_only_finished_lookups(self):
+        """should_stop is checked before each lookup starts: those started finish and are published, in due
+        order, and the rest stay due."""
+        self.due_keys(20)
+        self.lookup_delay = lambda key: 0.02
+        # Only the lookup threads are told to stop, so the round still sends what was looked up
+        result = self.publisher.publish_due(
+            should_stop=lambda: len(self.lookups) >= 6 and threading.current_thread().name == "rnfs-publish-lookup")
+        self.assertGreaterEqual(len(self.lookups), 6)
+        self.assertLess(len(self.lookups), 6 + PUBLISH_LOOKUPS)
+        self.assertEqual(self.running.finished, len(self.lookups))
+        self.assertEqual({cid.key for cid in result["published"]}, set(self.lookups))
+        self.assertEqual(sorted(result["published"], key=lambda cid: cid.key), result["published"])
+        for _, keys, _ in self.client.calls:
+            self.assertEqual(keys, [cid.key for cid in result["published"]])
+        self.assertEqual(self.publisher.next_due(), 0)  # the others are still due
+
+    def test_failed_lookup_ends_the_round_once_the_others_finish(self):
+        """A lookup that raises starts no more; publish_due raises it once those running have finished, having
+        sent nothing, and everything stays due."""
+        cids = self.due_keys(20)
+        first = min(cid.key for cid in cids)  # due first: never published, then by key
+        self.lookup_delay = lambda key: 0.05
+        finished = []
+
+        def fail(key):
+            """The first key's lookup raises."""
+            if key == first:
+                raise RuntimeError("lookup failed")
+
+        self.on_lookup = fail
+        with self.assertRaises(RuntimeError):
+            try:
+                self.publisher.publish_due()
+            finally:
+                finished.append(self.running.finished)
+        self.assertLessEqual(len(self.lookups), PUBLISH_LOOKUPS)
+        self.assertEqual(finished, [len(self.lookups) - 1])  # every other lookup started had finished
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.publisher.next_due(), 0)
+
+    # Refreshes that change nothing
+
+    def counting(self) -> dict[str, int]:
+        """Count the calls of storage.pins and dag_blocks from now until the test ends: {name: calls}."""
+        counts = {"pins": 0, "dag_blocks": 0}
+        for name in counts:
+            original = getattr(self.storage, name)
+
+            def counted(*args, name=name, original=original):
+                """Count the call, then make it."""
+                counts[name] += 1
+                return original(*args)
+
+            patcher = mock.patch.object(self.storage, name, counted)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return counts
+
+    def test_refresh_skipped_when_nothing_changed(self):
+        """With a generation, a refresh after which nothing it is computed from changed reads no pins or DAGs
+        and leaves the sets as they were; without one, every refresh computes."""
+        self.publisher = self.make_publisher(generation=True)
+        keys = {bytes([9]) * 16}
+        self.publisher.add_key_source(lambda: keys)
+        cid = self.pinned(os.urandom(100_000))
+        self.publisher.refresh()
+        provided, served = self.publisher._provided, self.publisher._served
+        counts = self.counting()
+        for _ in range(3):
+            self.publisher.refresh()
+        self.assertEqual(counts, {"pins": 0, "dag_blocks": 0})
+        self.assertIs(self.publisher._provided, provided)
+        self.assertIs(self.publisher._served, served)
+        self.assertEqual(self.publisher.provided(), {cid})
+        self.assertEqual(self.publisher.provided_keys(), keys)
+        publisher = self.make_publisher()
+        publisher.refresh()
+        counts["pins"] = 0
+        publisher.refresh()
+        self.assertEqual(counts["pins"], 1)
+
+    def test_refresh_computes_after_each_kind_of_change(self):
+        """With a generation, each change a refresh is computed from makes the next refresh compute, and what
+        stops being provided is withdrawn at once."""
+        self.publisher = self.make_publisher(generation=True)
+        self.config.provide_strategy = "roots"
+        deny = DenyList(self.state)
+        self.addCleanup(deny.close)
+        self.storage.deny = deny
+        keys: set[bytes] = set()
+        self.publisher.add_key_source(lambda: keys)
+        self.publisher.refresh()
+        counts = self.counting()
+
+        def refresh(provided: set, withdrawn: Cid | bytes | None = None):
+            """Refresh: it computes, provides provided (CIDs and keys) and has queued, at once, the withdrawal
+            of withdrawn (a CID or key published to N1 and N2). Then publish, and a refresh computes nothing."""
+            counts["pins"] = 0
+            self.publisher.refresh()
+            self.assertEqual(counts["pins"], 1)
+            self.assertEqual(self.publisher.provided() | self.publisher.provided_keys(), provided)
+            if withdrawn is not None:
+                key = withdrawn if isinstance(withdrawn, bytes) else withdrawn.key
+                self.assertEqual(self.records.providers(key), [])
+                self.assertEqual(self.held(self.publisher)["withdraw"], {N1: {key}, N2: {key}})
+            self.publisher.publish_due()  # also published, so a later withdrawal has nodes to go to
+            self.assertEqual(self.held(self.publisher)["withdraw"], {})
+            counts["pins"] = 0
+            self.publisher.refresh()
+            self.assertEqual(counts["pins"], 0)
+
+        with self.subTest("pin"):
+            a = self.pinned(b"a")
+            refresh({a})
+        with self.subTest("unpin"):
+            b = self.pinned(b"b")
+            refresh({a, b})
+            self.storage.unpin(b, USER)
+            refresh({a}, b)
+        fetched = builder.build_bytes(b"fetched", self.storage.put).cid
+        self.eligible.add(fetched)
+        self.publisher.refresh()
+        with self.subTest("cache record added"):
+            self.storage.record_fetch(fetched, [], fetched)
+            refresh({a, fetched})
+        with self.subTest("cache record dropped"):
+            self.storage.gc()
+            refresh({a}, fetched)
+        with self.subTest("fetched targets changed"):
+            builder.build_bytes(b"fetched", self.storage.put)
+            self.storage.record_fetch(fetched, [], fetched)
+            self.eligible.clear()
+            refresh({a})
+            self.eligible.add(fetched)
+            self.fetched_changes += 1
+            refresh({a, fetched})
+            self.eligible.clear()
+            self.fetched_changes += 1
+            refresh({a}, fetched)
+        big = builder.build_bytes(os.urandom(100_000), self.storage.put).cid
+        self.storage.pin(big, USER)
+        refresh({a, big})
+        damaged = next(cid for cid in self.storage.dag_blocks(big) if cid.is_raw)
+        block = self.storage.get(damaged)
+        with self.subTest("block deleted"):
+            with open(self.storage.blocks.path(damaged), "wb") as f:
+                f.write(b"damaged")
+            self.assertEqual(self.storage.verify()["bad"], [damaged])
+            refresh({a}, big)
+        with self.subTest("block stored"):
+            self.storage.put(damaged, block)
+            refresh({a, big})
+        with self.subTest("deny list"):
+            deny.add([str(damaged)])
+            refresh({a}, big)
+            deny.remove([str(damaged)])
+            refresh({a, big})
+        key = bytes([9]) * 16
+        with self.subTest("key source's keys"):
+            keys.add(key)
+            refresh({a, big, key})
+            keys.clear()
+            refresh({a, big}, key)
+        with self.subTest("new key source"):
+            keys.add(key)
+            refresh({a, big, key})
+            self.publisher.add_key_source(lambda: {key})  # the same key: computed again all the same
+            refresh({a, big, key})
+
+    def test_change_made_while_refreshing_is_seen_by_the_next(self):
+        """The generation is read before computing: a pin made after the compute read the pins is provided by
+        the next refresh, though nothing changed after that."""
+        self.publisher = self.make_publisher(generation=True)
+        a = self.pinned(b"a")
+        built = builder.build_bytes(b"pinned meanwhile", self.storage.put)
+        pins = self.storage.pins
+
+        def pins_then_pin():
+            """The pins as they were, then (once) another pin."""
+            result = pins()
+            if not self.storage.is_pinned(built.cid):
+                self.storage.pin(built.cid, USER)
+            return result
+
+        with mock.patch.object(self.storage, "pins", pins_then_pin):
+            self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {a})
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {a, built.cid})
+
+    def test_first_refresh_with_a_generation_withdraws_loaded_state(self):
+        """The first refresh after a restart computes, so what was published but is no longer provided is
+        withdrawn though the provided set is the same as before (empty)."""
+        cid = self.pinned(b"once provided")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.storage.unpin(cid, USER)
+        restarted = self.make_publisher(generation=True)
+        restarted.refresh()
+        self.assertEqual(self.held(restarted)["withdraw"], {N1: {cid.key}, N2: {cid.key}})
 
     def test_failed_save_is_written_next_time(self):
         """A round whose save fails raises (the loop logs it); the next save writes what it held."""

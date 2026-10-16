@@ -35,7 +35,7 @@ class ResponseOutcomeTest(unittest.TestCase):
             self.harness.tick()
         return logged
 
-    def fail(self, progress: float):
+    def fail_resource(self, progress: float):
         """RNS gives up on the Resource part-way, as it does when its transfer is lost: FAILED, then the
         callback."""
         self.resource.progress = progress
@@ -47,7 +47,7 @@ class ResponseOutcomeTest(unittest.TestCase):
     def test_failure_in_transit_is_logged(self):
         """A Resource RNS failed, which the server didn't cancel, is logged at debug, saying it was lost in
         transit; the slot is freed for the next request."""
-        logged = self.messages(lambda: self.fail(0.5))
+        logged = self.messages(lambda: self.fail_resource(0.5))
         failed = [(message, level) for message, level in logged if "failed after" in message]
         self.assertEqual(len(failed), 1, logged)
         self.assertIn("lost in transit", failed[0][0])
@@ -57,7 +57,7 @@ class ResponseOutcomeTest(unittest.TestCase):
     def test_failure_with_the_link_closed_says_so(self):
         """A Resource that failed because its link closed is logged as such."""
         self.link.status = RNS.Link.CLOSED
-        logged = self.messages(lambda: self.fail(0.2))
+        logged = self.messages(lambda: self.fail_resource(0.2))
         self.assertTrue(any("its link closed" in message for message, _ in logged), logged)
 
     def test_cancelled_here_is_logged_only_with_its_reason(self):

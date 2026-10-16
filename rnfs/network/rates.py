@@ -30,7 +30,7 @@ class RateEstimates:
         """No estimates yet; responses under min_rate_sample bytes are ignored."""
         self.min_rate_sample = min_rate_sample
         self.rates: dict[bytes, float] = {}
-        self.samples = 0  # estimates recorded so far, over every link (for status and tests)
+        self.samples = 0  # estimates recorded so far, over every link (read by tests)
         self.lock = threading.Lock()
 
     def record(self, link_id: bytes, response_size: int | None, expected_rate: float | None) -> bool:

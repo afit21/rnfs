@@ -353,12 +353,28 @@ class OtherCommandTest(CliTestCase):
         self.assertIn("invalid settings: private must be true or false", str(raised.exception.code))
 
     def test_node_that_cant_start_fails_cleanly(self):
-        # An error building the node (e.g. an rnfs dir that isn't private) is a message, not a traceback
+        """An error building the node (e.g. an rnfs dir that isn't private) is a message, not a traceback, and
+        the daemon.lock is let go."""
         from rnfs.errors import RnfsError
         with mock.patch("rnfs.node.RnfsNode", side_effect=RnfsError("the rnfs dir isn't private")), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             cli.main(["--dir", self.tmp, "daemon"])
         self.assertEqual(raised.exception.code, "rnfs: the rnfs dir isn't private")
+        self.assert_unlocked()
+
+    def test_debug_log_that_cant_open_fails_cleanly(self):
+        """A debug log that can't be written is a message, and the daemon.lock taken before it is let go."""
+        with mock.patch("rnfs.debuglog.start", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cli.main(["--dir", self.tmp, "daemon", "--debug-log"])
+        self.assertEqual(raised.exception.code, "rnfs: can't write the debug log: disk full")
+        self.assert_unlocked()
+
+    def assert_unlocked(self):
+        """The failed daemon closed its daemon.lock: this process can lock it again (an open descriptor would
+        hold the lock, and on Windows keep the temp dir from being removed)."""
+        fd = fsutil.lock_exclusive(os.path.join(self.tmp, cli.LOCK_FILE))
+        os.close(fd)
 
 
 class TokenTest(CliTestCase):

@@ -5,19 +5,26 @@ pinned with source "folder"; a changed or removed entry releases its old pin. En
 unchanged by a signature of path, size, modification time and execute bit (recursively for directories),
 remembered across restarts (the state database's shared_folder table, rnfs.statedb: after a scan that changed
 any, the entries changed are written durably), so unchanged entries aren't hashed again.
+
+An entry that fails to import because of its content (an invalid name, the deny list, too large) isn't tried
+again until it changes; one that fails for a reason that may pass (a full or failing disk, a pin that couldn't be
+saved, a file unreadable for now) is tried again RETRY_AFTER later. A failure to pin an unchanged entry again is
+logged and the scan goes on.
 """
 import hashlib
 import json
 import os
 import stat
 import threading
+import time
+from collections.abc import Callable
 
 from rnfs import constants, statedb
 from rnfs.content import builder
 from rnfs.content.builder import display_path
 from rnfs.content.cid import Cid
 from rnfs.content.storage import FOLDER, Storage
-from rnfs.errors import RnfsError
+from rnfs.errors import RnfsError, StorageFull
 from rnfs.log import LOG_INFO, LOG_WARNING, log
 
 
@@ -85,19 +92,25 @@ def open_signature(handle: builder.Handle, st: os.stat_result, path: str) -> str
     return digest.hexdigest()
 
 
+RETRY_AFTER = 600.0  # seconds before an entry whose import failed for a reason that may pass is tried again
+
+
 class SharedFolder:
     """Keeps the shared folder's entries imported and pinned with source "folder"."""
 
-    def __init__(self, directory: str, storage: Storage, state_dir: str | None = None):
+    def __init__(self, directory: str, storage: Storage, state_dir: str | None = None,
+                 clock: Callable[[], float] = time.monotonic):
         """Track directory (created if missing at the first scan); the signature cache lives in state_dir's
-        state database (not kept without one)."""
+        state database (not kept without one). clock times the retries of failed imports."""
         self.directory = os.path.expanduser(directory)
         self.storage = storage
+        self.clock = clock
         self._db = statedb.connect(os.path.expanduser(state_dir)) if state_dir else None
         self._lock = threading.Lock()
         self._known: dict[str, tuple[str, Cid]] = {}  # entry name -> (signature, CID) of its last import
         self._saved: dict[str, tuple[str, Cid]] = {}  # what the shared_folder table holds
-        self._failed: dict[str, str] = {}  # entry name -> signature that failed to import, not retried until it changes
+        # Entry name -> (signature that failed to import, when to try it again: None for not until it changes)
+        self._failed: dict[str, tuple[str, float | None]] = {}
         self._warned: set[str] = set()  # skipped entries already warned about
         try:
             self._load()
@@ -125,9 +138,10 @@ class SharedFolder:
                 tx.executemany("DELETE FROM shared_folder WHERE name = ?", bad)
 
     def names(self) -> dict[Cid, str]:
-        """CID → the shared-folder entry name it was imported from, for `pin ls`."""
-        with self._lock:
-            return {cid: name for name, (_, cid) in self._known.items()}
+        """CID → the shared-folder entry name it was imported from, for `pin ls`. Not locked, so it never waits
+        for a scan's imports: after __init__, _known is only ever replaced whole, never changed in place."""
+        known = self._known
+        return {cid: name for name, (_, cid) in known.items()}
 
     def _save(self):
         """Persist the entries of the signature cache that differ from what the table holds, durably (lock held)."""
@@ -174,7 +188,7 @@ class SharedFolder:
             return pins
 
     def _warn_once(self, key: str, message: str):
-        """Log a warning about a skipped entry, once until it changes."""
+        """Log a warning about a skipped entry, once per entry name and reason while the daemon runs."""
         if key not in self._warned:
             self._warned.add(key)
             log(f"shared folder: {message}", LOG_WARNING)
@@ -216,9 +230,13 @@ class SharedFolder:
             return None
         known = self._known.get(name)
         if known is not None and known[0] == sig and self.storage.is_complete(known[1]):
-            self.storage.pin(known[1], FOLDER)  # no-op if already pinned
+            try:
+                self.storage.pin(known[1], FOLDER)  # no-op if already pinned
+            except OSError as e:  # not saved (a full or failing disk): pinned again by the next scan
+                log(f"shared folder: couldn't pin {shown}: {e}", LOG_WARNING)
             return known
-        if self._failed.get(name) == sig:
+        failed = self._failed.get(name)
+        if failed is not None and failed[0] == sig and (failed[1] is None or self.clock() < failed[1]):
             return None
         warnings: list[str] = []
         try:
@@ -226,8 +244,12 @@ class SharedFolder:
                 with session.writer() as put:
                     built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True)
                 self.storage.pin(built.cid, FOLDER)
-        except (OSError, ValueError, RnfsError) as e:
-            self._failed[name] = sig
+        except (OSError, StorageFull) as e:  # may pass (a full or failing disk, a pin not saved): tried again later
+            self._failed[name] = (sig, self.clock() + RETRY_AFTER)
+            log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
+            return None
+        except (ValueError, RnfsError) as e:  # the content's: not until it changes
+            self._failed[name] = (sig, None)
             log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
             return None
         for warning in warnings:

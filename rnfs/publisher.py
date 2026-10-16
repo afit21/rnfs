@@ -3,11 +3,14 @@
 - **What is provided** (provide_strategy): `pinned` provides every complete pin; `roots` also every complete
   fetched target while it is cached (the node says which cached targets qualify: gateway fetches never do).
   Only these CIDs' DAGs are served to /blocks (section 7). A CID whose DAG holds a block the deny list (the
-  storage's) denies is never provided: a change to the list takes effect at the next refresh().
+  storage's) denies is never provided: a change to the list takes effect at the next refresh(). A refresh
+  recomputes this only when something it is computed from changed (the node's generation(), the deny list,
+  the key sources' keys, the strategy), so the many refreshes that change nothing cost almost nothing.
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. For
-  each due CID the K closest nodes are found; keys are grouped by node, and each node gets its keys (and any
-  withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed
-  store isn't retried until the next republish. The node also records itself locally.
+  each due CID the K closest nodes are found, PUBLISH_LOOKUPS lookups at once (one at a time on slow nodes);
+  keys are grouped by node, and each node gets its keys (and any withdrawals for it) in as few /provide
+  requests as fit, over one identified link. A refused or failed store isn't retried until the next
+  republish. The node also records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
   from the nodes it was last published to, at once, and from nodes of earlier rounds (or of a round cut
   short) whose record may not have expired yet: the closest set changes as nodes come and go.
@@ -56,6 +59,12 @@ SAVE_EVERY_SECONDS = 30.0
 # LoRa rates. One per 30 s keeps republishing a hundred keys to well under 1% of a day's airtime per hour
 SLOW_LOOKUP_PACE = 30.0
 SLOW_ROUND_LOOKUPS = 10  # lookups per round on slow nodes, so /provide batching still groups keys per node
+# Other nodes: closest-nodes lookups a round runs at once. Each keeps alpha (3) /find queries in flight, so 4
+# keep about 12, small requests (a link still carries at most MAX_REQUESTS_PER_LINK at once; the rest wait for a
+# slot); a round of a few hundred keys, each lookup a few round trips one after another, then takes about a
+# quarter of the time, with few threads. The airtime controls (upload_budget, interface rules, quiet hours)
+# apply to /blocks only (spec section 3): these send the same /find messages as one at a time would, overlapping
+PUBLISH_LOOKUPS = 4
 
 
 class DhtKey:
@@ -184,11 +193,13 @@ class Publisher:
     def __init__(self, own_id: bytes, config: Config, storage: Storage, providers, client,
                  make_lookup: Callable[[bytes], object], slow_node: bool = False, state_dir: str | None = None,
                  cached_eligible: Callable[[], set[Cid]] = set, clock: Callable[[], float] = time.time,
-                 retry_interval: float = RETRY_INTERVAL):
+                 retry_interval: float = RETRY_INTERVAL, generation: Callable[[], object] | None = None):
         """Publisher for own_id. providers is the ProviderStore (to record ourselves), client the PeerClient.
 
         make_lookup(key) returns a dht.lookup.Lookup; cached_eligible() returns the cached targets the
-        roots strategy may provide.
+        roots strategy may provide. generation(), if given, returns a value that changes whenever storage's pins,
+        cached targets or blocks, or cached_eligible(), may have: refresh() skips its recompute while it, the deny
+        list and the key sources' keys are as at the last one (without it, every refresh recomputes).
         """
         self.own_id = own_id
         self.config = config
@@ -200,6 +211,7 @@ class Publisher:
         self.cached_eligible = cached_eligible
         self.clock = clock
         self.retry_interval = retry_interval
+        self.generation = generation
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._wake = threading.Event()
@@ -213,6 +225,8 @@ class Publisher:
         # CID -> (deny list's CID set, dag_blocks object, whether one of them is denied), so each DAG is checked
         # against the deny list once per change of either
         self._denied_dags: dict[Cid, tuple[frozenset[bytes], frozenset[Cid], bool]] = {}
+        # (generation(), deny list's CID set, keys, strategy) of the last full refresh; None: the next computes
+        self._inputs: tuple | None = None
         self._published: dict[Cid, tuple[float, list[bytes]]] = {}  # CID -> (when, nodes that recorded it)
         # Other nodes that may still hold our record of a CID (earlier rounds' closest nodes, or a round cut
         # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
@@ -238,6 +252,7 @@ class Publisher:
         """Also provide the keys source() returns (DhtKeys), recomputed at each refresh(). Must not block."""
         with self._lock:
             self._key_sources.append(source)
+            self._inputs = None  # its keys aren't in the provided set yet
 
     @property
     def interval(self) -> float:
@@ -386,8 +401,19 @@ class Publisher:
         """True if cid is in the DAG of a provided CID, so /blocks may serve it."""
         return cid in self._served  # a frozenset swapped whole, so reading it needs no lock
 
-    def _compute(self) -> tuple[frozenset[Cid], frozenset[Cid]]:
-        """(provided CIDs, blocks they reach) from storage and the strategy. Lock held.
+    def _keys(self) -> set[bytes]:
+        """The keys the key sources return now (a failing source's are left out, logged). Lock held."""
+        keys: set[bytes] = set()
+        for source in list(self._key_sources):
+            try:
+                keys |= {bytes(key) for key in source()}  # as DhtKey takes them
+            except Exception as e:  # noqa: BLE001 - a broken feature mustn't stop CIDs being provided
+                log(f"a provided-key source failed: {e!r}", LOG_ERROR)
+        return keys
+
+    def _compute(self, keys: set[bytes], denied: frozenset[bytes]) -> tuple[frozenset[Cid], frozenset[Cid]]:
+        """(provided CIDs and DhtKeys of keys, blocks they reach) from storage, the strategy and denied (the
+        deny list's binary CIDs). Lock held.
 
         The served set and the DhtKeys are those of the last call when what they are built from hasn't changed
         (most refreshes): the same complete CIDs with the same dag_blocks objects, and the same keys. CIDs only
@@ -402,16 +428,9 @@ class Publisher:
                 dags[cid] = self.storage.dag_blocks(cid)  # memoised; raises unless complete
             except (NotFound, InvalidDag):
                 continue
-        denied = self.storage.deny.cids
         if denied:
             dags = {cid: blocks for cid, blocks in dags.items() if not self._denied(cid, blocks, denied)}
         self._denied_dags = {cid: checked for cid, checked in self._denied_dags.items() if cid in candidates}
-        keys: set[bytes] = set()
-        for source in list(self._key_sources):
-            try:
-                keys |= {bytes(key) for key in source()}  # as DhtKey takes them
-            except Exception as e:  # noqa: BLE001 - a broken feature mustn't stop CIDs being provided
-                log(f"a provided-key source failed: {e!r}", LOG_ERROR)
         last_dags, served = self._served_from
         new = [blocks for cid, blocks in dags.items() if last_dags.get(cid) is not blocks]
         if len(dags) - len(new) < len(last_dags):  # one went, or its blocks changed: built again
@@ -435,9 +454,26 @@ class Publisher:
         return checked[2]
 
     def refresh(self):
-        """Recompute what is provided (after pins, fetches, evictions); withdraw what no longer is, at once."""
+        """Recompute what is provided (after pins, fetches, evictions); withdraw what no longer is, at once.
+
+        Skipped when generation(), the deny list, the key sources' keys and the strategy are as at the last
+        refresh that computed: the same inputs give the same sets, so nothing would be added or removed.
+        removed also takes in _published, but _published stays within _provided between refreshes: a refresh
+        drops from _published what it doesn't provide, only refresh() changes _provided, and a round records
+        only items still in _provided. _load fills _published before any refresh, so the first refresh after
+        construction always computes (as does the first after add_key_source).
+        """
         with self._lock:
-            provided, served = self._compute()
+            keys, denied = self._keys(), self.storage.deny.cids  # the deny set is swapped whole
+            # Read before computing: a change made while this computes moves the generation past what is
+            # remembered here, so the next refresh computes again (perhaps once more than needed), never misses it
+            inputs = (None if self.generation is None
+                      else (self.generation(), denied, keys, self.config.provide_strategy))
+            last = self._inputs
+            if (inputs is not None and last is not None and (last[1] is denied or last[1] == denied)
+                    and last[0] == inputs[0] and last[2:] == inputs[2:]):
+                return
+            provided, served = self._compute(keys, denied)
             removed = (set(self._provided) | set(self._published)) - provided
             added = provided - self._provided
             self._provided, self._served = provided, served
@@ -452,6 +488,7 @@ class Publisher:
                     self._withdrawals.setdefault(node_id, set()).add(cid.key)
                     self._touch_node(node_id)
             cancelled = [cid for cid in added if self._provide_again(cid)]
+            self._inputs = inputs  # only once everything above is done: an exception computes again next time
             if removed:
                 log(f"no longer providing {plural(len(removed), 'CID')}", LOG_VERBOSE)
         if removed or cancelled:
@@ -544,12 +581,7 @@ class Publisher:
             if self.slow_node:
                 due = due[:SLOW_ROUND_LOOKUPS] if now >= self._next_lookup else []
 
-        closest: dict[Cid, list[bytes]] = {}
-        for cid in due:
-            if should_stop():
-                break
-            self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
-            closest[cid] = [n for n in self.make_lookup(cid.key).find_closest() if n != self.own_id]
+        closest = self._lookups(due, should_stop)
         with self._lock:
             if self.slow_node and closest:
                 self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * len(closest)
@@ -662,6 +694,64 @@ class Publisher:
                 LOG_VERBOSE)
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values())}
+
+    def _find_closest(self, cid: "Cid | DhtKey") -> list[bytes]:
+        """Record this node as cid's provider locally, then look up the nodes closest to its key (but this)."""
+        self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
+        return [n for n in self.make_lookup(cid.key).find_closest() if n != self.own_id]
+
+    def _lookups(self, due: list, should_stop: Callable[[], bool]) -> dict:
+        """{item: its closest nodes} for due's items whose lookup ran, in due's order, so a round's batches are
+        the same however the lookups were run. Called without the lock: refresh() may run meanwhile.
+
+        should_stop() is checked before each lookup starts; one running isn't interrupted. Slow nodes (and a
+        single item) look up one at a time; other nodes run up to PUBLISH_LOOKUPS at once on
+        rnfs-publish-lookup threads. A lookup that raises starts no more; the exception is raised once those
+        running have finished, ending the round as it would one at a time.
+        """
+        if self.slow_node or len(due) < 2 or PUBLISH_LOOKUPS < 2:
+            closest = {}
+            for cid in due:
+                if should_stop():
+                    break
+                closest[cid] = self._find_closest(cid)
+            return closest
+        lock = threading.Lock()
+        pending = iter(range(len(due)))
+        found: dict[int, list[bytes]] = {}
+        ended: list[BaseException | None] = []  # None once stopped, else the exception a lookup raised
+
+        def work():
+            """Run lookups in turn until none is left, the round is stopped, or one has raised."""
+            while True:
+                with lock:
+                    if ended:
+                        return
+                    index = next(pending, None)
+                    if index is None:
+                        return
+                    if should_stop():
+                        ended.append(None)
+                        return
+                try:
+                    nodes = self._find_closest(due[index])
+                except BaseException as e:  # noqa: BLE001 - raised by publish_due once the others finish
+                    with lock:
+                        ended.append(e)
+                    return
+                with lock:
+                    found[index] = nodes
+
+        threads = [threading.Thread(target=work, name="rnfs-publish-lookup", daemon=True)
+                   for _ in range(min(PUBLISH_LOOKUPS, len(due)))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        failure = next((e for e in ended if e is not None), None)
+        if failure is not None:
+            raise failure
+        return {due[index]: found[index] for index in sorted(found)}
 
     def run(self, stop_event: threading.Event, ready: threading.Event | None = None):
         """The publish loop, for a thread of its own: waits for ready (the join), then publishes what's due."""

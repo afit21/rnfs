@@ -59,7 +59,8 @@ LOCK_OFFSET = 1 << 30  # Windows: the byte locked, far past what the lock file h
 def lock_exclusive(path: str) -> int:
     """Open path (created 0600 if missing) and lock it for this process, without waiting; the descriptor, whose
     lock lasts until it is closed or the process ends (also by a crash), with this process's ID written in the
-    file. Raises BlockingIOError if another process holds the lock, OSError if path can't be opened.
+    file. Raises BlockingIOError if another process holds the lock, OSError if path can't be opened or locked.
+    Release it with unlock().
 
     POSIX: flock (advisory: only processes that lock it too are kept out). Windows: msvcrt.locking of one byte at
     LOCK_OFFSET, past the text.
@@ -71,7 +72,11 @@ def lock_exclusive(path: str) -> int:
             os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            except OSError as e:  # PermissionError (EACCES) when another process holds it
+            except OSError as e:
+                # PermissionError (EACCES) when another process holds it (EDEADLOCK in the waiting modes);
+                # anything else (a file system that can't lock, say) is no holder's doing
+                if e.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
                 raise BlockingIOError(errno.EAGAIN, f"{path} is locked by another process") from e
         else:
             import fcntl
@@ -83,6 +88,24 @@ def lock_exclusive(path: str) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def unlock(fd: int):
+    """Release lock_exclusive()'s lock on fd, then close fd. Windows may release a closed file's locks only some
+    time later, so a lock given up here can be taken again at once; one that won't unlock is left to the close.
+    Raises OSError if fd can't be closed."""
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass  # closing releases it too
+    finally:
+        os.close(fd)
 
 
 def lock_holder(path: str) -> int | None:

@@ -14,7 +14,7 @@ from rnfs.config import Config
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import NotFound, RnfsError
 from rnfs.names import NameManager, encode_record, parse_record
-from tests.support import POSIX_MODES, FakeClock, failing_commits, state_execute, state_rows, wait_for
+from tests.support import CAN_SYMLINK, POSIX_MODES, FakeClock, failing_commits, state_execute, state_rows, wait_for
 
 _saved_loglevel = RNS.loglevel
 
@@ -278,21 +278,70 @@ class KeyTest(NamesTestCase):
         with self.assertRaises(ValueError):
             self.manager.create("site")
 
+    @unittest.skipUnless(CAN_SYMLINK, "creating symlinks needs Developer Mode or an admin on Windows")
+    def test_create_refuses_an_alias_whose_key_is_a_dangling_symlink(self):
+        """An alias whose key file is a dangling symlink can't be read but isn't free: create and import refuse it,
+        and its saved record stays as it is."""
+        self.manager.create("site")
+        self.manager.publish("site", CID_A)
+        self.manager.close()
+        row = self.rows("SELECT * FROM names_published")
+        path = os.path.join(self.config.names_dir, "site")
+        os.remove(path)
+        os.symlink(os.path.join(self.config.names_dir, "elsewhere"), path)
+        restarted = self.make_manager()
+        self.assertEqual(restarted._unreadable, {"site"})
+        with self.assertRaisesRegex(ValueError, "alias site already exists"):
+            restarted.create("site")
+        with self.assertRaisesRegex(ValueError, "alias site already exists"):
+            restarted.import_key("site", RNS.Identity().get_private_key())
+        self.assertTrue(os.path.islink(path))
+        self.assertEqual(self.rows("SELECT * FROM names_published"), row)
+
+    def test_create_survives_a_remove_right_after_it(self):
+        """A remove landing as soon as create lets go of the lock doesn't make create fail: it returns the name."""
+        lock, depth, removed = self.manager._lock, [0], []
+        manager = self.manager
+
+        class RemovingLock:
+            """The manager's lock, removing "site" (as another thread might) once create releases it."""
+
+            def __enter__(self):
+                """Take the lock."""
+                lock.acquire()
+                depth[0] += 1
+
+            def __exit__(self, *exc):
+                """Release it, then remove "site" the first time it is free."""
+                depth[0] -= 1
+                lock.release()
+                if depth[0] == 0 and not removed:
+                    removed.append(True)
+                    manager.remove("site")
+
+        manager._lock = RemovingLock()
+        name = manager.create("site")
+        self.assertEqual(len(name), 16)
+        self.assertEqual((removed, manager.list()), ([True], []))
+
     def test_keys_survive_restart(self):
         """A new manager over the same directory loads the same names."""
         name = self.manager.create("site")
         self.assertEqual(self.make_manager().name("site"), name)
 
     def test_old_temp_files_removed_at_start(self):
-        """Temp files 0.1.1's interrupted writes left under fixed names are deleted; nothing else is."""
+        """Temp files interrupted key writes left are deleted (0.1.1's under fixed names, and write_atomic's,
+        which hold a private key); nothing else is."""
         self.manager.create("site")
-        old = [os.path.join(self.config.state_dir, "names.json.tmp"), os.path.join(self.config.names_dir, ".gone.tmp")]
-        kept = [os.path.join(self.config.names_dir, name) for name in (".notes", "x.tmp")]
+        old = [os.path.join(self.config.state_dir, "names.json.tmp"), os.path.join(self.config.names_dir, ".gone.tmp"),
+               os.path.join(self.config.names_dir, fsutil.PARTIAL_PREFIX + "0123456789abcdef")]
+        kept = [os.path.join(self.config.names_dir, name)
+                for name in (".notes", "x.tmp", fsutil.PARTIAL_PREFIX + "short", fsutil.PARTIAL_PREFIX + "0" * 17)]
         for path in old + kept:
             with open(path, "wb") as f:
                 f.write(b"partial")
         self.assertEqual(self.make_manager().list()[0]["alias"], "site")
-        self.assertEqual([os.path.exists(path) for path in old + kept], [False, False, True, True])
+        self.assertEqual([os.path.exists(path) for path in old + kept], [False] * len(old) + [True] * len(kept))
         # No temp file of its own: only the state database is there
         self.assertEqual([entry for entry in os.listdir(self.config.state_dir)
                           if not entry.startswith(statedb.DB_FILE)], [])
@@ -375,6 +424,53 @@ class PublishTest(NamesTestCase):
         self.assertEqual(self.pins.sources, {})
         self.assertEqual(restarted.list(), [])
         self.make_manager().release_gone()  # its entry is gone from the state: nothing left to release
+        self.assertEqual(self.pins.sources, {})
+
+    def test_deleted_key_file_pin_released_once_at_reconcile(self):
+        """reconcile_pins releases a deleted key's recorded pin once, with one warning; a pin nothing records is
+        still released."""
+        self.manager.create("site")
+        self.manager.publish("site", CID_A)
+        self.pins.pin(CID_B, "name:site")  # left by a crash
+        os.remove(os.path.join(self.config.names_dir, "site"))
+        restarted = self.make_manager()
+        with mock.patch.object(names, "log") as log:
+            restarted.reconcile_pins({cid: set(sources) for cid, sources in self.pins.sources.items()})
+        self.assertEqual(self.pins.sources, {})
+        self.assertEqual([call.args[0] for call in log.call_args_list],
+                         ["name key site is gone; releasing its pin",
+                          "releasing the pins of name site, which has no key"])
+        log.reset_mock()
+        self.pins.pin(CID_A, "name:site")
+        self.pins.unpin(CID_B, "name:site")
+        self.manager.close()
+        state_execute(self.config.state_dir, "INSERT INTO names_published VALUES ('site', '1', ?, 0)",
+                      (CID_A.binary,))
+        restarted = self.make_manager()
+        with mock.patch.object(names, "log") as log:
+            restarted.reconcile_pins({cid: set(sources) for cid, sources in self.pins.sources.items()})
+        self.assertEqual(self.pins.sources, {})
+        self.assertEqual([call.args[0] for call in log.call_args_list], ["name key site is gone; releasing its pin"])
+
+    def test_alias_replaced_while_refreshing_isnt_published(self):
+        """An imported key removed and its alias made again while its first publish refreshes: the publish fails,
+        rather than record the target under the old name and announce it under the new one."""
+        self.manager.start()
+        old = self.manager.import_key("site", RNS.Identity().get_private_key())
+
+        def replace(name):
+            """Remove "site" and create it again, with another key."""
+            self.network.on_request_path = None
+            self.manager.remove("site")
+            self.manager.create("site")
+
+        self.network.on_request_path = replace
+        with self.assertRaisesRegex(NotFound, "replaced while publishing"):
+            self.manager.publish("site", CID_A)
+        new = self.manager.name("site")
+        self.assertNotEqual(new, old)
+        self.assertEqual((self.manager.record(old), self.manager.record(new)), (None, None))
+        self.assertEqual(self.rows("SELECT * FROM names_held"), [])
         self.assertEqual(self.pins.sources, {})
 
     def test_sequence_increments(self):
@@ -627,6 +723,15 @@ class ResolveTest(NamesTestCase):
         self.manager.resolve(name, persist=True, max_age=60)
         self.assertEqual(self.network.path_requests, [name])
 
+    def test_watched_name_first_heard_unasked_is_kept(self):
+        """A name heard unasked and then watched counts as asked: a flood of new names doesn't evict it."""
+        watched = other_name(1)
+        self.network.announce(watched, encode_record(1, CID_A), self.clock.now)
+        self.manager.watch(watched)
+        for i in range(2, 10):
+            self.network.announce(other_name(i), encode_record(1, CID_B), self.clock.now)
+        self.assertEqual(self.manager.record(watched).sequence, 1)
+
     def test_resolve_rejects_bad_names(self):
         """Names must be 16 bytes."""
         with self.assertRaises(ValueError):
@@ -694,6 +799,28 @@ class StateTest(NamesTestCase):
         self.assertEqual(self.rows("SELECT * FROM names_held"), [])
         self.manager.stop()
         self.assertEqual(self.rows("SELECT name, sequence FROM names_held"), [(name, "4")])
+
+    def test_failed_save_of_a_heard_record_is_retried(self):
+        """An announce raising a held name's sequence whose save fails still wakes resolves and tells keepers and
+        listeners; announce_due saves it."""
+        name = other_name(1)
+        self.network.store(name, encode_record(4, CID_A), self.clock.now)
+        self.manager.resolve(name, persist=True)
+        self.manager.start()
+        keepers = self.manager.keepers = FakeKeepers()
+        heard = []
+        self.manager.watch(name)
+        self.manager.add_record_listener(lambda n, record: heard.append(record.sequence))
+        waiting = threading.Event()
+        self.manager._waiters[name] = [waiting]
+        with failing_commits(), mock.patch.object(keepers, "heard") as told:
+            self.network.announce(name, encode_record(5, CID_B), self.clock.now)
+        self.assertTrue(waiting.is_set())
+        self.assertEqual((heard, told.call_args.args[1]), ([5], 5))
+        self.assertEqual(self.manager.record(name).sequence, 5)
+        self.assertEqual(self.rows("SELECT sequence FROM names_held"), [("4",)])
+        self.manager.announce_due()
+        self.assertEqual(self.rows("SELECT sequence FROM names_held"), [("5",)])
 
     def test_malformed_rows_stop_startup(self):
         """A published or held row that doesn't parse stops startup, as a malformed names.json did: starting
@@ -898,6 +1025,19 @@ class FloorSaveTest(NamesTestCase):
         self.assertEqual(self.saved(), [other_name(1), other_name(2)])
         self.resolve_for_gateway(3)  # but the save that worked does
         self.assertEqual(len(self.saved()), 2)
+
+    def test_name_resolved_for_the_user_leaves_the_floor(self):
+        """A floor name resolved for the user is held: its floor entry goes, and the next floor save deletes its row,
+        so it no longer counts toward the floor's bound."""
+        self.resolve_for_gateway(1)
+        self.resolve_for_gateway(2)
+        self.manager.announce_due()
+        self.assertEqual(self.saved(), [other_name(1), other_name(2)])
+        self.manager.resolve(other_name(1), persist=True, max_age=60)
+        self.assertNotIn(other_name(1), self.manager._floor)
+        self.assertNotIn(other_name(1), self.manager._floor_used)
+        self.manager.announce_due()
+        self.assertEqual(self.saved(), [other_name(2)])
 
     def test_invalid_rows_are_dropped(self):
         """A floor row that doesn't parse is logged and deleted; the node starts without it."""

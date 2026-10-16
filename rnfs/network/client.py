@@ -57,14 +57,12 @@ class PeerClient:
 
     def rate_estimate(self, node_id: bytes) -> float | None:
         """The rate estimate (bits/s) of the open link to node_id, or None."""
-        with self.links.lock:
-            peer = self.links.shared.get(node_id)
+        peer = self.links.shared_peer(node_id)
         return peer.rate if peer is not None else None
 
     def link_mdu(self, node_id: bytes) -> int | None:
         """The packet MDU of the open link to node_id, which bounds the requests sent on it, or None."""
-        with self.links.lock:
-            peer = self.links.shared.get(node_id)
+        peer = self.links.shared_peer(node_id)
         return peer.mdu() if peer is not None and peer.is_active() else None
 
     def close(self, node_id: bytes):
@@ -166,7 +164,8 @@ class PeerClient:
 
     # /blocks
 
-    def blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None) -> BlocksResult:
+    def blocks(self, node_id: bytes, cids: list[Cid],
+               on_progress: Callable[[float], None] | None = None) -> BlocksResult:
         """_blocks(), counted in traffic (mesh): the outcome, verified bytes received and bad blocks."""
         result = self._blocks(node_id, cids, on_progress)
         if result.status != OK or result.blocks or result.missing or result.bad:
@@ -177,11 +176,11 @@ class PeerClient:
 
     def _interface(self, node_id: bytes) -> str | None:
         """The name of the interface the shared link to node_id runs over, or None."""
-        with self.links.lock:
-            peer = self.links.shared.get(node_id)
+        peer = self.links.shared_peer(node_id)
         return mesh.interface_label(getattr(getattr(peer, "link", None), "attached_interface", None))
 
-    def _blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None) -> BlocksResult:
+    def _blocks(self, node_id: bytes, cids: list[Cid],
+                on_progress: Callable[[float], None] | None = None) -> BlocksResult:
         """Ask node_id for blocks over its shared link, verifying each against its CID.
 
         Sends as many of cids (duplicates dropped) as fit one packet; the rest come back in .unsent.

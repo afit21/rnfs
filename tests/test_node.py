@@ -1,4 +1,5 @@
 """Tests for RnfsNode's facade and backend (rnfs/node.py), on offline nodes with a fake network client."""
+import hashlib
 import io
 import os
 import random
@@ -17,11 +18,11 @@ from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES, K
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import remote_source
 from rnfs import fetcher
-from rnfs.errors import InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
+from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
-from rnfs import fsutil, node as node_module
+from rnfs import fsutil, node as node_module, statedb
 from rnfs.node import RnfsNode
 from tests.support import POSIX_MODES, failing_commits, state_rows, wait_for
 from tests.test_names import FakeNetwork
@@ -290,6 +291,50 @@ class NetworkFacadeTest(NodeTest):
         self.assertEqual(self.b.pin_add(f"{cid}/sub")["cid"], self.a.info(f"{cid}/sub")["cid"])
         self.assertEqual(len(self.b.publisher.provided()), 1)
 
+    def test_read_file_is_info_and_read_in_one_fetch(self):
+        """read_file gives info()'s answer and read()'s bytes, cut to the file's size, from one fetch session."""
+        cid = self.a.add_path(self.tree())["cid"]
+        self.advertise(cid)
+        target = f"{cid}/big.bin"
+        sessions = []
+        fetching = self.b._fetching
+        with mock.patch.object(self.b, "_fetching", lambda *args, **kwargs: sessions.append(1) or fetching(*args,
+                                                                                                         **kwargs)):
+            info, chunks = self.b.read_file(target, offset=CHUNK_SIZE + 1, length=10)
+            self.assertEqual(b"".join(chunks), self.big[CHUNK_SIZE + 1:CHUNK_SIZE + 11])
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(info, self.b.info(target))
+            for offset, length in ((len(self.big) - 5, 100), (len(self.big) + 7, None), (0, 0)):
+                info, chunks = self.b.read_file(target, offset=offset, length=length)
+                self.assertEqual(b"".join(chunks), self.big[offset:] if length is None else
+                                 self.big[offset:offset + length])
+        with self.assertRaises(ValueError):
+            self.b.read_file(target, offset=-1)
+
+    def test_read_file_of_a_directory_reads_nothing(self):
+        """A directory's info comes back; reading it raises ValueError, and closing it unread ends the fetch."""
+        cid = self.a.add_path(self.tree())["cid"]
+        self.advertise(cid)
+        info, chunks = self.b.read_file(f"{cid}/sub")
+        self.assertEqual(info["type"], "directory")
+        with self.assertRaisesRegex(ValueError, "is a directory"):
+            next(chunks)
+        info, chunks = self.b.read_file(cid)
+        chunks.close()
+        self.assertEqual(self.b.storage._sessions, [])  # its protection session ended
+        with self.assertRaises(NotFound):
+            self.b.read_file(f"{cid}/missing")
+
+    def test_read_file_checks_the_deny_list_before_the_first_byte(self):
+        """A file whose hash is denied raises Denied at the first chunk, after its info."""
+        cid = self.a.add_stream(io.BytesIO(b"unwanted" * 100))["cid"]
+        self.advertise(cid)
+        self.b.deny.add(["sha256:" + hashlib.sha256(b"unwanted" * 100).hexdigest()])
+        info, chunks = self.b.read_file(cid)
+        self.assertEqual(info["size"], 800)
+        with self.assertRaises(Denied):
+            next(chunks)
+
     def test_invalid_root_reported(self):
         self.b.fetcher.mark_invalid(Cid.for_block(RAW, b"bad"))
         with self.assertRaises(InvalidDag):
@@ -495,6 +540,18 @@ class SecurityTest(NodeTest):
         self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
         self.assertEqual(self.a.storage.pins(), {})
 
+    def test_remote_pin_quota_counts_dag_blocks_already_stored(self):
+        """A DAG over the quota is refused even when this node already holds all of it (a user pin here)."""
+        self.a.config.remote_pin_quota = 50_000
+        cid = self.b.add_path(self.empty_files(400))["cid"]
+        self.b.records.store(Cid.parse(cid).key, B_ID)
+        self.a.routing.heard(B_ID)
+        self.a.pin_add(cid)
+        self.assertGreater(self.a.storage.dag_bytes(Cid.parse(cid)), 50_000)
+        self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), True)
+        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
+        self.assertEqual(self.a.storage.pins(), {Cid.parse(cid): {"user"}})
+
     def test_remote_pins_of_one_source_are_fetched_one_at_a_time(self):
         # Two DAGs of empty files, each within the quota but not both: fetched at once, each was checked
         # without the other's blocks and both were pinned
@@ -610,6 +667,20 @@ class RestartTest(NodeTest):
         """Stop node and start another over its directory."""
         node.stop()
         return self.make_node(name, node_id, **settings)
+
+    def test_failed_saves_dont_stop_stopping(self):
+        """Saves failing at stop (a full disk) are logged; the state database is still closed, and the node's
+        directory can be used again."""
+        node = self.make_node("full", N1)
+        failing = mock.Mock(side_effect=statedb.StateDbError("disk full"))
+        with mock.patch.object(node.records, "save", failing), mock.patch.object(node.publisher, "save", failing), \
+                mock.patch.object(node.names, "_save", failing), mock.patch("rnfs.node.log") as log:
+            node.stop()
+        self.assertGreaterEqual(failing.call_count, 3)
+        self.assertEqual(sum("saving state failed" in call.args[0] for call in log.call_args_list), 3)
+        self.assertIsNone(node._db._database)
+        self.assertIsNone(node.storage._db._database)
+        self.make_node("full", N1).stop()
 
     def test_deleted_name_key_releases_its_pin_at_startup(self):
         for strategy in ("roots", "pinned"):

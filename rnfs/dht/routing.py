@@ -28,9 +28,14 @@ def distance(a: bytes, b: bytes) -> int:
     return int.from_bytes(a, "big") ^ int.from_bytes(b, "big")
 
 
+def is_id(value) -> bool:
+    """True if value has the shape of a node ID or DHT key (ID_LENGTH bytes)."""
+    return isinstance(value, bytes) and len(value) == ID_LENGTH
+
+
 def check_id(node_id: bytes):
     """Raise ValueError unless node_id is an ID_LENGTH-byte bytes (node IDs and DHT keys)."""
-    if not isinstance(node_id, bytes) or len(node_id) != ID_LENGTH:
+    if not is_id(node_id):
         raise ValueError(f"node IDs and keys must be {ID_LENGTH} bytes")
 
 
@@ -51,7 +56,8 @@ class RoutingTable:
     """BUCKET_COUNT buckets of up to K servers each, by distance from own_id. Thread-safe.
 
     `clock` is monotonic seconds (nothing here is persisted). `admit(node_id)`, if given, must be True
-    for a node to be added: private mode passes a member check (section 3).
+    for a node to be added: private mode passes a member check (section 3). It is asked without the table's
+    lock held, since it may block (on RNS).
     """
 
     def __init__(self, own_id: bytes, config: Config, clock: Callable[[], float] = time.monotonic,
@@ -99,44 +105,59 @@ class RoutingTable:
         True if it was newly added; False if it was already in the table (now refreshed) or wasn't added
         (our own ID, banned, not admitted, or its bucket is full of healthy nodes).
         """
-        check_id(node_id)
-        if node_id == self.own_id:  # hearing our own announce is normal
-            return False
-        with self._lock:
-            now = self.clock()
-            self._prune(now)
-            if node_id in self._bans:
-                return False
-            bucket = self._buckets[self.bucket_index(node_id)]
-            entry = bucket.get(node_id)
-            if entry is not None:
-                entry.last_heard = now
-                entry.failures = 0
-                return False
-            if self.admit is not None and not self.admit(node_id):
-                return False
-
-            if len(bucket) >= K:
-                # Only the least recently heard node can give up its place, and only if it has stopped
-                # answering or gone silent. Healthy long-lived nodes are never displaced by newcomers.
-                victim = min(bucket.values(), key=lambda e: e.last_heard)
-                if not self._stale(victim, now):
-                    return False
-                del bucket[victim.node_id]
-                # Displaced, not dropped for failures: it may come back with its seniority like a dropped node
-                self._dropped[victim.node_id] = (victim.first_seen, now)
-
-            # A node dropped recently (e.g. by a lossy link) regains its seniority
-            first_seen, _ = self._dropped.pop(node_id, (now, now))
-            bucket[node_id] = _Entry(node_id, first_seen, now)
-            return True
+        return self._hear(node_id, False)
 
     def answered(self, node_id: bytes) -> bool:
         """Record that node_id answered a query: heard(), and it is reliable again. True if newly added."""
+        return self._hear(node_id, True)
+
+    def _hear(self, node_id: bytes, answered: bool) -> bool:
+        """heard(), and for answered() also forget node_id's failed queries, in the same locked step.
+
+        admit is asked outside the lock (it may block on RNS), and only for a node found not in the table and
+        not banned: the table is then checked again, so the outcome is as if admit had been asked under it.
+        """
         check_id(node_id)
-        with self._lock:
-            self._unanswered.pop(node_id, None)
-            return self.heard(node_id)
+        if node_id == self.own_id:  # hearing our own announce is normal
+            return False
+        admitted = True if self.admit is None else None  # None: not asked yet
+        while True:
+            with self._lock:
+                if answered:
+                    self._unanswered.pop(node_id, None)
+                now = self.clock()
+                self._prune(now)
+                if node_id in self._bans:
+                    return False
+                bucket = self._buckets[self.bucket_index(node_id)]
+                entry = bucket.get(node_id)
+                if entry is not None:
+                    entry.last_heard = now
+                    entry.failures = 0
+                    return False
+                if admitted:
+                    return self._add(bucket, node_id, now)
+                if admitted is False:
+                    return False
+            admitted = bool(self.admit(node_id))
+
+    def _add(self, bucket: dict[bytes, _Entry], node_id: bytes, now: float) -> bool:
+        """Add node_id, not in the table, to its bucket unless that is full of healthy nodes. True if added.
+        Caller holds the lock."""
+        if len(bucket) >= K:
+            # Only the least recently heard node can give up its place, and only if it has stopped
+            # answering or gone silent. Healthy long-lived nodes are never displaced by newcomers.
+            victim = min(bucket.values(), key=lambda e: e.last_heard)
+            if not self._stale(victim, now):
+                return False
+            del bucket[victim.node_id]
+            # Displaced, not dropped for failures: it may come back with its seniority like a dropped node
+            self._dropped[victim.node_id] = (victim.first_seen, now)
+
+        # A node dropped recently (e.g. by a lossy link) regains its seniority
+        first_seen, _ = self._dropped.pop(node_id, (now, now))
+        bucket[node_id] = _Entry(node_id, first_seen, now)
+        return True
 
     def failed(self, node_id: bytes) -> bool:
         """Count a query node_id didn't answer; after max_failures in a row it is dropped. True if dropped.
@@ -308,6 +329,6 @@ class RoutingTable:
 
     def _find(self, node_id: bytes) -> _Entry | None:
         """The entry for node_id, or None (also for malformed IDs and our own). Caller holds the lock."""
-        if not isinstance(node_id, bytes) or len(node_id) != ID_LENGTH or node_id == self.own_id:
+        if not is_id(node_id) or node_id == self.own_id:
             return None
         return self._buckets[self.bucket_index(node_id)].get(node_id)

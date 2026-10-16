@@ -1,6 +1,7 @@
 """Tests for the shared folder (specification section 8): entries imported and pinned with source "folder"."""
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -112,6 +113,86 @@ class SharedFolderTest(unittest.TestCase):
         self.write("b.txt", b"b")
         self.folder.scan()
         self.assertEqual(set(self.rows()), {"a.txt", "b.txt"})
+
+    def test_import_failing_for_a_reason_that_may_pass_is_tried_again(self):
+        """A pin that couldn't be saved (a full or failing disk) fails the import for RETRY_AFTER, not until the
+        file changes; the entry is imported once it is tried again."""
+        clock = [100.0]
+        self.folder.clock = lambda: clock[0]
+        self.write("a.txt", b"a")
+        with mock.patch.object(self.storage, "pin", side_effect=statedb.StateDbError("disk full")), \
+                mock.patch("rnfs.content.shared_folder.log"):
+            self.assertEqual(self.folder.scan(), set())
+        self.assertEqual(self.folder.scan(), set())  # not yet: no retry before RETRY_AFTER
+        self.assertEqual(self.storage.pinned_by(FOLDER), set())
+        clock[0] += shared_folder.RETRY_AFTER
+        self.assertEqual(self.folder.scan(), {self.cid_of("a.txt")})
+        self.assertEqual(self.storage.pinned_by(FOLDER), {self.cid_of("a.txt")})
+
+    def test_import_failing_for_its_content_waits_for_a_change(self):
+        """A failure of the content itself (here ValueError) isn't tried again, however long, until it changes."""
+        clock = [100.0]
+        self.folder.clock = lambda: clock[0]
+        self.write("a.txt", b"a")
+        with mock.patch.object(builder, "build_open", side_effect=ValueError("bad")), \
+                mock.patch("rnfs.content.shared_folder.log"):
+            self.folder.scan()
+        clock[0] += 100 * shared_folder.RETRY_AFTER
+        with mock.patch.object(builder, "build_open", side_effect=AssertionError("tried again")):
+            self.assertEqual(self.folder.scan(), set())
+        self.write("a.txt", b"changed")
+        self.assertEqual(self.folder.scan(), {self.cid_of("a.txt")})
+
+    def test_unchanged_entry_whose_pin_fails_doesnt_stop_the_scan(self):
+        """A failed pin of an unchanged entry is logged; the other entries are scanned and it is kept."""
+        self.write("a.txt", b"a")
+        self.folder.scan()
+        self.storage.unpin(self.cid_of("a.txt"), FOLDER)
+        self.write("b.txt", b"b")
+        pin = self.storage.pin
+
+        def failing(cid, source):
+            """Fail a.txt's pin as a full disk would."""
+            if cid == self.cid_of("a.txt"):
+                raise statedb.StateDbError("disk full")
+            return pin(cid, source)
+        with mock.patch.object(self.storage, "pin", failing), mock.patch("rnfs.content.shared_folder.log") as log:
+            self.assertEqual(self.folder.scan(), {self.cid_of("a.txt"), self.cid_of("b.txt")})
+        self.assertIn("couldn't pin", log.call_args_list[0].args[0])
+        self.assertEqual(self.storage.pinned_by(FOLDER), {self.cid_of("b.txt")})
+        self.folder.scan()  # pinned again by the next scan
+        self.assertEqual(self.storage.pinned_by(FOLDER), {self.cid_of("a.txt"), self.cid_of("b.txt")})
+
+    def test_names_answers_during_a_scan(self):
+        """names() doesn't wait for a scan's imports (`pin ls` during a long import): it answers with the entries
+        of the last scan to finish."""
+        self.write("a.txt", b"a")
+        self.folder.scan()
+        self.write("b.txt", b"b")
+        a, b = self.cid_of("a.txt"), self.cid_of("b.txt")  # before the patch: cid_of goes through build_open
+        importing, release = threading.Event(), threading.Event()
+        build_open = builder.build_open
+
+        def slow_build_open(*args, **kwargs):
+            """builder.build_open, held until the test releases it."""
+            importing.set()
+            release.wait(10)
+            return build_open(*args, **kwargs)
+
+        with mock.patch.object(builder, "build_open", side_effect=slow_build_open):
+            scan = threading.Thread(target=self.folder.scan)
+            scan.start()
+            try:
+                self.assertTrue(importing.wait(10))
+                answers = []
+                reader = threading.Thread(target=lambda: answers.append(self.folder.names()))
+                reader.start()
+                reader.join(5)
+                self.assertEqual(answers, [{a: "a.txt"}])
+            finally:
+                release.set()
+                scan.join(10)
+        self.assertEqual(self.folder.names(), {a: "a.txt", b: "b.txt"})
 
     def test_creates_missing_directory(self):
         self.assertEqual(self.folder.scan(), set())

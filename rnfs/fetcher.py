@@ -31,27 +31,26 @@ asked again until as long as that request took has passed again. Refusals within
 served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
 may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
 
-Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes
-a fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
-write-outs stop at max_output_entries entries met while fetching. fetch_dag also bounds the bytes of the
-DAG's distinct blocks by what its declared size can hold (dag_bound: the size, DAG_GRANULE_OVERHEAD per
-DAG_GRANULE of it and DAG_SLACK), plus what its directory and index nodes bring (node_credit: their own
-bytes and DAG_ENTRY_OVERHEAD per entry or index child, less INDEX_NODE_COST for an index node); a
-caller's max_dag_bytes (a quota) can lower it. fetch_listing has the same bound for a size of 0, and each
-read_range call bounds the bytes of the file nodes it meets by range_bound (what the range can hold, plus two
-full file nodes per level a file of the declared size can have). A file node may list children of size 0,
-and index nodes can be chained, so without these a file declaring 1 byte, or a directory of one entry, could
-hold any number of distinct nodes. What the builder writes never comes near them (design.md, "DAG byte
-bound"). While one applies, requests ask for no more than it leaves, counting a DAG node as MAX_BLOCK_SIZE
-until it arrives (a directory or index node as nothing under the size-derived bound: see _reserve), so a
-fetch downloads at most about one block beyond it before failing with TooLarge. max_storage never refuses a
-fetch: one
-that isn't being pinned evicts other cached fetches to make room for each response, and goes over
-max_storage if nothing is evictable (the node evicts again once it ends). What refuses a fetch, pinned or
-not, with StorageFull is the disk: its remaining size, and then each response, must leave the disk reserve
-free (Storage.check_disk). A CID the deny list denies (rnfs.denylist; the storage's) ends a fetch with Denied
-where it is met, root or child, stored or not, before it is asked for or read; a complete stored DAG is checked
-whole, since fetch_dag doesn't walk it.
+Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes a
+fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
+write-outs stop at max_output_entries entries met while fetching. fetch_dag also bounds the bytes of the DAG's
+distinct blocks by what its declared size can hold (dag_bound: the size, DAG_GRANULE_OVERHEAD per DAG_GRANULE
+of it and DAG_SLACK), plus what its directory and index nodes bring (node_credit: their own bytes and
+DAG_ENTRY_OVERHEAD per entry or index child, less INDEX_NODE_COST for an index node); a caller's max_dag_bytes
+(a quota) can lower it. fetch_listing has the same bound for a size of 0, and each read_range call bounds the
+bytes of the file nodes it meets by range_bound (what the range can hold, plus two full file nodes per level a
+file of the declared size can have). A file node may list children of size 0, and index nodes can be chained,
+so without these a file declaring 1 byte, or a directory of one entry, could hold any number of distinct nodes.
+What the builder writes never comes near them (design.md, "DAG byte bound"). While one applies, requests ask
+for no more than it leaves, counting a DAG node as MAX_BLOCK_SIZE until it arrives (a directory or index node
+as nothing under the size-derived bound: see _reserve), so a fetch downloads at most about one block beyond it
+before failing with TooLarge. max_storage never refuses a fetch: one that isn't being pinned evicts other
+cached fetches to make room for each response, and goes over max_storage if nothing is evictable (the node
+evicts again once it ends). What refuses a fetch, pinned or not, with StorageFull is the disk: its remaining
+size, and then each response, must leave the disk reserve free (Storage.check_disk). A CID the deny list denies
+(rnfs.denylist; the storage's) ends a fetch with Denied where it is met, root or child, stored or not, before
+it is asked for or read; a complete stored DAG is checked whole, since fetch_dag doesn't walk it (and its
+blocks against a quota).
 
 Requests are spread over up to max_parallel_providers providers (1 on slow nodes), one /blocks request in
 flight per provider. Request threads only call the client; all fetch state is changed by the thread that
@@ -76,7 +75,7 @@ from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
 from rnfs.content.walker import Expect
-from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, TooLarge
+from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 from rnfs.network import client as peer_client
 from rnfs.network import protocol, rates
@@ -165,10 +164,6 @@ def range_bound(size: int, length: int) -> int:
     and at most two chunks' worth more.
     """
     return dag_bound(length) + 2 * file_levels(size) * FILE_NODE_MAX
-
-
-class Cancelled(RnfsError):
-    """A fetch stopped because its observer asked it to (a job cancelled, or the node stopping)."""
 
 
 class Observer:
@@ -522,6 +517,10 @@ class Fetch:
                 denied = self.storage.deny.cids
                 if denied and any(cid.binary in denied for cid in self.storage.dag_blocks(target.cid)):
                     raise Denied(f"{target.cid} holds a block on this node's deny list")
+                # A quota counts the blocks stored as well as downloaded: a remote pin or auto-fetch of a DAG held
+                # already (a user pin, a cached fetch) gets the same answer as one fetched now
+                if self.max_dag_bytes is not None and self.storage.dag_bytes(target.cid) > self.max_dag_bytes:
+                    raise TooLarge(f"{self.root} holds more than {self.max_dag_bytes} bytes of blocks")
                 return
             # What is stored already needn't fit again (its DAG nodes make this an estimate)
             self.check_disk(target, size - self.storage.dag_bytes(target.cid))

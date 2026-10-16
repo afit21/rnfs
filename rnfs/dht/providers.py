@@ -1,4 +1,5 @@
-"""Provider records stored for other nodes (specification section 6). No RNS dependency.
+"""Provider records stored for other nodes (specification section 6). No network access (RNS is loaded
+only through rnfs.log, for logging).
 
 A record says "publisher provides key". Records expire PROVIDER_TTL after they were last stored and keep
 their first-stored time across republishes. At most max_records are kept, a tenth of them in a newcomer
@@ -38,8 +39,8 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 
 from rnfs import statedb
-from rnfs.constants import ID_LENGTH, K, PROVIDER_TTL
-from rnfs.dht.routing import check_id
+from rnfs.constants import K, PROVIDER_TTL
+from rnfs.dht.routing import check_id, is_id
 from rnfs.log import LOG_ERROR, LOG_WARNING, log, plural
 
 _STATE_VERSION = 1  # of providers.json, which rnfs 0.1.4 and earlier wrote
@@ -56,11 +57,6 @@ EVICTED_SHARE = 10  # ... and for newcomers evicted from the pool: at most pool_
 def _never(node_id: bytes) -> bool:
     """Default exclude predicate: excludes nothing."""
     return False
-
-
-def _is_id(value) -> bool:
-    """True if value is a node ID or DHT key (ID_LENGTH bytes)."""
-    return isinstance(value, bytes) and len(value) == ID_LENGTH
 
 
 def _number(value) -> float | None:
@@ -138,10 +134,10 @@ def import_records(value: dict, tx) -> int:
         log(f"providers: not importing providers.json ({e!r}); starting without its records", LOG_ERROR)
         return 0
     tx.executemany("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)",
-                   [(p, t) for p, t in first_seen.items() if _is_id(p) and t == t])
+                   [(p, t) for p, t in first_seen.items() if is_id(p) and t == t])
     kept: dict[tuple[bytes, bytes], tuple] = {}
     for key, publisher, first, last, pooled in sorted(records, key=lambda record: record[2]):
-        if _is_id(key) and _is_id(publisher) and first == first and last == last:
+        if is_id(key) and is_id(publisher) and first == first and last == last:
             kept.setdefault((key, publisher), (key, publisher, first, last, int(pooled)))
     tx.executemany("INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
                    " VALUES (?, ?, ?, ?, ?)", list(kept.values()))
@@ -149,7 +145,7 @@ def import_records(value: dict, tx) -> int:
         # The load applied them oldest first, a later one replacing an earlier one of the same publisher
         tx.executemany(f"INSERT OR REPLACE INTO {table} (publisher, first_seen, at) VALUES (?, ?, ?)",
                        [(p, seen, left) for p, seen, left in sorted(entries, key=lambda item: item[2])
-                        if _is_id(p) and seen == seen and left == left])
+                        if is_id(p) and seen == seen and left == left])
     return len(kept)
 
 
@@ -264,9 +260,10 @@ class ProviderStore:
         while it has been seen for less than `seniority`; expired records don't count; own_id is exempt). A
         key with max_per_key publishers evicts one at random, never one of the K/2 oldest records (those
         /find replies list first). Then, if the store outside the pool is full, a publisher seen before the
-        newest one there evicts a record of that newest publisher; any other goes into the pool, evicting a
-        random pooled record if it is full (refused if that record is its own, so it can't churn its own
-        records). So new identities can't displace older publishers, and a new publisher always gets in.
+        newest one there evicts a record of that newest publisher; any other goes into the pool. A full pool
+        evicts the record pooled first by one of the publishers holding the most pooled records, and refuses a
+        publisher already holding that many (so it can't churn its own records). So new identities can't
+        displace older publishers, and a new publisher always gets in.
         """
         check_id(key)
         check_id(publisher)
@@ -805,14 +802,14 @@ class ProviderStore:
         first_seen = {}
         for publisher, seen in publisher_rows:
             seen = _number(seen)
-            if seen is None or not _is_id(publisher):
+            if seen is None or not is_id(publisher):
                 malformed += 1
                 continue
             first_seen[publisher] = min(seen, now)
         records = []
         for key, publisher, first, last, pooled in record_rows:
             first, last = _number(first), _number(last)
-            if first is None or last is None or not _is_id(key) or not isinstance(pooled, int):
+            if first is None or last is None or not is_id(key) or not isinstance(pooled, int):
                 malformed += 1
                 continue
             records.append((key, publisher, min(first, now), min(last, now), bool(pooled)))
@@ -848,7 +845,7 @@ class ProviderStore:
         for rows, entries in ((departed_rows, departed), (evicted_rows, evicted)):
             for publisher, seen, left in rows:
                 seen, left = _number(seen), _number(left)
-                if seen is None or left is None or not _is_id(publisher):
+                if seen is None or left is None or not is_id(publisher):
                     malformed += 1
                     continue
                 entries.append((publisher, seen, left))

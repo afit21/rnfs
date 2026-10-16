@@ -10,9 +10,10 @@ from unittest import mock
 
 import RNS
 
-from rnfs import __version__, debuglog, fsutil, log
+from rnfs import __version__, debuglog, log
 from rnfs.config import Config
 from rnfs.gateway import GatewayServer
+from tests.support import POSIX_MODES
 from tests.test_api import FakeNode, raw_request
 
 
@@ -57,8 +58,9 @@ class FileTest(DebugLogTestCase):
         self.assertNotIn("'max_storage'", third)  # only settings that differ from the defaults
         self.assertEqual(self.debug.path, os.path.join(self.tmp.name, "debug.log"))
 
-    @unittest.skipIf(fsutil.IS_WINDOWS, "no POSIX modes on Windows")
+    @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX permission bits")
     def test_readable_by_its_owner_only(self):
+        """The debug log is readable by its owner only."""
         self.assertEqual(stat.S_IMODE(os.stat(self.debug.path).st_mode) & 0o077, 0)
 
     def test_each_start_keeps_the_last_run_as_dot_1(self):

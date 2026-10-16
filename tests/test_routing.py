@@ -70,6 +70,48 @@ class BucketTest(RoutingTestCase):
         self.assertFalse(table.heard(node_id(2)))
         self.assertEqual(table.nodes(), [node_id(1)])
 
+    def test_admit_is_asked_without_the_lock(self):
+        """admit may block on RNS, so heard() and answered() ask it with the table's lock free for other
+        threads (those answering /find, and lookups), and only for nodes not already in the table."""
+        asked, free = [], []
+
+        def admit(n: bytes) -> bool:
+            """Note whether another thread could take the table's lock now."""
+            def probe():
+                """Take and release the lock without waiting."""
+                if table._lock.acquire(blocking=False):
+                    table._lock.release()
+                    free.append(n)
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join()
+            asked.append(n)
+            return True
+
+        table = RoutingTable(OWN_ID, self.config, clock=self.clock, admit=admit)
+        self.assertTrue(table.heard(node_id(1)))
+        self.assertTrue(table.answered(node_id(2)))
+        self.assertFalse(table.heard(node_id(1)))  # in the table: not asked again
+        self.assertEqual(asked, [node_id(1), node_id(2)])
+        self.assertEqual(free, asked)
+
+    def test_changes_while_admit_is_asked_are_honoured(self):
+        """The table is checked again once admit answers: a node banned meanwhile isn't added, and one another
+        thread added meanwhile is only refreshed, whatever admit said."""
+        during = []
+
+        def admit(n: bytes) -> bool:
+            """Run the next change queued in during, as another thread could, then answer as it says."""
+            return during.pop()(n) if during else True
+
+        table = RoutingTable(OWN_ID, self.config, clock=self.clock, admit=admit)
+        during.append(lambda n: table.ban(n) or True)
+        self.assertFalse(table.heard(node_id(1)))
+        self.assertFalse(table.contains(node_id(1)))
+        during.append(lambda n: table.heard(n) and False)
+        self.assertFalse(table.answered(node_id(2)))
+        self.assertEqual(table.nodes(), [node_id(2)])
+
     def test_closest_ranks_every_bucket(self):
         rng = random.Random(1)
         ids = [rng.randbytes(ID_LENGTH) for _ in range(300)]
@@ -258,7 +300,7 @@ class ReplyFilterTest(RoutingTestCase):
 class UnreliableTest(RoutingTestCase):
     """Nodes whose queries keep failing are unreliable however often they announce, until one is answered."""
 
-    def fail(self, n: bytes, times: int):
+    def fail_queries(self, n: bytes, times: int):
         """Count times failed queries for n, hearing its announce before each, as a far node that keeps
         announcing but never connects is heard."""
         for _ in range(times):
@@ -268,9 +310,9 @@ class UnreliableTest(RoutingTestCase):
     def test_announces_do_not_reset_the_count(self):
         """A node heard before every failure is unreliable after max_failures of them, and stays in the table."""
         n = node_id(42)
-        self.fail(n, 2)
+        self.fail_queries(n, 2)
         self.assertFalse(self.table.unreliable(n))
-        self.fail(n, 1)
+        self.fail_queries(n, 1)
         self.assertTrue(self.table.unreliable(n))
         self.table.heard(n)
         self.assertTrue(self.table.unreliable(n))
@@ -287,17 +329,17 @@ class UnreliableTest(RoutingTestCase):
     def test_retried_after_a_doubling_backoff(self):
         """may_retry is True once the backoff has passed, for one caller; each failure doubles it up to AVOID_MAX."""
         n = node_id(42)
-        self.fail(n, 3)
+        self.fail_queries(n, 3)
         self.assertFalse(self.table.may_retry(n))
         self.clock.now += AVOID_AFTER
         self.assertTrue(self.table.may_retry(n))
         self.assertFalse(self.table.may_retry(n))  # claimed: another lookup doesn't retry it too
-        self.fail(n, 1)
+        self.fail_queries(n, 1)
         self.clock.now += 2 * AVOID_AFTER - 1
         self.assertFalse(self.table.may_retry(n))
         self.clock.now += 1
         self.assertTrue(self.table.may_retry(n))
-        self.fail(n, 20)
+        self.fail_queries(n, 20)
         self.clock.now += AVOID_MAX - 1
         self.assertFalse(self.table.may_retry(n))
         self.clock.now += 1
@@ -306,12 +348,12 @@ class UnreliableTest(RoutingTestCase):
     def test_an_answer_restores_it(self):
         """answered() makes the node reliable again: no retry needed, and failures count from zero."""
         n = node_id(42)
-        self.fail(n, 5)
+        self.fail_queries(n, 5)
         self.assertFalse(self.table.answered(n))  # already in the table
         self.assertFalse(self.table.unreliable(n))
         self.clock.now += AVOID_MAX
         self.assertFalse(self.table.may_retry(n))
-        self.fail(n, 2)
+        self.fail_queries(n, 2)
         self.assertFalse(self.table.unreliable(n))
 
     def test_answered_adds_like_heard(self):
@@ -324,7 +366,7 @@ class UnreliableTest(RoutingTestCase):
     def test_reliable_nodes_are_unaffected(self):
         """Fewer than max_failures failures in a row leave a node reliable, with no retry to claim."""
         n = node_id(42)
-        self.fail(n, 2)
+        self.fail_queries(n, 2)
         self.assertFalse(self.table.unreliable(n))
         self.assertFalse(self.table.may_retry(n))
         self.assertFalse(self.table.unreliable(node_id(43)))
@@ -336,7 +378,7 @@ class UnreliableTest(RoutingTestCase):
         self.addCleanup(setattr, routing, "MAX_UNRELIABLE", old)
         ids = [node_id(100 + i) for i in range(5)]
         for n in ids:
-            self.fail(n, 3)
+            self.fail_queries(n, 3)
         self.assertFalse(self.table.unreliable(ids[0]))
         self.assertTrue(all(self.table.unreliable(n) for n in ids[1:]))
 
@@ -370,6 +412,8 @@ class ThreadSafetyTest(RoutingTestCase):
     """Concurrent use from announce, request and lookup threads."""
 
     def test_concurrent_heard_failed_closest(self):
+        """Four threads hearing, failing and ranking nodes leave a consistent table: every node once, in its own
+        bucket, no bucket over K, and never our own ID."""
         rng = random.Random(2)
         ids = [rng.randbytes(ID_LENGTH) for _ in range(400)]
         errors = []
@@ -396,7 +440,13 @@ class ThreadSafetyTest(RoutingTestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
-        self.assertEqual(self.table.node_count(), len(self.table.nodes()))
+        nodes = self.table.nodes()
+        self.assertEqual(len(set(nodes)), self.table.node_count())  # each node once
+        self.assertNotIn(OWN_ID, nodes)
+        for n in nodes:
+            self.assertIn(n, self.table._buckets[self.table.bucket_index(n)])
+        self.assertTrue(all(len(bucket) <= K for bucket in self.table._buckets))
+        self.assertGreater(len(nodes), 0)
 
 
 if __name__ == "__main__":

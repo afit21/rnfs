@@ -103,7 +103,7 @@ class ContactsFeature(Feature):
         self._lock = threading.Lock()
         self._contacts: dict[str, tuple[str, bytes]] = {}  # nick -> (kind, hash)
         self._nicks: dict[tuple[str, bytes], int] = {}  # (kind, hash) -> how many nicks name it, for has()
-        self._dirty: set[str] = set()  # nicks changed (or deleted) whose save failed, written with the next
+        self._dirty: set[str] = set()  # nicks changed (or deleted) whose save failed, written with the next change
         # name -> (CID, monotonic time of the resolve that found it), reused for EXPAND_AGE
         self._expanded: dict[bytes, tuple[str, float]] = {}
         self._db = statedb.connect(node.config.state_dir)
