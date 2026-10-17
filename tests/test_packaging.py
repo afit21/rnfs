@@ -333,6 +333,70 @@ class DependencyLockTest(unittest.TestCase):
             self.assertIn(source["sha256"], lock[name][1], filename)
 
 
+def version_tuple(text: str) -> tuple[int, ...]:
+    """(1, 2, 3) from "1.2.3"."""
+    return tuple(int(part) for part in text.split("."))
+
+
+class ChangelogTest(unittest.TestCase):
+    """CHANGELOG.md's first section is the current version's, or the next one's while it is unreleased, and the
+    release workflow publishes that section as the release notes (TS6)."""
+
+    def notes_step(self) -> str:
+        """The run: script of release.yml's step that checks CHANGELOG.md and writes release-notes.md."""
+        step = re.search(r"(?m)^      - name: Release notes from CHANGELOG\.md.*\n(?:        .*\n)*?        run: \|\n"
+                         r"((?:          .*\n|\n)+?)(?=^      - )", read(os.path.join(WORKFLOWS, "release.yml")))
+        self.assertTrue(step)
+        return "\n".join(line[10:] for line in step.group(1).splitlines())
+
+    def test_first_section_is_the_version(self):
+        """The first `## ` heading is `## <__version__>`, or `## X.Y.Z (unreleased)` for a later X.Y.Z while
+        __version__ still has a section of its own (it is bumped at the release)."""
+        from rnfs import __version__
+        headings = re.findall(r"(?m)^## (.*)$", read(os.path.join(REPO, "CHANGELOG.md")))
+        self.assertTrue(headings)
+        first = re.fullmatch(r"(\d+\.\d+\.\d+)( \(unreleased\))?", headings[0])
+        self.assertTrue(first, headings[0])
+        if first.group(2):
+            self.assertGreater(version_tuple(first.group(1)), version_tuple(__version__), headings[0])
+            self.assertIn(__version__, headings[1:])
+        else:
+            self.assertEqual(first.group(1), __version__)
+        self.assertEqual(len(headings), len(set(headings)), "a version has two sections")
+
+    def test_release_notes_are_the_changelog_section(self):
+        """The release is created with --notes-file, from the notes the version job extracted, not
+        --generate-notes."""
+        release = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertNotIn("--generate-notes", release)
+        self.assertIn("--notes-file notes/release-notes.md", release)
+        self.assertIn('[ "${GITHUB_REF_TYPE}" = tag ] && [ "$first" != "## $VERSION" ]', self.notes_step())
+
+    @unittest.skipUnless(shutil.which("sh") and shutil.which("awk"), "needs a POSIX shell and awk")
+    def test_release_notes_step(self):
+        """The step refuses a tag whose section is still unreleased or not first, and writes the version's section
+        (without its heading or the next one) as the notes."""
+        changelog = ("# Changelog\n\nIntro.\n\n## 0.2.0 (unreleased)\n\nNext.\n\n## 0.1.9\n\nNotes of 0.1.9.\n\n"
+                     "### Security\n- A fix.\n\n## 0.1.8\n\nOlder.\n")
+
+        def run(text, version, ref_type):
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "CHANGELOG.md"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                done = subprocess.run(["sh", "-ec", self.notes_step()], cwd=tmp, capture_output=True, text=True,
+                                      env={**os.environ, "VERSION": version, "GITHUB_REF_TYPE": ref_type})
+                notes = read(os.path.join(tmp, "release-notes.md")) if done.returncode == 0 else None
+                return done.returncode, notes
+        section = "\nNotes of 0.1.9.\n\n### Security\n- A fix.\n\n"
+        self.assertEqual(run(changelog, "0.1.9", "branch"), (0, section))
+        self.assertNotEqual(run(changelog, "0.1.9", "tag")[0], 0)  # 0.2.0 is still above it
+        self.assertNotEqual(run(changelog, "0.2.0", "tag")[0], 0)  # unreleased
+        self.assertEqual(run(changelog, "0.2.0", "branch"), (0, "\nNext.\n\n"))
+        released = changelog.replace("## 0.2.0 (unreleased)\n\nNext.\n\n", "")
+        self.assertEqual(run(released, "0.1.9", "tag"), (0, section))
+        self.assertNotEqual(run(released, "0.1.7", "branch")[0], 0)  # no section
+
+
 class ReadmeTest(unittest.TestCase):
     """README.md's release links and file names are for the current version, so a version bump updates them."""
 

@@ -366,6 +366,9 @@ python3 packaging/smoke_test.py dist/rnfs
 pyserial) with the sha256 of each file PyPI has for it. `update-lock.py` with no arguments picks the newest
 versions `pyproject.toml` allows; commit the lock and the regenerated Flatpak sources together.
 
+To work on rnfs itself (the tests and their options, lint, the locks, adding a schema step or an API route,
+releasing), see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Reticulum and where things live
 
 rnfs uses Reticulum's own config directory, the same one `rnsd` and other RNS programs use. That is the

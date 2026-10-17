@@ -46,6 +46,28 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The release notes are CHANGELOG.md's section for this version (`## X.Y.Z`, ended by the next `## `). A tag
+      # needs it to be the first section and no longer marked "(unreleased)"; any other run takes the version's
+      # section as it stands
+      - name: Release notes from CHANGELOG.md (and check the version's section is released)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          first=$(grep -m1 '^## ' CHANGELOG.md)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "$first" != "## $VERSION" ]; then
+            echo "::error::CHANGELOG.md's first section is \"$first\", not \"## $VERSION\" (still unreleased?)"
+            exit 1
+          fi
+          awk -v heading="## $VERSION" '
+            /^## / { if (on) exit; on = ($0 == heading || index($0, heading " (") == 1); next }
+            on' CHANGELOG.md > release-notes.md
+          grep -q . release-notes.md || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          cat release-notes.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: notes  # not release-*: it isn't one of the release's files
+          path: release-notes.md
+          if-no-files-found: error
 
   python:
     name: wheel and sdist
@@ -222,6 +244,10 @@ jobs:
           pattern: release-*
           path: artifacts
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: notes
+          path: notes
       - name: Checksums
         working-directory: artifacts
         run: |
@@ -237,8 +263,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         # A release already made for this tag on GitHub's release page gets the files attached rather than
-        # failing; otherwise the release is created here. Files already attached are never replaced (no
-        # --clobber): users may have downloaded and checked them, so a re-run with the same names fails instead
+        # failing (its notes are left as they are); otherwise the release is created here, with the version's
+        # CHANGELOG.md section as its notes. Files already attached are never replaced (no --clobber): users may
+        # have downloaded and checked them, so a re-run with the same names fails instead
         run: |
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY"
@@ -246,6 +273,6 @@ jobs:
             gh release create "$GITHUB_REF_NAME" artifacts/* \
               --repo "$GITHUB_REPOSITORY" \
               --title "rnfs $VERSION" \
-              --generate-notes \
+              --notes-file notes/release-notes.md \
               --verify-tag
           fi
