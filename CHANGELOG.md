@@ -36,6 +36,10 @@ Security:
 - A neighbour replaying an older, validly signed name announce no longer makes its record look current: rnfs
   reads the replayed announce's own emission time from RNS's announce cache, treats one older than the path's
   (or carrying another record) as a suspected replay, gives its real age and asks keepers.
+- A provider can no longer hold a fetch for hours by dripping a `/blocks` response: once nothing is left to
+  request and a provider is idle, a batch in flight longer than `deadline_slack` is asked of it too, the first
+  verified copy wins, and the slow request's link is closed (left to finish if another fetch uses it) without
+  counting as a stall. Simulated: 20.6 → 3.3 s.
 - `get` of a directory can no longer be redirected by someone who can rename inside the output swapping one of
   its directories for a link or junction (or another directory) while it is written. On Linux and macOS the
   output being written is private (0700, setgid kept) and must start empty, every entry is created relative to
@@ -193,6 +197,14 @@ Changed:
   `"sent_cid": true` in the inbox record).
 
 Faster:
+- `cat`, gateway and range reads ask for the next 32-chunk window before handing the reader the current one, so
+  every provider stays busy across window boundaries: a 48 MiB read over 3 simulated 40 Mbit/s providers went
+  from 8.06 to 5.95 s (links 57% → 77% busy; 6.12 → 4.73 s without fsync). A reader that stops early has fetched
+  at most one extra window; closing it closes its links, except one another fetch is using (that request is left
+  to finish), and never cancels a Resource.
+- `get`, `pin add` and `ls` ask for a block's children as soon as the block arrives instead of one tree level at a
+  time, and count `max_output_entries` per block (small gains in simulation: up to about 4%, one request fewer on
+  a single LoRa provider).
 - The fetcher keeps a set beside its queue of blocks to fetch, so requeueing a refused or budget-cut request's
   blocks no longer scans the queue: 22 ms → 0.01 ms per answer with 16 000 blocks pending (1 GiB), 242 → 0.015
   ms at 10 GiB.

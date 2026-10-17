@@ -3,7 +3,7 @@ import types
 import unittest
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, KIB
+from rnfs.constants import CHUNK_SIZE, KIB, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
 from rnfs.network import rates
 
 LINK = b"L" * 16
@@ -117,6 +117,35 @@ class DeadlineAndBudgetTest(unittest.TestCase):
         config = Config(response_target=60)
         self.assertEqual(rates.requester_max_bytes(None, config), CHUNK_SIZE)
         self.assertEqual(rates.requester_max_bytes(8000, config), 60_000)
+
+
+class SizeRulesTest(unittest.TestCase):
+    """The /blocks size rules both ends share: response_capacity and the default upload cap."""
+
+    def test_response_capacity(self):
+        carried = MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD
+        self.assertEqual(rates.response_capacity(10 * CHUNK_SIZE, None, None, 60), CHUNK_SIZE)  # no estimate yet
+        self.assertEqual(rates.response_capacity(10 * 1024 * KIB, 1e9, None, 60), carried)
+        self.assertEqual(rates.response_capacity(1_000_000, 8000, None, 60), 60_000)
+        self.assertEqual(rates.response_capacity(1_000_000, 8000, 4000, 60), 30_000)  # the cap's rate, if lower
+        self.assertEqual(rates.response_capacity(1_000_000, 8000, 16000, 60), 60_000)
+        self.assertEqual(rates.response_capacity(5000, 1e9, None, 60), 5000)
+
+    def test_requester_capacity_is_its_max_bytes_up_to_one_response(self):
+        # What the fetcher estimates a response carries: max_bytes, at most what one response can hold
+        config = Config(response_target=60)
+        for rate in (None, 0, 1200, 8000, 50_000, 1e6, 1e9, 123_456.789):
+            with self.subTest(rate=rate):
+                max_bytes = rates.requester_max_bytes(rate, config)
+                self.assertEqual(rates.response_capacity(max_bytes, rate, None, config.response_target),
+                                 min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD))
+
+    def test_default_upload_cap(self):
+        self.assertEqual(rates.default_upload_cap(True, 50_000), 25_000)
+        self.assertIsNone(rates.default_upload_cap(True, None))  # no estimate: no derived cap (NET-2)
+        self.assertIsNone(rates.default_upload_cap(False, 50_000))
+        self.assertEqual(Config().effective_max_upload_rate(True, 50_000), 25_000)
+        self.assertEqual(Config(max_upload_rate=1000).effective_max_upload_rate(False, None), 1000)
 
 
 if __name__ == "__main__":

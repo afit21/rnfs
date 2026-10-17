@@ -6,8 +6,6 @@ import time
 import unittest
 from unittest import mock
 
-import RNS
-
 from rnfs import publisher as publisher_module
 from rnfs.config import Config
 from rnfs.constants import PROVIDER_TTL
@@ -17,40 +15,15 @@ from rnfs.content.storage import USER, Storage
 from rnfs.denylist import DenyList
 from rnfs.dht.providers import ProviderStore
 from rnfs.publisher import PUBLISH_LOOKUPS, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
+from tests.fakes.client import FakeClient
+from tests.fakes.log import quiet_log
 from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
 from tests.test_providers import recorded_writes, rows_written
 
 OWN = bytes(16)
 N1, N2, N3 = (bytes([i]) * 16 for i in (1, 2, 3))
 
-_saved_loglevel = RNS.loglevel
-
-
-def setUpModule():
-    """Silence the publisher's log."""
-    RNS.loglevel = RNS.LOG_CRITICAL
-
-
-def tearDownModule():
-    """Restore RNS's loglevel."""
-    RNS.loglevel = _saved_loglevel
-
-
-class FakeClient:
-    """Records /provide requests; nodes in refuse record nothing, a node in limit records only its first keys."""
-
-    def __init__(self):
-        """No requests yet."""
-        self.calls: list[tuple[bytes, list[bytes], list[bytes]]] = []
-        self.refuse: set[bytes] = set()
-        self.limit: dict[bytes, int] = {}
-
-    def provide(self, node_id, keys, withdrawn):
-        """Record one batched /provide; the keys the node may have recorded, as PeerClient.provide returns."""
-        self.calls.append((node_id, list(keys), list(withdrawn)))
-        if node_id in self.refuse:
-            return set()
-        return set(list(keys)[:self.limit.get(node_id, len(keys))])
+setUpModule, tearDownModule = quiet_log()
 
 
 class FakeLookup:

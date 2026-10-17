@@ -111,7 +111,8 @@ rnfs/
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
-    rates.py          rate estimates, slow links, slow node detection (section 2)
+    rates.py          rate estimates, slow links, slow node detection (section 2); the /blocks size rules both
+                      ends share: response_capacity, default_upload_cap (sections 3, 7)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
     guards.py         guards rejecting oversized, compressed or request Resource advertisements (on every
                       link in the daemon, on rnfs.dht links only in an embedded node) and, on rnfs.dht links,
@@ -1169,7 +1170,10 @@ feature. The public API has `test_public.py` (every interface test run on an emb
 ApiServer, the name-watch endpoint, the objects, `import rnfs`'s weight) and `test_embedded.py` (the guards'
 scopes, the dir lock, and with `RNFS_E2E=1` a host program over real RNS beside an embedded node). The state database has `test_statedb.py`, each store's migration a `test_migrate_*.py`, and
 `test_upgrade_014.py` loads `tests/fixtures/rnfs-0.1.4/`, a node directory 0.1.4 wrote (its `generate.py`
-writes it again). CI runs them on Linux, macOS and Windows; `packaging/smoke_test.py` checks a built package
+writes it again). Test doubles several modules share live in `tests/fakes/` (`FakeClient`, the `PeerClient`
+stand-in, and the quiet-log fixture); `test_fake_contract.py` checks the fakes against what they stand in for
+(`FakeNode` against `RnfsNode`, `FakeClient` and the node tests' `NetClient` against `PeerClient`, `FakeBackend`
+against `server.Backend`), so production code needn't look up with `getattr` a method a fake might lack. CI runs them on Linux, macOS and Windows; `packaging/smoke_test.py` checks a built package
 (`--version`, `--help`, daemon and status, an add, and that the state database holds the pin and imported a
 0.1.4 state file).
 
@@ -1206,7 +1210,8 @@ Everything in the specification is implemented, with these simplifications and a
 - `max_download_size` is checked against the target's verified size, or the range's size, before anything
   below the target is fetched, and the DAG-node bytes a fetch downloads count against it too, so directories
   of empty files can't get around it. Listing and writing out also stop fetching at `max_output_entries`.
-- **DAG byte bound** (`fetcher.dag_bound`, `Fetch.dag_limit`). `fetch_dag` counts the bytes of the distinct
+- **DAG byte bound** (`fetcher.dag_bound`, `Fetch.dag_limit`; the bookkeeping is `fetcher._DagBudget`, pure,
+  the fetch's own in `Fetch.budget`). `fetch_dag` counts the bytes of the distinct
   blocks of its target's DAG, stored or downloaded, against `dag_bound(size)` = size + `DAG_GRANULE_OVERHEAD`
   (64) per `DAG_GRANULE` (4 KiB, `SmallLeaves`' threshold) of the declared size + `DAG_SLACK` (1 KiB), plus
   what the counted directory and index nodes bring (`node_credit`): a directory node its own bytes and
@@ -1239,14 +1244,14 @@ Everything in the specification is implemented, with these simplifications and a
   `max_output_entries` entries, so a pin of an honest directory of any size is allowed (`get` and `export`
   still stop at `max_output_entries` entries); a directory's blocks are then about what an honest directory
   of as many entries takes, and `max_download_size` and quotas bound them. To keep the overshoot to about
-  one block, `_take_batch` asks only for what fits the room left after the requests in flight (`_room`,
-  `_reserve`): a raw chunk's declared size, anything else `MAX_BLOCK_SIZE`, except that under the
+  one block, `_take_batch` asks only for what fits the room left after the requests in flight
+  (`_DagBudget.room`, `reserve`): a raw chunk's declared size, anything else `MAX_BLOCK_SIZE`, except that under the
   size-derived bound (not under a quota, which entries don't raise) a directory or index node takes nothing,
   since it costs at most 64 bytes (a request of `MAX_BATCH` of them overshoots by at most 2 KiB); and always
   one CID when nothing is in flight. Honest fetches are not held back by this: the content still to come
   leaves room for many file nodes, and directory nodes cost nothing.
 - **Listings** (`fetch_listing`: `ls`, the gateway's directory pages) fetch only directory and index nodes,
-  and are bounded as `fetch_dag` is for a declared size of 0 (`_declared` = 0): `DAG_SLACK` plus the nodes'
+  and are bounded as `fetch_dag` is for a declared size of 0 (`declare(0)`): `DAG_SLACK` plus the nodes'
   credit. It used to count index children per level only, so 40 entries below chains of single-child index
   nodes down to `MAX_DEPTH` took 751 KB; now a single-child index node costs 48 bytes, and those chains are
   refused after 24 KB.
@@ -1261,9 +1266,10 @@ Everything in the specification is implemented, with these simplifications and a
   1 MiB, two up to 256 MiB, seven for any size. Raw chunks aren't counted: they hold the range and at most
   two chunks more. A file node padded with empty children made `cat` of a file declaring 1 byte download
   7.3 MB (and a sealed `get` of 12 KB 29 MB); now the read stops at about 27 KB plus one block, and at most
-  about 184 KB plus one block for any declared size. The budget (`_RangeBudget`) is set only while
-  `_range_leaves` ensures a node's children, since another read of the same fetch may run between a
-  generator's steps; `_reserve` counts a file node not yet received as `MAX_BLOCK_SIZE` against it, so a
+  about 184 KB plus one block for any declared size. Each call's budget (`_DagBudget.for_range`, which
+  counts every block against the fetch's own budget too) is passed explicitly to the `ensure` of a node's
+  children by `_range_leaves`, never kept on the fetch, since another read of the same fetch may run between a
+  generator's steps; `reserve` counts a file node not yet received as `MAX_BLOCK_SIZE` against it, so a
   small honest range ending inside two nodes of a level asks for them in two requests instead of one.
 - `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which
