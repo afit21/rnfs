@@ -263,15 +263,16 @@ class RnsPathsTest(unittest.TestCase):
 # Airtime policy
 
 class TokenBucketTest(unittest.TestCase):
-    """Continuous refill; a response goes if the bucket holds its size or is full."""
+    """Continuous refill; a response goes if the bucket holds its size (beyond what is committed) or is full."""
 
-    def test_spend_and_refill(self):
+    def test_reserve_and_refill(self):
         clock = FakeClock()
         bucket = mesh.TokenBucket(3600, 3600, clock)  # 1 byte/s
-        self.assertTrue(bucket.take(3000))
-        self.assertFalse(bucket.take(1000))  # 600 left
+        self.assertTrue(bucket.reserve(3000, 3000))
+        self.assertFalse(bucket.reserve(1000, 1000))  # 600 left
+        self.assertAlmostEqual(bucket.available(), 600)  # a refusal spends nothing
         clock.now += 400
-        self.assertTrue(bucket.take(1000))
+        self.assertTrue(bucket.reserve(1000, 1000))
         self.assertAlmostEqual(bucket.available(), 0)
         clock.now += 10_000
         self.assertEqual(bucket.available(), 3600)  # never above capacity
@@ -279,28 +280,55 @@ class TokenBucketTest(unittest.TestCase):
     def test_large_response_allowed_when_full(self):
         clock = FakeClock()
         bucket = mesh.TokenBucket(1000, 3600, clock)
-        self.assertTrue(bucket.take(5000))  # bigger than the whole budget, but the bucket was full
+        self.assertTrue(bucket.reserve(5000, 5000))  # bigger than the whole budget, but the bucket was full
         self.assertLess(bucket.available(), 0)
-        self.assertFalse(bucket.take(1))  # in debt
+        self.assertFalse(bucket.reserve(1, 1))  # in debt
         clock.now += 3600 * 4.9
-        self.assertFalse(bucket.take(1000))
+        self.assertFalse(bucket.reserve(1000, 1000))
         clock.now += 3600 * 1.2
-        self.assertTrue(bucket.take(5000))  # full again
+        self.assertTrue(bucket.reserve(5000, 5000))  # full again
+
+    def test_reservation_then_charges(self):
+        """Admitted on its whole size, a response is charged only its reservation up front, then as it is sent,
+        into debt if need be."""
+        clock = FakeClock()
+        bucket = mesh.TokenBucket(1000, 3600, clock)
+        self.assertTrue(bucket.reserve(800, 100))
+        self.assertEqual(bucket.available(), 900)
+        bucket.charge(700)
+        self.assertEqual(bucket.available(), 200)
+        bucket.charge(500)
+        self.assertEqual(bucket.available(), -300)
+        self.assertFalse(bucket.reserve(1, 1))
+
+    def test_committed_counts_as_gone(self):
+        clock = FakeClock()
+        bucket = mesh.TokenBucket(1000, 3600, clock)
+        self.assertFalse(bucket.reserve(100, 10, committed=950))  # full, but others are owed most of it
+        self.assertEqual(bucket.available(), 1000)
+        self.assertTrue(bucket.reserve(5000, 10, committed=0))  # full and nothing owed: any one response
+        self.assertEqual(bucket.available(), 990)
+        self.assertFalse(bucket.reserve(50, 10, committed=950))
+        self.assertTrue(bucket.reserve(40, 10, committed=950))
 
     def test_give_back(self):
         clock = FakeClock()
         bucket = mesh.TokenBucket(1000, 3600, clock)
-        bucket.take(800)
+        bucket.reserve(800, 800)
         bucket.give_back(800)
         self.assertEqual(bucket.available(), 1000)
+        bucket.reserve(800, 100)
+        bucket.charge(700)
+        bucket.give_back(5000)
+        self.assertEqual(bucket.available(), 1000)  # never above capacity
 
     def test_thread_safe(self):
         bucket = mesh.TokenBucket(10_000, 1e12)
         taken = []
 
         def spend():
-            """Take 1 byte many times."""
-            taken.append(sum(bucket.take(1) for _ in range(5000)))
+            """Reserve 1 byte many times."""
+            taken.append(sum(bucket.reserve(1, 1) for _ in range(5000)))
 
         threads = [threading.Thread(target=spend) for _ in range(4)]
         for thread in threads:
@@ -372,7 +400,9 @@ class AirtimePolicyTest(unittest.TestCase):
         policy = mesh.AirtimePolicy(Config())
         self.assertIsNone(policy.refusal([]))
         self.assertEqual(policy.limit(12345), 12345)
-        self.assertTrue(policy.spend(10**12))
+        self.assertTrue(policy.reserve(10**12, 10**12, committed=10**12))
+        policy.charge(10**12)
+        policy.refund(10**12)
         self.assertIsNone(policy.remaining())
 
     def test_quiet_hours(self):
@@ -386,12 +416,32 @@ class AirtimePolicyTest(unittest.TestCase):
         clock = FakeClock()
         policy = mesh.AirtimePolicy(Config(upload_budget=100 * KIB), clock)
         self.assertEqual(policy.limit(500 * KIB), 500 * KIB)  # full: any one response may go
-        self.assertTrue(policy.spend(60 * KIB))
+        self.assertTrue(policy.reserve(60 * KIB, 60 * KIB))
         self.assertEqual(policy.limit(500 * KIB), 40 * KIB - 1 * KIB)  # what's left, less framing room
-        self.assertTrue(policy.spend(40 * KIB))
+        self.assertEqual(policy.limit(500 * KIB, committed=10 * KIB), 30 * KIB - 1 * KIB)  # less what's owed
+        self.assertFalse(policy.reserve(41 * KIB, 41 * KIB))
+        self.assertTrue(policy.reserve(40 * KIB, 40 * KIB))
+        self.assertEqual(policy.remaining(), 0)
         self.assertEqual(policy.refusal([]), mesh.REFUSED_BUDGET)
         clock.now += 36  # 1% of an hour
         self.assertIsNone(policy.refusal([]))
+
+    def test_reserve_charge_refund(self):
+        """A response is admitted on its whole size, charged its reservation, then as it is sent; what wasn't
+        sent is refunded."""
+        clock = FakeClock()
+        policy = mesh.AirtimePolicy(Config(upload_budget=100 * KIB), clock)
+        self.assertTrue(policy.reserve(60 * KIB, 1 * KIB))
+        self.assertEqual(policy.remaining(), 99 * KIB)
+        policy.charge(29 * KIB)
+        self.assertEqual(policy.remaining(), 70 * KIB)
+        policy.charge(0)
+        policy.charge(-5)  # nothing: only what was sent is charged
+        self.assertEqual(policy.remaining(), 70 * KIB)
+        policy.refund(10 * KIB)
+        self.assertEqual(policy.remaining(), 80 * KIB)
+        self.assertFalse(policy.reserve(50 * KIB, 1 * KIB, committed=40 * KIB))  # 80 KiB less 40 KiB owed
+        self.assertEqual(policy.remaining(), 80 * KIB)  # refused: nothing charged
 
     def test_validate(self):
         for settings in ({"upload_budget": 0}, {"upload_budget": True}, {"upload_budget": 1.5},
@@ -487,7 +537,7 @@ class ServerAirtimeTest(unittest.TestCase):
 
     def test_missing_blocks_cost_nothing(self):
         srv = self.make_server(upload_budget=150 * KIB)
-        srv.airtime.bucket.take(149 * KIB)
+        srv.airtime.bucket.charge(149 * KIB)
         answer = self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, [block_of(10, 99)[0]]),
                           self.connect())
         self.assertEqual(protocol.parse_blocks_response(answer, 1), [None])

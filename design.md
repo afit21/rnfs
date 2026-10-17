@@ -882,7 +882,8 @@ its own threads and stops them, in reverse, before its own services. A feature m
 and the last save), `status()` (fields merged into `rnfs status`), `requests()` (new `rnfs.dht` paths; the request
 server applies private mode and the per-link limit, and turns `None` or an exception into `False`; a response must
 be a shape `protocol.response_refusal` accepts, True/False/None, a `/find` answer, or at most `MAX_BLOCKS_CIDS` bins
-or nils, since nodes since 0.1.4 refuse any other), `api_routes()` (all token-protected) and `cli_commands()`.
+or nils, since nodes since 0.1.4 refuse any other: the server checks each with `protocol.body_refusal` and answers
+`False`, logged as an error, instead of one they'd refuse), `api_routes()` (all token-protected) and `cli_commands()`.
 Feature modules don't import RNS at module level (the CLI imports them to build its parser) and their constructors
 work on `RnfsNode.offline` test nodes.
 

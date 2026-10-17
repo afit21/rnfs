@@ -479,6 +479,27 @@ class RequestServerTest(unittest.TestCase):
         self.assertIs(self.ask(PROVIDE_PATH, [[KEY], []], link, self.identity), True)
         self.assertIs(self.ask(PIN_PATH, [cid.binary, True], link, self.identity), True)
 
+    def test_feature_responses_requesters_refuse_are_answered_false(self):
+        """A feature's response is checked with protocol.body_refusal, as every requester since 0.1.4 checks it:
+        one of a shape they'd refuse is answered False (and logged as the bug it is) instead."""
+        answers = {}
+        self.backend.feature_requests = lambda: {"/feature": lambda data, identity: answers[data]}
+        self.make_server(self.config)
+        link = self.connect(b"a")
+        too_many = [None] * (protocol.MAX_BLOCKS_CIDS + 1)
+        for response in ({"a": 1}, "text", 7, too_many, [bytes(protocol.MAX_BLOCK_SIZE + 1)], [[KEY], [KEY], [KEY]]):
+            with self.subTest(response=repr(response)[:40]):
+                answers[b"x"] = response
+                with mock.patch.object(server, "log") as log:
+                    self.assertIs(self.ask("/feature", b"x", link), False)
+                log.assert_called_once_with(mock.ANY, server.LOG_ERROR)
+                self.assertIn("/feature", log.call_args.args[0])
+        for response in (True, False, [], [b"a", None], [[KEY], [KEY]]):
+            with self.subTest(response=response):
+                answers[b"x"] = response
+                self.assertEqual(self.ask("/feature", b"x", link), response)
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (0, 0))
+
     def test_busy_link_refused_after_the_checks(self):
         """With both of a link's request slots taken, a request is refused without running its work, and a
         refusal by a handler's own checks takes no slot."""

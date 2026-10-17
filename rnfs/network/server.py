@@ -23,6 +23,7 @@ from collections import Counter, OrderedDict
 from typing import Callable, Protocol
 
 import RNS
+from RNS.vendor import umsgpack
 
 from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
@@ -925,13 +926,22 @@ class RequestServer:
         return self._in_slot(link_id, answer)
 
     def _feature_handler(self, handler):
-        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, and never answering None."""
+        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, never answering None, and
+        answering False rather than a response requesters would refuse."""
         def handle(path, data, request_id, link_id, remote_identity):
             """Run the feature's handler(data, remote_identity) inside the per-link request limit."""
             def answer():
-                """The feature's response, False for None."""
+                """The feature's response, False for None or a shape no requester accepts."""
                 response = handler(data, remote_identity)
-                return False if response is None else response
+                if response is None:
+                    return False
+                # Requesters since 0.1.4 check every response's shape before decoding it (protocol.response_refusal):
+                # one they refuse would fail every request to this path, so it's a bug in the feature, said here
+                refusal = protocol.body_refusal(umsgpack.packb(response))
+                if refusal is not None:
+                    log(f"refused to answer {path} with a response no requester accepts: {refusal}", LOG_ERROR)
+                    return False
+                return response
             return self._in_slot(link_id, answer)
         return handle
 

@@ -308,15 +308,6 @@ class TokenBucket:
             self._refill()
             return self.tokens
 
-    def take(self, nbytes: int) -> bool:
-        """Spend nbytes if allowed (see the class). False, spending nothing, if not."""
-        with self.lock:
-            self._refill()
-            if self.tokens >= nbytes or self.tokens >= self.capacity:
-                self.tokens -= nbytes
-                return True
-            return False
-
     def give_back(self, nbytes: int):
         """Return bytes spent on a response that wasn't sent after all."""
         with self.lock:
@@ -377,10 +368,6 @@ class AirtimePolicy:
         if available >= self.bucket.capacity and committed <= 0:
             return limit
         return max(0, min(limit, int(available - committed) - RESPONSE_OVERHEAD))
-
-    def spend(self, nbytes: int) -> bool:
-        """Charge a response of nbytes to the upload budget. False if it must be refused."""
-        return self.bucket is None or self.bucket.take(nbytes)
 
     def reserve(self, nbytes: int, reservation: int, committed: int = 0) -> bool:
         """Admit a response of nbytes, charging reservation of it now (the rest is charged as it is sent).
