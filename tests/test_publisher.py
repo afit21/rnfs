@@ -606,14 +606,16 @@ class PublisherTest(unittest.TestCase):
         """A round's lookups run PUBLISH_LOOKUPS at once, on threads of their own, so a round of many keys whose
         lookups take time finishes in a fraction of the time one at a time takes."""
         self.due_keys(20)
-        self.lookup_delay = lambda key: 0.05  # 1 s one at a time
+        self.lookup_delay = lambda key: 0.1  # 2 s one at a time
         started = time.monotonic()
         result = self.publisher.publish_due()
         elapsed = time.monotonic() - started
         self.assertEqual(len(result["published"]), 20)
         self.assertEqual(self.running.peak, PUBLISH_LOOKUPS)
         self.assertEqual(self.running.threads, {"rnfs-publish-lookup"})
-        self.assertLess(elapsed, 0.6)  # about 20 / PUBLISH_LOOKUPS × 0.05 = 0.25 s
+        # About 20 / PUBLISH_LOOKUPS × 0.1 = 0.5 s; CI runners have taken 0.4 s more, so the bound only rules out
+        # lookups one at a time
+        self.assertLess(elapsed, 1.5)
         self.assertEqual(len(self.client.calls), 2)  # still one /provide per node, every key in it
         self.assertTrue(all(len(keys) == 20 for _, keys, _ in self.client.calls))
 
