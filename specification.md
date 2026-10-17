@@ -1363,8 +1363,8 @@ optionally from one node), `pin` (fetch a target completely and pin it with sour
 - Cancelling a queued job MUST end it at once; cancelling a running one MUST stop its fetch at the fetch's next
   step (within 0.5 s), not at the end of a request in flight, whose link is then closed (section 7). Writing
   out (`get`) or the archive (`export`) after the fetch is local and is not interrupted.
-- Stopping the node MUST NOT wait for jobs beyond a short bound (rnfs: 2 s); a job interrupted by the
-  shutdown is saved as queued and resumes at the next start.
+- Stopping the node MUST NOT wait for jobs beyond a short bound (rnfs: the node's stop budget, 5 s for every
+  thread it ends); a job interrupted by the shutdown is saved as queued and resumes at the next start.
 - At most `max_finished_jobs` (at least 1) finished jobs are kept, the oldest finished forgotten first, but
   a finished job is kept for at least 60 s whatever the cap, so a client following a fast job always finds
   its result. At most 1000 jobs may be queued or running (more are refused as busy). Two queued or running

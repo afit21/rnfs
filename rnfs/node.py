@@ -10,7 +10,9 @@ through NodeBackend. Background threads: the announcer, the join (bootstrap node
 repeated while too few servers are known), the publish loop, the name re-announce loop, the features' own, a
 worker per source with remote pins waiting, and maintenance (shared-folder scans, provider record expiry and
 saves, max_storage enforcement, periodic state saves, publisher refreshes asked for, deny-list changes retried,
-the remote pins waiting saved).
+the remote pins waiting saved). Stopping ends the features, then the node's services and threads (waiting for
+them, the features' too, at most STOP_TIMEOUT in all), saves every store and closes the state, each step guarded:
+one that fails skips none of the others.
 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
@@ -29,7 +31,8 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
-from typing import BinaryIO, Callable, Iterator
+from functools import partial
+from typing import BinaryIO, Callable, Iterator, Protocol, TypeVar
 
 import RNS
 
@@ -45,8 +48,8 @@ from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_rese
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
-from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, TooLarge
-from rnfs.fetcher import Fetch, Fetcher, describe
+from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, TooLarge
+from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
 from rnfs.names import NameManager, parse_name
@@ -64,7 +67,7 @@ STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched ta
 ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the block (msgpack framing, CID)
 EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else triggers one
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
-STOP_TIMEOUT = 5.0
+STOP_TIMEOUT = 5.0  # seconds stop() waits in all for the threads it ends (the features' and the node's)
 REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetched; more are refused
 BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many have answered
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
@@ -337,6 +340,34 @@ def _warn_unused_reticulum_config(config: Config):
             f"Set reticulum_dir (or --rnsconfig) to {config.root} to keep using it, or delete it", LOG_WARNING)
 
 
+class Store(Protocol):
+    """A part of the node that keeps state in the state database; the node lists every one (RnfsNode._add_store).
+
+    save() writes what changed since the last save, if anything; a store written through has nothing to save. It
+    raises OSError (StateDbError) if the database fails, keeping the change for the next save. close() releases
+    the store's reference to the state database, once everything is saved; the last reference closes it.
+    """
+
+    def save(self) -> None:
+        """Write the changes not yet saved, if any."""
+
+    def close(self) -> None:
+        """Release the state database."""
+
+
+_StoreT = TypeVar("_StoreT", bound=Store)
+
+
+class _StoreParts:
+    """A Store made of two functions: for a store that has no save (written through) or no close of its own, or for
+    the node's own tables."""
+
+    def __init__(self, save: Callable[[], None] = lambda: None, close: Callable[[], None] = lambda: None):
+        """A store whose save and close call save and close."""
+        self.save = save
+        self.close = close
+
+
 class _NamePins:
     """The pins NameManager uses: storage pins that also update what the node provides."""
 
@@ -520,31 +551,46 @@ class RnfsNode:
             except ValueError as e:
                 log(f"ignoring bootstrap node: {e}", LOG_WARNING)
         _make_private_dirs(config.root)
-        # First, so the JSON state files of earlier versions are imported before any store loads its state
+        # Every store, in the order made, and those _save_state saves (the others save on a schedule of their own).
+        # A store is added as soon as it is made, so a _setup that fails releases exactly the ones it made. The
+        # features are stores too, listed by self.features (_every_store)
+        self._stores: list[Store] = []
+        self._batched: list[Store] = []
+        # First, so the JSON state files of earlier versions are imported before any store loads its state; closed
+        # last
         self._db = statedb.connect(config.state_dir)
+        self._add_store(_StoreParts(close=self._db.close), batched=False)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
-        self.records = ProviderStore(config.max_records, config.state_dir, own_id=node_id,
-                                     seniority=config.provider_seniority)
+        # Saved with their expiry, every SAVE_INTERVAL (maintain): they change with every /provide
+        self.records = self._add_store(ProviderStore(config.max_records, config.state_dir, own_id=node_id,
+                                                     seniority=config.provider_seniority), batched=False)
         if config.private:
             # Records stored while the node was public, or from a member removed since, are never handed out
             removed = self.records.retain(self._is_member_publisher)
             if removed:
                 log(f"private mode: dropped {plural(removed, 'provider record')} of non-members", LOG_NOTICE)
-        self.storage = Storage(config.blocks_dir, config.state_dir, config.max_storage)
+        self.storage = self._add_store(Storage(config.blocks_dir, config.state_dir, config.max_storage))
         # Before anything is fetched or provided: the fetcher and the publisher check it through storage.deny
-        self.deny = denylist.DenyList(config.state_dir)
+        self.deny = self._add_store(denylist.DenyList(config.state_dir))
         self.storage.deny = self.deny
         self.deny.reload(self._read_deny_list)
         self._hash_noticed: set[Cid] = set()  # files _check_file refused by hash and logged the NOTICE for
+        # The shared folder and pin names are written through: nothing to save
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
+        self._add_store(_StoreParts(close=self.shared_folder.close), batched=False)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
-        self.fetcher = Fetcher(self.storage, client, config, node_id, self.routing, self._lookup, slow,
-                               config.state_dir, after_store=self._enforce_storage, make_room=self._make_room)
-        self.publisher = Publisher(node_id, config, self.storage, self.records, client, self._lookup, slow,
-                                   config.state_dir, cached_eligible=self._eligible_targets,
-                                   generation=self._provide_generation)
+        self._add_store(_StoreParts(close=self.pin_names.close), batched=False)
+        self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
+                                               slow, config.state_dir, after_store=self._enforce_storage,
+                                               make_room=self._make_room))
+        # Saved by its own refreshes and publish loop
+        self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client, self._lookup,
+                                                   slow, config.state_dir, cached_eligible=self._eligible_targets,
+                                                   generation=self._provide_generation), batched=False)
+        # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
+        self._add_store(_StoreParts(close=self.names.close), batched=False)
         self.backend = NodeBackend(self)
 
         self._lock = threading.Lock()
@@ -560,12 +606,16 @@ class RnfsNode:
         # Changed since last saved (by _save_state: maintenance, gc and stop); a row that didn't parse is deleted
         self._fetched_dirty = len(self._fetched) != len(self._fetched_saved)
         self._fetched_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
+        self._add_store(_StoreParts(save=self._save_fetched))  # closed with self._db
         # Remote source -> CIDs waiting or being fetched for it, in the order accepted (fetched one at a time)
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
-        self._remote_workers: set[str] = set()  # remote sources with a thread fetching their pins
+        # Remote source -> the thread fetching its pins (one at most); stop waits for them
+        self._remote_workers: dict[str, threading.Thread] = {}
         self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
         self._remote_pins_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
+        # Saved about every second (maintain); closed with self._db
+        self._add_store(_StoreParts(save=self._save_remote_pins), batched=False)
         self._refresh_wanted = threading.Event()
         # Taken first (before the publisher's and storage's locks): one deny-list change applied at a time
         self._deny_lock = threading.Lock()
@@ -587,6 +637,23 @@ class RnfsNode:
         # Changes apply at once; what the list denied at start, maintenance applies first
         self.deny.add_listener(self._apply_deny)
 
+    def _add_store(self, store: _StoreT, batched: bool = True) -> _StoreT:
+        """Add store to the node's stores, which are saved at stop and closed by _close_state; returns it.
+
+        batched: _save_state saves it (every STATE_SAVE_INTERVAL, and at gc); False for a store saved on a
+        schedule of its own, or written through.
+        """
+        self._stores.append(store)
+        if batched:
+            self._batched.append(store)
+        return store
+
+    def _every_store(self, batched: bool = False) -> list[Store]:
+        """The node's stores (only the batched ones if batched), in the order made, then the features (each saved
+        with the batched stores). After a _setup that failed, only those it made."""
+        stores = getattr(self, "_batched" if batched else "_stores", [])
+        return [*stores, *getattr(self, "features", {}).values()]
+
     def feature(self, name: str) -> "features.Feature":
         """The feature called name (rnfs.features). Raises KeyError if it isn't loaded."""
         return self.features[name]
@@ -607,42 +674,49 @@ class RnfsNode:
                 log(f"feature {feature.name} failed to start: {e!r}", LOG_ERROR)
 
     def stop(self, timeout: float = STOP_TIMEOUT):
-        """Stop background work, save state and close links. Work still waiting on the network is abandoned."""
+        """Stop background work, save state and close links. Work still waiting on the network is abandoned.
+
+        The features' threads and the node's are waited for at most timeout seconds in all. Each step is guarded:
+        one that raises is logged and the rest still run, so the state is saved and closed, and an embedded
+        node's destination released, whatever failed before.
+        """
         if self._stopped:
             return
         self._stopped = True
         log("stopping", LOG_NOTICE)
-        for feature in reversed(list(self.features.values())):
-            try:
-                feature.stop()
-            except Exception as e:  # noqa: BLE001 - keep stopping the rest
-                log(f"feature {feature.name} failed to stop: {e!r}", LOG_ERROR)
-        self.stop_event.set()
-        self.publisher.wake()
-        if self.announcer is not None:
-            self.announcer.stop()
-        if self.announce_handler is not None:
-            self.announce_handler.deregister()
-        if self.server is not None:
-            self.server.stop()
-        try:
-            self.names.stop()  # saves the names state
-        except OSError as e:  # stopping goes on: the rest is saved, the state closed and the links too
-            log(f"saving state failed: {e!r}", LOG_ERROR)
         deadline = time.monotonic() + timeout
-        for thread in self.threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        for save in (self.records.save, self._save_remote_pins, self.publisher.save):
-            try:
-                save()
-            except OSError as e:
-                log(f"saving state failed: {e!r}", LOG_ERROR)
-        self._save_state()
-        self._close_state()
+        steps: list[tuple[str, Callable[[], object]]] = [
+            (f"stopping feature {feature.name}", partial(features.stop_feature, feature, deadline))
+            for feature in reversed(list(self.features.values()))]
+        steps += [("signalling the threads to stop", self.stop_event.set),
+                  ("waking the publisher", self.publisher.wake)]
+        if self.announcer is not None:
+            steps.append(("stopping the announcer", self.announcer.stop))
+        if self.announce_handler is not None:
+            steps.append(("deregistering the announce handler", self.announce_handler.deregister))
+        if self.server is not None:
+            steps.append(("stopping the request server", self.server.stop))
+        steps.append(("deregistering names, saving state", self.names.stop))  # names.stop saves the names state
+        steps.append(("waiting for the background threads", partial(self._join_threads, deadline)))
+        steps += [("saving state", store.save) for store in self._every_store()]
+        steps.append(("closing state", self._close_state))
         if self.links is not None:
-            self.links.close_all()
+            steps.append(("closing links", self.links.close_all))
         if self.embedded:
-            self._release_destination()
+            steps.append(("releasing the rnfs.dht destination", self._release_destination))
+        for label, step in steps:
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 - the later steps run: the state is closed, the destination released
+                log(f"{label} failed: {e!r}", LOG_ERROR)
+
+    def _join_threads(self, deadline: float):
+        """Wait until deadline (a time.monotonic() value) for the background loops and the remote-pin workers to
+        end, once stop_event is set."""
+        with self._lock:
+            workers = list(self._remote_workers.values())
+        for thread in (*self.threads, *workers):
+            thread.join(max(0.0, deadline - time.monotonic()))
 
     def _release_destination(self):
         """An embedded node's last step: RNS stops answering for its rnfs.dht destination and the links to it
@@ -656,25 +730,22 @@ class RnfsNode:
             log(f"releasing the rnfs.dht destination failed: {e!r}", LOG_ERROR)
 
     def _close_state(self):
-        """Release every store's reference to the state database, once everything is saved; the last closes it.
-        After a _setup that failed, only the stores it made."""
-        names = ("records", "storage", "deny", "shared_folder", "pin_names", "fetcher", "publisher", "names")
-        stores = [getattr(self, name) for name in names if hasattr(self, name)]
-        for store in (*stores, *getattr(self, "features", {}).values(), getattr(self, "_db", None)):
-            if store is None:
-                continue
+        """Release every store's reference to the state database, once everything is saved, in the reverse of the
+        order made (the node's own reference last, which closes it). After a _setup that failed, only the stores
+        it made."""
+        for store in reversed(self._every_store()):
             try:
                 store.close()
             except Exception as e:  # noqa: BLE001 - release the rest
                 log(f"closing state failed: {e!r}", LOG_ERROR)
 
     def _save_state(self):
-        """Save cache records, fetched targets, invalid roots and remembered file hashes if they changed (each
-        change isn't written at once)."""
-        for save in (self.storage.save, self._save_fetched, self.fetcher.save, self.deny.save,
-                     *(f.save for f in self.features.values())):
+        """Save what changed in the batched stores (cache records, fetched targets, invalid roots, remembered file
+        hashes and the features' state: each change isn't written at once). A failing save is logged, and the rest
+        are still saved."""
+        for store in self._every_store(batched=True):
             try:
-                save()
+                store.save()
             except OSError as e:
                 log(f"saving state failed: {e!r}", LOG_ERROR)
 
@@ -1523,7 +1594,7 @@ class RnfsNode:
             log(f"refused remote pin of {cid} for {source}: couldn't start its fetch: {e}", LOG_ERROR)
             return False
         # Registered after start() succeeds, still under the lock, so the worker can't look before it is
-        self._remote_workers.add(source)
+        self._remote_workers[source] = thread
         return True
 
     def _remote_pin_worker(self, source: str):
@@ -1542,13 +1613,13 @@ class RnfsNode:
                 if cid is None:
                     # Deregistered in the same critical section that saw nothing waiting: a /pin arriving after
                     # it starts a new worker instead of relying on this one, which is about to return
-                    self._remote_workers.discard(source)
+                    self._remote_workers.pop(source, None)
                     return
             try:
                 self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
             except BaseException:
                 with self._lock:
-                    self._remote_workers.discard(source)
+                    self._remote_workers.pop(source, None)
                 raise
 
     def _save_remote_pins(self):
@@ -1621,13 +1692,15 @@ class RnfsNode:
 
     def _remote_pin_fetch(self, cid: Cid, source: str):
         """Fetch cid for a remote pin, dropping it as soon as its verified size, or the bytes of its DAG's
-        blocks met so far, would exceed the quota."""
+        blocks met so far, would exceed the quota. The fetch ends at its next step once the node stops."""
         quota = self.config.remote_pin_quota
+        observer = Observer()
+        observer.cancelled = self.stop_event.is_set
         try:
             with self._lock:
                 if (source, cid) in self._remote_released:
                     return  # released while it waited
-            with self.fetcher.open(cid, pinned=True) as fetch:
+            with observing(observer), self.fetcher.open(cid, pinned=True) as fetch:
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)
                 # Nothing else is being fetched for source (_remote_pin_worker), so its pins are all it uses
@@ -1653,6 +1726,9 @@ class RnfsNode:
                     self.storage.pin(cid, source)
             log(f"pinned {cid} for {source}", LOG_NOTICE)
             self.publisher.refresh()
+        except Cancelled:
+            log(f"remote pin of {cid} for {source} stopped with the node: it is fetched after the next start",
+                LOG_VERBOSE)
         except RnfsError as e:
             log(f"remote pin of {cid} for {source} failed: {e}", LOG_WARNING)
         except Exception as e:  # noqa: BLE001 - the pin waits for the next try; logged
