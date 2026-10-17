@@ -494,6 +494,48 @@ class BatchTest(FetcherTest):
                 self.assertEqual(list(new), list(old))
 
 
+class RequeueTest(FetcherTest):
+    """What a result puts back in the pending queue, and where, with a large file's chunks pending (A3)."""
+
+    def test_requeue_keeps_the_walk_order_with_a_large_pending_queue(self):
+        fetch = self.fetcher.open(self.file(b"root").cid).__enter__()
+        self.addCleanup(fetch.__exit__, None, None, None)
+        chunks = [i.to_bytes(8, "big") for i in range(20_000)]
+        expects = [walker.Expect(Cid.for_block(RAW, data), len(data), walker.FILE_TYPES, 2) for data in chunks]
+        blocks = {expect.cid: data for expect, data in zip(expects, chunks)}
+        wanted = {expect.cid: [expect] for expect in expects}
+        walk = list(wanted)
+        outstanding = set(wanted)
+        pending = fetcher_module._Pending(wanted)
+        for node_id in (P1, P2):
+            fetch._new_provider(node_id)
+        first = [pending.popleft() for _ in range(32)]
+        second = [pending.popleft() for _ in range(32)]
+        in_flight = {P1: (first, False), P2: (second, False)}
+
+        def result(node_id: bytes, cids: list[Cid], outcome: BlocksResult):
+            """Handle node_id's result for cids."""
+            fetch._handle_event(("result", node_id, cids, outcome, None, None), pending, in_flight, outstanding,
+                                wanted, {})
+
+        # P2's budget cut its response after 10 blocks: the rest go back to the front
+        result(P2, second, BlocksResult(OK, blocks={cid: blocks[cid] for cid in second[:10]}, unsent=second[10:]))
+        self.assertEqual(list(pending), walk[42:])
+        # A probe asks for first[0] (still in flight with P1) and the next pending CID (still pending)
+        in_flight[P3] = ([first[0], pending[0]], True)
+        result(P1, first, BlocksResult(BUSY))  # first[0] stays out: the probe still has it
+        self.assertEqual(list(pending), first[1:] + walk[42:])
+        result(P3, [first[0], walk[42]], BlocksResult(FAILED, unsent=[first[0], walk[42]]))
+        # Back in the walk's order, each CID once, and only the ones not stored
+        self.assertEqual(list(pending), walk[:32] + walk[42:])
+        self.assertEqual(len(pending), len(walk) - 10)
+        self.assertNotIn(second[0], pending)
+        self.assertIn(walk[-1], pending)
+        drained = [pending.popleft() for _ in range(len(pending))]
+        self.assertEqual(drained, walk[:32] + walk[42:])
+        self.assertFalse(any(cid in pending for cid in walk))
+
+
 class ValidityTest(FetcherTest):
     """Reader checks, max_download_size, space."""
 

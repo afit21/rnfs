@@ -220,6 +220,48 @@ class _RangeBudget:
                            "bytes of file nodes, more than such a range can need: refusing it")
 
 
+class _Pending:
+    """The CIDs a _download has still to ask for, in the walk's order, each at most once.
+
+    A deque with a set alongside: requeueing a result asks whether each of its CIDs is already pending, and
+    scanning a deque of a large file's chunks for every CID held up the fetch thread (16k pending, 20 ms a result).
+    """
+
+    __slots__ = ("_order", "_members")
+
+    def __init__(self, cids):
+        """Pending cids, in order (distinct, as a dict's keys are)."""
+        self._order: deque[Cid] = deque(cids)
+        self._members: set[Cid] = set(self._order)
+
+    def __len__(self) -> int:
+        """How many CIDs are pending."""
+        return len(self._order)
+
+    def __contains__(self, cid: Cid) -> bool:
+        """True if cid is pending."""
+        return cid in self._members
+
+    def __iter__(self) -> Iterator[Cid]:
+        """The pending CIDs, front first."""
+        return iter(self._order)
+
+    def __getitem__(self, index: int) -> Cid:
+        """The CID at index (0 is the next one asked for)."""
+        return self._order[index]
+
+    def popleft(self) -> Cid:
+        """Take the next CID to ask for."""
+        cid = self._order.popleft()
+        self._members.discard(cid)
+        return cid
+
+    def push_front(self, cids: list[Cid]):
+        """Put cids (none of them pending) back at the front, keeping their order."""
+        self._order.extendleft(reversed(cids))
+        self._members.update(cids)
+
+
 class _Provider:
     """What a fetch knows about one provider."""
 
@@ -802,7 +844,7 @@ class Fetch:
     def _download(self, wanted: dict[Cid, list[Expect]], children: dict):
         """Fetch the wanted blocks from providers until all are stored. Raises NotFound if none can."""
         outstanding = set(wanted)
-        pending = deque(wanted)
+        pending = _Pending(wanted)
         in_flight = self._in_flight
         self._progress_at = max(self._progress_at, self.fetcher.clock())  # it may be after a pacing wait
         give_up = self.config.lookup_timeout + self.config.stall_timeout
@@ -829,7 +871,7 @@ class Fetch:
             for event in events:
                 self._handle_event(event, pending, in_flight, outstanding, wanted, children)
 
-    def _handle_event(self, event: tuple, pending: deque, in_flight: dict, outstanding: set[Cid],
+    def _handle_event(self, event: tuple, pending: _Pending, in_flight: dict, outstanding: set[Cid],
                       wanted: dict[Cid, list[Expect]], children: dict):
         """Apply one event from a request thread or the lookup thread."""
         kind = event[0]
@@ -844,7 +886,7 @@ class Fetch:
             self._handle(provider, cids, result, probe, wanted, children, outstanding, sent_at, rate)
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending
                        and not any(cid in asked for asked, _ in in_flight.values())]
-            pending.extendleft(reversed(requeue))  # back at the front, keeping the walk's order
+            pending.push_front(requeue)  # back at the front, keeping the walk's order
 
     def _make_room(self, nbytes: int):
         """Before storing nbytes: evict other cached fetches over max_storage if not pinned (going over it if
@@ -894,7 +936,7 @@ class Fetch:
         waits = [p.busy_until - now for p in self._providers.values() if not p.failed and p.busy_until > now]
         return max(0.01, min([POLL, *waits]))
 
-    def _assign(self, pending: deque, in_flight: dict, outstanding: set[Cid], wanted: dict[Cid, list[Expect]]):
+    def _assign(self, pending: _Pending, in_flight: dict, outstanding: set[Cid], wanted: dict[Cid, list[Expect]]):
         """Send requests to idle providers, after finding providers if there are none."""
         now = self.fetcher.clock()
         usable = self._usable()
@@ -913,7 +955,7 @@ class Fetch:
                 self._send(provider.node_id, batch)
                 busy_providers += 1
 
-    def _take_batch(self, pending: deque, node_id: bytes, wanted: dict[Cid, list[Expect]]) -> list[Cid]:
+    def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]]) -> list[Cid]:
         """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
         hold, at least one.
 
@@ -971,7 +1013,7 @@ class Fetch:
 
     # Finding providers
 
-    def _discover(self, pending: deque, in_flight: dict):
+    def _discover(self, pending: _Pending, in_flight: dict):
         """No usable provider: ask nodes with open links, else start the lookup."""
         if not self._probed:
             self._probed = True
