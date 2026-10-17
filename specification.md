@@ -723,13 +723,16 @@ and repeat.
    chunks of 4 KiB or more (one level up to 1 MiB, seven for any size): a range ends inside at most two nodes
    of a level. Otherwise it fails ("too large"); a requester counts a file node not yet received as
    `MAX_BLOCK_SIZE`, as in item 5, so a small range ending in two nodes of a level asks for them one at a
-   time.
+   time. The chunks are fetched a window (32 chunks) at a time, and the next window's are asked for before the
+   reader is handed the current one's bytes, so the providers don't wait for the reader; a reader that stops
+   early has had at most one window fetched that it didn't read.
 7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
    only contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or
    misses the same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels
    the transfer, and its blocks are requested again from another provider; providers that keep failing are
-   handled as in section 6. A fetch that fails or is cancelled closes the links of its requests still in
-   flight, so their responses don't keep using the link and hold up the next `/blocks` to those nodes.
+   handled as in section 6. A fetch that fails or is cancelled, or whose reader stops early (item 6), closes
+   the links of its requests still in flight, so their responses don't keep using the link and hold up the next
+   `/blocks` to those nodes; it never cancels their Resources (section 3, Cooldown).
 8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
 9. When the target is complete, the node provides it if its strategy says so (section 6).

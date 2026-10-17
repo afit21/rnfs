@@ -58,6 +58,13 @@ flight per provider. Request threads only call the client and note when a respon
 fetch state is changed by the thread that runs the fetch, from the events they queue (ResultEvent, and the
 lookup thread's ProviderEvent and LookupDone).
 
+read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
+bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
+for it has returned is stored all the same. A fetch closes the links of its requests still in flight when it ends
+by an error, is cancelled, or ends with requests it no longer needs (a reader that stopped early, which has had
+at most one window fetched that it didn't read). It never cancels a response's Resource on a link it keeps: a
+responder would take that for a rejection and cool the requester down (section 3).
+
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
 """
@@ -558,6 +565,9 @@ class Fetch:
         self._events: queue.Queue = queue.Queue()
         # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
         self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
+        # What each CID of a request in flight (not a probe) was asked for as, so a block arriving after the
+        # _download call that asked for it has returned is checked and stored rather than dropped
+        self._expects: dict[Cid, list[Expect]] = {}
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -589,25 +599,30 @@ class Fetch:
     def __exit__(self, exc_type, exc, tb):
         """Stop the lookup and end the session; an InvalidDag raised by this fetch marks the root invalid.
 
-        A fetch ended by an error (or cancelled) closes the links of its requests still in flight, so their
-        responses don't keep using the link and hold up the next /blocks to those nodes.
+        A fetch ended by an error (or cancelled, or by its reader closing a read_range early) closes the links of
+        its requests still in flight, so their responses don't keep using the link and hold up the next /blocks
+        to those nodes. One that ends normally does so for requests it no longer needs (a read_range's next window,
+        left unread), but leaves a probe for the first block, which another node sent, to finish. Closing the link
+        is how a requester stops a response: it never cancels the response's Resource, which a responder would
+        take for a rejection and cool the requester down for (section 3).
         """
         self.closed = True
         if self._lookup is not None:
             self._lookup.stop()
-        if exc_type is not None:
-            while True:  # requests already answered aren't in flight any more
-                try:
-                    event = self._events.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(event, ResultEvent):
-                    self._in_flight.pop(event.node_id, None)
-            for node_id in list(self._in_flight):
-                try:
-                    self.client.close(node_id)
-                except Exception as e:  # noqa: BLE001 - closing is best effort; logged
-                    log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
+        while True:  # requests already answered aren't in flight any more
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(event, ResultEvent):
+                self._in_flight.pop(event.node_id, None)
+        for node_id, (_, probe) in list(self._in_flight.items()):
+            if exc_type is None and probe:
+                continue
+            try:
+                self.client.close(node_id)
+            except Exception as e:  # noqa: BLE001 - closing is best effort; logged
+                log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
         # Only this fetch's own error: one from another fetch nested in the same `with` is about another root
         if isinstance(exc, InvalidDag) and getattr(exc, "root", None) == self.root:
             self.fetcher.mark_invalid(self.root)
@@ -759,6 +774,10 @@ class Fetch:
         """The bytes of the file target in [offset, offset + length), fetching only the chunks covering them
         and the nodes above, WINDOW chunks at a time. Raises ValueError for a directory.
 
+        The next window's chunks are asked for before this one's bytes are handed to the reader, so the
+        providers keep working while it reads; a reader that stops early has fetched at most one window more
+        than it read, and ending the fetch closes the links still bringing it.
+
         Lazy all the way down: the range is walked depth-first as it is read, so a DAG claiming billions of
         chunks costs nothing until they are read, and small chunks count against max_output_entries. The file
         nodes it meets, stored or downloaded, may hold range_bound(size, range length) bytes (TooLarge past
@@ -780,18 +799,28 @@ class Fetch:
             if not target.cid.is_raw:
                 budget.count(target.cid, len(self.get(target)))  # the fetch's own budget has counted it already
             small = walker.SmallLeaves(self.config.max_output_entries)
-            window: list[tuple[Expect, int, int]] = []
-            for leaf in self._range_leaves(target, offset, end - offset, budget):
-                small.meet(leaf[2])
-                window.append(leaf)
-                if len(window) >= WINDOW:
-                    yield from self._read_window(window)
-                    window = []
-            yield from self._read_window(window)
+            leaves = self._range_leaves(target, offset, end - offset, budget)
+            window = self._next_window(leaves, small)
+            while window:
+                ahead = self._next_window(leaves, small)
+                yield from self._read_window(window, ahead)
+                window = ahead
 
-    def _read_window(self, window: list[tuple[Expect, int, int]]) -> Iterator[bytes]:
-        """Fetch a window of chunks in one go, then yield the range within each, in order."""
-        self.ensure([expect for expect, _, _ in window])
+    @staticmethod
+    def _next_window(leaves: Iterator[tuple[Expect, int, int]],
+                     small: walker.SmallLeaves) -> list[tuple[Expect, int, int]]:
+        """The next WINDOW chunks of a range's walk (fewer at its end, none past it), each met by small."""
+        window = []
+        for leaf in islice(leaves, WINDOW):
+            small.meet(leaf[2])
+            window.append(leaf)
+        return window
+
+    def _read_window(self, window: list[tuple[Expect, int, int]],
+                     ahead: list[tuple[Expect, int, int]]) -> Iterator[bytes]:
+        """Fetch a window of chunks in one go, asking for ahead's (the next window's) once nothing of it is left to
+        ask for, then yield the range within each, in order."""
+        self.ensure([expect for expect, _, _ in window], ahead=[expect for expect, _, _ in ahead])
         for expect, child_offset, child_length in window:
             block = self.get(expect)
             try:
@@ -824,16 +853,21 @@ class Fetch:
 
     # Getting blocks
 
-    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None) -> dict[Expect, list[Expect]]:
+    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None,
+               ahead: list[Expect] = ()) -> dict[Expect, list[Expect]]:
         """Make sure every block of expects is stored and passes its reader checks; their children's expects.
 
-        Their blocks are counted against budget (a read_range call's), by default the fetch's own.
+        Their blocks are counted against budget (a read_range call's), by default the fetch's own. The blocks of
+        ahead (a read_range's next window) are asked for once nothing of expects is left to ask for, and stored
+        as they arrive, during this call or a later one, but not waited for; one stored already, denied, or not
+        passing its CID check is left out, to be met when it is ensured.
         Raises InvalidDag, NotFound when no provider can supply a block, StorageFull, TooLarge.
         """
         with self._checking():
-            return self._ensure(expects, self.budget if budget is None else budget)
+            return self._ensure(expects, self.budget if budget is None else budget, ahead)
 
-    def _ensure(self, expects: list[Expect], budget: _DagBudget) -> dict[Expect, list[Expect]]:
+    def _ensure(self, expects: list[Expect], budget: _DagBudget,
+                ahead: list[Expect] = ()) -> dict[Expect, list[Expect]]:
         """ensure(), untagged."""
         self._check_cancelled()
         children: dict[Expect, list[Expect]] = {}
@@ -848,8 +882,18 @@ class Fetch:
                 children[expect] = checked
                 if self.observer is not None:
                     self.observer.block(expect.cid, self.storage.block_size(expect.cid) or 0, False)
-        if wanted:
-            self._download(wanted, children, budget)
+        prefetch: dict[Cid, list[Expect]] = {}
+        for expect in ahead:
+            cid = expect.cid
+            if cid in wanted or self.storage.has(cid) or self.storage.deny.denies(cid):
+                continue
+            try:
+                walker.check_cid(expect)
+            except InvalidDag:
+                continue
+            prefetch.setdefault(cid, []).append(expect)
+        if wanted or prefetch:
+            self._download(wanted, children, budget, prefetch)
             self.fetcher.after_store()
         return children
 
@@ -909,15 +953,30 @@ class Fetch:
             if self._lookup is not None:
                 self._lookup.stop()  # it may now have enough providers to stop searching
 
-    def _download(self, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
+    def _download(self, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
+                  ahead: dict[Cid, list[Expect]] | None = None):
         """Fetch the wanted blocks from providers until all are stored, counted against budget. Raises NotFound if
-        none can."""
-        outstanding = set(wanted)
-        pending = _Pending(wanted)
+        none can.
+
+        ahead's blocks (ensure's) are asked for after wanted's and stored as they arrive, but not waited for:
+        whatever of them is still to ask for once wanted's are stored goes out to the providers idle by then,
+        before returning, so they keep working while the caller uses wanted's.
+        """
+        outstanding = set(wanted)  # still to store: wanted's, then ahead's
+        needed = outstanding  # what the call waits for: wanted's
+        if ahead:
+            needed = set(outstanding)
+            for cid, expects in ahead.items():
+                wanted[cid] = expects
+                outstanding.add(cid)
         in_flight = self._in_flight
+        # A CID that a request still in flight (an earlier call's ahead) asked for isn't asked for again: its
+        # result is waited for, and requeued if it doesn't bring the block
+        asked = {cid for cids, _ in in_flight.values() for cid in cids}
+        pending = _Pending(cid for cid in wanted if cid not in asked)
         self._progress_at = max(self._progress_at, self.fetcher.clock())  # it may be after a pacing wait
         give_up = self.config.lookup_timeout + self.config.stall_timeout
-        while outstanding:
+        while needed:
             self._check_cancelled()  # each pass waits at most POLL, so a cancel takes effect promptly
             # Requests and lookups have deadlines of their own; this catches whatever hangs regardless
             if self.fetcher.clock() - max(self._progress_at, self._heard_at) > give_up:
@@ -925,7 +984,7 @@ class Fetch:
             self._assign(pending, in_flight, outstanding, wanted, budget)
             if not in_flight and not self._lookup_running and not self._waiting_for_busy():
                 if not self._rerun_lookup():
-                    raise NotFound(self._not_found_message(outstanding))
+                    raise NotFound(self._not_found_message(needed))
                 continue
             try:
                 events = [self._events.get(timeout=self._wait_time())]
@@ -938,11 +997,16 @@ class Fetch:
                 except queue.Empty:
                     break
             for event in events:
-                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget)
+                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget, needed)
+        if pending and self._usable():
+            # ahead's requests go out before the caller is handed wanted's blocks (never a lookup just for them)
+            self._assign(pending, in_flight, outstanding, wanted, budget)
 
     def _handle_event(self, event: ResultEvent | ProviderEvent | LookupDone, pending: _Pending, in_flight: dict,
-                      outstanding: set[Cid], wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
-        """Apply one event from a request thread or the lookup thread."""
+                      outstanding: set[Cid], wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
+                      needed: set[Cid] | None = None):
+        """Apply one event from a request thread or the lookup thread. needed is _download's, if it isn't
+        outstanding itself: the blocks stored are taken out of it too."""
         if isinstance(event, ProviderEvent):
             self._add_provider(event.node_id)
         elif isinstance(event, LookupDone):
@@ -953,9 +1017,14 @@ class Fetch:
             _, probe = in_flight.pop(event.node_id, (cids, False))
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
                          event.sent_at, event.rate)
-            requeue = [cid for cid in cids if cid in outstanding and cid not in pending
-                       and not any(cid in asked for asked, _ in in_flight.values())]
+            still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
+            requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
             pending.push_front(requeue)  # back at the front, keeping the walk's order
+            for cid in cids:
+                if cid not in still_asked:
+                    self._expects.pop(cid, None)
+            if needed is not None and needed is not outstanding:
+                needed.difference_update(cid for cid in cids if cid not in outstanding)
 
     def _make_room(self, nbytes: int):
         """Before storing nbytes: evict other cached fetches over max_storage if not pinned (going over it if
@@ -1030,6 +1099,8 @@ class Fetch:
             batch = self._take_batch(pending, provider.node_id, wanted, budget)
             if batch:
                 in_flight[provider.node_id] = (batch, False)
+                for cid in batch:
+                    self._expects[cid] = wanted[cid]
                 self._send(provider.node_id, batch)
                 busy_providers += 1
 
@@ -1195,10 +1266,16 @@ class Fetch:
                 provider = self._new_provider(node_id)
             self._fail(provider, "sent a block not matching its CID")
         new = {cid: block for cid, block in result.blocks.items() if cid in outstanding}
-        self._make_room(sum(len(block) for cid, block in new.items() if not self.storage.has(cid)))
+        # Asked for by an earlier _download call (a read_range's next window, while its walk fetched a file node):
+        # checked against what it was asked for as and stored, not dropped and asked for again
+        late = {cid: block for cid, block in result.blocks.items()
+                if cid not in outstanding and cid in self._expects and not self.storage.has(cid)}
+        self._make_room(sum(len(block) for cid, block in (new | late).items() if not self.storage.has(cid)))
         for cid, block in new.items():
             self._accept(cid, block, wanted, children, budget)
             outstanding.discard(cid)
+        for cid, block in late.items():
+            self._accept(cid, block, self._expects, {}, self.budget)
         if probe:
             # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised
             if result.blocks and provider is None:
