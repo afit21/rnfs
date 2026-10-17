@@ -163,6 +163,11 @@ Changed:
   and remote-pin fetches stop with the node (their pins are fetched at the next start).
 - A pin name or contact whose save failed (a full disk, say) is written again by the node's next save, at the
   latest at stop, rather than only at the next change.
+- GitHub releases take their notes from the version's section of this file instead of generated notes, and the
+  release workflow refuses a tag whose section is still marked unreleased. The check that the Flatpak's wheels
+  match `packaging/requirements.lock` runs on every push and pull request, and the release builds (Flatpak,
+  Windows exe, arm64 .deb, Debian 12 smoke test) also run, without publishing, on pull requests that touch
+  packaging and weekly. The Flatpak build no longer copies local debris from a checkout.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -221,6 +226,11 @@ Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 - `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
   `status` (messages from untrusted senders dropped by the rate limits since the start).
+- CONTRIBUTING.md: running the tests and their options, lint, the dependency locks, adding a schema step or an
+  API route, and releasing. `specification.md` names the version it describes and that the wire format is
+  byte-identical since 0.1.3. Dependabot updates the workflows' pinned actions. Tests check that the supported
+  Python versions agree across CI, `pyproject.toml`, the lock scripts, `build-deb.sh` and `install.sh`, and that
+  this file's version is `rnfs.__version__`'s.
 - The `follow_quota` setting: bytes a followed name's target may take (default 1 GiB; `0` stops fetching
   followed names).
 - `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and
