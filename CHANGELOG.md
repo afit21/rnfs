@@ -48,6 +48,14 @@ Security:
   symlink, a non-directory or one another user owns stops the start before Reticulum starts; a loose one is made
   0700, with a notice; and if others could write to it, entries another user owns are reported. Before, a user
   who could once write in a loose rnfs dir kept their access to `blocks/` and `names/` after it was tightened.
+- The shared folder is no longer scanned when `files/` leads into the rnfs dir. Before, a symlinked `files/` that
+  led to `storage/` or `names/` (or that someone who could write to a directory above it retargeted there)
+  imported, pinned and provided the node's identity or the name keys, and one that led to the rnfs dir or a
+  directory above it shared everything in it. A folder that resolves, as opened, to the rnfs dir, a directory
+  holding it, or anything inside `storage/`, `names/`, `state/`, `blocks/` or `lxmf/` is now refused with a
+  warning and scanned as empty: nothing is imported, and every pin with source `folder` is released, so keys a
+  0.1.5 node already shared that way stop being provided at the first scan after the upgrade. On Linux and macOS,
+  a directory above the folder that other users can change gets a warning, once.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
@@ -63,6 +71,9 @@ Changed:
 - The daemon and `rnfs.Node` check, in order, the rnfs dir, the settings, the subdirectories, then take the lock.
   The CLI prints settings warnings, and `rnfs.Client` raises them as `RuntimeWarning`. On Windows, a loose
   `rnfs.toml` no longer makes the CLI or `rnfs.Client` load RNS.
+- When a file is refused because its SHA-256 is on the deny list, the log suggests `rnfs deny add <file cid>`
+  (once per file): a `sha256:` entry doesn't stop the file's blocks being served one by one, and denying its CID
+  does.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
