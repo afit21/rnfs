@@ -84,6 +84,21 @@ Security:
   page meanwhile (before, every visit ran `rnfs pin ls`).
 - `examples/rnfs_share.py` and `rnfs.Client`'s log escape names and daemon messages, so a name can't drive the
   terminal.
+- `rnfs.Client` and the CLI check the daemon's proof before believing anything else the API port answers: while
+  the daemon is down, a program listening on its port can no longer make the client raise `Denied`, `NotFound`
+  or `StorageFull` with its own text. Without a valid proof a 503 is `Busy` and anything else `AuthFailed`, both
+  in the client's own words. Connecting and proving time out after 15 s (or the client's timeout, if shorter),
+  and at most 64 KiB of the proof response is read.
+- After the proof, the client sends the request on a new connection only to a daemon that proved a version below
+  0.1.5 (those close every connection); a newer daemon that closes the proved connection gets
+  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.1.7.
+- A followed name can no longer fill the follower's disk: its new target is fetched only if its size, and the
+  bytes of its DAG's blocks, fit in `follow_quota` (default 1 GiB); otherwise the check fails, the follow's state
+  says why, and the previous target stays pinned. While one target replaces another both are held, so a followed
+  name can use up to twice the quota for a time. Targets already pinned over the quota stay.
+- A node's own provider records can no longer be evicted from its own store: about 1000 Sybil stores to a key it
+  provides pushed its record out, and a full newcomer pool could take it too. Its own records don't count toward
+  the publishers a key keeps and are never chosen for eviction.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
@@ -108,6 +123,18 @@ Changed:
   folders, `~/.config/reticulum` included if your Reticulum config is there.
 - The README says plainly that pipx and plain `pip install` resolve dependencies unpinned, not at the versions in
   `packaging/requirements.lock`.
+- The gateway treats a request without `Sec-Fetch-Site` as the user's own only if its `User-Agent` doesn't start
+  with `Mozilla/`. Browsers without Fetch Metadata (Safari before 16.4, Firefox before 90) are now treated like a
+  web page on every request: `?format=` downloads get 409, and their network fetches count against
+  `gateway_fetches`. curl, scripts and other tools keep the user's own access, and so does a browser's own
+  navigation (`Sec-Fetch-Site: none`).
+- `rnfs name publish` in private mode warns that the name's announce (its sequence and target CID) is visible
+  outside the private network; only the content is served to members only. `POST /api/name/publish` then carries
+  the warning as an optional `warning` key, and `rnfs.Node`/`rnfs.Client` raise it as a `RuntimeWarning`; outside
+  private mode nothing changes.
+- The specification documents that the API's proof keep-open lets one connection hold an API slot about twice as
+  long as one request, and the measured cost of grinding node IDs near a key (raising it needs a change to how
+  node IDs are derived, so it is deferred).
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -119,6 +146,8 @@ Changed:
 
 Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
+- The `follow_quota` setting: bytes a followed name's target may take (default 1 GiB; `0` stops fetching
+  followed names).
 - `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and
   `PrivateTmp=yes`, for systems with unprivileged user namespaces. The default unit sets neither, nor `UMask`.
 
