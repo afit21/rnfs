@@ -952,6 +952,15 @@ types `node.feature("contacts")`, `self.dependency("contacts")` and `features.fi
 `tests/test_contacts.py` checks `ContactsFeature` against it, so a renamed method fails there instead of silently
 turning off LXMF's contact trust. LXMF resolves a recipient's nick with `ContactsFeature.resolve_id(nick, "lxmf")`.
 
+The node checks the features' names too when it loads them, with one error style (`FeatureError`, "feature
+<name>: <problem>"), so nothing is shadowed or dropped silently: `checked_classes()` checks every API route
+(`features.api_routes()`: GET or POST of a path matching `API_PATH`, under `/api/`, with a handler, defined neither
+by `ApiHandler.ROUTES` nor by another feature), and once the features are made, `features.request_handlers()`
+checks their request paths (`/` and a name, `REQUEST_PATH`, with a handler, neither one of rnfs's own,
+`CORE_REQUEST_PATHS`, nor another feature's). `NodeBackend.feature_requests()` hands the request server the paths
+checked then. A feature's constructor raising stops the node from being made (those made before it are closed);
+its `start()` raising is logged and the others still start (`RnfsNode._start_features`).
+
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic` | reads `Traffic`, the routing table, links, paths |

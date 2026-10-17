@@ -9,7 +9,9 @@ Rules for feature modules:
   its parser, and client commands must not pay for loading RNS. Import it inside functions.
 - The constructor must be cheap and must not need Reticulum, so tests can build an offline node.
 - API handlers take the ApiHandler and use its helpers (param, json_body, send_json); they reach the
-  feature through `_common.feature(handler, NAME)`. Every feature route requires the API token.
+  feature through `_common.feature(handler, NAME)`. Every feature route requires the API token. Routes and
+  request paths are checked when the node loads the features (api_routes, request_handlers): one that is
+  malformed, or that rnfs or another feature defines too, stops the node with a FeatureError.
 - CLI commands are added with the `command(subparsers, name, run, help)` helper the CLI passes in, and run
   functions talk to the daemon with `rnfs.cli.client(args)` (import rnfs.cli inside the function).
 - Background threads are started with `self._spawn(...)`; `stop(deadline)` asks them to end, then waits for them
@@ -21,10 +23,13 @@ Rules for feature modules:
 """
 import importlib
 import inspect
+import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Literal, Protocol, overload, runtime_checkable
+
+from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH
 
 # Module paths, in start order. A feature may use the features before it
 FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs.features.keepers",
@@ -32,6 +37,10 @@ FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs
                                "rnfs.features.deny"]
 
 ApiRoute = Callable[[object], None]  # handler(api_handler)
+API_METHODS = ("GET", "POST")  # what a feature's API route may answer
+API_PATH = re.compile(r"/api/[a-z0-9][a-z0-9_/-]*")  # a feature API route's path
+REQUEST_PATH = re.compile(r"/[a-z0-9][a-z0-9_/-]*")  # a feature request path (rnfs.dht)
+CORE_REQUEST_PATHS = (FIND_PATH, PROVIDE_PATH, BLOCKS_PATH, PIN_PATH)  # served by rnfs itself (network/server.py)
 
 STOP_WAIT = 5.0  # seconds stop() waits for a feature's threads when given no deadline (the node's own budget)
 
@@ -96,7 +105,7 @@ class Feature:
         """The node's feature called name, which this one declares in requires or optional; None if it isn't
         loaded. FeatureError for a name not declared, so a use the load-time check doesn't know of can't slip in."""
         if name not in self.requires and name not in self.optional:
-            raise FeatureError(f"feature {self.name} uses feature {name} without declaring it")
+            raise _refused(self.name, f"it uses feature {name} without declaring it")
         return find(self.node, name)
 
     def start(self):
@@ -157,12 +166,17 @@ class Feature:
         other shape (a dict, a string, a longer list) is refused as malformed, and widening that check wouldn't
         reach the nodes already running. The request server checks each response the same way
         (`protocol.body_refusal`) and answers False instead of one requesters would refuse, logging an error.
+
+        Called once, when the node loads its features: a path that isn't "/" and a name (REQUEST_PATH), one rnfs
+        serves itself, or one another feature adds too stops the node (FeatureError, request_handlers).
         """
         return {}
 
     @classmethod
     def api_routes(cls) -> dict[tuple[str, str], ApiRoute]:
-        """{(method, path): handler} for this feature's API endpoints (paths under /api/)."""
+        """{(method, path): handler} for this feature's API endpoints: GET or POST of a path under /api/
+        (API_PATH). A route the core API or another feature defines too stops the node from loading (FeatureError,
+        api_routes)."""
         return {}
 
     @classmethod
@@ -188,31 +202,70 @@ def feature_classes() -> list[type[Feature]]:
 
 def checked_classes() -> list[type[Feature]]:
     """feature_classes(), for the node to load in order, once checked: FeatureError if two share a name or one
-    has none, or if one requires a feature that isn't loaded before it."""
+    has none, if one requires a feature that isn't loaded before it, or for an API route api_routes() refuses."""
     classes = feature_classes()
     loaded: list[str] = []
     for cls in classes:
         if not isinstance(cls.name, str) or not cls.name:
-            raise FeatureError(f"feature {cls.__module__}.{cls.__qualname__} has no name")
+            raise _refused(f"{cls.__module__}.{cls.__qualname__}", "it has no name")
         if cls.name in loaded:
-            raise FeatureError(f"feature name {cls.name!r} is used by two features")
+            raise _refused(cls.name, "another feature has that name")
         for kind in ("requires", "optional"):
             names = getattr(cls, kind)
             if not isinstance(names, tuple) or not all(isinstance(name, str) for name in names):
-                raise FeatureError(f"feature {cls.name}: {kind} must be a tuple of feature names")
+                raise _refused(cls.name, f"{kind} must be a tuple of feature names")
         for name in cls.requires:
             if name not in loaded:
-                raise FeatureError(f"feature {cls.name} requires feature {name}, which isn't loaded before it")
+                raise _refused(cls.name, f"it requires feature {name}, which isn't loaded before it")
         loaded.append(cls.name)
+    _api_routes(classes)
     return classes
 
 
 def api_routes() -> dict[tuple[str, str], ApiRoute]:
-    """Every feature's API routes."""
+    """Every feature's API routes, checked: FeatureError for a route that isn't GET or POST of a path under /api/
+    with a handler, or that the core API (rnfs.api.ApiHandler.ROUTES) or another feature defines too."""
+    return _api_routes(feature_classes())
+
+
+def _api_routes(classes: list[type[Feature]]) -> dict[tuple[str, str], ApiRoute]:
+    """api_routes() of classes."""
+    from rnfs.api import ApiHandler  # here: only what serves or loads features needs the API's table
+    owners = dict.fromkeys(ApiHandler.ROUTES, "rnfs")  # route -> what defines it, for the error
     routes: dict[tuple[str, str], ApiRoute] = {}
-    for cls in feature_classes():
+    for cls in classes:
         for route, handler in cls.api_routes().items():
-            if route in routes:
-                raise RuntimeError(f"API route {route} is defined by two features")
+            if not (isinstance(route, tuple) and len(route) == 2 and route[0] in API_METHODS
+                    and isinstance(route[1], str) and API_PATH.fullmatch(route[1]) and callable(handler)):
+                raise _refused(cls.name, f"API route {route!r} must be (GET or POST, a path under /api/) with a "
+                                         "handler")
+            _claim(owners, route, cls.name, f"API route {route[0]} {route[1]}")
             routes[route] = handler
     return routes
+
+
+def request_handlers(loaded: Iterable[Feature]) -> dict[str, Callable]:
+    """Every loaded feature's request paths (Feature.requests), checked: FeatureError for a path that isn't "/"
+    and a name with a handler, or that rnfs serves itself (CORE_REQUEST_PATHS) or another feature adds too."""
+    owners = dict.fromkeys(CORE_REQUEST_PATHS, "rnfs")
+    handlers: dict[str, Callable] = {}
+    for feature in loaded:
+        for path, handler in feature.requests().items():
+            if not (isinstance(path, str) and REQUEST_PATH.fullmatch(path) and callable(handler)):
+                raise _refused(feature.name, f"request path {path!r} must be \"/\" and a name, with a handler")
+            _claim(owners, path, feature.name, f"request path {path}")
+            handlers[path] = handler
+    return handlers
+
+
+def _claim(owners: dict, key, name: str, what: str):
+    """Record that feature name defines key (what: how to say it); FeatureError if rnfs or a feature already does."""
+    if key in owners:
+        other = owners[key]
+        raise _refused(name, f"{what} is already defined by {'rnfs' if other == 'rnfs' else 'feature ' + other}")
+    owners[key] = name
+
+
+def _refused(name: str, problem: str) -> FeatureError:
+    """The one error for a feature that can't be loaded as it is: "feature <name>: <problem>"."""
+    return FeatureError(f"feature {name}: {problem}")

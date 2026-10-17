@@ -26,7 +26,8 @@ Everything received is untrusted: fields are parsed strictly and capped, text is
 printed. A message is only accepted once LXMF has validated its signature against the sender's identity; one
 from a sender whose identity isn't known yet is held while a path request fetches it.
 
-LXMF is optional: without the package (or with lxmf_enabled = false) the feature stays off and says so once.
+The LXMF package is a dependency (pyproject.toml), but the node runs without it: if it can't be imported (or with
+lxmf_enabled = false), the feature stays off and says so once.
 Nothing here imports RNS or LXMF at module level (CLI commands mustn't load them); LxmfNetwork, made in
 start(), holds every RNS and LXMF object, so the rest works on offline test nodes with a stand-in network.
 """
@@ -1038,6 +1039,14 @@ class LxmfFeature(features.Feature):
         return {"lxmf_address": self.network.address.hex() if self.network is not None else None,
                 "lxmf_inbox": len(self.inbox), "untrusted_dropped": self._untrusted_dropped}
 
+    def sync(self, nearest: bool = False) -> dict:
+        """Start downloading waiting messages from the propagation node (nearest: without lxmf_propagation_node
+        set, the nearest heard): {"propagation_node", "started"}. ValueError if LXMF is off."""
+        network = self._require_network()
+        node = network.propagation_node(nearest)
+        return {"propagation_node": node.hex() if node is not None else None,
+                "started": bool(node is not None and network.sync(nearest))}
+
     def _require_network(self):
         """The network, or ValueError explaining why LXMF is off."""
         if self.network is None:
@@ -1449,7 +1458,6 @@ class LxmfFeature(features.Feature):
             if output is not None:
                 path = output
             else:
-                from rnfs import fsutil
                 path = os.path.join(directory, fsutil.safe_default_name(names[-1] if names else None, str(root)))
             if os.path.lexists(path):
                 raise ValueError(f"{fsutil.printable(path)} already exists; remove it or choose another with -o")
@@ -1777,10 +1785,7 @@ def _api_sync(handler):
     from rnfs.api import parse_bool
     body = handler.json_body()
     nearest = parse_bool(body.get("nearest", False))
-    network = _feature(handler)._require_network()
-    node = network.propagation_node(nearest)
-    handler.send_json(200, {"propagation_node": node.hex() if node is not None else None,
-                            "started": bool(node is not None and network.sync(nearest))})
+    handler.send_json(200, _feature(handler).sync(nearest))
 
 
 # CLI commands

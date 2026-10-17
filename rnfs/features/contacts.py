@@ -39,6 +39,11 @@ _KIND_ASPECTS = {"name": ("rnfs", "name"), "node": ("rnfs", "dht"), "lxmf": ("lx
 _KIND_WORDS = {"name": ("a", "name", "name"), "node": ("a", "node", "node"), "lxmf": ("an", "LXMF address", "LXMF")}
 
 
+def _log(message: str, level: int = LOG_INFO):
+    """Log with this feature's prefix."""
+    _common.log(f"contacts: {message}", level)
+
+
 def check_nick(nick) -> str:
     """nick if it is a valid contact nick; ValueError otherwise."""
     if not isinstance(nick, str) or not _NICK.fullmatch(nick) or _HEX_ID.fullmatch(nick) or is_valid_cid(nick):
@@ -88,7 +93,7 @@ def import_contacts(value, tx) -> int:
                        (nick, check_kind(entry["kind"]), parse_hex(entry["id"])))
             count += 1
         except (KeyError, TypeError, ValueError):
-            ContactsFeature._log(f"ignoring malformed contact {nick!r} in contacts.json", LOG_WARNING)
+            _log(f"ignoring malformed contact {nick!r} in contacts.json", LOG_WARNING)
         if count >= MAX_CONTACTS:
             break
     return count
@@ -130,7 +135,7 @@ class ContactsFeature(Feature):
                     raise ValueError("not a 16-byte hash")
                 self._set(nick, (check_kind(kind), ident))
             except (TypeError, ValueError):
-                self._log(f"ignoring malformed contact {nick!r}", LOG_WARNING)
+                _log(f"ignoring malformed contact {nick!r}", LOG_WARNING)
                 bad.append((nick,))
         statedb.delete_rows(db, "contacts", ("nick",), bad)
 
@@ -163,11 +168,6 @@ class ContactsFeature(Feature):
         """Release the state database (the node calls this once it has saved everything at shutdown)."""
         self._db.close()
 
-    @staticmethod
-    def _log(message: str, level: int = LOG_INFO):
-        """Log with this feature's prefix."""
-        _common.log(f"contacts: {message}", level)
-
     # The address book
 
     def add(self, nick: str, ident_hex: str, kind: str | None = None) -> dict:
@@ -185,7 +185,7 @@ class ContactsFeature(Feature):
                 raise ValueError(f"the address book is full ({MAX_CONTACTS} contacts)")
             self._set(nick, (kind, ident))
             self._save(nick)
-        self._log(f"added {nick}: {kind} {ident.hex()}")
+        _log(f"added {nick}: {kind} {ident.hex()}")
         return {"nick": nick, "kind": kind, "id": ident.hex()}
 
     def remove(self, nick: str):

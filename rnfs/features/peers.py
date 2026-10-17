@@ -198,7 +198,7 @@ def human_age(seconds: float | None) -> str:
 
 
 def format_peers(peers: list[dict], now: float) -> list[str]:
-    """The `rnfs peers` table, one line per node."""
+    """The `rnfs peers` table, one line per node, escaped (the daemon's fields mustn't drive the terminal)."""
     lines = [f"{'NODE':<32} {'MODE':<7} {'TABLE':>6} {'HOPS':>4} {'INTERFACE':<20} {'RATE':>10} {'HEARD':>6} "
              f"{'SENT':>9} {'RECV':>9} {'FAIL':>5}"]
     for peer in peers:
@@ -207,15 +207,17 @@ def format_peers(peers: list[dict], now: float) -> list[str]:
         rate = human_rate(peer["rate"]) if peer["link"] else "-"
         interface = (peer.get("interface") or "-")[:20]
         flags = (" banned" if peer["banned"] else "") + (f" bad:{peer['bad']}" if peer.get("bad") else "")
-        lines.append(f"{printable(peer['node_id']):<32} {printable(peer['mode'] or '?'):<7} {table:>6} "
-                     f"{peer['hops'] if peer['hops'] is not None else '?':>4} {printable(interface):<20} "
-                     f"{rate:>10} {heard:>6} {human_size(peer['sent']):>9} {human_size(peer['received']):>9} "
-                     f"{peer['failed']:>5}{flags}")
+        # Each text field escaped before it is padded, so the columns line up; the whole line again for the rest
+        lines.append(printable(
+            f"{printable(peer['node_id']):<32} {printable(peer['mode'] or '?'):<7} {table:>6} "
+            f"{peer['hops'] if peer['hops'] is not None else '?':>4} {printable(interface):<20} "
+            f"{rate:>10} {heard:>6} {human_size(peer['sent']):>9} {human_size(peer['received']):>9} "
+            f"{peer['failed']:>5}{flags}"))
     return lines
 
 
 def format_stats(stats: dict) -> list[str]:
-    """The `rnfs stats` report."""
+    """The `rnfs stats` report, escaped (the daemon's fields mustn't drive the terminal)."""
     totals = stats["totals"]
     lines = [f"since: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats['since']))}",
              f"sent: {human_size(totals['sent'])} in {totals['responses']} /blocks responses",
@@ -227,9 +229,9 @@ def format_stats(stats: dict) -> list[str]:
         lines.append(f"upload budget: {human_size(stats.get('upload_budget_left'))} left of "
                      f"{human_size(stats['upload_budget'])} per hour")
     for name, counters in sorted(stats["interfaces"].items()):
-        lines.append(f"interface {printable(name)}: sent {human_size(counters['sent'])}, "
+        lines.append(f"interface {name}: sent {human_size(counters['sent'])}, "
                      f"received {human_size(counters['received'])}")
-    return lines
+    return [printable(line) for line in lines]
 
 
 def run_peers(args):

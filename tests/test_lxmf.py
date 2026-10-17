@@ -853,6 +853,12 @@ class SendTest(FeatureTestCase):
         self.assertEqual(lxmf.decode_field(self.network.sent[1][2]),
                          [Link(name=NAME, path=("docs", "a.txt"), from_node=B_ID)])
 
+    def test_sync(self):
+        """POST /api/lxmf/sync's answer: the propagation node asked, and whether a download started."""
+        feature = self.feature_node(FakeLxmf(heard=OTHER))
+        self.assertEqual(feature.sync(), {"propagation_node": None, "started": False})
+        self.assertEqual(feature.sync(nearest=True), {"propagation_node": OTHER.hex(), "started": True})
+
     def test_unfinished_messages_fail_after_restart(self):
         feature = self.feature_node()
         feature.send(SENDER.hex(), str(self.cid))
@@ -966,6 +972,8 @@ class DisabledTest(FeatureTestCase):
             feature.send(SENDER.hex(), str(self.cid))
         with self.assertRaisesRegex(ValueError, "not installed"):
             feature.address()
+        with self.assertRaisesRegex(ValueError, "not installed"):
+            feature.sync()
         self.assertEqual(feature.inbox_list(), [])  # stored messages stay readable
         feature.stop()
 
