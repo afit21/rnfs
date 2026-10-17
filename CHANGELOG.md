@@ -197,6 +197,14 @@ Faster:
 - Expiring provider records no longer checks every record for a time in the future unless the clock went back
   since a time was taken: one expiry pass at 100 000 records went from 16.6 to 8.7 ms, held under the store's
   lock.
+- `cat`, `info` and `GET /api/cat` remember which files aren't sealed (at most 4096; forgotten when the deny
+  list changes), so reading one again doesn't read its first bytes to check, and `GET /api/cat` opens a sealed
+  file once instead of twice: a 64 KiB read of a stored file 0.32 → 0.19 ms (through the API 0.47 → 0.21 ms).
+- `pin ls` remembers each complete pin's type, name and whether it is sealed instead of reading its blocks again
+  at every call: 68 → 3.8 ms at 2000 pins after the first.
+- The publisher's refresh after an add reads a cached set of pinned CIDs instead of copying every pin, and
+  gathers the keys of queued withdrawals once: the first refresh with 10 000 CIDs and withdrawals queued for 300
+  nodes 71 → 14.5 ms; a refresh after a pin at 3000 pins 2.25 → 1.69 ms.
 - Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
   over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
   there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
