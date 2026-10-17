@@ -785,8 +785,9 @@ top level and inside shared directories: it is also a file elsewhere, which whoe
 could have linked in. It is imported at the next scan after its other links are gone. `files/` may be a
 symlink, but a scan MUST NOT import from a folder that resolves, as opened, to the rnfs dir, to a directory
 holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, which hold the node's keys and state:
-rnfs logs a warning (once, while it stays so), imports nothing and keeps the folder's pins. rnfs also warns, once,
-when a directory above the folder can be changed by other users, who could replace the folder with another.
+rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin
+with source `folder` is released (including those an earlier version made from it). rnfs also warns, once, when
+a directory above the folder can be changed by other users, who could replace the folder with another.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,

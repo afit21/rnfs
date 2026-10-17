@@ -5,7 +5,8 @@ the rnfs dir or a directory above it, everything in it.
 
 Now the scan resolves the folder it opened (fsutil.final_path of its descriptor, or the real path the path walk
 checks) and refuses, with a warning shown once, a folder that is the rnfs dir, a directory holding it, or one inside
-storage/, names/, state/, blocks/ or lxmf/: nothing is imported, and the pins it already holds are kept. A folder
+storage/, names/, state/, blocks/ or lxmf/. It is scanned as an empty folder: nothing is imported, and every pin
+with source "folder" is released, including those a 0.1.5 node made from such a folder before the upgrade. A folder
 below a directory other users can change gets a warning, once, and is scanned.
 
 Reproduced with real symlinks in a temporary rnfs dir laid out as the node lays it out; the retarget is the
@@ -24,7 +25,7 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.shared_folder import SharedFolder
 from rnfs.content.storage import FOLDER, Storage
 from rnfs.node import RnfsNode
-from tests.support import CAN_SYMLINK, POSIX_MODES
+from tests.support import CAN_SYMLINK, POSIX_MODES, state_rows
 from tests.test_node import A_ID, FakeNetwork, NetClient
 
 IDENTITY = b"the node's private RNS identity\n"
@@ -75,16 +76,21 @@ class SharedFolderTargetTest(unittest.TestCase):
             f.write(content)
         return path
 
-    def assert_refused(self, folder: SharedFolder, held: set = frozenset()):
-        """A scan imports and pins nothing new, the keys stay unstored, and one warning names the rnfs dir."""
+    def assert_refused(self, folder: SharedFolder, keys_stored: bool = False):
+        """A scan imports nothing and leaves no folder pin and no saved entry (as an empty folder's scan does), the
+        keys stay unstored (unless keys_stored), and one warning names the rnfs dir and the released pins."""
         before = len(self.logged)
-        self.assertEqual(folder.scan(), set(held))
-        self.assertEqual(self.storage.pinned_by(FOLDER), set(held))
-        for secret in (IDENTITY, NAME_KEY):
-            self.assertFalse(self.storage.is_complete(Cid.for_block(RAW, secret)))
+        self.assertEqual(folder.scan(), set())
+        self.assertEqual(self.storage.pinned_by(FOLDER), set())
+        self.assertEqual(folder.names(), {})
+        self.assertEqual(state_rows(self.state, "SELECT name FROM shared_folder"), [])
+        if not keys_stored:
+            for secret in (IDENTITY, NAME_KEY):
+                self.assertFalse(self.storage.is_complete(Cid.for_block(RAW, secret)))
         warnings = self.logged[before:]
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("not scanning", warnings[0])
+        self.assertIn("released", warnings[0])
         self.assertIn(os.path.realpath(self.root), warnings[0])
 
     def test_private_subdirectories_are_refused(self):
@@ -113,20 +119,39 @@ class SharedFolderTargetTest(unittest.TestCase):
         self.point_at(self.directory("elsewhere"))
         self.assertEqual(len(folder.scan()), 1)
         self.point_at(os.path.join(self.root, "names"))
-        self.assert_refused(folder, self.storage.pinned_by(FOLDER))
+        self.assert_refused(folder)
 
-    def test_retargeted_folder_keeps_its_pins_and_imports_nothing(self):
+    def test_retargeted_folder_releases_its_pins_and_imports_nothing(self):
         """The audit's attack: files/ leads to shared/x, which someone who can write to shared/ swaps for a link to
-        storage/. The next scan imports nothing; what the folder already shared stays pinned."""
+        names/. The next scan imports nothing and releases what the folder shared, as for an empty folder."""
         target = self.directory("shared", "x", content=b"the owner's shared file")
+        with open(os.path.join(target, "b.txt"), "wb") as f:
+            f.write(b"another")
         self.point_at(target)
         folder = self.open()
         pins = folder.scan()
-        self.assertEqual(pins, {Cid.for_block(RAW, b"the owner's shared file")})
+        self.assertEqual(pins, {Cid.for_block(RAW, b"the owner's shared file"), Cid.for_block(RAW, b"another")})
+        self.assertEqual(self.storage.pinned_by(FOLDER), pins)
         os.rename(target, target + ".moved")
-        os.symlink(os.path.join(self.root, "storage"), target, target_is_directory=True)
+        os.symlink(os.path.join(self.root, "names"), target, target_is_directory=True)
         self.logged.clear()
-        self.assert_refused(folder, pins)
+        self.assert_refused(folder)
+
+    def test_upgrade_releases_keys_an_earlier_scan_imported(self):
+        """A 0.1.5 node whose files/ already led into names/ imported, pinned and provided the name key. The first
+        0.1.6 scan (over the same state) releases that pin and empties the shared_folder table."""
+        self.point_at(os.path.join(self.root, "names"))
+        earlier = self.open()
+        with mock.patch.object(shared_folder, "refused_reason", lambda real, rnfs_dir: None):  # as 0.1.5 scanned
+            imported = earlier.scan()
+        key = Cid.for_block(RAW, NAME_KEY)
+        self.assertEqual(imported, {key})
+        self.assertEqual(self.storage.pinned_by(FOLDER), {key})
+        earlier.close()
+        upgraded = self.open()
+        self.assertEqual(set(upgraded.names()), {key})  # the saved entry, as 0.1.5 left it
+        self.assert_refused(upgraded, keys_stored=True)
+        self.assertNotIn(key, self.storage.pins())
 
     def test_elsewhere_is_scanned(self):
         """A folder outside the rnfs dir (or files/ as a real directory in it) is scanned as before."""

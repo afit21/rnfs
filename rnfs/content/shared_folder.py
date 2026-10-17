@@ -13,9 +13,10 @@ logged and the scan goes on.
 
 The folder itself may be a symlink (the owner's setting), but it must not lead into the rnfs dir: a folder that is
 the rnfs dir, a directory holding it, or one inside the subdirectories holding its keys and state (PRIVATE_SUBDIRS)
-is refused, with a warning, and nothing in it is imported (audit CONT-3). The check is made on the folder as
-opened, which the scan then walks, so a link retargeted after it can't redirect the scan. A folder below a
-directory other users can change, who could retarget it, is scanned with a warning.
+is refused, with a warning: it counts as empty, so nothing in it is imported and every folder pin is released
+(audit CONT-3). The check is made on the folder as opened, which the scan then walks, so a link retargeted after
+it can't redirect the scan. A folder below a directory other users can change, who could retarget it, is scanned
+with a warning.
 """
 import errno
 import hashlib
@@ -234,9 +235,9 @@ class SharedFolder:
             try:
                 if not stat.S_ISDIR(st.st_mode):
                     raise NotADirectoryError(f"{display_path(self.directory)} is not a directory")
-                if not self._check_target(folder, st):
-                    return {cid for _, cid in self._known.values()}  # nothing imported, nothing released
-                items = builder.list_directory(folder)
+                # A refused folder counts as empty: every folder pin is released, so a node whose folder already
+                # led into the rnfs dir (as 0.1.5 allowed) stops providing what it imported from there
+                items = builder.list_directory(folder) if self._check_target(folder, st) else []
                 for item in items:
                     result = self._scan_item(folder, item)
                     if result is not None:
@@ -255,12 +256,12 @@ class SharedFolder:
 
     def _check_target(self, folder: builder.Handle, st: os.stat_result) -> bool:
         """False, with a warning while it stays so, if the folder open as folder (whose stat is st) may not be
-        scanned (refused_reason); a warning, once per directory, about a loose ancestor (loose_ancestor)."""
+        scanned (refused_reason; scan then treats it as empty); a warning, once per directory, about a loose ancestor (loose_ancestor)."""
         real = opened_path(folder, st, self.directory)
         reason = refused_reason(real, self.rnfs_dir)
         if reason is not None:
-            self._warn_once("target", f"not scanning {display_path(self.directory)}: {reason}. Point it at "
-                                      f"another directory (nothing in it is imported until then)")
+            self._warn_once("target", f"not scanning {display_path(self.directory)}: {reason}. Its pins with "
+                                      f"source folder were released; point it at another directory")
             return False
         self._warned.discard("target")  # so a folder refused again warns again
         loose = loose_ancestor(real)
