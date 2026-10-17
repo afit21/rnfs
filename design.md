@@ -403,18 +403,34 @@ prints the version and says why). The daemon writes a new random token to `<rnfs
 local users and processes can't drive the API. Before anything else uses the rnfs dir (the debug log, the
 node), the daemon locks `<rnfs dir>/daemon.lock` (`fsutil.lock_exclusive`: `flock`, or `msvcrt.locking` of a byte
 past the text on Windows; the file holds its process ID) and keeps the lock until it exits, so a second daemon
-on the same dir stops at once, naming the first (`lock_holder`). `_make_private_dirs` refuses to start (RnfsError) if the rnfs dir
-belongs to another user or can't be made 0700. On Windows (`rnfs/winacl.py`), mode bits set no ACL, so a new
+on the same dir stops at once, naming the first (`lock_holder`). A start runs in this order, in the daemon
+(`cli.run_daemon`) and in `rnfs.Node` alike: the root (`node.make_private_root`), then the settings
+(`Config.load`), then the subdirectories and the lock (`lock_rnfs_dir`: `_make_private_dirs(root)`, then
+`lock_exclusive`), so each step relies only on what an earlier one secured. `make_private_root` refuses to start
+(RnfsError) if the rnfs dir belongs to another user or can't be made 0700. `_make_private_dirs` (audit API-1)
+opens each of `node.PRIVATE_SUBDIRS` (`state`, `blocks`, `storage`, `names`, `lxmf`) with `O_DIRECTORY |
+O_NOFOLLOW`, creating it 0700 if missing: a symlink, a non-directory or one another user owns is refused with an
+RnfsError naming `chown`, before Reticulum starts; a loose one is `fchmod`ed to 0700 with a notice, and if its old
+mode let others write, one `lstat` pass (`_warn_foreign_entries`) warns about entries another user owns (a
+planted raw block would be trusted by its length). `rnfs.toml`, and RNS's `config` when `reticulum_dir` is the
+rnfs dir, are opened by `config.open_checked` (`O_NOFOLLOW | O_NONBLOCK`, so a symlink is refused and a FIFO
+never waited on) and checked through the descriptor: a regular file, the user's own, and if group or other bits
+are set `fchmod`ed to 0600 (`fsutil.check_owned_fd`, which the identity's check shares); at most
+`MAX_SETTINGS_SIZE` (1 MiB) is read. What was changed goes to `config.warnings` (a plain attribute, not a field,
+so `rnfs.toml` can't set it), never to `rnfs.log`, which imports RNS: the daemon prints them (`cli.warn`),
+`rnfs.Node` logs them, the CLI client prints them and `rnfs.Client` (`apiclient.api_port`) raises them as
+`RuntimeWarning`s. On Windows (`rnfs/winacl.py`), mode bits set no ACL, so a new
 rnfs dir and its subdirectories are created with a protected DACL allowing only the user and SYSTEM (inherited
 below it) in the CreateDirectoryW call itself (`winacl.make_private_dir`, a self-relative descriptor built by
 `private_descriptor`), so the parent's DACL never applies to them; a new root that already holds anything, and
-a root that is a junction or symlink (`fsutil.is_link` on its lstat), are refused. An existing one that allows
-anyone else is given the DACL, and one owned by another account is refused; the token, identity and name key
+a root that is a junction or symlink (`fsutil.is_link` on its lstat), are refused. An existing root or
+subdirectory that allows anyone else is given the DACL (`winacl.tighten(d, directory=True)`), one owned by
+another account is refused, and so is a subdirectory that is a junction or symlink; the token, identity and name key
 files get the same DACL before they are renamed into place (`fsutil.write_atomic(private=True)`), and
-`read_token` checks the opened token's DACL (Administrators tolerated). `rnfs.toml` (`Config.load`,
-`winacl.secure_settings`) and the identity (`network/identity.py`) are checked through the handle they are
-read from (`winacl.tighten(fd=...)`): another account's is refused, a loose one tightened with a warning, and
-a failure is fatal. A `--dir` outside `%USERPROFILE%` is warned about. The advapi32 and kernel32 calls are
+`read_token` checks the opened token's DACL (Administrators tolerated). `rnfs.toml` (`Config.load`) and the
+identity (`network/identity.py`) are checked through the handle they are read from (`fsutil.check_owned_fd`,
+which calls `winacl.tighten(fd=...)` there): another account's is refused, a loose one tightened with a warning,
+and a failure is fatal. A `--dir` outside `%USERPROFILE%` is warned about. The advapi32 and kernel32 calls are
 behind `winacl.backend`, which tests replace with a fake. A response to a request with
 `X-Rnfs-Challenge: <32 hex>` carries `X-Rnfs-Proof: apiclient.api_proof(token, port, challenge)` (HMAC-SHA256 of
 `rnfs api proof <port> <challenge>`); `apiclient.ApiConnection.verify_daemon` checks it with `GET /api/status` on the connection
@@ -484,7 +500,8 @@ and errors import neither RNS nor anything that does (tested, as the CLI's start
 
 `Node(rnfs_dir, *, reticulum=None, settings=None)`
 - `rnfs_dir` (str or path) is required: the app's own node directory (identity, blocks, state, optional
-  `rnfs.toml`), never guessed. Created private as the daemon's is (`_make_private_dirs`).
+  `rnfs.toml`), never guessed. Created private as the daemon's is, in the same order (`make_private_root`,
+  `Config.load`, whose `warnings` it logs, then `lock_rnfs_dir`).
 - `reticulum`: the running `RNS.Reticulum`, which must be `RNS.Reticulum.get_instance()` (RNS allows one per
   process; anything else is ValueError). None: the running instance if there is one, else the node starts one
   from the `reticulum_dir` setting, as the daemon does (so it attaches to `rnsd` if one runs). The node never
@@ -510,7 +527,8 @@ and errors import neither RNS nor anything that does (tested, as the CLI's start
 
 `Client(rnfs_dir=None, *, port=None, token_file=None, timeout=None)`: as `apiclient.ApiConnection` (default
 `~/.rnfs/`, the `api_port` in its `rnfs.toml`, the token from `<rnfs dir>/api_token`, proved before it is sent).
-Nothing is sent until the first call. Raises `SettingsError` if `rnfs.toml` can't be read.
+Nothing is sent until the first call. Raises `SettingsError` if `rnfs.toml` can't be read or trusted; one made
+private on the way is reported as a `RuntimeWarning` (`warnings.warn`), without loading RNS.
 
 Both: `close()` (idempotent; both end their event and job-watch threads, then a Node stops its features and
 threads, saves, closes the state database, releases its rnfs.dht destination and the lock; a Client's name

@@ -255,6 +255,38 @@ def is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or tag == _REPARSE_JUNCTION or bool(tag & _REPARSE_NAME_SURROGATE)
 
 
+def check_owned_fd(path: str, fd: int, info: os.stat_result, what: str) -> str | None:
+    """Check that what (e.g. "the settings file") at path, open as fd and whose fstat is info, belongs to this
+    user and is private to them, making it so if others may access it: a warning saying what was changed, or
+    None if nothing was. Raises PermissionError if another user owns it (they could change it again), OSError if
+    it can't be made private.
+
+    Through the descriptor, so a file swapped in at path after the open can't pass for it. POSIX: owned by the
+    effective user, and a file with group or other bits set is made 0600 (a directory 0700). Windows, whose
+    st_mode always shows others allowed and whose st_uid is always 0: the owner and access list instead
+    (winacl.tighten).
+    """
+    directory = stat.S_ISDIR(info.st_mode)
+    if IS_WINDOWS:
+        from rnfs import winacl
+        reason = winacl.tighten(path, directory=directory, fd=fd)
+        if reason is None:
+            return None
+        return f"{what} {path} was accessible to other users ({reason}); restricted it to you and SYSTEM"
+    if info.st_uid != os.geteuid():
+        raise PermissionError(f"{what} {path} belongs to another user (uid {info.st_uid})")
+    mode = stat.S_IMODE(info.st_mode)
+    if not mode & 0o077:
+        return None
+    private = 0o700 if directory else 0o600
+    try:
+        os.fchmod(fd, private)
+    except OSError as e:
+        raise PermissionError(f"{what} {path} is accessible to other users (mode {mode:o}) and can't be "
+                              f"restricted: {e.strerror or e}") from None
+    return f"{what} {path} was accessible to other users (mode {mode:o}); restricted it to {private:o}"
+
+
 def is_below(path: str, root: str) -> bool:
     """True if path is root or inside it; both should be real (resolved) paths. Case-insensitive on Windows."""
     path, root = os.path.normcase(path), os.path.normcase(root)

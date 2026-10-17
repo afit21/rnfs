@@ -32,6 +32,7 @@ import json
 import os
 import secrets
 import stat
+import warnings
 from urllib.parse import urlencode
 
 from rnfs import errors, fsutil, winacl
@@ -124,14 +125,23 @@ def token_path(rnfs_dir: str = DEFAULT_DIR) -> str:
     return os.path.join(os.path.expanduser(rnfs_dir), TOKEN_FILE)
 
 
-def api_port(rnfs_dir: str = DEFAULT_DIR) -> int:
-    """The port the daemon using rnfs_dir listens on: api_port in its rnfs.toml, else DEFAULT_API_PORT. Raises
-    SettingsError if rnfs.toml can't be read."""
+def load_settings(rnfs_dir: str = DEFAULT_DIR) -> Config:
+    """The settings of the daemon using rnfs_dir (Config.load), with what was changed to trust them in its
+    warnings, for the caller to show. Raises SettingsError if rnfs.toml can't be read or trusted."""
     try:
-        port = Config.load(rnfs_dir).api_port
+        return Config.load(rnfs_dir)
     except (ValueError, TypeError, OSError) as e:  # TypeError: a badly typed setting validate() missed
         raise SettingsError(f"can't read the settings in {rnfs_dir}: {e}") from None
-    return port if port is not None else DEFAULT_API_PORT
+
+
+def api_port(rnfs_dir: str = DEFAULT_DIR) -> int:
+    """The port the daemon using rnfs_dir listens on: api_port in its rnfs.toml, else DEFAULT_API_PORT. A
+    settings file made private on the way (others could access it) is reported as a RuntimeWarning. Raises
+    SettingsError if rnfs.toml can't be read."""
+    config = load_settings(rnfs_dir)
+    for message in config.warnings:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    return config.api_port if config.api_port is not None else DEFAULT_API_PORT
 
 
 def api_proof(token: str, port: int, challenge: str) -> str:

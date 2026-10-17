@@ -134,9 +134,12 @@ def client(args) -> ApiClient:
     port = args.api_port
     if port is None:
         try:
-            port = apiclient.api_port(args.dir)
+            config = apiclient.load_settings(args.dir)
         except apiclient.ApiError as e:
             fail(str(e))
+        for warning in config.warnings:
+            warn(warning)
+        port = config.api_port
     return ApiClient(port, token_path(args.dir))
 
 
@@ -181,8 +184,15 @@ def run_daemon(args):
     from rnfs.errors import RnfsError
     from rnfs.gateway import GatewayServer
     from rnfs.log import LOG_ERROR, LOG_NOTICE
-    from rnfs.node import DirInUse, RnfsNode, lock_rnfs_dir
+    from rnfs.node import DirInUse, RnfsNode, lock_rnfs_dir, make_private_root
 
+    # The rnfs dir is made private first, then the settings in it are checked and read, then its subdirectories
+    # are made private and it is locked (lock_rnfs_dir): nobody else can change what each step relies on
+    root = os.path.expanduser(args.dir)
+    try:
+        make_private_root(root)
+    except (RnfsError, OSError) as e:
+        fail(f"can't use the rnfs dir {root}: {e}")
     try:
         config = Config.load(args.dir, reticulum_dir=args.rnsconfig,
                              api_port=args.api_port, gateway_port=args.gateway_port,
@@ -193,6 +203,8 @@ def run_daemon(args):
                              debug_log=args.debug_log)
     except (ValueError, TypeError, OSError) as e:
         fail(f"invalid settings: {e}")
+    for warning in config.warnings:
+        warn(warning)
 
     # Before anything uses the rnfs dir (made private first, as the node would make it): a second daemon on it
     # would load and save the same state, announce the same node ID and rotate the first one's debug log
