@@ -7,7 +7,9 @@ Anyone can open the page, so it lists only what the operator chose to share and 
 - never a sealed (encrypted) file, whose name is meant to stay private: the page checks each file pin's
   first bytes once (`rnfs cat --raw`, a local read) and remembers the answer in its data dir;
 - names and descriptions are escaped, so they show literally on one line and can't add Micron markup;
-- visitors see a generic message if the list isn't available; the details go to a log in the data dir.
+- visitors see a generic message if the list isn't available; the details go to a log in the data dir;
+- the page is rendered at most once a minute, one request at a time (a lock file): visitors meanwhile get the
+  page as last rendered, kept in the data dir, so visiting often doesn't keep the daemon busy.
 See this page's README.
 """
 import json
@@ -43,6 +45,15 @@ PAGE_DIR = os.environ.get("RNFS_PAGE_DIR") or os.path.join(
 SEALED_CACHE = os.path.join(PAGE_DIR, "sealed.json")  # {cid: sealed?}, a CID's content never changes
 LOG = os.path.join(PAGE_DIR, "page.log")
 LOG_MAX = 1024 * 1024  # the log is moved to page.log.1 past this size
+CACHE = os.path.join(PAGE_DIR, "page.mu")  # the page as last rendered
+LOCK = os.path.join(PAGE_DIR, "lock")  # held while a request renders the page
+
+# The page is rendered (which runs `rnfs pin ls`) at most once per CACHE_SECONDS; visitors meanwhile get the
+# cached page, so visiting it often costs the daemon nothing.
+CACHE_SECONDS = 60
+
+UNAVAILABLE = "The file list isn't available right now; try again later.\n"
+BUSY = "This page is busy with another request; try again in a moment.\n"
 
 # How a sealed (encrypted) file starts (rnfs/content/seal.py).
 SEALED_MAGIC = b"rnfs-sealed\n"
@@ -162,7 +173,8 @@ def entry(pin):
     return "\n".join(lines)
 
 
-print("""#!c=0
+# The top of the page, before the lists.
+HEADER = """#!c=0
         ~+                            
                                       
                  *       +            
@@ -188,27 +200,99 @@ RNFS is a decentralized file system built for Reticulum & based on IPFS (InterPl
 
 Any of the following files or folders can be freely accessed using RNFS:
 `F888rnfs get <CID> -o <file name>`f
-""")
+"""
+
 
 def section(title, pins):
-    """Print a heading and its entries, sorted by name; nothing if no entry is shown."""
+    """The Micron text of a heading and its entries, sorted by name; "" if no entry is shown."""
     entries = [entry(pin) for pin in sorted(pins, key=lambda pin: (display_name(pin) or "").lower())]
     entries = [text for text in entries if text]
-    if entries:
-        print(f">{title}")
-        print("\n\n".join(entries) + "\n")
-    return bool(entries)
+    return f">{title}\n" + "\n\n".join(entries) + "\n\n" if entries else ""
 
 
-try:
-    pins = load_pins()
-except Exception as error:  # noqa: BLE001 - the daemon isn't running, rnfs isn't installed, ...
-    log(f"listing pins failed: {type(error).__name__}: {error}")
-    print("The file list isn't available right now; try again later.")
-else:
+def render():
+    """The whole page, or None if the pin list can't be had (the details are logged)."""
+    try:
+        pins = load_pins()
+    except Exception as error:  # noqa: BLE001 - the daemon isn't running, rnfs isn't installed, ...
+        log(f"listing pins failed: {type(error).__name__}: {error}")
+        return None
     folders = [pin for pin in pins if pin.get("type") == "directory"]
     files = [pin for pin in pins if pin.get("type") != "directory"]
-    listed = section("Folders", folders)
-    listed = section("Files", files) or listed
-    if not listed:
-        print("Nothing is shared yet.")
+    lists = section("Folders", folders) + section("Files", files)
+    return HEADER + "\n" + (lists or "Nothing is shared yet.\n")
+
+
+def cached(max_age):
+    """The cached page if it was rendered less than max_age seconds ago (at any time if max_age is None), else
+    None. One dated in the future (the clock was set back) counts as old."""
+    try:
+        with open(CACHE, encoding="utf-8") as f:
+            age = time.time() - os.fstat(f.fileno()).st_mtime
+            if max_age is not None and not 0 <= age < max_age:
+                return None
+            return f.read()
+    except (OSError, ValueError):  # missing, unreadable, or not UTF-8 (UnicodeDecodeError)
+        return None
+
+
+def save(page):
+    """Cache page, atomically: a request reading the cache meanwhile gets the old page or this one, whole.
+    Called with the lock held, so the temporary file is this request's alone."""
+    try:
+        with open(CACHE + ".tmp", "w", encoding="utf-8") as f:
+            f.write(page)
+        os.replace(CACHE + ".tmp", CACHE)
+    except OSError as error:
+        log(f"saving {CACHE} failed: {error}")
+
+
+def take_lock():
+    """Lock the page's lock file so requests render one at a time; the open file (closing it unlocks), or
+    None if another request holds the lock. (The display page's take_lock.)"""
+    handle = open(LOCK, "a+")
+    try:
+        try:
+            import fcntl
+        except ImportError:  # Windows
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def page_now():
+    """The page for a visit that found no fresh cached page: rendered (and cached) now, under the lock; while
+    another request holds the lock (it is rendering), the cached page of any age, or a busy message if there is
+    none; a generic message if the data dir or the pin list can't be used."""
+    try:
+        os.makedirs(PAGE_DIR, mode=0o700, exist_ok=True)
+        lock = take_lock()
+    except OSError as error:
+        # No lock, no rendering: the page fails closed, as the display page does
+        log(f"can't use the page's data dir {PAGE_DIR}: {error}")
+        return HEADER + "\n" + UNAVAILABLE
+    if lock is None:
+        return cached(None) or HEADER + "\n" + BUSY
+    with lock:
+        page = cached(CACHE_SECONDS)  # the request that held the lock before may have just rendered it
+        if page is None:
+            page = render()
+            if page is None:
+                # Not cached: the next visit tries again, as the daemon may be back by then
+                return HEADER + "\n" + UNAVAILABLE
+            save(page)
+        return page
+
+
+def main():
+    """Print the page: the cached one while it is fresh (CACHE_SECONDS), else page_now()."""
+    print(cached(CACHE_SECONDS) or page_now(), end="")
+
+
+if __name__ == "__main__":
+    main()

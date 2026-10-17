@@ -16,6 +16,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # run from a source checkout
 
 import rnfs
+from rnfs.fsutil import printable  # names come from DAGs other people made: escape them for the terminal
 
 
 def share(node: rnfs.Rnfs, path: str) -> str:
@@ -23,19 +24,19 @@ def share(node: rnfs.Rnfs, path: str) -> str:
     added = node.add(path)
     print(f"added {added.cid} ({added.size} bytes)")
     for warning in added.warnings:
-        print(f"  warning: {warning}")
+        print(f"  warning: {printable(warning)}")
     target = str(added.cid)
     if os.path.isdir(path):
         entries = node.ls(added.cid)
         for entry in entries:
-            print(f"  {entry.kind:10} {entry.size:>12}  {entry.name}")
+            print(f"  {entry.kind:10} {entry.size:>12}  {printable(entry.name)}")
         files = [entry for entry in entries if not entry.is_dir]
         target = f"{added.cid}/{files[0].name}" if files else None
     if target is not None:
         with node.open(target) as f:
             f.seek(f.size // 2)  # only the chunks this read covers are fetched
             data = f.read(4096)
-        print(f"read {len(data)} bytes from the middle of {target}")
+        print(f"read {len(data)} bytes from the middle of {printable(target)}")
 
     mine = {name.alias: name for name in node.names.list()}
     name = mine.get("example") or node.names.create("example")
@@ -43,12 +44,12 @@ def share(node: rnfs.Rnfs, path: str) -> str:
 
     def on_record(record: rnfs.Record):
         """Called on the node's event thread when a newer record of the name is heard (here: our publish)."""
-        print(f"heard rnfs:name/{record.name.hex()} -> {record.cid} (sequence {record.sequence})")
+        print(printable(f"heard rnfs:name/{record.name.hex()} -> {record.cid} (sequence {record.sequence})"))
         heard.set()
 
     with node.names.watch(name, on_record):
         record = name.publish(added.cid)
-        print(f"published rnfs:name/{name.hex} -> {record.cid}")
+        print(printable(f"published rnfs:name/{name.hex} -> {record.cid}"))
         heard.wait(10)
 
     output = os.path.join(tempfile.mkdtemp(), os.path.basename(os.path.normpath(path)) or "copy")
@@ -82,7 +83,7 @@ def main():
         with instance as node:
             share(node, args.path)
     except rnfs.RnfsError as e:  # every rnfs error, from either class
-        sys.exit(f"rnfs_share: {e}")
+        sys.exit(f"rnfs_share: {printable(e)}")
 
 
 if __name__ == "__main__":

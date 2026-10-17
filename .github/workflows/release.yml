@@ -173,6 +173,8 @@ jobs:
           flatpak run io.github.afit21.rnfs --version
           if command -v python3 >/dev/null; then
             mkdir -p "$HOME/smoke-tmp"
+            # The sandbox reaches only ~/.rnfs, ~/.reticulum and Downloads unless granted more
+            flatpak override --user --filesystem="$HOME/smoke-tmp" io.github.afit21.rnfs
             TMPDIR="$HOME/smoke-tmp" python3 packaging/smoke_test.py flatpak run io.github.afit21.rnfs
           fi
       - name: Name it for the release

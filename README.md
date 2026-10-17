@@ -198,12 +198,19 @@ alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type j
 The app has these permissions:
 
 - network access;
-- your home folder, for the files you add or get, plus `~/.rnfs` and `~/.reticulum`;
-- all devices, for RNode and other serial interfaces. If you don't use serial interfaces, remove this
-  with `flatpak override --user --nodevice=all io.github.afit21.rnfs`.
+- `~/.rnfs` and `~/.reticulum` (created if missing), for rnfs's and Reticulum's files;
+- your Downloads folder, for the files you add or get.
 
-To reach files outside your home folder, run
-`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`.
+It can't see the rest of your home folder, or any device. Grant more with `flatpak override`:
+
+```sh
+flatpak override --user --device=all io.github.afit21.rnfs                    # RNode and other serial interfaces
+flatpak override --user --filesystem=~/Documents io.github.afit21.rnfs        # another folder to add from or get into
+flatpak override --user --filesystem=~/.config/reticulum io.github.afit21.rnfs   # a Reticulum config kept there
+```
+
+`flatpak override --user --reset io.github.afit21.rnfs` takes these back. Until 0.1.6 the Flatpak had your
+whole home folder and every device; after updating, grant the ones you used again.
 
 - **Update:** install the newer release's `.flatpak` the same way.
 - **Uninstall:** `flatpak uninstall --user io.github.afit21.rnfs`.
@@ -282,8 +289,11 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
 `~/.local/share/rnfs/venv`. It installs the release's source archive (`rnfs-X.Y.Z.tar.gz`) only if it matches
 the release's `SHA256SUMS` and, if the [GitHub CLI](https://cli.github.com/) (2.49 or newer) is installed and
-logged in, its signed build provenance (`gh attestation verify`). Without `gh` it warns that only the checksum
-was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it stop instead. Dependencies are installed at the
+logged in, its signed build provenance (`gh attestation verify`). If `gh` is installed but not logged in, it
+stops: log in with `gh auth login`, or set `RNFS_REQUIRE_ATTESTATION=0` to install with only the checksum
+checked. Without `gh` it warns that only the checksum was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it
+stop instead. So `curl | sh` without `gh` trusts whoever can write the release's files on GitHub, since
+`SHA256SUMS` comes from the same place as the archive. Dependencies are installed at the
 versions pinned in the source's `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
 `~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
 
@@ -302,7 +312,9 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   The branch has no checksums or provenance to check.
 - **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
   `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
-  `loginctl enable-linger $USER`.
+  `loginctl enable-linger $USER`. More sandboxing (`ProtectSystem`, `PrivateTmp`) needs unprivileged user
+  namespaces, so it is an optional drop-in, for this unit or the `.deb`'s:
+  [`contrib/rnfs.service.d/hardening.conf`](contrib/rnfs.service.d/hardening.conf) says how to add it.
 - **For all users:** run it as root with `--system`
   (`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sudo sh -s -- --system`).
   This installs to `/opt/rnfs` and `/usr/local/bin/rnfs`.
@@ -310,7 +322,8 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
 - `--force` replaces an existing `~/.local/bin/rnfs`, for example one installed by pipx.
 - `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the latest release (it
   overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
-  installed unpinned (newest), with a warning.
+  installed unpinned (newest), with a warning. Nothing checks what it downloads, so a plain `http://` URL
+  gets a warning too.
 
 ### pipx from GitHub
 
@@ -319,7 +332,10 @@ pipx install git+https://github.com/afit21/rnfs                                 
 pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip          # Windows (no git needed)
 ```
 
-Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too.
+Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too. Both
+resolve rnfs's dependencies (Reticulum, LXMF, cryptography, ...) unpinned, at the newest versions rnfs allows,
+not at the tested versions and hashes in `packaging/requirements.lock` that the other packages and the install
+script use.
 
 ### From source
 
