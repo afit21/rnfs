@@ -101,7 +101,7 @@ DEFAULT_DISPLAY_NAME = "rnfs node"  # nothing in it links the LXMF address to th
 PROPAGATION_NODES_LIMIT = 64  # propagation nodes remembered from announces
 PROPAGATION_NODE_AGE = 7 * 24 * 3600.0  # forget a propagation node not heard this long
 IDENTITY_WAIT = 15.0  # seconds `send` waits for an unknown recipient's identity (capped by path_timeout)
-TICK = 1.0  # seconds between polls of outbound message states
+TICK = 1.0  # seconds between polls of outbound message states (while any is followed, held or downloading)
 SYNC_TIMEOUT = 900.0  # a propagation node download still unfinished after this is abandoned
 
 _HEX32 = re.compile(r"[0-9a-fA-F]{32}")
@@ -1048,13 +1048,17 @@ class LxmfFeature(features.Feature):
 
     def _run(self):
         """Announce (at start, after startup_announce_delay, then every announce_interval), download from the
-        propagation node every lxmf_sync_interval, and poll outbound messages."""
+        propagation node every lxmf_sync_interval, and poll outbound messages every TICK. While the network has
+        nothing to poll (network.idle()), sleep until the next announce or download is due instead: the network
+        wakes the loop (wake()) when it queues or holds a message or starts a download, so an idle node doesn't
+        wake each second."""
         network = self.network
         now = time.monotonic()
         announce_at = [now, now + self.config.startup_announce_delay]
         sync_at = now + max(self.config.startup_announce_delay, 10.0) if self.config.lxmf_sync_interval else None
         while not self._stop.is_set():
             now = time.monotonic()
+            timeout = TICK
             try:
                 if announce_at and now >= announce_at[0]:
                     announce_at.pop(0)
@@ -1069,10 +1073,18 @@ class LxmfFeature(features.Feature):
                         network.sync()
                 for message_hash, state, progress in network.poll():
                     self.outbound_changed(message_hash, state, progress)
+                # A message queued or held after this check sets _wake, so the wait below returns at once
+                if network.idle():
+                    due = announce_at[0] if sync_at is None else min(announce_at[0], sync_at)
+                    timeout = max(0.0, due - time.monotonic())
             except Exception as e:  # noqa: BLE001 - keep the loop alive
                 _log(f"loop failed: {e!r}", LOG_ERROR)
-            self._wake.wait(TICK)
+            self._wake.wait(timeout)
             self._wake.clear()
+
+    def wake(self):
+        """Wake the loop to poll the network now: it queued or held a message, or started a download."""
+        self._wake.set()
 
     def _no_propagation_node(self, consequence: str):
         """Log, once, that no propagation node is set and how to set one."""
@@ -2113,7 +2125,7 @@ class LxmfNetwork:
         if node is None:
             return False
         router = self.router
-        busy = router.PR_PATH_REQUESTED <= router.propagation_transfer_state < router.PR_COMPLETE
+        busy = self._downloading()
         if busy and time.monotonic() - self._sync_started < SYNC_TIMEOUT:
             return False
         if busy:
@@ -2121,7 +2133,21 @@ class LxmfNetwork:
         router.acknowledge_sync_completion(reset_state=True)
         self._sync_started = time.monotonic()
         router.request_messages_from_propagation_node(self.identity, SYNC_MAX_MESSAGES)
+        self.feature.wake()  # poll() bounds the download's link from now on, until it ends
         return True
+
+    def idle(self) -> bool:
+        """True while poll() has nothing to do: no outbound message followed, none held, and no propagation node
+        download running. The feature's loop then sleeps until its next announce or download."""
+        with self._lock:
+            if self._outbound or self._held:
+                return False
+        return not self._downloading()
+
+    def _downloading(self) -> bool:
+        """True while a propagation node download runs: from its path request until it completes or fails."""
+        router = self.router
+        return router.PR_PATH_REQUESTED <= router.propagation_transfer_state < router.PR_COMPLETE
 
     # Sending
 
@@ -2156,6 +2182,7 @@ class LxmfNetwork:
         self.router.handle_outbound(message)
         with self._lock:
             self._outbound[bytes(message.hash)] = [message, None, None]
+        self.feature.wake()  # follow its state from now on
         return bytes(message.hash)
 
     def poll(self) -> list[tuple[bytes, str, float | None]]:
@@ -2282,6 +2309,7 @@ class LxmfNetwork:
             _log(f"dropped a held message from unknown sender {victim[1][ID_LENGTH:2 * ID_LENGTH].hex()} for one "
                  f"from trusted sender {source.hex()}", LOG_VERBOSE)
         self._held.append((time.monotonic() + HOLD_TIME, packed, method))
+        self.feature.wake()  # poll() retries it once its sender's identity is known
         return True
 
     def _request_path(self, destination: bytes) -> bool:

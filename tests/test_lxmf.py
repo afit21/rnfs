@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -23,7 +25,7 @@ from rnfs.features import lxmf
 from rnfs.features.lxmf import FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE, Incoming, Link, MessageLog
 from rnfs.node import RnfsNode
 
-from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
+from tests.support import FakeClock, failing_commits, state_execute, state_rows, wait_for, write_legacy
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -414,6 +416,10 @@ class FakeLxmf:
     def poll(self):
         """Nothing changes by itself."""
         return []
+
+    def idle(self):
+        """Nothing to poll."""
+        return True
 
     def sync(self, nearest=False):
         """Started if there is a propagation node to use."""
@@ -856,6 +862,93 @@ class SendTest(FeatureTestCase):
         self.assertEqual(again.outbox_list()[0]["state"], "failed")
         again.save()
         self.assertEqual(self.reloaded().outbox_list()[0]["state"], "failed")
+
+
+class LoopNetwork(FakeLxmf):
+    """FakeLxmf counting the loop's announces, downloads and polls; idle unless the test queues a message."""
+
+    def __init__(self):
+        """Nothing queued; feature is set by the test, for wake()."""
+        super().__init__()
+        self.announces = self.syncs = self.polls = 0
+        self.pending = 0  # polls until the queued message is done with
+        self.feature = None
+
+    def announce(self):
+        """Count it."""
+        self.announces += 1
+
+    def sync(self, nearest=False):
+        """Count it."""
+        self.syncs += 1
+        return super().sync(nearest)
+
+    def poll(self):
+        """Count it; the queued message is done with after its polls."""
+        self.polls += 1
+        self.pending = max(0, self.pending - 1)
+        return []
+
+    def idle(self):
+        """Idle once the queued message is done with."""
+        return not self.pending
+
+    def queue(self, polls: int):
+        """Queue a message followed for polls polls, waking the loop as LxmfNetwork.send does."""
+        self.pending = polls
+        self.feature.wake()
+
+
+class LoopTest(FeatureTestCase):
+    """S7: the announce/sync/poll loop polls each TICK only while the network has something to poll."""
+
+    def test_idle_loop_waits_until_the_next_announce_or_download(self):
+        network = LoopNetwork()
+        feature = self.feature_node(network, startup_announce_delay=30, lxmf_sync_interval=3600)
+        timeouts = []
+
+        class Recording(threading.Event):
+            """Records each wait's timeout and returns at once; queues a message at the third, stops at the sixth."""
+
+            def wait(self, timeout=None):
+                timeouts.append(timeout)
+                if len(timeouts) == 3:
+                    network.pending = 2
+                if len(timeouts) == 6:
+                    feature._stop.set()
+                return super().wait(0)
+
+        feature._wake = Recording()
+        feature._run()  # here, until the sixth wait stops it
+        self.assertEqual((network.announces, network.syncs, network.polls), (1, 0, 6))
+        # Idle: until the second announce (startup_announce_delay); the queued message: each TICK
+        self.assertEqual(timeouts[3], lxmf.TICK)
+        for timeout in timeouts[:3] + timeouts[4:]:
+            self.assertTrue(29 < timeout <= 30, timeouts)
+
+    def test_a_queued_message_wakes_the_idle_loop(self):
+        network = LoopNetwork()
+        feature = self.feature_node(network)  # the default startup_announce_delay: idle, it waits 30 s
+        network.feature = feature
+        thread = threading.Thread(target=feature._run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(feature.wake)
+        self.addCleanup(feature._stop.set)
+        wait_for(lambda: network.polls, 10, "the first poll")
+        time.sleep(1.2)
+        self.assertEqual(network.polls, 1)  # no polls each second while idle
+        network.queue(2)
+        # Polled at once, then each TICK until it is done with; then idle again
+        wait_for(lambda: network.polls >= 3, 10, "the queued message's polls")
+        time.sleep(1.2)
+        self.assertEqual(network.polls, 3)
+        self.assertEqual(network.announces, 1)
+        # stop() wakes the idle loop
+        feature._stop.set()
+        feature.wake()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
 
 
 class DisabledTest(FeatureTestCase):
@@ -1356,6 +1449,7 @@ class NetworkBoundsTest(unittest.TestCase):
         network._propagation_nodes = {}
         network._configured_pn = network._current_pn = None
         network._sync_started = float("-inf")
+        network._outbound = {}
         network.identity = object()
         return network
 
@@ -1473,6 +1567,40 @@ class NetworkBoundsTest(unittest.TestCase):
             self.assertTrue(network.sync(nearest=True))
         network.router.request_messages_from_propagation_node.assert_called_once_with(
             network.identity, lxmf.SYNC_MAX_MESSAGES)
+
+    def test_idle_and_wakes(self):
+        # S7: the feature's loop polls only while a message is followed or held or a download runs, and the
+        # network wakes it when one starts
+        network = self.network()
+        self.network_lxmf = LXMF = network.LXMF
+        router, wake = network.router, network.feature.wake
+        router.PR_PATH_REQUESTED, router.PR_COMPLETE = LXMF.LXMRouter.PR_PATH_REQUESTED, LXMF.LXMRouter.PR_COMPLETE
+        router.propagation_transfer_state = LXMF.LXMRouter.PR_IDLE
+        self.assertTrue(network.idle())
+        with mock.patch.object(RNS.Transport, "request_path"):
+            network._delivered(self.forged(os.urandom(16), b"HELD"))
+        wake.assert_called_once_with()
+        self.assertFalse(network.idle())
+        network._held = []
+        self.assertTrue(network.idle())
+        for state, idle in ((LXMF.LXMRouter.PR_PATH_REQUESTED, False), (LXMF.LXMRouter.PR_RECEIVING, False),
+                            (LXMF.LXMRouter.PR_COMPLETE, True), (LXMF.LXMRouter.PR_FAILED, True)):
+            router.propagation_transfer_state = state
+            self.assertEqual(network.idle(), idle, state)
+        router.propagation_transfer_state = LXMF.LXMRouter.PR_IDLE
+        network._configured_pn = OTHER
+        wake.reset_mock()
+        self.assertTrue(network.sync())
+        wake.assert_called_once_with()
+        # Sending: followed (and the loop woken) from when it is queued
+        wake.reset_mock()
+        network.LXMF, network.destination = mock.Mock(), mock.Mock()
+        network.LXMF.LXMessage.return_value = mock.Mock(hash=b"m" * 32)
+        with mock.patch.object(RNS.Identity, "recall", return_value=mock.Mock()), \
+                mock.patch.object(RNS, "Destination"):
+            self.assertEqual(network.send(SENDER, "hi", {}, False), b"m" * 32)
+        wake.assert_called_once_with()
+        self.assertFalse(network.idle())
 
     def test_settings(self):
         # BG-L7 and the new lxmf_send_from_hint
