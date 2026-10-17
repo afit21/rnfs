@@ -1,5 +1,5 @@
 """L10: Micron line injection through DAG entry names on the file-index-node page. The page's escape() only
-escapes backslash and backtick (index.mu:28-30), but a directory entry name may contain newlines and other
+escaped backslash and backtick, but a directory entry name may contain newlines and other
 control characters (dag.check_name allows them). A name with a newline therefore injects whole Micron lines
 into the page: a fake ">" heading, or a fake entry line.
 
