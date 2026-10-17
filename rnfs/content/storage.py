@@ -33,8 +33,8 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 from rnfs import denylist, statedb
-from rnfs.constants import MAX_BLOCK_SIZE, MIB
-from rnfs.content import dag, walker
+from rnfs.constants import MIB
+from rnfs.content import blockstore, dag, walker
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, IndexNode
@@ -347,7 +347,7 @@ class Storage:
             if cid not in self._sizes:
                 return None
         block = self.blocks.get(cid)
-        if block is None or (verify and not (len(block) <= MAX_BLOCK_SIZE and cid.verify(block))):
+        if block is None or (verify and not blockstore.matches(cid, block)):
             with self._lock:
                 if cid in self._sizes and not self.blocks.verify(cid):
                     log(f"storage: block {cid} is damaged or missing; removing it", LOG_ERROR)
@@ -376,7 +376,7 @@ class Storage:
             stored = cid in self._sizes
         if stored:
             # Verified all the same, so callers (archive import) never count unchecked bytes as supplied
-            if len(block) > MAX_BLOCK_SIZE or not cid.verify(block):
+            if not blockstore.matches(cid, block):
                 raise ValueError(f"block does not match {cid}")
             return
         self.blocks.put(cid, block)  # verifies; outside the lock, since it writes to disk
@@ -589,7 +589,7 @@ class Storage:
             return DAMAGED
         if block is None:
             return MISSING
-        if len(block) > MAX_BLOCK_SIZE or not cid.verify(block):
+        if not blockstore.matches(cid, block):
             return DAMAGED
         try:
             return dag.decode(block)
