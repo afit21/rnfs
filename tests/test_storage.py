@@ -322,6 +322,50 @@ class PinTest(StorageTest):
         check(self.storage)
         check(self.open())
 
+    def test_pinned_cids(self):
+        """pinned_cids() is pins()'s CIDs, the same frozenset while pins don't change, through pins, a second
+        source, unpins, failed saves (asked for while saving, too) and a reopen."""
+        a, b, c = (self.add(b"%d" % i).cid for i in range(3))
+
+        def check(storage):
+            self.assertEqual(storage.pinned_cids(), frozenset(storage.pins()))
+
+        empty = self.storage.pinned_cids()
+        self.assertEqual(empty, frozenset())
+        self.assertIs(self.storage.pinned_cids(), empty)
+        self.storage.pin(a, USER)
+        pinned = self.storage.pinned_cids()
+        self.assertEqual(pinned, {a})
+        self.assertIs(self.storage.pinned_cids(), pinned)
+        self.storage.pin_many([a, b], FOLDER)
+        self.assertEqual(self.storage.pinned_cids(), {a, b})
+        check(self.storage)
+        self.storage.pin(a, FOLDER)  # nothing changes
+        self.assertIs(self.storage.pinned_cids(), self.storage.pinned_cids())
+
+        def failing_save(*args, **kwargs):
+            """Ask for the set while the change is in memory but not saved, then fail as a full disk does."""
+            self.storage.pinned_cids()
+            raise OSError("database or disk is full")
+
+        with mock.patch.object(self.storage, "_save_pins", side_effect=failing_save):
+            with self.assertRaises(OSError):
+                self.storage.pin(c, USER)
+            self.assertEqual(self.storage.pinned_cids(), {a, b})
+            with self.assertRaises(OSError):
+                self.storage.unpin(b, FOLDER)
+            self.assertEqual(self.storage.pinned_cids(), {a, b})
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.storage.pin(c, USER)
+        check(self.storage)
+        self.storage.unpin(a, USER)
+        self.assertEqual(self.storage.pinned_cids(), {a, b})  # still pinned by the folder
+        self.storage.unpin(a, FOLDER)
+        self.assertEqual(self.storage.pinned_cids(), {b})
+        check(self.storage)
+        check(self.open())
+
     def test_damaged_state_is_moved_aside(self):
         with open(os.path.join(self.tmp.name, "state", "pins.json"), "w", encoding="utf-8") as f:
             f.write("{not json")

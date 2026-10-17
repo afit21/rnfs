@@ -205,7 +205,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
   cache records, so they never refer to block names a power loss could undo.
 - pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
-  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]`, `pin_count()`, `is_complete(cid)`.
+  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]` (a copy), `pinned_cids() -> frozenset[Cid]` (the
+  same set until pins change: the publisher's refresh reads it after every add), `has_pin(cid, source)`,
+  `pin_count()`, `is_complete(cid)`.
 - cache: `record_fetch(root, names, target)` (keeps the path's nodes and the target's DAG), LRU touched on use.
   `cache_generation()` grows whenever records are removed or retargeted, so the node prunes its fetched
   targets only then. `changes()` grows with every block stored or deleted, pin or release, and record added,
@@ -1048,7 +1050,10 @@ runs while a lock is held:
   deny list's CID set, the key sources' keys or the strategy. A refresh that changed none of them returns at once
   (about 1 µs, from 7 ms at 10 000 pins); the generation is read before computing, so a change made meanwhile
   makes the next refresh compute. When it does compute, it builds the set of blocks served again only when a
-  provided CID went or its DAG's blocks changed (CIDs only added are unioned in).
+  provided CID went or its DAG's blocks changed (CIDs only added are unioned in). It takes the pins as
+  `Storage.pinned_cids()`, not a copy of every pin's sources, and gathers the keys withdrawals are queued for once,
+  so an item newly provided searches the queues only when its key is among them (a mass re-pin, or the first
+  refresh after a start with withdrawals pending).
 - `Storage.evict` and `gc` decide what to delete, and delete it, under the storage lock (after reading the DAG
   nodes outside it); `verify` checks completeness and re-reads the blocks outside it.
 - Every pin and unpin commits its row durably (`synchronous=FULL`, after the blocks are synced) under the
