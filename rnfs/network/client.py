@@ -69,6 +69,13 @@ class PeerClient:
         """Close the shared link to node_id, cancelling any transfer on it."""
         self.links.close(node_id)
 
+    def close_unless_used(self, node_id: bytes, own: set[int]) -> bool:
+        """Close the shared link to node_id, as close() does, unless a request made from a thread not in own
+        (thread idents: the caller's request threads) is in progress on it or waiting for a slot, so one fetch
+        giving up on its request doesn't fail another's. True if closed (or there was no link); False if left
+        open, its request left to finish. Never cancels a Resource: closing the link stops it (section 3)."""
+        return self.links.close_unless_used(node_id, own)
+
     # /find
 
     def find(self, node_id: bytes, key: bytes) -> tuple[list[bytes], list[bytes]] | None:

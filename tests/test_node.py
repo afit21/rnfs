@@ -63,6 +63,10 @@ class NetClient:
         """No estimates."""
         return None
 
+    def link_mdu(self, node_id):
+        """No open links, so no MDU known."""
+        return None
+
     def find(self, node_id, key):
         """Ask a node's backend as /find would."""
         node = self.nodes.get(node_id)

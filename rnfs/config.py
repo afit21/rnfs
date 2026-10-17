@@ -196,12 +196,13 @@ class Config:
         return 1 if slow_node else 3
 
     def effective_max_upload_rate(self, slow_link: bool, rate_estimate: float | None) -> float | None:
-        """The upload cap for a link in bits/s, or None for no cap."""
+        """The upload cap for a link in bits/s, or None for no cap: max_upload_rate if set, else the default
+        (rates.default_upload_cap: a slow link's rate estimate halved)."""
         if self.max_upload_rate is not None:
             return self.max_upload_rate
-        if slow_link and rate_estimate is not None:
-            return rate_estimate / 2
-        return None
+        # Here: rnfs.network.rates imports this module, and RNS (through rnfs.log), which settings alone don't need
+        from rnfs.network import rates
+        return rates.default_upload_cap(slow_link, rate_estimate)
 
     def validate(self):
         """Raise ValueError for settings the spec forbids, or of the wrong type or out of range."""
