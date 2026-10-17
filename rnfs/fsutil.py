@@ -10,6 +10,7 @@ import secrets
 import stat
 import sys
 import time
+import unicodedata
 
 # The one platform switch for rnfs's Windows behaviour; tests patch it to exercise that behaviour anywhere
 IS_WINDOWS = os.name == "nt"
@@ -377,6 +378,33 @@ def printable(text) -> str:
     if text.isprintable():
         return text
     return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii") for c in text)
+
+
+# Printable characters that show nothing: the Hangul fillers and the blank braille pattern
+_BLANK_FILLERS = frozenset("ᅟᅠㅤﾠ⠀")
+MAX_COMBINING_RUN = 2  # combining marks kept in a row (some scripts stack two); more spill over the text around
+
+
+def printable_label(text) -> str:
+    """text, a label someone else chose (an LXMF display name), escaped as printable() does, and also where it
+    could pass for another label or for none: backslashes (so it can't spell out an escape), the blank fillers,
+    a combining mark that follows no printed character (it would join what was printed before) or makes more
+    than MAX_COMBINING_RUN in a row, and a label of nothing but spaces. Not for paths: printable() keeps a
+    Windows path's backslashes."""
+    out, run, after_base = [], 0, False  # run: combining marks kept in a row; after_base: one may follow
+    for c in str(text):
+        mark = unicodedata.category(c).startswith("M")
+        if c == "\\" or c in _BLANK_FILLERS or not c.isprintable() \
+                or (mark and (not after_base or run >= MAX_COMBINING_RUN)):
+            out.append(c.encode("unicode_escape").decode("ascii"))  # "\\" for a backslash, "ㅤ" for a filler
+            after_base = False
+            continue
+        out.append(c)
+        run = run + 1 if mark else 0
+        after_base = True
+    if out and all(c == " " for c in out):
+        return "\\x20" * len(out)
+    return "".join(out)
 
 
 def unsafe_name_reason(name: str) -> str | None:
