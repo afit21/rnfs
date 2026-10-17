@@ -85,7 +85,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | NET-1 | `test_net1_cancelled_responses.py`, `test_l17_rejected_responses.py` | `rnfs/network/server.py` (`NO_PROGRESS_FRACTION`) | `0ec517b` |
 | NET-2 | `test_net2_single_packet_pacing.py`; also `tests/test_pacing.py`, `tests/test_server.py` | `rnfs/network/server.py` (pacing under `max_upload_rate`) | `c0ec333` |
 | NET-3 | `test_net3_outgoing_requests.py`, `test_l1_response_precheck.py` | `rnfs/network/guards.py` (`guarded_receive`) | `81afb98` |
-| NET-4 | phase 6, pending | `rnfs/fetcher.py` | phase 6, pending |
+| NET-4 | `test_net4_dripping_provider.py`; also `tests/test_fetcher.py` (`ReadAheadLinkTest`) | `rnfs/fetcher.py` (end-game duplication of a batch in flight past `deadline_slack`), `rnfs/network/client.py` and `rnfs/network/links.py` (`close_unless_used`) | `afa3820`, `ac9ed4f` |
 | NET-5 | `test_net5_proof_wait.py` | `rnfs/network/server.py` (`RequestServer._proof_wait`) | `db27b8b` |
 | none (RNS internals) | `test_rns_compat_security.py` | the RNS attributes `rnfs/network/server.py` and `rnfs/network/guards.py` rely on (H1, M1, L1, L17) | `dbd1144`, `09c6324`, `73041a7`, `42aadca`, `90a2952` (test) |
 
