@@ -42,8 +42,9 @@ def simple_cuts(data: bytes) -> list[int]:
 class ChunkerTest(unittest.TestCase):
 
     def test_parameters(self):
-        self.assertEqual((chunker.MIN_SIZE, chunker.AVG_SIZE, chunker.MAX_SIZE), (16384, 65536, 131072))
-        self.assertEqual(chunker.MAX_SIZE, MAX_BLOCK_SIZE)
+        self.assertEqual((chunker.MIN_SIZE, chunker.AVG_SIZE, chunker.FASTCDC_MAX), (16384, 65536, 131072))
+        self.assertEqual(chunker.FASTCDC_MAX, MAX_BLOCK_SIZE)
+        self.assertEqual(chunker.MAX_SIZE, chunker.FASTCDC_MAX)  # the name before 0.1.6, kept
         self.assertEqual(chunker.GEAR[0], 0x61304b5b3811834c)
         self.assertEqual(chunker.GEAR[255], 0x7989ca9814accbdb)
         self.assertEqual(chunker.GEAR[7], int.from_bytes(hashlib.sha256(b"rnfs-fastcdc-gear\x07").digest()[:8], "big"))
@@ -72,12 +73,12 @@ class ChunkerTest(unittest.TestCase):
         self.assertEqual(sum(lengths), len(data))
         for length in lengths[:-1]:
             self.assertGreaterEqual(length, chunker.MIN_SIZE)
-            self.assertLessEqual(length, chunker.MAX_SIZE)
-        self.assertLessEqual(lengths[-1], chunker.MAX_SIZE)
+            self.assertLessEqual(length, chunker.FASTCDC_MAX)
+        self.assertLessEqual(lengths[-1], chunker.FASTCDC_MAX)
         average = len(data) / len(lengths)
         self.assertTrue(48 * 1024 < average < 96 * 1024, average)  # normalized chunking stays near 64 KiB
-        # No cut point at all: every chunk is MAX_SIZE
-        self.assertEqual(set(chunker.fastcdc_cuts(bytes(1 << 20))), {chunker.MAX_SIZE})
+        # No cut point at all: every chunk is FASTCDC_MAX
+        self.assertEqual(set(chunker.fastcdc_cuts(bytes(1 << 20))), {chunker.FASTCDC_MAX})
         self.assertEqual(chunker.fastcdc_cuts(b"x" * 100), [100])
 
     def test_boundaries_survive_an_insertion(self):
@@ -148,13 +149,13 @@ class ChunkerTest(unittest.TestCase):
 
     def test_tree_rule_over_many_chunks(self):
         """More than MAX_CHILDREN chunks are grouped by the tree rule, as for fixed chunks."""
-        data = bytes(300 * chunker.MAX_SIZE)  # zeros: every chunk is MAX_SIZE, so 300 chunks
+        data = bytes(300 * chunker.FASTCDC_MAX)  # zeros: every chunk is FASTCDC_MAX, so 300 chunks
         blocks: dict[Cid, bytes] = {}
         with chunker.using(chunker.FASTCDC):
             built = builder.build_bytes(data, lambda cid, block: blocks.setdefault(cid, block))
         root = dag.decode(blocks[built.cid])
         self.assertEqual(len(root.children), 2)
-        self.assertEqual([c.size for c in root.children], [256 * chunker.MAX_SIZE, 44 * chunker.MAX_SIZE])
+        self.assertEqual([c.size for c in root.children], [256 * chunker.FASTCDC_MAX, 44 * chunker.FASTCDC_MAX])
 
     def test_throughput(self):
         """Report MB/s (not a pass/fail threshold beyond a sanity floor)."""
