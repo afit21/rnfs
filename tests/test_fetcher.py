@@ -794,7 +794,9 @@ class LimitTest(FetcherTest):
         self.config.lookup_timeout, self.config.stall_timeout = 0.3, 0.2
         built = self.file(b"never arrives")
         self.hold(P1)
-        self.client.behaviour[P1] = lambda cids: (time.sleep(5), BlocksResult(FAILED, unsent=list(cids)))[1]
+        release = threading.Event()  # set as the test ends, so its request thread doesn't outlive it
+        self.addCleanup(release.set)
+        self.client.behaviour[P1] = lambda cids: (release.wait(5), BlocksResult(FAILED, unsent=list(cids)))[1]
         self.runs.append([P1])
         start = time.monotonic()
         with self.assertRaises(NotFound):
