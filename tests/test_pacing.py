@@ -15,21 +15,12 @@ from rnfs.dht.routing import RoutingTable
 from rnfs.fetcher import Fetcher
 from rnfs.network import protocol, rates, server
 from rnfs.network.client import BUSY, OK, BlocksResult
+from tests.fakes.log import quiet_log
 from tests.support import FakeClock
 from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource
 
 OWN, PROVIDER = bytes(16), bytes([1]) * 16
-_saved_loglevel = RNS.loglevel
-
-
-def setUpModule():
-    """Silence the fetcher's and server's logs."""
-    RNS.loglevel = RNS.LOG_CRITICAL
-
-
-def tearDownModule():
-    """Restore RNS's loglevel."""
-    RNS.loglevel = _saved_loglevel
+setUpModule, tearDownModule = quiet_log()
 
 
 class PacingTest(unittest.TestCase):

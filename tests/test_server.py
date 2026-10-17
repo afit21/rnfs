@@ -362,6 +362,10 @@ class FakeBackend:
         """The served block for cid, if any."""
         return self.blocks.get(cid)
 
+    def served_block_size(self, cid):
+        """Not known: the server reads each block to size it."""
+        return None
+
     def remote_pin(self, identity_hash, cid, pin):
         """Accept or refuse a remote pin."""
         self.pins.append((identity_hash, cid, pin))
@@ -370,6 +374,10 @@ class FakeBackend:
     def is_member(self, identity_hash):
         """Whether the identity is a member."""
         return identity_hash in self.members
+
+    def feature_requests(self):
+        """No feature request paths."""
+        return {}
 
 
 class RequestServerTest(unittest.TestCase):

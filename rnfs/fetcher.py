@@ -976,11 +976,10 @@ class Fetch:
         budget = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
         # However large max_bytes is, the responder's budget is at most this (server.blocks_budget, section 7)
         carried = min(budget, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
-        # The client sends what fits its link's packet and returns the rest: the open link's MDU, else the
-        # largest request any link allows (test fakes may not know links). Whether a prefix fits only gets
-        # worse as it grows, so one count covers every batch taken from the front of pending
-        link_mdu = getattr(self.client, "link_mdu", None)
-        mdu = (link_mdu(node_id) if link_mdu is not None else None) or MAX_REQUEST_SIZE
+        # The client sends what fits its link's packet and returns the rest: the open link's MDU, else (no link
+        # open yet) the largest request any link allows. Whether a prefix fits only gets worse as it grows, so
+        # one count covers every batch taken from the front of pending
+        mdu = self.client.link_mdu(node_id) or MAX_REQUEST_SIZE
         fit = max(1, protocol.blocks_batch_size(budget, list(islice(pending, MAX_BATCH)), mdu))
         room = self._room(wanted)
         batch: list[Cid] = []

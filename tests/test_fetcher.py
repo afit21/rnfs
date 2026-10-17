@@ -9,8 +9,6 @@ import unittest
 from collections import deque
 from unittest import mock
 
-import RNS
-
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
 from rnfs.content import builder, dag, walker
@@ -24,74 +22,13 @@ from rnfs import fetcher as fetcher_module
 from rnfs.fetcher import Fetcher
 from rnfs.network import protocol, server
 from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
+from tests.fakes.client import BATCH, FakeClient
+from tests.fakes.log import quiet_log
 from tests.support import failing_commits, state_execute, state_rows
 
 OWN = bytes(16)
 P1, P2, P3, P4 = (bytes([i]) * 16 for i in (1, 2, 3, 4))
-BATCH = 4  # CIDs the fake client sends per request, like a packet limit
-
-_saved_loglevel = RNS.loglevel
-
-
-def setUpModule():
-    """Silence the fetcher's log."""
-    RNS.loglevel = RNS.LOG_CRITICAL
-
-
-def tearDownModule():
-    """Restore RNS's loglevel."""
-    RNS.loglevel = _saved_loglevel
-
-
-class FakeClient:
-    """Stands in for PeerClient: each node holds a dict of blocks, or behaves as a test function says."""
-
-    def __init__(self):
-        """No nodes, no open links."""
-        self.holdings: dict[bytes, dict[Cid, bytes]] = {}
-        self.behaviour: dict[bytes, object] = {}  # node -> f(cids) -> BlocksResult, or None for the default
-        self.links: list[bytes] = []
-        self.rate: float | None = None
-        self.requests: list[tuple[bytes, list[Cid]]] = []
-        self.closed: list[bytes] = []
-        self.lock = threading.Lock()
-
-    def open_links(self) -> list[bytes]:
-        """Nodes with an open link."""
-        return list(self.links)
-
-    def rate_estimate(self, node_id: bytes):
-        """The same estimate for every link."""
-        return self.rate
-
-    def close(self, node_id: bytes):
-        """Close the link to node_id (noted)."""
-        with self.lock:
-            self.closed.append(node_id)
-
-    def blocks(self, node_id: bytes, cids: list[Cid], on_progress=None) -> BlocksResult:
-        """Serve what node_id holds, BATCH CIDs per request."""
-        with self.lock:
-            self.requests.append((node_id, list(cids)))
-        self.on_progress = on_progress
-        behaviour = self.behaviour.get(node_id)
-        if behaviour is not None:
-            result = behaviour(cids)
-            if result is not None:
-                return result
-        held = self.holdings.get(node_id, {})
-        result = BlocksResult(OK)
-        for cid in cids[:BATCH]:
-            if cid in held:
-                result.blocks[cid] = held[cid]
-            else:
-                result.missing.append(cid)
-        result.unsent = list(cids[BATCH:])
-        return result
-
-    def asked(self, node_id: bytes) -> list[Cid]:
-        """Every CID sent to node_id."""
-        return [cid for node, cids in self.requests if node == node_id for cid in cids[:BATCH]]
+setUpModule, tearDownModule = quiet_log()
 
 
 class FakeLookup:

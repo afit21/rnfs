@@ -1125,7 +1125,10 @@ feature. The public API has `test_public.py` (every interface test run on an emb
 ApiServer, the name-watch endpoint, the objects, `import rnfs`'s weight) and `test_embedded.py` (the guards'
 scopes, the dir lock, and with `RNFS_E2E=1` a host program over real RNS beside an embedded node). The state database has `test_statedb.py`, each store's migration a `test_migrate_*.py`, and
 `test_upgrade_014.py` loads `tests/fixtures/rnfs-0.1.4/`, a node directory 0.1.4 wrote (its `generate.py`
-writes it again). CI runs them on Linux, macOS and Windows; `packaging/smoke_test.py` checks a built package
+writes it again). Test doubles several modules share live in `tests/fakes/` (`FakeClient`, the `PeerClient`
+stand-in, and the quiet-log fixture); `test_fake_contract.py` checks the fakes against what they stand in for
+(`FakeNode` against `RnfsNode`, `FakeClient` and the node tests' `NetClient` against `PeerClient`, `FakeBackend`
+against `server.Backend`), so production code needn't look up with `getattr` a method a fake might lack. CI runs them on Linux, macOS and Windows; `packaging/smoke_test.py` checks a built package
 (`--version`, `--help`, daemon and status, an add, and that the state database holds the pin and imported a
 0.1.4 state file).
 
