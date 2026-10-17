@@ -160,6 +160,14 @@ Changed:
   pinned the sent CID because the name didn't resolve ("auto-fetch pinned (sent CID; name unresolved)";
   `"sent_cid": true` in the inbox record).
 
+Faster:
+- The fetcher keeps a set beside its queue of blocks to fetch, so requeueing a refused or budget-cut request's
+  blocks no longer scans the queue: 22 ms → 0.01 ms per answer with 16 000 blocks pending (1 GiB), 242 → 0.015
+  ms at 10 GiB.
+- `open()` on `rnfs.Client` or `rnfs.Node` reads ahead while reads are sequential, doubling each refill from 64
+  KiB up to 4 MiB; a seek that moves starts again with a read of only what it covers. Sequential 64 KiB reads: 33
+  → 560 MB/s through `rnfs.Client`, 79 → 1219 MB/s on `rnfs.Node`; `read()` of a whole file 310 → 589 MB/s.
+
 Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 - `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in

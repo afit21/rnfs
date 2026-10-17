@@ -882,7 +882,7 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # an rnfs node inside it; or: 
     added = node.add("photos/")                   # rnfs.Added: .cid, .size, .warnings
     for entry in node.ls(added.cid):              # rnfs.Entry(name, kind, size, cid)
         print(entry.name, entry.size)
-    with node.open(f"{added.cid}/cat.jpg") as f:  # seekable: each read fetches only the chunks it covers
+    with node.open(f"{added.cid}/cat.jpg") as f:  # seekable: a read after a seek fetches only what it covers
         f.seek(1_000_000)
         data = f.read(4096)
     site = node.names.create("site")              # rnfs.Name
