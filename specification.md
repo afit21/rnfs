@@ -1086,7 +1086,11 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 **Limits.**
 - RNS identities are free to create. A determined attacker can surround one key with responsive nodes and
   make that key hard to find (a Sybil attack); it can't forge data. `get <cid> --from <node ID>` bypasses
-  the DHT when a provider is known.
+  the DHT when a provider is known. Grinding IDs near a key is cheap: one CPU core makes about 20,000-30,000
+  identities a second, each with its node ID (measured for rnfs 0.1.6), and getting `K` of them closer to a
+  key than the `K` closest of n honest nodes takes about n tries, so a fraction of a second against 10,000
+  nodes and under a minute against a million. Raising this cost means changing how node IDs are derived, a
+  protocol change left for a later version.
 - Patient attackers that keep identities alive for days defeat the preference for old records and long-known
   providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
   answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
