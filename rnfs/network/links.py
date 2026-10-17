@@ -27,6 +27,7 @@ import RNS
 
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_REQUESTS_PER_LINK
+from rnfs import log as rnfs_log
 from rnfs.log import LOG_DEBUG, LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, protocol, rates
 
@@ -54,6 +55,12 @@ def close_reason(link) -> str:
     if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
         return "closed by the other node"
     return "closed"
+
+
+def _debug_logged() -> bool:
+    """True if a LOG_DEBUG message is kept anywhere: RNS logs at debug level, or the debug log (which keeps
+    every message, whatever RNS's loglevel) is on."""
+    return RNS.loglevel >= LOG_DEBUG or rnfs_log._debug_sink is not None
 
 
 def path_description(node_id: bytes) -> str:
@@ -282,7 +289,8 @@ class LinkPool:
         if not RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
             return False
-        log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
+        if _debug_logged():  # RNS path lookups, only for a message that will be kept
+            log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
 
         identity = self._recall(node_id)
         if identity is None:
@@ -330,16 +338,23 @@ class LinkPool:
         return True
 
     def _recall(self, node_id: bytes):
-        """The node's identity from RNS, asking for a path again (whose response carries it) if needed."""
+        """The node's identity from RNS, asking for a path again (whose response carries it) if needed.
+
+        A recall marks the destination used, which keeps it in RNS's known destinations for longer (and is
+        an RPC of its own on a shared instance): right for a node being contacted, but not for each of the
+        polls while its identity is awaited, so those don't mark it, and one recall marks it once it is there.
+        """
         identity = RNS.Identity.recall(node_id)
         if identity is not None:
             return identity
         RNS.Transport.request_path(node_id)
         deadline = time.monotonic() + self.config.path_timeout
-        while identity is None and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(0.1)
-            identity = RNS.Identity.recall(node_id)
-        return identity
+            found = RNS.Identity.recall(node_id, _no_use=True)
+            if found is not None:
+                return RNS.Identity.recall(node_id) or found
+        return None
 
     def identify(self, peer: PeerLink):
         """Identify again on peer's link (unacknowledged, so it may need repeating)."""
@@ -485,7 +500,8 @@ class LinkPool:
                                             progress_callback=exchange.on_progress,
                                             timeout=None, max_response_size=max_response_size)
             except Exception as e:  # noqa: BLE001 - a failed send is a failed request; logged
-                log(f"could not send {path} to {node_name(peer.node_id)}: {e}", LOG_VERBOSE)
+                # Link.request answers False when it can't send (a closed link too), so an exception is a bug
+                log(f"could not send {path} to {node_name(peer.node_id)}: {e!r}", LOG_WARNING)
                 return exchange
             if not receipt:
                 log(f"could not send {path} to {node_name(peer.node_id)}", LOG_VERBOSE)

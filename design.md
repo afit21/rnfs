@@ -17,18 +17,25 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   `close()`).
 - `rnfs/content/cid.py` — `Cid` (binary form `.binary`, `.codec` `RAW`/`DAG`, `.key` DHT key, `.verify(block)`,
   `str()` written form, `Cid.parse`, `Cid.from_bytes`, `Cid.for_block`). Code passes `Cid` objects everywhere;
-  strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire.
+  strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire. `Cid.from_block_name` is the
+  block store's scan at startup: it accepts exactly what `parse` accepts, but checks the canonical form with one
+  regular expression and decodes with `int(..., 32)` instead of re-encoding, keeping the name as the written form.
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
   `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set
-  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel.
+  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel. `ThrottledLog(interval, clock)`
+  logs one line about a kind of event at most every interval (60 s), with a count of those left out; `due()` is
+  the check alone. The response guards, the request rate limit (`RequestServer._over_rate`), `RnsPaths` and the
+  peers listing use it. An unexpected exception caught by a broad `except` (a `# noqa: BLE001` reason says why
+  it's caught) is logged at `LOG_WARNING` inside the `except`, so the debug log gets its traceback: among them the
+  fetcher's `/blocks` worker, the lookup's routing-table callbacks and `LinkPool.request`.
 - `rnfs/debuglog.py` — the debug log file (`debug_log`, `daemon --debug-log`), `<rnfs dir>/debug.log` (0600),
   started by the daemon before the node: version first, then every rnfs message (warnings and errors logged in
   an `except` block with their traceback), RNS's own log lines at Info or more severe (`RNS_LEVEL`; copied from
   `RNS.logdest = LOG_CALLBACK`, which still prints all of them), threads that die (`threading.excepthook`), a status line every 5 minutes (`status_line`:
   the node's status, open links, each interface up or down), and gateway requests, numbered (`tag`). Each start
   and every 16 MiB moves the file to `debug.log.1`. Lookups report their queries through `Lookup(report=)` (dht
-  stays free of RNS), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
+  stays free of RNS at import), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
 - `rnfs/fsutil.py` — the one platform switch (`IS_WINDOWS`), `O_BINARY`, and `replace`/`remove` that retry for
   about a second on Windows while another handle holds the file; `rename_new` (rename onto a path that must not
   exist; atomic through `renameat2(RENAME_NOREPLACE)` on Linux or a hard link, else check then rename);
@@ -251,6 +258,9 @@ the next one back a further backoff, so concurrent lookups don't all retry it), 
 min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
 dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
 `nodes()`, `node_count()`, `live_count()` (nodes `/find` replies would include).
+Every `heard` forgets expired bans and dropped nodes' seniority, looking only at the front of each: both are kept
+in expiry order (an entry set again is moved to the end), and their readers check expiry too, so an entry out of
+order (after a clock step or a changed setting) only lingers in memory.
 
 `providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
 max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
@@ -615,8 +625,13 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 `read()` of the rest is one read. Reads
 go by the target as opened, root and path, since providers announce roots and the file's own CID may have none;
 an `rnfs:name/` URI is resolved once, at `open`, and a contact nick is expanded by the node (which reuses its
-CID for 60 s). It is an `io.BufferedReader` of 64 KiB over `_FileReader`, whose every `readinto` is one `read`
-(or one `GET /api/cat`) of `[position, position + its length)`, so only the chunks covering it are fetched; a sealed file reads its plaintext unless `raw`. Raises fetch errors as reads happen. Not
+CID for 60 s). It is an `io.BufferedReader` of 64 KiB (`FILE_BUFFER`) over `_FileReader`, whose refill after
+`open` or a seek is one `read` (or one `GET /api/cat`) of `[position, position + its length)`, so only the chunks
+covering it are fetched. While reads are sequential (a refill starting where the last read ended), each refill
+reads ahead twice as far as the last, up to `READ_AHEAD` (4 MiB), and keeps the rest for the next `readinto`s: a
+sequential reader makes few requests and fetches beyond what it reads at most about what it has read already. A
+seek that moves the position drops what was read ahead and starts again at 64 KiB. A sealed file reads its
+plaintext unless `raw`. Raises fetch errors as reads happen. Not
 thread-safe, like any file object. `Job`, `Name` and every object are snapshots as of their last `refresh()`,
 `wait()` or callback.
 
@@ -678,7 +693,7 @@ Rules, the same for both:
 |---|---|
 | A Node's events come from in-process hooks; a Client's from polling (jobs, 1 s) and the long poll (names) | Documented; the same callbacks and rules. A daemon older than the endpoint can't watch names (`NotFound` at `watch()`) |
 | Paths (`add`, `get`, `export`, `import_archive`, a job's output) are opened by the daemon for a Client | Same machine and user (the token requires it); made absolute on the app's side, as now |
-| `open()` costs one API request per buffer refill for a Client | Accepted; the 64 KiB buffer bounds the requests |
+| `open()` costs one API request per buffer refill for a Client | Accepted; the 64 KiB buffer bounds the requests, and sequential reads read ahead up to 4 MiB a request |
 | Settings, DHT mode, LXMF, lifecycle: a Node's own; the daemon's for a Client | Documented: a Client can't change them; `close()` only ends the Client |
 | No gateway or API in a Node | Not offered in 0.2 (decision 6) |
 | The API's `GET /api/info` has no `raw` | A Client's `info(raw=True)` (and `open(raw=True)`) takes a sealed file's `stored_size` as its size |
@@ -780,7 +795,9 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 ## Mesh
 
 `mesh.py` (no RNS at module level): `PathInfo`, `provider_rank` and `RnsPaths` (hops and next-hop
-interfaces from `RNS.Transport`, or through a shared instance's RPC with its interface stats cached for 30 s);
+interfaces from `RNS.Transport`, or through a shared instance's RPC with its interface stats cached for 30 s
+and each node's next-hop interface name for 15 s, `PATH_CACHE`, in an LRU of at most 1024 nodes; `infos()` fills
+the names of many nodes from one `get_path_table` RPC, for `rnfs peers`);
 the airtime policy (`TokenBucket`, `AirtimePolicy`, interface matching, quiet-hours parsing, all with
 injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 1000), per interface (at most 64)
 and in total, never persisted.
@@ -819,7 +836,11 @@ and in total, never persisted.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
-  nothing for; `_over_rate` counts them and logs at most once a minute.
+  nothing for; `_over_rate` counts them and logs at most once a minute. Every handler but `/blocks` runs its
+  work through `RequestServer._in_slot(link_id, answer)` after its own checks (so a refusal by those takes no
+  slot): it takes one of the link's `MAX_REQUESTS_PER_LINK` slots (`IncomingLinks.start_request`), answers
+  `False` if none is free, and frees it when `answer()` returns or raises. A `/blocks` slot outlives its handler
+  (until the response's Resource concludes), so `_handle_blocks` keeps its own.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
   caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
   (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
@@ -866,13 +887,14 @@ its own threads and stops them, in reverse, before its own services. A feature m
 and the last save), `status()` (fields merged into `rnfs status`), `requests()` (new `rnfs.dht` paths; the request
 server applies private mode and the per-link limit, and turns `None` or an exception into `False`; a response must
 be a shape `protocol.response_refusal` accepts, True/False/None, a `/find` answer, or at most `MAX_BLOCKS_CIDS` bins
-or nils, since nodes since 0.1.4 refuse any other), `api_routes()` (all token-protected) and `cli_commands()`.
+or nils, since nodes since 0.1.4 refuse any other: the server checks each with `protocol.body_refusal` and answers
+`False`, logged as an error, instead of one they'd refuse), `api_routes()` (all token-protected) and `cli_commands()`.
 Feature modules don't import RNS at module level (the CLI imports them to build its parser) and their constructors
 work on `RnfsNode.offline` test nodes.
 
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
-| `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; its own `rnfs.dht` announce handler, so client-mode nodes' mode and last-heard time are known | reads `Traffic`, the routing table, links, paths |
+| `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic` | reads `Traffic`, the routing table, links, paths |
 | `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job`, CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
@@ -963,9 +985,12 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | `rnfs-deny` | deny | every deny-list source's check and fetch, one at a time, once joined |
 | `rnfs-events`, `rnfs-job-watch` | rnfs.Node | callbacks into the program, one at a time; polling watched jobs (both started on first use) |
 | `rnfs-client-events`, `rnfs-client-job-watch`, `rnfs-client-name-watch` | rnfs.Client (in the program) | callbacks; polling watched jobs; the `GET /api/name/watch` long poll |
-| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second; auto-fetch, one at a time, senders in turn (LXMF runs its own job thread) |
+| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second while a message is followed or held or a download runs (otherwise it sleeps until the next announce or download; `LxmfNetwork.send`, `_hold` and `sync` wake it); auto-fetch, one at a time, senders in turn (LXMF runs its own job thread) |
 
-The API and gateway run one thread per connection, capped (32 and 64).
+The API and gateway run one thread per connection, capped (32 and 64). The daemon's main thread waits for
+SIGINT, SIGTERM or SIGBREAK (`cli.wait_until_stopping`): on POSIX a signal interrupts the wait, so it has no
+timeout and wakes only for the debug log's status line; on Windows a wait isn't interrupted for signal handlers,
+so it wakes each second.
 
 Locks are taken in this order, never the reverse: `names._lock` → `publisher._lock` → `node._lock` → `storage._lock`
 → the state database's lock (`statedb`, innermost: a store opens a transaction only once it holds every lock the

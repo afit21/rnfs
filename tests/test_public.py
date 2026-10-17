@@ -178,6 +178,48 @@ class PublicTests:
             self.assertEqual(f.read(), data)
         self.assertEqual(reads, [(0, len(data))])  # the rest in one read, not one per 8 KiB
 
+    def test_open_reads_ahead_while_sequential(self):
+        """Sequential refills double up to READ_AHEAD; a seek starts again with a refill of only what it covers."""
+        data = os.urandom(1_000_000)
+        cid = self.share(data, "f.bin")
+        reads = []
+        original = self.rnfs._backend.read
+
+        def spy(target, offset, length, raw, from_node):
+            """Record each read the file makes."""
+            reads.append((offset, length))
+            return original(target, offset, length, raw, from_node)
+        buffer = interface.FILE_BUFFER
+        with mock.patch.object(self.rnfs._backend, "read", spy), \
+                mock.patch.object(interface, "READ_AHEAD", 4 * buffer), self.rnfs.open(f"{cid}/f.bin") as f:
+            self.assertEqual(b"".join(iter(lambda: f.read(1000), b"")), data)
+            self.assertEqual(f.tell(), len(data))
+            self.assertEqual(reads, [(0, buffer), (buffer, 2 * buffer), (3 * buffer, 4 * buffer),
+                                     (7 * buffer, 4 * buffer), (11 * buffer, 4 * buffer),
+                                     (15 * buffer, len(data) - 15 * buffer)])
+            # Random reads: each refill reads only the chunks it covers, however far the read-ahead had grown
+            reads.clear()
+            for offset in (500_000, 10, 999_990, 300_000):
+                f.seek(offset)
+                self.assertEqual(f.read(10), data[offset:offset + 10])
+            self.assertEqual(reads, [(500_000, buffer), (10, buffer), (999_990, 10), (300_000, buffer)])
+            # Reading on from a seek grows again from FILE_BUFFER, and tell() counts what was read ahead as unread
+            reads.clear()
+            self.assertEqual(f.read(3 * buffer), data[300_010:300_010 + 3 * buffer])
+            self.assertEqual(f.tell(), 300_010 + 3 * buffer)
+            self.assertEqual(reads, [(300_000 + buffer, 2 * buffer), (300_000 + 3 * buffer, 4 * buffer)])
+            # A seek into what was read ahead (past the File's own buffer) reads it again, from there only
+            reads.clear()
+            f.seek(300_000 + 5 * buffer)
+            self.assertEqual(f.read(10), data[300_000 + 5 * buffer:300_010 + 5 * buffer])
+            self.assertEqual(reads, [(300_000 + 5 * buffer, buffer)])
+            # The rest: what was read ahead, then one read
+            reads.clear()
+            self.assertEqual(f.read(buffer), data[300_010 + 5 * buffer:300_010 + 6 * buffer])
+            self.assertEqual(f.read(), data[300_010 + 6 * buffer:])
+            self.assertEqual(reads, [(300_000 + 6 * buffer, 2 * buffer), (300_000 + 8 * buffer,
+                                                                          len(data) - 300_000 - 8 * buffer)])
+
     def test_cat_get_and_uri_targets(self):
         """cat and get, rnfs: URI targets (from= and a name), and block()."""
         data = os.urandom(100_000)

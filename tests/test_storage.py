@@ -291,6 +291,36 @@ class PinTest(StorageTest):
         self.storage.unpin(a, FOLDER)
         self.assertEqual(self.storage.pin_count(), 1)
 
+    def test_has_pin(self):
+        """has_pin(cid, source) agrees with pins() through pins, unpins, a failed unpin and a reopen."""
+        a, b = self.add(b"a").cid, self.add(b"b").cid
+        lxmf = "lxmf:" + IDENTITY
+
+        def check(storage):
+            pins = storage.pins()
+            for cid in (a, b):
+                for source in (USER, FOLDER, lxmf):
+                    self.assertEqual(storage.has_pin(cid, source), source in pins.get(cid, set()), (cid, source))
+
+        check(self.storage)
+        self.assertFalse(self.storage.has_pin(a, USER))
+        self.storage.pin(a, USER)
+        self.storage.pin_many([a, b], lxmf)
+        self.assertTrue(self.storage.has_pin(a, lxmf))
+        self.assertFalse(self.storage.has_pin(b, USER))
+        check(self.storage)
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.storage.unpin(b, lxmf)
+        self.assertTrue(self.storage.has_pin(b, lxmf))  # still pinned, as the database says
+        self.storage.unpin(a, USER)
+        self.assertFalse(self.storage.has_pin(a, USER))
+        self.assertTrue(self.storage.has_pin(a, lxmf))
+        self.storage.unpin(b, lxmf)  # its last source: b is no longer pinned at all
+        self.assertFalse(self.storage.has_pin(b, lxmf))
+        check(self.storage)
+        check(self.open())
+
     def test_damaged_state_is_moved_aside(self):
         with open(os.path.join(self.tmp.name, "state", "pins.json"), "w", encoding="utf-8") as f:
             f.write("{not json")

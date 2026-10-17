@@ -7,6 +7,7 @@ import http.client
 import inspect
 import json
 import os
+import re
 import select
 import socket
 import tempfile
@@ -15,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from rnfs import cli, fsutil
+from rnfs import api, cli, features, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import Busy, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
@@ -917,6 +918,33 @@ class ConnectionTest(ApiTestCase):
         self.assertIn(f"{cid}/\\x1b[2J\\n", message)
         self.assertNotIn("\x1b", message)
         self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class RouteTableTest(unittest.TestCase):
+    """ApiHandler.ROUTES, the features' routes and the module docstring's tables agree (ND4)."""
+
+    def test_every_route_names_a_handler_method(self):
+        """ROUTES dispatches by name through getattr, so a typo would only show when that route is requested."""
+        for route, name in ApiHandler.ROUTES.items():
+            with self.subTest(route=route):
+                self.assertTrue(name.startswith("api_"), name)
+                self.assertTrue(callable(getattr(ApiHandler, name, None)), name)
+        self.assertLessEqual(ApiHandler.OPEN_ROUTES | {ApiHandler.PROOF_ROUTE}, set(ApiHandler.ROUTES))
+        for route, handler in features.api_routes().items():
+            with self.subTest(route=route):
+                self.assertTrue(callable(handler))
+                self.assertNotIn(route, ApiHandler.ROUTES)
+
+    def test_docstring_tables_list_every_route(self):
+        """Each (method, path) the docstring's tables list is a route, once, and every route is listed."""
+        documented = []
+        for line in api.__doc__.splitlines():
+            row = re.match(r"\| (GET|POST) +\| (/api/[^|]*?) +\|", line)
+            if row is not None:
+                documented += [(row[1], path) for path in row[2].split(", ")]
+        self.assertEqual(len(documented), len(set(documented)), "a route is listed twice")
+        routes = set(ApiHandler.ROUTES) | set(features.api_routes())
+        self.assertEqual(sorted(documented), sorted(routes))
 
 
 class BindTest(unittest.TestCase):

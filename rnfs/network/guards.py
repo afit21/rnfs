@@ -64,7 +64,7 @@ import RNS
 
 from rnfs import __version__
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_RESPONSE_SIZE
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, plural
+from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, plural
 from rnfs.network import protocol
 
 # Resource data is a 4-byte random hash plus the payload, encrypted as an RNS Token: 16-byte IV, 32-byte HMAC
@@ -182,32 +182,10 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
 PACKET_CHECK_SIZE = RNS.Reticulum.MTU  # response packets larger than RNS's default MTU are checked first
 REFUSAL_LOG_INTERVAL = 60.0  # seconds between log lines about refused responses, after the first
 
-
-class _ThrottledLog:
-    """A log line at most every REFUSAL_LOG_INTERVAL seconds, counting the ones left out, so whoever sends
-    refused responses can't flood the log."""
-
-    def __init__(self, clock=time.monotonic):
-        """Nothing logged yet."""
-        self.clock = clock
-        self.lock = threading.Lock()
-        self.logged_at = None
-        self.skipped = 0
-
-    def __call__(self, message: str, level: int):
-        """Log message at level now, or count it if a line was logged less than REFUSAL_LOG_INTERVAL ago."""
-        with self.lock:
-            now = self.clock()
-            if self.logged_at is not None and now - self.logged_at < REFUSAL_LOG_INTERVAL:
-                self.skipped += 1
-                return
-            skipped, self.skipped, self.logged_at = self.skipped, 0, now
-        log(message + (f" ({plural(skipped, 'more')} since the last)" if skipped else ""), level)
-
-
-_log_refused_response = _ThrottledLog()
-_log_unexpected_response = _ThrottledLog()
-_log_unexpected_request = _ThrottledLog()
+# Whoever sends refused or unexpected responses or requests can't flood the log
+_log_refused_response = ThrottledLog(REFUSAL_LOG_INTERVAL)
+_log_unexpected_response = ThrottledLog(REFUSAL_LOG_INTERVAL)
+_log_unexpected_request = ThrottledLog(REFUSAL_LOG_INTERVAL)
 
 
 def _answer_as_malformed(link, request_id, size: int):

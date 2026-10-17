@@ -103,7 +103,7 @@ def open_sealed(node, fetch, expect: walker.Expect, unlock: bool = True) -> seal
     Raises NotRecipient (unlocking) if the node's identity can't open it, SealError if it is damaged.
     """
     block = fetch.get(expect)
-    if walker.kind_of(expect, block) != "file":
+    if walker.kind_of(expect, block) != walker.FILE_TYPE:
         return None
     stored_size = walker.size_of(expect, block)
     sealed = seal.open_sealed(lambda offset, length: fetch.read_range(expect, offset, length), stored_size)
@@ -185,7 +185,7 @@ def stored_head(node, target: str, length: int, deny: bool = True) -> bytes | No
         if deny:
             get = denying(node, get)
         expect = walker.resolve(root, names, get)
-        if deny and node.deny.hashes and walker.kind_of(expect, get(expect)) == "file":
+        if deny and node.deny.hashes and walker.kind_of(expect, get(expect)) == walker.FILE_TYPE:
             if not expect.cid.is_raw and node.deny.known_hash(expect.cid) is None \
                     and not node.storage.is_complete(expect.cid):
                 # leaf_bytes counts the chunks its file nodes list, so they must all be there to be counted

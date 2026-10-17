@@ -48,7 +48,7 @@ def tearDownModule():
     RNS.loglevel = _saved_loglevel
 
 
-def recall(node_id):
+def recall(node_id, _no_use=False):
     """RNS.Identity.recall as RNS would answer it for the test's node IDs (their announces were heard)."""
     identity_hash = IDENTITIES.get(node_id)
     return None if identity_hash is None else types.SimpleNamespace(hash=identity_hash)

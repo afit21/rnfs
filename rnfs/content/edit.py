@@ -51,7 +51,7 @@ def dir_set(root: Cid, names: list[str], name: str, child: Cid, executable: bool
     dag.check_name(name)
     child_expect = walker.root_expect(child)
     child_block = get(child_expect)
-    if walker.kind_of(child_expect, child_block) == "directory":
+    if walker.kind_of(child_expect, child_block) == walker.DIRECTORY_TYPE:
         if executable:
             raise ValueError("a directory can't be executable")
         kind = dag.KIND_DIRECTORY

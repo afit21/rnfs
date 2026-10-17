@@ -225,9 +225,9 @@ def parse_target(text: str) -> tuple[Cid, list[str]]:
 
 
 def kind_of(expect: Expect, block: bytes) -> str:
-    """"file" or "directory": what the checked block is the root of."""
+    """FILE_TYPE ("file") or DIRECTORY_TYPE ("directory"): what the checked block is the root of."""
     node = decode_checked(expect, block)
-    return "directory" if isinstance(node, (DirectoryNode, IndexNode)) else "file"
+    return DIRECTORY_TYPE if isinstance(node, (DirectoryNode, IndexNode)) else FILE_TYPE
 
 
 def size_of(expect: Expect, block: bytes) -> int:

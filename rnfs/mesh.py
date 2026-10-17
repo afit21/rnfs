@@ -24,6 +24,11 @@ from rnfs.constants import HOUR, RESPONSE_OVERHEAD
 MAX_PEERS = 1000  # peers tracked by Traffic; the least recently active is forgotten beyond this
 MAX_INTERFACES = 64  # interfaces tracked by Traffic, likewise
 STATS_CACHE = 30.0  # seconds a shared instance's interface stats are reused for bitrate lookups
+# Seconds a shared instance's answer for a node's next-hop interface is reused, and how many nodes' answers are
+# kept: each answer is an RPC to the instance, about 41 ms over TCP (macOS, Windows), asked per open link and
+# per provider at the start of every fetch, and per peer by `rnfs peers`
+PATH_CACHE = 15.0
+MAX_CACHED_PATHS = 1024
 PATHFINDER_M = 128  # RNS.Transport.PATHFINDER_M: what hops_to returns for an unknown path
 
 # Why a /blocks request was refused by an airtime control (Traffic.refused keys)
@@ -69,8 +74,9 @@ class RnsPaths:
     """path_info backed by RNS.Transport (or, attached to a shared instance, by its RPC). Thread-safe.
 
     In a shared-instance client, next_hop_interface is the local interface to the shared instance, so the
-    interface name comes from the instance (Reticulum.get_next_hop_if_name) and its bitrate from the
-    instance's interface stats, cached for STATS_CACHE.
+    interface name comes from the instance (Reticulum.get_next_hop_if_name, cached per node for PATH_CACHE) and
+    its bitrate from the instance's interface stats, cached for STATS_CACHE. Whether there is a path, and its
+    hops, are always read fresh (they are local); only the interface may be up to PATH_CACHE old.
     """
 
     def __init__(self, reticulum=None, clock: Callable[[], float] = time.monotonic):
@@ -80,6 +86,13 @@ class RnsPaths:
         self._stats: dict[str, tuple[str, float | None]] = {}  # full name -> (short name, bitrate)
         self._stats_at = -math.inf
         self._lock = threading.Lock()
+        # node ID -> (when asked, the instance's next-hop interface name), oldest first: an entry is moved to
+        # the end when stored, so expired entries and those evicted beyond MAX_CACHED_PATHS are at the front
+        self._names: OrderedDict[bytes, tuple[float, str | None]] = OrderedDict()
+        self._names_lock = threading.Lock()
+        from rnfs.log import ThrottledLog  # here, not at module level: it loads RNS
+        # RNS failing to answer is a bug or an RNS change, asked about per provider and per peer: a line a minute
+        self._failure_log = ThrottledLog()
 
     def info(self, node_id: bytes) -> PathInfo:
         """Hops and next-hop interface of the path to node_id; NO_PATH if RNS has none or fails."""
@@ -89,15 +102,77 @@ class RnsPaths:
                 return NO_PATH
             hops = RNS.Transport.hops_to(node_id)
             hops = hops if isinstance(hops, int) and 0 <= hops < PATHFINDER_M else None
-            reticulum = self.reticulum or RNS.Reticulum.get_instance()
-            if reticulum is not None and getattr(reticulum, "is_connected_to_shared_instance", False):
-                name, bitrate = self._shared_interface(reticulum, reticulum.get_next_hop_if_name(node_id))
+            reticulum = self._shared_instance()
+            if reticulum is not None:
+                name, bitrate = self._shared_interface(reticulum, self._next_hop_name(reticulum, node_id))
             else:
                 interface = RNS.Transport.next_hop_interface(node_id)
                 name, bitrate = interface_label(interface), _bitrate(getattr(interface, "bitrate", None))
             return PathInfo(hops, name, bitrate)
-        except Exception:  # noqa: BLE001 - RNS internals: no path known if they fail
+        except Exception as e:  # noqa: BLE001 - RNS internals: no path known if they fail; logged
+            # Inside the except, so the debug log has the traceback
+            self._failure_log(f"couldn't read the path to {RNS.prettyhexrep(node_id)} from RNS: {e!r}", RNS.LOG_WARNING)
             return NO_PATH
+
+    def infos(self, node_ids: list[bytes]) -> dict[bytes, PathInfo]:
+        """info() of each of node_ids. Attached to a shared instance, the next-hop interfaces not cached are
+        read from one path table RPC (Reticulum.get_path_table) instead of one RPC per node."""
+        import RNS
+        try:
+            reticulum = self._shared_instance()
+            if reticulum is not None:
+                now = self.clock()
+                with self._names_lock:
+                    missing = {node_id for node_id in node_ids if not self._cached(node_id, now)}
+                missing = {node_id for node_id in missing if RNS.Transport.has_path(node_id)}
+                # One RPC either way for a single node: its own answer is the smaller one
+                if len(missing) > 1:
+                    table = reticulum.get_path_table() or []
+                    now = self.clock()
+                    for entry in table:
+                        node_id = entry.get("hash") if isinstance(entry, dict) else None
+                        if node_id in missing:
+                            # The "interface" here is str() of the same path table entry's interface that
+                            # get_next_hop_if_name answers with; a node not in the table is asked on its own
+                            self._remember(node_id, entry.get("interface"), now)
+        except Exception:  # noqa: BLE001 - RNS internals: info() asks node by node if the table fails
+            pass
+        return {node_id: self.info(node_id) for node_id in node_ids}
+
+    def _shared_instance(self):
+        """The Reticulum instance if it is attached to a shared instance (RPC answers paths), else None."""
+        import RNS
+        reticulum = self.reticulum or RNS.Reticulum.get_instance()
+        if reticulum is not None and getattr(reticulum, "is_connected_to_shared_instance", False):
+            return reticulum
+        return None
+
+    def _next_hop_name(self, reticulum, node_id: bytes):
+        """The shared instance's name for node_id's next-hop interface, asked at most once per PATH_CACHE."""
+        with self._names_lock:
+            cached = self._cached(node_id, self.clock())
+        if cached is not None:
+            return cached[1]
+        # Asked outside the lock: an RPC can take 41 ms, and other nodes' cached answers needn't wait for it
+        name = reticulum.get_next_hop_if_name(node_id)
+        self._remember(node_id, name, self.clock())
+        return name
+
+    def _cached(self, node_id: bytes, now: float) -> tuple[float, str | None] | None:
+        """node_id's cached (when, name) if younger than PATH_CACHE, else None. Caller holds _names_lock."""
+        cached = self._names.get(node_id)
+        return cached if cached is not None and now - cached[0] <= PATH_CACHE else None
+
+    def _remember(self, node_id: bytes, name, now: float):
+        """Cache the instance's next-hop interface name for node_id, dropping expired and excess entries."""
+        with self._names_lock:
+            self._names[node_id] = (now, name)
+            self._names.move_to_end(node_id)
+            while self._names:
+                oldest = next(iter(self._names.values()))
+                if len(self._names) <= MAX_CACHED_PATHS and now - oldest[0] <= PATH_CACHE:
+                    break
+                self._names.popitem(last=False)
 
     def _shared_interface(self, reticulum, full_name) -> tuple[str | None, float | None]:
         """(short name, bitrate) of the shared instance's interface called full_name (str(interface))."""
@@ -238,15 +313,6 @@ class TokenBucket:
             self._refill()
             return self.tokens
 
-    def take(self, nbytes: int) -> bool:
-        """Spend nbytes if allowed (see the class). False, spending nothing, if not."""
-        with self.lock:
-            self._refill()
-            if self.tokens >= nbytes or self.tokens >= self.capacity:
-                self.tokens -= nbytes
-                return True
-            return False
-
     def give_back(self, nbytes: int):
         """Return bytes spent on a response that wasn't sent after all."""
         with self.lock:
@@ -307,10 +373,6 @@ class AirtimePolicy:
         if available >= self.bucket.capacity and committed <= 0:
             return limit
         return max(0, min(limit, int(available - committed) - RESPONSE_OVERHEAD))
-
-    def spend(self, nbytes: int) -> bool:
-        """Charge a response of nbytes to the upload budget. False if it must be refused."""
-        return self.bucket is None or self.bucket.take(nbytes)
 
     def reserve(self, nbytes: int, reservation: int, committed: int = 0) -> bool:
         """Admit a response of nbytes, charging reservation of it now (the rest is charged as it is sent).

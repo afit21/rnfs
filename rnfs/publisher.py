@@ -100,6 +100,11 @@ class DhtKey:
         return hash((DhtKey, self.key))
 
 
+# What the publisher provides: a CID, or a feature's DhtKey. Both have .key, hashing, str() and parse(), but only a
+# Cid has .binary or is served, so code that needs those must check (provided() does)
+ProvidedItem = Cid | DhtKey
+
+
 def key_interval(key: bytes, base: float) -> float:
     """The republish interval of DhtKey key: max(base, KEY_MIN_INTERVAL) with key's fixed jitter, below
     PROVIDER_TTL / 2 (base is already below it: Config.validate)."""
@@ -110,12 +115,12 @@ def key_interval(key: bytes, base: float) -> float:
     return min(jittered, max(interval, PROVIDER_TTL / 2 - HOUR))
 
 
-def _parse_item(text: str) -> "Cid | DhtKey":
+def _parse_item(text: str) -> ProvidedItem:
     """A provided item as str() writes it (the published tables' item). Raises ValueError."""
     return DhtKey.parse(text) if isinstance(text, str) and text.startswith(KEY_PREFIX) else Cid.parse(text)
 
 
-def _item(text) -> "Cid | DhtKey":
+def _item(text) -> ProvidedItem:
     """A saved provided item: _parse_item, but only an ID_LENGTH-byte DhtKey. Raises ValueError."""
     item = _parse_item(text)
     if isinstance(item, DhtKey) and len(item.key) != ID_LENGTH:
@@ -215,7 +220,7 @@ class Publisher:
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._wake = threading.Event()
-        self._provided: frozenset[Cid] = frozenset()
+        self._provided: frozenset[ProvidedItem] = frozenset()
         self._served: frozenset[Cid] = frozenset()
         # What _compute last built, and from what, so a refresh that changed nothing needn't build it again: the
         # served set from each provided CID's dag_blocks (memoised by storage, so the same object while its DAG
@@ -227,18 +232,18 @@ class Publisher:
         self._denied_dags: dict[Cid, tuple[frozenset[bytes], frozenset[Cid], bool]] = {}
         # (generation(), deny list's CID set, keys, strategy) of the last full refresh; None: the next computes
         self._inputs: tuple | None = None
-        self._published: dict[Cid, tuple[float, list[bytes]]] = {}  # CID -> (when, nodes that recorded it)
-        # Other nodes that may still hold our record of a CID (earlier rounds' closest nodes, or a round cut
+        self._published: dict[ProvidedItem, tuple[float, list[bytes]]] = {}  # item -> (when, nodes that recorded it)
+        # Other nodes that may still hold our record of an item (earlier rounds' closest nodes, or a round cut
         # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
-        self._earlier: dict[Cid, dict[bytes, float]] = {}
+        self._earlier: dict[ProvidedItem, dict[bytes, float]] = {}
         self._withdrawals: dict[bytes, set[bytes]] = {}  # node -> keys to withdraw from it
-        self._retry_at: dict[Cid, float] = {}  # CIDs whose last lookup found no nodes
+        self._retry_at: dict[ProvidedItem, float] = {}  # items whose last lookup found no nodes
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
         # Changed since the last save (only tracked when persisted): items whose published or earlier rows, and
         # nodes whose withdrawals, save() writes again
-        self._dirty_items: set = set()
+        self._dirty_items: set[ProvidedItem] = set()
         self._dirty_nodes: set = set()
         self._db = None if state_dir is None else statedb.connect(state_dir)
         if self._db is not None:
@@ -259,7 +264,7 @@ class Publisher:
         """Seconds between republishes: republish_interval, 3 days on slow nodes by default."""
         return self.config.effective_republish_interval(self.slow_node)
 
-    def interval_for(self, item: "Cid | DhtKey") -> float:
+    def interval_for(self, item: ProvidedItem) -> float:
         """Seconds between republishes of item: interval for a CID, key_interval for a DhtKey."""
         if isinstance(item, DhtKey):
             return key_interval(item.key, self.interval)
@@ -280,7 +285,7 @@ class Publisher:
         doomed: set = set()  # item texts whose rows are deleted here: they don't parse, or aren't as str() writes
         malformed = 0
 
-        def item_of(text) -> "Cid | DhtKey | None":
+        def item_of(text) -> ProvidedItem | None:
             """The item a row's text names, or None if it doesn't parse (counted and doomed)."""
             nonlocal malformed
             try:
@@ -375,7 +380,7 @@ class Publisher:
         if self._db is not None:
             self._db.close()
 
-    def _touch_item(self, item: "Cid | DhtKey"):
+    def _touch_item(self, item: ProvidedItem):
         """Note that item's published or earlier entry changed, for the next save. Caller holds the lock."""
         if self._db is not None:
             self._dirty_items.add(item)
@@ -411,7 +416,7 @@ class Publisher:
                 log(f"a provided-key source failed: {e!r}", LOG_ERROR)
         return keys
 
-    def _compute(self, keys: set[bytes], denied: frozenset[bytes]) -> tuple[frozenset[Cid], frozenset[Cid]]:
+    def _compute(self, keys: set[bytes], denied: frozenset[bytes]) -> tuple[frozenset[ProvidedItem], frozenset[Cid]]:
         """(provided CIDs and DhtKeys of keys, blocks they reach) from storage, the strategy and denied (the
         deny list's binary CIDs). Lock held.
 
@@ -496,7 +501,7 @@ class Publisher:
         if removed or any(self._is_due(cid, self.clock()) for cid in added):
             self.wake()
 
-    def _provide_again(self, cid: "Cid | DhtKey") -> bool:
+    def _provide_again(self, cid: ProvidedItem) -> bool:
         """cid is provided (again): record ourselves locally and cancel withdrawals of its key still queued;
         True if any were. Lock held.
 
@@ -526,7 +531,7 @@ class Publisher:
         """Make the publish loop look for due work now."""
         self._wake.set()
 
-    def _is_due(self, cid: Cid, now: float) -> bool:
+    def _is_due(self, cid: ProvidedItem, now: float) -> bool:
         """True if cid should be (re)published now (lock held or not; reads are atomic)."""
         retry = self._retry_at.get(cid)
         if retry is not None:
@@ -592,7 +597,7 @@ class Publisher:
                 del closest[cid]
                 self.providers.withdraw(cid.key, self.own_id)
 
-            by_node: dict[bytes, list[Cid]] = {}
+            by_node: dict[bytes, list[ProvidedItem]] = {}
             for cid, nodes in closest.items():
                 for node_id in nodes:
                     by_node.setdefault(node_id, []).append(cid)
@@ -607,7 +612,7 @@ class Publisher:
                     if not self._withdrawals[node_id]:
                         del self._withdrawals[node_id]
                     self._touch_node(node_id)
-        accepted: dict[Cid, list[bytes]] = {cid: [] for cid in closest}
+        accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
         unsaved, saved_at = 0, self.clock()
         for node_id in sorted(set(by_node) | set(withdrawals)):
@@ -646,7 +651,7 @@ class Publisher:
                 self.save()
                 unsaved, saved_at = 0, answered
 
-        unfinished: list[Cid] = []
+        unfinished: list[ProvidedItem] = []
         with self._lock:
             for node_id, keys in sent_withdrawals.items():
                 remaining = self._withdrawals.get(node_id, set()) - keys
@@ -695,12 +700,12 @@ class Publisher:
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values())}
 
-    def _find_closest(self, cid: "Cid | DhtKey") -> list[bytes]:
+    def _find_closest(self, cid: ProvidedItem) -> list[bytes]:
         """Record this node as cid's provider locally, then look up the nodes closest to its key (but this)."""
         self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
         return [n for n in self.make_lookup(cid.key).find_closest() if n != self.own_id]
 
-    def _lookups(self, due: list, should_stop: Callable[[], bool]) -> dict:
+    def _lookups(self, due: list[ProvidedItem], should_stop: Callable[[], bool]) -> dict[ProvidedItem, list[bytes]]:
         """{item: its closest nodes} for due's items whose lookup ran, in due's order, so a round's batches are
         the same however the lookups were run. Called without the lock: refresh() may run meanwhile.
 

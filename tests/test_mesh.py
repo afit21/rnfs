@@ -2,18 +2,21 @@
 seniority, hops and bitrate; the upload budget, interface rules and quiet hours on /blocks; traffic counters
 and `rnfs peers` on an offline node."""
 import os
+import sys
 import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 import RNS
 
-from rnfs import mesh
+from rnfs import log, mesh
 from rnfs.config import Config
 from rnfs.constants import BLOCKS_PATH, FIND_PATH, KIB, MAX_RESPONSE_SIZE
 from rnfs.features import peers as peers_feature
 from rnfs.network import protocol, server
+from rnfs.network.announces import DhtAnnounceHandler, encode_mode
 from rnfs.network.client import BUSY, FAILED, OK, BlocksResult, PeerClient
 from rnfs.node import RnfsNode
 from tests.support import FakeClock
@@ -22,6 +25,14 @@ from tests.test_names import FakeNetwork
 from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource, block_of
 
 P1, P2, P3, P4 = (bytes([i]) * 16 for i in (1, 2, 3, 4))
+
+
+def recorder(logged: list):
+    """A stand-in for rnfs.log.log appending (message, level, the type of the exception being handled) to logged."""
+    def record(message, level=log.LOG_INFO):
+        """Record the line and whether it was logged inside an except."""
+        logged.append((message, level, sys.exc_info()[0]))
+    return record
 
 _saved_loglevel = RNS.loglevel
 
@@ -102,6 +113,36 @@ class FetcherOrderTest(FetcherTest):
         probed = {node for node, _ in self.client.requests[:2]}
         self.assertEqual(probed, {P3, P1})  # P2's path is unknown: last
 
+    def test_open_links_paths_looked_up_together(self):
+        """The open links' paths come from one path_infos call (one RPC on a shared instance), ranked as one by one;
+        a node it doesn't answer for falls back to path_info, and a failing path_infos to path_info alone."""
+        self.config.max_parallel_providers = 2
+        self.client.links = [P1, P2, P3]
+        one_by_one = paths({P1: (3, None), P3: (1, 9600)})
+        calls = []
+
+        def together(node_ids):
+            """path_infos, answering for all but P3."""
+            calls.append(list(node_ids))
+            return {node_id: one_by_one(node_id) for node_id in node_ids if node_id != P3}
+
+        self.fetcher.path_info = one_by_one
+        self.fetcher.path_infos = together
+        self.fetch_all(self.block.cid)
+        self.assertEqual(calls, [[P1, P2, P3]])
+        self.assertEqual({node for node, _ in self.client.requests[:2]}, {P3, P1})
+
+    def test_path_infos_errors_fall_back_to_path_info(self):
+        def broken(node_ids):
+            """A batch lookup that fails."""
+            raise RuntimeError("no RNS")
+        self.config.max_parallel_providers = 2
+        self.client.links = [P1, P2, P3]
+        self.fetcher.path_info = paths({P1: (3, None), P3: (1, 9600)})
+        self.fetcher.path_infos = broken
+        self.fetch_all(self.block.cid)
+        self.assertEqual({node for node, _ in self.client.requests[:2]}, {P3, P1})
+
     def test_path_info_errors_mean_unknown(self):
         def broken(node_id):
             """A lookup that fails."""
@@ -112,18 +153,147 @@ class FetcherOrderTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(self.block.cid))
 
 
+HUB = "TCPInterface[Hub/10.0.0.1:4242]"
+RADIO = "RNodeInterface[LoRa]"
+
+
+class FakeInstance:
+    """A Reticulum attached to a shared instance: path answers come by RPC, counted in calls."""
+
+    is_connected_to_shared_instance = True
+
+    def __init__(self, names: dict):
+        """The instance's next-hop interface name per node ({node_id: str(interface)})."""
+        self.names = names
+        self.calls = {"next_hop": 0, "path_table": 0, "stats": 0}
+        self.table_fails = False
+
+    def get_next_hop_if_name(self, node_id: bytes) -> str:
+        """One RPC: str() of the next-hop interface, "None" for a node the instance has no path to."""
+        self.calls["next_hop"] += 1
+        return self.names.get(node_id, "None")
+
+    def get_path_table(self, max_hops=None) -> list[dict]:
+        """One RPC: the instance's whole path table."""
+        self.calls["path_table"] += 1
+        if self.table_fails:
+            raise ConnectionError("rpc failed")
+        return [{"hash": node_id, "timestamp": 0, "via": b"\0" * 16, "hops": 2, "expires": 0, "interface": name}
+                for node_id, name in self.names.items()]
+
+    def get_interface_stats(self) -> dict:
+        """One RPC: the instance's interfaces."""
+        self.calls["stats"] += 1
+        return {"interfaces": [{"name": HUB, "short_name": "Hub", "bitrate": 10_000_000},
+                               {"name": RADIO, "short_name": "LoRa", "bitrate": 1200}]}
+
+
+class RnsPathsTest(unittest.TestCase):
+    """RnsPaths attached to a shared instance: next-hop interfaces cached for at most PATH_CACHE (C1)."""
+
+    def setUp(self):
+        """Local paths to P1-P3 (P4 has none), and an instance knowing P1 and P2's interfaces."""
+        self.local = {P1: 1, P2: 3, P3: 2}  # node -> hops in this process's own path table
+        for name, fake in (("has_path", lambda node_id: node_id in self.local),
+                           ("hops_to", lambda node_id: self.local.get(node_id, mesh.PATHFINDER_M))):
+            patcher = mock.patch.object(RNS.Transport, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.instance = FakeInstance({P1: HUB, P2: RADIO})
+        self.clock = FakeClock()
+        self.paths = mesh.RnsPaths(self.instance, clock=self.clock)
+
+    def test_info(self):
+        self.assertEqual(self.paths.info(P1), mesh.PathInfo(1, "Hub", 10_000_000.0))
+        self.assertEqual(self.paths.info(P2), mesh.PathInfo(3, "LoRa", 1200.0))
+        self.assertEqual(self.paths.info(P3), mesh.PathInfo(2, None, None))  # the instance has no path
+        self.assertEqual(self.paths.info(P4), mesh.NO_PATH)
+        self.assertEqual(self.instance.calls["next_hop"], 3)  # none for P4: no local path, no question
+
+    def test_rns_failure_logged_with_its_traceback(self):
+        """RNS failing to answer is a bug or an RNS change: logged at LOG_WARNING inside the except (so the debug
+        log has the traceback), at most once a minute; the path is unknown."""
+        self.paths._failure_log = log.ThrottledLog(60.0, self.clock)
+        logged = []
+        with mock.patch.object(RNS.Transport, "has_path", side_effect=TypeError("renamed")), \
+                mock.patch("rnfs.log.log", recorder(logged)):
+            self.assertEqual(self.paths.info(P1), mesh.NO_PATH)
+            self.assertEqual(self.paths.info(P2), mesh.NO_PATH)
+        self.assertEqual([(level, raised) for _, level, raised in logged], [(RNS.LOG_WARNING, TypeError)])
+        self.assertIn("renamed", logged[0][0])
+
+    def test_interface_reused_for_at_most_path_cache(self):
+        self.paths.info(P1)
+        self.instance.names[P1] = RADIO  # the path moved to another interface
+        self.clock.now += mesh.PATH_CACHE
+        self.assertEqual(self.paths.info(P1).interface, "Hub")  # stale, within PATH_CACHE
+        self.assertEqual(self.instance.calls["next_hop"], 1)
+        self.clock.now += 0.001
+        self.assertEqual(self.paths.info(P1).interface, "LoRa")  # never older than PATH_CACHE
+        self.assertEqual(self.instance.calls["next_hop"], 2)
+
+    def test_path_and_hops_always_fresh(self):
+        self.paths.info(P1)
+        self.local[P1] = 4
+        self.assertEqual(self.paths.info(P1).hops, 4)
+        del self.local[P1]
+        self.assertEqual(self.paths.info(P1), mesh.NO_PATH)
+        self.assertEqual(self.instance.calls["next_hop"], 1)
+
+    def test_cache_bounded(self):
+        many = [bytes([5, i]) * 8 for i in range(20)]
+        self.local.update(dict.fromkeys(many, 1))
+        with mock.patch.object(mesh, "MAX_CACHED_PATHS", 8):
+            for node_id in many:
+                self.paths.info(node_id)
+            self.assertEqual(len(self.paths._names), 8)
+            self.assertEqual(list(self.paths._names), many[-8:])  # the oldest are forgotten first
+            self.clock.now += mesh.PATH_CACHE + 1
+            self.paths.info(P1)
+            self.assertEqual(list(self.paths._names), [P1])  # expired entries are dropped too
+
+    def test_infos_reads_one_path_table(self):
+        ids = [P1, P2, P3, P4]
+        expected = {node_id: mesh.RnsPaths(FakeInstance(dict(self.instance.names))).info(node_id) for node_id in ids}
+        self.assertEqual(self.paths.infos(ids), expected)
+        # P3 has a local path the instance's table lacks: asked on its own, as info() would
+        self.assertEqual(self.instance.calls, {"next_hop": 1, "path_table": 1, "stats": 1})
+        self.assertEqual(self.paths.infos(ids), expected)
+        self.assertEqual(self.instance.calls, {"next_hop": 1, "path_table": 1, "stats": 1})  # all cached
+        self.clock.now += mesh.PATH_CACHE + 1
+        self.instance.names[P1] = RADIO
+        self.assertEqual(self.paths.infos(ids)[P1].interface, "LoRa")
+        self.assertEqual(self.instance.calls["path_table"], 2)
+
+    def test_infos_without_the_table_asks_each_node(self):
+        self.instance.table_fails = True
+        self.assertEqual(self.paths.infos([P1, P2, P4]),
+                         {P1: mesh.PathInfo(1, "Hub", 10_000_000.0), P2: mesh.PathInfo(3, "LoRa", 1200.0),
+                          P4: mesh.NO_PATH})
+        self.assertEqual(self.instance.calls["next_hop"], 2)
+
+    def test_own_transport_needs_no_rpc(self):
+        interface = types.SimpleNamespace(name="LoRa", bitrate=1200)
+        self.instance.is_connected_to_shared_instance = False
+        with mock.patch.object(RNS.Transport, "next_hop_interface", lambda node_id: interface):
+            self.assertEqual(self.paths.infos([P1, P2]), {P1: mesh.PathInfo(1, "LoRa", 1200.0),
+                                                         P2: mesh.PathInfo(3, "LoRa", 1200.0)})
+        self.assertEqual(self.instance.calls, {"next_hop": 0, "path_table": 0, "stats": 0})
+
+
 # Airtime policy
 
 class TokenBucketTest(unittest.TestCase):
-    """Continuous refill; a response goes if the bucket holds its size or is full."""
+    """Continuous refill; a response goes if the bucket holds its size (beyond what is committed) or is full."""
 
-    def test_spend_and_refill(self):
+    def test_reserve_and_refill(self):
         clock = FakeClock()
         bucket = mesh.TokenBucket(3600, 3600, clock)  # 1 byte/s
-        self.assertTrue(bucket.take(3000))
-        self.assertFalse(bucket.take(1000))  # 600 left
+        self.assertTrue(bucket.reserve(3000, 3000))
+        self.assertFalse(bucket.reserve(1000, 1000))  # 600 left
+        self.assertAlmostEqual(bucket.available(), 600)  # a refusal spends nothing
         clock.now += 400
-        self.assertTrue(bucket.take(1000))
+        self.assertTrue(bucket.reserve(1000, 1000))
         self.assertAlmostEqual(bucket.available(), 0)
         clock.now += 10_000
         self.assertEqual(bucket.available(), 3600)  # never above capacity
@@ -131,28 +301,55 @@ class TokenBucketTest(unittest.TestCase):
     def test_large_response_allowed_when_full(self):
         clock = FakeClock()
         bucket = mesh.TokenBucket(1000, 3600, clock)
-        self.assertTrue(bucket.take(5000))  # bigger than the whole budget, but the bucket was full
+        self.assertTrue(bucket.reserve(5000, 5000))  # bigger than the whole budget, but the bucket was full
         self.assertLess(bucket.available(), 0)
-        self.assertFalse(bucket.take(1))  # in debt
+        self.assertFalse(bucket.reserve(1, 1))  # in debt
         clock.now += 3600 * 4.9
-        self.assertFalse(bucket.take(1000))
+        self.assertFalse(bucket.reserve(1000, 1000))
         clock.now += 3600 * 1.2
-        self.assertTrue(bucket.take(5000))  # full again
+        self.assertTrue(bucket.reserve(5000, 5000))  # full again
+
+    def test_reservation_then_charges(self):
+        """Admitted on its whole size, a response is charged only its reservation up front, then as it is sent,
+        into debt if need be."""
+        clock = FakeClock()
+        bucket = mesh.TokenBucket(1000, 3600, clock)
+        self.assertTrue(bucket.reserve(800, 100))
+        self.assertEqual(bucket.available(), 900)
+        bucket.charge(700)
+        self.assertEqual(bucket.available(), 200)
+        bucket.charge(500)
+        self.assertEqual(bucket.available(), -300)
+        self.assertFalse(bucket.reserve(1, 1))
+
+    def test_committed_counts_as_gone(self):
+        clock = FakeClock()
+        bucket = mesh.TokenBucket(1000, 3600, clock)
+        self.assertFalse(bucket.reserve(100, 10, committed=950))  # full, but others are owed most of it
+        self.assertEqual(bucket.available(), 1000)
+        self.assertTrue(bucket.reserve(5000, 10, committed=0))  # full and nothing owed: any one response
+        self.assertEqual(bucket.available(), 990)
+        self.assertFalse(bucket.reserve(50, 10, committed=950))
+        self.assertTrue(bucket.reserve(40, 10, committed=950))
 
     def test_give_back(self):
         clock = FakeClock()
         bucket = mesh.TokenBucket(1000, 3600, clock)
-        bucket.take(800)
+        bucket.reserve(800, 800)
         bucket.give_back(800)
         self.assertEqual(bucket.available(), 1000)
+        bucket.reserve(800, 100)
+        bucket.charge(700)
+        bucket.give_back(5000)
+        self.assertEqual(bucket.available(), 1000)  # never above capacity
 
     def test_thread_safe(self):
         bucket = mesh.TokenBucket(10_000, 1e12)
         taken = []
 
         def spend():
-            """Take 1 byte many times."""
-            taken.append(sum(bucket.take(1) for _ in range(5000)))
+            """Reserve 1 byte many times."""
+            taken.append(sum(bucket.reserve(1, 1) for _ in range(5000)))
 
         threads = [threading.Thread(target=spend) for _ in range(4)]
         for thread in threads:
@@ -224,7 +421,9 @@ class AirtimePolicyTest(unittest.TestCase):
         policy = mesh.AirtimePolicy(Config())
         self.assertIsNone(policy.refusal([]))
         self.assertEqual(policy.limit(12345), 12345)
-        self.assertTrue(policy.spend(10**12))
+        self.assertTrue(policy.reserve(10**12, 10**12, committed=10**12))
+        policy.charge(10**12)
+        policy.refund(10**12)
         self.assertIsNone(policy.remaining())
 
     def test_quiet_hours(self):
@@ -238,12 +437,32 @@ class AirtimePolicyTest(unittest.TestCase):
         clock = FakeClock()
         policy = mesh.AirtimePolicy(Config(upload_budget=100 * KIB), clock)
         self.assertEqual(policy.limit(500 * KIB), 500 * KIB)  # full: any one response may go
-        self.assertTrue(policy.spend(60 * KIB))
+        self.assertTrue(policy.reserve(60 * KIB, 60 * KIB))
         self.assertEqual(policy.limit(500 * KIB), 40 * KIB - 1 * KIB)  # what's left, less framing room
-        self.assertTrue(policy.spend(40 * KIB))
+        self.assertEqual(policy.limit(500 * KIB, committed=10 * KIB), 30 * KIB - 1 * KIB)  # less what's owed
+        self.assertFalse(policy.reserve(41 * KIB, 41 * KIB))
+        self.assertTrue(policy.reserve(40 * KIB, 40 * KIB))
+        self.assertEqual(policy.remaining(), 0)
         self.assertEqual(policy.refusal([]), mesh.REFUSED_BUDGET)
         clock.now += 36  # 1% of an hour
         self.assertIsNone(policy.refusal([]))
+
+    def test_reserve_charge_refund(self):
+        """A response is admitted on its whole size, charged its reservation, then as it is sent; what wasn't
+        sent is refunded."""
+        clock = FakeClock()
+        policy = mesh.AirtimePolicy(Config(upload_budget=100 * KIB), clock)
+        self.assertTrue(policy.reserve(60 * KIB, 1 * KIB))
+        self.assertEqual(policy.remaining(), 99 * KIB)
+        policy.charge(29 * KIB)
+        self.assertEqual(policy.remaining(), 70 * KIB)
+        policy.charge(0)
+        policy.charge(-5)  # nothing: only what was sent is charged
+        self.assertEqual(policy.remaining(), 70 * KIB)
+        policy.refund(10 * KIB)
+        self.assertEqual(policy.remaining(), 80 * KIB)
+        self.assertFalse(policy.reserve(50 * KIB, 1 * KIB, committed=40 * KIB))  # 80 KiB less 40 KiB owed
+        self.assertEqual(policy.remaining(), 80 * KIB)  # refused: nothing charged
 
     def test_validate(self):
         for settings in ({"upload_budget": 0}, {"upload_budget": True}, {"upload_budget": 1.5},
@@ -339,7 +558,7 @@ class ServerAirtimeTest(unittest.TestCase):
 
     def test_missing_blocks_cost_nothing(self):
         srv = self.make_server(upload_budget=150 * KIB)
-        srv.airtime.bucket.take(149 * KIB)
+        srv.airtime.bucket.charge(149 * KIB)
         answer = self.ask(BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, [block_of(10, 99)[0]]),
                           self.connect())
         self.assertEqual(protocol.parse_blocks_response(answer, 1), [None])
@@ -438,6 +657,77 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertIsNone(listed[P1.hex()]["hops"])  # offline: no paths known
         lines = peers_feature.format_peers(list(listed.values()), 0)
         self.assertEqual(len(lines), 5)
+
+    def test_listing_failures_logged_with_their_traceback(self):
+        """What a listing can't read is left out and logged at LOG_WARNING inside the except (so the debug log has
+        the traceback), at most once a minute for the feature."""
+        clock = FakeClock()
+        self.feature._failure_log = log.ThrottledLog(60.0, clock)
+        logged = []
+
+        def broken(*args):
+            """A bug or an RNS change."""
+            raise TypeError("renamed")
+        self.node.client.open_links = broken
+        with mock.patch("rnfs.log.log", recorder(logged)):
+            self.assertEqual(self.feature.peers(), [])
+            self.feature.peers()  # within the minute: counted, not logged
+        self.assertEqual([(level, raised) for _, level, raised in logged], [(RNS.LOG_WARNING, TypeError)])
+        self.assertIn("open links", logged[0][0])
+        del self.node.client.open_links
+        self.node.client.rate_estimate = broken
+        clock.now += 60
+        with mock.patch("rnfs.log.log", recorder(logged)):
+            (listed,) = self.feature.peers()
+        self.assertIsNone(listed["rate"])
+        self.assertEqual([(level, raised) for _, level, raised in logged[1:]], [(RNS.LOG_WARNING, TypeError)])
+        self.assertIn("rate estimate", logged[1][0])
+        self.assertIn("(1 more since the last)", logged[1][0])
+
+    def test_paths_from_one_lookup(self):
+        asked = []
+
+        class Paths:
+            """RnsPaths' bulk lookup, recording what it is asked."""
+
+            def infos(self, node_ids):
+                """A path to P1 only."""
+                asked.append(list(node_ids))
+                return {node_id: mesh.PathInfo(2, "LoRa", 1200.0) if node_id == P1 else mesh.NO_PATH
+                        for node_id in node_ids}
+        self.node.paths = Paths()
+        self.node.routing.heard(P1)
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        self.assertEqual(asked, [[P1, P3]])
+        self.assertEqual([listed[P1.hex()][key] for key in ("hops", "interface", "bitrate")], [2, "LoRa", 1200.0])
+        self.assertIsNone(listed[P3.hex()]["hops"])
+        self.assertEqual(list(listed), [P1.hex(), P3.hex()])  # nearest first
+
+    def test_announces_counted_once_by_the_node(self):
+        # S8: the node's rnfs.dht announce handler counts each announce; the feature registers none of its own
+        self.node.reticulum = object()
+        self.addCleanup(setattr, self.node, "reticulum", None)
+        with mock.patch.object(RNS.Transport, "register_announce_handler") as register:
+            self.feature.start()
+        register.assert_not_called()
+        handler = DhtAnnounceHandler(self.node._heard_server, self.node._heard_client, self.node.routing.is_banned,
+                                     self.node.node_id)  # as RnfsNode._start_network wires it
+        self.node.routing.ban(P4)
+        with mock.patch.object(self.feature.traffic, "heard", wraps=self.feature.traffic.heard) as heard:
+            for node_id, server in ((P1, True), (P2, False), (P4, True), (OWN, True)):
+                handler.received_announce(node_id, None, encode_mode(server))
+        self.assertEqual(heard.call_args_list, [mock.call(P1, "server"), mock.call(P2, "client")])
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        self.assertEqual((listed[P1.hex()]["mode"], listed[P1.hex()]["in_table"]), ("server", True))
+        self.assertEqual((listed[P2.hex()]["mode"], listed[P2.hex()]["in_table"]), ("client", False))
+        self.assertIsNotNone(listed[P2.hex()]["last_heard"])
+
+    def test_recalled_mode_doesnt_mark_used(self):
+        # A listing is a check, not a contact (C2)
+        self.node.reticulum = object()
+        with mock.patch.object(RNS.Identity, "recall_app_data", return_value=None) as recall:
+            self.assertIsNone(self.feature._recalled_mode(P1))
+        recall.assert_called_once_with(P1, _no_use=True)
 
     def test_status_and_stats(self):
         status = self.node.status()
