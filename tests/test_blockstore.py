@@ -1,4 +1,5 @@
 """Tests for BlockStore: one verified, atomically written file per CID (specification section 8)."""
+import base64
 import os
 import tempfile
 import unittest
@@ -121,6 +122,20 @@ class BlockStoreTest(unittest.TestCase):
         self.assertEqual(list(store.scan()), [])
         self.assertEqual(sorted(os.listdir(self.tmp.name)), sorted(["notes.txt", HELLO_WORLD.upper()]))
 
+
+    def test_scan_names_blocks_by_their_canonical_cids_only(self):
+        raw, node = Cid.for_block(RAW, b"leaf"), Cid.for_block(DAG, b"node")
+        self.store.put(raw, b"leaf")
+        self.store.put(node, b"node")
+        alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+        spare_bits_set = str(raw)[:-1] + alphabet[alphabet.index(str(raw)[-1]) + 1]  # parse() refuses it
+        dag_pb = "b" + base64.b32encode(bytes([1, 0x70, 0x12, 0x20]) + bytes(32)).decode().lower().rstrip("=")
+        for name in (spare_bits_set, dag_pb, str(raw) + "=", "b" + str(node)[1:].upper()):
+            open(os.path.join(self.tmp.name, name), "wb").close()
+        scanned = sorted(BlockStore(self.tmp.name).scan())
+        self.assertEqual(scanned, sorted([(raw, 4), (node, 4)]))
+        self.assertEqual(sorted(str(cid) for cid, _ in scanned), sorted([str(raw), str(node)]))
+        self.assertEqual({cid.codec for cid, _ in scanned}, {RAW, DAG})
 
 if __name__ == "__main__":
     unittest.main()

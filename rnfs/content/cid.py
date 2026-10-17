@@ -10,6 +10,7 @@ one written form.
 """
 import base64
 import hashlib
+import re
 
 from rnfs.constants import ID_LENGTH
 
@@ -21,12 +22,30 @@ _PREFIXES = {
     DAG: bytes([0x01, 0x80, 0x80, 0xC0, 0x01, 0x12, 0x20]),  # codec 0x300000, multicodec private use
 }
 _DIGEST_LENGTH = 32
+_BASE32 = "abcdefghijklmnopqrstuvwxyz234567"  # RFC 4648, lowercase as written
+_TO_INT_DIGITS = str.maketrans(_BASE32, "0123456789abcdefghijklmnopqrstuv")  # the same values as int(..., 32) reads
+
+
+def _written_form(prefix: bytes) -> tuple[int, int, str]:
+    """(length, spare bits, regular expression) of the canonical written form of the CIDs with prefix: "b", then
+    lowercase base32 digits, the final one's spare bits (past the binary's last) zero, as encoding leaves them."""
+    bits = (len(prefix) + _DIGEST_LENGTH) * 8
+    digits = -(-bits // 5)
+    spare_bits = digits * 5 - bits
+    last = "".join(c for value, c in enumerate(_BASE32) if value % (1 << spare_bits) == 0)
+    return 1 + digits, spare_bits, f"b[a-z2-7]{{{digits - 1}}}[{last}]"
+
+
+# For from_block_name(): every canonical written form (but for the prefix), and written length -> (prefix, spare bits)
+_FORMS = {prefix: _written_form(prefix) for prefix in _PREFIXES.values()}
+_CANONICAL = re.compile("|".join(pattern for _, _, pattern in _FORMS.values()))
+_WRITTEN = {length: (prefix, spare_bits) for prefix, (length, spare_bits, _) in _FORMS.items()}
 
 
 class Cid:
     """A valid CID. Immutable and hashable; compare and use as dict keys freely.
 
-    Build one with Cid.for_block(codec, block), Cid.from_bytes(binary) or Cid.parse(text).
+    Build one with Cid.for_block(codec, block), Cid.from_bytes(binary) or Cid.parse(text) (or from_block_name).
     Every constructor raises ValueError for anything that isn't a valid CID.
     """
 
@@ -69,6 +88,23 @@ class Cid:
         cid = cls.from_bytes(binary)
         if str(cid) != text:
             raise ValueError(f"invalid CID {text!r}: not in canonical form (lowercase, unpadded)")
+        return cid
+
+    @classmethod
+    def from_block_name(cls, name: str) -> "Cid":
+        """The CID whose written form is name, a file name read from the block directory. Accepts exactly what
+        parse() accepts and raises ValueError for the rest, but checks the canonical form without re-encoding,
+        and keeps name as str(): opening a store scans every block's name. API and wire input use parse()."""
+        if not isinstance(name, str) or not _CANONICAL.fullmatch(name):
+            raise ValueError(f"invalid CID {name!r}: not in canonical form")
+        prefix, spare_bits = _WRITTEN[len(name)]
+        # The digits are known to be base32 here, so int() decodes them (far faster than b32decode)
+        value = int(name[1:].translate(_TO_INT_DIGITS), 32) >> spare_bits
+        binary = value.to_bytes(len(prefix) + _DIGEST_LENGTH, "big")
+        if not binary.startswith(prefix):
+            raise ValueError(f"invalid CID {name!r}: not a raw or rnfs-dag CID")
+        cid = cls(binary)
+        cid._text = name
         return cid
 
     @property

@@ -17,7 +17,9 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   `close()`).
 - `rnfs/content/cid.py` — `Cid` (binary form `.binary`, `.codec` `RAW`/`DAG`, `.key` DHT key, `.verify(block)`,
   `str()` written form, `Cid.parse`, `Cid.from_bytes`, `Cid.for_block`). Code passes `Cid` objects everywhere;
-  strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire.
+  strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire. `Cid.from_block_name` is the
+  block store's scan at startup: it accepts exactly what `parse` accepts, but checks the canonical form with one
+  regular expression and decodes with `int(..., 32)` instead of re-encoding, keeping the name as the written form.
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
   `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set
@@ -251,6 +253,9 @@ the next one back a further backoff, so concurrent lookups don't all retry it), 
 min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
 dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
 `nodes()`, `node_count()`, `live_count()` (nodes `/find` replies would include).
+Every `heard` forgets expired bans and dropped nodes' seniority, looking only at the front of each: both are kept
+in expiry order (an entry set again is moved to the end), and their readers check expiry too, so an entry out of
+order (after a clock step or a changed setting) only lingers in memory.
 
 `providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
 max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,

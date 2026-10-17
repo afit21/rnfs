@@ -3,6 +3,7 @@ import base64
 import copy
 import hashlib
 import pickle
+import random
 import unittest
 
 from RNS.vendor import umsgpack
@@ -18,6 +19,30 @@ EMPTY = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
 def written(binary: bytes) -> str:
     """binary as "b" + lowercase unpadded base32, without checking it."""
     return "b" + base64.b32encode(binary).decode().lower().rstrip("=")
+
+
+def malformed() -> dict[str, object]:
+    """Reason -> a value that is not a valid written CID."""
+    digest = bytes(32)
+    return {
+        "not a string": b"bafk",
+        "wrong multibase": "z" + HELLO_WORLD[1:],
+        "empty": "",
+        "too short": "bae",
+        "truncated": HELLO_WORLD[:-4],
+        "not base32": "b!!!!",
+        "non-ascii": "bafkreié",
+        "padded": HELLO_WORLD + "====",
+        "uppercase": HELLO_WORLD.upper(),
+        "uppercase body": "b" + HELLO_WORLD[1:].upper(),
+        "unused bits set": HELLO_WORLD[:-1] + chr(ord(HELLO_WORLD[-1]) + 1),
+        "CIDv0-like version": written(bytes([0, 0x55, 0x12, 0x20]) + digest),
+        "dag-pb codec": written(bytes([1, 0x70, 0x12, 0x20]) + digest),
+        "wrong hash": written(bytes([1, 0x55, 0x13, 0x20]) + digest),
+        "short digest": written(bytes([1, 0x55, 0x12, 0x20]) + digest[:31]),
+        "long digest": written(bytes([1, 0x55, 0x12, 0x20]) + digest + b"\0"),
+        "dag codec, raw length": written(bytes.fromhex("018080c0011220") + digest[:29]),
+    }
 
 
 class CidTest(unittest.TestCase):
@@ -85,25 +110,7 @@ class CidTest(unittest.TestCase):
 
     def test_rejects_malformed(self):
         digest = bytes(32)
-        bad = {
-            "not a string": b"bafk",
-            "wrong multibase": "z" + HELLO_WORLD[1:],
-            "empty": "",
-            "too short": "bae",
-            "truncated": HELLO_WORLD[:-4],
-            "not base32": "b!!!!",
-            "non-ascii": "bafkreié",
-            "padded": HELLO_WORLD + "====",
-            "uppercase": HELLO_WORLD.upper(),
-            "uppercase body": "b" + HELLO_WORLD[1:].upper(),
-            "unused bits set": HELLO_WORLD[:-1] + chr(ord(HELLO_WORLD[-1]) + 1),
-            "CIDv0-like version": written(bytes([0, 0x55, 0x12, 0x20]) + digest),
-            "dag-pb codec": written(bytes([1, 0x70, 0x12, 0x20]) + digest),
-            "wrong hash": written(bytes([1, 0x55, 0x13, 0x20]) + digest),
-            "short digest": written(bytes([1, 0x55, 0x12, 0x20]) + digest[:31]),
-            "long digest": written(bytes([1, 0x55, 0x12, 0x20]) + digest + b"\0"),
-            "dag codec, raw length": written(bytes.fromhex("018080c0011220") + digest[:29]),
-        }
+        bad = malformed()
         for reason, value in bad.items():
             with self.subTest(reason):
                 with self.assertRaises(ValueError):
@@ -114,6 +121,45 @@ class CidTest(unittest.TestCase):
             with self.subTest(reason):
                 with self.assertRaises(ValueError):
                     Cid.from_bytes(binary)
+
+    def test_from_block_name_accepts_exactly_what_parse_accepts(self):
+        # The block-directory scan's cheaper check (S2) must agree with parse() on every name, valid or not
+        rng = random.Random(4)
+        valid = [str(Cid.for_block(codec, bytes([i]))) for codec in (RAW, DAG) for i in range(4)]
+        names = list(valid) + list(malformed().values()) + [None, 1, HELLO_WORLD.encode()]
+        # One digit replaced: by base32 digits (most of which set spare bits in the final digit), by other ASCII,
+        # and by non-ASCII whose upper() is ASCII ("ı" -> "I", "ſ" -> "S")
+        pool = cid_module._BASE32 + cid_module._BASE32.upper() + "0189=_ -!\n" + "ıſéK"
+        for name in valid[::3]:
+            for i in range(len(name)):
+                names += [name[:i] + c + name[i + 1:] for c in pool]
+        for name in valid:
+            names += [name[:-1], name + "a", name + "=", name + "\n", " " + name, name[:-1] + "=", name[1:]]
+        # Random binaries of every length near a CID's, most with a wrong prefix, and the prefixes one bit off
+        for length in range(30, 45):
+            names += [written(rng.randbytes(length)) for _ in range(20)]
+        for prefix in cid_module._PREFIXES.values():
+            for bit in range(len(prefix) * 8):
+                flipped = (int.from_bytes(prefix, "big") ^ (1 << bit)).to_bytes(len(prefix), "big")
+                names.append(written(flipped + rng.randbytes(32)))
+            names += [written(prefix + rng.randbytes(32)) for _ in range(50)]
+        accepted = 0
+        for name in names:
+            with self.subTest(name=name):
+                try:
+                    expected = Cid.parse(name)
+                except ValueError:
+                    with self.assertRaises(ValueError):
+                        Cid.from_block_name(name)
+                    continue
+                cid = Cid.from_block_name(name)
+                accepted += 1
+                self.assertEqual(cid, expected)
+                self.assertEqual((cid.binary, cid.codec, str(cid), cid.key), (expected.binary, expected.codec,
+                                                                              str(expected), expected.key))
+                self.assertIs(str(cid), name)  # kept as the written form, not encoded again
+        self.assertGreater(accepted, 100)  # both outcomes were exercised
+        self.assertGreater(len(names) - accepted, 1000)
 
     def test_ordering(self):
         a, b = sorted([Cid.for_block(RAW, b"1"), Cid.for_block(RAW, b"2")])
