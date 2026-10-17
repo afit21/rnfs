@@ -782,7 +782,11 @@ and repeat.
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
 old pin. Unlike `add`, a scan MUST skip (with a log line) a regular file that has other hard links, at the
 top level and inside shared directories: it is also a file elsewhere, which whoever may write to the folder
-could have linked in. It is imported at the next scan after its other links are gone.
+could have linked in. It is imported at the next scan after its other links are gone. `files/` may be a
+symlink, but a scan MUST NOT import from a folder that resolves, as opened, to the rnfs dir, to a directory
+holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, which hold the node's keys and state:
+rnfs logs a warning (once, while it stays so), imports nothing and keeps the folder's pins. rnfs also warns, once,
+when a directory above the folder can be changed by other users, who could replace the folder with another.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,

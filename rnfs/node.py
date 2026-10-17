@@ -533,7 +533,7 @@ class RnfsNode:
         self.deny = denylist.DenyList(config.state_dir)
         self.storage.deny = self.deny
         self.deny.reload(self._read_deny_list)
-        self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
+        self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
         self.fetcher = Fetcher(self.storage, client, config, node_id, self.routing, self._lookup, slow,
                                config.state_dir, after_store=self._enforce_storage, make_room=self._make_room)

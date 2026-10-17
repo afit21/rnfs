@@ -1175,6 +1175,14 @@ Everything in the specification is implemented, with these simplifications and a
   inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. The scan (not `add`)
   skips regular files whose opened descriptor has `st_nlink > 1` (`builder.hard_links`, `build_open`'s
   `skip_hard_links`); such a file's signature is marked, so it is imported once its other links are gone.
+- Each scan resolves the shared folder it opened (`shared_folder.opened_path`: `fsutil.final_path` of its
+  descriptor, the path walk's checked root, or else its real path with the same device and inode) and refuses one
+  that is the rnfs dir (`SharedFolder`'s `rnfs_dir`, `config.root` in the node), a directory holding it, or inside
+  one of `PRIVATE_SUBDIRS` (`storage`, `names`, `state`, `blocks`, `lxmf`, each resolved): a warning while it
+  stays refused, nothing imported or released. The walk then reads that descriptor, so a link retargeted after
+  the check can't redirect it. On POSIX, the first directory above it owned by another user (not root) or writable
+  by group or others (unless sticky and what is below it is the user's or root's) is warned about once
+  (`loose_ancestor`).
 - The identity file (`network/identity.py`) is opened with `O_NOFOLLOW | O_NONBLOCK` after an lstat that must
   show a regular file, not a link; the descriptor must be that same regular file (device and inode), owned by
   the user, and is tightened through `fchmod` if loose. The key is read from it (`RNS.Identity.from_bytes`),
