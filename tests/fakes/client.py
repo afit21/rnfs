@@ -26,6 +26,8 @@ class FakeClient:
         self.mdu: int | None = None  # every link's MDU; None, as for a node with no open link: not known
         self.requests: list[tuple[bytes, list[Cid]]] = []
         self.closed: list[bytes] = []
+        self.kept_open: list[bytes] = []  # close_unless_used calls that left the link open
+        self.users: dict[bytes, dict[int, int]] = {}  # node -> threads with a /blocks call to it in progress
         self.lock = threading.Lock()
         # /provide
         self.calls: list[tuple[bytes, list[bytes], list[bytes]]] = []
@@ -49,8 +51,34 @@ class FakeClient:
         with self.lock:
             self.closed.append(node_id)
 
+    def close_unless_used(self, node_id: bytes, own: set[int]) -> bool:
+        """close(node_id) unless a thread not in own has a /blocks call to node_id in progress (noted in
+        kept_open)."""
+        with self.lock:
+            others = any(ident not in own for ident in self.users.get(node_id, {}))
+            if others:
+                self.kept_open.append(node_id)
+        if others:
+            return False
+        self.close(node_id)
+        return True
+
     def blocks(self, node_id: bytes, cids: list[Cid], on_progress=None) -> BlocksResult:
-        """Serve what node_id holds, BATCH CIDs per request."""
+        """Serve what node_id holds, BATCH CIDs per request (the calling thread counted among node_id's users)."""
+        ident = threading.get_ident()
+        with self.lock:
+            users = self.users.setdefault(node_id, {})
+            users[ident] = users.get(ident, 0) + 1
+        try:
+            return self._blocks(node_id, cids, on_progress)
+        finally:
+            with self.lock:
+                users[ident] -= 1
+                if not users[ident]:
+                    del users[ident]
+
+    def _blocks(self, node_id: bytes, cids: list[Cid], on_progress) -> BlocksResult:
+        """blocks(), served."""
         with self.lock:
             self.requests.append((node_id, list(cids)))
         self.on_progress = on_progress

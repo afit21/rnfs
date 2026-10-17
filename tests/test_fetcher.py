@@ -816,11 +816,13 @@ class ReadAheadTest(FetcherTest):
 
 class ReadAheadLinkTest(unittest.TestCase):
     """An early-closing reader over the real PeerClient and LinkPool (RNS faked as in test_links): its link is torn
-    down, which stops the response; it never cancels the response's Resource (a responder would cool it down)."""
+    down, which stops the response, unless another fetch has a request on it; it never cancels the response's
+    Resource (a responder would cool it down)."""
 
     def setUp(self):
         """A fetcher using a PeerClient whose links are FakeLinks; one provider serving a file of three windows of
-        two chunks, which answers nothing past the first window."""
+        two chunks, which holds back its answers past the first window until self.release is set (5 s at most),
+        and another file of as many chunks, which it serves at once."""
         patcher = mock.patch.object(links, "RNS", link_fakes.fake_rns())
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -834,31 +836,38 @@ class ReadAheadLinkTest(unittest.TestCase):
         config = Config(rnfs_dir=tmp.name, slow="no")
         storage = Storage(os.path.join(tmp.name, "blocks"), os.path.join(tmp.name, "state"), 10**9)
         self.addCleanup(storage.close)
-        pool = links.LinkPool(object(), config)
-        self.addCleanup(pool.close_all)
+        self.pool = links.LinkPool(object(), config)
+        self.addCleanup(self.pool.close_all)
         network: dict[Cid, bytes] = {}
         self.data = os.urandom(6 * CHUNK_SIZE)
         self.root = builder.build_bytes(self.data, network.__setitem__).cid
-        first_window = {self.root} | {child.cid for child in dag.decode(network[self.root]).children[:2]}
+        self.other_data = os.urandom(6 * CHUNK_SIZE)
+        self.other = builder.build_bytes(self.other_data, network.__setitem__).cid
+        held = {child.cid for child in dag.decode(network[self.root]).children[2:]}
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
 
         def respond(link, path, data):
-            """Serve the root and the first window; leave the rest unanswered, as a slow response would be."""
+            """Serve at once, but the first file's chunks past its first window only once released, as a slow
+            response would arrive."""
             cids = [Cid.from_bytes(binary) for binary in data[1]]
-            if not first_window.issuperset(cids):
-                return link_fakes.SILENT
+            if held.intersection(cids):
+                self.release.wait(5)
             return [network[cid] for cid in cids]
         link_fakes.FakeLink.responder = staticmethod(respond)
-        self.fetcher = Fetcher(storage, client_module.PeerClient(pool, config), config, OWN, RoutingTable(OWN, config),
-                               lambda key: FakeLookup([[P1]]))
+        self.fetcher = Fetcher(storage, client_module.PeerClient(self.pool, config), config, OWN,
+                               RoutingTable(OWN, config), lambda key: FakeLookup([[P1]]))
         self.addCleanup(self.fetcher.close)
+        self.fetches = []
+
+    def read(self, root: Cid):
+        """What node.read does: the fetch ends when the reader closes its iterator."""
+        with self.fetcher.open(root) as fetch:
+            self.fetches.append(fetch)
+            yield from fetch.read_range(fetch.resolve())
 
     def test_closing_the_reader_tears_the_link_down(self):
-        def read():
-            """What node.read does: the fetch ends when the reader closes its iterator."""
-            with self.fetcher.open(self.root) as fetch:
-                yield from fetch.read_range(fetch.resolve())
-
-        reader = read()
+        reader = self.read(self.root)
         self.assertEqual(next(reader), self.data[:CHUNK_SIZE])
         link = link_fakes.FakeLink.created[0]
         response = mock.Mock()  # the next window's response Resource, arriving
@@ -866,6 +875,33 @@ class ReadAheadLinkTest(unittest.TestCase):
         self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
         reader.close()
         self.assertEqual(link.status, link_fakes.FakeLink.CLOSED)
+        response.cancel.assert_not_called()
+
+    def test_closing_a_reader_leaves_a_link_another_fetch_uses(self):
+        other = self.read(self.other)
+        self.assertEqual(next(other), self.other_data[:CHUNK_SIZE])  # its provider found, its link open
+        reader = self.read(self.root)
+        self.assertEqual(next(reader), self.data[:CHUNK_SIZE])  # its next window now holds the link's /blocks slot
+        rest = []
+        thread = threading.Thread(target=lambda: rest.append(b"".join(other)), daemon=True)
+        thread.start()
+        peer = self.pool.shared_peer(P1)
+        deadline = time.monotonic() + 5
+        while len(peer.users) < 2 and time.monotonic() < deadline:  # the other read's request waits for the slot
+            time.sleep(0.01)
+        self.assertEqual(len(peer.users), 2)
+        link = link_fakes.FakeLink.created[0]
+        response = mock.Mock()
+        link.incoming_resources = [response]
+        reader.close()  # gives up mid-window: its request is left to finish, the other's isn't failed
+        self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
+        self.release.set()
+        thread.join(10)
+        self.assertEqual(rest, [self.other_data[CHUNK_SIZE:]])
+        provider = self.fetches[0]._providers[P1]
+        self.assertEqual((provider.failed, provider.stalls, provider.busy), (False, 0, 0))
+        self.assertEqual(len(link_fakes.FakeLink.created), 1)  # the one link, never closed
+        self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
         response.cancel.assert_not_called()
 
 

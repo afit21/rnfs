@@ -28,8 +28,8 @@ End-game duplication (NET-4; section 7): once nothing is left to ask for, an idl
 batch another has had in flight for longer than deadline_slack, so a response dripping in (never stalling, its
 deadline hours away at unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once,
 and only while fewer than max_parallel_providers requests are in flight (never on a slow node). The first
-verified copy wins: the request still sending what has arrived has its link closed, which isn't counted against
-its provider.
+verified copy wins: the request still sending what has arrived has its link closed (unless another fetch has a
+request on it: then it is left to finish), and its outcome isn't counted against its provider.
 
 Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
 the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
@@ -72,9 +72,10 @@ interrupted fetch stored hangs together from the target, and the next fetch resu
 
 read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
 bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
-for it has returned is stored all the same. A fetch closes the links of its requests still in flight when it ends
-by an error, is cancelled, or ends with requests it no longer needs (a reader that stopped early, which has had
-at most one window fetched that it didn't read). It never cancels a response's Resource on a link it keeps: a
+for it has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it
+no longer needs (a reader that stopped early, which has had at most one window fetched that it didn't read)
+closes the links of its requests still in flight, unless another fetch has a request on the same (shared) link:
+then its request is left to finish, rather than fail the other's. It never cancels a response's Resource: a
 responder would take that for a rejection and cool the requester down (section 3).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
@@ -629,6 +630,10 @@ class Fetch:
         self._duplicated: dict[bytes, bytes] = {}
         self._duplicates: dict[bytes, bytes] = {}
         self._abandoned: set[bytes] = set()
+        # The idents of this fetch's request threads while they run, and the providers whose links it closed:
+        # a link another fetch has a request on isn't closed (PeerClient.close_unless_used)
+        self._threads: set[int] = set()
+        self._links_closed: set[bytes] = set()
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -663,9 +668,11 @@ class Fetch:
         A fetch ended by an error (or cancelled, or by its reader closing a read_range early) closes the links of
         its requests still in flight, so their responses don't keep using the link and hold up the next /blocks
         to those nodes. One that ends normally does so for requests it no longer needs (a read_range's next window,
-        left unread), but leaves a probe for the first block, which another node sent, to finish. Closing the link
-        is how a requester stops a response: it never cancels the response's Resource, which a responder would
-        take for a rejection and cool the requester down for (section 3).
+        left unread), but leaves a probe for the first block, which another node sent, to finish. A link another
+        fetch has a request on (in progress or waiting for the link's /blocks slot) isn't closed: this fetch's
+        request is left to finish, and its blocks dropped, rather than fail the other fetch's and make it drop
+        the provider. Closing the link is how a requester stops a response: it never cancels the response's
+        Resource, which a responder would take for a rejection and cool the requester down for (section 3).
         """
         self.closed = True
         if self._lookup is not None:
@@ -678,12 +685,9 @@ class Fetch:
             if isinstance(event, ResultEvent):
                 self._in_flight.pop(event.node_id, None)
         for node_id, (_, probe) in list(self._in_flight.items()):
-            if (exc_type is None and probe) or node_id in self._abandoned:  # an abandoned one's is closed already
+            if (exc_type is None and probe) or node_id in self._links_closed:
                 continue
-            try:
-                self.client.close(node_id)
-            except Exception as e:  # noqa: BLE001 - closing is best effort; logged
-                log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
+            self._close_link(node_id)
         # Only this fetch's own error: one from another fetch nested in the same `with` is about another root
         if isinstance(exc, InvalidDag) and getattr(exc, "root", None) == self.root:
             self.fetcher.mark_invalid(self.root)
@@ -801,7 +805,8 @@ class Fetch:
 
         The next window's chunks are asked for before this one's bytes are handed to the reader, so the
         providers keep working while it reads; a reader that stops early has fetched at most one window more
-        than it read, and ending the fetch closes the links still bringing it.
+        than it read, and ending the fetch closes the links still bringing it (but not one another fetch has a
+        request on: that request is left to finish).
 
         Lazy all the way down: the range is walked depth-first as it is read, so a DAG claiming billions of
         chunks costs nothing until they are read, and small chunks count against max_output_entries. The file
@@ -1203,9 +1208,10 @@ class Fetch:
 
     def _settle_duplicate(self, node_id: bytes, in_flight: dict):
         """node_id's request has been answered: if it was one of a duplicated pair and the other copy, still in
-        flight, now carries nothing not stored, close that one's link (the first verified copy won). Closing the
-        link stops the response without cancelling its Resource (section 3), and its outcome isn't counted
-        against its provider (_handle's counted)."""
+        flight, now carries nothing not stored, close that one's link (the first verified copy won), unless another
+        fetch has a request on it: then it is left to finish. Either way its outcome isn't counted against its
+        provider (_handle's counted). Closing the link stops the response without cancelling its Resource
+        (section 3)."""
         other = self._duplicated.pop(node_id, None)
         if other is not None:
             self._duplicates.pop(other, None)
@@ -1216,12 +1222,19 @@ class Fetch:
         if any(not self.storage.has(cid) for cid in in_flight[other][0]):
             return  # it still carries blocks nobody else has sent
         self._abandoned.add(other)
-        log(f"closing the link to {node_name(other)}: {node_name(node_id)} sent what it was still sending",
-            LOG_VERBOSE)
+        log(f"{node_name(node_id)} sent what {node_name(other)} was still sending; closing that link unless "
+            "another fetch uses it", LOG_VERBOSE)
+        self._close_link(other)
+
+    def _close_link(self, node_id: bytes):
+        """Close the link of this fetch's request to node_id, unless another fetch has a request on it."""
         try:
-            self.client.close(other)
+            if self.client.close_unless_used(node_id, set(self._threads)):
+                self._links_closed.add(node_id)
+            else:
+                log(f"leaving the request to {node_name(node_id)} to finish: another fetch uses its link", LOG_VERBOSE)
         except Exception as e:  # noqa: BLE001 - closing is best effort; logged
-            log(f"could not close the link to {node_name(other)}: {e}", LOG_WARNING)
+            log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
 
     def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]],
                     budget: _DagBudget | None) -> list[Cid]:
@@ -1271,6 +1284,8 @@ class Fetch:
             it was sent with (the responder's upload cap derives from the same response)."""
             sent_at = self.fetcher.clock()
             rate = None
+            ident = threading.get_ident()
+            self._threads.add(ident)  # until its request is over: the link's users that are this fetch's
             try:
                 rate = self.client.rate_estimate(node_id)
                 result = self.client.blocks(node_id, cids, on_progress=progress)
@@ -1279,6 +1294,8 @@ class Fetch:
                 # except, so the debug log has its traceback
                 log(f"/blocks to {node_name(node_id)} raised {e!r}", LOG_WARNING)
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
+            finally:
+                self._threads.discard(ident)
             if result.elapsed is not None:
                 # When it actually went out: opening the link or waiting for its /blocks slot isn't its time
                 sent_at = max(sent_at, self.fetcher.clock() - result.elapsed)
