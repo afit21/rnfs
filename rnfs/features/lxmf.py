@@ -15,7 +15,8 @@ startup_announce_delay and every announce_interval. LXMF keeps its router state 
 - Receiving: messages with rnfs links go to a bounded inbox. Links from senders in lxmf_auto_fetch_from are
   fetched and pinned with source `lxmf:<sender>`, within lxmf_auto_fetch_quota per sender; removing the
   message from the inbox releases those pins, and a message holding pins is never dropped to make room for
-  others. lxmf_accept_from restricts senders.
+  others' (each such sender keeps at most 1/n of the inbox, so none fills it). lxmf_accept_from restricts
+  senders.
 - The inbox and outbox are kept in the state database (rnfs.statedb, the lxmf_messages table) and saved in
   batches, each save writing the records changed since the last; outbox messages still unfinished at a start
   are marked failed (LXMF doesn't persist its outbound queue).
@@ -37,7 +38,7 @@ import signal
 import sys
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
@@ -485,13 +486,16 @@ class MessageLog:
     per record in its box: a save writes the records added, changed or removed since the last. Thread-safe.
 
     At most limit records and max_bytes of JSON are kept. To make room, the oldest record protect() is false
-    for is dropped; a protected one only when every other is protected too. add() may also name records that
-    are dropped only for each other's (reserved). valid() checks records loaded (malformed ones are dropped;
-    clean says whether the box was saved whole, or imported from a whole file, and every record was read).
+    for is dropped; a protected one only when every other is protected too, and then only one with the new
+    record's "from". add() may also name records that are dropped only for each other's (reserved), and limit
+    the new record's "from" to a share. holds(record) is what a protected record holds (the inbox: pinned CIDs
+    and queued links): one whose holdings another record of its sender also holds is dropped first among a
+    sender's protected records. valid() checks records loaded (malformed ones are dropped; clean says whether
+    the box was saved whole, or imported from a whole file, and every record was read).
     """
 
     def __init__(self, state_dir: str, box: str, limit: int, max_bytes: int | None = None, protect=None,
-                 valid=None):
+                 valid=None, holds=None):
         """Load box's records from the state database in state_dir (malformed ones are dropped). Close it when
         done."""
         from rnfs import statedb
@@ -499,6 +503,7 @@ class MessageLog:
         self.limit = limit
         self.max_bytes = max_bytes
         self.protect = protect or (lambda entry: False)
+        self.holds = holds or (lambda entry: ())
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._dirty: set[int] = set()  # ids of records added, changed or removed since the last save
@@ -540,12 +545,15 @@ class MessageLog:
                 if bad:
                     statedb.set_meta(tx, self.box, "clean", 0)
 
-    def add(self, entry: dict, per_from: int | None = None, reserved=None) -> tuple[int | None, list[dict]]:
+    def add(self, entry: dict, per_from: int | None = None, reserved=None,
+            share: tuple[int, int] | None = None) -> tuple[int | None, list[dict]]:
         """Append entry with a new id; returns the id (None if entry itself was dropped: every other record is
-        protected and it isn't) and the entries dropped to stay within the bounds. per_from: also keep at most
-        that many unprotected records with entry's "from". reserved(record): records it is true for are dropped
-        to make room only for an entry it is true for too, and only once no other unprotected record is left
-        (trusted senders' records, so new identities can't push them out)."""
+        protected and it isn't, or none of the others it may push out has its "from") and the entries dropped to
+        stay within the bounds. per_from: also keep at most that many unprotected records with entry's "from".
+        share (records, bytes): keep at most that many records and bytes with entry's "from", protected ones
+        included (entry is kept even if it alone exceeds them). reserved(record): records it is true for are
+        dropped to make room only for an entry it is true for too, and only once no other unprotected record is
+        left (trusted senders' records, so new identities can't push them out)."""
         reserved = reserved or (lambda record: False)
         with self._lock:
             if self._next_id > MAX_ID:  # only a hand-edited next id gets here: refused, so saves keep working
@@ -559,6 +567,8 @@ class MessageLog:
             if per_from is not None:
                 same = [e for e in self._entries if e.get("from") == entry.get("from") and not self.protect(e)]
                 dropped += same[:max(0, len(same) - per_from)]
+            if share is not None:
+                dropped += self._over_share(entry, share, dropped)
             entry_reserved = reserved(entry)
             while self._over(dropped):
                 gone = {id(e) for e in dropped}
@@ -568,9 +578,11 @@ class MessageLog:
                     victim = others[0]
                 if victim is None:
                     # Every other record holds pins (or is reserved, and entry isn't): refuse entry rather than
-                    # drop them, unless it holds pins too (then the oldest goes; only a trusted sender gets here)
-                    victim = entry if not self.protect(entry) or len(self._entries) - len(dropped) == 1 else \
-                        next(e for e in self._entries if id(e) not in gone and e is not entry)
+                    # drop them, unless it holds pins too. Then one of its own sender's records goes, never another
+                    # sender's, so no sender pushes out another's pins (FEAT-1); with none, entry is refused
+                    own = [e for e in self._entries
+                           if e.get("from") == entry.get("from") and id(e) not in gone and e is not entry]
+                    victim = self._own_victim(own, own + [entry]) if self.protect(entry) and own else entry
                 dropped.append(victim)
                 if victim is entry:
                     break
@@ -580,6 +592,31 @@ class MessageLog:
                 self._sizes.pop(e["id"], None)
             self._dirty.update(e["id"] for e in [entry, *dropped])  # a refused entry still took an id
             return (None if id(entry) in gone else entry["id"]), [e for e in dropped if e is not entry]
+
+    def _over_share(self, entry: dict, share: tuple[int, int], dropped: list[dict]) -> list[dict]:
+        """The records of entry's "from" to drop (besides dropped) so that its records, entry and protected ones
+        included, are within share (records, bytes), chosen by _own_victim; never entry (lock held)."""
+        max_records, max_bytes = share
+        gone = {id(e) for e in dropped}
+        own = [e for e in self._entries if e.get("from") == entry.get("from") and id(e) not in gone]
+        size = sum(self._sizes[e["id"]] for e in own)
+        victims = []
+        while len(own) > 1 and (len(own) > max_records or size > max_bytes):
+            victim = self._own_victim([e for e in own if e is not entry], own)
+            victims.append(victim)
+            own = [e for e in own if e is not victim]
+            size -= self._sizes[victim["id"]]
+        return victims
+
+    def _own_victim(self, candidates: list[dict], own: list[dict]) -> dict:
+        """Which of candidates (records of one sender, oldest first) to drop: the oldest unprotected; else the
+        oldest whose holdings another of own (that sender's records kept so far) also holds, which drops no pin
+        (a sender re-linking one CID over and over has many such records); else the oldest (lock held)."""
+        victim = next((e for e in candidates if not self.protect(e)), None)
+        if victim is not None:
+            return victim
+        held = Counter(item for e in own for item in set(self.holds(e)))
+        return next((e for e in candidates if all(held[item] > 1 for item in set(self.holds(e)))), candidates[0])
 
     def _over(self, dropped: list[dict]) -> bool:
         """Whether the records left after dropping these exceed the limit or max_bytes (lock held)."""
@@ -700,6 +737,18 @@ def _unlisted() -> dict:
 def _holds_pins(entry: dict) -> bool:
     """Whether an inbox record has auto-fetched pins, or is about to (queued): a flood mustn't release them."""
     return any(isinstance(a, dict) and a.get("state") in ("queued", "pinned") for a in entry.get("auto") or [])
+
+
+def _held(entry: dict) -> set:
+    """What an inbox record holds for its sender (MessageLog's holds): the CIDs pinned for it, and each link
+    still queued (its own: nobody else's record holds what it will pin)."""
+    held = set()
+    for index, result in enumerate(entry.get("auto") or []):
+        if isinstance(result, dict) and result.get("state") == "pinned":
+            held.add(str(result.get("cid")))
+        elif isinstance(result, dict) and result.get("state") == "queued":
+            held.add((entry.get("id"), index))
+    return held
 
 
 @dataclass
@@ -836,7 +885,7 @@ class LxmfFeature(features.Feature):
         self._wake = threading.Event()
         self._threads: list[threading.Thread] = []
         self.inbox = MessageLog(config.state_dir, INBOX, INBOX_LIMIT, MAX_INBOX_BYTES, protect=_holds_pins,
-                                valid=_valid_inbox_entry)
+                                valid=_valid_inbox_entry, holds=_held)
         try:
             self.outbox = MessageLog(config.state_dir, OUTBOX, OUTBOX_LIMIT, valid=_valid_outbox_entry)
         except BaseException:
@@ -912,8 +961,11 @@ class LxmfFeature(features.Feature):
                          "release them.",
                  "auto": [{"state": "pinned", "cid": str(cid)} for cid in cids]}
         with self._lock:
-            _, dropped = self.inbox.add(entry)
+            entry_id, dropped = self.inbox.add(entry)
             self._release(dropped)
+        if entry_id is None:  # never another sender's pins for these: kept unrecorded, released at a later start
+            _log(f"no room for that message: the inbox is full of other senders' messages holding pins; {listed} "
+                 f"stay pinned until a start finds the inbox whole", LOG_WARNING)
         try:
             self.inbox.save()
         except OSError as e:  # the pins are kept; recorded again at the next start
@@ -1195,9 +1247,12 @@ class LxmfFeature(features.Feature):
             return None
         with self._lock:
             # A sender not trusted with auto-fetch gets INBOX_PER_SENDER records, so one can't push out others',
-            # and records of trusted senders are dropped only for each other's: identities are free
+            # and records of trusted senders are dropped only for each other's: identities are free. An
+            # auto-fetch sender's records hold pins, which others' records never push out, so each such sender
+            # gets 1/n of the inbox, protected records included: one can't fill it and push out another's (FEAT-1)
             entry_id, dropped = self.inbox.add(entry, per_from=None if auto else INBOX_PER_SENDER,
-                                               reserved=lambda record: self._trusted_hex(record.get("from")))
+                                               reserved=lambda record: self._trusted_hex(record.get("from")),
+                                               share=self._auto_share() if auto else None)
             self._release(dropped)
         if entry_id is None:
             _log(f"message {message_hash} from {sender} not kept: the inbox is full of messages from trusted "
@@ -1209,6 +1264,12 @@ class LxmfFeature(features.Feature):
             for index in range(len(entry["links"])):
                 self._queue_auto_fetch(entry_id, index, sender)
         return entry_id
+
+    def _auto_share(self) -> tuple[int, int]:
+        """The inbox records and bytes one auto-fetch sender may hold: 1/n of the inbox's limits for n senders in
+        lxmf_auto_fetch_from, and always room for one record."""
+        senders = max(1, len(self.auto_fetch_from))
+        return max(1, self.inbox.limit // senders), max(MAX_ENTRY_BYTES, self.inbox.max_bytes // senders)
 
     def accepts(self, source: bytes) -> bool:
         """Whether messages from LXMF address source are kept: lxmf_accept_from (empty: everyone), and
