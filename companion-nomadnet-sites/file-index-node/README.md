@@ -41,6 +41,8 @@ directory, so none of it is served.
 | File | What it is |
 | --- | --- |
 | `sealed.json` | Which pinned files are sealed, by CID. A CID's content never changes, so the answers stay valid. You can delete it at any time. |
+| `page.mu` | The page as last rendered, served for a minute (see below). Delete it to show a change (a new pin, `DESCRIPTIONS`, `HIDDEN`) at once. |
+| `lock` | Held while a request renders the page. |
 | `page.log` | Errors, with details. Moved to `page.log.1` past 1 MB. |
 
 If the daemon can't be reached, visitors only see "The file list isn't available right now". The CLI's error
@@ -48,3 +50,13 @@ message, which can contain local paths, goes to `page.log`.
 
 `RNFS_PAGE_DIR` overrides the directory when you run the page by hand. NomadNet runs pages with a minimal
 environment, so it doesn't pass that variable on.
+
+## How often it asks rnfs
+
+Rendering the page runs `rnfs pin ls`, and a sealed check for each file pin it hasn't checked before. So
+that visitors can't keep the daemon busy by reloading the page, it renders at most once every 60 seconds
+(`CACHE_SECONDS`), one request at a time (a lock, as the display page uses). Every visit in between gets the
+page as last rendered, from `page.mu`. A visit that arrives while another request is rendering also gets
+`page.mu`, however old, or "This page is busy" if there is none yet. The page is replaced atomically, so a
+visitor never gets part of one. A failed render (the daemon isn't running) isn't kept, so the next visit
+tries again.
