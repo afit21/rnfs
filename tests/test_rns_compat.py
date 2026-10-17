@@ -14,6 +14,7 @@ import functools
 import inspect
 import os
 import re
+import sys
 import tempfile
 import textwrap
 import threading
@@ -145,6 +146,19 @@ INTERNALS = [
     # Identities and announces RNS remembers
     Internal("node.py, names.py, features/peers.py", "Identity.known_destinations entries: [time heard, packet "
              "hash, public key, app_data, ...]", lambda: _known_destinations()),
+    Internal("names.py", "Transport.path_table entries holding, at IDX_PT_RANDBLOBS, the random blobs of the "
+             "announces the path was taken from, a blob added only for an announce not heard before; "
+             "Transport.timebase_from_random_blobs, their newest emission time",
+             lambda: (_true(sys.modules["RNS.Transport"].IDX_PT_RANDBLOBS == names._PATH_RANDOM_BLOBS,
+                            "IDX_PT_RANDBLOBS moved"),
+                      _true(isinstance(RNS.Transport.path_table, dict), "path_table isn't a dict"),
+                      _true(RNS.Transport.timebase_from_random_blobs([os.urandom(5) + (1234).to_bytes(5, "big"),
+                                                                     os.urandom(5) + (99).to_bytes(5, "big")])
+                            == 1234, "timebase_from_random_blobs isn't the newest emission"),
+                      _source(RNS.Transport, "if not random_blob in random_blobs:",
+                              "random_blobs.append(random_blob)",
+                              "path_table_entry = [now, received_from, announce_hops, expires, random_blobs, "
+                              "packet.receiving_interface, packet.packet_hash]"))),
     Internal("node_content.py", "Identity.recall(hash, from_identity_hash=, _no_use=), raising AttributeError "
              "without a Reticulum instance unless _no_use", lambda: _recall()),
     Internal("features/keepers.py", "Transport.get_cached_packet(packet_hash, packet_type=\"announce\") and the "
@@ -194,6 +208,15 @@ INTERNALS = [
                       _source(LXMRouter.delivery_link_established,
                               "link.set_resource_started_callback(self.delivery_resource_transfer_began)"),
                       _has(RNS.Link, "set_resource_started_callback"))),
+    Internal("features/lxmf.py", "LXMRouter.delivery_resource_advertised(resource), looked up on the router "
+             "when a delivery link is established and given the ResourceAdvertisement, whose get_segments() "
+             "is its l and i its segment index",
+             lambda: (_params(LXMRouter.delivery_resource_advertised, "resource"),
+                      _source(LXMRouter.delivery_link_established,
+                              "link.set_resource_callback(self.delivery_resource_advertised)"),
+                      _source(RNS.Link, "if self.callbacks.resource(resource_advertisement)"),
+                      _source(RNS.ResourceAdvertisement.get_segments, "return self.l"),
+                      _source(RNS.ResourceAdvertisement.unpack, "adv.i = dictionary['i']"))),
     Internal("features/lxmf.py", "LXMRouter.request_messages_from_propagation_node(identity, max_messages), "
              "called again through the router once the propagation node link is up",
              lambda: (_params(LXMRouter.request_messages_from_propagation_node, "identity", "max_messages"),

@@ -511,6 +511,34 @@ class SecurityTest(ApiTestCase):
             self.assertIsNone(headers[cli.PROOF_HEADER], bad)
         self.assertIsNone(self.call("GET", "/api/status", api=False)[1][cli.PROOF_HEADER])
 
+    def test_proof_connection_kept_for_one_request(self):
+        # A proof request asking for keep-alive keeps its connection for the client's request, then closes it
+        challenge = "0123456789abcdef" * 2
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        self.addCleanup(connection.close)
+        connection.connect()
+        connection.auto_open = 0  # a closed connection fails rather than being opened again
+        host = f"127.0.0.1:{self.port}"
+        connection.request("GET", "/api/status", headers={"Host": host, cli.CHALLENGE_HEADER: challenge,
+                                                          "Connection": "keep-alive"})
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.getheader("Connection"), "keep-alive")
+        self.assertIsNotNone(connection.sock)
+        # A second proof on it isn't kept open again: one request follows a proof, no more
+        connection.request("GET", "/api/status", headers={"Host": host, cli.CHALLENGE_HEADER: challenge,
+                                                          "Connection": "keep-alive", "X-Rnfs-Api": self.server.token})
+        response = connection.getresponse()
+        self.assertEqual(json.loads(response.read())["node_id"], self.node.status()["node_id"])
+        self.assertIsNone(response.getheader("Connection"))
+        self.assertIsNone(connection.sock)
+        # Without a valid challenge, or asking to close, the connection closes after its one request
+        for headers in ({"Connection": "keep-alive"}, {cli.CHALLENGE_HEADER: "zz" * 16, "Connection": "keep-alive"},
+                        {cli.CHALLENGE_HEADER: challenge}, {cli.CHALLENGE_HEADER: challenge, "Connection": "close"}):
+            status, response_headers, _ = self.call("GET", "/api/status", headers=headers, api=False)
+            self.assertEqual(status, 200)
+            self.assertNotEqual(response_headers["Connection"], "keep-alive", headers)
+
     def test_http_0_9_is_refused_with_headers(self):
         """http.server would answer HTTP/0.9 with a bare body; every answer here has a status line and the API's
         headers."""

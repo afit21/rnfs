@@ -1857,6 +1857,7 @@ class LxmfNetwork:
             original_began(resource)
 
         self.router.delivery_resource_transfer_began = began
+        self.router.delivery_resource_advertised = self._delivery_advertised(self.router.delivery_resource_advertised)
         # LXMF calls this again itself once the propagation node's link is up (or its path known): bound the
         # link's Resources before any request on it can be answered
         original_request = self.router.request_messages_from_propagation_node
@@ -2026,6 +2027,23 @@ class LxmfNetwork:
         if link is not None and not getattr(link, "rnfs_bounded", False):
             link.set_resource_started_callback(self._pn_resource)
             link.rnfs_bounded = True
+
+    @staticmethod
+    def _delivery_advertised(original):
+        """LXMRouter.delivery_resource_advertised, refusing a Resource of several segments before any of it is
+        transferred. LXMF checks only the advertised data size, which each segment states for itself, so
+        segments of a few hundred kB each would add up without limit: RNS appends every segment to one file
+        under its storage, removed only once the last arrives, and LXMF reads the whole Resource into memory
+        before checking any signature. A message within the delivery limit always fits in one segment."""
+
+        def advertised(advertisement):
+            if advertisement.get_segments() != 1 or getattr(advertisement, "i", 1) != 1:
+                _log(f"refused an incoming LXMF delivery Resource of {advertisement.get_segments()} segments",
+                     LOG_VERBOSE)
+                return False
+            return original(advertisement)
+
+        return advertised
 
     def _pn_resource(self, resource):
         """A Resource starting on the propagation node link: refuse (tearing the link down) one larger than

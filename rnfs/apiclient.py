@@ -5,11 +5,13 @@ too; ApiConnection's dict-returning methods are its backend, and the CLI's ApiCl
 Standard library only, and it never imports RNS, so a program using it starts quickly.
 
 - The daemon writes a new random token to `<rnfs dir>/api_token` (mode 0600, or a private access list on
-  Windows) at each start. The client reads it before its first request that needs it and sends it as
-  `X-Rnfs-Api` with every request but the open status (version()).
+  Windows) at each start. The client reads it before its first request that needs it, and again
+  when a proof with it fails, and sends it as `X-Rnfs-Api` with every request but the open status (version()).
 - Before sending the token, the client makes whatever listens on the API port prove it knows it (api_proof,
   verify_daemon), since while the daemon is down any local user could listen there. Nothing else is sent to a
-  listener that fails: neither the token nor a request's body.
+  listener that fails: neither the token nor a request's body. The proof is made on the connection that then
+  carries the request (the daemon keeps it open for that one request), for every request, so a client used
+  for a long time sends nothing to a program listening on the port after the daemon stopped.
 - That proof request is also where the daemon's version is read (Client.daemon_version), and check_daemon is the
   one place to refuse a daemon by it; every version is accepted for now.
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
@@ -19,9 +21,9 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a subclass of the node's own
   (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except clause catches what rnfs.Node
   and rnfs.Client raise alike.
-- Each request opens its own connection, with no timeout unless one is given (fetches can take hours), so an
-  ApiConnection may be used from several threads. Paths are on the daemon's machine, which is this one: they are
-  made absolute here.
+- Each request opens its own connection (its proof, then the request), with no timeout unless one is given
+  (fetches can take hours), so an ApiConnection may be used from several threads. Paths are on the daemon's
+  machine, which is this one: they are made absolute here.
 """
 import hashlib
 import hmac
@@ -30,7 +32,6 @@ import json
 import os
 import secrets
 import stat
-import threading
 from urllib.parse import urlencode
 
 from rnfs import errors, fsutil, winacl
@@ -246,9 +247,8 @@ class ApiConnection:
         self.port = api_port(rnfs_dir) if port is None else port
         self.token_file = token_path(rnfs_dir) if token_file is None else token_file
         self.timeout = timeout
-        self.token: str | None = None  # once the daemon has proved it knows it
-        self.daemon_version: str | None = None  # what the daemon said in the proof request
-        self._token_lock = threading.Lock()
+        self.token: str | None = None  # the token read last, once a daemon has proved it knows it
+        self.daemon_version: str | None = None  # what the daemon said in the last proof request
 
     # The protocol
 
@@ -259,13 +259,11 @@ class ApiConnection:
 
         params go in the query string (None values left out); json_body is sent as JSON; body may be bytes or a
         binary file, sent chunked without length. Unless authenticated is False (version(), and the proof
-        request itself), the token is sent, once the daemon has proved it knows it.
+        request itself), the token is sent, on a connection whose other end has just proved it knows it.
         """
         url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
         # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
         headers = {"Host": f"127.0.0.1:{self.port}", **(extra_headers or {})}
-        if authenticated:
-            headers[API_HEADER] = self._proven_token()
         if json_body is not None:
             body = json.dumps(json_body).encode()
             headers["Content-Type"] = "application/json"
@@ -273,7 +271,18 @@ class ApiConnection:
             headers["Content-Type"] = "application/octet-stream"
             if length is not None:
                 headers["Content-Length"] = str(length)
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+        connection = self._connect()
+        if authenticated:
+            connection, headers[API_HEADER] = self._prove(connection)
+        return self._send(connection, method, url, body, headers)
+
+    def _connect(self) -> http.client.HTTPConnection:
+        """A new connection to the API port (opened by its first request)."""
+        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
+
+    def _send(self, connection: http.client.HTTPConnection, method: str, url: str, body,
+              headers: dict) -> http.client.HTTPResponse:
+        """Send one request on connection and return the successful response; errors raise ApiError."""
         try:
             connection.request(method, url, body=body, headers=headers)
             response = connection.getresponse()
@@ -293,22 +302,38 @@ class ApiConnection:
             raise error_for(response.status, str(message))
         return response
 
-    def _proven_token(self) -> str:
-        """The token, read and proved (verify_daemon) on first use."""
-        with self._token_lock:
-            if self.token is None:
-                token = read_token(self.token_file)
-                self.verify_daemon(token)
-                self.token = token
-            return self.token
+    def _prove(self, connection: http.client.HTTPConnection) -> tuple[http.client.HTTPConnection, str]:
+        """Make what listens on the API port prove, on connection, that it knows the token, and return the
+        connection to send the request on and the token. The daemon keeps a connection it proved itself on
+        open for one more request, so the token and the request's body can only reach it: a proof made once,
+        on another connection, would hold no longer than the daemon, and any local user can listen on its port
+        once it stops. The token read is kept, and read again if the proof fails (a daemon restarted since
+        wrote a new one)."""
+        token = self.token or read_token(self.token_file)
+        try:
+            self.verify_daemon(token, connection)
+        except AuthFailed:
+            fresh = read_token(self.token_file)
+            if fresh == token:
+                raise
+            connection.close()
+            connection = self._connect()
+            self.verify_daemon(fresh, connection)
+            token = fresh
+        self.token = token
+        if connection.sock is None:
+            # A daemon before 0.1.5 closes every connection: the request goes on a new one, as its clients sent it
+            connection = self._connect()
+        else:
+            connection.auto_open = 0  # never reconnect: a new connection could reach another listener
+        return connection, token
 
-    def verify_daemon(self, token: str):
-        """Raise AuthFailed unless whatever listens on the API port proves it knows token, before the token (or
-        a name key) is sent to it: while the daemon is down, any local user could be listening on its port.
-        Then check_daemon() with its version."""
+    def verify_daemon(self, token: str, connection: http.client.HTTPConnection | None = None):
+        """Raise AuthFailed unless whatever listens on the API port (on connection, else a new one) proves it
+        knows token, before the token (or a name key) is sent to it. Then check_daemon() with its version."""
         challenge = secrets.token_hex(16)
-        response = self.request("GET", "/api/status", extra_headers={CHALLENGE_HEADER: challenge},
-                                authenticated=False)
+        headers = {"Host": f"127.0.0.1:{self.port}", CHALLENGE_HEADER: challenge, "Connection": "keep-alive"}
+        response = self._send(connection or self._connect(), "GET", "/api/status", None, headers)
         data = read_all(response)
         proof = (response.getheader(PROOF_HEADER) or "").strip().encode("ascii", "replace")
         if not hmac.compare_digest(proof, api_proof(token, self.port, challenge).encode()):

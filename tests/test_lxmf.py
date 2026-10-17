@@ -1421,6 +1421,21 @@ class NetworkBoundsTest(unittest.TestCase):
         network._bound_propagation_downloads()
         link.set_resource_started_callback.assert_called_once_with(network._pn_resource)
 
+    def test_delivery_resources_of_several_segments_are_refused(self):
+        # Each segment states its own data size, so segments within the delivery limit added up without limit
+        original = mock.Mock(return_value=True)
+        advertised = lxmf.LxmfNetwork._delivery_advertised(original)
+        for segments, index, accepted in ((1, 1, True), (2, 1, False), (100000, 1, False), (1, 2, False)):
+            advertisement = mock.Mock(i=index)
+            advertisement.get_segments.return_value = segments
+            original.reset_mock()
+            self.assertEqual(advertised(advertisement), accepted)
+            self.assertEqual(original.called, accepted)
+        original.return_value = False  # LXMF's own size check still applies to one segment
+        advertisement = mock.Mock(i=1)
+        advertisement.get_segments.return_value = 1
+        self.assertFalse(advertised(advertisement))
+
     def test_sync_only_with_a_configured_node_unless_nearest(self):
         network = self.network()
         network.router.PR_PATH_REQUESTED, network.router.PR_COMPLETE = 1, 7

@@ -239,7 +239,7 @@ class OperationsTest(ClientTestCase):
             self.api.job("nope")
 
     def test_used_from_several_threads(self):
-        """Concurrent first requests prove the daemon once, and all send the token."""
+        """Concurrent requests each prove the daemon on their own connection, and all send the token."""
         seen = self.tokens_seen()
         results = []
         threads = [threading.Thread(target=lambda: results.append(self.api.status()["node_id"])) for _ in range(8)]
@@ -248,16 +248,16 @@ class OperationsTest(ClientTestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(len(results), 8)
-        self.assertEqual(seen.count(("/api/status", None)), 1)
+        self.assertEqual(seen.count(("/api/status", None)), 8)
         self.assertEqual(seen.count(("/api/status", self.server.token)), 8)
 
 
 class ProofTest(ClientTestCase):
     """The token is sent only to a listener that proves it knows it."""
 
-    def impostor(self, received: list) -> int:
-        """Start a server answering everything 200 with a guessed proof; its port. What it receives goes in
-        received as (path, headers, body)."""
+    def impostor(self, received: list, port: int = 0) -> int:
+        """Start a server on port (0: any) answering everything 200 with a guessed proof; its port. What it
+        receives goes in received as (path, headers, body)."""
 
         class Impostor(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -275,7 +275,7 @@ class ProofTest(ClientTestCase):
                 self.wfile.write(data)
             do_GET = do_POST = answer
 
-        server = http.server.HTTPServer(("127.0.0.1", 0), Impostor)
+        server = http.server.HTTPServer(("127.0.0.1", port), Impostor)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -295,6 +295,55 @@ class ProofTest(ClientTestCase):
         self.assertIn("X-Rnfs-Challenge", headers)
         self.assertEqual(body, b"")
         self.assertIsNone(api.token)
+
+    def test_impostor_after_the_daemon_stops(self):
+        """A client that has used the daemon sends nothing to a listener taking its port once it stops."""
+        self.api.status()
+        self.server.stop()
+        received = []
+        self.impostor(received, self.server.port)
+        with self.assertRaises(AuthFailed):
+            self.api.call("POST", "/api/name/import", params={"alias": "stolen"}, body=b"K" * 64)
+        self.assertEqual(len(received), 1)
+        path, headers, body = received[0]
+        self.assertTrue(path.startswith("/api/status"))
+        self.assertNotIn("X-Rnfs-Api", headers)
+        self.assertEqual(body, b"")
+
+    def test_request_goes_on_the_proved_connection(self):
+        """The proof and the request it allows are one connection, which the daemon then closes."""
+        clients = []
+        original = self.server.server.RequestHandlerClass.dispatch
+
+        def spy(handler):
+            """Record which connection each request came on."""
+            clients.append((handler.path.split("?")[0], handler.client_address))
+            original(handler)
+        with mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy):
+            self.api.post("/api/gc")
+            self.api.post("/api/gc")
+        self.assertEqual([path for path, _ in clients], ["/api/status", "/api/gc"] * 2)
+        self.assertEqual(clients[0][1], clients[1][1])
+        self.assertEqual(clients[2][1], clients[3][1])
+        self.assertNotEqual(clients[0][1], clients[2][1])
+
+    def test_daemon_closing_every_connection(self):
+        """A daemon before 0.1.5 closes the proof's connection: the request goes on a new one."""
+        seen = self.tokens_seen()
+        with mock.patch.object(self.server.server.RequestHandlerClass, "PROOF_ROUTE", None):
+            self.assertEqual(self.api.status()["node_id"], self.node.status()["node_id"])
+        self.assertEqual(seen, [("/api/status", None), ("/api/status", self.server.token)])
+
+    def test_daemon_restarted(self):
+        """A client used before the daemon restarted reads its new token and goes on working."""
+        self.api.status()
+        self.server.stop()
+        restarted = ApiServer(self.node, self.server.port)
+        restarted.start()
+        self.addCleanup(restarted.stop)
+        cli.write_token(self.token_file, restarted.token)
+        self.assertEqual(self.api.status()["node_id"], self.node.status()["node_id"])
+        self.assertEqual(self.api.token, restarted.token)
 
     def test_stale_token_is_never_sent(self):
         """A token the daemon doesn't hold (an old daemon's) fails the proof and is never sent."""

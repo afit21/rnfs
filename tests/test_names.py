@@ -83,6 +83,7 @@ class FakeNetwork:
         self.handlers = []
         self.app_data: dict[bytes, bytes] = {}
         self.heard: dict[bytes, float] = {}
+        self.emitted: dict[bytes, float] = {}
         self.path_requests = []
         self.on_request_path = None
 
@@ -121,14 +122,21 @@ class FakeNetwork:
         """When RNS 'stored' it."""
         return self.heard.get(name)
 
-    def store(self, name, app_data, heard):
-        """Make RNS 'remember' an announce, as validate_announce does, without calling handlers."""
+    def emitted_time(self, name):
+        """When the newest announce RNS 'took a path from' was emitted (None: tests not setting emitted)."""
+        return self.emitted.get(name)
+
+    def store(self, name, app_data, heard, emitted=None):
+        """Make RNS 'remember' an announce, as validate_announce does, without calling handlers. An announce
+        emitted at emitted joins the path's, which keeps the newest emission: repeating an old one changes nothing."""
         self.app_data[name] = app_data
         self.heard[name] = heard
+        if emitted is not None:
+            self.emitted[name] = max(emitted, self.emitted.get(name, emitted))
 
-    def announce(self, name, app_data, heard):
+    def announce(self, name, app_data, heard, emitted=None):
         """Deliver an announce as RNS does: remembered, then passed to every matching handler."""
-        self.store(name, app_data, heard)
+        self.store(name, app_data, heard, emitted)
         for handler in self.handlers:
             handler.received_announce(destination_hash=name, announced_identity=None, app_data=app_data)
 
@@ -650,6 +658,61 @@ class ResolveTest(NamesTestCase):
         self.clock.now += 50
         self.network.announce(name, encode_record(5, CID_A), self.clock.now)
         self.assertEqual(self.manager.resolve(name, persist=False, max_age=10)["age"], 0)
+
+    def test_replayed_announce_shows_its_record_current_for_a_bounded_time(self):
+        """An old announce repeated (RNS remembers it as just heard; its emission stays) is heard no later than
+        ANNOUNCE_VALIDITY announce intervals after it was emitted: a resolve past that asks keepers, which have
+        the newer record, and a follow's or deny list's check, reusing a record for that long, does too after it."""
+        name = other_name(1)
+        emitted = self.clock.now
+        window = names.ANNOUNCE_VALIDITY * self.config.announce_interval
+
+        def replayed(manager, keepers):
+            """The old announce, repeated by a neighbour, also in answer to path requests."""
+            self.network.announce(name, encode_record(1, CID_A), self.clock.now, emitted=emitted)
+            self.network.on_request_path = lambda n: self.network.store(n, encode_record(1, CID_A), self.clock.now,
+                                                                        emitted=emitted)
+            keepers.answers[name] = [(2, CID_B, emitted + 10)]  # the owner published again; this node missed it
+
+        keepers = self.manager.keepers = FakeKeepers()
+        replayed(self.manager, keepers)
+        self.clock.now = emitted + window - 100
+        replayed(self.manager, keepers)
+        self.assertEqual(self.manager.resolve(name, persist=False)["sequence"], 1)
+        self.clock.now = emitted + window + 100
+        replayed(self.manager, keepers)
+        self.assertEqual(self.manager.resolve(name, persist=False)["sequence"], 2)
+        self.assertEqual(keepers.queried, [name])
+
+        # A follow's check (max_age = window) on another node holding the old record
+        self.network = FakeNetwork()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = Config(rnfs_dir=self.tmp.name, path_timeout=0.2, name_table_size=3, announce_interval=3600,
+                             startup_announce_delay=30)
+        self.clock.now = emitted
+        follower = self.make_manager()
+        follower.start()
+        keepers = follower.keepers = FakeKeepers()
+        replayed(follower, keepers)
+        sequences = []
+        while self.clock.now < emitted + 3 * window:
+            self.clock.now += window / 4
+            replayed(follower, keepers)
+            sequences.append(follower.resolve(name, persist=True, max_age=window)["sequence"])
+        self.assertEqual(sequences[:7], [1] * 7)  # up to 2 windows after it was emitted
+        self.assertEqual(set(sequences[8:]), {2})
+
+    def test_announces_of_an_owner_still_announcing_stay_current(self):
+        """Each new announce has a new emission time, so the record stays current, and keepers aren't asked."""
+        keepers = self.manager.keepers = FakeKeepers()
+        name = other_name(1)
+        window = names.ANNOUNCE_VALIDITY * self.config.announce_interval
+        for _ in range(6):
+            self.network.announce(name, encode_record(1, CID_A), self.clock.now, emitted=self.clock.now)
+            self.assertEqual(self.manager.resolve(name, persist=True, max_age=window)["age"], 0)
+            self.clock.now += self.config.announce_interval
+        self.assertEqual((keepers.queried, self.network.path_requests), ([], []))
 
     def test_malformed_announce_ignored(self):
         """A malformed record is ignored and leaves the held one."""

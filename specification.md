@@ -861,8 +861,8 @@ the name through the network and asks keepers (below), since the key's earlier r
 - The daemon registers one announce handler for `rnfs.name` (with `receive_path_responses=True`).
 - To refresh, call `Transport.request_path(name)`, wait up to `path_timeout`, then read
   `Identity.recall_app_data(name)`.
-- If the path request heard nothing within `path_timeout` (or always, with `keeper_query = always`), ask
-  keepers (below). Storing a provider record is free, and so is answering `/find`, so neither a record's age,
+- If the path request heard nothing within `path_timeout`, or heard only an announce emitted more than
+  2 × `announce_interval` ago (or always, with `keeper_query = always`), ask keepers (below). Storing a provider record is free, and so is answering `/find`, so neither a record's age,
   nor the order a reply lists it in, nor how many nodes list it may decide which keepers are asked. Standing
   is read from the routing table as it was when the query started: a node the lookup meets doesn't gain rank
   from answering it, and one that fails a query meanwhile loses rank. An *established* node is one that was
@@ -889,7 +889,11 @@ the name through the network and asks keepers (below), since the key's earlier r
   A keeper query (a DHT lookup plus a few requests) costs roughly ten to twenty times the airtime of a
   resolve a path response answers, so `always` SHOULD NOT be used on slow links.
 - Return the record with the highest sequence held, and how long ago it was heard (for a record from a
-  keeper, from its signed emission time, never in the future).
+  keeper, from its signed emission time, never in the future). RNS remembers a repeated old announce as just
+  heard, so a record is counted as heard through an announce no later than 2 × `announce_interval` after the
+  newest emission time (signed) RNS holds for the name, which repeating an old announce doesn't change (rnfs:
+  from RNS's path table). A neighbour repeating an old announce can then keep a replaced record current for
+  at most that long, plus the age a caller accepts (a follow's or deny list's 2 × `announce_interval`).
 
 **Sequence.** RNS stores any validly signed announce, including a replayed old one, so persisted sequences are
 what prevent rollback.
@@ -966,7 +970,8 @@ followed name is checked when a newer record is heard and every `announce_interv
 - RNS orders announces by a signed emission timestamp from the publisher's clock, so a publisher whose clock
   goes backwards can't update its name until old paths expire.
 - A resolver's first resolution of a name, through an announce or a keeper, can't detect a replayed old
-  record.
+  record. A node that missed a name's newer announces and is next to someone repeating an older one gets the
+  newer record from keepers only once the repeated announce is 2 × `announce_interval` old (above).
 - The same name key used on two machines can produce two records with one sequence; each resolver keeps the
   one it heard first.
 
@@ -988,7 +993,7 @@ as is cheap. Rules live in the sections referenced.
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
 | Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected unsent, or fell far behind its schedule; many fast-link slots; requester stall detection (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
-| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links and on links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
+| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links, LXMF delivery links and links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
@@ -1153,9 +1158,12 @@ gateway can never reach the API.
   anything else stops the daemon with an error.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
-  Before it first sends the token, a client SHOULD check this proof with a `GET /api/status` (the CLI and
-  `rnfs.apiclient` do), so a program another user runs on the port while the daemon is down learns neither the
-  token nor a name key being imported.
+  Before it sends the token, a client SHOULD check this proof with a `GET /api/status` on the connection
+  that will carry the request (the CLI and `rnfs.apiclient` do, for every request), so a program another user
+  runs on the port while the daemon is down learns neither the token nor a name key being imported, nor can
+  answer in the daemon's place. The API keeps a connection open after a status request carrying a valid
+  challenge and `Connection: keep-alive` (and no body), answering it with `Connection: keep-alive`, for one
+  more request, which is its last; every other connection is closed after its request.
 - The API never sends CORS headers.
 - Both servers SHOULD time-limit reading a request (rnfs: 15 s for the request line, headers and small
   bodies; 60 s between reads of an upload), but not the node's work, and SHOULD cap concurrent
@@ -1442,6 +1450,9 @@ unreserved, pct-encoded: as in RFC 3986
 - On the link to a propagation node, a response Resource larger than 1 MB (4 × the 256 kB delivery limit,
   which LXMF asks the node to respect) or of more than one segment is refused and the link torn down;
   decompression is bounded to 1 MB.
+- On a delivery link, a Resource of more than one segment is refused before any of it is transferred: LXMF
+  checks only the size each segment advertises for itself, and a message within the 256 kB delivery limit
+  always fits one segment.
 
 **Receiving.**
 - Senders in `lxmf_accept_from` or `lxmf_auto_fetch_from`, and LXMF contacts (section 11), are *trusted*.

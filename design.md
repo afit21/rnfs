@@ -314,8 +314,10 @@ Programs use `rnfs.Node` or `rnfs.Client` (Public API, below). The CLI, and `rnf
 daemon through the local API with `rnfs/apiclient.py` (`ApiConnection`), which imports neither RNS nor anything
 that does. `ApiConnection(rnfs_dir, port, token_file, timeout)` takes the port from `rnfs.toml`
 (`api_port()`, `SettingsError`) and the token from `<rnfs dir>/api_token` (`read_token`, `TokenError`); its
-first request needing the token proves the daemon first (`verify_daemon`, under a lock, so concurrent first
-requests prove it once), which also reads the daemon's version for `check_daemon`, the one place a version
+every request needing the token first proves the daemon on its own connection (`_prove`, `verify_daemon`),
+which the daemon keeps open for that request only, so a client used for a long time sends nothing to a program
+that took the port after the daemon stopped; the token is read again when a proof with it fails (a restarted
+daemon's). The proof also reads the daemon's version for `check_daemon`, the one place a version
 check goes. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed`, `AuthFailed` (a failed proof,
 or 403) and the API's statuses (`STATUS_ERRORS`, `error_for`); `Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
@@ -408,8 +410,9 @@ read from (`winacl.tighten(fd=...)`): another account's is refused, a loose one 
 a failure is fatal. A `--dir` outside `%USERPROFILE%` is warned about. The advapi32 and kernel32 calls are
 behind `winacl.backend`, which tests replace with a fake. A response to a request with
 `X-Rnfs-Challenge: <32 hex>` carries `X-Rnfs-Proof: apiclient.api_proof(token, port, challenge)` (HMAC-SHA256 of
-`rnfs api proof <port> <challenge>`); `apiclient.ApiConnection.verify_daemon` checks it with `GET /api/status` before
-first sending the token. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
+`rnfs api proof <port> <challenge>`); `apiclient.ApiConnection.verify_daemon` checks it with `GET /api/status` on the connection
+that then carries the token: `ApiHandler.dispatch` keeps one open after a proof request asking for
+`keep-alive` (`keep_open`, once per connection: `proved`), giving the next request a new request deadline. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
 32, gateway 64) and refuse HTTP/0.9 with a 400 carrying the usual headers (both add them in `end_headers`, so
 http.server's own error pages, 400, 414, 431 and 501, carry them too). Gateway errors raised by the node
 (anything but `GatewayError` and `NotFound`: 400, 413, 422, 503, 507, 500) say only a fixed message per status
@@ -834,7 +837,8 @@ work on `RnfsNode.offline` test nodes.
 installs SIGINT/SIGTERM handlers that exit at once), a 256 kB delivery limit, announce data without
 `SF_COMPRESSION`, and incoming delivery Resources (and propagation-node downloads) allowed to decompress up to
 that limit, since the daemon sets RNS's global limit to 0 (an embedded node leaves it, and the limit bounds them
-all the same). It keeps a table of up to 64 propagation nodes from
+all the same). `delivery_resource_advertised` is wrapped to refuse a delivery Resource of more than one segment
+(LXMF checks only each segment's own size). It keeps a table of up to 64 propagation nodes from
 announces (forgotten after 7 days unheard), but uses one automatically only if it is `lxmf_propagation_node`;
 the nearest heard is used only for a request with `nearest`, and without a configured node the feature logs
 once (notice) that downloads and the fallback are off. On a propagation-node link it cancels any response

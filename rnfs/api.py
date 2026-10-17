@@ -639,6 +639,9 @@ class ApiHandler(TimedHandler):
         ("POST", "/api/import"): "api_import",
     }
     OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
+    PROOF_ROUTE = ("GET", "/api/status")
+    proved = False  # this connection had its proof request kept open: it is closed after the next request
+    keep_open = False  # the request being answered is a proof request whose connection stays open
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
@@ -666,6 +669,8 @@ class ApiHandler(TimedHandler):
         challenge = (self.headers.get(CHALLENGE_HEADER) or "").strip()
         if CHALLENGE.fullmatch(challenge):
             self.send_header(PROOF_HEADER, api_proof(self.token, self.server.server_address[1], challenge))
+        if self.keep_open:
+            self.send_header("Connection", "keep-alive")
 
     def send_json(self, status: int, body):
         """Send body as a JSON response with the given status."""
@@ -722,7 +727,10 @@ class ApiHandler(TimedHandler):
 
     def dispatch(self):
         """Check Host and the token, route the request, and map exceptions to error responses."""
-        self.close_connection = True  # one request per connection keeps body handling simple
+        # One request per connection keeps body handling simple, but for a proof request: its client then sends
+        # its request on that connection, which can only reach this server (apiclient.ApiConnection._prove)
+        self.close_connection = True
+        self.keep_open = False
         url = urlsplit(self.path)
         self.query = parse_qs(url.query, keep_blank_values=True)
         self.headers_sent = False
@@ -742,10 +750,20 @@ class ApiHandler(TimedHandler):
                                            f"token the daemon wrote to <rnfs dir>/api_token")
             if self.command != "POST":
                 self.request_read()  # no body; POST endpoints call it once they have read theirs
+            self.keep_open = (route == self.PROOF_ROUTE and not self.proved
+                              and CHALLENGE.fullmatch((self.headers.get(CHALLENGE_HEADER) or "").strip()) is not None
+                              and "keep-alive" in (self.headers.get("Connection") or "").lower()
+                              and not self.headers.get("Content-Length") and not self.headers.get("Transfer-Encoding"))
             if feature_route is not None:
                 feature_route(self)
             else:
                 getattr(self, name)()
+            if self.keep_open:
+                # The next request on this connection gets the time limits of a new one, and is its last
+                self.proved = True
+                self.close_connection = False
+                self.deadline = time.monotonic() + self.request_timeout
+                self.phase = "request"
         except ApiRequestError as e:
             self.respond_error(e.status, str(e))
         except RequestTimeout as e:

@@ -66,7 +66,7 @@ Added:
   stops the program's Reticulum, and locks its rnfs dir as the daemon does, so the two can't share one.
 - `rnfs.apiclient`, the local API's protocol layer under `rnfs.Client` and the CLI: it finds the rnfs
   directory, port and token as the CLI does, makes whatever listens on the API port prove it knows the token
-  before sending it, and raises a typed error for each failure (each also a subclass of the node's matching
+  before sending it, on the connection carrying each request, and raises a typed error for each failure (each also a subclass of the node's matching
   error). Standard library only. The CLI now uses it, with the same output.
 - `GET /api/name/watch`, a long poll for newer records of names, and a `from` parameter on `GET /api/cat`
   (specification section 11).
@@ -85,6 +85,22 @@ Added:
   asking for a denied block is told it isn't held.
 
 Fixes:
+- Anyone able to reach the node's LXMF delivery destination could pass the 256 kB message limit by sending a
+  Resource in many segments, each within the limit: RNS appended them to one file under its storage, kept
+  until the last arrived, and LXMF read the whole Resource into memory before checking its signature. A
+  delivery Resource of more than one segment is now refused before any of it is transferred (a message within
+  the limit always fits one), in an embedded node too.
+- The local API's clients proved the daemon once, then trusted the port: a program kept running across a daemon
+  restart (an `rnfs.Client`, a long `rnfs get` or job wait) sent the token and request bodies, name keys being
+  imported among them, to whatever listened on the port next, and took its answers. The daemon now proves itself
+  on the connection carrying each request (it keeps a proof request's connection open for one more request), and
+  a client reads the token again when the proof fails, so it also goes on working after the daemon restarts
+  (before, it got 403 until restarted itself). A client of this version still works with an older daemon.
+- A neighbour repeating a name's old announce could keep a node that missed the newer one on the old record
+  indefinitely: RNS remembers a repeated announce as just heard, so the record looked current, the checks of
+  followed names and deny lists skipped the network, and resolves never asked keepers. An announce now shows
+  its record current at most 2 × `announce_interval` after it was emitted (its signed time, which repeating it
+  doesn't change); past that, resolves ask keepers.
 - A far node that keeps announcing but never accepts a link cost every lookup its connection timeout (60 s or
   more at 9–10 hops), and held lookups open long after they had their answer: its announces reset the failure
   count that would have dropped it, and other nodes kept naming it in their replies once it was dropped. A node

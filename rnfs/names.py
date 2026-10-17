@@ -3,7 +3,9 @@
 A name is the hash of an `rnfs.name` destination whose RNS identity is the name's key. Its record,
 `[sequence, binary CID]` in msgpack, rides in the destination's announce app_data, which RNS signs. RNS stores
 any validly signed announce, including a replayed old one, so the highest sequence seen is persisted for every
-name this node publishes or resolves for the user, and lower sequences are never accepted from any source.
+name this node publishes or resolves for the user, and lower sequences are never accepted from any source. RNS
+also remembers a replayed announce as just heard, so an announce shows its record current only up to
+ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers.
 Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
 names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
 within seconds of a resolve or an announce raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten
@@ -61,6 +63,10 @@ _PARTIAL = re.compile(re.escape(fsutil.PARTIAL_PREFIX) + r"[0-9a-f]{16}")  # a k
 _DECIMAL = re.compile(r"-?[0-9]+")  # a sequence column (decimal text: sequences don't fit SQLite's integers)
 _MAX_USED = 2**62  # floor rows' used values stay below this, so the ones after them still fit SQLite's integers
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
+# An announce shows its record current for this many announce_intervals after it was emitted, however recently
+# it was heard: RNS remembers a replayed announce as just heard (_announce_heard)
+ANNOUNCE_VALIDITY = 2
+_PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds its announces' random blobs
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up
 
 
@@ -318,6 +324,24 @@ class RnsNetwork:
     def recall_app_data(self, name: bytes) -> bytes | None:
         """The app_data of the last validly signed announce RNS heard for name."""
         return RNS.Identity.recall_app_data(name)
+
+    def emitted_time(self, name: bytes) -> float | None:
+        """When the newest announce RNS took a path to name from was emitted (its owner's clock, signed), or None.
+
+        RNS internal (Transport.path_table[hash][IDX_PT_RANDBLOBS], the random blobs of the announces it took the
+        path from, whose bytes 5-10 are each one's emission time: Transport.timebase_from_random_blobs). RNS adds an
+        announce's blob only if it was emitted later than the path's newest, so repeating an old announce, which
+        RNS still remembers as just heard (heard_time), leaves this as it was. If it changes in another RNS version
+        this returns None and callers go by the heard time alone.
+        """
+        try:
+            entry = RNS.Transport.path_table.get(name)
+            if not entry:
+                return None
+            emitted = RNS.Transport.timebase_from_random_blobs(entry[_PATH_RANDOM_BLOBS])
+            return float(emitted) if type(emitted) is int and emitted > 0 else None
+        except Exception:
+            return None
 
     def heard_time(self, name: bytes) -> float | None:
         """When RNS last stored a validly signed announce for name (wall clock), or None.
@@ -877,7 +901,19 @@ class NameManager:
             held = self._record(name, touch=False)
             same = held is not None and held.sequence == sequence and held.cid == cid
             heard = held.heard if same else self._clock()
-        self._offer(name, sequence, cid, heard)
+        self._offer(name, sequence, cid, self._announce_heard(name, heard))
+
+    def _announce_heard(self, name: bytes, heard: float) -> float:
+        """The heard time of name's record from an announce RNS heard at heard: no later than ANNOUNCE_VALIDITY
+        announce_intervals after RNS's newest announce of name was emitted. Anyone may repeat an old announce, and
+        RNS remembers it as just heard, so by its time alone a record its owner has since replaced would look
+        current, and resolves would never ask keepers for the newer one. The owner announces every
+        announce_interval, so an announce older than ANNOUNCE_VALIDITY of them no longer shows its record current.
+        """
+        emitted = self._network.emitted_time(name)
+        if emitted is None:
+            return heard
+        return min(heard, emitted + ANNOUNCE_VALIDITY * self.config.announce_interval)
 
     def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
@@ -889,7 +925,7 @@ class NameManager:
             if parsed is not None:
                 # Unasked: not being resolved (a path response would have a waiter), kept nor watched
                 unasked = not kept and name not in self._waiters and name not in self._watched
-                self._offer(name, parsed[0], parsed[1], self._clock(), unasked=unasked)
+                self._offer(name, parsed[0], parsed[1], self._announce_heard(name, self._clock()), unasked=unasked)
             else:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):
