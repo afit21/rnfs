@@ -8,18 +8,19 @@ recently, so a flood of new identities can't displace older publishers; a publis
 one seen most recently) stores into the pool instead. A full pool evicts a record of the publisher holding the
 most pooled records (one of them at random, if several hold as many), never the storer's own, so a new
 publisher can always store something and a flood of identities evens out the pool rather than emptying it of
-everyone else's records. This node's own records are always accepted.
+everyone else's records. This node's own records are always accepted and never evicted: they are what the node
+provides, and its /find replies list it as a provider from them.
 
 Local limits, not part of the protocol, bound what one identity can take: a publisher holds at most
 max_records // PUBLISHER_SHARE records once it has been seen for `seniority`, and a tenth of that before (so
 one long-lived identity can't fill the store and lock everyone else out, and a fresh one gets little; this
-node's own records are exempt); and a key has at most MAX_PUBLISHERS_PER_KEY publishers (so /find replies
-stay cheap however many identities advertise one key). A newcomer to a full key evicts one of its publishers
-at random, never one of the K/2 oldest records: refusing newcomers would let early Sybil identities hold the
-key, and the random half of /find replies relies on newcomers getting stored. A publisher's first-seen time
-is kept for a TTL after its last record goes, so one that was away for a while isn't new again; that of a
-newcomer whose last record was evicted from the pool is kept too, in a smaller memory that forgets the most
-recently first seen first, so a flood can't keep a new publisher new forever.
+node's own records are exempt); and a key has at most MAX_PUBLISHERS_PER_KEY publishers besides this node (so
+/find replies stay cheap however many identities advertise one key). A newcomer to a full key evicts one of its
+publishers at random, never one of the K/2 oldest records nor this node's own: refusing newcomers would let early
+Sybil identities hold the key, and the random half of /find replies relies on newcomers getting stored. A
+publisher's first-seen time is kept for a TTL after its last record goes, so one that was away for a while isn't
+new again; that of a newcomer whose last record was evicted from the pool is kept too, in a smaller memory that
+forgets the most recently first seen first, so a flood can't keep a new publisher new forever.
 
 Records, first-seen times and departures are persisted in the state database (rnfs.statedb: the
 provider_records, provider_publishers, provider_departed and provider_evicted tables) by save(), which the node
@@ -196,7 +197,8 @@ class ProviderStore:
         max_per_publisher defaults to max(MIN_PER_PUBLISHER, max_records // PUBLISHER_SHARE); a publisher
         seen for less than `seniority` seconds (the node passes provider_seniority; 0: no ramp-up) may hold
         newcomer_per_publisher, a tenth of it. own_id's records (the node recording itself) aren't limited by
-        either, and are never refused for room: they are as many as the node provides.
+        either, nor counted toward max_per_key, and are never refused for room or evicted: they are as many as
+        the node provides (beyond max_records, in the rare case that it provides more than the store holds).
         """
         self.max_records = max_records
         self.max_per_publisher = (max_per_publisher if max_per_publisher is not None
@@ -263,7 +265,9 @@ class ProviderStore:
         newest one there evicts a record of that newest publisher; any other goes into the pool. A full pool
         evicts the record pooled first by one of the publishers holding the most pooled records, and refuses a
         publisher already holding that many (so it can't churn its own records). So new identities can't
-        displace older publishers, and a new publisher always gets in.
+        displace older publishers, and a new publisher always gets in. own_id's records are never evicted by
+        either limit, nor counted toward max_per_key: Sybil stores to a key could otherwise push the node's own
+        record out of its own store.
         """
         check_id(key)
         check_id(publisher)
@@ -375,15 +379,18 @@ class ProviderStore:
             self._sweep_publisher(publisher, entry, now)
             if publisher in self._publishers and len(self._publishers[publisher].keys) >= allowance:
                 return False
+        if publisher == self.own_id:
+            return True  # the node's own record doesn't count toward max_per_key, so it evicts no one
         records = self._records.get(key)
-        if records is not None and len(records) >= self.max_per_key:
+        # The node's own record is neither counted nor a candidate: otherwise about a thousand Sybil stores to a
+        # key it provides would evict it from its own store, and its own /find replies would leave it out
+        if records is not None and len(records) - (self.own_id in records) >= self.max_per_key:
             self._drop_expired([(key, other) for other in records], now)
-            records = self._records.get(key, {})
-            if len(records) >= self.max_per_key:
+            others = [other for other in self._records.get(key, {}) if other != self.own_id]
+            if len(others) >= self.max_per_key:
                 # Records are in first-stored order: the K/2 oldest (the half /find replies favour) stay
                 senior = min(K // 2, self.max_per_key - 1)
-                victim = list(records)[self.rng.randrange(senior, len(records))]
-                self._remove(key, victim)
+                self._remove(key, others[self.rng.randrange(senior, len(others))])
         return True
 
     def _sweep_publisher(self, publisher: bytes, entry: _Publisher, now: float):
@@ -431,17 +438,32 @@ class ProviderStore:
         if self._pool_count < self.pool_size:
             return True
         # Fair shares: a publisher already holding as many pooled records as anyone can't push others out (nor
-        # churn its own); any other takes a record from one of those holding the most
-        if not own and len(self._pooled.get(publisher, ())) >= self._most_pooled:
+        # churn its own); any other takes a record from one of those holding the most. The node's own records are
+        # never taken, nor counted among the most held (it holds what it provides, not a share)
+        most = self._most_pooled_by_others()
+        if not own and len(self._pooled.get(publisher, ())) >= most:
             return None
-        holders = self._holders[self._most_pooled]
+        if most == 0:
+            return True  # only own records are pooled: the node's own goes over the pool rather than evict its own
+        holders = self._holders[most]
         index = self.rng.randrange(len(holders))
         victim_id = holders[index]
-        if victim_id == publisher and len(holders) > 1:  # own records: another's first, if another holds as many
+        if victim_id == self.own_id:  # at most one entry, and not the only one at `most`
             victim_id = holders[(index + 1) % len(holders)]
         key = next(iter(self._pooled[victim_id]))  # the one it had pooled first
         self._remove(key, victim_id, evicted=True)
         return True
+
+    def _most_pooled_by_others(self) -> int:
+        """The most pooled records any publisher but own_id holds (0: none). Caller holds the lock.
+
+        _most_pooled unless own_id alone holds that many: then the next count held, found by stepping down (only
+        then, so O(1) otherwise).
+        """
+        most = self._most_pooled
+        while most and self._holders.get(most, [self.own_id]) == [self.own_id]:
+            most -= 1
+        return most
 
     @staticmethod
     def _rank(entry: _Publisher) -> tuple[float, int]:
@@ -695,7 +717,7 @@ class ProviderStore:
         return self._live(key, exclude)
 
     def _live_unsorted(self, key: bytes) -> list[bytes]:
-        """Unexpired providers of key in the order their records were stored (at most max_per_key)."""
+        """Unexpired providers of key in the order their records were stored (at most max_per_key, and own_id)."""
         with self._lock:
             now = self.clock()
             return [publisher for publisher, record in self._records.get(key, {}).items()
@@ -818,17 +840,21 @@ class ProviderStore:
             self._publishers[publisher] = _Publisher(seen, next(self._order))
         # Oldest records first, so each key's records are in first-stored order and the limits keep the oldest
         for key, publisher, first, last, pooled in sorted(records, key=lambda record: record[2]):
+            own = publisher == self.own_id
+            held = self._records.get(key, {})
+            # As store() keeps them: the node's own records aren't limited, nor counted toward max_per_key
             if (publisher not in self._publishers or now - last >= self.ttl
-                    or (publisher != self.own_id
-                        and len(self._publishers[publisher].keys) >= self.max_per_publisher)
-                    or len(self._records.get(key, ())) >= self.max_per_key):
+                    or (not own and len(self._publishers[publisher].keys) >= self.max_per_publisher)
+                    or (not own and len(held) - (self.own_id in held) >= self.max_per_key)):
                 continue
-            # Where it was if there is room there, else wherever there is
+            # Where it was if there is room there, else wherever there is (the node's own: where it was, as
+            # store() lets them exceed the store rather than evict them)
             main_room = self._main_count < self.main_size
             pool_room = self._pool_count < self.pool_size
-            if not (main_room or pool_room):
+            if not (main_room or pool_room or own):
                 continue
-            pooled = pool_room if pooled or not main_room else False
+            if main_room or pool_room:
+                pooled = pool_room if pooled or not main_room else False
             entry = self._publishers[publisher]
             self._records.setdefault(key, {})[publisher] = _Record(first, last, pooled)
             entry.keys.add(key)

@@ -611,7 +611,10 @@ and repeat.
   as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
   always store something, a flood churns only the pool, and the pool is shared out evenly between
   publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
-  republished while the rest has room. The node's own records are always accepted.
+  republished while the rest has room. The node's own records are always accepted and never evicted to make
+  room for others' (rnfs: nor counted toward its local limit of 1000 publishers per key, a newcomer to a full
+  key evicting a random one of the others but the `K/2` oldest), so Sybil stores can't push a node's own record
+  out of its own store.
 - First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
   (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
   oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer

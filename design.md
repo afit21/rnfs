@@ -261,7 +261,9 @@ non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `provid
 that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
 swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
 from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
-one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool evicting by fair share: each
+one, never one of the `K/2` oldest records. The node's own record (`own_id`) isn't counted toward the 1000 and is
+never a victim, here or in the pool (`_most_pooled_by_others` steps past it when it alone holds the most), so
+Sybil stores can't push it out of its own store; its records may exceed the pool rather than evict each other. A tenth of the store is a newcomer pool evicting by fair share: each
 publisher's pooled keys sit in an ordered dict (oldest pooled first), and publishers in lists by how many they
 hold (`_holders`, with each one's index, and `_most_pooled`), so a full pool picks one of the biggest holders at
 random in O(1); one already holding the most is refused. The newest publisher with records outside the pool comes
