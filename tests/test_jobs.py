@@ -212,6 +212,21 @@ class JobsTest(JobsBase):
         self.assertEqual(self.finished(started)["state"], "done")
         self.assertEqual(self.finished(queued)["state"], "done")
 
+    def test_a_stalled_running_job_isnt_saved_again(self):
+        """The periodic save writes a running job only when its record changed: a stalled one costs no commit."""
+        cid = self.share(b"stalled")
+        self.net.gate.clear()
+        job_id = self.jobs.submit("get", cid, self.out("stalled"))["id"]
+        self.assertTrue(wait_for(lambda: self.jobs.get(job_id)["state"] == "running"))
+        self.jobs.save()
+        with mock.patch.object(self.jobs._db, "transaction", wraps=self.jobs._db.transaction) as write:
+            self.jobs.save()
+            self.jobs.save()
+        self.assertEqual(write.call_count, 0)
+        self.net.gate.set()
+        self.assertEqual(self.finished(job_id)["state"], "done")
+        self.assertTrue(wait_for(lambda: [r["state"] for r in self.saved()] == ["done"]))  # its outcome saved
+
     def test_cancel_queued_job_and_concurrency_limit(self):
         self.b.config.max_jobs = 1
         cids = [self.share(f"file {i}".encode()) for i in range(3)]
@@ -471,7 +486,7 @@ class JobsTest(JobsBase):
         with failing_commits():
             job_id = self.jobs.submit("pin", cid)["id"]
         self.assertEqual(self.saved(), [])
-        self.assertTrue(self.jobs._dirty)
+        self.assertEqual(self.jobs._store.pending, {job_id})  # left for the next save
         self.jobs.save()
         self.assertEqual([(r["id"], r["state"]) for r in self.saved()], [(job_id, "queued")])
 
