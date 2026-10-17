@@ -56,6 +56,34 @@ Security:
   warning and scanned as empty: nothing is imported, and every pin with source `folder` is released, so keys a
   0.1.5 node already shared that way stop being provided at the first scan after the upgrade. On Linux and macOS,
   a directory above the folder that other users can change gets a warning, once.
+- A node no longer reads request packets sent to it on `rnfs.dht` links it opened. That end of a link has no
+  request handlers, yet RNS decoded each request (up to the link's packet size) and started a thread for it
+  before finding nothing to run, for any node rnfs linked to. LXMF and host-program links are unchanged.
+- An explicit `max_upload_rate` now applies to every `/blocks` response, including one that fits in one packet.
+  Such responses never give the link a rate estimate, and the cap applied only once there was one, so on a
+  large-MTU path (RNS's TCP interfaces) a requester asking only for single-packet answers was never paced. Waits
+  of up to 5.6 s are held and longer ones refused as busy, as for larger responses. The default cap (half the
+  rate estimate, on slow links) is unchanged.
+- The wait for a previous `/blocks` response's proof uses the round-trip time the requester claims only if it is
+  a finite, non-negative number, and still at most 5 s. Before, a negative claim gave an honest proof no grace,
+  and a value that wasn't a number made the request handler fail.
+- `install.sh` ties a release install to the tag it asked for: where `gh` supports them, the provenance check
+  passes `--source-ref=refs/tags/<tag>` and `--deny-self-hosted-runners`, and only an `rnfs-<version>-*.whl` of
+  that tag's version is installed. Before, an older release's genuinely attested sdist, renamed to the new
+  release's file name, passed both checks.
+- `install.sh` stops when the GitHub CLI has `gh attestation` but isn't logged in (root installs usually hit
+  this), instead of quietly checking `SHA256SUMS` only. Log in with `gh auth login`, or set
+  `RNFS_REQUIRE_ATTESTATION=0` to install with the checksum only. Without `gh` it still warns, and the README now
+  says that `curl | sh` without `gh` trusts whoever can write the release's files.
+- The Flatpak's sandbox is narrowed to `~/.rnfs`, `~/.reticulum` and the Downloads folder, with no devices
+  (before: your whole home folder and every device, so a compromised daemon could write `~/.bashrc`). See the
+  upgrade note below.
+- `install.sh` warns when `RNFS_SOURCE` is, or names, a plain `http://` URL, and the `.deb`'s postinst
+  byte-compiles with `python3 -I`.
+- The file-index-node NomadNet page renders at most once a minute, one visit at a time, and serves its cached
+  page meanwhile (before, every visit ran `rnfs pin ls`).
+- `examples/rnfs_share.py` and `rnfs.Client`'s log escape names and daemon messages, so a name can't drive the
+  terminal.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
@@ -74,6 +102,12 @@ Changed:
 - When a file is refused because its SHA-256 is on the deny list, the log suggests `rnfs deny add <file cid>`
   (once per file): a `sha256:` entry doesn't stop the file's blocks being served one by one, and denying its CID
   does.
+- **Upgrade note (Flatpak):** after updating, the Flatpak no longer sees the rest of your home folder or any
+  device. Grant what you used again: `flatpak override --user --device=all io.github.afit21.rnfs` for an RNode or
+  other serial interface, and `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` for other
+  folders, `~/.config/reticulum` included if your Reticulum config is there.
+- The README says plainly that pipx and plain `pip install` resolve dependencies unpinned, not at the versions in
+  `packaging/requirements.lock`.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -85,6 +119,8 @@ Changed:
 
 Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
+- `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and
+  `PrivateTmp=yes`, for systems with unprivileged user namespaces. The default unit sets neither, nor `UMask`.
 
 ## 0.1.5
 

@@ -1334,9 +1334,13 @@ Everything in the specification is implemented, with these simplifications and a
     without build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
     `build-backend.lock`. `build-deb.sh` fails if a supported Python has no cffi backend, caps `python3` below
     3.15, and writes a DEP-5 `copyright` and `md5sums`.
-  - `install.sh` installs the latest release's source archive (`archive/refs/tags/<tag>.zip`, the tag taken
-    from where `releases/latest` redirects, so no GitHub API), the main branch's with `--main`, or
-    `RNFS_SOURCE`. Since the script on `main` installs older release trees, it must keep working with every
+  - `install.sh` installs the latest release's sdist (`rnfs-X.Y.Z.tar.gz`, the tag taken from where
+    `releases/latest` redirects, so no GitHub API), the main branch's archive with `--main`, or `RNFS_SOURCE`
+    (with a warning for a plain `http://` URL). A release's sdist must match the release's `SHA256SUMS` and,
+    where the GitHub CLI (2.49 or newer) can check it, its signed build provenance for that tag
+    (`--source-ref=refs/tags/<tag>` and `--deny-self-hosted-runners` when this `gh` has them); a `gh` with the
+    attestation command that isn't logged in stops the install unless `RNFS_REQUIRE_ATTESTATION=0`, and without
+    `gh` it warns. Only a wheel of the tag's version is installed from it. Since the script on `main` installs older release trees, it must keep working with every
     release's layout from 0.1.1 on (`packaging/requirements.lock`, `packaging/build-backend.lock`).
     It unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
     locks; a `.whl` or other requirement has none, so it warns and installs dependencies unpinned. It installs
