@@ -244,6 +244,8 @@ Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 - `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
   `status` (messages from untrusted senders dropped by the rate limits since the start).
+- `tests/security/README.md`: an index from each security finding's audit ID to its regression tests, the code they
+  guard and the commits that fixed it, grouped by subsystem (a test checks that every security test is listed).
 - CONTRIBUTING.md: running the tests and their options, lint, the dependency locks, adding a schema step or an
   API route, and releasing. `specification.md` names the version it describes and that the wire format is
   byte-identical since 0.1.3. Dependabot updates the workflows' pinned actions. Tests check that the supported
