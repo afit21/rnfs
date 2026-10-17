@@ -14,7 +14,7 @@ from rnfs.content.builder import Built
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.shared_folder import FolderFiles, SharedFolder
 from rnfs.content.storage import FOLDER, USER, Storage
-from rnfs.errors import Denied
+from rnfs.errors import BlockMismatch, Denied, TooLarge
 from rnfs.node import RnfsNode
 from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES, state_execute, state_rows, write_legacy
 from tests.test_builder import swap_on_open, within
@@ -138,11 +138,12 @@ class SharedFolderTest(unittest.TestCase):
         self.assertEqual(self.storage.pinned_by(FOLDER), {self.cid_of("a.txt")})
 
     def test_import_failing_for_its_content_waits_for_a_change(self):
-        """A failure of the content itself (here ValueError) isn't tried again, however long, until it changes."""
+        """A failure of the content itself (an RnfsError: here TooLarge) isn't tried again, however long, until it
+        changes."""
         clock = [100.0]
         self.folder.clock = lambda: clock[0]
         self.write("a.txt", b"a")
-        with mock.patch.object(builder, "build_open", side_effect=ValueError("bad")), \
+        with mock.patch.object(builder, "build_open", side_effect=TooLarge("too deep")), \
                 mock.patch("rnfs.content.shared_folder.log"):
             self.folder.scan()
         clock[0] += 100 * shared_folder.RETRY_AFTER
@@ -150,6 +151,26 @@ class SharedFolderTest(unittest.TestCase):
             self.assertEqual(self.folder.scan(), set())
         self.write("a.txt", b"changed")
         self.assertEqual(self.folder.scan(), {self.cid_of("a.txt")})
+
+    def test_unexpected_value_error_is_tried_again(self):
+        """A ValueError isn't the content's (invalid names and special files inside are skipped): a bug, such as a
+        BlockMismatch, so the entry is logged with the error's type and tried again RETRY_AFTER later, not parked
+        until it changes (XC4)."""
+        for error in (ValueError("bug"), BlockMismatch("block does not match")):
+            with self.subTest(type(error).__name__):
+                clock = [100.0]
+                self.folder.clock = lambda: clock[0]
+                name = f"{type(error).__name__}.txt"
+                self.write(name, name.encode())
+                with mock.patch.object(builder, "build_open", side_effect=error), \
+                        mock.patch("rnfs.content.shared_folder.log") as log:
+                    self.folder.scan()
+                self.assertIn(type(error).__name__, log.call_args_list[0].args[0])
+                self.assertEqual(log.call_args_list[0].args[1], shared_folder.LOG_WARNING)
+                with mock.patch.object(builder, "build_open", side_effect=AssertionError("tried again")):
+                    self.folder.scan()  # not yet: no retry before RETRY_AFTER
+                clock[0] += shared_folder.RETRY_AFTER
+                self.assertIn(self.cid_of(name), self.folder.scan())
 
     def test_unchanged_entry_whose_pin_fails_doesnt_stop_the_scan(self):
         """A failed pin of an unchanged entry is logged; the other entries are scanned and it is kept."""

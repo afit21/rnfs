@@ -260,6 +260,30 @@ class PublicTests:
         self.assertIsInstance(self.rnfs.gc(), rnfs.Collected)
         self.assertEqual(self.rnfs.verify().bad, ())
 
+    def test_dir_set_and_rm(self):
+        """dir_set adds an entry, dir_rm removes it again; dir_rm of a root is ValueError (a 400 for a Client),
+        refused by the node itself before it fetches anything (ND3)."""
+        directory = self.share(b"inside", name="a.txt")
+        child = self.rnfs.add(b"child").cid
+        edited = self.rnfs.dir_set(directory, "b.txt", child, executable=True)
+        self.assertEqual([(e.name, e.kind) for e in self.rnfs.ls(edited)], [("a.txt", "file"), ("b.txt", "executable")])
+        self.assertEqual(self.rnfs.dir_rm(f"{edited}/b.txt"), directory)
+        remote = self.share(b"not here", name="c.txt")
+        for target in (remote, f"{remote}/"):
+            with self.subTest(target), self.assertRaisesRegex(ValueError, "the entry to remove"):
+                self.rnfs.dir_rm(target)
+        self.assertFalse(self.b.storage.has(remote))  # not fetched
+
+    def test_remote_pin_providers_and_ping(self):
+        """pin_remote asks the node (as /pin), providers finds the provider, ping times a node or answers None."""
+        cid = self.share(b"provided")
+        self.assertIs(self.rnfs.pin_remote(A_ID, cid), True)
+        self.assertIs(self.rnfs.pin_remote(A_ID, cid, pin=False), True)
+        self.assertEqual(self.net.pins, [(A_ID, cid, True), (A_ID, cid, False)])
+        self.assertIn(A_ID, self.rnfs.providers(cid))
+        self.assertEqual(self.rnfs.ping(A_ID), 0.1)
+        self.assertIsNone(self.rnfs.ping(OTHER))
+
     def test_errors_are_one_hierarchy(self):
         """The same exception classes whichever class raises them."""
         data = os.urandom(1000)
@@ -844,7 +868,8 @@ class ImportTest(unittest.TestCase):
     def test_client_loads_no_rns(self):
         """rnfs.Client, the objects and errors load no RNS."""
         code = ("import sys, rnfs; rnfs.Client(port=1); rnfs.Cid, rnfs.Record, rnfs.NotFound, rnfs.ApiError, "
-                "rnfs.Job, rnfs.File; print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
+                "rnfs.Job, rnfs.File, rnfs.SealError, rnfs.NotRecipient, rnfs.BlockMismatch; "
+                "print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
         self.assertEqual(self.run_python(code), "False")
 
     def test_node_loads_rns_when_used(self):
@@ -856,6 +881,11 @@ class ImportTest(unittest.TestCase):
         """API_STATUS, the exported names, and an unknown one."""
         self.assertEqual(rnfs.API_STATUS, "provisional")
         self.assertIs(rnfs.NotFound, __import__("rnfs.errors").errors.NotFound)
+        # The errors programs could only catch as ValueError before (XC4): the classes rnfs raises
+        from rnfs.content import blockstore, seal
+        self.assertIs(rnfs.SealError, seal.SealError)
+        self.assertIs(rnfs.NotRecipient, seal.NotRecipient)
+        self.assertIs(rnfs.BlockMismatch, blockstore.BlockMismatch)
         self.assertIs(rnfs.Client, remote.Client)
         self.assertIn("Node", dir(rnfs))
         with self.assertRaises(AttributeError):

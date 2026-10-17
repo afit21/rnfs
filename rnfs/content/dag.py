@@ -28,6 +28,7 @@ from rnfs.errors import InvalidDag
 FILE, DIRECTORY, INDEX = 1, 2, 3
 KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2
 KINDS = (KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY)
+KIND_NAMES = {KIND_FILE: "file", KIND_EXECUTABLE: "executable", KIND_DIRECTORY: "directory"}  # as `ls` shows them
 
 MAX_SIZE = 2**64 - 1  # a size above this makes a DAG invalid
 MAX_NAME_BYTES = 255

@@ -11,6 +11,11 @@ from unittest import mock
 from rnfs import features
 
 
+def no_routes(cls):
+    """No API routes: a feature class's api_routes, so two test features don't define the same."""
+    return {}
+
+
 class DummyFeature(features.Feature):
     """A feature recording what the framework calls."""
 
@@ -49,6 +54,7 @@ class DeadlineFeature(DummyFeature):
     """A feature whose stop takes the node's deadline, with one thread that runs until stopped."""
 
     name = "deadline"
+    api_routes = classmethod(no_routes)  # DummyFeature's are its own: the node refuses a route defined twice
 
     def __init__(self, node):
         """Not stopped yet."""
@@ -114,6 +120,107 @@ class FeatureFrameworkTest(unittest.TestCase):
                 conn.close()
                 self.assertEqual(response.status, expected, body)
             self.assertEqual(body, {"hello": "me"})
+
+
+def install(*classes):
+    """Make rnfs.features load classes, in that order, each from a fake module of its own."""
+    modules = {}
+    for i, cls in enumerate(classes):
+        module = types.ModuleType(f"rnfs_test_feature_{i}")
+        module.FEATURE = cls
+        modules[module.__name__] = module
+    return (mock.patch.dict(sys.modules, modules), mock.patch.object(features, "FEATURE_MODULES", list(modules)))
+
+
+def feature_class(name, base=DummyFeature, **attributes):
+    """A subclass of base called name, without API routes unless given, with the class attributes given."""
+    return type(f"{name.title()}Feature", (base,), {"name": name, "api_routes": classmethod(no_routes),
+                                                    **attributes})
+
+
+class FeatureDependencyTest(unittest.TestCase):
+    """requires and optional, checked when the node loads its features; dependency() (audit FT4)."""
+
+    def classes(self, *classes):
+        """features.checked_classes() with only classes installed."""
+        patchers = install(*classes)
+        for patcher in patchers:
+            patcher.start()
+        try:
+            return features.checked_classes()
+        finally:
+            for patcher in reversed(patchers):
+                patcher.stop()
+
+    def test_the_shipped_features_load(self):
+        classes = features.checked_classes()
+        names = [cls.name for cls in classes]
+        self.assertEqual(len(set(names)), len(names))
+        for cls in classes:
+            for name in (*cls.requires, *cls.optional):
+                self.assertIn(name, names, cls.name)
+
+    def test_requires_a_feature_loaded_before(self):
+        base, user = feature_class("base"), feature_class("user", requires=("base",))
+        self.assertEqual(self.classes(base, user), [base, user])
+        for order in ((user,), (user, base)):
+            with self.assertRaisesRegex(features.FeatureError, "feature user: it requires feature base"):
+                self.classes(*order)
+        # An optional one may be missing, or come later
+        optional = feature_class("user", optional=("base", "absent"))
+        self.assertEqual(self.classes(optional, base), [optional, base])
+
+    def test_names_and_declarations_are_checked(self):
+        cases = ((("dummy", "dummy"), "feature dummy: another feature has that name"), (("",), "it has no name"))
+        for names, message in cases:
+            with self.subTest(names), self.assertRaisesRegex(features.FeatureError, message):
+                self.classes(*(feature_class(name) for name in names))
+        for kind, value in (("requires", "base"), ("optional", ["base"]), ("optional", (1,))):
+            with self.subTest(kind=kind, value=value), \
+                    self.assertRaisesRegex(features.FeatureError, f"feature user: {kind} must be a tuple"):
+                self.classes(feature_class("user", **{kind: value}))
+
+    def test_node_refuses_to_load_a_missing_requirement(self):
+        """Before any feature is made: none is half made, and the state is released (a retry can open it)."""
+        from rnfs.config import Config
+        from rnfs.node import RnfsNode
+        from tests.test_names import FakeNetwork
+        from tests.test_node import N1, NetClient
+        made = []
+
+        def init(self, node):
+            """Record that it was made."""
+            DummyFeature.__init__(self, node)
+            made.append(self)
+
+        user = feature_class("user", requires=("base",), __init__=init)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=os.path.join(tmp.name, "n"), slow="no")
+        patchers = install(user, feature_class("base"))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with self.assertRaisesRegex(features.FeatureError, "feature user: it requires feature base"):
+            RnfsNode.offline(config, N1, NetClient(), FakeNetwork())
+        self.assertEqual(made, [])
+        features.FEATURE_MODULES.reverse()  # base before user: it loads
+        node = RnfsNode.offline(config, N1, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        self.assertEqual(made, [node.feature("user")])
+        self.assertIs(node.feature("user").dependency("base"), node.feature("base"))
+
+    def test_dependency_refuses_an_undeclared_feature(self):
+        node = types.SimpleNamespace(features={})
+        user = feature_class("user", requires=("base",), optional=("extra",))(node)
+        base = feature_class("base")(node)
+        node.features.update(base=base, user=user)
+        self.assertIs(user.dependency("base"), base)
+        self.assertIsNone(user.dependency("extra"))  # optional, not loaded
+        with self.assertRaisesRegex(features.FeatureError, "feature user: it uses feature dummy without declaring"):
+            user.dependency("dummy")
+        # A stand-in node without features (some tests use one)
+        self.assertIsNone(feature_class("user", optional=("base",))(types.SimpleNamespace()).dependency("base"))
 
 
 class FeatureLifecycleTest(unittest.TestCase):
@@ -207,3 +314,178 @@ class FeatureLifecycleTest(unittest.TestCase):
                     feature.stop(time.monotonic() + 5)
                 self.assertEqual(order[0], "loop ended")
                 self.assertFalse(any(thread.is_alive() for thread in feature._spawned))
+
+
+def handler(*_args):
+    """A request or API handler that is never called."""
+    return False
+
+
+def routes(table):
+    """An api_routes classmethod answering table."""
+    return classmethod(lambda cls: dict(table))
+
+
+def paths(table):
+    """A requests method answering table."""
+    return lambda self: dict(table)
+
+
+class OfflineNodes:
+    """Offline nodes loading only the features a test installs."""
+
+    def install(self, *classes):
+        """Load only classes, in that order, until the test ends."""
+        for patcher in install(*classes):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def config(self):
+        """A config for a node in a new temporary directory."""
+        from rnfs.config import Config
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Config(rnfs_dir=os.path.join(tmp.name, "n"), slow="no")
+
+    def node(self, config=None):
+        """An offline node (stopped when the test ends)."""
+        from rnfs.node import RnfsNode
+        from tests.test_names import FakeNetwork
+        from tests.test_node import N1, NetClient
+        node = RnfsNode.offline(config or self.config(), N1, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        return node
+
+
+class FeatureRouteTest(OfflineNodes, unittest.TestCase):
+    """API routes and request paths are checked when the node loads its features, with one error style: a route
+    or path that is malformed, that the core defines, or that two features define stops the node (audit FT5)."""
+
+    def assertRefused(self, classes, message):
+        """Loading classes raises FeatureError with message, whether alone or by a node (which then releases
+        its state: a node with the same directory can be made after)."""
+        self.install(*classes)
+        with self.assertRaisesRegex(features.FeatureError, message):
+            features.api_routes()
+            features.request_handlers(cls(None) for cls in features.checked_classes())
+        config = self.config()
+        with self.assertRaisesRegex(features.FeatureError, message):
+            self.node(config)
+        features.FEATURE_MODULES.clear()
+        self.node(config)
+
+    def test_the_shipped_routes_and_paths_load(self):
+        from rnfs.api import ApiHandler
+        from rnfs.features import keepers
+        self.assertFalse(set(features.api_routes()) & set(ApiHandler.ROUTES))
+        self.assertEqual(set(self.node().backend.feature_requests()), {keepers.NAME_PATH})
+
+    def test_a_core_api_route_is_refused(self):
+        self.assertRefused([feature_class("bad", api_routes=routes({("GET", "/api/status"): handler}))],
+                           r"^feature bad: API route GET /api/status is already defined by rnfs$")
+
+    def test_an_api_route_of_two_features_is_refused(self):
+        self.assertRefused([DummyFeature, feature_class("other", api_routes=routes({("GET", "/api/dummy"): handler}))],
+                           r"^feature other: API route GET /api/dummy is already defined by feature dummy$")
+
+    def test_a_malformed_api_route_is_refused(self):
+        for route, route_handler in ((("PUT", "/api/x"), handler), (("GET", "/x"), handler),
+                                     (("GET", "/api/x?y=1"), handler), (("GET", "/api/"), handler),
+                                     ("GET /api/x", handler), (("GET", "/api/x"), None)):
+            with self.subTest(route=route):
+                self.assertRefused([feature_class("bad", api_routes=routes({route: route_handler}))],
+                                   r"^feature bad: API route .* must be \(GET or POST, a path under /api/\)")
+
+    def test_a_core_request_path_is_refused(self):
+        for path in features.CORE_REQUEST_PATHS:
+            with self.subTest(path):
+                self.assertRefused([feature_class("bad", requests=paths({path: handler}))],
+                                   rf"^feature bad: request path {path} is already defined by rnfs$")
+
+    def test_a_request_path_of_two_features_is_refused(self):
+        self.assertRefused([feature_class("one", requests=paths({"/extra": handler})),
+                            feature_class("two", requests=paths({"/extra": handler}))],
+                           r"^feature two: request path /extra is already defined by feature one$")
+
+    def test_a_malformed_request_path_is_refused(self):
+        for path, path_handler in (("extra", handler), ("/", handler), ("/a b", handler), (b"/extra", handler),
+                                   ("/extra", None)):
+            with self.subTest(path=path):
+                self.assertRefused([feature_class("bad", requests=paths({path: path_handler}))],
+                                   r"^feature bad: request path .* must be \"/\" and a name, with a handler$")
+
+
+class Recorder(DummyFeature):
+    """A feature recording (name, call) in the shared list events, for the order across features."""
+
+    events: list = []
+
+    def start(self):
+        """Record start."""
+        self.events.append((self.name, "start"))
+
+    def stop(self, deadline=None):
+        """Record stop."""
+        self.events.append((self.name, "stop"))
+
+    def save(self):
+        """Record save."""
+        self.events.append((self.name, "save"))
+
+    def close(self):
+        """Record close."""
+        self.events.append((self.name, "close"))
+
+
+class FeatureNodeLifecycleTest(OfflineNodes, unittest.TestCase):
+    """What the node calls on its features, and in what order (audit FT5)."""
+
+    def setUp(self):
+        """A fresh event list, and two features recording into it."""
+        self.events = []
+        self.first = feature_class("first", base=Recorder, events=self.events)
+        self.second = feature_class("second", base=Recorder, events=self.events)
+
+    def test_requests_reach_the_request_server(self):
+        """The request server registers what the node's backend hands it: each feature's requests()."""
+        self.install(feature_class("dummy", requests=paths({"/dummy": handler})))
+        self.assertEqual(self.node().backend.feature_requests(), {"/dummy": handler})
+
+    def test_start_stop_save_close_order(self):
+        """Started in order; stopped in reverse, before the node's own saves; saved in order, closed in reverse."""
+        self.install(self.first, self.second)
+        node = self.node()
+        node._start_features()
+        self.assertEqual(self.events, [("first", "start"), ("second", "start")])
+        del self.events[:]
+        node.stop()
+        self.assertEqual(self.events, [("second", "stop"), ("first", "stop"), ("first", "save"),
+                                       ("second", "save"), ("second", "close"), ("first", "close")])
+
+    def test_a_failing_start_is_isolated(self):
+        """One feature's start() raising is logged; the others still start, and the node runs on."""
+        def broken(feature):
+            """Fail to start."""
+            raise RuntimeError("no start")
+
+        self.install(feature_class("broken", base=Recorder, events=self.events, start=broken), self.second)
+        node = self.node()
+        with mock.patch("rnfs.node.log") as log:
+            node._start_features()
+        self.assertEqual(self.events, [("second", "start")])
+        self.assertIn("feature broken failed to start: RuntimeError('no start')", log.call_args.args[0])
+
+    def test_a_failing_constructor_stops_the_node(self):
+        """A feature's constructor raising stops the node from being made, and those made before it are closed,
+        so the state is released (a node with the same directory can be made after)."""
+        def broken(feature, node):
+            """Fail to be made."""
+            raise RuntimeError("no init")
+
+        self.install(self.first, feature_class("broken", __init__=broken), self.second)
+        config = self.config()
+        with self.assertRaisesRegex(RuntimeError, "no init"):
+            self.node(config)
+        self.assertEqual(self.events, [("first", "close")])
+        features.FEATURE_MODULES.clear()
+        self.node(config)

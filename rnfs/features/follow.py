@@ -26,7 +26,7 @@ No RNS at module level (the CLI imports this module).
 import threading
 import time
 
-from rnfs.constants import ID_LENGTH
+from rnfs.constants import ID_LENGTH, MISSED_ANNOUNCES
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError, TooLarge
 from rnfs.features import Feature, _common
@@ -37,7 +37,6 @@ from rnfs.fsutil import printable
 NAME = "follow"
 SOURCE_PREFIX = "follow:"
 FAR_FUTURE = float("inf")
-STALE_ANNOUNCES = 2  # a record not heard for this many announce_intervals is refreshed from the network
 
 
 def follow_source(name: bytes) -> str:
@@ -79,6 +78,8 @@ class FollowFeature(Feature):
     """Followed names and their pins. Thread-safe."""
 
     name = NAME
+    requires = ("keepers",)  # a followed name is kept
+    optional = ("contacts",)  # a name contact's nick names a name (parse_name_arg)
 
     def __init__(self, node):
         """Load followed names; no network."""
@@ -94,7 +95,7 @@ class FollowFeature(Feature):
         self._resolved: set[bytes] = set()  # names whose last check resolved them (a failed fetch, then)
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._keepers = node.feature("keepers")
+        self._keepers = self.dependency("keepers")
         self._keepers.add_listener(self._changed)
         try:
             self._reconcile(self._load())
@@ -275,7 +276,7 @@ class FollowFeature(Feature):
         """Bring name's follow pin up to date with its latest target; True if it is (or nothing to do).
 
         network=True resolves through the network (a flooded path request, maybe a DHT lookup) only if the
-        record held wasn't heard within STALE_ANNOUNCES x announce_interval; network=False uses the record held
+        record held wasn't heard within MISSED_ANNOUNCES x announce_interval; network=False uses the record held
         whatever its age (the network only when none is held).
         """
         with self._lock:
@@ -284,7 +285,7 @@ class FollowFeature(Feature):
             pinned = self._pinned[name]
             self._resolved.discard(name)
         try:
-            max_age = STALE_ANNOUNCES * self.node.config.announce_interval if network else FAR_FUTURE
+            max_age = MISSED_ANNOUNCES * self.node.config.announce_interval if network else FAR_FUTURE
             result = self.node.names.resolve(name, persist=True, max_age=max_age)
         except Exception as e:  # noqa: BLE001 - resolving is retried later
             self._set_state(name, f"resolve failed: {e}")

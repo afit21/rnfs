@@ -20,7 +20,7 @@ import threading
 import time
 
 from rnfs import interface
-from rnfs.apiclient import ApiConnection, read_all
+from rnfs.apiclient import ApiConnection
 from rnfs.fsutil import printable
 from rnfs.objects import Record
 
@@ -188,11 +188,11 @@ class _Backend:
 
     def dir_set(self, target: str, name: str, child: str, executable: bool) -> dict:
         """POST /api/dir/set."""
-        return self.api.post("/api/dir/set", target=target, name=name, cid=child, executable=executable)
+        return self.api.dir_set(target, name, child, executable)
 
     def dir_rm(self, target: str) -> dict:
         """POST /api/dir/rm."""
-        return self.api.post("/api/dir/rm", target=target)
+        return self.api.dir_rm(target)
 
     def pin_add(self, target: str) -> dict:
         """POST /api/pin/add."""
@@ -208,31 +208,31 @@ class _Backend:
 
     def pin_remote(self, node_id: str, cid: str, pin: bool) -> bool:
         """POST /api/pin/remote."""
-        return self.api.post("/api/pin/remote", node=node_id, cid=cid, pin=pin)["accepted"]
+        return self.api.pin_remote(node_id, cid, pin)
 
     def providers(self, cid: str) -> list[str]:
         """GET /api/providers."""
-        return self.api.get("/api/providers", cid=cid)["providers"]
+        return self.api.providers(cid)
 
     def ping(self, node_id: str) -> float | None:
         """GET /api/ping."""
-        return self.api.get("/api/ping", node=node_id)["rtt"]
+        return self.api.ping(node_id)
 
     def export(self, target: str, output: str) -> dict:
         """POST /api/export."""
-        return self.api.post("/api/export", target=target, output=output)
+        return self.api.export(target, output)
 
     def import_archive(self, path: str) -> dict:
         """POST /api/import."""
-        return self.api.post("/api/import", path=path)
+        return self.api.import_archive(path)
 
     def gc(self) -> dict:
         """POST /api/gc."""
-        return self.api.post("/api/gc")
+        return self.api.gc()
 
     def verify(self) -> dict:
         """POST /api/verify."""
-        return self.api.post("/api/verify")
+        return self.api.verify()
 
     def name_create(self, alias: str) -> dict:
         """POST /api/name/create."""
@@ -240,16 +240,15 @@ class _Backend:
 
     def name_import(self, alias: str, key: bytes) -> dict:
         """POST /api/name/import (the key as the body)."""
-        body = bytes(key)
-        return self.api.call("POST", "/api/name/import", params={"alias": alias}, body=body, length=len(body))
+        return self.api.name_import(alias, key)
 
     def name_rm(self, alias: str):
         """POST /api/name/rm."""
-        self.api.post("/api/name/rm", alias=alias)
+        self.api.name_rm(alias)
 
     def name_export(self, alias: str) -> bytes:
         """POST /api/name/export: the key bytes."""
-        return read_all(self.api.request("POST", "/api/name/export", json_body={"alias": alias}))
+        return self.api.name_export(alias)
 
     def name_list(self) -> list[dict]:
         """GET /api/name/list."""

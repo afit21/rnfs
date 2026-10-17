@@ -24,7 +24,6 @@ eviction, gc and the size queries read the DAG nodes they will walk beforehand (
 """
 import itertools
 import os
-import re
 import shutil
 import threading
 from collections import OrderedDict
@@ -32,13 +31,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
-from rnfs import denylist, statedb
+from rnfs import denylist, ids, statedb
 from rnfs.constants import MIB
 from rnfs.content import blockstore, dag, walker
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, IndexNode
-from rnfs.errors import Denied, InvalidDag, NotFound, StorageFull
+from rnfs.errors import BlockMismatch, Denied, InvalidDag, NotFound, StorageFull
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
 
 USER, FOLDER = "user", "folder"
@@ -59,7 +58,9 @@ DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unrea
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 
-_IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
+# The ID in a remote:, follow: or lxmf: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as
+# a pin row that fails is deleted
+_IDENTITY_HASH = ids.HEX16_LOWER
 
 
 def disk_reserve(total: int) -> int:
@@ -198,7 +199,7 @@ class Session:
             self.cids.add(cid)
 
     def put(self, cid: Cid, block: bytes):
-        """Store a block and protect it. Raises ValueError if it doesn't match its CID."""
+        """Store a block and protect it. Raises BlockMismatch (a ValueError) if it doesn't match its CID."""
         self.add(cid)  # first, so an eviction between storing and protecting can't take it
         self._storage._put(cid, block, protected=True)
 
@@ -402,8 +403,8 @@ class Storage:
             return self._sizes.get(cid)
 
     def put(self, cid: Cid, block: bytes):
-        """Store a block after verifying it (atomic, durable). Raises ValueError if it doesn't match or is too
-        large, even when the block is already stored, and Denied if the deny list denies it.
+        """Store a block after verifying it (atomic, durable). Raises BlockMismatch (a ValueError) if it doesn't
+        match or is too large, even when the block is already stored, and Denied if the deny list denies it.
 
         A block stored outside a protection session is cache that no record reaches: the first to go.
         """
@@ -418,7 +419,7 @@ class Storage:
         if stored:
             # Verified all the same, so callers (archive import) never count unchecked bytes as supplied
             if not blockstore.matches(cid, block):
-                raise ValueError(f"block does not match {cid}")
+                raise BlockMismatch(f"block does not match {cid}")
             return
         self.blocks.put(cid, block)  # verifies; outside the lock, since it writes to disk
         with self._lock:

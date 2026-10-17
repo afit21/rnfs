@@ -17,6 +17,7 @@ from typing import Iterator
 from rnfs import fsutil
 from rnfs.constants import MAX_BLOCK_SIZE
 from rnfs.content.cid import Cid
+from rnfs.errors import BlockMismatch
 
 PARTIAL_PREFIX = fsutil.PARTIAL_PREFIX  # also the prefix of every other atomic write's temporary file
 
@@ -62,11 +63,12 @@ class BlockStore:
             return None
 
     def put(self, cid: Cid, block: bytes):
-        """Store block under cid unless already stored. Raises ValueError, storing nothing, if it doesn't match."""
+        """Store block under cid unless already stored. Raises BlockMismatch (a ValueError), storing nothing, if
+        it doesn't match."""
         if not matches(cid, block):
             if len(block) > MAX_BLOCK_SIZE:
-                raise ValueError(f"block for {cid} exceeds MAX_BLOCK_SIZE")
-            raise ValueError(f"block does not match {cid}")
+                raise BlockMismatch(f"block for {cid} exceeds MAX_BLOCK_SIZE")
+            raise BlockMismatch(f"block does not match {cid}")
         path = self.path(cid)
         if os.path.isfile(path):
             return  # content-addressed, so the same bytes; replacing them would fail on Windows while read

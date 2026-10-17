@@ -42,9 +42,11 @@ import time
 from collections import deque
 from contextlib import ExitStack
 
+from rnfs import ids
 from rnfs.constants import PARTIAL_SUFFIX
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
+from rnfs.fsutil import printable
 
 NAME = "jobs"
 KINDS = ("get", "pin", "export")
@@ -60,7 +62,7 @@ POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
 FINISHED_GRACE = 60.0  # seconds a finished job is kept whatever max_finished_jobs says
 _JOB_ID = re.compile(r"[0-9a-f]{8}")
-_NODE_ID = re.compile(r"[0-9a-f]{32}")
+_NODE_ID = ids.HEX16_LOWER  # a saved job's from_node, as bytes.hex() writes it (a row that fails is deleted)
 
 
 def _log(message: str, level: int = LOG_INFO):
@@ -292,6 +294,7 @@ class JobsFeature(Feature):
     """The job manager: queue, threads, persistence, protection of resumable blocks. Thread-safe."""
 
     name = NAME
+    optional = ("contacts",)  # a target may start with a name contact's nick
 
     def __init__(self, node):
         """Load saved jobs, queueing again those that hadn't finished and protecting their blocks."""
@@ -308,7 +311,7 @@ class JobsFeature(Feature):
     @property
     def max_jobs(self) -> int:
         """Jobs running at once: max_jobs, by default 2, or 1 on slow nodes."""
-        configured = getattr(self.node.config, "max_jobs", None)
+        configured = self.node.config.max_jobs
         return configured if configured is not None else (1 if self.node.slow else 2)
 
     # Persistence
@@ -574,7 +577,7 @@ class JobsFeature(Feature):
         by DHT discovery if from_node fails.
         """
         from rnfs.errors import Busy
-        contacts = getattr(self.node, "features", {}).get("contacts")
+        contacts = self.dependency("contacts")
         if contacts is not None:
             # `alice/docs`: a name contact's nick becomes the CID its name points at now (rnfs.features.contacts)
             target = contacts.expand_target(target)
@@ -811,7 +814,6 @@ def format_progress(job: dict, width: int = 20) -> str:
 
 def format_job(job: dict) -> str:
     """One `rnfs jobs` line: ID, state, kind, progress, target (and output)."""
-    from rnfs.cli import printable
     where = f" -> {job['output']}" if job.get("output") else ""
     return printable(f"{job['id']}  {job['state']:<9} {job['kind']:<6} {format_progress(job)}  {job['target']}{where}")
 
@@ -918,14 +920,14 @@ def follow(api, job_id: str, cancel_on_interrupt: bool) -> dict:
             if job["state"] in FINISHED:
                 return job
             if line:
-                line.show(format_progress(job))
+                line.show(printable(format_progress(job)))
     except KeyboardInterrupt:
         if line:
             line.clear()
         if cancel_on_interrupt:
             api.post("/api/jobs/cancel", id=job_id)
-            print(f"rnfs: cancelled job {job_id} (with --background, a transfer keeps running after the command "
-                  "ends)", file=sys.stderr)
+            print(f"rnfs: cancelled job {printable(job_id)} (with --background, a transfer keeps running after "
+                  "the command ends)", file=sys.stderr)
         sys.exit(130)
     finally:
         if line:
@@ -950,9 +952,11 @@ def run_transfer(args, fields: dict, fallback) -> dict | None:
         return fallback(api)
     job = api.post("/api/jobs", **fields)
     if getattr(args, "background", False):
-        print(job["id"])
+        # Everything the daemon sends is escaped before it reaches the terminal, its job IDs too
+        job_id = printable(job["id"])
+        print(job_id)
         if sys.stderr.isatty():
-            print(f"rnfs: started job {job['id']}; follow it with: rnfs jobs wait {job['id']}", file=sys.stderr)
+            print(f"rnfs: started job {job_id}; follow it with: rnfs jobs wait {job_id}", file=sys.stderr)
         return None
     job = follow(api, job["id"], cancel_on_interrupt=True)
     if job["state"] != DONE:
@@ -1005,18 +1009,18 @@ def run_cancel(args):
     from rnfs import cli
     job = cli.client(args).post("/api/jobs/cancel", id=_cli_id(args.id))
     if job["state"] == RUNNING:
-        print(f"cancelling {job['id']}")
+        print(f"cancelling {printable(job['id'])}")
     elif job["state"] == CANCELLED:
-        print(f"cancelled {job['id']}")
+        print(f"cancelled {printable(job['id'])}")
     else:
-        print(f"{job['id']} already {job['state']}")
+        print(printable(f"{job['id']} already {job['state']}"))
 
 
 def run_clear(args):
     """Forget finished jobs."""
     from rnfs import cli
     removed = cli.client(args).post("/api/jobs/clear", id=_cli_id(args.id) if args.id else None)["removed"]
-    print(f"removed {removed} finished job{'' if removed == 1 else 's'}")
+    print(printable(f"removed {removed} finished job{'' if removed == 1 else 's'}"))
 
 
 def _cli_id(text: str) -> str:

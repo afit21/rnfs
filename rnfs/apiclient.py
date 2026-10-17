@@ -20,11 +20,11 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   one place to refuse a daemon by it; every version is accepted for now.
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
   (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
-  refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS: 400
-  BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507 StorageFull, other 5xx
-  ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a subclass of the node's own
-  (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except clause catches what rnfs.Node
-  and rnfs.Client raise alike.
+  refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS, from
+  rnfs.errors.STATUSES: 400 BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507
+  StorageFull, other 5xx ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a
+  subclass of the node's own (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except
+  clause catches what rnfs.Node and rnfs.Client raise alike.
 - Each request opens its own connection (its proof, then the request), with no timeout for the request unless
   one is given (fetches can take hours), so an ApiConnection may be used from several threads. Paths are on the
   daemon's machine, which is this one: they are made absolute here.
@@ -119,9 +119,22 @@ class ServerError(ApiError):
     """500 or another 5xx: the daemon failed (see its log)."""
 
 
+# The client's error for each of the node's (errors.STATUSES), a subclass of both ApiError and the node's class
+_STATUS_CLASSES = (BadRequest, NotFound, TooLarge, InvalidDag, Denied, Busy, StorageFull)
+
+
+def _status_errors() -> dict[int, type[ApiError]]:
+    """Each API error status's ApiError subclass: errors.STATUSES' statuses, each to the client class of its node
+    error, and 403 (the token refused) to AuthFailed. A status added there without a class here fails here, at
+    import."""
+    table: dict[int, type[ApiError]] = {403: AuthFailed}
+    for error_class, status in errors.STATUSES:
+        table[status] = next(client for client in _STATUS_CLASSES if issubclass(client, error_class))
+    return table
+
+
 # The API's error statuses (design.md, "Node facade"); other 4xx raise ApiError, other 5xx ServerError
-STATUS_ERRORS = {400: BadRequest, 403: AuthFailed, 404: NotFound, 413: TooLarge, 422: InvalidDag, 451: Denied,
-                 503: Busy, 507: StorageFull}
+STATUS_ERRORS = _status_errors()
 
 
 def error_for(status: int, message: str) -> ApiError:
@@ -261,7 +274,7 @@ class ApiConnection:
     its rnfs.toml). token_file defaults to <rnfs_dir>/api_token and is read on the first request needing it.
 
     request() and call() are the whole protocol; get() and post() call any endpoint (features' too); the other
-    methods are the main operations, jobs, the deny list and name watching, returning what the API answers
+    methods are every core route (api.ApiHandler.ROUTES), jobs and the deny list, returning what the API answers
     (design.md, "Node facade"). Every failure raises an ApiError subclass.
     """
 
@@ -515,6 +528,32 @@ class ApiConnection:
         """{"cid", "size", "blocks", "local_blocks", "local_bytes"} of a target."""
         return self.get("/api/stat", target=target)
 
+    def dir_set(self, target: str, name: str, cid: str, executable: bool = False) -> dict:
+        """A new directory: the directory target with entry name set to cid (a file, executable if asked, or a
+        directory), pinned user: {"cid"}."""
+        return self.post("/api/dir/set", target=target, name=name, cid=cid, executable=executable)
+
+    def dir_rm(self, target: str) -> dict:
+        """A new directory without the entry target (<cid>/<path>) names, pinned user: {"cid"}."""
+        return self.post("/api/dir/rm", target=target)
+
+    def export(self, target: str, output: str) -> dict:
+        """Write a target's DAG as an archive to output (a path on this machine, which must not exist):
+        {"roots", "blocks", ...}."""
+        return self.post("/api/export", target=target, output=os.path.abspath(os.path.expanduser(output)))
+
+    def import_archive(self, path: str) -> dict:
+        """Import an archive on this machine: {"roots", "incomplete", ...}."""
+        return self.post("/api/import", path=os.path.abspath(os.path.expanduser(path)))
+
+    def gc(self) -> dict:
+        """Remove blocks no pin needs: {"removed_blocks", "freed_bytes"}."""
+        return self.post("/api/gc")
+
+    def verify(self) -> dict:
+        """Check every stored block against its CID: {"checked", "bad", ...}."""
+        return self.post("/api/verify")
+
     # Pins
 
     def pin_add(self, target: str) -> dict:
@@ -529,6 +568,20 @@ class ApiConnection:
         """Every pin (or cid's): [{"cid", "sources", "complete", "type", "sealed", "name"}]."""
         return self.get("/api/pin/ls", cid=cid)["pins"]
 
+    def pin_remote(self, node: str, cid: str, pin: bool = True) -> bool:
+        """Ask node (hex) to pin cid for this node, or (pin=False) to release that pin; True if it accepted."""
+        return self.post("/api/pin/remote", node=node, cid=cid, pin=pin)["accepted"]
+
+    # The network
+
+    def providers(self, cid: str) -> list[str]:
+        """The nodes (hex) providing cid: the records held, then what a provider lookup finds."""
+        return self.get("/api/providers", cid=cid)["providers"]
+
+    def ping(self, node: str) -> float | None:
+        """The round-trip time in seconds of a new link to node (hex), or None if it is unreachable."""
+        return self.get("/api/ping", node=node)["rtt"]
+
     # Names
 
     def name_list(self) -> list[dict]:
@@ -538,6 +591,19 @@ class ApiConnection:
     def name_create(self, alias: str) -> dict:
         """Create a name key: {"alias", "name"}."""
         return self.post("/api/name/create", alias=alias)
+
+    def name_import(self, alias: str, key: bytes) -> dict:
+        """Import a name key exported elsewhere (its bytes) as alias: {"alias", "name"}."""
+        body = bytes(key)
+        return self.call("POST", "/api/name/import", params={"alias": alias}, body=body, length=len(body))
+
+    def name_export(self, alias: str) -> bytes:
+        """A name's key, to import elsewhere: whoever has it can publish the name."""
+        return read_all(self.request("POST", "/api/name/export", json_body={"alias": alias}))
+
+    def name_rm(self, alias: str):
+        """Delete a name's key (NotFound if there is no such alias)."""
+        self.post("/api/name/rm", alias=alias)
 
     def name_publish(self, alias: str, target: str) -> dict:
         """Point a name of this node at a target: {"name", "cid", "sequence"}, and "warning" in private mode (the

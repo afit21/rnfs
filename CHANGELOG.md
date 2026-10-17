@@ -192,6 +192,22 @@ Changed:
   long, including one that found nothing, and simultaneous resolves of a name share one refresh: a page with many
   `/name/<n>/…` assets whose owner is offline costs one path request and one keeper query, not one each. A name
   republished moments ago may show its older record on the gateway for up to 60 s. CLI resolves always refresh.
+- GitHub releases take their notes from the version's section of this file instead of generated notes, and the
+  release workflow refuses a tag whose section is still marked unreleased. The check that the Flatpak's wheels
+  match `packaging/requirements.lock` runs on every push and pull request, and the release builds (Flatpak,
+  Windows exe, arm64 .deb, Debian 12 smoke test) also run, without publishing, on pull requests that touch
+  packaging and weekly. The Flatpak build no longer copies local debris from a checkout.
+- A block that doesn't match its CID raises `BlockMismatch`, and a damaged sealed file `SealError`: both are
+  `RnfsError`s and still `ValueError`s, so the API keeps answering 400 (and logs a `BlockMismatch` as a warning,
+  as it means a bug rather than a bad request). A shared-folder entry that fails with an unexpected `ValueError`
+  is logged and tried again after 10 minutes rather than skipped until the file changes. `dir rm` refuses a
+  target without a path in the node itself, before fetching anything.
+- `rnfs jobs` (`--background`, `cancel`, `clear` and the progress line), `rnfs peers` and `rnfs stats` escape every
+  field the daemon sends, as the other feature commands already did. Internally, features declare the features
+  they use, and the node checks those and every feature's API routes and request paths when it loads them.
+- 16-byte IDs written as hex (node IDs, names, identity hashes, LXMF addresses) are parsed in one place with the
+  same rules everywhere; the only input refused that was accepted before is a `bootstrap_nodes` entry with
+  whitespace between its hex digits, now skipped with the warning other malformed entries get.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -269,6 +285,16 @@ Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 - `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
   `status` (messages from untrusted senders dropped by the rate limits since the start).
+- `rnfs.BlockMismatch`, `rnfs.SealError` and `rnfs.NotRecipient`, to catch these errors by class. `ApiConnection`
+  has a typed method for every core API route (`dir_set`, `dir_rm`, `pin_remote`, `providers`, `ping`,
+  `name_import`, `name_export`, `name_rm`, `export`, `import_archive`, `gc`, `verify`).
+- `tests/security/README.md`: an index from each security finding's audit ID to its regression tests, the code they
+  guard and the commits that fixed it, grouped by subsystem (a test checks that every security test is listed).
+- CONTRIBUTING.md: running the tests and their options, lint, the dependency locks, adding a schema step or an
+  API route, and releasing. `specification.md` names the version it describes and that the wire format is
+  byte-identical since 0.1.3. Dependabot updates the workflows' pinned actions. Tests check that the supported
+  Python versions agree across CI, `pyproject.toml`, the lock scripts, `build-deb.sh` and `install.sh`, and that
+  this file's version is `rnfs.__version__`'s.
 - The `follow_quota` setting: bytes a followed name's target may take (default 1 GiB; `0` stops fetching
   followed names).
 - `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and

@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound
-from rnfs.features import Feature, _common
+from rnfs.features import Feature, _common, find
 from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE
 
 NAME = "keepers"
@@ -610,6 +610,7 @@ class KeepersFeature(Feature):
     """Keeps and serves signed name records, and asks keepers when resolving. Thread-safe."""
 
     name = NAME
+    optional = ("contacts",)  # a name contact's nick names a name (parse_name_arg)
 
     def __init__(self, node):
         """Load kept names, hook into names and the publisher; no network."""
@@ -1016,7 +1017,7 @@ def name_subcommands(commands):
 def parse_name_arg(node, text) -> bytes:
     """A name from 32 hex characters, or a name contact's nick (rnfs.features.contacts). ValueError."""
     from rnfs.names import parse_name
-    contacts = node.features.get("contacts") if hasattr(node, "features") else None
+    contacts = find(node, "contacts")
     if contacts is not None:
         return contacts.resolve_id(text, "name")
     return parse_name(text)

@@ -91,8 +91,10 @@ Security:
   (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
   so another local user listening there while the daemon is down learns neither the token nor a name key being
   imported.
-- Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, Denied 451 (the deny
-  list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500.
+- Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
+  Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
+  error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
+  warning, with its traceback in the debug log.
 
 Connections (both this API and the gateway, through LocalServer):
 - The request line, headers and any JSON body must arrive within request_timeout of connecting, else the
@@ -114,13 +116,12 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from rnfs import __version__, fsutil
+from rnfs import __version__, fsutil, ids
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
-from rnfs.config import _HEX_ID  # exactly 32 hex digits, as names.parse_name and identity lists are checked
 from rnfs.content.cid import Cid
-from rnfs.errors import Busy, Denied, InvalidDag, NotFound, StorageFull, TooLarge
-from rnfs.log import LOG_ERROR, log
+from rnfs.errors import STATUSES, BlockMismatch, Busy
+from rnfs.log import LOG_ERROR, LOG_WARNING, log
 
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
@@ -133,9 +134,8 @@ MAX_WATCH_WAIT = 30  # seconds one may wait, as GET /api/jobs/get's wait=
 WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it ends
 MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
 
-# Exception class → HTTP status, checked in order (design.md); anything else is 500
-ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), (InvalidDag, 422), (Busy, 503),
-                  (StorageFull, 507)]
+# Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
+ERROR_STATUSES = STATUSES
 
 
 _feature_routes: dict | None = None
@@ -196,11 +196,9 @@ def parse_cid(text) -> str:
 
 
 def parse_hex_id(text, what: str = "node ID") -> bytes:
-    """A 16-byte node ID or name written as 32 hex characters (spaces around allowed). Raises ValueError."""
-    # Hex digits only: bytes.fromhex alone would skip whitespace between them (as names.parse_name checks)
-    if not isinstance(text, str) or not _HEX_ID.fullmatch(text.strip()):
-        raise ValueError(f"invalid {what} {text!r}: must be 32 hex characters")
-    return bytes.fromhex(text.strip())
+    """A 16-byte node ID or name written as 32 hex characters (spaces around allowed, no <angle brackets>).
+    Raises ValueError."""
+    return ids.parse_hex16(text, what)
 
 
 def parse_path(text) -> str:
@@ -807,6 +805,9 @@ class ApiHandler(TimedHandler):
             status = error_status(e)
             if status == 500:
                 log(f"API {self.command} {loggable(url.path)} failed: {e!r}", LOG_ERROR)
+            elif isinstance(e, BlockMismatch):
+                # Answered 400 as a ValueError, as before, but the node's own fault: logged, with its traceback
+                log(f"API {self.command} {loggable(url.path)} failed: {e!r}", LOG_WARNING)
             message = str(e) or type(e).__name__
             self.respond_error(status, message, {"Retry-After": "10"} if status == 503 else None)
 
@@ -1031,11 +1032,8 @@ class ApiHandler(TimedHandler):
                                               executable=parse_bool(body.get("executable"))))
 
     def api_dir_rm(self):
-        """POST /api/dir/rm {"target"}: a new directory without the target's entry."""
-        target = parse_target(self.json_body().get("target"))
-        if "/" not in target.rstrip("/"):
-            raise ValueError("dir rm needs <cid>/<path>: the entry to remove")
-        self.send_json(200, self.node.dir_rm(target))
+        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one)."""
+        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target"))))
 
     def api_pin_add(self):
         """POST /api/pin/add {"target"}: fetch and pin with source user; answers once complete."""

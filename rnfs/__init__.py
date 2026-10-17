@@ -31,7 +31,8 @@ _EXPORTS = {
                                          "Status", "Collected", "Verified", "Exported", "Imported", "DenyState")},
     **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File")},
     **{name: "rnfs.errors" for name in ("RnfsError", "NotFound", "TooLarge", "InvalidDag", "StorageFull", "Busy",
-                                        "Denied", "Cancelled", "Closed")},
+                                        "Denied", "Cancelled", "Closed", "BlockMismatch", "SealError",
+                                        "NotRecipient")},
     **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "ConnectionFailed", "TokenError",
                                            "AuthFailed", "SettingsError", "BadRequest", "ServerError")},
 }

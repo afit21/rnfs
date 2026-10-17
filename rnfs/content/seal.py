@@ -35,6 +35,7 @@ from RNS.vendor import umsgpack
 
 from rnfs.constants import KIB
 from rnfs.content import chunker, dag
+from rnfs.errors import NotRecipient, SealError  # defined there, so rnfs.<name> exports them without RNS
 
 MAGIC = b"rnfs-sealed\n"
 VERSION = 1
@@ -54,14 +55,6 @@ SEGMENT_INFO = b"rnfs-seal-v1 segments"
 NAME_INFO = b"rnfs-seal-v1 name"
 
 RawReader = Callable[[int, int], Iterator[bytes]]  # (offset, length) -> the stored bytes of that range
-
-
-class SealError(ValueError):
-    """A sealed file is malformed or has been tampered with."""
-
-
-class NotRecipient(ValueError):
-    """This node's identity isn't among a sealed file's recipients."""
 
 
 def is_sealed(head: bytes) -> bool:

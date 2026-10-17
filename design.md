@@ -5,13 +5,23 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 
 ## Shared foundation
 
-- `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes.
+- `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes, and
+  `MISSED_ANNOUNCES` (2): the announces a node or name may miss before the routing table, name resolves, follows
+  and deny lists count it gone or stale (`2 × announce_interval` in the spec).
 - `rnfs/config.py` — `Config`: every local setting (section 12), paths under `<rnfs dir>`, and the `effective_*`
   helpers for settings that depend on slow nodes or links. Loaded from `<rnfs dir>/rnfs.toml` plus command-line
   overrides (and `defaults` beneath the file: an embedded node's); `validate()` checks every core setting's type and
   range (`WHOLE_NUMBERS`, `RATES`, `DURATIONS`, `FLAGS`, `IDENTITY_LISTS`), and the daemon exits on an invalid one.
   Reticulum is started from `reticulum_dir`, by default RNS's own config directory, so the node attaches to `rnsd`
-  with the matching RPC key.
+  with the matching RPC key. `member_set` and `remote_pin_set` are `members` and `remote_pin_identities` as
+  frozensets of lowercase hex, normalised once there for the node, the link pool and the request server.
+- `rnfs/ids.py` — stdlib only: the one parser of 16-byte IDs written as 32 hex digits (node IDs, names, identity
+  hashes, LXMF addresses). `parse_hex16(text, what, *, brackets=False, upper=True)` takes whitespace around the
+  digits, RNS's `<angle brackets>` only where `brackets`, and nothing between them (`bytes.fromhex` alone would skip
+  whitespace there); `is_hex16` is its check and `normal_hex16` the lowercase form. `api.parse_hex_id`,
+  `names.parse_name`, `identity.parse_node_id`, `contacts.parse_hex`, `lxmf.parse_address` and `Config.validate`
+  use it. Persisted rows are checked against its patterns (`HEX16`, `HEX16_LOWER`) as they are, unstripped, so
+  what loaded before still loads.
 - `rnfs/errors.py` — `RnfsError` and subclasses `InvalidDag`, `NotFound`, `TooLarge`, `StorageFull`, `Busy`,
   `Denied`, `Cancelled` (a fetch stopped by its observer), `Closed` (an `rnfs.Node` or `rnfs.Client` used after
   `close()`).
@@ -89,7 +99,7 @@ locks internally.
 ```
 rnfs.py, rnfs/__main__.py   entry points (python3 rnfs.py, python3 -m rnfs); the installed command is rnfs.cli:main
 rnfs/
-  constants.py config.py errors.py log.py          shared foundation
+  constants.py config.py ids.py errors.py log.py   shared foundation
   debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
   statedb.py          the state database, <rnfs dir>/state/rnfs.db: schema, transactions, JSON state migration
@@ -161,7 +171,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 ## Content layer interfaces
 
 `dag.py`
-- `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`.
+- `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`, and `KIND_NAMES`
+  (`file`, `executable`, `directory`: how `ls` shows them).
 - Frozen dataclasses `Child(cid, size)`, `Entry(name, cid, size, kind)`, `IndexChild(first_name, cid, size)`;
   nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`, each with `child_cids` (the CIDs it
   lists, in order) and `names` (its entries' names or children's first names; none for a file node).
@@ -377,8 +388,10 @@ connection could reach another listener. That fallback goes in 0.1.7. `request()
 failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
 `Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
-`ls`, `stat`, `pin_*`, `name_*` (with `name_watch`), `submit_job`, `job`, `jobs`, `cancel_job`, `clear_jobs`,
-`deny*`) send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
+`ls`, `stat`, `dir_set`, `dir_rm`, `export`, `import_archive`, `gc`, `verify`, `pin_*` (with `pin_remote`),
+`providers`, `ping`, `name_*` (with `name_watch`, `name_import`, `name_export`, `name_rm`), `submit_job`, `job`,
+`jobs`, `cancel_job`, `clear_jobs`, `deny*`) cover every core route (`ApiHandler.ROUTES`; checked by
+test_apiclient), so `remote.py` writes no path itself, and send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
 node's own too (`NotFound` of `errors.NotFound`, `BadRequest` of `ValueError`, ...). The CLI's `ApiClient`
 subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are the library's.
 
@@ -399,7 +412,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `ls(target, for_gateway=False)` | `[{"name", "kind": "file"\|"executable"\|"directory", "size", "cid"}]` |
 | `stat(target)` | `{"cid", "size", "blocks", "local_blocks", "local_bytes"}` |
 | `is_local(target)` | `bool`: everything needed is stored, so no network fetch |
-| `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
+| `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user`; `dir_rm` refuses a target that names no entry (`edit.check_entry_target`: ValueError, before fetching anything), so the API and `rnfs.Node` don't check it themselves |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
@@ -432,9 +445,13 @@ nodes) and re-records the node's own record, and a round sends only withdrawals 
 each node, so a withdrawal queued while the key was briefly unprovided never follows a store of it.
 `protocol.provide_batches` puts withdrawals before stores, and a key in both lists is only stored.
 
-Errors: `ValueError` → 400, `NotFound` → 404, `TooLarge` → 413, `InvalidDag` → 422, `Busy` → 503,
-`StorageFull` → 507, `Denied` → 451, other `RnfsError` → 500. Paths passed to `add_path`, `get`, `export` and `import_archive`
-are absolute paths on the daemon's machine (the CLI resolves them); stdin is uploaded as a request body.
+Errors (`errors.STATUSES`, the one table: `api.ERROR_STATUSES` is it, `apiclient.STATUS_ERRORS` and the gateway's
+`ERROR_MESSAGES` follow it): `ValueError` → 400 (with `BlockMismatch`, `SealError` and `NotRecipient`, which
+subclass it), `NotFound` → 404, `TooLarge` → 413, `InvalidDag` → 422, `Busy` → 503, `StorageFull` → 507, `Denied`
+→ 451, other `RnfsError` → 500. The API logs a 500 as an error and a `BlockMismatch` (a block the node itself
+handed the store not matching its CID: a bug, not a bad request) as a warning. Paths passed to `add_path`, `get`,
+`export` and `import_archive` are absolute paths on the daemon's machine (the CLI resolves them); stdin is uploaded
+as a request body.
 
 **Core API routes** (`rnfs/api.py` `ROUTES`): `GET /api/status` (open), `/api/info`, `/api/cat`, `/api/ls`,
 `/api/stat`, `/api/pin/ls`, `/api/providers`, `/api/ping`, `/api/name/list`, `/api/name/resolve`,
@@ -487,8 +504,9 @@ that then carries the token: `ApiHandler.dispatch` keeps one open after a proof 
 `keep-alive` (`keep_open`, once per connection: `proved`), giving the next request a new request deadline. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
 32, gateway 64) and refuse HTTP/0.9 with a 400 carrying the usual headers (both add them in `end_headers`, so
 http.server's own error pages, 400, 414, 431 and 501, carry them too). Gateway errors raised by the node
-(anything but `GatewayError` and `NotFound`: 400, 413, 422, 503, 507, 500) say only a fixed message per status
-(`gateway.ERROR_MESSAGES`; the detail goes to the log); malformed `Range` headers are ignored.
+(anything but `GatewayError` and `NotFound`: 400, 413, 422, 451, 503, 507, 500) say only a fixed message per status
+(`gateway.ERROR_MESSAGES`, which has one for every status of `errors.STATUSES`; the detail goes to the log);
+malformed `Range` headers are ignored.
 
 Neither server sends CORS headers. Gateway pages run sandboxed in an opaque origin, so they load their DAG's
 files as subresources but can't read any gateway response with `fetch()`; an earlier rule allowing a gateway
@@ -674,7 +692,9 @@ before submitting, as the CLI resolves a nick. Jobs are persisted, resumed at th
 LXMF). Not in the typed interface for 0.2: keep/follow, contacts, peers/stats, LXMF.
 
 **Errors.** One hierarchy in `rnfs.errors`, every class importable as `rnfs.<Name>`: `RnfsError` ⊃
-`NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`.
+`NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`, and
+`BlockMismatch` and `SealError` (a sealed file malformed or tampered with), which are `ValueError`s too, as is
+`NotRecipient` (this node can't open a sealed file).
 `ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning`, `ConnectionFailed`, `TokenError`,
 `AuthFailed`, `SettingsError`, `ServerError` (500, or another 5xx), and the API statuses, each also a subclass
 of the node's class: `apiclient.NotFound(ApiError, errors.NotFound)` and so on, `BadRequest(ApiError,
@@ -933,13 +953,33 @@ or nils, since nodes since 0.1.4 refuse any other: the server checks each with `
 Feature modules don't import RNS at module level (the CLI imports them to build its parser) and their constructors
 work on `RnfsNode.offline` test nodes.
 
+A feature declares the features it uses: `requires` (it can't work without them; each must come before it in
+`FEATURE_MODULES`) and `optional` (used when loaded). The node loads them through `features.checked_classes()`,
+which raises `features.FeatureError` before making any if a required feature is missing or later, or two features
+share a name; a feature reaches another only with `self.dependency(name)`, which raises `FeatureError` for a name it
+didn't declare and returns `None` for an optional one not loaded. Today follow requires keepers; jobs, keepers,
+follow and lxmf use contacts, contacts uses keepers and lxmf uses jobs, all optionally. What the others call on
+contacts is the `features.ContactsApi` Protocol (`lookup`, `has`, `nick_of`, `resolve_id`, `expand_target`), which
+types `node.feature("contacts")`, `self.dependency("contacts")` and `features.find(node, "contacts")`;
+`tests/test_contacts.py` checks `ContactsFeature` against it, so a renamed method fails there instead of silently
+turning off LXMF's contact trust. LXMF resolves a recipient's nick with `ContactsFeature.resolve_id(nick, "lxmf")`.
+
+The node checks the features' names too when it loads them, with one error style (`FeatureError`, "feature
+<name>: <problem>"), so nothing is shadowed or dropped silently: `checked_classes()` checks every API route
+(`features.api_routes()`: GET or POST of a path matching `API_PATH`, under `/api/`, with a handler, defined neither
+by `ApiHandler.ROUTES` nor by another feature), and once the features are made, `features.request_handlers()`
+checks their request paths (`/` and a name, `REQUEST_PATH`, with a handler, neither one of rnfs's own,
+`CORE_REQUEST_PATHS`, nor another feature's). `NodeBackend.feature_requests()` hands the request server the paths
+checked then. A feature's constructor raising stops the node from being made (those made before it are closed);
+its `start()` raising is logged and the others still start (`RnfsNode._start_features`).
+
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic` | reads `Traffic`, the routing table, links, paths |
 | `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job`, CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
-| `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
+| `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
 | `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `LXMF_PREFIX` in `storage.check_source` |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 
@@ -1291,10 +1331,12 @@ Everything in the specification is implemented, with these simplifications and a
   RNS 1.5.6 that reaches the provider as a rejection, which before a quarter of the response is sent cools the
   requester down there (`RequestServer._concluded`), while a closed link doesn't. In private mode, incoming
   links not identified as a member's are closed first to make room.
-- A shared-folder entry that fails to import because of its content (an invalid name, the deny list, too large)
-  isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a pin the
-  state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, and an unchanged
-  entry whose pin fails is logged without ending the scan.
+- A shared-folder entry that fails to import because of its content (an `RnfsError`: the deny list, too large or
+  too deep) isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a
+  pin the state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, as is one
+  failing with a `ValueError` (a bug, such as a `BlockMismatch`: invalid names and special files inside an entry
+  are skipped, so the content doesn't cause one), logged with its type; an unchanged entry whose pin fails is
+  logged without ending the scan.
 - Inside an entry whose signature changed, the scan reads only the files that changed (audit D1):
   `SharedFolder.files` (a `FolderFiles`) maps each file's `builder.file_state` (device, inode, size, `mtime_ns`,
   execute bit; the open file's `fstat`, taken before it is read) to the `Built` it gave, grouped by top-level
@@ -1455,7 +1497,8 @@ Everything in the specification is implemented, with these simplifications and a
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
   `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
   `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
-  a manual run only builds. The Windows exe isn't code-signed, and unpacks itself on each start.
+  a manual run only builds, as do the runs for a pull request touching `packaging/**`, `pyproject.toml` or
+  `.github/**` and the weekly scheduled run. The Windows exe isn't code-signed, and unpacks itself on each start.
   - `lxmf>=1.2.0,<1.3` is a regular dependency next to `rns>=1.5.6,<1.6` (`pyproject.toml`), so every
     install includes LXMF; the PyInstaller spec fails the build without it. The upper bounds keep unpinned
     installs off RNS and LXMF releases rnfs hasn't been tested with, since it relies on some of their internals.
@@ -1464,8 +1507,8 @@ Everything in the specification is implemented, with these simplifications and a
     `python3 -I packaging/update-lock.py [pkg==ver …]` regenerates it (no arguments: the newest versions
     `pyproject.toml` allows), then `packaging/flatpak/generate-sources.py` regenerates the Flatpak's
     `python3-deps.json` from it; both are committed. `install.sh`, `build-deb.sh`, the tests and the release's
-    Windows exe install from it with `pip --require-hashes --only-binary=:all:` (then `pip check`), and the
-    release's flatpak-sources step fails if regenerating changes the committed files. The sdist includes the
+    Windows exe install from it with `pip --require-hashes --only-binary=:all:` (then `pip check`), and
+    `tests.yml`'s flatpak-sources job fails if regenerating changes the committed files. The sdist includes the
     lock.
   - `update-lock.py --build pyinstaller==<ver>` writes `build-backend.lock` (setuptools, within
     `pyproject.toml`'s `<85` bound) and `build-tools.lock` (build, twine, PyInstaller, setuptools, ruff and

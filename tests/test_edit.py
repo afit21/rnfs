@@ -90,6 +90,16 @@ class EditTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             edit.dir_rm(self.root.cid, [], get, put)
 
+    def test_check_entry_target(self):
+        """dir rm's target must name an entry, <cid>/<path>: a root alone (with or without slashes) or a non-string
+        is ValueError, with the one message every caller gives (ND3)."""
+        cid = str(self.root.cid)
+        for target in (f"{cid}/docs", f"{cid}/docs/a", f"{cid}/docs/", "nick/docs"):
+            edit.check_entry_target(target)
+        for target in (cid, f"{cid}/", f"{cid}//", "", None, 5):
+            with self.subTest(target), self.assertRaisesRegex(ValueError, "the entry to remove"):
+                edit.check_entry_target(target)
+
     def test_through_index_nodes(self):
         """Edits inside a directory split into index nodes, and paths that step through them."""
         with mock.patch.multiple(constants, CHUNK_SIZE=4, MAX_CHILDREN=3):

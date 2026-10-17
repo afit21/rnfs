@@ -11,10 +11,12 @@ it is still stored and none is denied, and its remembered content hash still goe
 What the files were built as is kept in the shared_folder_files table, saved with the node's periodic saves and at
 stop, not durably: a power loss costs at most reading some files again.
 
-An entry that fails to import because of its content (an invalid name, the deny list, too large) isn't tried
-again until it changes; one that fails for a reason that may pass (a full or failing disk, a pin that couldn't be
-saved, a file unreadable for now) is tried again RETRY_AFTER later. A failure to pin an unchanged entry again is
-logged and the scan goes on.
+An entry that fails to import because of its content (the deny list, too large or too deep: an RnfsError) isn't
+tried again until it changes; one that fails for a reason that may pass (a full or failing disk, a pin that couldn't
+be saved, a file unreadable for now) is tried again RETRY_AFTER later, and so is one failing with a ValueError,
+which the content doesn't cause (invalid names and special files inside an entry are skipped): a bug, such as a
+BlockMismatch, logged with its traceback in the debug log rather than leaving the entry unshared until it changes.
+A failure to pin an unchanged entry again is logged and the scan goes on.
 
 The folder itself may be a symlink (the owner's setting), but it must not lead into the rnfs dir: a folder that is
 the rnfs dir, a directory holding it, or one inside the subdirectories holding its keys and state (PRIVATE_SUBDIRS)
@@ -515,12 +517,14 @@ class SharedFolder:
                     built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True, options=options,
                                                cache=files)
                 self.storage.pin(built.cid, FOLDER)
-        except (OSError, StorageFull) as e:  # may pass (a full or failing disk, a pin not saved): tried again later
+        except (OSError, StorageFull, ValueError) as e:
+            # May pass (a full or failing disk, a pin not saved): tried again later. So is a ValueError (a
+            # BlockMismatch too), which the content doesn't cause (see the module docstring): a bug, shown by type
             self._failed[name] = (sig, self.clock() + RETRY_AFTER)
-            log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
+            log(f"shared folder: couldn't import {shown}: {repr(e) if isinstance(e, ValueError) else e}", LOG_WARNING)
             self._keep_files(name, files, complete=False)
             return None
-        except (ValueError, RnfsError) as e:  # the content's: not until it changes
+        except RnfsError as e:  # the content's: not until it changes
             self._failed[name] = (sig, None)
             log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
             self._keep_files(name, files, complete=False)

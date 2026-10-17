@@ -74,8 +74,9 @@ SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing s
 NAME_CACHE_TIME = 60.0
 NAME_CACHE_SIZE = 1000
 INDEX = "index.html"
-# What an error from the node says on the gateway, by status: never its own text (see the module docstring)
-ERROR_MESSAGES = {400: "invalid request", 413: "too large for this node's download limits",
+# What an error from the node says on the gateway, by status: never its own text (see the module docstring). Every
+# status of rnfs.errors.STATUSES has one, and 500; a NotFound's own text is shown, this only if it has none
+ERROR_MESSAGES = {400: "invalid request", 404: "not found", 413: "too large for this node's download limits",
                   451: "unavailable: this node's deny list blocks this content",
                   422: "invalid content: it breaks the rnfs format's rules", 503: "the node is busy; try again shortly",
                   507: "not enough free disk space on this node", 500: "internal error; see the rnfs daemon's log"}
@@ -426,7 +427,7 @@ class GatewayHandler(TimedHandler):
             self.respond_error(e.status, str(e), e.headers)
         except NotFound as e:
             log(f"gateway: {loggable(self.path)} not found: {e}", LOG_DEBUG)
-            self.respond_error(404, str(e) or "not found", {})
+            self.respond_error(404, str(e) or ERROR_MESSAGES[404], {})
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             # str(e) may name local paths (a StorageFull's or an OSError's) or the node's limits: logged only

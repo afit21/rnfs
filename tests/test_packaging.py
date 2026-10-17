@@ -1,4 +1,6 @@
-"""Static checks of the packaging files: install.sh's isolation and unit quoting, and the dependency lock."""
+"""Static checks of the packaging files: install.sh's isolation and unit quoting, the dependency locks, the workflows,
+the supported Pythons and the CHANGELOG's version."""
+import ast
 import json
 import os
 import re
@@ -247,6 +249,30 @@ class BuildScriptsTest(unittest.TestCase):
                 self.assertRegex(step.group(2), r"(?m)^ +cache: false$", f"{name}: {step.group(0)}")
         self.assertTrue(steps)
 
+    def test_flatpak_sources_are_checked_by_the_tests(self):
+        """The check that the Flatpak's wheels match the lock runs in tests.yml (on every push, not only at a
+        release, TS5), and the release builds the committed files rather than an artifact of its own."""
+        tests = read(os.path.join(WORKFLOWS, "tests.yml"))
+        job = re.search(r"(?m)^  flatpak-sources:\n((?:    .*\n|\n)+?)(?=^  \S|\Z)", tests)
+        self.assertTrue(job)
+        self.assertIn("python -I packaging/flatpak/generate-sources.py\n", job.group(1))
+        self.assertIn("git diff --exit-code -- packaging/flatpak ||", job.group(1))
+        release = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertNotIn("flatpak-sources", release.replace("tests.yml's flatpak-sources job", ""))
+
+    def test_flatpak_copies_no_local_debris(self):
+        """The Flatpak's copy of the checkout skips what local builds, tests and lint leave: every .gitignore entry
+        that isn't a pattern (flatpak-builder's skip entries are paths), and the egg-info (TS12)."""
+        manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
+        block = re.search(r"(?m)^        path: \.\./\.\.\n        skip:\n((?:          - .*\n)+)", manifest)
+        self.assertTrue(block)
+        skipped = set(re.findall(r"- (\S+)", block.group(1)))
+        ignored = {line.strip().rstrip("/") for line in read(os.path.join(REPO, ".gitignore")).splitlines()
+                   if line.strip() and not line.startswith("#") and not set("*?[") & set(line)}
+        self.assertTrue(ignored)
+        self.assertEqual(ignored - skipped, set())
+        self.assertIn("rnfs.egg-info", skipped)
+
     def test_flatpak_sandbox_is_narrow(self):
         """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
         manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
@@ -320,6 +346,164 @@ class DependencyLockTest(unittest.TestCase):
             self.assertIn(name, lock, filename)
             self.assertEqual(version, lock[name][0], filename)
             self.assertIn(source["sha256"], lock[name][1], filename)
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    """(1, 2, 3) from "1.2.3"."""
+    return tuple(int(part) for part in text.split("."))
+
+
+def python_constants(path: str) -> dict[str, object]:
+    """The module-level constants (literals) a Python script assigns, read without running it."""
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), path)
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            try:
+                constants[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass  # not a literal
+    return constants
+
+
+def shell_assignment(path: str, name: str) -> str:
+    """The value of a NAME=value (or NAME="value") line in a shell script."""
+    match = re.search(r'(?m)^%s="?([^"\n#]*?)"?(?:\s+#.*)?$' % re.escape(name), read(path))
+    assert match, (path, name)
+    return match.group(1)
+
+
+class SupportedPythonsTest(unittest.TestCase):
+    """The supported Pythons are written in several places; they all agree with the tests.yml matrix (TS7), so
+    adding one (or dropping one) in only some of them fails here rather than in a release build."""
+
+    @classmethod
+    def setUpClass(cls):
+        """The tests.yml matrix's Pythons, oldest first."""
+        matrix = re.search(r'(?m)^ +python: \[(.*)\]$', read(os.path.join(WORKFLOWS, "tests.yml")))
+        assert matrix
+        cls.pythons = sorted(re.findall(r'"(3\.\d+)"', matrix.group(1)), key=version_tuple)
+        cls.oldest, cls.newest = cls.pythons[0], cls.pythons[-1]
+
+    def test_matrix_is_consecutive(self):
+        """The matrix is every minor version from the oldest to the newest."""
+        major, low = version_tuple(self.oldest)
+        self.assertEqual(self.pythons, [f"{major}.{minor}" for minor in range(low, version_tuple(self.newest)[1] + 1)])
+
+    def test_requires_python(self):
+        """pyproject.toml's requires-python is the oldest."""
+        with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
+            self.assertEqual(tomllib.load(f)["project"]["requires-python"], f">={self.oldest}")
+
+    def test_update_lock(self):
+        """build-tools.lock has wheels for every matrix Python, and requirements.lock is resolved for the oldest."""
+        constants = python_constants(os.path.join(REPO, "packaging", "update-lock.py"))
+        self.assertEqual(constants["BUILD_PYTHONS"], self.pythons)
+        args = constants["RESOLVE_ARGS"]
+        self.assertEqual(args[args.index("--python-version") + 1], self.oldest)
+        args = constants["BUILD_RESOLVE_ARGS"]
+        self.assertIn(args[args.index("--python-version") + 1], self.pythons)
+
+    def test_flatpak_runtime_pythons(self):
+        """The Flatpak's wheels are for supported Pythons, up to the newest (the runtime's Python and its
+        neighbours)."""
+        runtime = python_constants(os.path.join(REPO, "packaging", "flatpak", "generate-sources.py"))["RUNTIME_PYTHONS"]
+        self.assertLessEqual(set(runtime), set(self.pythons))
+        self.assertEqual(max(runtime, key=version_tuple), self.newest)
+
+    def test_build_deb(self):
+        """The .deb bundles a cffi backend for every matrix Python, and its python3 dependency is within them."""
+        self.assertEqual([self.oldest, *shell_assignment(BUILD_DEB, "EXTRA_PYTHONS").split()], self.pythons)
+        major, minor = version_tuple(self.newest)
+        self.assertEqual(shell_assignment(BUILD_DEB, "PYTHON_BELOW"), f"{major}.{minor + 1}")
+        text = read(BUILD_DEB)
+        self.assertIn(f"for version in {self.oldest} $EXTRA_PYTHONS; do", text)
+        self.assertIn(f"--python-version {self.oldest} ", text)
+        self.assertIn(f"Depends: python3 (>= {self.oldest}),", text)
+
+    def test_install_sh(self):
+        """install.sh accepts the oldest and looks for each matrix Python by name, newest first."""
+        candidates = re.search(r"(?m)^    for candidate in (.*); do$", shell_function("find_python"))
+        self.assertTrue(candidates)
+        self.assertEqual(candidates.group(1).split(),
+                         ["python3", *(f"python{v}" for v in reversed(self.pythons))])
+        major, minor = version_tuple(self.oldest)
+        self.assertIn(f"sys.version_info >= ({major}, {minor})", shell_function("python_ok"))
+        self.assertIn(f"older than Python {self.oldest}, which rnfs needs", shell_function("find_python"))
+
+    def test_readme_pyinstaller_is_locked(self):
+        """README's pyinstaller==X (building the binary by hand) is the version build-tools.lock pins."""
+        versions = re.findall(r"\bpyinstaller==([\w.]+)", read(os.path.join(REPO, "README.md")))
+        self.assertTrue(versions)
+        self.assertEqual(set(versions), {read_lock(TOOLS_LOCK)["pyinstaller"][0]})
+
+
+class ChangelogTest(unittest.TestCase):
+    """CHANGELOG.md's first section is the current version's, or the next one's while it is unreleased, and the
+    release workflow publishes that section as the release notes (TS6)."""
+
+    def notes_step(self) -> str:
+        """The run: script of release.yml's step that checks CHANGELOG.md and writes release-notes.md."""
+        step = re.search(r"(?m)^      - name: Release notes from CHANGELOG\.md.*\n(?:        .*\n)*?        run: \|\n"
+                         r"((?:          .*\n|\n)+?)(?=^      - )", read(os.path.join(WORKFLOWS, "release.yml")))
+        self.assertTrue(step)
+        return "\n".join(line[10:] for line in step.group(1).splitlines())
+
+    def test_first_section_is_the_version(self):
+        """The first `## ` heading is `## <__version__>`, or `## X.Y.Z (unreleased)` for a later X.Y.Z while
+        __version__ still has a section of its own (it is bumped at the release)."""
+        from rnfs import __version__
+        headings = re.findall(r"(?m)^## (.*)$", read(os.path.join(REPO, "CHANGELOG.md")))
+        self.assertTrue(headings)
+        first = re.fullmatch(r"(\d+\.\d+\.\d+)( \(unreleased\))?", headings[0])
+        self.assertTrue(first, headings[0])
+        if first.group(2):
+            self.assertGreater(version_tuple(first.group(1)), version_tuple(__version__), headings[0])
+            self.assertIn(__version__, headings[1:])
+        else:
+            self.assertEqual(first.group(1), __version__)
+        self.assertEqual(len(headings), len(set(headings)), "a version has two sections")
+
+    def test_specification_names_the_version(self):
+        """specification.md's version note names the version CHANGELOG.md's first section is for (TS11)."""
+        first = re.search(r"(?m)^## (\d+\.\d+\.\d+)", read(os.path.join(REPO, "CHANGELOG.md")))
+        note = re.search(r"(?m)^\*\*Version\.\*\* This document describes rnfs (\d+\.\d+\.\d+)\.",
+                         read(os.path.join(REPO, "specification.md")))
+        self.assertTrue(first and note)
+        self.assertEqual(note.group(1), first.group(1))
+
+    def test_release_notes_are_the_changelog_section(self):
+        """The release is created with --notes-file, from the notes the version job extracted, not
+        --generate-notes."""
+        release = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertNotIn("--generate-notes", release)
+        self.assertIn("--notes-file notes/release-notes.md", release)
+        self.assertIn('[ "${GITHUB_REF_TYPE}" = tag ] && [ "$first" != "## $VERSION" ]', self.notes_step())
+
+    @unittest.skipUnless(shutil.which("sh") and shutil.which("awk"), "needs a POSIX shell and awk")
+    def test_release_notes_step(self):
+        """The step refuses a tag whose section is still unreleased or not first, and writes the version's section
+        (without its heading or the next one) as the notes."""
+        changelog = ("# Changelog\n\nIntro.\n\n## 0.2.0 (unreleased)\n\nNext.\n\n## 0.1.9\n\nNotes of 0.1.9.\n\n"
+                     "### Security\n- A fix.\n\n## 0.1.8\n\nOlder.\n")
+
+        def run(text, version, ref_type):
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "CHANGELOG.md"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                done = subprocess.run(["sh", "-ec", self.notes_step()], cwd=tmp, capture_output=True, text=True,
+                                      env={**os.environ, "VERSION": version, "GITHUB_REF_TYPE": ref_type})
+                notes = read(os.path.join(tmp, "release-notes.md")) if done.returncode == 0 else None
+                return done.returncode, notes
+        section = "\nNotes of 0.1.9.\n\n### Security\n- A fix.\n\n"
+        self.assertEqual(run(changelog, "0.1.9", "branch"), (0, section))
+        self.assertNotEqual(run(changelog, "0.1.9", "tag")[0], 0)  # 0.2.0 is still above it
+        self.assertNotEqual(run(changelog, "0.2.0", "tag")[0], 0)  # unreleased
+        self.assertEqual(run(changelog, "0.2.0", "branch"), (0, "\nNext.\n\n"))
+        released = changelog.replace("## 0.2.0 (unreleased)\n\nNext.\n\n", "")
+        self.assertEqual(run(released, "0.1.9", "tag"), (0, section))
+        self.assertNotEqual(run(released, "0.1.7", "branch")[0], 0)  # no section
 
 
 class ReadmeTest(unittest.TestCase):

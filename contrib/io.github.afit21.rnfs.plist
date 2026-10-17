@@ -8,7 +8,7 @@
 
   Stop it with `launchctl unload ~/Library/LaunchAgents/io.github.afit21.rnfs.plist`; launchd sends SIGTERM,
   which the daemon handles by shutting down cleanly. It assumes `pipx install`, which puts rnfs in
-  ~/.local/bin; adjust the path below (both places) otherwise. launchd doesn't expand ~, hence the sh -c.
+  ~/.local/bin; adjust the path below (all three places) otherwise. launchd doesn't expand ~, hence the sh -c.
   If rnfs isn't there (e.g. uninstalled), the job logs that and exits successfully, so launchd doesn't keep
   restarting it. daemon.log isn't rotated: empty it now and then with `: > ~/.rnfs/daemon.log`.
 -->

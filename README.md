@@ -12,7 +12,7 @@ Access any file on RNFS by it's **'CID'**.
 ***Example:*** The Communist Manifesto PDF: ```bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya```
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
 
 <hr>
@@ -365,6 +365,9 @@ python3 packaging/smoke_test.py dist/rnfs
 `packaging/requirements.lock` pins every runtime dependency (rns, lxmf, cryptography, cffi, pycparser,
 pyserial) with the sha256 of each file PyPI has for it. `update-lock.py` with no arguments picks the newest
 versions `pyproject.toml` allows; commit the lock and the regenerated Flatpak sources together.
+
+To work on rnfs itself (the tests and their options, lint, the locks, adding a schema step or an API route,
+releasing), see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Reticulum and where things live
 

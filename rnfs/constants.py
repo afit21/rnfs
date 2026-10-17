@@ -24,6 +24,10 @@ ID_LENGTH = 16  # node IDs and DHT keys: RNS destination hashes, 128 bits
 BUCKET_COUNT = 128
 RESPONSE_OVERHEAD = 1 * KIB  # room left for msgpack framing in a /blocks response (section 7)
 MAX_PROVIDE_KEYS = 55  # keys in one /provide, both lists: the most that fit MAX_REQUEST_SIZE (section 4)
+# Announces a node or name may miss, at announce_interval each, before it is presumed gone or its record stale: a
+# routing table entry silent this long is dropped (section 6), an announce shows its record current for this long
+# after it was emitted, and follows and deny lists refresh a record not heard this long (section 9)
+MISSED_ANNOUNCES = 2
 
 # Local, not protocol: a file being written out (.rnfs-get-<random>.partial, .rnfs-job-<id>.partial), then renamed
 PARTIAL_SUFFIX = ".partial"
