@@ -309,6 +309,9 @@ class Fetcher:
         # node ID -> mesh.PathInfo (hops, next-hop interface bitrate) for ranking providers; the node sets
         # RNS's (mesh.RnsPaths.info), and without it nothing is known and ranking falls back to reply order
         self.path_info: Callable[[bytes], mesh.PathInfo] = mesh.no_path_info
+        # path_info of several nodes at once (mesh.RnsPaths.infos: one RPC to a shared instance, not one each)
+        self.path_infos: Callable[[list[bytes]], dict[bytes, mesh.PathInfo]] = lambda node_ids: {
+            node_id: self.path_info(node_id) for node_id in node_ids}
         self._lock = threading.Lock()
         self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
@@ -632,7 +635,7 @@ class Fetch:
             raise ValueError("offset and length must be non-negative")
         with self._checking():
             self.ensure([target])
-            if walker.kind_of(target, self.get(target)) != "file":
+            if walker.kind_of(target, self.get(target)) != walker.FILE_TYPE:
                 raise ValueError(f"{target.cid} is a directory")
             size = self.size_of(target)
             end = size if length is None else min(size, offset + length)
@@ -925,6 +928,14 @@ class Fetch:
         except Exception:  # noqa: BLE001 - RNS internals: no path known if they fail
             return mesh.NO_PATH
 
+    def _paths(self, node_ids: list[bytes]) -> dict[bytes, mesh.PathInfo]:
+        """_path of each of node_ids, looked up together (fetcher.path_infos)."""
+        try:
+            found = self.fetcher.path_infos(node_ids)
+        except Exception:  # noqa: BLE001 - RNS internals: no path known if they fail
+            found = {}
+        return {node_id: found.get(node_id) or self._path(node_id) for node_id in node_ids}
+
     def _waiting_for_busy(self) -> bool:
         """True if a usable provider is only waiting out a busy delay."""
         now = self.fetcher.clock()
@@ -1019,8 +1030,10 @@ class Fetch:
             self._probed = True
             banned = self.fetcher.routing.is_banned
             linked = [n for n in self.client.open_links() if n != self.fetcher.own_id and not banned(n)]
-            # Ranked like providers; most recently used breaks ties
-            ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], self._path(item[1]), item[0]))
+            # Ranked like providers; most recently used breaks ties. Their paths in one go: attached to a shared
+            # instance, that is one RPC rather than one per link before the first request (plan C1)
+            paths = self._paths(linked)
+            ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], paths[item[1]], item[0]))
             candidates = [node_id for _, node_id in ranked][:self.fetcher.max_parallel]
             if candidates and pending:
                 # Each is asked for just the first block missing, which is the root at the start

@@ -466,6 +466,7 @@ class RnfsNode:
         # mesh: hops and next-hop interfaces rank providers; one set of traffic counters for client and server
         self.paths = RnsPaths(self.reticulum)
         self.fetcher.path_info = self.paths.info
+        self.fetcher.path_infos = self.paths.infos
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
         self.announcer = DhtAnnouncer(self.destination, config)
@@ -1312,7 +1313,7 @@ class RnfsNode:
     def _read(self, fetch: Fetch, expect: walker.Expect, offset: int, length: int | None, for_gateway: bool,
               raw: bool) -> Iterator[bytes]:
         """read() of a resolved target, in fetch."""
-        if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == "file":
+        if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == walker.FILE_TYPE:
             # The whole file is fetched and hashed (once: then remembered) before any of it is sent
             self._check_fetched(fetch, expect)
         sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
@@ -1326,7 +1327,7 @@ class RnfsNode:
         root, names = self._parse_target(target, for_gateway)
         with self._fetching(root, names, None, for_gateway) as fetch:
             expect = fetch.resolve()
-            if walker.kind_of(expect, fetch.get(expect)) != "directory":
+            if walker.kind_of(expect, fetch.get(expect)) != walker.DIRECTORY_TYPE:
                 raise ValueError(f"{target} is not a directory")
             fetch.fetch_listing(expect)
             return [{"name": entry.name, "kind": KIND_NAMES[entry.kind], "size": entry.size, "cid": str(entry.cid)}

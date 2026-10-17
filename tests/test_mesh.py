@@ -104,6 +104,36 @@ class FetcherOrderTest(FetcherTest):
         probed = {node for node, _ in self.client.requests[:2]}
         self.assertEqual(probed, {P3, P1})  # P2's path is unknown: last
 
+    def test_open_links_paths_looked_up_together(self):
+        """The open links' paths come from one path_infos call (one RPC on a shared instance), ranked as one by one;
+        a node it doesn't answer for falls back to path_info, and a failing path_infos to path_info alone."""
+        self.config.max_parallel_providers = 2
+        self.client.links = [P1, P2, P3]
+        one_by_one = paths({P1: (3, None), P3: (1, 9600)})
+        calls = []
+
+        def together(node_ids):
+            """path_infos, answering for all but P3."""
+            calls.append(list(node_ids))
+            return {node_id: one_by_one(node_id) for node_id in node_ids if node_id != P3}
+
+        self.fetcher.path_info = one_by_one
+        self.fetcher.path_infos = together
+        self.fetch_all(self.block.cid)
+        self.assertEqual(calls, [[P1, P2, P3]])
+        self.assertEqual({node for node, _ in self.client.requests[:2]}, {P3, P1})
+
+    def test_path_infos_errors_fall_back_to_path_info(self):
+        def broken(node_ids):
+            """A batch lookup that fails."""
+            raise RuntimeError("no RNS")
+        self.config.max_parallel_providers = 2
+        self.client.links = [P1, P2, P3]
+        self.fetcher.path_info = paths({P1: (3, None), P3: (1, 9600)})
+        self.fetcher.path_infos = broken
+        self.fetch_all(self.block.cid)
+        self.assertEqual({node for node, _ in self.client.requests[:2]}, {P3, P1})
+
     def test_path_info_errors_mean_unknown(self):
         def broken(node_id):
             """A lookup that fails."""
