@@ -1,6 +1,7 @@
 """L15 (fix): install.sh installed GitHub's auto-generated archive of the release tag, which neither SHA256SUMS nor the
 signed provenance covers and which a moved tag changes. Now it installs the release's sdist, checked against the
 release's SHA256SUMS and, where the GitHub CLI can, its signed provenance (gh attestation verify), failing closed.
+SUP-2 ties that provenance to the release's tag; SUP-3 stops the install when gh could check it but isn't logged in.
 
 install.sh's download, verify_release and fetch_release functions are run with sh against a fake release (file://
 URLs) and a fake gh on a PATH holding only the tools they need, so the real network and any real gh are never
@@ -83,7 +84,7 @@ class ReleaseCheckTest(unittest.TestCase):
         """Run fetch_release for v9.9.9 as do_install would; prints the SOURCE it leaves."""
         repo_url = "file://" + os.path.join(self.tmp.name, "repo")
         script = "\n".join([PRELUDE, shell_function("download"), shell_function("verify_release"),
-                            shell_function("gh_can_verify"), shell_function("fetch_release"),
+                            shell_function("gh_has_attestation"), shell_function("fetch_release"),
                             'fetch_release "$1"', 'printf "SOURCE=%s\\n" "$SOURCE"'])
         environment = {"PATH": self.bin, "PYTHON": sys.executable, "REPO_URL": repo_url, "RELEASE_TAG": "v9.9.9",
                        "SOURCE": repo_url + "/releases/download/v9.9.9/rnfs-9.9.9.tar.gz",
@@ -163,14 +164,30 @@ class ReleaseCheckTest(unittest.TestCase):
         self.assert_refused(result, "no valid signed provenance")
         self.assertIn("no attestations found", result.stderr)  # gh's own explanation is shown
 
-    def test_gh_that_cant_verify_counts_as_absent(self):
-        # Ubuntu 24.04's gh 2.45 has no attestation command; a gh not logged in can't query attestations
-        for behaviour in ("old", "logged-out"):
-            with self.subTest(behaviour):
-                self.install_gh(behaviour)
-                self.assert_installs_checked_file(self.fetch())
-                self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
-                self.assert_refused(self.fetch(RNFS_REQUIRE_ATTESTATION="1"), "RNFS_REQUIRE_ATTESTATION=1")
+    def test_gh_without_attestation_counts_as_absent(self):
+        # Ubuntu 24.04's gh 2.45 has no attestation command
+        self.install_gh("old")
+        result = self.fetch()
+        self.assert_installs_checked_file(result)
+        self.assertIn("against the release's SHA256SUMS only", result.stderr)
+        self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
+        self.assert_refused(self.fetch(RNFS_REQUIRE_ATTESTATION="1"), "RNFS_REQUIRE_ATTESTATION=1")
+
+    def test_logged_out_gh_stops_the_install(self):
+        """SUP-3: a gh that could check the provenance but isn't logged in (a root install's, usually) stops the
+        install, and the error names the opt-out, RNFS_REQUIRE_ATTESTATION=0. (Until 0.1.6 it counted as absent.)"""
+        self.install_gh("logged-out")
+        for env in ({}, {"RNFS_REQUIRE_ATTESTATION": "1"}):
+            with self.subTest(env):
+                result = self.fetch(**env)
+                self.assert_refused(result, "the GitHub CLI (gh) is installed but not logged in")
+                self.assertIn("RNFS_REQUIRE_ATTESTATION=0", result.stderr)
+        self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
+        result = self.fetch(RNFS_REQUIRE_ATTESTATION="0")
+        self.assert_installs_checked_file(result)
+        self.assertIn("RNFS_REQUIRE_ATTESTATION=0: checked rnfs-9.9.9.tar.gz against the release's SHA256SUMS only",
+                      result.stderr)
+        self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
 
 
 class DefaultSourceTest(unittest.TestCase):

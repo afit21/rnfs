@@ -282,8 +282,11 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
 `~/.local/share/rnfs/venv`. It installs the release's source archive (`rnfs-X.Y.Z.tar.gz`) only if it matches
 the release's `SHA256SUMS` and, if the [GitHub CLI](https://cli.github.com/) (2.49 or newer) is installed and
-logged in, its signed build provenance (`gh attestation verify`). Without `gh` it warns that only the checksum
-was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it stop instead. Dependencies are installed at the
+logged in, its signed build provenance (`gh attestation verify`). If `gh` is installed but not logged in, it
+stops: log in with `gh auth login`, or set `RNFS_REQUIRE_ATTESTATION=0` to install with only the checksum
+checked. Without `gh` it warns that only the checksum was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it
+stop instead. So `curl | sh` without `gh` trusts whoever can write the release's files on GitHub, since
+`SHA256SUMS` comes from the same place as the archive. Dependencies are installed at the
 versions pinned in the source's `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
 `~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
 

@@ -28,13 +28,16 @@
 #                           them are then fetched unpinned, and a C compiler and Python headers are needed
 #              RNFS_REQUIRE_ATTESTATION=1  fail unless the release's signed provenance could be checked (needs
 #                           the GitHub CLI, gh 2.49 or newer, logged in)
+#              RNFS_REQUIRE_ATTESTATION=0  install with only the SHA256SUMS check when gh is installed but not
+#                           logged in (which otherwise stops the install)
 #
 # The latest release is installed from its source archive (rnfs-X.Y.Z.tar.gz, a release file, not the archive
 # GitHub makes of the tag), which must match the release's SHA256SUMS. Where the GitHub CLI (gh 2.49 or newer)
 # is installed and logged in, its signed build provenance is checked too (gh attestation verify, made by
-# release.yml for this repository from this release's tag), and a failed check stops the install. Without gh
-# the install goes ahead with a warning: SHA256SUMS shows the download is whole, but whoever could replace the
-# release's files could replace it too.
+# release.yml for this repository from this release's tag), and a failed check stops the install. Where gh is
+# installed but not logged in, the install stops (unless RNFS_REQUIRE_ATTESTATION=0). Without gh the install
+# goes ahead with a warning: SHA256SUMS shows the download is whole, but whoever could replace the release's
+# files could replace it too.
 #
 # Dependencies (rns, lxmf, cryptography, ...) are installed as wheels at the versions and sha256 hashes
 # pinned in the source's packaging/requirements.lock (pip --require-hashes --only-binary=:all:), and rnfs
@@ -347,9 +350,21 @@ if digest.hexdigest() != expected[0]:
 EOF
     # SHA256SUMS is a release file like any other: whoever can replace the sdist can replace it too. The signed
     # provenance can't be made outside this repository's release workflow
-    if gh_can_verify; then
+    if gh_has_attestation; then
+        if ! gh auth status >/dev/null 2>&1; then
+            # This gh could check the provenance once logged in, so a missing login stops the install rather than
+            # quietly skipping the check (root's gh, for a --system install, is rarely logged in)
+            [ "${RNFS_REQUIRE_ATTESTATION:-}" = 0 ] || die "the GitHub CLI (gh) is installed but not logged in, so
+it can't check the signed build provenance of $(basename -- "$1"), which wasn't installed. Log in with
+gh auth login (as the user running this script) and run this again, or set RNFS_REQUIRE_ATTESTATION=0 to
+install with only the SHA256SUMS check:
+  curl -fsSL .../install.sh | RNFS_REQUIRE_ATTESTATION=0 sh   (or: | sudo RNFS_REQUIRE_ATTESTATION=0 sh -s -- --system)"
+            warn "RNFS_REQUIRE_ATTESTATION=0: checked $(basename -- "$1") against the release's SHA256SUMS only, not its
+signed provenance (gh isn't logged in). That shows the download is whole, not that the release workflow built it."
+            return 0
+        fi
         # Older gh versions can only name the repository, not the workflow or the tag (gh_help, read by
-        # gh_can_verify, lists the options this one has)
+        # gh_has_attestation, lists the options this one has)
         options=""
         case "$gh_help" in
             *--signer-workflow*) options="--signer-workflow=$REPO/.github/workflows/release.yml" ;;
@@ -374,8 +389,8 @@ signed provenance is checked too. Set RNFS_REQUIRE_ATTESTATION=1 to refuse to in
     fi
 }
 
-gh_can_verify() {  # the GitHub CLI is here, logged in, and new enough to have gh attestation (2.49); sets gh_help
-    command -v gh >/dev/null 2>&1 && gh_help=$(gh attestation verify --help 2>&1) && gh auth status >/dev/null 2>&1
+gh_has_attestation() {  # the GitHub CLI is here and new enough to have gh attestation (2.49); sets gh_help
+    command -v gh >/dev/null 2>&1 && gh_help=$(gh attestation verify --help 2>&1)
 }
 
 fetch_release() {  # fetch_release WORKDIR: download the release's sdist and SHA256SUMS, check them, and install that file
