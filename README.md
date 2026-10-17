@@ -30,7 +30,7 @@ Access any file on RNFS by it's **'CID'**.
 [How rnfs adapts IPFS](#how-rnfs-adapts-ipfs) · [Settings](#settings) · [Commands](#commands) ·
 [Building apps on rnfs](#building-apps-on-rnfs) · [Keeping content off your node](#keeping-content-off-your-node) ·
 [Example use cases](#example-use-cases) · [Running several nodes](#running-several-nodes) ·
-[Tests](#tests) · [Known limitations](#known-limitations) ·
+[Known limitations](#known-limitations) ·
 [specification.md](specification.md) (the protocol) · [design.md](design.md) (the code)
 </div>
 
@@ -60,7 +60,8 @@ This section covers the basics to get you using rnfs.
 ## 1 - Install
 
 > [!WARNING]
-> If you do not already have an instance of the Reticulum installed & setup on your machine, you'll need to update your Reticulum config to connect to the public distributed backbone after running rnfs for the first time. Your Reticulum config can be found in `~/.reticulum` on linux. Refer to [reticulum.network/connect.html](https://reticulum.network/connect.html) for more info on this.
+> If you don't already have Reticulum running on your machine, you'll need to configure some interfaces to
+> connect to the backbone: see [Connecting to the network](https://reticulum.network/connect.html).
 
 Different package options available at [latest release](https://github.com/afit21/rnfs/releases/latest)
 
@@ -110,29 +111,25 @@ rnfs add holiday.jpg        # prints its CID: give that to anyone who should hav
 That's all you need for the basics. [Getting started](#getting-started) goes a step further (folders,
 links that can change, sharing in the background), and [Commands](#commands) lists everything.
 
-
 # Install
 
-rnfs runs on Linux, macOS and Windows. The easiest way to install it is a file from the
-[latest release](https://github.com/afit21/rnfs/releases/latest):
+rnfs runs on Linux, macOS and Windows. Every package includes Reticulum and LXMF and gives you one `rnfs`
+command. Your data in `~/.rnfs` is never touched by an update or uninstall.
 
-| System | Download | Install |
-|---|---|---|
-| Windows (64-bit) | [`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe) | [Windows](#windows) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.5_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb) or [`rnfs_0.1.5_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_arm64.deb) | [Debian and Ubuntu](#debian-and-ubuntu) |
-| Other Linux (x86_64) | [`rnfs-0.1.5-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak) | [Other Linux](#other-linux-flatpak) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.1.5-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl) | [macOS](#macos) |
+| System | Download |
+|---|---|
+| Windows (64-bit) | [`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe) ([how](#windows)) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.5_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb) or [`rnfs_0.1.5_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_arm64.deb) ([how](#debian-and-ubuntu)) |
+| Other Linux (x86_64) | [`rnfs-0.1.5-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.5-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl) ([how](#macos)) |
 
-Every package includes Reticulum and LXMF, gives you one `rnfs` command, and keeps your data in the same
-places. The release also has the source archive (`rnfs-0.1.5.tar.gz`) and `SHA256SUMS`, to
-[check your download](#checking-a-download). These links are for 0.1.5; for a newer version, take the
-same files from the [latest release](https://github.com/afit21/rnfs/releases/latest).
+These links are for 0.1.5; for a newer version, take the same files from the
+[latest release](https://github.com/afit21/rnfs/releases/latest), which also has the source archive
+(`rnfs-0.1.5.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
 
 ## Windows
 
-Download [`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe). It is a single file that
-includes Python, Reticulum and LXMF; nothing else needs installing. In PowerShell, from your download
-folder, put it on your PATH as `rnfs`:
+The exe is a single file with Python, Reticulum and LXMF inside. In PowerShell, from your download folder:
 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
@@ -144,296 +141,158 @@ Unblock-File "$bin\rnfs.exe"
 rnfs daemon
 ```
 
-- **SmartScreen:** the exe isn't code-signed, so Windows may warn you the first time. Choose
-  "More info", then "Run anyway".
-- **Update:** stop the daemon and replace `rnfs.exe` with the newer release's exe.
-- **Uninstall:** delete `rnfs.exe`. Your data in `%USERPROFILE%\.rnfs` stays.
-- **Start at logon:** the Task Scheduler script
-  [contrib/install-windows-task.ps1](contrib/install-windows-task.ps1) runs the daemon at logon. It
-  expects `rnfs.exe` in `%USERPROFILE%\.local\bin`, as above, and logs to
-  `%USERPROFILE%\.rnfs\daemon.log`. Add `-Uninstall` to remove the task:
-  ```powershell
-  powershell -ExecutionPolicy Bypass -File install-windows-task.ps1
-  ```
-
-Windows Firewall may ask about network access the first time Reticulum opens an interface. rnfs's own API
-and gateway listen only on 127.0.0.1. Windows has no execute bit, so a directory containing executable
-scripts gets a different CID when added on Windows than on Linux or macOS. Windows support is newer than
-Linux and macOS support, so please report problems.
+- The exe isn't code-signed: if SmartScreen warns you, choose "More info", then "Run anyway".
+- **Update:** stop the daemon and replace `rnfs.exe`. **Uninstall:** delete it.
+- **Start at logon:** download [contrib/install-windows-task.ps1](contrib/install-windows-task.ps1) and run
+  `powershell -ExecutionPolicy Bypass -File install-windows-task.ps1` (`-Uninstall` removes it). It logs to
+  `%USERPROFILE%\.rnfs\daemon.log`.
+- Windows has no execute bit, so a directory with executable scripts gets a different CID than on Linux or
+  macOS. Windows support is the newest, so please report problems.
 
 ## Debian and Ubuntu
 
-For Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) and other Debian-based systems with Python 3.11
-or newer. Ubuntu 22.04 ships Python 3.10, so it isn't supported; use the [install script](#install-script)
-there instead. Pick `amd64` or `arm64` to match `dpkg --print-architecture`:
+Pick `amd64` or `arm64` to match `dpkg --print-architecture`. Ubuntu 22.04 has Python 3.10, which is too old;
+use the [install script](#install-script) there.
 
 ```sh
 curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb
 sudo apt install ./rnfs_0.1.5_amd64.deb
-rnfs daemon                             # or run it in the background:
-systemctl --user enable --now rnfs      # a systemd user service; logs: journalctl --user -u rnfs -f
+systemctl --user enable --now rnfs      # run it as a service; logs: journalctl --user -u rnfs -f
+loginctl enable-linger $USER            # keep it running while you're logged out
 ```
 
-The package bundles Reticulum and LXMF (the tested versions, pinned in `packaging/requirements.lock`) in
-`/opt/rnfs`, and installs the `/usr/bin/rnfs` command and a systemd user unit. To keep the service running
-while you're logged out: `loginctl enable-linger $USER`.
-
-- **Update:** install the newer release's `.deb` the same way, then `systemctl --user restart rnfs`.
-- **Uninstall:** `systemctl --user disable --now rnfs`, then `sudo apt remove rnfs`. Your data in
-  `~/.rnfs` stays.
+- **Update:** install the newer `.deb` the same way, then `systemctl --user restart rnfs`.
+- **Uninstall:** `systemctl --user disable --now rnfs && sudo apt remove rnfs`.
 
 ## Other Linux (Flatpak)
-
-For x86_64 Linux distributions without `.deb` support. The Flatpak uses the Flathub
-`org.freedesktop.Platform` runtime:
 
 ```sh
 curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak install --user rnfs-0.1.5-x86_64.flatpak
-flatpak run io.github.afit21.rnfs daemon
-alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type just "rnfs"
-```
-
-The app has these permissions:
-
-- network access;
-- your home folder, for the files you add or get, plus `~/.rnfs` and `~/.reticulum`;
-- all devices, for RNode and other serial interfaces. If you don't use serial interfaces, remove this
-  with `flatpak override --user --nodevice=all io.github.afit21.rnfs`.
-
-To reach files outside your home folder, run
-`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`.
-
-- **Update:** install the newer release's `.flatpak` the same way.
-- **Uninstall:** `flatpak uninstall --user io.github.afit21.rnfs`.
-
-On other architectures (e.g. a 32-bit Raspberry Pi), use the [install script](#install-script).
-
-## macOS
-
-Install the wheel from the release with [pipx](https://pipx.pypa.io), which gives rnfs its own environment
-and puts the `rnfs` command on your PATH. Homebrew also installs a recent Python:
-
-```sh
-brew install pipx
-pipx ensurepath                 # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl     # includes Reticulum and LXMF
+alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc
 rnfs daemon
 ```
 
-The same command works on any system with Python 3.11+, including Linux and Windows.
+The app can use the network, your home folder and all devices (for RNode and other serial interfaces; remove
+that with `flatpak override --user --nodevice=all io.github.afit21.rnfs`). Other folders need
+`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`. Update by installing the newer
+`.flatpak`; uninstall with `flatpak uninstall --user io.github.afit21.rnfs`.
 
-- **Update:** `pipx install --force <the newer release's .whl URL>`.
-- **Uninstall:** `pipx uninstall rnfs`. Your data in `~/.rnfs` stays.
-- **Start at login:** install the launchd agent. It runs `~/.local/bin/rnfs daemon` and logs to
-  `~/.rnfs/daemon.log`:
+## macOS
+
+```sh
+brew install pipx && pipx ensurepath          # then open a new terminal
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl
+rnfs daemon
+```
+
+- **Update:** `pipx install --force <the newer .whl URL>`. **Uninstall:** `pipx uninstall rnfs`.
+- **Start at login:**
   ```sh
   curl -fsSL -o ~/Library/LaunchAgents/io.github.afit21.rnfs.plist \
     https://raw.githubusercontent.com/afit21/rnfs/main/contrib/io.github.afit21.rnfs.plist
   launchctl load -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist
   ```
-  To remove it: `launchctl unload -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist`.
+- pipx installs the newest Reticulum and LXMF rnfs allows, not the exact tested versions the other packages
+  bundle.
 
-pipx installs Reticulum and LXMF at the newest versions rnfs allows, not the exact tested versions the
-other packages bundle.
+## Install script
 
-## Checking a download
-
-Each release's `SHA256SUMS` lists the checksum of every file. Download it next to your file, then:
-
-```sh
-sha256sum -c SHA256SUMS --ignore-missing          # Linux
-shasum -a 256 rnfs-0.1.5-py3-none-any.whl         # macOS: compare with the line in SHA256SUMS
-```
-
-```powershell
-Get-FileHash .\rnfs-0.1.5-windows-x64.exe          # Windows: compare with the line in SHA256SUMS
-```
-
-A matching checksum shows the download is whole, not who made it: anyone able to replace a release's files
-could replace `SHA256SUMS` too. Every file also has signed build provenance, which shows it was built by this
-repository's release workflow. Check it with the [GitHub CLI](https://cli.github.com/) (2.49 or newer,
-logged in with `gh auth login`):
+For any Linux with Python 3.11+ and venv (`sudo apt install python3 python3-venv` on Debian/Ubuntu). It
+installs the latest release into `~/.local/share/rnfs/venv`, with the dependency versions and hashes pinned in
+the release, and checks the download against `SHA256SUMS` (and its signed provenance, if the GitHub CLI is
+installed and logged in; `RNFS_REQUIRE_ATTESTATION=1` makes that required).
 
 ```sh
-gh attestation verify rnfs_0.1.5_amd64.deb --repo afit21/rnfs
-```
-
-## Other ways to install
-
-The install script installs the latest release; pipx from GitHub and a source checkout install the latest
-code from the main branch, which may be newer than the latest release.
-
-### Install script
-
-Installs the latest release on any Linux distribution. You need Python 3.11 or newer with venv:
-
-- Debian/Ubuntu: `sudo apt install python3 python3-venv`
-- Fedora: `sudo dnf install python3`
-- Arch: `sudo pacman -S python`
-
-Git isn't needed.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
-```
-
-This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
-`~/.local/share/rnfs/venv`. It installs the release's source archive (`rnfs-X.Y.Z.tar.gz`) only if it matches
-the release's `SHA256SUMS` and, if the [GitHub CLI](https://cli.github.com/) (2.49 or newer) is installed and
-logged in, its signed build provenance (`gh attestation verify`). Without `gh` it warns that only the checksum
-was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it stop instead. Dependencies are installed at the
-versions pinned in the source's `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
-`~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --service    # also run the daemon as a systemd user service
-curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --update     # update to the latest release
-curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --main       # install the main branch instead
+curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh                   # install or update
+curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --service    # also run it as a systemd user service
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s -- --uninstall  # remove it (keeps ~/.rnfs)
 ```
 
-- **Update:** run the script again, with or without `--update`. It re-installs rnfs from the latest
-  release (or with `--main`, the main branch), with the dependency versions pinned there. If you installed
-  the service, it restarts.
-- **Main branch:** `--main` installs the latest code from the main branch, which may be newer than the
-  latest release. Give it again each time you update, or the next update goes back to the latest release.
-  The branch has no checksums or provenance to check.
-- **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
-  `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
-  `loginctl enable-linger $USER`.
-- **For all users:** run it as root with `--system`
-  (`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sudo sh -s -- --system`).
-  This installs to `/opt/rnfs` and `/usr/local/bin/rnfs`.
-- `--python /usr/bin/python3.12` chooses the Python to use.
-- `--force` replaces an existing `~/.local/bin/rnfs`, for example one installed by pipx.
-- `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the latest release (it
-  overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
-  installed unpinned (newest), with a warning.
+- Running it again updates rnfs and restarts the service if you installed it.
+- `--main` installs the main branch instead (no checksum to check; give it on every update).
+- `--system`, as root, installs for all users in `/opt/rnfs` and `/usr/local/bin/rnfs`.
+- `--python PATH` picks the Python; `--force` replaces another `rnfs` command (e.g. pipx's);
+  `RNFS_SOURCE=<dir, archive, .whl or URL>` installs something other than the latest release.
+- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out.
 
-### pipx from GitHub
+## Checking a download
+
+Each release's `SHA256SUMS` lists every file's checksum. With it next to your download:
 
 ```sh
-pipx install git+https://github.com/afit21/rnfs                                  # Linux, macOS
-pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip          # Windows (no git needed)
+sha256sum -c SHA256SUMS --ignore-missing                  # Linux; macOS: shasum -a 256 <file>
+gh attestation verify rnfs_0.1.5_amd64.deb --repo afit21/rnfs
 ```
 
-Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too.
+A matching checksum shows the file is whole, not who made it. The signed build provenance, checked with the
+[GitHub CLI](https://cli.github.com/) (2.49 or newer, logged in), shows it was built by this repository's
+release workflow. On Windows, `Get-FileHash .\rnfs-0.1.5-windows-x64.exe` gives the checksum.
 
-### From source
+## From source
 
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
-pip install -e .                    # the rnfs command, running your working copy, with Reticulum and LXMF
+pip install --require-hashes -r packaging/requirements.lock   # the tested Reticulum and LXMF (optional)
+pip install -e .
 rnfs daemon
+python3 -m unittest discover tests                             # the tests
 ```
 
-To get the tested, hash-checked versions of Reticulum and LXMF, run
-`pip install --require-hashes -r packaging/requirements.lock` first. Without `pip install -e .`, install them
-that way and use `python3 rnfs.py` (on Windows, `py rnfs.py`) wherever this README says `rnfs`.
-
-**Building the packages yourself.** `.github/workflows/release.yml` does this for releases. By hand:
-
-```sh
-python3 -m build                                   # wheel and sdist
-sh packaging/build-deb.sh --arch amd64             # or arm64; installs the lock's pinned, hash-checked wheels
-pip install --require-hashes -r packaging/requirements.lock && pip install --no-deps . pyinstaller==6.22.3
-pyinstaller --clean packaging/pyinstaller/rnfs.spec          # one-file binary for this OS (needs LXMF installed)
-python3 -I packaging/update-lock.py rns==X lxmf==Y ...       # bump the pinned dependencies, then:
-python3 -I packaging/flatpak/generate-sources.py             # refresh the Flatpak's wheels from the lock
-flatpak-builder --user --install --force-clean build-dir packaging/flatpak/io.github.afit21.rnfs.yml
-python3 packaging/smoke_test.py dist/rnfs
-```
-
-`packaging/requirements.lock` pins every runtime dependency (rns, lxmf, cryptography, cffi, pycparser,
-pyserial) with the sha256 of each file PyPI has for it. `update-lock.py` with no arguments picks the newest
-versions `pyproject.toml` allows; commit the lock and the regenerated Flatpak sources together.
+`pipx install git+https://github.com/afit21/rnfs` installs the main branch without a checkout. The release
+packages are built by `.github/workflows/release.yml`; the scripts it uses are in `packaging/`.
 
 ## Reticulum and where things live
 
-rnfs uses Reticulum's own config directory, the same one `rnsd` and other RNS programs use. That is the
-first of `/etc/reticulum`, `~/.config/reticulum` or `~/.reticulum` that exists; on Windows it is
-`%USERPROFILE%\.reticulum`. If `rnsd` is running, rnfs attaches to it as a shared instance. Otherwise rnfs
-starts Reticulum itself from that config. To use a different config, pass `rnfs daemon --rnsconfig DIR` or
-set `reticulum_dir`. Your network interfaces (LAN, TCP, RNode/LoRa…) are set up in Reticulum's `config`
-file. See the [Reticulum manual](https://reticulum.network/manual/interfaces.html).
+rnfs uses Reticulum's own config directory (`/etc/reticulum`, `~/.config/reticulum` or `~/.reticulum`;
+`%USERPROFILE%\.reticulum` on Windows), and attaches to `rnsd` if it is running. Your network interfaces
+(LAN, TCP, RNode/LoRa…) are set up in its `config` file: see the
+[Reticulum manual](https://reticulum.network/manual/interfaces.html). `daemon --rnsconfig DIR` uses another.
 
-Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`; on Windows `%USERPROFILE%\.rnfs`).
-Uninstalling never deletes it.
+Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`), which only you can read:
 
 | Path | Contents |
 |---|---|
-| `rnfs.toml` | your settings ([Settings](#settings)) |
-| `storage/identity` | the node's RNS identity; your node ID comes from it |
-| `storage/lxmf_identity` | a separate identity for your LXMF address |
+| `rnfs.toml` | your [settings](#settings) |
+| `storage/identity`, `storage/lxmf_identity` | the node's identity (your node ID comes from it) and your LXMF identity |
 | `blocks/` | stored blocks |
-| `state/rnfs.db` | pins, cache records, provider records, names' sequences, jobs, kept and followed names, contacts, LXMF inbox and outbox, your deny list and the deny lists in use (one SQLite database; an older version's JSON files there are imported at the first start and kept as `*.migrated`) |
-| `names/` | name keys (back them up: `rnfs name export`) |
-| `files/` | the shared folder: anything put here is added, pinned and shared automatically |
-| `api_token` | the running daemon's API token |
-| `daemon.lock` | locked by the daemon or `rnfs.Node` using the directory, so a second one on it stops at once |
-| `debug.log`, `debug.log.1` | with `debug_log` on: this run's debug log and the previous one's (readable by you only) |
+| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
+| `names/` | name keys: back them up with `rnfs name export` |
+| `files/` | the shared folder: anything put here is added, pinned and shared |
+| `api_token`, `daemon.lock` | the running daemon's API token and lock |
+| `debug.log` | with `debug_log` on, this run's debug log (`debug.log.1`: the previous run's) |
 
-The rnfs directory holds your keys and the API token, so rnfs keeps it private: readable by you only, and on
-Windows with an access list for you and SYSTEM only (also on another drive or under `C:\ProgramData`, where
-Windows would otherwise let every local user read it). On Windows a new rnfs directory gets that access list
-as it is created, and the daemon refuses an rnfs directory that is a junction or symlink (give its target as
-`--dir`) and a new one that something else has already put files in. A `--dir` outside your user profile
-still gets a warning on Windows, since accounts that can change its parent folder could replace it.
-
-`rnfs.toml` and `storage/identity` must be your own: rnfs refuses to use either if it belongs to another
-account, and makes them private to you (with a warning) if others could read them. The identity must be a
-regular file, not a symlink: the daemon refuses to start otherwise.
-
-The shared folder must not be writable by accounts you don't trust. rnfs skips links inside it and checks
-every directory and file it opens there, but on Windows, where directories are walked by path, someone who
-can write to it gets a race: swapping a directory for a junction while it is scanned. The checks are made to
-win that race, but don't rely on them: keep `files/` (and anything you link it to) changeable only by you.
-Files with more than one hard link are skipped too, with a line in the log, also inside shared directories:
-such a file is also a file somewhere else, which someone who can write to `files/` could have linked there.
-Copy a file into `files/` rather than hard linking it (or share it with `rnfs add`, which takes hard-linked
-files).
+Keep `files/` writable only by you. rnfs skips links and files with several hard links in it, so copy files in
+rather than linking them. rnfs refuses an identity or `rnfs.toml` owned by another account.
 
 # Sample files
 
-Some files & Folders that I host as examples for everyone to download. Fetch them with a running daemon that is
+Some files & folders that I host as examples for everyone to download. Fetch them with a running daemon that is
 connected to a network ([Getting started](#getting-started)):
 
-The Communist Manifesto - bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya (PDF, 715 KB)
+*The Communist Manifesto* - bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya (PDF, 715 KB)
 
-Original Doge Photo - bafkreigqte4wbglswc74766w445b67scla7kd2wvrqtp6t7a2ofw32znny
+*Original Doge Photo* - bafkreigqte4wbglswc74766w445b67scla7kd2wvrqtp6t7a2ofw32znny
 
-MeshChatv2.4.0 (folder) - bagaibqabciqaiphoe7qtscjuqprvwpr2ifr3hgnvuk5rgeh53mpk4ntapwutr3a
+*MeshChatv2.4.0 (folder)* - bagaibqabciqaiphoe7qtscjuqprvwpr2ifr3hgnvuk5rgeh53mpk4ntapwutr3a
 
-Nasa Apolo 11 'One Small Step' audio mp3 - bagaibqabciqbe75h7g7s4zqozhwrbxbica6krk5iggn7itaoh6t2fh7lnhqpjeq
+*Nasa Apolo 11 'One Small Step' audio mp3* - bagaibqabciqbe75h7g7s4zqozhwrbxbica6krk5iggn7itaoh6t2fh7lnhqpjeq
 
-Reticulum github zip taken on 11/10/2026 - bagaibqabciqd6s6yrwpp6eemv27sa7ud4l3r7rjcyu5oh4fgziopqa432htdxma
+*Reticulum github zip taken on 11/10/2026* - bagaibqabciqd6s6yrwpp6eemv27sa7ud4l3r7rjcyu5oh4fgziopqa432htdxma
 
-Apline Linux 3.24.2 ISOs (folder) - bagaibqabciqh5e4vsvwazopdfypoiflpfjvbfqionjko7cvxsmzmumsdoppzixy
+*Apline Linux 3.24.2 ISOs (folder)* - bagaibqabciqh5e4vsvwazopdfypoiflpfjvbfqionjko7cvxsmzmumsdoppzixy
 
-SCP-106 Original Image - bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a
+*SCP-106 Original Image* - bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a
 
-rockyou.txt.zip - bagaibqabciqp26agunewwmavivqgwv3c53xvnxdn7vpz4rdknjlfai72zszhdza
+*rockyou.txt.zip* - bagaibqabciqp26agunewwmavivqgwv3c53xvnxdn7vpz4rdknjlfai72zszhdza
 
-```sh
-rnfs get bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya -o ManifestoOftheCommunistParty.pdf
-```
-
-The OG SCP-106 Image - bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a (JPEG, 227 KB)
+Fetch one with `rnfs get <cid> -o <output file name>`, or open it in your browser through the local gateway
+(`?filename=` sets the type and the download name):
 
 ```sh
 rnfs get bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a -o scp-106.jpg
 ```
-
-rockyou.txt in a .zip file - bagaibqabciqp26agunewwmavivqgwv3c53xvnxdn7vpz4rdknjlfai72zszhdza (53 MB; too
-big for LoRa)
-
-```sh
-rnfs get bagaibqabciqp26agunewwmavivqgwv3c53xvnxdn7vpz4rdknjlfai72zszhdza -o rockyou.txt.zip
-```
-
-Or open one in your browser through the local gateway. `?filename=` sets the type and the download name:
 
 ```
 http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya?filename=ManifestoOftheCommunistParty.pdf
@@ -441,595 +300,262 @@ http://127.0.0.1:8789/rnfs/bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwp
 
 # Getting started
 
-### 1. Start the daemon
+### 1. Run the daemon and connect it
+
+`rnfs daemon` runs your node; leave it running (or install it as a service), since every other command
+talks to it. Your node needs Reticulum interfaces that reach other nodes:
+
+- **Local network:** Reticulum's default `AutoInterface` finds nodes on the same LAN or Wi-Fi with no setup.
+- **Internet:** add an interface to a public transport node to your Reticulum `config`; see
+  [reticulum.network/connect.html](https://reticulum.network/connect.html) for the public backbone.
+- **Radio:** add an `RNodeInterface` for LoRa ([Reticulum manual](https://reticulum.network/manual/interfaces.html)).
+
+Your node then joins the DHT through the project's built-in bootstrap nodes and the rnfs nodes it hears
+announcing. `rnfs status` shows your node ID and `known_nodes`; `rnfs peers` lists the nodes it knows. To also
+join through a node you choose, run `rnfs daemon --bootstrap <NODE_ID>` (or set `bootstrap_nodes`);
+`default_bootstrap = false` stops it contacting the built-in ones.
+
+### 2. Get files
 
 ```sh
-rnfs daemon
+rnfs get <cid> -o out.pdf               # a progress bar; Ctrl+C cancels, and a later get resumes
+rnfs get <cid>/docs/ --background       # leave it running in the daemon: rnfs jobs
+rnfs ls <cid>                           # list a directory; rnfs cat <cid> writes to stdout
+rnfs get <cid> --from <node ID>         # ask a node you know has it, without the DHT
 ```
 
-Leave it running, or install it as a service (see [Install](#install)). Every other command talks to it.
-`rnfs status` shows your node ID and how many other nodes your node knows (`known_nodes`).
+In a browser, `http://127.0.0.1:8789/rnfs/<cid>/` shows a directory's listing or its `index.html`, so a folder
+with a website in it works as a site.
 
-### 2. Connect to a network
-
-rnfs nodes find each other through Reticulum, so your node needs Reticulum interfaces that reach other
-rnfs nodes:
-
-- **Local network:** Reticulum's default config has an `AutoInterface`, which finds other Reticulum
-  nodes on the same LAN or Wi-Fi with no setup.
-- **Over the Internet:** add a `TCPClientInterface` to a Reticulum transport node in
-  `~/.reticulum/config`, then restart the daemon:
-
-  ```ini
-  [[rnfs entry point]]
-    type = TCPClientInterface
-    enabled = yes
-    target_host = <HOST>        # placeholder: the project's public entry point, once there is one
-    target_port = <PORT>
-  ```
-
-- **Radio:** add an `RNodeInterface` for LoRa. See the
-  [Reticulum manual](https://reticulum.network/manual/interfaces.html).
-
-Your node then learns about other rnfs nodes from their announces, and joins the DHT through the
-project's **bootstrap nodes**, which are built in. It contacts them at every start, and again whenever it
-knows fewer than 3 nodes, so it also gets in where no announces reach it (for example behind a LoRa access
-point), as long as Reticulum can reach them. To join through nodes you choose as well, such as a friend's
-(`rnfs status` shows its node ID), give them first:
+### 3. Share files
 
 ```sh
-rnfs daemon --bootstrap <NODE_ID>          # or bootstrap_nodes = ["<NODE_ID>"] in ~/.rnfs/rnfs.toml
-```
-
-`default_bootstrap = false` in `rnfs.toml` stops rnfs contacting the built-in nodes. Private mode never
-contacts them.
-
-`rnfs peers` lists the nodes yours knows, nearest first.
-
-### 3. Get a file
-
-```sh
-rnfs get bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a -o scp-106.jpg
-```
-
-A progress bar shows the rate and the time left. Over LoRa a large file can take hours. Press Ctrl+C to
-cancel, or add `--background` to leave it running in the daemon (`rnfs jobs` shows it). Interrupted
-transfers continue where they stopped. `rnfs cat <cid>` writes to stdout instead, and `rnfs ls <cid>` lists
-a directory.
-
-**In a browser:** open `http://127.0.0.1:8789/rnfs/<cid>`. Directories show a listing, or their
-`index.html`, so a folder with a website in it works as a site. Paths work too:
-`http://127.0.0.1:8789/rnfs/<cid>/docs/report.pdf`.
-
-If you know a node that has the file, `rnfs get <cid> --from <node ID>` asks it directly, without the DHT.
-
-### 4. Add and share a file
-
-```sh
-rnfs add report.pdf             # prints its CID
+rnfs add report.pdf             # prints its CID; give that to others
 rnfs add photos/                # a whole directory
 rnfs add report.pdf --wrap      # in a directory, so the link keeps its name: <cid>/report.pdf
 ```
 
-`add` stores the file in your node, **pins** it (keeps it) and announces to the DHT that you have it. Give
-the CID to others. They can get it while your node, or any other node that pinned it, is reachable. Files
-you drop into `~/.rnfs/files/` are added and shared automatically. `rnfs pin rm <cid>` stops sharing a file,
-and `rnfs gc` frees space used by downloads you didn't pin. By default your node also shares what you
-download (`get`, `cat`, even `stat` of a small file) while it's cached, so others can see what you fetched;
-set `provide_strategy = "pinned"` to share only what you pin.
+`add` stores and **pins** the file and tells the DHT you have it. Files dropped into `~/.rnfs/files/` are
+shared automatically. `rnfs pin rm <cid>` stops sharing, and `rnfs gc` frees space used by downloads you
+didn't pin. By default your node also shares what you download while it's cached, so others can see what you
+fetched; `provide_strategy = "pinned"` shares only what you pin.
 
-### 5. Names: a link that can change
+### 4. Names: a link that can change
 
-A CID always means the same content. A **name** is a fixed ID that you can point at new CIDs, like a
-website address:
+A CID always means the same content. A **name** is a fixed ID you can point at new CIDs:
 
 ```sh
 rnfs name create site                   # prints the name (32 hex characters)
-rnfs name publish site <cid>            # point it at a CID; again later for a new version
-rnfs name resolve <name>                # anyone: what does it point at now?
-rnfs contacts add site <name>           # a nickname, so you can type "site" instead of the hex
+rnfs name publish site <cid>            # again later for a new version
+rnfs contacts add site <name>           # a nickname, so others can type "site"
 rnfs get site/index.html                # whatever the name points at now
+rnfs name follow <name>                 # keep the latest version pinned
 ```
 
-In a browser: `http://127.0.0.1:8789/name/<name>/`. Others can `rnfs name follow <name>` to keep the latest
-version pinned. Back up your name key with `rnfs name export site -o site.key`, because only that key can
-update the name.
+In a browser: `http://127.0.0.1:8789/name/<name>/`. Back up the key with `rnfs name export site -o site.key`:
+only it can update the name.
 
 # How rnfs adapts IPFS
 
-rnfs follows IPFS where its design helps, uses Reticulum's own features in place of libp2p, and drops what
-only makes sense on IP networks. It is **not** compatible with IPFS. The full comparison is in
+rnfs follows IPFS where its design helps, uses Reticulum in place of libp2p, and drops what only makes sense on
+IP networks. It is **not** compatible with IPFS. The full comparison is in
 [specification.md, Appendix A](specification.md#appendix-a-comparison-with-ipfs).
 
 | IPFS | rnfs |
 |---|---|
-| CIDs | Same idea. A raw block or one rnfs DAG codec, SHA-256, base32 only. A file of up to 64 KiB is one raw block, with the same CID as that raw block in IPFS. |
-| UnixFS files and directories | 64 KiB chunks (optionally FastCDC) in balanced trees, and sorted directory indexes in place of HAMT sharding. The execute bit is kept; mtimes and symlinks are dropped. |
-| PeerID, multiaddrs, transports, NAT traversal | A node ID is a Reticulum destination hash. Reticulum routes by hash and encrypts every link. |
-| Kademlia DHT | Kademlia for provider records only, with 128-bit keys and `K` = 10. Server and client modes are kept. Peers are found through Reticulum announces, and Sybil resistance comes from seniority. |
-| Bitswap | `/blocks` requests over Reticulum Resources. Downloads are multi-source, resumable and verified. Providers are ranked by seniority, then hops and link speed. Responses are sized to the link's measured rate. |
-| IPNS | Names are Reticulum announces with a signed record. **Keepers** (any node, with `name keep`) store and re-serve a name's signed record, so it outlives its owner's announces. |
-| Pinning, remote pinning, GC | The same, with pin sources (user, folder, name, remote, follow, LXMF). `add --no-pin` adds a file as evictable cache. |
-| Reprovider strategies | `roots` (default: what you added or pinned, plus your complete downloads while cached, which anyone can then see) or `pinned` (only what you added or pinned). |
-| CAR files | rnfs archives: `export` / `import`. |
-| HTTP gateway | Local gateway with sandboxed pages, plus trustless `?format=raw` and `?format=archive`. |
-| MFS | `dir set` / `dir rm` make edited copies of a directory; use a name for the mutable root. |
-| Pubsub | Dropped: floods are unaffordable on radio. Use `name follow`, and send links over LXMF (`rnfs send`). |
-| Swarm keys (private networks) | Reticulum interface access codes, plus rnfs private mode (members only). |
-| DNSLink | Dropped: Reticulum has no DNS. |
+| CIDs | Same idea: a raw block or one rnfs DAG codec, SHA-256, base32. A file of up to 64 KiB has the same CID as in IPFS |
+| UnixFS | 64 KiB chunks (optionally FastCDC) in balanced trees, sorted directory indexes. The execute bit is kept; mtimes and symlinks aren't |
+| PeerID, transports, NAT traversal | A node ID is a Reticulum destination hash; Reticulum routes and encrypts |
+| Kademlia DHT | For provider records only, `K` = 10, server and client modes, Sybil resistance from seniority |
+| Bitswap | Multi-source, resumable, verified `/blocks` requests over Reticulum, sized to each link's measured rate |
+| IPNS | Signed records in Reticulum announces, re-served by **keepers** so a name outlives its owner's announces |
+| Pinning, remote pinning, GC | The same, with pin sources (user, folder, name, remote, follow, LXMF) |
+| CAR files, HTTP gateway | `export` / `import` archives; a local gateway with sandboxed pages and trustless `?format=raw` / `archive` |
+| MFS | `dir set` / `dir rm` make edited copies; a name is the mutable root |
+| Pubsub, DNSLink | Dropped (floods are unaffordable on radio; Reticulum has no DNS). Use `name follow` and LXMF links |
+| Private networks | Reticulum interface access codes, plus rnfs private mode (members only) |
 
 # Settings
 
-Settings go in `~/.rnfs/rnfs.toml` (or `<--dir>/rnfs.toml`). Times are in seconds, sizes in bytes and rates
-in bits/s. Command-line options override the file. An unknown setting is an error, and every setting is
-optional.
+Settings go in `~/.rnfs/rnfs.toml`; command-line options override them. Times are in seconds, sizes in bytes,
+rates in bits/s, and an unknown setting is an error. These are the ones you're most likely to change; every
+setting and its default is in [specification.md, section 12](specification.md#12-constants).
 
 ```toml
 # ~/.rnfs/rnfs.toml
-bootstrap_nodes = ["<node ID>"]
-dht_mode = "server"               # "client" on phones, laptops and battery nodes
+dht_mode = "client"               # on phones, laptops and battery nodes
 max_storage = 21474836480         # 20 GiB
-max_download_size = 1073741824    # refuse fetches over 1 GiB
+provide_strategy = "pinned"       # don't share your downloads
 upload_budget = 5_000_000         # upload at most ~5 MB per hour
 no_serve_interfaces = ["RNode"]   # don't upload over the LoRa radio
 quiet_hours = "22:00-06:00"
-lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
+lxmf_accept_from = ["<a friend's LXMF address>"]
 ```
 
-**Network and DHT**
-
-| Setting | Default | Description |
+| Setting | Default | What it does |
 |---|---|---|
-| `reticulum_dir` | RNS's own | Reticulum config directory (`daemon --rnsconfig`) |
-| `bootstrap_nodes` | `[]` | Node IDs to join the DHT through, contacted before the built-in ones (`daemon --bootstrap`) |
-| `default_bootstrap` | `true` | Also join through the project's built-in bootstrap nodes. Never used in private mode |
-| `dht_mode` | `"server"` | `"server"` stores DHT records for others; `"client"` only asks (for nodes often offline or short of bandwidth) |
-| `slow` | `"auto"` | `"yes"`, `"no"` or `"auto"`: a slow node uses one provider at a time and fewer parallel queries. `auto` is slow when every interface is under `slow_bitrate` |
-| `slow_bitrate` | `100000` | Links and interfaces below this (bits/s) count as slow |
-| `min_rate_sample` | `16384` | Smallest response used to measure a link's rate |
-| `unmeasured_bitrate` | `100` | Rate assumed for deadlines before a link is measured; lower it on very slow multi-hop LoRa |
-| `alpha` | 3; 1 on slow nodes | Parallel DHT queries per lookup |
-| `beta` | `3` | Closest nodes that must answer before a lookup is complete |
-| `announce_interval` | `21600` (6 h) | How often the node (and its names) announce; keep it ≥ 1 h |
-| `startup_announce_delay` | `30` | Second announce after startup |
-| `republish_interval` | 24 h; 3 days on slow nodes | How often provider records are republished; must be under 3.5 days |
-| `provide_strategy` | `"roots"` | `"roots"`: share pins and every complete download while it's cached (up to `max_storage`), whatever fetched it: `get`, `cat`, even a `stat` of a small file. The node is then listed as a provider and serves those blocks, so **anyone can learn what it downloaded**. `"pinned"`: share only pins, so downloads stay private |
-| `provider_seniority` | `86400` (1 day) | Providers and name keepers known this long are tried first; publishers seen this long get their full share of a full provider store |
-| `lookup_timeout` | `600` | Time budget of a DHT lookup |
-| `path_timeout` | `30` | Wait for a Reticulum path |
-| `max_failures` | `3` | Unanswered queries before a node is dropped; busy refusals before a provider is skipped |
-| `link_idle_timeout` | `300` | Close idle links after this |
-| `max_incoming_links` | `128` | Incoming links at once |
-| `max_records` | `100000` | Provider records stored for others |
-| `ban_time` | `3600` | How long a node that sent a bad block is ignored |
-| `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |
-| `debug_log` | `false` | Also write `<rnfs dir>/debug.log` for diagnosing problems (`daemon --debug-log`): it begins with the daemon's version, then has every rnfs message at every level whatever `verbosity` is (which nodes are asked, which fail and why, links that fail or close), Reticulum's own messages at Info and above that its loglevel shows (interfaces that can't connect or drop; not its debug detail), each gateway request with its outcome, errors with tracebacks, and a status line every 5 minutes. It names what you fetched and browsed, so it is readable by you only and never sent anywhere; each start keeps the previous run's as `debug.log.1`, and the two stay under 32 MiB |
-
-**Storage**
-
-| Setting | Default | Description |
-|---|---|---|
-| `max_storage` | `10737418240` (10 GiB) | Soft limit. Cached downloads are evicted (oldest use first) above it, and pins are never evicted. The disk keeps max(256 MiB, 2%) free in any case |
+| `dht_mode` | `"server"` | `"client"` only asks the DHT, for nodes often offline or short of bandwidth |
+| `bootstrap_nodes`, `default_bootstrap` | `[]`, `true` | Node IDs to join through first; whether to also use the built-in ones |
+| `slow` | `"auto"` | A slow node uses one provider at a time and fewer parallel queries; `auto` when every interface is under `slow_bitrate` (100 kbit/s) |
+| `announce_interval` | `21600` (6 h) | How often the node and its names announce; keep it ≥ 1 h |
+| `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
+| `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
-| `max_output_entries` | `100000` | Most directory entries a listing, `get` or export may write |
-| `scan_interval` | `60` | How often the shared folder `files/` is scanned |
-| `remote_pin_identities` | `[]` | Identity hashes allowed to ask this node to pin (`pin remote add`); a node's is the `identity_hash` in its `rnfs status`. Pins accepted and not yet fetched are resumed after a restart |
-| `remote_pin_quota` | `1073741824` (1 GiB) | Storage each of those identities may use |
-| `deny_lists` | `[]` | Deny lists to apply, each `"<cid>[/path]"` or `"name/<name>[/path]"` (follows the name): see "Keeping content off your node" |
+| `max_jobs` | 2; 1 on slow nodes | Transfers running at once |
+| `upload_budget` | none | Bytes per hour your node uploads in total |
+| `serve_interfaces`, `no_serve_interfaces` | all, none | Reticulum interfaces to upload on, or never upload on (names or prefixes) |
+| `quiet_hours` | off | Local times with no uploads, e.g. `"22:00-06:00"` |
+| `remote_pin_identities`, `remote_pin_quota` | `[]`, 1 GiB | Identities allowed to ask this node to pin (`pin remote add`), and the storage each may use |
+| `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
+| `keep_max_names` | `100` | Names you keep or follow for others |
+| `lxmf_accept_from` | everyone | Only keep LXMF messages from these addresses (recommended if you only expect links from people you know) |
+| `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota` | `[]`, 1 GiB | Senders whose links are fetched and pinned automatically, and the storage each may use |
+| `lxmf_propagation_node` | none | Propagation node for offline delivery (`send --propagate`) and periodic downloads |
+| `lxmf_send_from_hint` | `true` | Links you send carry your node ID, so recipients can fetch from you; this links your LXMF address to your node |
+| `api_port`, `gateway_port` | `8788`, `8789` | Local API and gateway ports (127.0.0.1 only) |
+| `gateway_scripts` | `true` | Let gateway pages run scripts |
+| `debug_log` | `false` | Write `~/.rnfs/debug.log` (readable by you only) for diagnosing problems (`daemon --debug-log`) |
+| `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |
 
-**Transfers**
+<a id="privacy"></a>**Private mode.** `private = true` with a `members` list (identity hashes, from each
+node's `rnfs status`) makes the node link to, serve and keep records for members only.
 
-| Setting | Default | Description |
-|---|---|---|
-| `max_parallel_providers` | 3; 1 on slow nodes | Providers downloaded from at once |
-| `response_target` | `60` | Transfer time each block response aims for |
-| `deadline_slack` | `30` | Added to response deadlines |
-| `stall_timeout` | `120` | A response with no progress for this long is abandoned |
-| `blocks_cooldown` | `300` | A link whose response made no progress is refused `/blocks` this long |
-| `max_blocks_responses` | `4` | Uploads in progress at once on slow links: half of this (≥ 2) |
-| `fast_blocks_responses` | `16` | Uploads in progress at once on other links (≥ 1; at least the other half of `max_blocks_responses`). Each holds up to ~2.5 MiB of memory while in flight |
-| `max_upload_rate` | none; half the measured rate on slow links | Upload cap per link (bits/s) |
-| `max_jobs` | 2; 1 on slow nodes | Transfers (`get`, `pin add`, `export`) running at once; set 1 on a slow radio |
-| `max_finished_jobs` | `100` | Finished jobs remembered by `rnfs jobs` (at least 1). A finished job is kept for at least 60 s whatever this says, so a command waiting for it always sees the result |
-
-**Mesh and airtime.** These limit only uploads of content. Lookups, announces and publishing keep working.
-
-| Setting | Default | Description |
-|---|---|---|
-| `upload_budget` | none | Bytes per hour your node uploads, in total. One requester may hold at most half of it in responses still being sent, and what a failed or cancelled response didn't send is given back |
-| `serve_interfaces` | `[]` (all) | Upload only on these Reticulum interfaces (names or prefixes, any case) |
-| `no_serve_interfaces` | `[]` | Never upload on these interfaces; wins over `serve_interfaces` |
-| `quiet_hours` | `""` (off) | Local times with no uploads, e.g. `"22:00-06:00"` or `"01:00-05:00,12:00-13:00"` |
-
-**Names**
-
-| Setting | Default | Description |
-|---|---|---|
-| `name_table_size` | `10000` | Records remembered for names you haven't resolved yourself |
-| `keep_max_names` | `100` | Names kept or followed for others (your own don't count). Each is a DHT key your node republishes (every 3 days or more) and, if followed, a pin |
-| `keeper_query` | `"fallback"` | Ask keepers only when the network had no answer (`"fallback"`), or on every resolve (`"always"`). `always` costs about 10 times the airtime per resolve: keep `fallback` on slow links |
-
-**Content.** No settings: chunking, sealing and `--no-pin` are chosen per `rnfs add`.
-
-**LXMF** (the `lxmf` package is installed with rnfs)
-
-| Setting | Default | Description |
-|---|---|---|
-| `lxmf_enabled` | on if LXMF is installed | `false` turns LXMF off (`true` or `false` only) |
-| `lxmf_display_name` | `"rnfs node"` | Name shown to LXMF contacts (1–64 printable characters). The default says nothing about your node ID |
-| `lxmf_send_from_hint` | `true` | Links you send carry `from=<your node ID>`, so recipients can fetch straight from your node when the DHT doesn't know it. This tells everyone who reads the message which rnfs node your LXMF address belongs to; `false` leaves it out |
-| `lxmf_propagation_node` | none | Propagation node (32 hex) for `send --propagate`, for resending direct messages that failed, and for the periodic downloads. Without it none of these happen automatically; a propagation node only heard announcing itself is used only with `--nearest` |
-| `lxmf_sync_interval` | `3600` | How often waiting messages are downloaded from `lxmf_propagation_node`; 0 never |
-| `lxmf_accept_from` | `[]` (everyone) | Only keep messages from these LXMF addresses (recommended: see below) |
-| `lxmf_auto_fetch_from` | `[]` | Senders whose links are fetched and pinned automatically |
-| `lxmf_auto_fetch_quota` | `1073741824` (1 GiB) | Storage each auto-fetch sender may use |
-
-The inbox keeps at most 500 messages (4 MiB in all), and at most 50 from any one sender not in
-`lxmf_auto_fetch_from`. Messages holding auto-fetched pins aren't pushed out by other people's messages.
-
-Senders you've named (in `lxmf_accept_from`, in `lxmf_auto_fetch_from`, or as an LXMF contact with
-`rnfs contacts add NICK ADDRESS --kind lxmf`) are trusted. Anyone can make new LXMF addresses for free, so
-messages from everyone else can only push out each other's, and at most 32 new ones are kept in a burst,
-then one a minute, and at most 4 from any one of them at once, then one per 15 minutes (so one sender can't use
-up the rest's); while a flood from many addresses lasts, a stranger's message may not be kept. If you only expect links from
-people you know, set `lxmf_accept_from` to their addresses: messages from anyone else are then ignored, and
-nobody can crowd them out.
-
-**Gateway and API**
-
-| Setting | Default | Description |
-|---|---|---|
-| `api_port` | `8788` | Local API port (127.0.0.1). Also `--api-port` on every command |
-| `gateway_port` | `8789` | Gateway port (127.0.0.1) (`daemon --gateway-port`) |
-| `gateway_scripts` | `true` | Let gateway pages run scripts (`daemon --no-gateway-scripts` turns it off) |
-| `gateway_fetches` | `2` | Network fetches at once for requests that web pages make (not your own navigation) |
-
-<a id="privacy"></a>**Privacy**
-
-| Setting | Default | Description |
-|---|---|---|
-| `private` | `false` | Private mode: every link identifies, links go only to `members`, only they are served, and only their provider records are kept and handed out (`daemon --private`) |
-| `members` | `[]` | Identity hashes of the members. `rnfs status` shows a node's `identity_hash` (so does `rnid -i ~/.rnfs/storage/identity`) |
+LXMF senders you've named (in `lxmf_accept_from`, `lxmf_auto_fetch_from`, or as an LXMF contact) are trusted.
+Anyone can make new LXMF addresses for free, so messages from everyone else only push out each other's, within
+fixed limits; set `lxmf_accept_from` if strangers' messages aren't wanted.
 
 # Commands
 
-Every command except `daemon` talks to the running daemon through its local API. Two global options work
-before the command or at the end of it (after the subcommand, for groups such as `name list` or
-`contacts ls`):
-
-- `--dir DIR` uses another rnfs directory (default `~/.rnfs`);
-- `--api-port N` talks to the daemon on another API port.
-
-`rnfs --version` prints the version. Run commands as the daemon's user: the CLI reads the daemon's secret
-token from `<rnfs dir>/api_token`.
-
-A **target** is `<cid>[/path]`, or `<contact>/path` for a name contact (`alice/docs/report.pdf`). Where a
-node ID is expected, a node contact's nick works too.
-
-**Daemon and status**
+Every command except `daemon` talks to the running daemon, so run them as the daemon's user. `--dir DIR` and
+`--api-port N` pick another daemon; `rnfs <command> --help` shows every option. A **target** is
+`<cid>[/path]` or `<contact>/path`; where a node ID is expected, a node contact's nick works too.
 
 | Command | Description |
 |---|---|
-| `rnfs daemon [--bootstrap NODE_ID…] [--rnsconfig DIR] [--gateway-port N] [--dht-mode server\|client] [--slow yes\|no\|auto] [--private] [--provide-strategy pinned\|roots] [--no-gateway-scripts] [--debug-log] [-v\|-vv]` | Run a node with its API and gateway |
-| `rnfs status` | Node ID, identity hash (what others list in `members` and `remote_pin_identities`), known nodes, records, storage, traffic, jobs, deny-list entries and lists, LXMF address. Without a readable API token (another user's health check) only the daemon's version |
-| `rnfs peers [--json]` | Known nodes: DHT mode, seniority, hops, interface, link rate, last heard, traffic, bans |
-| `rnfs stats [--json]` | Traffic since start: totals, uploads refused by your limits, per interface |
-| `rnfs ping NODE_ID` | Round-trip time to a node |
-| `rnfs providers CID` | Find nodes providing a CID |
+| `rnfs daemon` | Run a node with its API and gateway (`--bootstrap`, `--rnsconfig`, `--private`, `--debug-log`, `-v`…) |
+| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address / known nodes / traffic |
+| `rnfs ping NODE_ID` / `providers CID` | Round-trip time to a node / nodes providing a CID |
+| `rnfs add PATH\|-` | Add a file, directory or stdin, pin it and print its CID (options below) |
+| `rnfs get TARGET [-o OUT] [--from NODE_ID] [--background]` | Fetch and write out a file or directory |
+| `rnfs cat TARGET [--offset N] [--length N]` | Write a file, or part of one, to stdout |
+| `rnfs ls TARGET` / `stat TARGET` | List a directory / size and how much is stored locally |
+| `rnfs dir set TARGET NAME CID` / `dir rm TARGET/NAME` | Make a copy of a directory with an entry added, replaced or removed |
+| `rnfs export TARGET -o FILE` / `import FILE` | Write or import an archive (USB sticks, sneakernet) |
+| `rnfs pin add TARGET` / `pin rm CID` / `pin ls` | Fetch and pin / unpin / list pins, their sources and where they came from |
+| `rnfs pin remote add\|rm NODE_ID CID` | Ask another node to pin or unpin (it must list you in `remote_pin_identities`) |
+| `rnfs gc` / `verify` | Evict cached downloads / re-check every stored block |
+| `rnfs deny add\|rm ENTRY…` / `deny ls` | Edit your deny list / show it and the lists in use |
+| `rnfs jobs [list\|show\|wait\|cancel\|clear] [ID]` | Background transfers: progress, rate, time left |
+| `rnfs name create\|list\|publish\|resolve\|rm` | Your names and what they point at |
+| `rnfs name export\|import ALIAS` | Back up or restore a name's private key |
+| `rnfs name keep\|unkeep\|kept NAME` | Store and serve someone's name record, so it resolves while they're offline |
+| `rnfs name follow\|unfollow\|following NAME` | Keep the latest version a name points at pinned |
+| `rnfs contacts add NICK HEX` / `rm` / `ls` | Nicknames for names, node IDs and LXMF addresses |
+| `rnfs lxmf address` / `lxmf sync` | Your LXMF address / download waiting messages now |
+| `rnfs send ADDRESS TARGET [-m TEXT] [--propagate]` | Send an `rnfs:` link over LXMF |
+| `rnfs inbox` / `inbox get N` / `inbox rm N` / `outbox` | Received links, fetching them, sent messages |
 
-**Adding and getting content**
+`add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
+`--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
+`--to RECIPIENT…` (after the path) seals a file so only those node IDs, LXMF addresses or contacts can read it,
+and `--to-self` adds you.
 
-| Command | Description |
-|---|---|
-| `rnfs add PATH\|- [--wrap] [--only-hash] [--name NAME] [--no-pin] [--to RECIPIENT…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc]` | Add a file, directory or stdin (`-`), pin it and print its CID |
-| `rnfs get TARGET [-o OUT] [--from NODE_ID] [--background] [--raw]` | Fetch and write out a file or directory (default name: below) |
-| `rnfs cat TARGET [--offset N] [--length N] [--raw] [--block]` | Write a file, or part of one, to stdout (fetching only what's needed) |
-| `rnfs ls TARGET` | List a directory: kind, size, CID, name |
-| `rnfs stat TARGET` | Size, block count and how much is stored locally |
-| `rnfs dir set TARGET NAME CID [--exec]` | Make a new directory with an entry added or replaced; prints its CID |
-| `rnfs dir rm TARGET/NAME` | Make a new directory with an entry removed |
-| `rnfs export TARGET -o FILE [--background]` | Write an archive (for USB sticks, sneakernet) |
-| `rnfs import FILE` | Import an archive, pinning its complete roots |
+`get` without `-o` uses the target's name only if it is a safe file name (printable, not starting with `.`),
+otherwise its CID, and writes under a temporary name until the transfer is complete. It decrypts sealed files
+you can open; `--raw` gives the stored bytes, which is what scripts that show content to others should use.
 
-`add` options:
-
-- `--wrap` puts the file in a directory, so links keep its name.
-- `--only-hash` prints the CID without storing anything.
-- `--name` names stdin, wrapping it in a directory.
-- `--no-pin` keeps the file as cache that can be evicted.
-- `--to` seals the file so only those recipients can read it. A recipient is a node ID, an LXMF address or
-  identity hash that RNS has heard, a 128-hex public key, or a contact. Put `--to` after the path, since it
-  takes several values. Sealing works on single files: put a directory in a tar file first.
-- `--to-self` also seals the file for you.
-- `--no-sealed-name` leaves the file name out of the sealed file.
-- `--chunker fastcdc` uses content-defined chunks, so a later edited version shares most blocks.
-
-`get` without `-o` writes into the current directory under the target's last path name, but only if that
-name is printable, doesn't start with `.` and is a valid file name here; otherwise under its root CID. So a
-link to `.bash_login`, or a name with terminal escapes, is written as `./<cid>`. A sealed file you can open
-is written under its sealed name by the same rule. `get` writes under a hidden temporary name beside the
-output (`.rnfs-get-….partial`, or `.rnfs-job-<id>.partial` for a job) and renames it when complete, so an
-interrupted transfer never leaves a half-written file under the real name. Names from other nodes are
-printed and logged with control characters escaped.
-
-`get`/`cat --raw` give a sealed file's stored (encrypted) bytes. `cat --block` gives a CID's own block.
-`cat` and `get` decrypt sealed files this node can open, so scripts and pages that show content to other
-people must use `cat --raw` (and refuse what starts with `rnfs-sealed`), or skip pins that `pin ls --json`
-marks `"sealed": true`. Under the default `provide_strategy`, anything such a script reads completely is
-also shared from your node (see `provide_strategy`).
-
-**Pins and storage**
-
-| Command | Description |
-|---|---|
-| `rnfs pin add TARGET [--background]` | Fetch completely and pin (share) |
-| `rnfs pin rm CID` | Remove your pin |
-| `rnfs pin ls [CID] [--json]` | Pins, their sources (`user`, `folder`, `name:…`, `remote:…`, `follow:…`, `lxmf:…`, `deny`), whether each is a sealed file (`(sealed)`; `"sealed": true`, `false`, or `null` if not stored enough to tell) and where each came from: the local path you added it from (`~/notes.txt`, `(stdin)`, `archive …`, the target given to `pin add`), the shared-folder file name, or for a directory its single entry's name or entry count. These names are kept only on your machine, sealed files' too (their sealed name is what others can't read): anything that publishes a pin list must leave sealed entries out; pins made before this was added show none for plain files |
-| `rnfs pin remote add NODE_ID CID` / `rnfs pin remote rm NODE_ID CID` | Ask another node to pin or unpin (it must list your identity in `remote_pin_identities`) |
-| `rnfs gc` | Evict every cached download |
-| `rnfs verify` | Re-check every stored block against its CID |
-| `rnfs deny add ENTRY…` / `rnfs deny rm ENTRY…` | Add CIDs or file hashes (`sha256:<hex>`) to your local deny list, or remove them |
-| `rnfs deny ls` | Your local deny list, then each `deny_lists` list: the version in use, its entry count and state |
-
-**Background jobs**
-
-| Command | Description |
-|---|---|
-| `rnfs jobs` / `rnfs jobs list` | Every transfer: ID, state, progress, rate, time left |
-| `rnfs jobs show ID` | Everything about one job |
-| `rnfs jobs wait ID` | Wait for a job with a progress bar; fails if the job fails. A get's result keeps the first 100 warnings and their total |
-| `rnfs jobs cancel ID` | Cancel a queued or running job |
-| `rnfs jobs clear [ID]` | Forget finished jobs (or one) |
-
-```
-$ rnfs get bafy…/maps.tar -o maps.tar --background
-3fa2b1c9
-$ rnfs jobs
-3fa2b1c9  running   get    [######--------------]  31%  310 KB of 1.00 MB  280 B/s  ETA 41m04s  bafy…/maps.tar -> /home/me/maps.tar
-$ rnfs jobs wait 3fa2b1c9
-```
-
-**Names**
-
-| Command | Description |
-|---|---|
-| `rnfs name create ALIAS` | Create a name key; prints the name |
-| `rnfs name list` | Your names, with what they point at |
-| `rnfs name publish ALIAS TARGET` | Point a name at a CID (pins it) |
-| `rnfs name resolve NAME` | What a name points at |
-| `rnfs name rm ALIAS` | Delete a name key and release its pin |
-| `rnfs name export ALIAS [-o FILE]` | Write a name's private key (to a file with mode 0600, or a redirect) |
-| `rnfs name import ALIAS [FILE]` | Import a name key from a file or stdin |
-| `rnfs name keep NAME` / `rnfs name unkeep NAME` | Store and serve someone's name record, so it still resolves while they're offline |
-| `rnfs name kept` | Kept names: sequence, CID, why kept |
-| `rnfs name follow NAME` / `rnfs name unfollow NAME` | Keep the latest version a name points at pinned, fetched in the background |
-| `rnfs name following` | Followed names: pinned CID, latest CID, state |
-
-A `NAME` is 32 hex characters or a name contact's nick. A followed name is checked every
-`announce_interval`; a failed check is retried after 5 minutes, then 10, 20 and so on up to
-`announce_interval`.
-
-**Contacts**
-
-| Command | Description |
-|---|---|
-| `rnfs contacts add NICK HEX [--kind name\|node\|lxmf]` | Nickname a name, node ID or LXMF address (kind detected if omitted) |
-| `rnfs contacts rm NICK` | Delete a contact |
-| `rnfs contacts ls` | List contacts |
-
-Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
-
-**LXMF messaging**
-
-| Command | Description |
-|---|---|
-| `rnfs lxmf address` | Your LXMF address, to give to friends |
-| `rnfs send ADDRESS\|CONTACT TARGET [-m TEXT] [--propagate] [--nearest]` | Send an `rnfs:` link (and text). The target may also be `name/<name>[/path]` or an `rnfs:` URI. `--propagate` sends through `lxmf_propagation_node` for offline recipients. `--nearest`, without `lxmf_propagation_node`, uses the nearest propagation node heard (for `--propagate`, or if direct delivery fails) |
-| `rnfs inbox` | Received messages with rnfs links |
-| `rnfs inbox get N [--link K] [-o OUT]` | Fetch what message N links to (only its K-th link with `--link`; `-o` for one link only), asking the sender's node first, then the DHT. Default names follow the `get` rule above |
-| `rnfs inbox rm N` / `rnfs inbox rm --all` | Remove messages, releasing what they auto-fetched |
-| `rnfs outbox` | Sent messages and their delivery state |
-| `rnfs lxmf sync [--nearest]` | Download waiting messages from `lxmf_propagation_node` now (`--nearest`: from the nearest one heard, if none is set) |
-
-**Gateway** (`http://127.0.0.1:8789`, browser only, not a command):
-
-- `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and directories (with `index.html` or a
-  listing), with byte ranges.
-- `?filename=` sets the type and the download name.
-- `/rnfs/<cid>?format=raw` returns the block, and `/rnfs/<cid>[/path]?format=archive` returns an archive
-  you can `rnfs import`. You can check both against the CID without trusting the gateway. A web page's
-  request or a `HEAD` never gets either (409), so pages can't tell what your node stores; opening the URL
-  yourself fetches what isn't stored first.
-- Pages are sandboxed: they can show files of their own content (images, scripts, style sheets), but no page
-  can read gateway responses with `fetch()`. Sealed files are never decrypted by the gateway.
+**Gateway** (`http://127.0.0.1:8789`): `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and
+directories; `?filename=` sets the type and download name; `?format=raw` and `?format=archive` return data you
+can check against the CID. Pages are sandboxed and can't read the gateway's responses, and sealed files are
+never decrypted there.
 
 # Building apps on rnfs
 
-Programs use rnfs from Python the way they use RNS. There are two classes with the same methods, objects and
-errors, so an app switches between them by changing one line:
+Python programs use rnfs the way they use RNS, through one of two classes with the same methods, objects and
+errors:
 
-- **`rnfs.Node`** runs an rnfs node inside your program, beside the program's own Reticulum, in a directory of
-  its own. Use it when your app should have its own node: its own storage, identity and place in the DHT.
-- **`rnfs.Client`** uses the user's running daemon (`rnfs daemon`) through its local API. Use it when your app
-  should share the user's node: the content they already have, their pins and names. It never loads Reticulum,
+- **`rnfs.Node`** runs a node inside your program, beside its own Reticulum, with its own storage and identity.
+- **`rnfs.Client`** uses the user's running daemon (their content, pins and names). It never loads Reticulum,
   so it starts fast.
 
-Nothing picks one for you: construct the one you want. **The API is provisional until rnfs 0.2**
-(`rnfs.API_STATUS`): names may still change once it has been tried in real apps.
+**The API is provisional until rnfs 0.2** (`rnfs.API_STATUS`).
 
 ```python
 import RNS, rnfs
 
 RNS.Reticulum()                                   # your program's Reticulum, as with any RNS app
-with rnfs.Node("~/.myapp/rnfs") as node:          # an rnfs node inside it; or: rnfs.Client()
+with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the daemon (no RNS.Reticulum())
     added = node.add("photos/")                   # rnfs.Added: .cid, .size, .warnings
     for entry in node.ls(added.cid):              # rnfs.Entry(name, kind, size, cid)
         print(entry.name, entry.size)
     with node.open(f"{added.cid}/cat.jpg") as f:  # seekable: each read fetches only the chunks it covers
-        f.seek(1_000_000)
         data = f.read(4096)
-    site = node.names.create("site")              # rnfs.Name
+    site = node.names.create("site")
     site.publish(added.cid)
     node.names.watch(site, lambda record: print("now", record.cid))
-    job = node.jobs.get(f"rnfs:name/{site.hex}", "/tmp/copy",
-                        on_progress=lambda job: print(job.done_bytes, "of", job.total_bytes))
-    job.wait()
+    node.jobs.get(f"rnfs:name/{site.hex}", "/tmp/copy").wait()
 ```
 
-With the daemon instead, only the `with` line changes (and `RNS.Reticulum()` isn't needed):
-
-```python
-with rnfs.Client() as node:                       # the daemon using ~/.rnfs/; rnfs.Client("/srv/rnfs") for another
-    print(node.status().node_id.hex())
-    try:
-        print(node.names.resolve("ab" * 16).cid)
-    except rnfs.NotFound:                         # the same errors from either class
-        print("not resolved")
-```
-
-- Targets are a `rnfs.Cid`, `<cid>/path`, or an `rnfs:` link (`rnfs:name/<name>/path` is resolved first).
-- Methods: `add` (a path, bytes or a binary file), `get`, `open`, `cat`, `ls`, `info`, `stat`, `pin`, `unpin`,
-  `pins`, `export`, `import_archive`; `names.create`/`list`/`resolve`/`watch`, `Name.publish`;
-  `jobs.get`/`pin`/`export` with `on_progress`, `Job.wait`/`cancel`; `deny.add`/`remove`/`list`; and the rest of
-  the CLI's operations (design.md, "Public API").
-- Callbacks run on one event thread of the instance, with no rnfs lock held. Keep them short: a slow one delays
-  the others.
-- An embedded node runs as a DHT client with LXMF off unless you say otherwise:
-  `rnfs.Node(dir, settings={"dht_mode": "server", "lxmf_enabled": True})`. It never stops your Reticulum, and
-  your program's own RNS links work as with RNS alone. A directory is used by one node at a time: never point a
-  `Node` at the daemon's `~/.rnfs/`.
-- A `Client` must run as the daemon's user (only it can read the API token).
-
-`examples/rnfs_share.py` (in the source tree and the source archive) is a runnable example using either class (`--node DIR` or `--daemon`). design.md's
-"Public API" section is the reference. Other languages use the local API's JSON endpoints directly (`rnfs/api.py`
-lists them).
+- An embedded node is a DHT client with LXMF off unless you pass `settings={"dht_mode": "server", ...}`. It
+  never stops your Reticulum. Never point it at the daemon's `~/.rnfs/`: a directory is used by one node at a
+  time.
+- Callbacks run on one event thread; keep them short.
+- `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the
+  reference. Other languages can use the local API's JSON endpoints (listed in `rnfs/api.py`).
 
 # Keeping content off your node
 
-If you run a public gateway or a provider node, a deny list keeps chosen content off it. Entries are CIDs and
-file hashes (`sha256:` and the 64 hex digits of a file's SHA-256, as `sha256sum` prints it):
+A deny list keeps chosen content off a public gateway or provider node. Entries are CIDs or file hashes
+(`sha256:<hex>`, as `sha256sum` prints it):
 
 ```sh
 rnfs deny add bafkreidhtnhwyqkmbhxvp2mrery66f4kpdsfbxew3qrfqrbtwbs6zb5zce
 rnfs deny add sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
-rnfs deny ls
 ```
 
-To use a list someone maintains, put its CID in `deny_lists` in `rnfs.toml`, or `name/<name>` to follow the
-updates of a list published under a name. A list is a text file with one entry per line; `#` starts a comment.
+To use a list someone maintains (a text file, one entry per line, `#` for comments), add its CID, or
+`name/<name>/path` to follow its updates, to `deny_lists` in `rnfs.toml`.
 
-```toml
-deny_lists = ["name/3f2a9c7e1b4d5a6f8e0c1d2b3a4f5e6d/denylist.txt"]
-```
-
-A denied CID is never fetched, read, stored or served by your node, whether it is the content asked for or
-anywhere inside it, and nothing holding it is provided (records already published are withdrawn). `get`,
-`cat`, the gateway (status 451), `pin add`, remote pins, followed names and LXMF auto-fetch all refuse it. When
-an entry is added, cached downloads holding it are deleted and pins made for other nodes (`pin remote`) are
-released; your own pins are kept, but not served or read, and the log names each one so you can remove it
-(`rnfs pin rm`, or what made the pin: the shared-folder file, `name publish`, `name unfollow`, `inbox rm`).
-
-A file hash is only known once the file has been downloaded, so it stops `get`, `cat` and the gateway from
-handing the file out (they check before writing or sending anything, which makes them fetch the whole file
-first) and `add`, the shared folder or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served.
-Deny the CID to stop that. Lists larger than 4 MiB, with over 100 000 entries, not UTF-8 text, with a line that
-isn't an entry, or that are a directory are refused, and the previous version stays in use.
+A denied CID is never fetched, stored or served, whether asked for directly or found inside other content
+(the gateway answers 451). Cached copies are deleted and remote pins released; your own pins are kept but not
+served, and the log names them so you can remove them. A file hash is only known once a file is downloaded,
+so it stops the file being handed out or added, not its blocks being fetched: deny the CID for that.
 
 # Example use cases
 
-**Community library over LoRa.** A few well-placed nodes run as DHT servers. The librarian keeps a
-directory of documents and maps behind a name and updates it with `dir set` / `name publish`. Each library
-node follows the name, so it always holds and shares the latest edition:
+**Community library over LoRa.** A librarian publishes a directory of documents under a name and updates it
+with `dir set` and `name publish`. Library nodes `rnfs name follow` it, so each always holds the latest
+edition, and readers `rnfs get library/maps/region.pdf`.
 
-```sh
-rnfs contacts add library <name>
-rnfs name follow library
-rnfs ls library                        # what's in it
-rnfs get library/maps/region.pdf
-```
+**Sharing with a friend over LXMF.** `rnfs send <their LXMF address> <cid>/report.pdf -m "as promised"`.
+Sideband, NomadNet and MeshChat show the link as text; their rnfs node lists it in `rnfs inbox` and fetches it
+with `rnfs inbox get 1`, asking your node first. Add friends to `lxmf_auto_fetch_from` to fetch their links
+automatically.
 
-**Sharing with a friend via LXMF.** Send a link to your friend's Sideband, NomadNet or MeshChat address.
-Any client shows it as text, and an rnfs node recognises it:
+<a id="private-group"></a>**Private group.** `rnfs add minutes.pdf --to <alice's node ID> bob --to-self` seals
+a file so only those people can read it, while any node can carry it. For a fully closed group, run every
+node with `private = true` and the same `members`.
 
-```sh
-rnfs send <their LXMF address> <cid>/report.pdf -m "the report, as promised"
-rnfs inbox                              # on their side
-rnfs inbox get 1                        # writes ./report.pdf, asking your node first
-```
+**Offline sneakernet.** `rnfs export <cid> -o bundle.rnfs` on a connected node, `rnfs import bundle.rnfs` on
+the offline one: it's verified and pinned.
 
-To have a friend's links fetched and pinned automatically, add their address to `lxmf_auto_fetch_from`
-(limited by `lxmf_auto_fetch_quota`). For friends who are often offline, set `lxmf_propagation_node` to a
-propagation node you trust: messages that can't be delivered directly are then sent through it, and your
-node collects messages waiting there every `lxmf_sync_interval`. The links you send name your node
-(`from=`), so your friend can fetch from it even if the DHT doesn't know the content yet; set
-`lxmf_send_from_hint = false` if your LXMF address shouldn't be linked to your node ID.
+**Mirroring a publisher.** `rnfs name follow <their name>` keeps their latest content pinned and their name
+resolvable through your node while they're offline.
 
-<a id="private-group"></a>**Private group.** Seal a file so only chosen people can read it, while any node
-can still carry the encrypted blocks:
+**Field kit with an airtime budget.** A battery node on a shared LoRa channel:
+`dht_mode = "client"`, `max_jobs = 1`, `upload_budget = 2_000_000`, `quiet_hours = "22:00-06:00"` and
+`no_serve_interfaces = ["RNode"]`. Interface rules need rnfs to run Reticulum itself: attached to a shared
+`rnsd`, every link looks like it arrives on the local interface.
 
-```sh
-rnfs add minutes.pdf --to <alice node ID> bob --to-self
-rnfs get <cid>              # recipients get the decrypted file under its original name (or the CID)
-```
-
-For a fully closed group, run every node with `private = true` and the same `members` list (their identity
-hashes). Members then answer, store records for and serve only each other.
-
-**Offline sneakernet.** Carry content where there's no link at all:
-
-```sh
-rnfs export <cid> -o bundle.rnfs        # on a connected node
-rnfs import bundle.rnfs                 # on the offline node: verified and pinned
-```
-
-**Mirroring a publisher.** Help keep someone's site available even when they're offline. Following pins
-the content, and keeping the name means it still resolves through your node:
-
-```sh
-rnfs name follow <their name>           # implies keep
-rnfs name kept
-```
-
-**Field kit with an airtime budget.** A battery node on a shared LoRa channel: a DHT client, one transfer at
-a time, limited uploads and silent nights:
-
-```toml
-dht_mode = "client"
-max_jobs = 1
-upload_budget = 2_000_000
-quiet_hours = "22:00-06:00"
-no_serve_interfaces = ["RNode"]         # upload over TCP/Wi-Fi only
-```
-
-Note: when rnfs is attached to a shared `rnsd`, every link looks like it arrives on the local interface,
-so interface rules can't tell your radios apart. Let rnfs run Reticulum itself if you need them.
-
-**A website on the mesh.** Put a static site in a directory, add it and publish it under a name:
-
-```sh
-rnfs add mysite/                        # prints <cid>
-rnfs name create site && rnfs name publish site <cid>
-```
-
-Visitors open `http://127.0.0.1:8789/name/<name>/` on their own node. Links inside the site work, and a
-new `name publish` updates it for everyone. NomadNet pages can't open `rnfs:` links, so show the link as
-text along with the command and gateway URL to use:
-
-```
-rnfs:name/<name>/index.html
-rnfs get <cid>/index.html --from <your node ID>   or   http://127.0.0.1:8789/name/<name>/
-```
+**A website on the mesh.** `rnfs add mysite/`, then `rnfs name create site && rnfs name publish site <cid>`.
+Visitors open `http://127.0.0.1:8789/name/<name>/` on their own node, and each `name publish` updates it.
+NomadNet pages can't open `rnfs:` links, so show the link as text: `rnfs:name/<name>/index.html`.
 
 # Running several nodes
 
-To run several daemons on one machine, give each its own `--dir`, `--api-port`, `--gateway-port` and
-Reticulum config (`--rnsconfig`). Then connect their Reticulum instances:
-
-- The first node's Reticulum `config` has a `TCPServerInterface` with `enable_transport = Yes`.
-- The others have a `TCPClientInterface` to it and `share_instance = No`, and start with
-  `--bootstrap <first node ID>`.
-
-Pass `--api-port` to talk to a particular daemon:
+Give each daemon its own `--dir`, `--api-port`, `--gateway-port` and Reticulum config (`--rnsconfig`). The
+first node's Reticulum config has a `TCPServerInterface` with `enable_transport = Yes`; the others have a
+`TCPClientInterface` to it and `share_instance = No`, and start with `--bootstrap <first node ID>`:
 
 ```sh
 rnfs --dir /tmp/a --api-port 9001 daemon --rnsconfig /tmp/a --gateway-port 9101 --bootstrap <hub id>
@@ -1040,15 +566,11 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 # Known limitations
 
 - A name resolves only while its owner, a transport node that remembers its announce, or a keeper is
-  reachable. A name can be updated about once an hour.
-- Sybil attacks can make a single CID hard to find; `get --from` bypasses the DHT. Data can never be
-  forged.
-- Sealed files hide content and file name, not size or recipients, and don't prove who sealed them. `get` of
-  a directory leaves the sealed files inside it encrypted.
-- With the default `provide_strategy = "roots"`, every complete download is provided to the DHT and served,
-  including `cat` and `stat` reads of other nodes' content: anyone can learn what your node fetched. Use
-  `"pinned"` to keep downloads private.
-- LXMF: messages over 256 kB are refused, and unsent messages are lost if the daemon restarts. Offline
-  delivery and downloads need `lxmf_propagation_node` (or `--nearest` each time). A message rnfs can't keep
-  (from a stranger during a flood, or from a sender whose identity can't be found) is lost, though the
-  sender's app shows it as delivered; senders you trust (see the LXMF settings) are protected from floods.
+  reachable, and can be updated about once an hour.
+- Sybil attacks can make a CID hard to find (`get --from` bypasses the DHT), but data can never be forged.
+- Sealed files hide content and file name, not size or recipients, and don't prove who sealed them. `get` of a
+  directory leaves sealed files inside it encrypted.
+- Under the default `provide_strategy = "roots"`, anyone can learn what your node downloaded.
+- LXMF messages over 256 kB are refused, unsent messages are lost if the daemon restarts, and offline delivery
+  needs `lxmf_propagation_node`. A message rnfs can't keep (a stranger's during a flood) is lost, though the
+  sender's app shows it as delivered.
