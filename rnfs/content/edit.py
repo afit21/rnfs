@@ -66,10 +66,21 @@ def dir_set(root: Cid, names: list[str], name: str, child: Cid, executable: bool
     return _rebuild(chain, names, entries, get, put)
 
 
+NEEDS_ENTRY = "dir rm needs <cid>/<path>: the entry to remove"
+
+
+def check_entry_target(target) -> None:
+    """Raise ValueError unless target names an entry inside a directory, `<cid>/<path>` (dir rm's target: a root
+    can't be removed). The node checks this before fetching anything; the path itself is checked as it is
+    parsed."""
+    if not isinstance(target, str) or "/" not in target.rstrip("/"):
+        raise ValueError(NEEDS_ENTRY)
+
+
 def dir_rm(root: Cid, names: list[str], get: walker.Get, put: Put) -> Cid:
     """The new root after removing the entry <root>/<names...>. Raises NotFound if it doesn't exist."""
     if not names:
-        raise ValueError("dir rm needs a path: <cid>/<name>...")
+        raise ValueError(NEEDS_ENTRY)
     chain = _directory_chain(root, names[:-1], get)
     entries = list(walker.list_directory(chain[-1], get))
     remaining = [e for e in entries if e.name != names[-1]]

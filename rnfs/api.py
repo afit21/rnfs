@@ -1035,11 +1035,8 @@ class ApiHandler(TimedHandler):
                                               executable=parse_bool(body.get("executable"))))
 
     def api_dir_rm(self):
-        """POST /api/dir/rm {"target"}: a new directory without the target's entry."""
-        target = parse_target(self.json_body().get("target"))
-        if "/" not in target.rstrip("/"):
-            raise ValueError("dir rm needs <cid>/<path>: the entry to remove")
-        self.send_json(200, self.node.dir_rm(target))
+        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one)."""
+        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target"))))
 
     def api_pin_add(self):
         """POST /api/pin/add {"target"}: fetch and pin with source user; answers once complete."""

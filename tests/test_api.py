@@ -18,6 +18,7 @@ from unittest import mock
 
 from rnfs import api, cli, features, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
+from rnfs.content import edit
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs import errors
 from rnfs.errors import Busy, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
@@ -282,6 +283,7 @@ class FakeNode:
 
     def dir_rm(self, target):
         self.record("dir_rm", target)
+        edit.check_entry_target(target)  # as RnfsNode.dir_rm, before anything is fetched
         parent, name = target.rsplit("/", 1)
         obj = self._object(self._resolve(parent))
         if name not in obj[1]:

@@ -260,6 +260,20 @@ class PublicTests:
         self.assertIsInstance(self.rnfs.gc(), rnfs.Collected)
         self.assertEqual(self.rnfs.verify().bad, ())
 
+    def test_dir_set_and_rm(self):
+        """dir_set adds an entry, dir_rm removes it again; dir_rm of a root is ValueError (a 400 for a Client),
+        refused by the node itself before it fetches anything (ND3)."""
+        directory = self.share(b"inside", name="a.txt")
+        child = self.rnfs.add(b"child").cid
+        edited = self.rnfs.dir_set(directory, "b.txt", child, executable=True)
+        self.assertEqual([(e.name, e.kind) for e in self.rnfs.ls(edited)], [("a.txt", "file"), ("b.txt", "executable")])
+        self.assertEqual(self.rnfs.dir_rm(f"{edited}/b.txt"), directory)
+        remote = self.share(b"not here", name="c.txt")
+        for target in (remote, f"{remote}/"):
+            with self.subTest(target), self.assertRaisesRegex(ValueError, "the entry to remove"):
+                self.rnfs.dir_rm(target)
+        self.assertFalse(self.b.storage.has(remote))  # not fetched
+
     def test_errors_are_one_hierarchy(self):
         """The same exception classes whichever class raises them."""
         data = os.urandom(1000)

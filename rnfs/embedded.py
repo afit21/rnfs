@@ -192,9 +192,7 @@ class _Backend:
         return self.node.dir_set(target, name, child, executable=executable)
 
     def dir_rm(self, target: str) -> dict:
-        """RnfsNode.dir_rm, which needs a path to remove."""
-        if "/" not in target.rstrip("/"):
-            raise ValueError("dir_rm needs <cid>/<path>: the entry to remove")
+        """RnfsNode.dir_rm, which needs a path to remove (and checks it has one)."""
         return self.node.dir_rm(target)
 
     def pin_add(self, target: str) -> dict:

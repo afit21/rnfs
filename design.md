@@ -398,7 +398,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `ls(target, for_gateway=False)` | `[{"name", "kind": "file"\|"executable"\|"directory", "size", "cid"}]` |
 | `stat(target)` | `{"cid", "size", "blocks", "local_blocks", "local_bytes"}` |
 | `is_local(target)` | `bool`: everything needed is stored, so no network fetch |
-| `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
+| `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user`; `dir_rm` refuses a target that names no entry (`edit.check_entry_target`: ValueError, before fetching anything), so the API and `rnfs.Node` don't check it themselves |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |

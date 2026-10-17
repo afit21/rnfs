@@ -1495,7 +1495,9 @@ class RnfsNode:
         return {"cid": str(new_root)}
 
     def dir_rm(self, target: str) -> dict:
-        """A new root without the entry target names; pinned "user" (the complete directory is fetched first)."""
+        """A new root without the entry target names; pinned "user" (the complete directory is fetched first).
+        Raises ValueError, before fetching anything, unless target is <cid>/<path>."""
+        edit.check_entry_target(target)
         root, names = self._parse_target(target)
         with self.fetcher.open(root, pinned=True) as fetch:
             fetch.fetch_dag(fetch.resolve())
