@@ -1265,9 +1265,20 @@ Everything in the specification is implemented, with these simplifications and a
   wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
   fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
   (`_remote_workers` maps each source to its thread) within its budget.
-- Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks at a time ahead of what has been
-  written out. A read may meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds
-  files built from repeated tiny or empty subtrees without limiting honest large files.
+- Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks (`WINDOW`) at a time ahead of what
+  has been written out. The next window is asked for before the current one is handed to the reader, so every
+  provider stays busy across window boundaries (a block that arrives after the call that asked for it is stored,
+  not dropped). A reader that stops early has fetched at most one window more than it read; when its fetch ends,
+  the links it still has requests on are closed (`PeerClient.close_unless_used`) unless another fetch is using one,
+  whose request is then left to finish: never a `Resource.cancel()`, which a 0.1.6 server cools down (NET-1). A
+  read may meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds files built from
+  repeated tiny or empty subtrees without limiting honest large files.
+- `fetch_dag` and `fetch_listing` are one `ensure()` over a `_Walk`: a block's children are queued as soon as it is
+  stored or downloaded, not one tree level at a time, and `max_entries` is counted per block. A parent is stored
+  before its children are asked for, so an interrupted fetch resumes from what it stored, as before.
+- End game (NET-4): when nothing is left to ask for and a provider is idle, a batch in flight longer than
+  `deadline_slack` is asked of it too (once, not on slow nodes, within `max_parallel`); the first verified copy
+  wins, and the slower request's link is closed as above, without counting as a stall.
 - Archive import pins only roots whose every block was in the archive, and reads at most 1024 roots. It
   verifies every block, including ones already stored, and stops with `StorageFull` like a fetch when a block
   not yet stored would leave less than the disk reserve free (`Storage.check_disk`).
