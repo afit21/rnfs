@@ -33,6 +33,12 @@ Security:
   `lookup_timeout` and the keepers then had one second to answer. Each batch of `/name` queries now has its own
   budget (87.5 s at the defaults); the search for keepers stops once some are known and `lookup_timeout` / 5 has
   passed, and resumes if their answers don't settle the name.
+- `get` of a directory can no longer be redirected by someone who can rename inside the output swapping one of
+  its directories for a link or junction (or another directory) while it is written. On Linux and macOS the
+  output being written is private (0700, setgid kept) and must start empty, every entry is created relative to
+  its parent's descriptor without following links, and each directory is checked by device and inode before
+  anything is written into it. On Windows it gets a private access list while it is written, and each file's
+  final path must be inside it. A swap fails the get with "output was changed while being written".
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
@@ -40,6 +46,8 @@ Changed:
 - While the deny list has file hashes, a highly repetitive file over 64 MiB (a zero-filled disk image, say) can't
   be read or imported (451). The user's own gateway HEAD of a file that isn't wholly stored is then typed by its
   name only, not by its first bytes.
+- On Windows, a directory `get` output is private to the user while it is written, then inherits its folder's
+  access list again before it gets its final name (if that fails, a warning is logged and it stays private).
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
