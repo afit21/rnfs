@@ -39,6 +39,15 @@ Security:
   its parent's descriptor without following links, and each directory is checked by device and inode before
   anything is written into it. On Windows it gets a private access list while it is written, and each file's
   final path must be inside it. A swap fails the get with "output was changed while being written".
+- On Linux and macOS, `rnfs.toml` is now checked before its settings are used, as on Windows: a symlink, a FIFO
+  or anything else that isn't a regular file is refused, and so is a file another user owns; one others may
+  access is made 0600, with a warning; at most 1 MiB of it is read. Its settings choose the Reticulum config, and
+  with it programs rnfs starts, so anyone who could write it could run code as you. Reticulum's `config` gets the
+  same check when `reticulum_dir` is the rnfs dir.
+- The rnfs dir's subdirectories (`state`, `blocks`, `storage`, `names`, `lxmf`) are checked at every start: a
+  symlink, a non-directory or one another user owns stops the start before Reticulum starts; a loose one is made
+  0700, with a notice; and if others could write to it, entries another user owns are reported. Before, a user
+  who could once write in a loose rnfs dir kept their access to `blocks/` and `names/` after it was tightened.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
@@ -48,6 +57,12 @@ Changed:
   name only, not by its first bytes.
 - On Windows, a directory `get` output is private to the user while it is written, then inherits its folder's
   access list again before it gets its final name (if that fails, a warning is logged and it stays private).
+- A symlinked `rnfs.toml` is refused: dotfile setups that symlink it into the rnfs dir stop working (put the
+  file itself there). A loose `rnfs.toml` (such as 0664) or subdirectory (such as 0775) is tightened at the next
+  start, with a warning; it isn't refused.
+- The daemon and `rnfs.Node` check, in order, the rnfs dir, the settings, the subdirectories, then take the lock.
+  The CLI prints settings warnings, and `rnfs.Client` raises them as `RuntimeWarning`. On Windows, a loose
+  `rnfs.toml` no longer makes the CLI or `rnfs.Client` load RNS.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
