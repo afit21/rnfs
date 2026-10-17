@@ -802,7 +802,11 @@ and in total, never persisted.
   link closed, or RNS gave up) starts none, so a reader that gives up early must close its links and never
   call `Resource.cancel()` on a response, or it would cool itself down at its providers. `Cooldowns` is flat:
   every cooldown lasts `blocks_cooldown`, per link and per identity. The `Response` docstring records which
-  thread or lock owns each of its fields.
+  thread or lock owns each of its fields. A new `/blocks` arriving while the link's previous response has
+  sent all its parts waits, on `RequestServer.clock`, up to `_proof_wait(link)` (2 × RTT + 1 s, at most
+  `PROOF_GRACE`, 5 s) for its proof (`_previous_done`). That is the server's only use of `link.rtt`, which on an
+  incoming link is what the requester claims: anything but a finite, non-negative number counts as no RTT, and
+  any future use must go through it, capped.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
@@ -836,7 +840,8 @@ and in total, never persisted.
   `MAX_BLOCKS_CIDS` (26) entries of `bin` up to `MAX_BLOCK_SIZE` or `nil`, and nothing after it. A refused
   response is handed to `Link.handle_response` as `None`, which every parser refuses, so the request fails as
   malformed; refusals are logged at most once a minute. `guarded_receive` drops a response packet on an
-  incoming `rnfs.dht` link without decrypting it. Everything else goes to RNS's own methods unchanged.
+  incoming `rnfs.dht` link, and a request packet on one this node opened (`link.initiator`), without
+  decrypting it. Everything else goes to RNS's own methods unchanged.
 - `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
   instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
   RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in
