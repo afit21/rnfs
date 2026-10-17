@@ -120,7 +120,7 @@ class PeersFeature(Feature):
             import RNS
             from rnfs.constants import MODE_SERVER
             from rnfs.network.announces import parse_mode
-            app_data = RNS.Identity.recall_app_data(node_id)
+            app_data = RNS.Identity.recall_app_data(node_id, _no_use=True)  # a listing doesn't mark it used
             if app_data is None:
                 return None
             return "server" if parse_mode(app_data) == MODE_SERVER else "client"

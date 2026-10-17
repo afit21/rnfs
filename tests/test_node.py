@@ -388,6 +388,15 @@ class BackendTest(NodeTest):
         self.assertTrue(node.backend.is_member(IDENTITY))
         self.assertFalse(node.backend.is_member(bytes(16)))
 
+    def test_identity_checks_dont_mark_destinations_used(self):
+        # Checks, not contacts (C2): recalled with _no_use, which skips RNS's "used" RPC on a shared instance
+        node = self.make_node("p", bytes([0xD] * 16), private=True, members=[IDENTITY.hex()])
+        member = mock.Mock(hash=IDENTITY)
+        with mock.patch.object(RNS.Identity, "recall", return_value=member) as recall:
+            self.assertTrue(node._is_member_node(A_ID))
+            self.assertTrue(node_module._rns_is_known(B_ID))
+        self.assertEqual(recall.call_args_list, [mock.call(A_ID, _no_use=True), mock.call(B_ID, _no_use=True)])
+
     def wait_for(self, condition, timeout=10):
         """Poll until condition() is true."""
         deadline = time.monotonic() + timeout

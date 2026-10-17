@@ -150,7 +150,7 @@ def fake_rns():
         Identity=types.SimpleNamespace(recall=lambda node_id: types.SimpleNamespace(node_id=node_id)),
         Transport=types.SimpleNamespace(await_path=lambda node_id, timeout: True, has_path=lambda node_id: True,
                                         request_path=lambda node_id: None),
-        log=lambda *args: None, prettyhexrep=lambda b: b.hex(), LOG_INFO=4, LOG_VERBOSE=5,
+        log=lambda *args: None, prettyhexrep=lambda b: b.hex(), LOG_INFO=4, LOG_VERBOSE=5, loglevel=4,
     )
 
 
@@ -237,6 +237,27 @@ class LinkPoolTest(unittest.TestCase):
     def test_unreachable(self):
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
+
+    def test_awaited_identity_marked_used_once(self):
+        # Polls for an identity still on its way don't mark the destination used; contacting it does, once (C2)
+        calls = []
+
+        def recall(node_id, _no_use=False):
+            """Unknown for the first call and two polls, then known."""
+            calls.append(_no_use)
+            return types.SimpleNamespace(node_id=node_id) if len(calls) > 3 else None
+        links.RNS.Identity.recall = recall
+        self.assertIsNotNone(run(self, lambda: self.pool.get(NODE)))
+        self.assertEqual(calls, [False, True, True, True, False])
+
+    def test_path_described_only_for_a_kept_debug_message(self):
+        # The description costs RNS lookups: built only when a LOG_DEBUG message goes somewhere (C2)
+        with mock.patch.object(links, "path_description", return_value="") as describe:
+            run(self, lambda: self.pool.get(NODE))
+            describe.assert_not_called()
+            links.RNS.loglevel = links.LOG_DEBUG
+            run(self, lambda: self.pool.get(OTHER))
+        describe.assert_called_once_with(OTHER)
 
     def test_no_link_to_another_destination_of_the_identity(self):
         # The identity recalled for NODE has another rnfs.dht hash: NODE is some other destination of it

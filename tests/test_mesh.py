@@ -575,6 +575,13 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertIsNone(listed[P3.hex()]["hops"])
         self.assertEqual(list(listed), [P1.hex(), P3.hex()])  # nearest first
 
+    def test_recalled_mode_doesnt_mark_used(self):
+        # A listing is a check, not a contact (C2)
+        self.node.reticulum = object()
+        with mock.patch.object(RNS.Identity, "recall_app_data", return_value=None) as recall:
+            self.assertIsNone(self.feature._recalled_mode(P1))
+        recall.assert_called_once_with(P1, _no_use=True)
+
     def test_status_and_stats(self):
         status = self.node.status()
         for key in ("bytes_sent", "bytes_received", "blocks_refused_budget", "blocks_refused_interface",
