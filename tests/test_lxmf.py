@@ -991,6 +991,8 @@ class CliTest(unittest.TestCase):
         self.assertEqual(parser.parse_args(["inbox"]).run.__name__, "_run_inbox")
         args = parser.parse_args(["inbox", "get", "4", "--link", "2", "-o", "x"])
         self.assertEqual((args.run.__name__, args.n, args.link, args.output), ("_run_inbox_get", 4, 2, "x"))
+        self.assertFalse(args.use_sent_cid)
+        self.assertTrue(parser.parse_args(["inbox", "get", "4", "--use-sent-cid"]).use_sent_cid)
         self.assertTrue(parser.parse_args(["inbox", "rm", "--all"]).all)
         self.assertEqual(parser.parse_args(["outbox"]).run.__name__, "_run_outbox")
         self.assertEqual(parser.parse_args(["lxmf", "address"]).run.__name__, "_run_address")
@@ -1086,7 +1088,7 @@ class AuditFixesTest(FeatureTestCase):
         client.post.return_value = results
         out = io.StringIO()
         with mock.patch("rnfs.cli.client", return_value=client), mock.patch("sys.stdout", out):
-            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None))
+            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None, use_sent_cid=False))
         self.assertNotIn("\x1b", out.getvalue())
         self.assertNotIn("\x07", out.getvalue())
 
@@ -1235,7 +1237,7 @@ class RestartAndCancelTest(FeatureTestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("rnfs.cli.client", return_value=client), mock.patch("sys.stdout", out), \
                 mock.patch("sys.stderr", err), self.assertRaises(SystemExit):
-            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None))
+            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None, use_sent_cid=False))
         self.assertIn("job 0123abcd: /x/a", out.getvalue())
         self.assertIn("/x/b: too many jobs", err.getvalue())
         self.assertNotIn("\x1b", err.getvalue())

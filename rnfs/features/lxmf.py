@@ -729,7 +729,7 @@ def _fit_entry(entry: dict):
     """Bound an inbox record to MAX_ENTRY_BYTES as JSON: drop links from the last (keeping one), then cut text.
 
     Room is left for the auto-fetch results it may get."""
-    reserve = 128 * len(entry["links"])  # {"state": "pinned", "cid": ...} per link
+    reserve = 128 * len(entry["links"])  # {"state": "pinned", "cid": ..., "sent_cid": true} per link
     while len(entry["links"]) > 1 and _json_bytes(entry) + reserve > MAX_ENTRY_BYTES:
         entry["links"].pop()
         reserve -= 128
@@ -1278,27 +1278,37 @@ class LxmfFeature(features.Feature):
         if released:
             self.node.publisher.refresh()
 
-    def _resolve(self, link: Link, persist: bool = True) -> tuple[Cid, list[str]]:
-        """The root CID and path a link names, resolving a name (falling back to the CID it was sent with).
+    def _resolve(self, link: Link, persist: bool = True,
+                 allow_sent_cid: bool = False) -> tuple[Cid, list[str], bool]:
+        """The root CID and path a link names, resolving a name, and whether it fell back to the CID the name link
+        was sent with: only if allow_sent_cid and the name can't be resolved. NotFound if it can't be resolved
+        and that isn't allowed (naming --use-sent-cid if the link has a sent CID).
+
+        The sender chose the sent CID: nothing ties it to the name, so a stranger could pose as a well-known name
+        with it. A name that resolves is always used.
 
         persist False (auto-fetch): the name's record goes only into the bounded table, so names arriving
         unasked don't grow the held records; its sequence still goes into the bounded, saved floor, so a later
         auto-fetch of the name never resolves to an older record."""
         if link.name is None:
-            return link.cid, list(link.path)
+            return link.cid, list(link.path), False
         from rnfs.errors import NotFound
         try:
             if persist:
-                return Cid.parse(self.node.name_resolve(link.name.hex())["cid"]), list(link.path)
+                return Cid.parse(self.node.name_resolve(link.name.hex())["cid"]), list(link.path), False
             record = self.node.names.resolve(link.name, persist=False)
             if record is None:
                 raise NotFound(f"name {link.name.hex()} could not be resolved")
-            return Cid.parse(record["cid"]), list(link.path)
+            return Cid.parse(record["cid"]), list(link.path), False
         except NotFound:
             if link.cid is None:
                 raise
+            if not allow_sent_cid:
+                raise NotFound(f"name {link.name.hex()} could not be resolved; the sender says it pointed at "
+                               f"{link.cid}, but nothing ties that CID to the name: to get it anyway, use "
+                               f"--use-sent-cid") from None
             _log(f"name {link.name.hex()} could not be resolved; using the CID it was sent with", LOG_NOTICE)
-            return link.cid, list(link.path)
+            return link.cid, list(link.path), True
 
     def _hints(self, link: Link) -> list[bytes | None]:
         """Where to fetch from: the link's provider hint first (unless it is this node), then the DHT."""
@@ -1307,11 +1317,14 @@ class LxmfFeature(features.Feature):
         return [None]
 
     def inbox_get(self, entry_id: int, index: int | None = None, output: str | None = None,
-                  directory: str | None = None) -> list[dict]:
+                  directory: str | None = None, use_sent_cid: bool = False) -> list[dict]:
         """Fetch the links of inbox message entry_id (only link index, 1-based, if given) and write each out:
         to output, or into directory under its last path name (the root CID if that name is hidden,
         non-printable or not a plain file name here: the sender chose it). Tries the sender's node first, then
-        the DHT. Once one link has started, a later one's failure is a result with "error", not raised."""
+        the DHT. Once one link has started, a later one's failure is a result with "error", not raised.
+
+        A name link whose name can't be resolved is NotFound before anything is written or started, unless
+        use_sent_cid: then the CID it was sent with is fetched, and its result says so in "warnings"."""
         from rnfs.errors import NotFound
         entry = self.inbox.get(entry_id)
         if entry is None:
@@ -1328,7 +1341,9 @@ class LxmfFeature(features.Feature):
         # Every output is checked before anything starts, so a clash can't stop the fetches halfway
         planned = []
         for number, link in enumerate(links, 1):
-            root, names = self._resolve(link)
+            root, names, fell_back = self._resolve(link, allow_sent_cid=use_sent_cid)
+            warnings = [f"name {link.name.hex()} could not be resolved: fetching {root}, the CID the sender says it "
+                        f"pointed at (nothing ties that CID to the name)"] if fell_back else []
             target = "/".join([str(root), *names])
             if output is not None:
                 path = output
@@ -1337,20 +1352,23 @@ class LxmfFeature(features.Feature):
                 path = os.path.join(directory, fsutil.safe_default_name(names[-1] if names else None, str(root)))
             if os.path.lexists(path):
                 raise ValueError(f"{fsutil.printable(path)} already exists; remove it or choose another with -o")
-            same = next((i for i, (_, other, _) in enumerate(planned) if other == path), None)
+            same = next((i for i, (_, other, _, _) in enumerate(planned) if other == path), None)
             if same is not None:
                 raise ValueError(f"links {same + 1} and {number} would both be written to {fsutil.printable(path)}: "
                                  f"get them one at a time with --link and -o")
-            planned.append((link, path, target))
+            planned.append((link, path, target, warnings))
         results = []
-        for link, path, target in planned:
+        for link, path, target, warnings in planned:
             try:
-                results.append(self._get_link(link, path, target))
+                result = self._get_link(link, path, target)
             except Exception as e:  # raised as is when nothing has started
                 if not results:
                     raise
                 # Something has started already: report it, and this failure with it
-                results.append({"target": target, "output": path, "error": str(e) or type(e).__name__})
+                result = {"target": target, "output": path, "error": str(e) or type(e).__name__}
+            if warnings:
+                result["warnings"] = [*result.get("warnings", []), *warnings]
+            results.append(result)
         return results
 
     def _get_link(self, link: Link, path: str, target: str) -> dict:
@@ -1446,8 +1464,10 @@ class LxmfFeature(features.Feature):
     def auto_fetch(self, entry_id: int, index: int):
         """Fetch one link of an inbox message and pin it with source lxmf:<sender>, within the sender's quota.
 
-        The fetch stops (within fetcher.POLL) when the node stops, leaving the link queued for the next start,
-        or when the message is removed."""
+        The sender is trusted, so a name link whose name can't be resolved falls back to the CID it was sent with;
+        the result then records "sent_cid": true, which the inbox listing shows. The fetch stops (within
+        fetcher.POLL) when the node stops, leaving the link queued for the next start, or when the message is
+        removed."""
         from rnfs import fetcher
         from rnfs.content.storage import LXMF_PREFIX
         from rnfs.errors import Denied, InvalidDag, RnfsError, StorageFull, TooLarge
@@ -1459,12 +1479,12 @@ class LxmfFeature(features.Feature):
         try:
             link = Link.from_json(entry["links"][index])
             source = LXMF_PREFIX + entry["from"]
-            root, names = self._resolve(link, persist=False)
+            root, names, sent_cid = self._resolve(link, persist=False, allow_sent_cid=True)
             hints = self._hints(link)
             for attempt, from_node in enumerate(hints):
                 try:
                     with fetcher.observing(observer):
-                        cid = self._fetch_and_pin(entry_id, index, root, names, from_node, source)
+                        cid = self._fetch_and_pin(entry_id, index, root, names, from_node, source, sent_cid)
                     break
                 except (TooLarge, InvalidDag, StorageFull, fetcher.Cancelled):
                     raise
@@ -1490,27 +1510,32 @@ class LxmfFeature(features.Feature):
              f"{fsutil.printable(result['error'])}", LOG_NOTICE)
         self._set_auto(entry_id, index, result)
 
-    def _pin_recorded(self, entry_id: int, index: int, cid: Cid, source: str) -> bool:
-        """Pin cid with source and record it in the inbox entry, in one locked step so a removal can't come
-        between them and leave a pin no entry releases; False (nothing pinned) if the entry is gone."""
+    def _pin_recorded(self, entry_id: int, index: int, cid: Cid, source: str, sent_cid: bool = False) -> bool:
+        """Pin cid with source and record it in the inbox entry (with "sent_cid": true if it is a name link's sent
+        CID, the name unresolved), in one locked step so a removal can't come between them and leave a pin no
+        entry releases; False (nothing pinned) if the entry is gone."""
+        result = {"state": "pinned", "cid": str(cid)}
+        if sent_cid:
+            result["sent_cid"] = True
         with self._lock:
             if self.inbox.get(entry_id) is None:
                 return False
             self.node.storage.pin(cid, source)
-            self._set_auto(entry_id, index, {"state": "pinned", "cid": str(cid)})
+            self._set_auto(entry_id, index, result)
             return True
 
     def _fetch_and_pin(self, entry_id: int, index: int, root: Cid, names: list[str], from_node: bytes | None,
-                       source: str) -> Cid | None:
+                       source: str, sent_cid: bool = False) -> Cid | None:
         """Fetch <root>/<names> completely and pin the target with source, unless it would exceed the
-        sender's quota (TooLarge). Returns the CID pinned, or None if the message went away meanwhile."""
+        sender's quota (TooLarge). Returns the CID pinned, or None if the message went away meanwhile. sent_cid:
+        root is a name link's sent CID (recorded with the pin)."""
         from rnfs.errors import TooLarge
         quota = self.config.lxmf_auto_fetch_quota
         storage = self.node.storage
         with self.node.fetcher.open(root, names, from_node, pinned=True) as fetch:
             expect = fetch.resolve()
             if source in storage.pins().get(expect.cid, set()):
-                return expect.cid if self._pin_recorded(entry_id, index, expect.cid, source) else None
+                return expect.cid if self._pin_recorded(entry_id, index, expect.cid, source, sent_cid) else None
             content = fetch.size_of(expect)
             used = storage.source_usage(source)
             if used + content > quota:
@@ -1519,7 +1544,7 @@ class LxmfFeature(features.Feature):
             # A DAG of empty files has size 0 yet can hold many directory nodes: count its blocks too
             fetch.max_dag_bytes = quota - used
             fetch.fetch_dag(expect)
-            if not self._pin_recorded(entry_id, index, expect.cid, source):
+            if not self._pin_recorded(entry_id, index, expect.cid, source, sent_cid):
                 return None
         self.node.publisher.refresh()
         return expect.cid
@@ -1553,6 +1578,9 @@ class LxmfFeature(features.Feature):
         get.add_argument("n", type=int, metavar="N", help="message number, from `rnfs inbox`")
         get.add_argument("--link", type=int, metavar="K", help="only the K-th link of the message")
         get.add_argument("-o", "--output", help="where to write (one link only; default: its name, here)")
+        get.add_argument("--use-sent-cid", action="store_true",
+                         help="if a name link's name can't be resolved, get the CID the sender says it pointed at "
+                              "(nothing ties that CID to the name: only for a sender you trust)")
         rm = command(inbox_commands, "rm", _run_inbox_rm,
                      "remove inbox messages, releasing what they auto-fetched")
         rm.add_argument("n", type=int, nargs="?", metavar="N", help="message number")
@@ -1608,13 +1636,14 @@ def _int(value, name: str, required: bool = True) -> int | None:
 
 
 def _api_inbox_get(handler):
-    """POST /api/lxmf/inbox/get {id, link?, output? | directory?}: {"results": [...]}."""
-    from rnfs.api import parse_path
+    """POST /api/lxmf/inbox/get {id, link?, output? | directory?, use_sent_cid?}: {"results": [...]}. A name link
+    whose name can't be resolved is 404 unless use_sent_cid (then its result carries a warning)."""
+    from rnfs.api import parse_bool, parse_path
     body = handler.json_body()
     output = parse_path(body["output"]) if body.get("output") is not None else None
     directory = parse_path(body["directory"]) if body.get("directory") is not None else None
     results = _feature(handler).inbox_get(_int(body.get("id"), "id"), _int(body.get("link"), "link", False),
-                                          output, directory)
+                                          output, directory, parse_bool(body.get("use_sent_cid", False)))
     handler.send_json(200, {"results": results})
 
 
@@ -1657,7 +1686,8 @@ def _when(timestamp) -> str:
 
 
 def _print_links(entry: dict, printable):
-    """Print a message's links, one per line, with size and auto-fetch state."""
+    """Print a message's links, one per line, with size, the CID a name link was sent as (the sender's word: only
+    the name's own record ties a CID to it) and auto-fetch state."""
     auto = entry.get("auto") if isinstance(entry.get("auto"), list) else []
     for i, link in enumerate(entry.get("links") or []):
         if not isinstance(link, dict):
@@ -1665,8 +1695,12 @@ def _print_links(entry: dict, printable):
         notes = []
         if isinstance(link.get("size"), int):
             notes.append(human_size(link["size"]))
+        if link.get("name") is not None and link.get("cid") is not None:
+            notes.append(f"sent as {link['cid']}")
         if i < len(auto) and isinstance(auto[i], dict):
             state = auto[i].get("state")
+            if auto[i].get("sent_cid") is True:
+                state = f"{state} (sent CID; name unresolved)"
             notes.append(f"auto-fetch {state}" + (f": {auto[i]['error']}" if auto[i].get("error") else ""))
         print(f"    [{i + 1}] {printable(link.get('uri'))}" + (f"  ({printable(', '.join(notes))})" if notes else ""))
 
@@ -1715,7 +1749,7 @@ def _run_inbox_get(args):
     if output is not None and os.path.lexists(output):
         cli.fail(f"{output} already exists; remove it or choose another with -o")
     result = cli.client(args).post("/api/lxmf/inbox/get", id=args.n, link=args.link, output=output,
-                                   directory=os.getcwd())
+                                   directory=os.getcwd(), use_sent_cid=args.use_sent_cid)
     failed = False
     for item in result["results"]:
         cli.print_warnings(item)
