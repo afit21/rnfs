@@ -58,6 +58,11 @@ flight per provider. Request threads only call the client and note when a respon
 fetch state is changed by the thread that runs the fetch, from the events they queue (ResultEvent, and the
 lookup thread's ProviderEvent and LookupDone).
 
+fetch_dag and fetch_listing walk the DAG inside one _download: a block's children still to fetch are queued as
+soon as it is met, stored or downloaded, rather than once its whole tree level has arrived, so no provider waits
+for a level's last response. A parent is always stored before its children are asked for, so whatever an
+interrupted fetch stored hangs together from the target, and the next fetch resumes from it.
+
 read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
 bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
 for it has returned is stored all the same. A fetch closes the links of its requests still in flight when it ends
@@ -391,6 +396,48 @@ class _Pending:
         self._order.extendleft(reversed(cids))
         self._members.update(cids)
 
+    def extend(self, cids: list[Cid]):
+        """Add cids (none of them pending) at the back, keeping their order."""
+        self._order.extend(cids)
+        self._members.update(cids)
+
+
+class _Walk:
+    """The walk of fetch_dag or fetch_listing below a target, met block by block (A4): what each block met adds to
+    fetch, and the directory entries met so far. Pure bookkeeping, used by the fetch thread only."""
+
+    __slots__ = ("seen", "listing", "max_entries", "entries", "index_queued")
+
+    def __init__(self, target: Expect, listing: bool, max_entries: int | None):
+        """A walk from target: of its whole DAG, or for a listing (listing=True) of its index nodes only."""
+        self.seen = {target}
+        self.listing = listing
+        self.max_entries = max_entries
+        self.entries = 0  # entries of the distinct directory nodes met
+        self.index_queued: set[Expect] = set()  # index children queued, not met yet
+
+    def met(self, expect: Expect, children: list[Expect]) -> list[Expect]:
+        """The children of expect, a block just met (stored or downloaded), to fetch next: each not seen before,
+        and for a listing only an index's (a directory's entries and a file's chunks carry no first_name).
+
+        Raises TooLarge once more than max_entries entries are met, counted per block before its children are
+        fetched: the entries of the distinct directory nodes met, plus one for each index child queued and not
+        met yet, which holds at least one entry below it (its first_name), so an index tree can't grow unchecked
+        either.
+        """
+        self.index_queued.discard(expect)
+        self.entries += sum(1 for child in children if child.kind is not None)
+        follow = []
+        for child in children:
+            if child not in self.seen and (not self.listing or walker.is_index_step(child)):
+                self.seen.add(child)
+                follow.append(child)
+                if walker.is_index_step(child):
+                    self.index_queued.add(child)
+        if self.max_entries is not None and self.entries + len(self.index_queued) > self.max_entries:
+            raise TooLarge(f"more than max_output_entries ({self.max_entries}) entries")
+        return follow
+
 
 class _Provider:
     """What a fetch knows about one provider."""
@@ -691,7 +738,8 @@ class Fetch:
             self.storage.check_disk(size)
 
     def fetch_dag(self, target: Expect, max_entries: int | None = None):
-        """Fetch every block of target's DAG not already stored, level by level, checking each.
+        """Fetch every block of target's DAG not already stored, checking each; a block's children are asked for
+        as soon as it is met (_Walk).
 
         Raises TooLarge once its distinct blocks hold more than dag_limit() bytes (what target's declared
         size and the directory entries met allow, or max_dag_bytes if lower), and with max_entries once more
@@ -718,19 +766,7 @@ class Fetch:
                 return
             # What is stored already needn't fit again (its DAG nodes make this an estimate)
             self.check_disk(target, size - self.storage.dag_bytes(target.cid))
-            seen = {target}
-            frontier = [target]
-            entries = 0
-            while frontier:
-                children = self.ensure(frontier)
-                next_frontier = []
-                for expect in frontier:
-                    for child in children[expect]:
-                        if child not in seen:
-                            seen.add(child)
-                            next_frontier.append(child)
-                entries = self._count_entries(entries, frontier, children, next_frontier, max_entries)
-                frontier = next_frontier
+            self.ensure([target], walk=_Walk(target, False, max_entries))
 
     def fetch_listing(self, target: Expect, max_entries: int | None = None):
         """Fetch the directory and index nodes of the directory target (not its entries' contents).
@@ -743,32 +779,7 @@ class Fetch:
             max_entries = self.config.max_output_entries
         with self._checking():
             self.budget.declare(0)  # from here on its blocks are counted, the target's again
-            frontier = [target]
-            seen = {target}
-            entries = 0
-            while frontier:
-                children = self.ensure(frontier)
-                # Only an index's children carry first_name; a directory's entries and a file's chunks don't
-                next_frontier = [child for expect in frontier for child in children[expect]
-                                 if walker.is_index_step(child) and child not in seen]
-                entries = self._count_entries(entries, frontier, children, next_frontier, max_entries)
-                seen.update(next_frontier)
-                frontier = next_frontier
-
-    @staticmethod
-    def _count_entries(entries: int, frontier: list[Expect], children: dict[Expect, list[Expect]],
-                       next_frontier: list[Expect], max_entries: int | None) -> int:
-        """Entries met so far, after a level: raises TooLarge past max_entries, before the next level is fetched.
-
-        Entries of distinct directory nodes are counted, plus the index children about to be fetched: each
-        holds at least one entry below it (its first_name), so an index tree can't grow unchecked either.
-        """
-        entries += sum(1 for expect in frontier for child in children[expect] if child.kind is not None)
-        if max_entries is not None:
-            pending = sum(1 for child in next_frontier if walker.is_index_step(child))
-            if entries + pending > max_entries:
-                raise TooLarge(f"more than max_output_entries ({max_entries}) entries")
-        return entries
+            self.ensure([target], walk=_Walk(target, True, max_entries))
 
     def read_range(self, target: Expect, offset: int = 0, length: int | None = None) -> Iterator[bytes]:
         """The bytes of the file target in [offset, offset + length), fetching only the chunks covering them
@@ -853,35 +864,28 @@ class Fetch:
 
     # Getting blocks
 
-    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None,
-               ahead: list[Expect] = ()) -> dict[Expect, list[Expect]]:
+    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None, ahead: list[Expect] = (),
+               walk: _Walk | None = None) -> dict[Expect, list[Expect]]:
         """Make sure every block of expects is stored and passes its reader checks; their children's expects.
 
         Their blocks are counted against budget (a read_range call's), by default the fetch's own. The blocks of
         ahead (a read_range's next window) are asked for once nothing of expects is left to ask for, and stored
         as they arrive, during this call or a later one, but not waited for; one stored already, denied, or not
-        passing its CID check is left out, to be met when it is ensured.
+        passing its CID check is left out, to be met when it is ensured. Under walk (fetch_dag's or
+        fetch_listing's; not with ahead), each block met adds the children walk.met returns, ensured in the same
+        call, and nothing is returned.
         Raises InvalidDag, NotFound when no provider can supply a block, StorageFull, TooLarge.
         """
         with self._checking():
-            return self._ensure(expects, self.budget if budget is None else budget, ahead)
+            return self._ensure(expects, self.budget if budget is None else budget, ahead, walk)
 
-    def _ensure(self, expects: list[Expect], budget: _DagBudget,
-                ahead: list[Expect] = ()) -> dict[Expect, list[Expect]]:
+    def _ensure(self, expects: list[Expect], budget: _DagBudget, ahead: list[Expect] = (),
+                walk: _Walk | None = None) -> dict[Expect, list[Expect]]:
         """ensure(), untagged."""
         self._check_cancelled()
         children: dict[Expect, list[Expect]] = {}
         wanted: dict[Cid, list[Expect]] = {}
-        for expect in dict.fromkeys(expects):
-            self.fetcher.check_denied(expect.cid)  # before fetching or reading it, stored or not
-            walker.check_cid(expect)  # before fetching a block that can't be right
-            checked = self._check_stored(expect, budget)
-            if checked is None:
-                wanted.setdefault(expect.cid, []).append(expect)
-            else:
-                children[expect] = checked
-                if self.observer is not None:
-                    self.observer.block(expect.cid, self.storage.block_size(expect.cid) or 0, False)
+        self._meet(expects, wanted, children, budget, walk)
         prefetch: dict[Cid, list[Expect]] = {}
         for expect in ahead:
             cid = expect.cid
@@ -893,9 +897,35 @@ class Fetch:
                 continue
             prefetch.setdefault(cid, []).append(expect)
         if wanted or prefetch:
-            self._download(wanted, children, budget, prefetch)
+            self._download(wanted, children, budget, prefetch, walk)
             self.fetcher.after_store()
         return children
+
+    def _meet(self, expects, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
+              walk: _Walk | None) -> list[Cid]:
+        """Check each of expects before fetching or reading it (the deny list, its CID) and, if it is stored,
+        against its reader checks (counted against budget), its children going into children; the rest go into
+        wanted. Under walk, a stored block's children walk.met returns are met in turn, and children isn't kept.
+        Returns the CIDs newly wanted, in the order met."""
+        queue = deque(dict.fromkeys(expects))
+        new = []
+        while queue:
+            expect = queue.popleft()
+            self.fetcher.check_denied(expect.cid)  # before fetching or reading it, stored or not
+            walker.check_cid(expect)  # before fetching a block that can't be right
+            checked = self._check_stored(expect, budget)
+            if checked is None:
+                if expect.cid not in wanted:
+                    new.append(expect.cid)
+                wanted.setdefault(expect.cid, []).append(expect)
+                continue
+            if self.observer is not None:
+                self.observer.block(expect.cid, self.storage.block_size(expect.cid) or 0, False)
+            if walk is None:
+                children[expect] = checked
+            else:
+                queue.extend(walk.met(expect, checked))
+        return new
 
     def _check_stored(self, expect: Expect, budget: _DagBudget) -> list[Expect] | None:
         """Children of a stored block after checking it against expect (counted against budget), or None if it
@@ -954,13 +984,14 @@ class Fetch:
                 self._lookup.stop()  # it may now have enough providers to stop searching
 
     def _download(self, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
-                  ahead: dict[Cid, list[Expect]] | None = None):
+                  ahead: dict[Cid, list[Expect]] | None = None, walk: _Walk | None = None):
         """Fetch the wanted blocks from providers until all are stored, counted against budget. Raises NotFound if
         none can.
 
         ahead's blocks (ensure's) are asked for after wanted's and stored as they arrive, but not waited for:
         whatever of them is still to ask for once wanted's are stored goes out to the providers idle by then,
-        before returning, so they keep working while the caller uses wanted's.
+        before returning, so they keep working while the caller uses wanted's. Under walk, each block stored adds
+        its children still to fetch (_meet) to wanted's, at the back of the queue.
         """
         outstanding = set(wanted)  # still to store: wanted's, then ahead's
         needed = outstanding  # what the call waits for: wanted's
@@ -997,16 +1028,17 @@ class Fetch:
                 except queue.Empty:
                     break
             for event in events:
-                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget, needed)
+                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget, needed, walk)
         if pending and self._usable():
             # ahead's requests go out before the caller is handed wanted's blocks (never a lookup just for them)
             self._assign(pending, in_flight, outstanding, wanted, budget)
 
     def _handle_event(self, event: ResultEvent | ProviderEvent | LookupDone, pending: _Pending, in_flight: dict,
                       outstanding: set[Cid], wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
-                      needed: set[Cid] | None = None):
+                      needed: set[Cid] | None = None, walk: _Walk | None = None):
         """Apply one event from a request thread or the lookup thread. needed is _download's, if it isn't
-        outstanding itself: the blocks stored are taken out of it too."""
+        outstanding itself: the blocks stored are taken out of it too. Under walk, the children of the blocks
+        stored are met, and those still to fetch queued."""
         if isinstance(event, ProviderEvent):
             self._add_provider(event.node_id)
         elif isinstance(event, LookupDone):
@@ -1015,6 +1047,7 @@ class Fetch:
         elif isinstance(event, ResultEvent):
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
+            asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
                          event.sent_at, event.rate)
             still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
@@ -1025,6 +1058,15 @@ class Fetch:
                     self._expects.pop(cid, None)
             if needed is not None and needed is not outstanding:
                 needed.difference_update(cid for cid in cids if cid not in outstanding)
+            if walk is not None:
+                # In the order asked for, so the queue keeps the walk's order (breadth first, as met)
+                met = [child for cid in asked_now if cid not in outstanding
+                       for expect in wanted[cid] for child in walk.met(expect, children.pop(expect))]
+                new = self._meet(met, wanted, children, budget, walk)
+                outstanding.update(new)
+                if needed is not None and needed is not outstanding:
+                    needed.update(new)
+                pending.extend([cid for cid in new if cid not in still_asked])
 
     def _make_room(self, nbytes: int):
         """Before storing nbytes: evict other cached fetches over max_storage if not pinned (going over it if

@@ -869,6 +869,77 @@ class ReadAheadLinkTest(unittest.TestCase):
         response.cancel.assert_not_called()
 
 
+class WalkTest(FetcherTest):
+    """fetch_dag and fetch_listing queue a block's children as soon as it is met (A4), keeping parents before their
+    children, so an interrupted fetch resumes from what it stored."""
+
+    def setUp(self):
+        """A directory of three subdirectories of four small files each; each request carries one DAG node (as
+        if each were a full block), so the subdirectories go to three providers."""
+        super().setUp()
+        patcher = mock.patch.object(fetcher_module, "DAG_NODE_GUESS", CHUNK_SIZE)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.subdirs, self.files = [], []
+        for i in range(3):
+            files = [self.file(os.urandom(100 + 10 * i + k)) for k in range(4)]
+            self.files.append([built.cid for built in files])
+            self.subdirs.append(builder.build_directory([Entry(f"f{k}", built.cid, built.size, 0)
+                                                         for k, built in enumerate(files)], self.put))
+        self.root = builder.build_directory([Entry(f"s{i}", sub.cid, sub.size, 2)
+                                             for i, sub in enumerate(self.subdirs)], self.put)
+
+    def test_children_are_asked_for_before_the_level_ends(self):
+        asked_below = threading.Event()
+        seen = []
+        early = {cid for files in self.files[:2] for cid in files}
+
+        def answer(cids):
+            """Hold the last subdirectory until files below the others are asked for (up to 3 s)."""
+            if early.intersection(cids):
+                asked_below.set()
+            if self.subdirs[2].cid in cids:
+                seen.append(asked_below.wait(3))
+            return None
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+            self.client.behaviour[node_id] = answer
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(self.root.cid)
+        self.assertTrue(self.storage.is_complete(self.root.cid))
+        self.assertEqual(seen, [True], "nothing below the level was asked for while its last block was held")
+        asked = [cid for node_id in (P1, P2, P3) for cid in self.client.asked(node_id)]
+        self.assertEqual(sorted(asked), sorted(self.network))  # each block once
+
+    def test_interrupted_walk_stores_no_child_without_its_parent(self):
+        self.hold(P1, [cid for cid in self.network if cid != self.subdirs[1].cid])
+        self.runs.append([P1])
+        with self.assertRaises(NotFound):  # P1 fails once it answers None for the second subdirectory
+            self.fetch_all(self.root.cid)
+        self.assertFalse(any(self.storage.has(cid) for cid in self.files[1]))
+        missing = [cid for cid in self.network if not self.storage.has(cid)]
+        self.hold(P2)
+        self.runs[:] = [[P2]]
+        self.fetch_all(self.root.cid)
+        self.assertTrue(self.storage.is_complete(self.root.cid))
+        self.assertEqual(sorted(self.client.asked(P2)), sorted(missing))  # resumed from what it stored
+
+    def test_listing_fetches_index_nodes_as_they_are_met(self):
+        with mock.patch("rnfs.constants.MAX_CHILDREN", 4):
+            empty = self.file(b"")
+            root = builder.build_directory([Entry(f"{i:04d}", empty.cid, 0, 0) for i in range(100)], self.put)
+        self.hold(P1)
+        self.hold(P2)
+        self.runs.append([P1, P2])
+        with self.fetcher.open(root.cid) as fetch:
+            fetch.fetch_listing(fetch.resolve())
+            entries = list(walker.list_directory(fetch.target, fetch.get, 1000))
+        self.assertEqual([entry.name for entry in entries], [f"{i:04d}" for i in range(100)])
+        asked = self.client.asked(P1) + self.client.asked(P2)
+        self.assertEqual(len(asked), len(set(asked)))
+        self.assertNotIn(empty.cid, asked)  # the entries' contents aren't fetched
+
+
 class LimitTest(FetcherTest):
     """Bounds on what a hostile DAG or provider can make a fetch cost (security findings B1-B3, B5, B7, B9)."""
 
