@@ -16,7 +16,9 @@ the API token, the node's identity and the name keys. So on Windows:
   private); an existing identity or settings file (rnfs.toml) is checked through the handle it is read from
   before use: one owned by another account is refused, one that lets others in is tightened, and a DACL that
   can't be read or tightened stops rnfs;
-- every CLI command checks the token file's DACL before trusting it, and the daemon the rnfs dir's at start.
+- every CLI command checks the token file's DACL before trusting it, and the daemon the rnfs dir's at start;
+- a directory `get` writes out is created with that DACL too, so nobody else can rename inside it while it is
+  written (audit CONT-2), and given back its folder's inherited access list (inherit_from_parent) once complete.
 
 A DACL counts as private if it allows nobody but the current user, SYSTEM and Administrators (who can read any
 file anyway); deny entries and audit entries don't matter. The owner must be one of those too, since an owner can
@@ -133,6 +135,11 @@ def private_acl(user_sid: str, directory: bool) -> bytes:
     return struct.pack("<BBHHH", ACL_REVISION, 0, 8 + len(entries), 2, 0) + entries
 
 
+def empty_acl() -> bytes:
+    """A binary ACL with no entries: set unprotected, the object keeps only what it inherits from its parent."""
+    return struct.pack("<BBHHH", ACL_REVISION, 0, 8, 0, 0)
+
+
 def private_descriptor(user_sid: str, directory: bool) -> bytes:
     """A self-relative security descriptor whose DACL is private_acl, marked protected (nothing inherited from
     the parent), with no owner or group (the creating process's defaults apply), for CreateDirectoryW."""
@@ -187,6 +194,7 @@ class _Windows:
     OWNER_SECURITY_INFORMATION = 0x1
     DACL_SECURITY_INFORMATION = 0x4
     PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
     TOKEN_QUERY = 0x8
     TOKEN_USER = 1
     ERROR_ALREADY_EXISTS = 183
@@ -294,6 +302,15 @@ class _Windows:
         if code != 0:
             raise self._error(code, path)
 
+    def inherit(self, path: str):
+        """Replace path's DACL with an empty, unprotected one, so it has only what it inherits from its parent;
+        SetNamedSecurityInfoW passes the parent's inheritable entries on to everything below it too."""
+        acl = self.ctypes.create_string_buffer(empty_acl())
+        info = self.DACL_SECURITY_INFORMATION | self.UNPROTECTED_DACL_SECURITY_INFORMATION
+        code = self.set_named(path, self.SE_FILE_OBJECT, info, None, None, acl, None)
+        if code != 0:
+            raise self._error(code, path)
+
     def create_private_dir(self, path: str) -> bool:
         """Create the directory path with the protected DACL of private_acl from the start (CreateDirectoryW
         with it in its SECURITY_ATTRIBUTES); False if something already exists at path. Raises OSError."""
@@ -342,6 +359,15 @@ def make_private_dir(path: str) -> bool:
     except FileExistsError:
         return False
     return True
+
+
+def inherit_from_parent(path: str):
+    """On Windows, give path (and everything below it) only the access its parent passes on, as if it had been
+    created there plainly: for a get output written below a make_private_dir root, once it is complete.
+    Raises OSError."""
+    acl = _backend() if fsutil.IS_WINDOWS else None
+    if acl is not None:
+        acl.inherit(path)
 
 
 def check_private(path: str, fd: int | None = None) -> str | None:
