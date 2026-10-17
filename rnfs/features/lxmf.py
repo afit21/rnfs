@@ -815,6 +815,21 @@ class LxmfFeature(features.Feature):
         self.off_reason = "LXMF has not been started"
         self.accept_from = {parse_address(a).hex() for a in config.lxmf_accept_from}
         self.auto_fetch_from = {parse_address(a).hex() for a in config.lxmf_auto_fetch_from}
+        # Every attribute is set before any method runs: the start-up steps below can reach the inbox, the
+        # auto-fetch queue and the lock (_release_unrecorded -> _record_kept -> _release)
+        self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
+        self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
+        self._told_no_pn = False  # logged once how to set a propagation node
+        self._auto_queue = _RoundRobin()  # (entry id, link index) by sender
+        self.clock = time.monotonic  # for the rate limit on senders not trusted (tests set their own)
+        self._untrusted_tokens = float(UNTRUSTED_BURST)
+        self._untrusted_at: float | None = None
+        self._untrusted_dry = False  # logged (notice) that the bucket ran dry; verbose until a token is taken
+        self._sender_tokens: OrderedDict[bytes, tuple[float, float]] = OrderedDict()  # sender -> (tokens, when)
+        self._auto_wanted = threading.Condition()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._threads: list[threading.Thread] = []
         self.inbox = MessageLog(config.state_dir, INBOX, INBOX_LIMIT, MAX_INBOX_BYTES, protect=_holds_pins,
                                 valid=_valid_inbox_entry)
         try:
@@ -828,23 +843,10 @@ class LxmfFeature(features.Feature):
                     # LXMF doesn't persist its outbound queue
                     self.outbox.update(entry["id"], state="failed",
                                        error="the daemon stopped before it was delivered")
-            self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
             self._release_unrecorded()
         except BaseException:
             self.close()
             raise
-        self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
-        self._told_no_pn = False  # logged once how to set a propagation node
-        self._auto_queue = _RoundRobin()  # (entry id, link index) by sender
-        self.clock = time.monotonic  # for the rate limit on senders not trusted (tests set their own)
-        self._untrusted_tokens = float(UNTRUSTED_BURST)
-        self._untrusted_at: float | None = None
-        self._untrusted_dry = False  # logged (notice) that the bucket ran dry; verbose until a token is taken
-        self._sender_tokens: OrderedDict[bytes, tuple[float, float]] = OrderedDict()  # sender -> (tokens, when)
-        self._auto_wanted = threading.Condition()
-        self._stop = threading.Event()
-        self._wake = threading.Event()
-        self._threads: list[threading.Thread] = []
 
     def _release_unrecorded(self):
         """Release lxmf: pins no inbox message records as pinned. Pins are saved at once and the inbox every
