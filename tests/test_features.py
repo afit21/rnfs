@@ -177,3 +177,33 @@ class FeatureLifecycleTest(unittest.TestCase):
         self.assertEqual(len(current.deadlines), 1)
         self.assertTrue(before + STOP_TIMEOUT <= current.deadlines[0] <= after + STOP_TIMEOUT, current.deadlines)
         self.assertEqual([t.is_alive() for t in current._spawned], [False])
+
+    def test_follow_deny_and_keepers_wait_for_their_threads(self):
+        """stop() returns only once the feature's own thread has ended (or the deadline passed), so the node
+        doesn't close the state database under it; keepers saves after its thread ends."""
+        from rnfs.config import Config
+        from rnfs.node import RnfsNode
+        from tests.test_names import FakeNetwork
+        from tests.test_node import N1, NetClient
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        node = RnfsNode.offline(Config(rnfs_dir=os.path.join(tmp.name, "n"), slow="no"), N1, NetClient(),
+                                FakeNetwork())
+        self.addCleanup(node.stop)
+        for name in ("follow", "deny", "keepers"):
+            with self.subTest(name):
+                feature = node.feature(name)
+                order = []
+
+                def loop(feature=feature, order=order):
+                    """The feature's loop: still busy a moment after stop is asked."""
+                    feature._stop.wait()
+                    time.sleep(0.3)
+                    order.append("loop ended")
+
+                with mock.patch.object(feature, "_loop", loop), \
+                        mock.patch.object(feature, "save", lambda order=order: order.append("saved")):
+                    feature.start()
+                    feature.stop(time.monotonic() + 5)
+                self.assertEqual(order[0], "loop ended")
+                self.assertFalse(any(thread.is_alive() for thread in feature._spawned))

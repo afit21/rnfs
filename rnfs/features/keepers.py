@@ -621,7 +621,6 @@ class KeepersFeature(Feature):
         self._pending: dict[bytes, None] = {}  # names to refresh in the background, in order
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._listeners: list = []
         # The last name the periodic retry queued: the next retry starts after it, so past MAX_PENDING
         # names without a record every one is asked in turn
@@ -646,13 +645,14 @@ class KeepersFeature(Feature):
 
     def start(self):
         """Start the background refresher."""
-        self._thread = threading.Thread(target=self._loop, name="rnfs-keepers", daemon=True)
-        self._thread.start()
+        self._spawn(self._loop, "rnfs-keepers")
 
-    def stop(self):
-        """Stop the refresher and save."""
+    def stop(self, deadline: float | None = None):
+        """Stop the refresher, wait for it until deadline, then save: so the last save comes after its last
+        change, and the node doesn't close the state database under it."""
         self._stop.set()
         self._wake.set()
+        self._join(deadline)
         self.save()
 
     def save(self):

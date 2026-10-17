@@ -86,7 +86,6 @@ class DenyFeature(Feature):
         self._failures: dict[str, int] = {}  # source -> checks failed in a row
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         for source in self.deny.accepted():
             if source not in self._sources:
                 self.deny.forget(source)
@@ -112,13 +111,14 @@ class DenyFeature(Feature):
         with self._lock:
             for source in self._sources:
                 self._due[source] = first
-        self._thread = threading.Thread(target=self._loop, name="rnfs-deny", daemon=True)
-        self._thread.start()
+        self._spawn(self._loop, "rnfs-deny")
 
-    def stop(self):
-        """Stop the background thread (a fetch in progress stops at its next network wait)."""
+    def stop(self, deadline: float | None = None):
+        """Stop the background thread and wait for it until deadline (a fetch in progress stops at its next network
+        wait), so the node doesn't close the state database under it."""
         self._stop.set()
         self._wake.set()
+        self._join(deadline)
 
     def status(self) -> dict:
         """Entries denied (the local list's and every source's) and sources configured."""
