@@ -540,7 +540,8 @@ class ApiConnection:
         return self.post("/api/name/create", alias=alias)
 
     def name_publish(self, alias: str, target: str) -> dict:
-        """Point a name of this node at a target: {"name", "cid", "sequence"}."""
+        """Point a name of this node at a target: {"name", "cid", "sequence"}, and "warning" in private mode (the
+        name's announce is visible outside the private network)."""
         return self.post("/api/name/publish", alias=alias, target=target)
 
     def name_resolve(self, name: str) -> dict:

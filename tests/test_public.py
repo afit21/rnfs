@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from unittest import mock
 
 import RNS
@@ -248,6 +249,24 @@ class PublicTests:
         with self.assertRaises(rnfs.NotFound):
             self.rnfs.names.get("site")
         self.assertEqual(self.rnfs.names.import_key("again", key).name, name.name)
+
+    def test_publish_warning_is_a_runtime_warning(self):
+        """The node's private-mode warning on publish (DHT-4) reaches the program as a RuntimeWarning, and the
+        record is returned as usual; without one, nothing is warned."""
+        cid = self.rnfs.add(b"site").cid
+        name = self.rnfs.names.create("site")
+        original = self.rnfs._backend.name_publish
+
+        def warning_publish(alias, target):
+            return {**original(alias, target), "warning": "visible outside the private network"}
+
+        with mock.patch.object(self.rnfs._backend, "name_publish", warning_publish), \
+                self.assertWarnsRegex(RuntimeWarning, "visible outside the private network"):
+            record = name.publish(cid)
+        self.assertEqual((record.cid, record.sequence), (cid, 1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertEqual(name.publish(cid).sequence, 2)
         self.assertEqual(rnfs.Name.from_dict(name.to_dict()), name)
 
     def test_watch_hears_newer_records_on_the_event_thread(self):
