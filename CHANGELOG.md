@@ -161,6 +161,8 @@ Changed:
   step no longer leaves the database open or the `rnfs.dht` destination registered in a host program. Stopping
   waits at most 5 s in all for the features' threads and the node's own (LXMF and jobs no longer add 2 s each),
   and remote-pin fetches stop with the node (their pins are fetched at the next start).
+- A pin name or contact whose save failed (a full disk, say) is written again by the node's next save, at the
+  latest at stop, rather than only at the next change.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -177,6 +179,9 @@ Faster:
 - `open()` on `rnfs.Client` or `rnfs.Node` reads ahead while reads are sequential, doubling each refill from 64
   KiB up to 4 MiB; a seek that moves starts again with a read of only what it covers. Sequential 64 KiB reads: 33
   → 560 MB/s through `rnfs.Client`, 79 → 1219 MB/s on `rnfs.Node`; `read()` of a whole file 310 → 589 MB/s.
+- An add makes one durable commit instead of two: the pin is committed durably first, and the name `pin ls` shows
+  for it is written after it without a sync of its own, so a power loss can lose at most the latest names, never
+  a pin. 4 KiB adds 12.9 → 10.5 ms, 1 MiB adds 18.9 → 16.4 ms on a local SSD.
 - Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
   over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
   there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
