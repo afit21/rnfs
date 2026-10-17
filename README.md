@@ -322,7 +322,10 @@ pipx install git+https://github.com/afit21/rnfs                                 
 pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip          # Windows (no git needed)
 ```
 
-Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too.
+Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too. Both
+resolve rnfs's dependencies (Reticulum, LXMF, cryptography, ...) unpinned, at the newest versions rnfs allows,
+not at the tested versions and hashes in `packaging/requirements.lock` that the other packages and the install
+script use.
 
 ### From source
 
