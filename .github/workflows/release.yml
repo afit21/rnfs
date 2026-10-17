@@ -161,7 +161,9 @@ jobs:
           manifest-path: packaging/flatpak/io.github.afit21.rnfs.yml
           bundle: rnfs.flatpak
           arch: x86_64
-          cache-key: flatpak-builder-${{ github.sha }}
+          # No Actions cache: any default-branch workflow can write one, and a restored cache would go into the
+          # attested bundle
+          cache: false
           upload-artifact: false
       - name: Install and smoke test the bundle
         # Best effort: running sandboxed apps inside the CI container depends on the runner's kernel settings

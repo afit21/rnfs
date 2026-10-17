@@ -148,6 +148,17 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertFalse([line for line in uploads if "--clobber" in line])
         self.assertRegex(text, r"actions/attest-build-provenance@[0-9a-f]{40}")
 
+    def test_flatpak_builds_skip_the_actions_cache(self):
+        """Every flatpak-builder step turns the Actions cache off: a cache any workflow run can write must not
+        reach a release bundle."""
+        steps = 0
+        for name in os.listdir(WORKFLOWS):
+            text = read(os.path.join(WORKFLOWS, name))
+            for step in re.finditer(r"(?m)^( *)- uses: [^\n]*/flatpak-builder@.*\n((?:\1  .*\n)*)", text):
+                steps += 1
+                self.assertRegex(step.group(2), r"(?m)^ +cache: false$", f"{name}: {step.group(0)}")
+        self.assertTrue(steps)
+
     def test_release_waits_for_the_tests(self):
         """The release job needs the whole tests workflow, called from release.yml."""
         release = read(os.path.join(WORKFLOWS, "release.yml"))
