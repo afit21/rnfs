@@ -868,7 +868,12 @@ busiest one's newest place (that link is marked skipped). Links without the fiel
 `MAX_SCAN_CHARS` (16 384) characters of the content. `inbox get` (through the jobs feature) checks every output
 before starting any (two links with one output are refused), then submits a get job per link with its `from`
 and `fallback_dht`; once one has started, a later link's failure is reported in its result (`error`) rather
-than raised. An output without `-o` is named with `fsutil.safe_default_name`. Sent links carry `from` only with
+than raised. Names are resolved while planning: `_resolve(link, persist, allow_sent_cid)` returns
+`(cid, names, fell_back)` and raises NotFound (naming `--use-sent-cid`) for an unresolvable name unless
+`allow_sent_cid`, so without `use_sent_cid` nothing is written and no job submitted; with it, a link that fell
+back to its sent CID gets a `warnings` entry in its result. Auto-fetch passes `allow_sent_cid=True` (its senders
+are trusted) and records `"sent_cid": true` with such a pin; `_print_links` shows it, and a name link's sent CID.
+An output without `-o` is named with `fsutil.safe_default_name`. Sent links carry `from` only with
 `lxmf_send_from_hint`. The inbox and outbox are rows of the `lxmf_messages` table, saved in batches (NORMAL).
 
 **Feature API routes** (all need the token): `POST /api/jobs`, `GET /api/jobs`, `GET /api/jobs/get?id=&wait=`,
@@ -882,8 +887,9 @@ takes, for a get, the JSON booleans `sealed_name` (write a sealed file this node
 name in the output's directory; the CLI sets it for `rnfs get <bare cid>` without `-o`, so it no longer calls
 `GET /api/info` first) and `fallback_dht` (a get with `from` that fails, other than by cancellation,
 `TooLarge` or `StorageFull`, is retried once through the DHT). `POST /api/lxmf/send` and `/api/lxmf/sync` take
-`nearest`; `GET /api/lxmf/address` returns `propagation_node` (the configured one only) and
-`nearest_propagation_node`. Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
+`nearest`; `POST /api/lxmf/inbox/get` takes `use_sent_cid` (without it, an unresolvable name link is 404);
+`GET /api/lxmf/address` returns `propagation_node` (the configured one only) and `nearest_propagation_node`.
+Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 `chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`; `GET /api/cat`
 `raw=1`, `block=1`; `GET /api/info` `from`.
 

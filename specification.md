@@ -1119,7 +1119,7 @@ are local conveniences, not part of the protocol.
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
-| `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set |
+| `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
 | `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address (only the version without a readable API token) |
 
@@ -1498,6 +1498,13 @@ unreserved, pct-encoded: as in RFC 3986
   the DHT if that fails. `inbox get` without `-o` names its output by the `get` rule (section 11): the link's
   last path name only if it is printable, not hidden, doesn't start with `-` and is a valid file name, else
   the root CID.
+- A `name/` link is fetched at what the name resolves to. Its `cid` is only the sender's word: nothing ties
+  it to the name, so any sender could pose as a well-known name with it. If the name can't be resolved,
+  `inbox get` fails (404 through the API) before writing anything or starting a job, unless the user passes
+  `--use-sent-cid` (API: `use_sent_cid`): then it fetches the sent CID and that link's result carries a
+  warning saying so. A name that resolves is always used. Auto-fetch, whose senders are trusted, falls back
+  to the sent CID and records `"sent_cid": true` with the pin. `inbox` shows a name link's sent CID ("sent
+  as `<cid>`") and such a pin ("auto-fetch pinned (sent CID; name unresolved)").
 
 ## Appendix A. Comparison with IPFS
 
