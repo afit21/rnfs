@@ -575,9 +575,11 @@ class RnfsNode:
         self.storage.deny = self.deny
         self.deny.reload(self._read_deny_list)
         self._hash_noticed: set[Cid] = set()  # files _check_file refused by hash and logged the NOTICE for
-        # The shared folder is written through: nothing to save
+        # The shared folder is written through: nothing to save. Its per-file cache (what the files inside its entries
+        # were built as) is saved with the batched stores; the shared folder's close releases it too
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
         self._add_store(_StoreParts(close=self.shared_folder.close), batched=False)
+        self._add_store(self.shared_folder.files)
         # Where pins came from, for pin ls (local only). Written through, not durably: a power loss can lose a
         # name, never the pin it names, which is committed durably first; its save writes a name whose write failed
         self.pin_names = self._add_store(PinNames(config.state_dir), batched=False)

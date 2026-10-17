@@ -3,17 +3,23 @@ import hashlib
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
 from rnfs import fsutil, statedb
+from rnfs.config import Config
 from rnfs.content import builder, chunker, shared_folder
+from rnfs.content.builder import Built
 from rnfs.content.cid import RAW, Cid
-from rnfs.content.shared_folder import SharedFolder
+from rnfs.content.shared_folder import FolderFiles, SharedFolder
 from rnfs.content.storage import FOLDER, USER, Storage
 from rnfs.errors import Denied
+from rnfs.node import RnfsNode
 from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES, state_execute, state_rows, write_legacy
 from tests.test_builder import swap_on_open, within
+from tests.test_names import FakeNetwork
+from tests.test_node import A_ID, NetClient
 
 SECRET = b"private key"
 
@@ -359,6 +365,90 @@ class SharedFolderTest(unittest.TestCase):
         self.folder.scan(builder.BuildOptions(chunker.FASTCDC))
         self.assertIsNone(self.folder.files.get(builder.file_state(os.stat(paths[0]))))
 
+    def file_rows(self) -> dict:
+        """What the shared_folder_files table holds: (entry name, state) -> (CID, height, digest)."""
+        return {(statedb.load(name), tuple(statedb.load(state))): (Cid.from_bytes(cid), height, digest)
+                for name, state, cid, height, digest in state_rows(
+                    self.state, "SELECT name, state, cid, height, digest FROM shared_folder_files")}
+
+    def test_the_file_cache_survives_a_restart(self):
+        """What files were built as is saved (by save(), with the node's batched stores), and a restart keeps it;
+        rows follow the entries: a file replaced or removed, and an entry removed, take their rows with them."""
+        paths = self.tree(3)
+        hashing = builder.BuildOptions(check=lambda digest: None)
+        self.folder.scan(hashing)
+        self.assertEqual(self.file_rows(), {})  # saved by save(), not by the scan
+        self.folder.files.save()
+        states = [builder.file_state(os.stat(path)) for path in paths]
+        self.assertEqual(self.file_rows(), {("dir", state): (Cid.for_block(RAW, f"file {i}".encode()), 0,
+                                                             hashlib.sha256(f"file {i}".encode()).digest())
+                                            for i, state in enumerate(states)})
+        self.folder.close()
+        self.folder = self.open()
+        self.rewrite(paths[0], b"changed")
+        self.assertEqual(self.scan_counting(hashing), ({self.cid_of("dir")}, 1))
+        self.folder.files.save()
+        rows = self.file_rows()
+        self.assertEqual(len(rows), 3)
+        self.assertNotIn(("dir", states[0]), rows)
+        self.assertIn(("dir", builder.file_state(os.stat(paths[0]))), rows)
+        os.remove(paths[1])
+        self.folder.scan(hashing)
+        self.folder.files.save()
+        self.assertEqual(len(self.file_rows()), 2)
+        for path in (paths[0], paths[2]):
+            os.remove(path)
+        os.rmdir(os.path.dirname(paths[0]))
+        self.folder.scan(hashing)
+        self.folder.files.save()
+        self.assertEqual(self.file_rows(), {})
+
+    def test_damaged_file_rows_are_deleted(self):
+        """File rows that don't parse are skipped at load and deleted; the others are kept."""
+        (path,) = self.tree(1)
+        self.folder.scan()
+        self.folder.files.save()
+        ((name, state), (cid, _, _)), = self.file_rows().items()
+        good = statedb.dump(list(state))
+        bad = [("not json", good, cid.binary, 0, None), ("7", good, cid.binary, 0, None),
+               ('"x"', "not json", cid.binary, 0, None), ('"x"', "[1, 2]", cid.binary, 0, None),
+               ('"x"', "[1, 2, -3, 4, false]", cid.binary, 0, None), ('"x"', "[true, 2, 3, 4, false]", cid.binary, 0, None),
+               ('"x"', "[1, 2, 3, 4, 1]", cid.binary, 0, None), ('"a"', good, b"not a cid", 0, None),
+               ('"b"', good, cid.binary, -1, None), ('"c"', good, cid.binary, "zero", None),
+               ('"d"', good, cid.binary, 0, b"short")]
+        for row in bad:
+            state_execute(self.state, "INSERT INTO shared_folder_files (name, state, cid, height, digest) "
+                                      "VALUES (?, ?, ?, ?, ?)", row)
+        with mock.patch("rnfs.content.shared_folder.log"):
+            folder = self.open()
+        self.assertEqual(set(self.file_rows()), {(name, state)})
+        self.assertEqual(folder.files.get(builder.file_state(os.stat(path))), Built(cid, 6, 0, 0))
+
+    def test_failed_file_save_is_written_by_the_next(self):
+        """A save whose commit failed raises, keeps the changes, and the next save writes them."""
+        self.tree(2)
+        self.folder.scan()
+        with mock.patch.object(self.folder.files._rows.db, "transaction",
+                               side_effect=statedb.StateDbError("disk I/O error")):
+            with self.assertRaises(OSError):
+                self.folder.files.save()
+        self.assertEqual(self.file_rows(), {})
+        self.folder.files.save()
+        self.assertEqual(len(self.file_rows()), 2)
+
+    def test_file_entry_names_that_are_not_unicode_round_trip(self):
+        """An entry name with a lone surrogate is saved and loaded as it was."""
+        files = FolderFiles(self.state)
+        self.addCleanup(files.close)
+        state = (1, 2, 1, 4, False)
+        built = Built(Cid.for_block(RAW, b"x"), 1, 0, 0, hashlib.sha256(b"x").digest())
+        files.update("caf\udce9", {state: built}, complete=True)
+        files.save()
+        loaded = FolderFiles(self.state)
+        self.addCleanup(loaded.close)
+        self.assertEqual(loaded._entries, {"caf\udce9": {state: built}})
+        self.assertEqual(loaded.get(state).digest, built.digest)
+
     def test_creates_missing_directory(self):
         self.assertEqual(self.folder.scan(), set())
         self.assertTrue(os.path.isdir(self.files))
@@ -527,6 +617,40 @@ class SharedFolderTest(unittest.TestCase):
             pins = within(5, self.folder.scan)
         self.assertEqual(pins, {self.cid_of("dir")})
         self.assertEqual(within(5, self.folder.scan), pins)
+
+
+class NodeFileCacheTest(unittest.TestCase):
+    """The node saves the shared folder's per-file cache with its other stores (D1, XC5)."""
+
+    def test_saved_at_stop_and_used_after_a_restart(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=os.path.join(tmp.name, "rnfs"), slow="no")
+        paths = []
+        for i in range(3):
+            path = os.path.join(config.files_dir, "dir", f"f{i}")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(f"file {i}".encode())
+            paths.append(path)
+        node = RnfsNode.offline(config, A_ID, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        self.assertIn(node.shared_folder.files, node._every_store(batched=True))
+        node.maintain(time.monotonic(), {})
+        self.assertEqual(state_rows(config.state_dir, "SELECT COUNT(*) FROM shared_folder_files"), [(0,)])
+        node.stop()
+        self.assertEqual(state_rows(config.state_dir, "SELECT COUNT(*) FROM shared_folder_files"), [(3,)])
+        st = os.stat(paths[0])
+        with open(paths[0], "wb") as f:
+            f.write(b"changed")
+        os.utime(paths[0], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        node = RnfsNode.offline(config, A_ID, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        with mock.patch.object(builder, "build_file", wraps=builder.build_file) as build_file:
+            node.maintain(time.monotonic(), {})
+        self.assertEqual(build_file.call_count, 1)
+        self.assertEqual(node.storage.pinned_by(FOLDER),
+                         {builder.add_path(os.path.join(config.files_dir, "dir"), builder.NO_PUT)[0].cid})
 
 
 if __name__ == "__main__":

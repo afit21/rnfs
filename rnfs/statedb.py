@@ -136,6 +136,13 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # Files' content SHA-256 (digest) by binary CID; used orders them (least recently used lowest)
         "CREATE TABLE deny_hashes (cid BLOB PRIMARY KEY, digest BLOB NOT NULL, used INTEGER NOT NULL) WITHOUT ROWID",
     )),
+    ("shared_folder_files", (
+        # What each file in the shared folder was built as (rnfs 0.1.6). name: the dump()ed top-level entry holding
+        # it; state: the dump()ed [device, inode, size, mtime_ns, execute bit] (text: an inode may not fit SQLite's
+        # integers); digest: its content SHA-256, NULL if it was built without one
+        "CREATE TABLE shared_folder_files (name TEXT NOT NULL, state TEXT NOT NULL, cid BLOB NOT NULL,"
+        " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
+    )),
 )
 
 

@@ -1059,7 +1059,11 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at
   most 4 × `name_table_size`, or 8 × for names resolved within 7 days; NORMAL, saved by a resolve or record
   raising it, at most every 5 s, and by the re-announce loop when changed);
-- `shared_folder` (FULL); `jobs` (record per job in creation order; FULL, including progress saves; results keep
+- `shared_folder` (FULL) and `shared_folder_files` (the shared folder's per-file cache, `FolderFiles`: one row per
+  file per top-level entry, the `dump()`ed entry name and `[device, inode, size, mtime_ns, execute bit]` as text,
+  the CID, its height and the content SHA-256 if one was computed; a `RowStore` in SNAPSHOT mode, NORMAL with the
+  periodic saves and at stop, changed rows only: a power loss costs at most reading some files again);
+- `jobs` (record per job in creation order; FULL, including progress saves; results keep
   at most 100 warnings plus `warnings_total`, older results capped at load); `keepers` (records re-verified at
   load; NORMAL); `follow` (FULL); `contacts` (FULL); `lxmf_messages` (inbox: 500 messages, 4 MiB, 50 per
   non-auto-fetch sender, 16 KiB per record; outbox 200, unfinished messages marked failed at a restart; NORMAL,
@@ -1257,7 +1261,8 @@ Everything in the specification is implemented, with these simplifications and a
   import, as before), and its remembered content hash still goes to `BuildOptions.check`; one remembered without
   a hash (built while the deny list had none) is read again when there is a check. A file whose state changed
   while it was read isn't remembered. Only fixed-chunker builds use it. It sits behind CONT-3's target check: a
-  refused folder is scanned as empty, which empties it.
+  refused folder is scanned as empty, which empties it. It is a store of its own (`shared_folder_files`, saved
+  with the node's batched stores, `RnfsNode._add_store`), so a restart doesn't read the folder's files again.
 - The shared-folder scan and `add` walk directories by file descriptor (`O_NOFOLLOW`, `O_NONBLOCK`, type and
   inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. The scan (not `add`)
   skips regular files whose opened descriptor has `st_nlink > 1` (`builder.hard_links`, `build_open`'s

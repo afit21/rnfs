@@ -8,6 +8,8 @@ any, the entries changed are written durably), so unchanged entries aren't hashe
 changed, a regular file is not read again either if it was imported before and its device, inode, size,
 modification time and execute bit are as they were (FolderFiles, audit D1): its CID is reused while every block of
 it is still stored and none is denied, and its remembered content hash still goes through the deny list's check.
+What the files were built as is kept in the shared_folder_files table, saved with the node's periodic saves and at
+stop, not durably: a power loss costs at most reading some files again.
 
 An entry that fails to import because of its content (an invalid name, the deny list, too large) isn't tried
 again until it changes; one that fails for a reason that may pass (a full or failing disk, a pin that couldn't be
@@ -160,21 +162,92 @@ def loose_ancestor(real: str) -> str | None:
     return None
 
 
+FILES_TABLE = "shared_folder_files"
+
+
+def _parse_state(value) -> FileState:
+    """A builder.file_state saved as a JSON list. Raises ValueError (or TypeError) if it isn't one."""
+    if not (isinstance(value, list) and len(value) == 5 and isinstance(value[4], bool)
+            and all(isinstance(n, int) and not isinstance(n, bool) for n in value[:4]) and value[2] >= 0):
+        raise ValueError(f"not a file state: {value!r}")
+    return value[0], value[1], value[2], value[3], value[4]
+
+
+def _record(built: Built | None) -> tuple | None:
+    """What a FolderFiles row holds of built (its size and kind come from the state), to tell a change."""
+    return None if built is None else (built.cid, built.height, built.digest)
+
+
 class FolderFiles:
     """The shared folder's per-file cache (audit D1): what each regular file imported from the folder was built as,
     by its builder.file_state, so the files of a changed entry that didn't change aren't read again.
 
     Kept per top-level entry: an entry imported again keeps only the files it holds now, and an entry gone takes its
     files with it. A file is found by its state whatever entry holds it, so one moved to another entry is reused
-    too. In memory.
+    too. Kept in state_dir's state database (FILES_TABLE; only in memory without one), as a node.Store: save()
+    writes the rows changed since the last save (not durably), close() releases the database.
     """
 
-    def __init__(self):
-        """An empty cache."""
+    def __init__(self, state_dir: str | None = None):
+        """The cache saved in state_dir (empty without one); a row that doesn't parse is logged and deleted."""
         self._lock = threading.Lock()  # held briefly, never during a build
         self._entries: dict[str, dict[FileState, Built]] = {}  # entry name -> its files' states and what they built
         self._index: dict[FileState, Built] = {}  # every entry's files, by state
         self._stale = False  # _index may hold files no entry holds any more (retain rebuilds it)
+        self._rows: statedb.RowStore | None = None
+        self._db = statedb.open_store(os.path.expanduser(state_dir), self._load) if state_dir else None
+
+    def _load(self, db: statedb.StateDb):
+        """Read FILES_TABLE."""
+        # Saved with the node's batched saves and at stop, outside the lock, not durably: what a power loss takes
+        # is read again
+        self._rows = statedb.RowStore(db, FILES_TABLE, ("name", "state"), durable=False, mode=statedb.SNAPSHOT,
+                                      lock=self._lock, row=self._row, key_values=self._key_values)
+        bad = []
+        for name_text, state_text, binary, height, digest in db.query(
+                f"SELECT name, state, cid, height, digest FROM {FILES_TABLE}"):
+            try:
+                name, state = statedb.load(name_text), _parse_state(statedb.load(state_text))
+                if not isinstance(name, str):
+                    raise TypeError("not a string")
+                if not (isinstance(height, int) and 0 <= height <= constants.MAX_DEPTH):
+                    raise ValueError(f"height {height!r}")
+                if digest is not None and not (isinstance(digest, bytes) and len(digest) == 32):
+                    raise ValueError("not a SHA-256 digest")
+                kind = dag.KIND_EXECUTABLE if state[4] else dag.KIND_FILE
+                built = Built(Cid.from_bytes(binary), state[2], kind, height, digest)
+            except (ValueError, TypeError):
+                log(f"shared folder: ignoring invalid saved file {name_text!r} {state_text!r}", LOG_WARNING)
+                bad.append((name_text, state_text))
+                continue
+            self._entries.setdefault(name, {})[state] = built
+            self._index[state] = built
+        statedb.delete_rows(db, FILES_TABLE, ("name", "state"), bad)
+
+    @staticmethod
+    def _key_values(key: tuple[str, FileState]) -> tuple[str, str]:
+        """The name and state columns of a row's key (entry name, state)."""
+        name, state = key
+        return statedb.dump(name), statedb.dump(list(state))
+
+    def _row(self, key: tuple[str, FileState]) -> tuple | None:
+        """The row of key (entry name, state), or None if it is gone (lock held)."""
+        name, state = key
+        built = self._entries.get(name, {}).get(state)
+        if built is None:
+            return None
+        return (*self._key_values(key), built.cid.binary, built.height, built.digest)
+
+    def save(self):
+        """Write the files changed since the last save. Raises OSError (StateDbError) if the database fails; they
+        are written by the next save."""
+        if self._rows is not None:
+            self._rows.save()
+
+    def close(self):
+        """Release the state database (idempotent)."""
+        if self._db is not None:
+            self._db.close()
 
     def get(self, state: FileState) -> Built | None:
         """What the file in state was built as, if known."""
@@ -200,7 +273,7 @@ class FolderFiles:
                 self._stale = False
 
     def _set(self, name: str, files: dict[FileState, Built]):
-        """Make files entry name's (none: forget it). Lock held."""
+        """Make files entry name's (none: forget it), noting the rows that change. Lock held."""
         old = self._entries.get(name, {})
         if old.keys() - files.keys():
             self._stale = True
@@ -208,6 +281,9 @@ class FolderFiles:
             self._entries[name] = files
         else:
             self._entries.pop(name, None)
+        if self._rows is not None:
+            self._rows.changed(*((name, state) for state in old.keys() | files.keys()
+                                 if _record(old.get(state)) != _record(files.get(state))))
 
 
 class _EntryFiles:
@@ -269,8 +345,9 @@ class SharedFolder:
         # Entry name -> (signature that failed to import, when to try it again: None for not until it changes)
         self._failed: dict[str, tuple[str, float | None]] = {}
         self._warned: set[str] = set()  # skipped entries already warned about
-        self.files = FolderFiles()  # what the files inside entries were built as (D1)
         try:
+            # What the files inside entries were built as (D1): a store of its own, which the node saves
+            self.files = FolderFiles(state_dir)
             self._load()
         except BaseException:
             self.close()
@@ -314,7 +391,11 @@ class SharedFolder:
         self._saved = dict(self._known)
 
     def close(self):
-        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        """Release the state database, the per-file cache's too (the node calls this once it has saved everything
+        at shutdown; the cache's changes are saved by files.save(), not here)."""
+        files = getattr(self, "files", None)  # not made if __init__ failed first
+        if files is not None:
+            files.close()
         if self._db is not None:
             self._db.close()
 
