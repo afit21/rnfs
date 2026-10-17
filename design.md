@@ -205,7 +205,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
   cache records, so they never refer to block names a power loss could undo.
 - pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
-  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]`, `pin_count()`, `is_complete(cid)`.
+  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]` (a copy), `pinned_cids() -> frozenset[Cid]` (the
+  same set until pins change: the publisher's refresh reads it after every add), `has_pin(cid, source)`,
+  `pin_count()`, `is_complete(cid)`.
 - cache: `record_fetch(root, names, target)` (keeps the path's nodes and the target's DAG), LRU touched on use.
   `cache_generation()` grows whenever records are removed or retargeted, so the node prunes its fetched
   targets only then. `changes()` grows with every block stored or deleted, pin or release, and record added,
@@ -399,7 +401,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
-| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. Callers that show pins to others must skip `sealed` entries' names and content |
+| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
@@ -814,7 +816,11 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   creating the output, so nothing raised there leaves a file. `open_sealed` reports the stored (ciphertext)
   size as a job's total, which is what its done bytes count.
 - Cost: `get`, `cat` and `info` of a file read its first 12 bytes to detect sealing (`--raw` skips this), so
-  the first chunk is fetched first even for a `cat --offset` deep in a file. The gateway does so only for a
+  the first chunk is fetched first even for a `cat --offset` deep in a file. `info` and `read` (so `cat`) remember
+  the targets found not to be sealed (`RnfsNode._open_sealed`: by resolved expectation, `NOT_SEALED_MEMO` 4096,
+  least recently used forgotten first; emptied when the deny list's CIDs change, since that read meets them), so
+  reading one again doesn't read its first bytes; `read_file` (`GET /api/cat`) hands the `SealedFile` its info
+  opened to its read rather than opening it twice. The gateway does so only for a
   GET from byte 0 or a web page's request (`limited()`, so its type never depends on what is stored); the
   user's own HEAD, or range not at 0, uses the first bytes only if already stored (`stored_head`), else takes
   the Content-Type from the name, or `application/octet-stream`. `stored_head` applies the deny list as a read
@@ -1050,7 +1056,10 @@ runs while a lock is held:
   deny list's CID set, the key sources' keys or the strategy. A refresh that changed none of them returns at once
   (about 1 µs, from 7 ms at 10 000 pins); the generation is read before computing, so a change made meanwhile
   makes the next refresh compute. When it does compute, it builds the set of blocks served again only when a
-  provided CID went or its DAG's blocks changed (CIDs only added are unioned in).
+  provided CID went or its DAG's blocks changed (CIDs only added are unioned in). It takes the pins as
+  `Storage.pinned_cids()`, not a copy of every pin's sources, and gathers the keys withdrawals are queued for once,
+  so an item newly provided searches the queues only when its key is among them (a mass re-pin, or the first
+  refresh after a start with withdrawals pending).
 - `Storage.evict` and `gc` decide what to delete, and delete it, under the storage lock (after reading the DAG
   nodes outside it); `verify` checks completeness and re-reads the blocks outside it.
 - Every pin and unpin commits its row durably (`synchronous=FULL`, after the blocks are synced) under the

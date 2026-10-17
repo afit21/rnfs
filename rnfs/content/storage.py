@@ -276,6 +276,7 @@ class Storage:
         self._sizes: dict[Cid, int] = dict(self.blocks.scan())
         self._used = sum(self._sizes.values())
         self._pins: dict[Cid, set[str]] = {}
+        self._pinned: frozenset[Cid] | None = None  # pinned_cids(), built when asked; None again once pins change
         self._cache: OrderedDict[CacheKey, Cid] = OrderedDict()  # oldest first
         self._sessions: list[Session] = []
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
@@ -470,6 +471,7 @@ class Storage:
             if not added:
                 return
             self._changes += 1
+            self._pinned = None
             try:
                 self._save_pins(source, added=added)
             except BaseException:
@@ -479,6 +481,7 @@ class Storage:
                     sources.discard(source)
                     if not sources:
                         del self._pins[cid]
+                self._pinned = None
                 raise
 
     def unpin(self, cid: Cid, source: str) -> bool:
@@ -492,10 +495,12 @@ class Storage:
             if not sources:
                 del self._pins[cid]
                 self._maybe_garbage = True
+                self._pinned = None
             try:
                 self._save_pins(source, removed=[cid])
             except BaseException:
                 self._pins.setdefault(cid, set()).add(source)  # still pinned, as the database says
+                self._pinned = None
                 raise
             return True
 
@@ -503,6 +508,14 @@ class Storage:
         """Every pin and its sources (a copy)."""
         with self._lock:
             return {cid: set(sources) for cid, sources in self._pins.items()}
+
+    def pinned_cids(self) -> frozenset[Cid]:
+        """Every pinned CID: the same frozenset until pins change, so asking after every add costs nothing where
+        pins() would copy every pin and its sources."""
+        with self._lock:
+            if self._pinned is None:
+                self._pinned = frozenset(self._pins)
+            return self._pinned
 
     def pinned_by(self, source: str) -> set[Cid]:
         """CIDs held by source."""
