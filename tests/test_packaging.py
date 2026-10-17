@@ -1,4 +1,6 @@
-"""Static checks of the packaging files: install.sh's isolation and unit quoting, and the dependency lock."""
+"""Static checks of the packaging files: install.sh's isolation and unit quoting, the dependency locks, the workflows,
+the supported Pythons and the CHANGELOG's version."""
+import ast
 import json
 import os
 import re
@@ -336,6 +338,92 @@ class DependencyLockTest(unittest.TestCase):
 def version_tuple(text: str) -> tuple[int, ...]:
     """(1, 2, 3) from "1.2.3"."""
     return tuple(int(part) for part in text.split("."))
+
+
+def python_constants(path: str) -> dict[str, object]:
+    """The module-level constants (literals) a Python script assigns, read without running it."""
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), path)
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            try:
+                constants[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass  # not a literal
+    return constants
+
+
+def shell_assignment(path: str, name: str) -> str:
+    """The value of a NAME=value (or NAME="value") line in a shell script."""
+    match = re.search(r'(?m)^%s="?([^"\n#]*?)"?(?:\s+#.*)?$' % re.escape(name), read(path))
+    assert match, (path, name)
+    return match.group(1)
+
+
+class SupportedPythonsTest(unittest.TestCase):
+    """The supported Pythons are written in several places; they all agree with the tests.yml matrix (TS7), so
+    adding one (or dropping one) in only some of them fails here rather than in a release build."""
+
+    @classmethod
+    def setUpClass(cls):
+        """The tests.yml matrix's Pythons, oldest first."""
+        matrix = re.search(r'(?m)^ +python: \[(.*)\]$', read(os.path.join(WORKFLOWS, "tests.yml")))
+        assert matrix
+        cls.pythons = sorted(re.findall(r'"(3\.\d+)"', matrix.group(1)), key=version_tuple)
+        cls.oldest, cls.newest = cls.pythons[0], cls.pythons[-1]
+
+    def test_matrix_is_consecutive(self):
+        """The matrix is every minor version from the oldest to the newest."""
+        major, low = version_tuple(self.oldest)
+        self.assertEqual(self.pythons, [f"{major}.{minor}" for minor in range(low, version_tuple(self.newest)[1] + 1)])
+
+    def test_requires_python(self):
+        """pyproject.toml's requires-python is the oldest."""
+        with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
+            self.assertEqual(tomllib.load(f)["project"]["requires-python"], f">={self.oldest}")
+
+    def test_update_lock(self):
+        """build-tools.lock has wheels for every matrix Python, and requirements.lock is resolved for the oldest."""
+        constants = python_constants(os.path.join(REPO, "packaging", "update-lock.py"))
+        self.assertEqual(constants["BUILD_PYTHONS"], self.pythons)
+        args = constants["RESOLVE_ARGS"]
+        self.assertEqual(args[args.index("--python-version") + 1], self.oldest)
+        args = constants["BUILD_RESOLVE_ARGS"]
+        self.assertIn(args[args.index("--python-version") + 1], self.pythons)
+
+    def test_flatpak_runtime_pythons(self):
+        """The Flatpak's wheels are for supported Pythons, up to the newest (the runtime's Python and its
+        neighbours)."""
+        runtime = python_constants(os.path.join(REPO, "packaging", "flatpak", "generate-sources.py"))["RUNTIME_PYTHONS"]
+        self.assertLessEqual(set(runtime), set(self.pythons))
+        self.assertEqual(max(runtime, key=version_tuple), self.newest)
+
+    def test_build_deb(self):
+        """The .deb bundles a cffi backend for every matrix Python, and its python3 dependency is within them."""
+        self.assertEqual([self.oldest, *shell_assignment(BUILD_DEB, "EXTRA_PYTHONS").split()], self.pythons)
+        major, minor = version_tuple(self.newest)
+        self.assertEqual(shell_assignment(BUILD_DEB, "PYTHON_BELOW"), f"{major}.{minor + 1}")
+        text = read(BUILD_DEB)
+        self.assertIn(f"for version in {self.oldest} $EXTRA_PYTHONS; do", text)
+        self.assertIn(f"--python-version {self.oldest} ", text)
+        self.assertIn(f"Depends: python3 (>= {self.oldest}),", text)
+
+    def test_install_sh(self):
+        """install.sh accepts the oldest and looks for each matrix Python by name, newest first."""
+        candidates = re.search(r"(?m)^    for candidate in (.*); do$", shell_function("find_python"))
+        self.assertTrue(candidates)
+        self.assertEqual(candidates.group(1).split(),
+                         ["python3", *(f"python{v}" for v in reversed(self.pythons))])
+        major, minor = version_tuple(self.oldest)
+        self.assertIn(f"sys.version_info >= ({major}, {minor})", shell_function("python_ok"))
+        self.assertIn(f"older than Python {self.oldest}, which rnfs needs", shell_function("find_python"))
+
+    def test_readme_pyinstaller_is_locked(self):
+        """README's pyinstaller==X (building the binary by hand) is the version build-tools.lock pins."""
+        versions = re.findall(r"\bpyinstaller==([\w.]+)", read(os.path.join(REPO, "README.md")))
+        self.assertTrue(versions)
+        self.assertEqual(set(versions), {read_lock(TOOLS_LOCK)["pyinstaller"][0]})
 
 
 class ChangelogTest(unittest.TestCase):
