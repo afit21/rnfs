@@ -958,6 +958,29 @@ class StopTest(NodeTest):
         self.assertTrue(any("announcer broke" in call.args[0] for call in log.call_args_list))
         self.make_node("embedded", N1).stop()
 
+    def test_links_close_before_the_threads_are_waited_for(self):
+        """A background thread stuck on the network (the publisher connecting to a node that has gone) is freed by
+        closing the links, and its last save lands while the state database is still open (found by the interop
+        harness: `publishing failed: StateDbError(... is closed)` at stop)."""
+        node = self.make_node("stuck", N1)
+        freed = threading.Event()
+        saved = []
+
+        def stuck_publisher():
+            """Waits on the network until the links close, then saves, as the publisher's loop does."""
+            freed.wait(10)
+            node.publisher.save()
+            saved.append(node._db._database is not None)
+
+        node.links = mock.Mock(**{"close_all.side_effect": freed.set})
+        thread = threading.Thread(target=stuck_publisher, daemon=True)
+        thread.start()
+        node.threads.append(thread)
+        with mock.patch("rnfs.node.log") as log:
+            node.stop()
+        self.assertEqual(saved, [True])
+        self.assertFalse([call for call in log.call_args_list if "failed" in call.args[0]])
+
     def test_a_raising_feature_or_save_skips_nothing(self):
         """A feature's stop and a store's save raising something other than OSError: the other stores are still
         saved and the state closed."""

@@ -729,11 +729,15 @@ class RnfsNode:
         if self.server is not None:
             steps.append(("stopping the request server", self.server.stop))
         steps.append(("deregistering names, saving state", self.names.stop))  # names.stop saves the names state
+        if self.links is not None:
+            # Before the wait: a thread still connecting to a node that has gone (the publisher, say) is freed
+            # now, and ends while the state database is open, rather than once it is closed
+            steps.append(("closing links", self.links.close_all))
         steps.append(("waiting for the background threads", partial(self._join_threads, deadline)))
         steps += [("saving state", store.save) for store in self._every_store()]
         steps.append(("closing state", self._close_state))
         if self.links is not None:
-            steps.append(("closing links", self.links.close_all))
+            steps.append(("closing links opened since", self.links.close_all))
         if self.embedded:
             steps.append(("releasing the rnfs.dht destination", self._release_destination))
         for label, step in steps:
