@@ -1238,7 +1238,11 @@ gateway can never reach the API.
   runs on the port while the daemon is down learns neither the token nor a name key being imported, nor can
   answer in the daemon's place. The API keeps a connection open after a status request carrying a valid
   challenge and `Connection: keep-alive` (and no body), answering it with `Connection: keep-alive`, for one
-  more request, which is its last; every other connection is closed after its request.
+  more request, which is its last; every other connection is closed after its request. Any caller can ask for
+  this (the proof needs no token), and the second request gets a new read deadline, so one connection can hold
+  a connection slot (below) about twice as long as a single request could (rnfs: about 2 × 15 s). This is
+  accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
+  exactly one more request.
 - The API never sends CORS headers.
 - Both servers SHOULD time-limit reading a request (rnfs: 15 s for the request line, headers and small
   bodies; 60 s between reads of an upload), but not the node's work, and SHOULD cap concurrent
@@ -1271,7 +1275,8 @@ gateway can never reach the API.
     its first byte, so the user's own `GET` fetches the whole DAG first, within `max_download_size` and
     `max_output_entries` (413 otherwise), and the fetch is cancelled if the client disconnects.
   - Every format is answered only to the user's own `GET`, which fetches what isn't stored. A request that
-    isn't the user's own navigation (`Sec-Fetch-Site` present and not `none`) and any `HEAD` get
+    isn't the user's own (`Sec-Fetch-Site` present and not `none`, or absent with a browser's `User-Agent`;
+    below) and any `HEAD` get
     `409 Conflict`, whether the target is stored or not, without the node fetching anything. A browser
     downloads both types, and a frame of a download fires no load event while an error page does, so an
     answer that depended on what is stored (a download for stored content, a fetch that fails or a `503` for
@@ -1300,7 +1305,12 @@ gateway can never reach the API.
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
   `gateway_fetches` network fetches or name resolutions at a time. Content already stored is served without
   limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
-  user started (address bar, bookmark); a request without it comes from a local tool the user runs.
+  user started (address bar, bookmark). A request without it is the user's own only if its `User-Agent`
+  doesn't start with `Mozilla/` (rnfs ignores case and leading spaces): then it comes from a local tool the
+  user runs, such as curl. Every browser's `User-Agent` starts with `Mozilla/`, and browsers without Fetch
+  Metadata (Safari before 16.4, Firefox before 90) send no `Sec-Fetch-Site` for a web page's requests either,
+  so all their requests are treated as a web page's: in them even the user's own navigation gets `409` for
+  `?format=` and is held to `gateway_fetches`.
 - Apart from timing, the `gateway_fetches` limit and content no provider has, a web page's request gets the
   same answer whether the node stores the content or has to fetch it. The limit is a known, accepted leak: while a
   page keeps every slot busy with fetches, stored content is still served and content that needs a fetch gets 503,

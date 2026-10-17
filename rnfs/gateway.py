@@ -32,8 +32,10 @@ Behaviour:
 - Requests that aren't the user's own navigation (Sec-Fetch-Site present and not "none") may hold at most
   gateway_fetches network fetches or name resolutions at a time; over that, 503 with Retry-After.
   Content already stored (node.is_local) is served without limit. A request with no Sec-Fetch-Site is
-  treated as the user's own: every browser sends the header to 127.0.0.1/localhost (potentially
-  trustworthy origins), so its absence means a local tool such as curl, run by the user.
+  treated as the user's own only if its User-Agent doesn't start with "Mozilla/": browsers with Fetch
+  Metadata send the header to 127.0.0.1/localhost (potentially trustworthy origins), so its absence means
+  a local tool such as curl, run by the user, or a browser without Fetch Metadata (Safari < 16.4, Firefox
+  < 90), whose every request is then treated as a web page's (no ?format=, held to gateway_fetches).
 - Everything is requested with for_gateway=True: fetched content is cache, never provided, and names go
   only into the capped table. Name resolutions are reused for NAME_CACHE_TIME, so a page's many
   subresources don't each start a resolution against gateway_fetches.
@@ -450,7 +452,11 @@ class GatewayHandler(TimedHandler):
     def limited(self) -> bool:
         """True if this request isn't the user's own navigation, so its network use is limited."""
         site = self.headers.get("Sec-Fetch-Site")
-        return site is not None and site.strip().lower() != "none"
+        if site is None:
+            # Browsers without Fetch Metadata (Safari < 16.4, Firefox < 90) send no Sec-Fetch-Site for a web page's
+            # requests either, and every browser's User-Agent starts with "Mozilla/": only a tool's is the user's own
+            return (self.headers.get("User-Agent") or "").strip().lower().startswith("mozilla/")
+        return site.strip().lower() != "none"
 
     def need_network(self):
         """Take a gateway_fetches slot for a limited request about to use the network (once per request)."""

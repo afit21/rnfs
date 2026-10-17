@@ -330,9 +330,27 @@ class ProofTest(ClientTestCase):
     def test_daemon_closing_every_connection(self):
         """A daemon before 0.1.5 closes the proof's connection: the request goes on a new one."""
         seen = self.tokens_seen()
-        with mock.patch.object(self.server.server.RequestHandlerClass, "PROOF_ROUTE", None):
+        with mock.patch.object(self.server.server.RequestHandlerClass, "PROOF_ROUTE", None), \
+                mock.patch("rnfs.api.__version__", "0.1.4"):
             self.assertEqual(self.api.status()["node_id"], self.node.status()["node_id"])
         self.assertEqual(seen, [("/api/status", None), ("/api/status", self.server.token)])
+
+    def test_newer_daemon_closing_the_connection(self):
+        """A daemon of 0.1.5 or later that closes the proof's connection gets nothing more (API-4)."""
+        seen = self.tokens_seen()
+        with mock.patch.object(self.server.server.RequestHandlerClass, "PROOF_ROUTE", None), \
+                mock.patch("rnfs.api.__version__", "0.1.5"):
+            with self.assertRaises(ConnectionFailed) as raised:
+                self.api.status()
+        self.assertIn("closed the connection it proved itself on", str(raised.exception))
+        self.assertEqual(seen, [("/api/status", None)])
+
+    def test_version_numbers(self):
+        """The numbers a version starts with, for the fallback's comparison."""
+        for version, expected in (("0.1.4", (0, 1, 4)), ("0.1.5.dev1", (0, 1, 5)), ("0.1.4.post1", (0, 1, 4)),
+                                  ("1", (1,)), ("10.0rc1", (10, 0)), ("", None), ("v0.1.4", None), (None, None),
+                                  (15, None)):
+            self.assertEqual(apiclient.version_numbers(version), expected, version)
 
     def test_daemon_restarted(self):
         """A client used before the daemon restarted reads its new token and goes on working."""
