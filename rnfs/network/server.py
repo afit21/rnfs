@@ -64,6 +64,13 @@ FLOOR_FRACTION = 1 / 1000
 # A response displaced for a newcomer while making progress at less than this fraction of the rate it needs to
 # be done when it is due (Response.due) counts as making none: its requester cools down
 FAR_BEHIND = 1 / 4
+# A response whose Resource its requester rejects or cancels before this fraction of it was sent made no real
+# progress: its requester cools down (section 3). Otherwise one could take the first window of parts of each
+# response, cancel it and ask again, having the node read, hash, pack and encrypt a whole response per window
+# (on a slow link, a window of RNS.Resource.WINDOW_MAX_SLOW parts is about 7% of a 64 KiB response). An honest
+# 0.1.5 fetcher never cancels a Resource (a reader giving up closes the link), so only RNS running out of
+# retries on a lossy path does
+NO_PROGRESS_FRACTION = 1 / 4
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
 # Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
 # An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
@@ -231,7 +238,44 @@ def progress_floor(bitrate: float | None, hops: int | None, config: Config) -> f
 
 
 class Response:
-    """A /blocks response in progress, holding a slot in one of the pools."""
+    """A /blocks response in progress, holding a slot in one of the pools.
+
+    Threads and locks. A response is touched by its request's handler thread (RNS starts one per request), the
+    next request's handler on the same link (_previous_done), the monitor thread (check_responses), RNS's threads
+    (the outgoing-Resource registration hook on the packet thread; the Resource's callback on the packet thread,
+    on a Resource's watchdog, on the thread RNS starts for a rejection's callback, or on whichever thread
+    cancelled it) and link-closed callbacks (_link_closed, on the thread that tore the link down). Python
+    assigns attributes atomically; what matters is who may write a field, under which lock, and in what order:
+    - link_id, request_id, pool and started: set at construction, never changed.
+    - grace, floor, interface and identity: set by ResponsePools.reserve under ResponsePools.lock, before the
+      response is visible to any other thread. grace is set again, with no lock, by the handler thread at
+      handover, dropping the pacing wait it covered until then: a reader sees one value or the other.
+    - size, deadline, due, find_until and untracked: written once each, with no lock, by the handler thread at
+      handover, size first and the others after it, before it returns the body (so before RNS can build the
+      Resource) and before it wakes the monitor. Readers take size None to mean not yet handed over and skip
+      the response (check_responses), so a reader that sees size set but an older deadline (inf) or
+      find_until (inf) only waits one more pass. requester is likewise set once by the handler, before _admit.
+    - sent and first_progress: written by the monitor thread only (note_progress), with no lock. Other threads
+      read them as a snapshot: a stale value only makes a response look slower than it is.
+    - grace_start and progress_at: moved forward only (max), with no lock, by the handler at handover, by
+      _attach (on the packet thread or the monitor) and, for progress_at, by the monitor. A lost update loses
+      at most the gap between two near-simultaneous "now"s.
+    - resource: set by _attach, with no lock, from the registration hook (packet thread) or the monitor's
+      poll, whichever sees the Resource first; both check it is still None and would attach the same
+      Resource, so a race only runs _hook twice, which installs the callback once (and _concluded runs once).
+    - idle: set under ResponsePools.lock when a newcomer displaces it (_displaceable), or with no lock by the
+      monitor (_check_progress) just before it cancels it, and read by the _cancel that follows. A displaced
+      response has left the pool, so only a monitor pass whose snapshot predates that can still reach it; both
+      then cancel it, which _finish makes harmless, and either one's idle decides the cooldown.
+    - finished and concluded: check-and-set under RequestServer.lock (_finish, _concluded), so each runs once
+      whichever thread gets there first. Read without the lock elsewhere as a hint: neither ever goes back to
+      False, so a stale False only means that thread's later _finish (or _concluded) call returns early.
+    - cost, charged and settled: written under RequestServer.lock (_admit, _charge_progress, _settle, and the
+      handler's settled=True for single-packet and untracked responses). Read without it by commitment() and
+      _committed() outside _admit, where a stale value only shifts an admission estimate.
+    - done: a threading.Event, set by _finish.
+    NW2's later steps (in a later release) give a response its own lock; until then, keep to these owners.
+    """
 
     def __init__(self, link_id: bytes, request_id: bytes, pool: str, started: float):
         """A response that has just taken a slot; its size and deadline follow once it's built."""
@@ -1206,7 +1250,7 @@ class RequestServer:
 
     def _concluded(self, response: Response, link, resource):
         """The response's Resource concluded: record the rate if it completed, start a cooldown if its requester
-        rejected it with nothing sent, and free the slots."""
+        rejected or cancelled it before it made real progress (_made_progress), and free the slots."""
         with self.lock:
             # The Resource's callback, the monitor and the next request may all notice; handle it once
             first, response.concluded = not response.concluded, True
@@ -1214,28 +1258,34 @@ class RequestServer:
         status = getattr(resource, "status", None)
         if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
-        elif first and status == RNS.Resource.REJECTED and not self._sent_any(response, resource):
-            # Turned down at its advertisement (no honest requester does that): no progress, so its requester
-            # cools down as for a response cancelled for making none, rather than having the node build another
-            # at once (section 3)
-            log("a /blocks response was rejected with nothing sent: its requester cools down", LOG_VERBOSE)
+        elif first and status == RNS.Resource.REJECTED and not self._made_progress(response, resource):
+            # Turned down at its advertisement or cancelled by its requester (on RNS 1.5.6 both arrive as
+            # REJECTED) before a quarter of it was sent: no honest 0.1.5 fetcher does that, it closes the link.
+            # So no real progress, and its requester cools down as for a response cancelled for making none,
+            # rather than having the node build another at once (section 3)
+            log(f"a /blocks response ({size(response.size or 0)}) was rejected before a quarter of it was sent: "
+                "its requester cools down", LOG_VERBOSE)
             self.cooldowns.add(response.link_id, response.identity)
         elif first and not cancelled and status in (RNS.Resource.FAILED, RNS.Resource.CORRUPT):
-            # Not cancelled here: RNS gave up on the transfer, so the requester sees it stop arriving
+            # Not cancelled here: RNS gave up on the transfer, or the requester closed the link, so the requester
+            # sees it stop arriving. No cooldown, however little was sent: an honest reader that gives up early
+            # closes its links, and in private mode a cooldown would hold back its own identity
             log(f"a /blocks response ({size(response.size or 0)}) failed after {size(int(response.sent))} sent: "
                 f"{'its link closed' if getattr(link, 'status', None) == RNS.Link.CLOSED else 'lost in transit'}",
                 LOG_DEBUG)
         self._finish(response)  # charges what was sent: all of a completed Resource
 
     @staticmethod
-    def _sent_any(response: Response, resource) -> bool:
-        """Whether any of response's Resource was sent (or that can't be read)."""
-        if response.sent > 0:
+    def _made_progress(response: Response, resource) -> bool:
+        """Whether at least NO_PROGRESS_FRACTION of response was sent: the more of what the monitor last saw and
+        what its Resource reads now. True if its size or the Resource's progress can't be read."""
+        if response.size is None:
             return True
         try:
-            return resource.get_progress() > 0
+            sent = max(response.sent, resource.get_progress() * response.size)
         except Exception:  # noqa: BLE001 - progress unknown counts as progress
             return True
+        return sent >= NO_PROGRESS_FRACTION * response.size
 
     def _cancel(self, response: Response, reason: str):
         """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""

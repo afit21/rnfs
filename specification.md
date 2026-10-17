@@ -178,14 +178,25 @@ pass a `max_response_size` just above their largest honest answer.
   - A response that makes **no progress** is cancelled and its budget charge refunded: one with nothing sent,
     once its grace plus `deadline_slack` has passed; any response with no progress for `stall_timeout`.
   - **Cooldown.** A link (and its identity, if it identified) whose response was displaced or cancelled for
-    making no progress, or whose response Resource it rejected before any of it was sent (no honest requester
-    does: otherwise one could have the node build a response, reject it and ask again in a loop), is refused
-    new `/blocks` for `blocks_cooldown`. A response displaced as the slowest counts as making no progress if
-    it was moving at less than a quarter of the rate it needs to be done when due: by its deadline, or, on a
-    link with no rate estimate whose MTU RNS raised, by the deadline it would have at `slow_bitrate`. So a
-    requester taking a little of each response can't keep its slots young by displacing its own responses
-    from a spare link; an honest one keeping to its schedule is displaced without a cooldown. The refusal is
-    answered at once, before any slot is reserved or block read.
+    making no progress, or whose response Resource it rejected or cancelled before a quarter of it was sent, is
+    refused new `/blocks` for `blocks_cooldown`. Otherwise a requester could have the node build a response,
+    take its first window of parts, reject it and ask again in a loop: each round costs the node reading,
+    hashing, packing and encrypting the whole response, and the requester one window. On RNS 1.5.6 a receiver
+    cancelling a Resource, at its advertisement or mid-transfer, reaches the sender as a rejection
+    (`REJECTED`); the part sent is the more of the progress last read and the Resource's progress then, and
+    counts as a quarter or more if it can't be read. A requester that gives up on a response (a stall, a
+    reader that stops early) MUST close the link, so the Resource fails (`FAILED`), and MUST NOT cancel or
+    reject the Resource itself (`Resource.cancel()`), or it would cool itself down at its providers. A link
+    closing starts no cooldown however little was sent: in private mode that would hold back the member's own
+    identity. So the only honest cancel is RNS's receiver running out of retries on a lossy path; that
+    requester's next `/blocks` to the node are refused (`False`) until the cooldown ends, and it moves to
+    another provider after `max_failures` of them (section 6). A response displaced as the slowest counts as
+    making no progress if it was moving at less than a quarter of the rate it needs to be done when due: by
+    its deadline, or, on a link with no rate estimate whose MTU RNS raised, by the deadline it would have at
+    `slow_bitrate`. So a requester taking a little of each response can't keep its slots young by displacing
+    its own responses from a spare link; an honest one keeping to its schedule is displaced without a cooldown.
+    Every cooldown lasts `blocks_cooldown`, flat: it doesn't grow with repeats. The refusal is answered at
+    once, before any slot is reserved or block read.
   - A handler gets no direct handle on the response Resource RNS sends for it. Responses are tracked through
     the link's outgoing Resources (`Link.outgoing_resources`, matched by `request_id`) and cancelled with
     `Resource.cancel()` (which acts only while the Resource is not yet complete). These are RNS internals that
@@ -991,7 +1002,7 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected unsent, or fell far behind its schedule; many fast-link slots; requester stall detection (2, 3, 7) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links, LXMF delivery links and links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
@@ -1054,6 +1065,17 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
   `/blocks` responses only after RNS has received them can be made to build one per cooldown per link, and
   RNS spends a key exchange on every new link.
+- A `/blocks` requester that takes a response and cancels it still has the node build the whole response (read,
+  hash, pack and encrypt it) each round, and the cooldown binds it only below a quarter sent (section 3):
+  - cancelling at a quarter or more starts no cooldown, so it costs the requester at least a quarter of each
+    response's bytes. Where a single window of parts is that much (a link whose MTU RNS raised, or a small
+    response), cancelling after the first window is not told apart from it;
+  - closing the link instead starts no cooldown however little was sent, deliberately: an honest reader that
+    gives up closes its links, and in private mode a cooldown would hold back its own identity. Each round
+    then costs a new link (a key exchange at both ends, and a place among `max_incoming_links`);
+  - an honest requester whose Resource RNS cancels after running out of retries on a lossy path, before a
+    quarter of it arrived, is cooled down at that node for `blocks_cooldown` and fetches from other providers
+    meanwhile.
 - Any web page can make the local gateway fetch content (a plain request to `127.0.0.1` passes the Host
   check), and can time responses to guess what is cached. The gateway's own limits (section 11) bound the
   airtime this costs: `gateway_fetches`, and no `?format=` response (raw block or archive) at all for a web

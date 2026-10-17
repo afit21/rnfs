@@ -768,8 +768,13 @@ and in total, never persisted.
   has passed, or that makes no progress for `stall_timeout`. `Cooldowns` then refuses `/blocks` from a link
   (and its identity, if identified) whose response was displaced or cancelled idle, for `blocks_cooldown`,
   cheaply and before any slot is taken. `_concluded` starts the same
-  cooldown for a response whose Resource the requester rejected (`REJECTED`) with nothing sent (`_sent_any`:
-  `Response.sent`, else the Resource's `get_progress()`).
+  cooldown for a response whose Resource the requester rejected or cancelled (both `REJECTED` on RNS 1.5.6)
+  before `NO_PROGRESS_FRACTION` (a quarter) of it was sent (`_made_progress`: the more of `Response.sent` and
+  the Resource's `get_progress()` × size; progress counts if either can't be read). A `FAILED` response (the
+  link closed, or RNS gave up) starts none, so a reader that gives up early must close its links and never
+  call `Resource.cancel()` on a response, or it would cool itself down at its providers. `Cooldowns` is flat:
+  every cooldown lasts `blocks_cooldown`, per link and per identity. The `Response` docstring records which
+  thread or lock owns each of its fields.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
@@ -1117,7 +1122,10 @@ Everything in the specification is implemented, with these simplifications and a
   `Fetch._pace` waits as long again as the request took before asking that provider again, and a refusal within
   4 × that time of the request being sent isn't counted towards `max_failures` (retried after an eighth of it,
   at least `busy_delay`). A `Fetch` exiting with an error (or cancelled) closes the links of its requests still
-  in flight. In private mode, incoming links not identified as a member's are closed first to make room.
+  in flight. It never cancels a response's Resource (`Resource.cancel()`), and nothing in the fetcher may: on
+  RNS 1.5.6 that reaches the provider as a rejection, which before a quarter of the response is sent cools the
+  requester down there (`RequestServer._concluded`), while a closed link doesn't. In private mode, incoming
+  links not identified as a member's are closed first to make room.
 - A shared-folder entry that fails to import because of its content (an invalid name, the deny list, too large)
   isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a pin the
   state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, and an unchanged
