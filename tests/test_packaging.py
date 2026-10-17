@@ -202,6 +202,19 @@ class BuildScriptsTest(unittest.TestCase):
                 self.assertRegex(step.group(2), r"(?m)^ +cache: false$", f"{name}: {step.group(0)}")
         self.assertTrue(steps)
 
+    def test_flatpak_sandbox_is_narrow(self):
+        """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
+        manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
+        block = re.search(r"(?m)^finish-args:\n((?: +.*\n)+)", manifest)
+        self.assertTrue(block)
+        args = re.findall(r"(?m)^ +- (--\S+)$", block.group(1))
+        self.assertEqual(args, ["--share=network", "--filesystem=~/.rnfs:create", "--filesystem=~/.reticulum:create",
+                                "--filesystem=xdg-download"])
+        # The opt-ins are documented in the manifest and the README
+        for text in (block.group(1), read(os.path.join(REPO, "README.md"))):
+            for override in ("--device=all", "--filesystem="):
+                self.assertIn(f"flatpak override --user {override}", text)
+
     def test_release_waits_for_the_tests(self):
         """The release job needs the whole tests workflow, called from release.yml."""
         release = read(os.path.join(WORKFLOWS, "release.yml"))

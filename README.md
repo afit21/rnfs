@@ -198,12 +198,19 @@ alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type j
 The app has these permissions:
 
 - network access;
-- your home folder, for the files you add or get, plus `~/.rnfs` and `~/.reticulum`;
-- all devices, for RNode and other serial interfaces. If you don't use serial interfaces, remove this
-  with `flatpak override --user --nodevice=all io.github.afit21.rnfs`.
+- `~/.rnfs` and `~/.reticulum` (created if missing), for rnfs's and Reticulum's files;
+- your Downloads folder, for the files you add or get.
 
-To reach files outside your home folder, run
-`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`.
+It can't see the rest of your home folder, or any device. Grant more with `flatpak override`:
+
+```sh
+flatpak override --user --device=all io.github.afit21.rnfs                    # RNode and other serial interfaces
+flatpak override --user --filesystem=~/Documents io.github.afit21.rnfs        # another folder to add from or get into
+flatpak override --user --filesystem=~/.config/reticulum io.github.afit21.rnfs   # a Reticulum config kept there
+```
+
+`flatpak override --user --reset io.github.afit21.rnfs` takes these back. Until 0.1.6 the Flatpak had your
+whole home folder and every device; after updating, grant the ones you used again.
 
 - **Update:** install the newer release's `.flatpak` the same way.
 - **Uninstall:** `flatpak uninstall --user io.github.afit21.rnfs`.
