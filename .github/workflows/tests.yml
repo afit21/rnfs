@@ -94,6 +94,27 @@ jobs:
       - name: No merge-conflict markers
         run: "! git grep -nE '^(<<<<<<<|>>>>>>>)( |$)|^=======$' -- . ':!*.lock'"
 
+  # The Flatpak's wheels must be the ones packaging/requirements.lock pins (what every other package installs):
+  # regenerate them from the lock and fail if that changes the committed files. Run here, not only at release, so
+  # a lock bump that forgets them fails before a vX.Y.Z tag is pushed; the release builds the committed files
+  flatpak-sources:
+    name: flatpak sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false  # no token left in .git/config for the build code that runs next
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: Check the pinned Flatpak wheels match packaging/requirements.lock
+        run: |
+          python -I packaging/flatpak/generate-sources.py
+          git diff --exit-code -- packaging/flatpak || {
+            echo "::error::packaging/flatpak/*.json is out of date: run python3 packaging/flatpak/generate-sources.py and commit"
+            exit 1
+          }
+
   # The packages the release workflow builds, smoke-tested: wheel/sdist, .deb, install.sh, PyInstaller binary
   packaging:
     runs-on: ubuntu-latest

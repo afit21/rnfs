@@ -247,6 +247,17 @@ class BuildScriptsTest(unittest.TestCase):
                 self.assertRegex(step.group(2), r"(?m)^ +cache: false$", f"{name}: {step.group(0)}")
         self.assertTrue(steps)
 
+    def test_flatpak_sources_are_checked_by_the_tests(self):
+        """The check that the Flatpak's wheels match the lock runs in tests.yml (on every push, not only at a
+        release, TS5), and the release builds the committed files rather than an artifact of its own."""
+        tests = read(os.path.join(WORKFLOWS, "tests.yml"))
+        job = re.search(r"(?m)^  flatpak-sources:\n((?:    .*\n|\n)+?)(?=^  \S|\Z)", tests)
+        self.assertTrue(job)
+        self.assertIn("python -I packaging/flatpak/generate-sources.py\n", job.group(1))
+        self.assertIn("git diff --exit-code -- packaging/flatpak ||", job.group(1))
+        release = read(os.path.join(WORKFLOWS, "release.yml"))
+        self.assertNotIn("flatpak-sources", release.replace("tests.yml's flatpak-sources job", ""))
+
     def test_flatpak_sandbox_is_narrow(self):
         """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
         manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
