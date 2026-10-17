@@ -12,9 +12,12 @@ A file with one chunk is just that raw block, an empty file is a zero-byte raw b
 directory is [2, []].
 
 Builders hand every block to a `put(cid, block)` callback, so they don't depend on Storage; a no-op
-callback (NO_PUT) gives only-hash mode. Files are streamed, one chunk in memory at a time. Within
-`with checking(check):` each file's whole-content SHA-256 is passed to check (the deny list's file hashes),
-which may raise to stop the build before the file's root node is stored.
+callback (NO_PUT) gives only-hash mode. Files are streamed, one chunk in memory at a time. A build's
+BuildOptions are passed explicitly: the chunker, which decides files' CIDs, and check, which is given each
+file's whole-content SHA-256 (the deny list's file hashes) and may raise to stop the build before the file's
+root node is stored. Explicit, because a ContextVar isn't copied to a worker thread: a build moved onto one would
+silently fall back to the fixed chunker and skip the check (maintainability audit CT2). Without options, a build
+takes them from chunker.using() and checking(), the wrappers that set them for the current context.
 """
 import errno
 import hashlib
@@ -116,14 +119,34 @@ def _put_node(node: dag.Node, put: Put) -> Cid:
     return cid
 
 
+@dataclass(frozen=True)
+class BuildOptions:
+    """What a build needs beyond its input, passed down explicitly so it holds on any thread.
+
+    chunker: the name of the chunker cutting files (chunker.FIXED, the default, or FASTCDC); it decides their CIDs.
+    check: called with each file's content SHA-256 once it is read, before the file's root node is stored; it may
+    raise to stop the build (the deny list's file hashes). None checks nothing, and hashes nothing for it.
+    Raises ValueError for an unknown chunker.
+    """
+
+    chunker: str = chunker.FIXED
+    check: Callable[[bytes], None] | None = None
+
+    def __post_init__(self):
+        """Check the chunker's name (None is the default)."""
+        object.__setattr__(self, "chunker", chunker.check(self.chunker or chunker.FIXED))
+
+
 # What build_file passes each file's content SHA-256 to in this thread/context (checking), if anything
 _check: ContextVar[Callable[[bytes], None] | None] = ContextVar("rnfs_file_check", default=None)
 
 
 @contextmanager
 def checking(check: Callable[[bytes], None] | None) -> Iterator[None]:
-    """Within the block, build_file calls check(digest) with each file's content SHA-256 once it is read, before
-    the file's root node is stored; check may raise to stop the build. None checks nothing."""
+    """Within the block, a build given no BuildOptions calls check(digest) with each file's content SHA-256 once it
+    is read, before the file's root node is stored; check may raise to stop the build. None checks nothing.
+
+    A wrapper kept for callers that don't pass BuildOptions yet: it holds only in this thread/context."""
     token = _check.set(check)
     try:
         yield
@@ -131,8 +154,28 @@ def checking(check: Callable[[bytes], None] | None) -> Iterator[None]:
         _check.reset(token)
 
 
-def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = dag.KIND_FILE) -> Built:
-    """Build a file from everything read from stream, or exactly size bytes of it (ValueError if it ends early)."""
+def current_options() -> BuildOptions:
+    """The BuildOptions that chunker.using() and checking() set for this thread/context (the defaults if neither)."""
+    return BuildOptions(chunker.active(), _check.get())
+
+
+def _resolve(options: BuildOptions | None) -> BuildOptions:
+    """options, or those of this context (current_options) if None."""
+    return options if options is not None else current_options()
+
+
+def _chunks(stream: BinaryIO, size: int | None, name: str) -> Iterator[bytes]:
+    """A file's chunks by the chunker called name (as chunker.chunks gives them for the active one)."""
+    if name == chunker.FASTCDC:
+        return chunker.fastcdc_stream(stream, size)
+    return chunker.fixed_chunks(stream, size)
+
+
+def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = dag.KIND_FILE,
+               options: BuildOptions | None = None) -> Built:
+    """Build a file from everything read from stream, or exactly size bytes of it (ValueError if it ends early).
+
+    options: the chunker and check (by default those of this context, current_options)."""
 
     def make_group(level: int, pairs: list[tuple]) -> tuple:
         """A type 1 node over a group of chunks or file nodes."""
@@ -140,10 +183,11 @@ def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = 
         return Child(_put_node(node, put), node.size), _height(pairs)
 
     levels = _Levels(make_group, constants.MAX_CHILDREN)
-    check = _check.get()
+    options = _resolve(options)
+    check = options.check
     digest = hashlib.sha256() if check is not None else None
-    # Fixed CHUNK_SIZE pieces unless `add --chunker fastcdc` selected content-defined chunks (chunker.using)
-    for chunk in chunker.chunks(stream, size):
+    # Fixed CHUNK_SIZE pieces unless `add --chunker fastcdc` selected content-defined chunks
+    for chunk in _chunks(stream, size, options.chunker):
         cid = Cid.for_block(RAW, chunk)
         if digest is not None:
             digest.update(chunk)
@@ -164,9 +208,9 @@ def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = 
     return Built(child.cid, child.size, kind, height)
 
 
-def build_bytes(data: bytes, put: Put, kind: int = dag.KIND_FILE) -> Built:
-    """Build a file from bytes in memory."""
-    return build_file(io.BytesIO(data), put, len(data), kind)
+def build_bytes(data: bytes, put: Put, kind: int = dag.KIND_FILE, options: BuildOptions | None = None) -> Built:
+    """Build a file from bytes in memory (options as for build_file)."""
+    return build_file(io.BytesIO(data), put, len(data), kind, options)
 
 
 def build_directory(entries: Iterable[Entry], put: Put, child_height: int = 0) -> Built:
@@ -422,8 +466,8 @@ def close(handle: Handle):
         os.close(handle)
 
 
-def build_path(path: str, put: Put, warnings: list[str]) -> Built:
-    """Build the file or directory at path, appending to warnings what was skipped.
+def build_path(path: str, put: Put, warnings: list[str], options: BuildOptions | None = None) -> Built:
+    """Build the file or directory at path, appending to warnings what was skipped (options as for build_file).
 
     The path itself is followed if it is a symlink (the user named it); inside a directory, hidden files
     are included and symlinks, devices, sockets, FIFOs and invalid names are skipped with a warning.
@@ -431,7 +475,7 @@ def build_path(path: str, put: Put, warnings: list[str]) -> Built:
     """
     handle, st = open_path(path)
     try:
-        return build_open(handle, st, path, put, warnings)
+        return build_open(handle, st, path, put, warnings, options=options)
     finally:
         close(handle)
 
@@ -445,23 +489,25 @@ def hard_links(handle: Handle) -> int:
 
 
 def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings: list[str],
-               depth: int = 1, skip_hard_links: bool = False) -> Built:
+               depth: int = 1, skip_hard_links: bool = False, options: BuildOptions | None = None) -> Built:
     """Build the regular file or directory open as handle (from open_path or open_child), whose stat is st.
 
     path is only for messages (and for directories without FD_WALK); depth as for _build_tree. With
     skip_hard_links, files below a directory that have other hard links are skipped with a warning (the shared
-    folder: someone who may write to it could link a file of yours there that you never put in it).
+    folder: someone who may write to it could link a file of yours there that you never put in it). options as
+    for build_file, taken from this context once, here, if not given: the whole tree is built with them.
     """
+    options = _resolve(options)
     if stat.S_ISDIR(st.st_mode):
-        return _build_tree(handle, path, put, warnings, depth, skip_hard_links)
+        return _build_tree(handle, path, put, warnings, depth, skip_hard_links, options)
     kind = dag.KIND_EXECUTABLE if is_executable(st.st_mode) else dag.KIND_FILE
     # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
     with os.fdopen(handle, "rb", closefd=False) as f:
-        return build_file(f, put, kind=kind)
+        return build_file(f, put, kind=kind, options=options)
 
 
 def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int,
-                skip_hard_links: bool = False) -> Built:
+                skip_hard_links: bool, options: BuildOptions) -> Built:
     """Build the open directory at path, which sits depth directories from the root (1 for the root)."""
     # Every directory level adds at least one DAG node, so this bounds the recursion before it gets deep
     if depth > constants.MAX_DEPTH:
@@ -491,7 +537,7 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
             if skip_hard_links and (links := hard_links(handle)):
                 warnings.append(f"skipped {shown}: {hard_link_reason(links)}")
                 continue
-            child = build_open(handle, st, child_path, put, warnings, depth + 1, skip_hard_links)
+            child = build_open(handle, st, child_path, put, warnings, depth + 1, skip_hard_links, options)
         except Changed:
             # A directory walked by path, swapped when it was listed (see list_directory)
             warnings.append(f"skipped {shown}: it changed while being added")
@@ -509,13 +555,15 @@ def hard_link_reason(links: int) -> str:
             f"not be meant for sharing")
 
 
-def add_path(path: str, put: Put, wrap_it: bool = False) -> tuple[Built, list[str]]:
-    """Build the file or directory at path, optionally wrapped in a directory under its own name.
+def add_path(path: str, put: Put, wrap_it: bool = False,
+             options: BuildOptions | None = None) -> tuple[Built, list[str]]:
+    """Build the file or directory at path, optionally wrapped in a directory under its own name (options as for
+    build_file).
 
     Returns the root and the warnings for what was skipped.
     """
     warnings: list[str] = []
-    built = build_path(path, put, warnings)
+    built = build_path(path, put, warnings, options)
     if wrap_it:
         name = os.path.basename(os.path.normpath(os.path.abspath(path)))
         built = wrap(name, built, put)
@@ -523,12 +571,13 @@ def add_path(path: str, put: Put, wrap_it: bool = False) -> tuple[Built, list[st
 
 
 def add_stream(stream: BinaryIO, put: Put, size: int | None = None, name: str | None = None,
-               executable: bool = False) -> Built:
-    """Build a file from a stream, wrapped as the entry name in a directory if name is given."""
+               executable: bool = False, options: BuildOptions | None = None) -> Built:
+    """Build a file from a stream, wrapped as the entry name in a directory if name is given (options as for
+    build_file)."""
     kind = dag.KIND_EXECUTABLE if executable else dag.KIND_FILE
     if name is not None:
         dag.check_name(name)  # before reading a possibly large stream
-    built = build_file(stream, put, size, kind)
+    built = build_file(stream, put, size, kind, options)
     if name is not None:
         built = wrap(name, built, put)
     return built

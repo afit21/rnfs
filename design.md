@@ -96,8 +96,8 @@ rnfs/
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
     dag.py            DAG node encoding, strict decoding, names (section 5)
-    chunker.py        fixed and FastCDC chunkers; chunker.using(name) picks one per context (section 5)
-    builder.py        building trees: files, directories, wrap, only-hash (section 5)
+    chunker.py        fixed and FastCDC chunkers (section 5)
+    builder.py        building trees: files, directories, wrap, only-hash; BuildOptions (section 5)
     seal.py           sealed files: SealingReader, open_sealed/SealedFile, recipients (section 5, Sealed files)
     walker.py         Expect, reader checks, path lookup, byte ranges, listing, writing out (sections 5, 7)
     edit.py           dir set / dir rm (section 11)
@@ -247,8 +247,8 @@ CID's content SHA-256, `MAX_KNOWN_HASHES` LRU, kept across restarts in `deny_has
 `_save_state`, writes the rows changed since the last one outside the lock, behind a save lock); `add_listener(fn)`,
 called after each change outside its lock; `DENY_HASH_RATIO` and `DENY_HASH_SLACK` bound what `_check_file` hashes.
 `walker.write_out(..., check)` and `walker.iter_files` and
-`builder.checking(check)` (a ContextVar: `build_file` hashes each file and passes the digest before the file's root
-node is stored) are its hooks in the content layer; `archive.import_archive(..., check)` runs on the complete roots
+`builder.BuildOptions(chunker, check)` (`build_file` hashes each file and passes the digest to check before the
+file's root node is stored) are its hooks in the content layer; `archive.import_archive(..., check)` runs on the complete roots
 before they are pinned.
 
 ## DHT layer interfaces
@@ -770,9 +770,12 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 
 ## Content additions
 
-- `content/chunker.py` — `chunks(stream, size)` yields chunks from the chunker chosen with the context
-  manager `chunker.using(name)` (a ContextVar, so the shared-folder scan on its own thread keeps fixed
-  chunks); `builder.build_file` takes its chunks from it. FastCDC computes gear hashes for 8 KiB at a time on
+- `content/chunker.py` — `fixed_chunks` and `fastcdc_stream` cut a stream into chunks. Which one a build uses
+  is `builder.BuildOptions.chunker`, frozen with the deny check (`check`) and passed explicitly down through
+  `add_path`, `add_stream`, `build_open`, `build_file` and `SharedFolder.scan`: a ContextVar isn't copied to a
+  worker thread, so a build moved onto one would silently get other CIDs and skip the check. `chunker.using(name)`
+  and `builder.checking(check)` remain as wrappers setting them for the current context, which a build given no
+  options takes (`builder.current_options()`). FastCDC computes gear hashes for 8 KiB at a time on
   a big integer of 9-byte lanes (≈ 39 MB/s in CPython 3.12, against ≈ 15 MB/s for the byte-by-byte reference
   `cut_point_simple` it is tested against, and ≈ 2 GB/s for fixed chunking).
 - `content/seal.py` — the sealed-file format: `SealingReader` (file-like, one segment in memory),

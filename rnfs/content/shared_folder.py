@@ -225,8 +225,12 @@ class SharedFolder:
         if self._db is not None:
             self._db.close()
 
-    def scan(self) -> set[Cid]:
-        """Import new and changed entries, release the pins of changed and removed ones; returns the folder's pins."""
+    def scan(self, options: builder.BuildOptions | None = None) -> set[Cid]:
+        """Import new and changed entries, release the pins of changed and removed ones; returns the folder's pins.
+
+        options: the chunker and the deny list's file-hash check every import is built with (builder.BuildOptions;
+        by default those of this context, builder.current_options)."""
+        options = options if options is not None else builder.current_options()
         with self._lock:
             os.makedirs(self.directory, exist_ok=True)
             current: dict[str, tuple[str, Cid]] = {}
@@ -239,7 +243,7 @@ class SharedFolder:
                 # led into the rnfs dir (as 0.1.5 allowed) stops providing what it imported from there
                 items = builder.list_directory(folder) if self._check_target(folder, st) else []
                 for item in items:
-                    result = self._scan_item(folder, item)
+                    result = self._scan_item(folder, item, options)
                     if result is not None:
                         current[item.name] = result
             finally:
@@ -278,7 +282,8 @@ class SharedFolder:
             self._warned.add(key)
             log(f"shared folder: {message}", LOG_WARNING)
 
-    def _scan_item(self, folder: builder.Handle, item: os.DirEntry) -> tuple[str, Cid] | None:
+    def _scan_item(self, folder: builder.Handle, item: os.DirEntry,
+                   options: builder.BuildOptions) -> tuple[str, Cid] | None:
         """(signature, CID) of a top-level entry, importing and pinning it if new or changed; None if skipped."""
         path = os.path.join(self.directory, item.name)
         shown = display_path(path)
@@ -302,12 +307,13 @@ class SharedFolder:
             if links:
                 self._warn_once(f"hardlink:{item.name}", f"skipped {shown}: {builder.hard_link_reason(links)}")
                 return None
-            return self._import(item.name, handle, st, path)
+            return self._import(item.name, handle, st, path, options)
         finally:
             builder.close(handle)
 
-    def _import(self, name: str, handle: builder.Handle, st: os.stat_result, path: str) -> tuple[str, Cid] | None:
-        """_scan_item for an entry open as handle."""
+    def _import(self, name: str, handle: builder.Handle, st: os.stat_result, path: str,
+                options: builder.BuildOptions) -> tuple[str, Cid] | None:
+        """_scan_item for an entry open as handle, built with options."""
         shown = display_path(path)
         try:
             sig = open_signature(handle, st, path)
@@ -327,7 +333,7 @@ class SharedFolder:
         try:
             with self.storage.protect() as session:
                 with session.writer() as put:
-                    built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True)
+                    built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True, options=options)
                 self.storage.pin(built.cid, FOLDER)
         except (OSError, StorageFull) as e:  # may pass (a full or failing disk, a pin not saved): tried again later
             self._failed[name] = (sig, self.clock() + RETRY_AFTER)
