@@ -24,6 +24,13 @@ that isn't a valid DAG node marks the root invalid locally and fails the fetch (
 longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
 block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
 
+End-game duplication (NET-4; section 7): once nothing is left to ask for, an idle provider is also asked for a
+batch another has had in flight for longer than deadline_slack, so a response dripping in (never stalling, its
+deadline hours away at unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once,
+and only while fewer than max_parallel_providers requests are in flight (never on a slow node). The first
+verified copy wins: the request still sending what has arrived has its link closed (unless another fetch has a
+request on it: then it is left to finish), and its outcome isn't counted against its provider.
+
 Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
 the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
 would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
@@ -57,6 +64,19 @@ flight per provider. Request threads only call the client and note when a respon
 (Fetch._heard_at, which the no-progress deadline reads with the fetch thread's own _progress_at); all other
 fetch state is changed by the thread that runs the fetch, from the events they queue (ResultEvent, and the
 lookup thread's ProviderEvent and LookupDone).
+
+fetch_dag and fetch_listing walk the DAG inside one _download: a block's children still to fetch are queued as
+soon as it is met, stored or downloaded, rather than once its whole tree level has arrived, so no provider waits
+for a level's last response. A parent is always stored before its children are asked for, so whatever an
+interrupted fetch stored hangs together from the target, and the next fetch resumes from it.
+
+read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
+bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
+for it has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it
+no longer needs (a reader that stopped early, which has had at most one window fetched that it didn't read)
+closes the links of its requests still in flight, unless another fetch has a request on the same (shared) link:
+then its request is left to finish, rather than fail the other's. It never cancels a response's Resource: a
+responder would take that for a rejection and cool the requester down (section 3).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
@@ -384,6 +404,48 @@ class _Pending:
         self._order.extendleft(reversed(cids))
         self._members.update(cids)
 
+    def extend(self, cids: list[Cid]):
+        """Add cids (none of them pending) at the back, keeping their order."""
+        self._order.extend(cids)
+        self._members.update(cids)
+
+
+class _Walk:
+    """The walk of fetch_dag or fetch_listing below a target, met block by block (A4): what each block met adds to
+    fetch, and the directory entries met so far. Pure bookkeeping, used by the fetch thread only."""
+
+    __slots__ = ("seen", "listing", "max_entries", "entries", "index_queued")
+
+    def __init__(self, target: Expect, listing: bool, max_entries: int | None):
+        """A walk from target: of its whole DAG, or for a listing (listing=True) of its index nodes only."""
+        self.seen = {target}
+        self.listing = listing
+        self.max_entries = max_entries
+        self.entries = 0  # entries of the distinct directory nodes met
+        self.index_queued: set[Expect] = set()  # index children queued, not met yet
+
+    def met(self, expect: Expect, children: list[Expect]) -> list[Expect]:
+        """The children of expect, a block just met (stored or downloaded), to fetch next: each not seen before,
+        and for a listing only an index's (a directory's entries and a file's chunks carry no first_name).
+
+        Raises TooLarge once more than max_entries entries are met, counted per block before its children are
+        fetched: the entries of the distinct directory nodes met, plus one for each index child queued and not
+        met yet, which holds at least one entry below it (its first_name), so an index tree can't grow unchecked
+        either.
+        """
+        self.index_queued.discard(expect)
+        self.entries += sum(1 for child in children if child.kind is not None)
+        follow = []
+        for child in children:
+            if child not in self.seen and (not self.listing or walker.is_index_step(child)):
+                self.seen.add(child)
+                follow.append(child)
+                if walker.is_index_step(child):
+                    self.index_queued.add(child)
+        if self.max_entries is not None and self.entries + len(self.index_queued) > self.max_entries:
+            raise TooLarge(f"more than max_output_entries ({self.max_entries}) entries")
+        return follow
+
 
 class _Provider:
     """What a fetch knows about one provider."""
@@ -558,6 +620,20 @@ class Fetch:
         self._events: queue.Queue = queue.Queue()
         # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
         self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
+        # What each CID of a request in flight (not a probe) was asked for as, so a block arriving after the
+        # _download call that asked for it has returned is checked and stored rather than dropped
+        self._expects: dict[Cid, list[Expect]] = {}
+        # End-game duplication (_duplicate): when each request in flight (not a probe) was sent, by the fetch
+        # thread's clock; a request duplicated -> its duplicate, and back, while each is in flight; and the
+        # requests whose links were closed because the other copy won, whose outcome isn't counted
+        self._sent_at: dict[bytes, float] = {}
+        self._duplicated: dict[bytes, bytes] = {}
+        self._duplicates: dict[bytes, bytes] = {}
+        self._abandoned: set[bytes] = set()
+        # The idents of this fetch's request threads while they run, and the providers whose links it closed:
+        # a link another fetch has a request on isn't closed (PeerClient.close_unless_used)
+        self._threads: set[int] = set()
+        self._links_closed: set[bytes] = set()
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -589,25 +665,29 @@ class Fetch:
     def __exit__(self, exc_type, exc, tb):
         """Stop the lookup and end the session; an InvalidDag raised by this fetch marks the root invalid.
 
-        A fetch ended by an error (or cancelled) closes the links of its requests still in flight, so their
-        responses don't keep using the link and hold up the next /blocks to those nodes.
+        A fetch ended by an error (or cancelled, or by its reader closing a read_range early) closes the links of
+        its requests still in flight, so their responses don't keep using the link and hold up the next /blocks
+        to those nodes. One that ends normally does so for requests it no longer needs (a read_range's next window,
+        left unread), but leaves a probe for the first block, which another node sent, to finish. A link another
+        fetch has a request on (in progress or waiting for the link's /blocks slot) isn't closed: this fetch's
+        request is left to finish, and its blocks dropped, rather than fail the other fetch's and make it drop
+        the provider. Closing the link is how a requester stops a response: it never cancels the response's
+        Resource, which a responder would take for a rejection and cool the requester down for (section 3).
         """
         self.closed = True
         if self._lookup is not None:
             self._lookup.stop()
-        if exc_type is not None:
-            while True:  # requests already answered aren't in flight any more
-                try:
-                    event = self._events.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(event, ResultEvent):
-                    self._in_flight.pop(event.node_id, None)
-            for node_id in list(self._in_flight):
-                try:
-                    self.client.close(node_id)
-                except Exception as e:  # noqa: BLE001 - closing is best effort; logged
-                    log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
+        while True:  # requests already answered aren't in flight any more
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(event, ResultEvent):
+                self._in_flight.pop(event.node_id, None)
+        for node_id, (_, probe) in list(self._in_flight.items()):
+            if (exc_type is None and probe) or node_id in self._links_closed:
+                continue
+            self._close_link(node_id)
         # Only this fetch's own error: one from another fetch nested in the same `with` is about another root
         if isinstance(exc, InvalidDag) and getattr(exc, "root", None) == self.root:
             self.fetcher.mark_invalid(self.root)
@@ -676,7 +756,8 @@ class Fetch:
             self.storage.check_disk(size)
 
     def fetch_dag(self, target: Expect, max_entries: int | None = None):
-        """Fetch every block of target's DAG not already stored, level by level, checking each.
+        """Fetch every block of target's DAG not already stored, checking each; a block's children are asked for
+        as soon as it is met (_Walk).
 
         Raises TooLarge once its distinct blocks hold more than dag_limit() bytes (what target's declared
         size and the directory entries met allow, or max_dag_bytes if lower), and with max_entries once more
@@ -703,19 +784,7 @@ class Fetch:
                 return
             # What is stored already needn't fit again (its DAG nodes make this an estimate)
             self.check_disk(target, size - self.storage.dag_bytes(target.cid))
-            seen = {target}
-            frontier = [target]
-            entries = 0
-            while frontier:
-                children = self.ensure(frontier)
-                next_frontier = []
-                for expect in frontier:
-                    for child in children[expect]:
-                        if child not in seen:
-                            seen.add(child)
-                            next_frontier.append(child)
-                entries = self._count_entries(entries, frontier, children, next_frontier, max_entries)
-                frontier = next_frontier
+            self.ensure([target], walk=_Walk(target, False, max_entries))
 
     def fetch_listing(self, target: Expect, max_entries: int | None = None):
         """Fetch the directory and index nodes of the directory target (not its entries' contents).
@@ -728,36 +797,16 @@ class Fetch:
             max_entries = self.config.max_output_entries
         with self._checking():
             self.budget.declare(0)  # from here on its blocks are counted, the target's again
-            frontier = [target]
-            seen = {target}
-            entries = 0
-            while frontier:
-                children = self.ensure(frontier)
-                # Only an index's children carry first_name; a directory's entries and a file's chunks don't
-                next_frontier = [child for expect in frontier for child in children[expect]
-                                 if walker.is_index_step(child) and child not in seen]
-                entries = self._count_entries(entries, frontier, children, next_frontier, max_entries)
-                seen.update(next_frontier)
-                frontier = next_frontier
-
-    @staticmethod
-    def _count_entries(entries: int, frontier: list[Expect], children: dict[Expect, list[Expect]],
-                       next_frontier: list[Expect], max_entries: int | None) -> int:
-        """Entries met so far, after a level: raises TooLarge past max_entries, before the next level is fetched.
-
-        Entries of distinct directory nodes are counted, plus the index children about to be fetched: each
-        holds at least one entry below it (its first_name), so an index tree can't grow unchecked either.
-        """
-        entries += sum(1 for expect in frontier for child in children[expect] if child.kind is not None)
-        if max_entries is not None:
-            pending = sum(1 for child in next_frontier if walker.is_index_step(child))
-            if entries + pending > max_entries:
-                raise TooLarge(f"more than max_output_entries ({max_entries}) entries")
-        return entries
+            self.ensure([target], walk=_Walk(target, True, max_entries))
 
     def read_range(self, target: Expect, offset: int = 0, length: int | None = None) -> Iterator[bytes]:
         """The bytes of the file target in [offset, offset + length), fetching only the chunks covering them
         and the nodes above, WINDOW chunks at a time. Raises ValueError for a directory.
+
+        The next window's chunks are asked for before this one's bytes are handed to the reader, so the
+        providers keep working while it reads; a reader that stops early has fetched at most one window more
+        than it read, and ending the fetch closes the links still bringing it (but not one another fetch has a
+        request on: that request is left to finish).
 
         Lazy all the way down: the range is walked depth-first as it is read, so a DAG claiming billions of
         chunks costs nothing until they are read, and small chunks count against max_output_entries. The file
@@ -780,18 +829,28 @@ class Fetch:
             if not target.cid.is_raw:
                 budget.count(target.cid, len(self.get(target)))  # the fetch's own budget has counted it already
             small = walker.SmallLeaves(self.config.max_output_entries)
-            window: list[tuple[Expect, int, int]] = []
-            for leaf in self._range_leaves(target, offset, end - offset, budget):
-                small.meet(leaf[2])
-                window.append(leaf)
-                if len(window) >= WINDOW:
-                    yield from self._read_window(window)
-                    window = []
-            yield from self._read_window(window)
+            leaves = self._range_leaves(target, offset, end - offset, budget)
+            window = self._next_window(leaves, small)
+            while window:
+                ahead = self._next_window(leaves, small)
+                yield from self._read_window(window, ahead)
+                window = ahead
 
-    def _read_window(self, window: list[tuple[Expect, int, int]]) -> Iterator[bytes]:
-        """Fetch a window of chunks in one go, then yield the range within each, in order."""
-        self.ensure([expect for expect, _, _ in window])
+    @staticmethod
+    def _next_window(leaves: Iterator[tuple[Expect, int, int]],
+                     small: walker.SmallLeaves) -> list[tuple[Expect, int, int]]:
+        """The next WINDOW chunks of a range's walk (fewer at its end, none past it), each met by small."""
+        window = []
+        for leaf in islice(leaves, WINDOW):
+            small.meet(leaf[2])
+            window.append(leaf)
+        return window
+
+    def _read_window(self, window: list[tuple[Expect, int, int]],
+                     ahead: list[tuple[Expect, int, int]]) -> Iterator[bytes]:
+        """Fetch a window of chunks in one go, asking for ahead's (the next window's) once nothing of it is left to
+        ask for, then yield the range within each, in order."""
+        self.ensure([expect for expect, _, _ in window], ahead=[expect for expect, _, _ in ahead])
         for expect, child_offset, child_length in window:
             block = self.get(expect)
             try:
@@ -824,34 +883,68 @@ class Fetch:
 
     # Getting blocks
 
-    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None) -> dict[Expect, list[Expect]]:
+    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None, ahead: list[Expect] = (),
+               walk: _Walk | None = None) -> dict[Expect, list[Expect]]:
         """Make sure every block of expects is stored and passes its reader checks; their children's expects.
 
-        Their blocks are counted against budget (a read_range call's), by default the fetch's own.
+        Their blocks are counted against budget (a read_range call's), by default the fetch's own. The blocks of
+        ahead (a read_range's next window) are asked for once nothing of expects is left to ask for, and stored
+        as they arrive, during this call or a later one, but not waited for; one stored already, denied, or not
+        passing its CID check is left out, to be met when it is ensured. Under walk (fetch_dag's or
+        fetch_listing's; not with ahead), each block met adds the children walk.met returns, ensured in the same
+        call, and nothing is returned.
         Raises InvalidDag, NotFound when no provider can supply a block, StorageFull, TooLarge.
         """
         with self._checking():
-            return self._ensure(expects, self.budget if budget is None else budget)
+            return self._ensure(expects, self.budget if budget is None else budget, ahead, walk)
 
-    def _ensure(self, expects: list[Expect], budget: _DagBudget) -> dict[Expect, list[Expect]]:
+    def _ensure(self, expects: list[Expect], budget: _DagBudget, ahead: list[Expect] = (),
+                walk: _Walk | None = None) -> dict[Expect, list[Expect]]:
         """ensure(), untagged."""
         self._check_cancelled()
         children: dict[Expect, list[Expect]] = {}
         wanted: dict[Cid, list[Expect]] = {}
-        for expect in dict.fromkeys(expects):
+        self._meet(expects, wanted, children, budget, walk)
+        prefetch: dict[Cid, list[Expect]] = {}
+        for expect in ahead:
+            cid = expect.cid
+            if cid in wanted or self.storage.has(cid) or self.storage.deny.denies(cid):
+                continue
+            try:
+                walker.check_cid(expect)
+            except InvalidDag:
+                continue
+            prefetch.setdefault(cid, []).append(expect)
+        if wanted or prefetch:
+            self._download(wanted, children, budget, prefetch, walk)
+            self.fetcher.after_store()
+        return children
+
+    def _meet(self, expects, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
+              walk: _Walk | None) -> list[Cid]:
+        """Check each of expects before fetching or reading it (the deny list, its CID) and, if it is stored,
+        against its reader checks (counted against budget), its children going into children; the rest go into
+        wanted. Under walk, a stored block's children walk.met returns are met in turn, and children isn't kept.
+        Returns the CIDs newly wanted, in the order met."""
+        queue = deque(dict.fromkeys(expects))
+        new = []
+        while queue:
+            expect = queue.popleft()
             self.fetcher.check_denied(expect.cid)  # before fetching or reading it, stored or not
             walker.check_cid(expect)  # before fetching a block that can't be right
             checked = self._check_stored(expect, budget)
             if checked is None:
+                if expect.cid not in wanted:
+                    new.append(expect.cid)
                 wanted.setdefault(expect.cid, []).append(expect)
-            else:
+                continue
+            if self.observer is not None:
+                self.observer.block(expect.cid, self.storage.block_size(expect.cid) or 0, False)
+            if walk is None:
                 children[expect] = checked
-                if self.observer is not None:
-                    self.observer.block(expect.cid, self.storage.block_size(expect.cid) or 0, False)
-        if wanted:
-            self._download(wanted, children, budget)
-            self.fetcher.after_store()
-        return children
+            else:
+                queue.extend(walk.met(expect, checked))
+        return new
 
     def _check_stored(self, expect: Expect, budget: _DagBudget) -> list[Expect] | None:
         """Children of a stored block after checking it against expect (counted against budget), or None if it
@@ -909,15 +1002,31 @@ class Fetch:
             if self._lookup is not None:
                 self._lookup.stop()  # it may now have enough providers to stop searching
 
-    def _download(self, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
+    def _download(self, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
+                  ahead: dict[Cid, list[Expect]] | None = None, walk: _Walk | None = None):
         """Fetch the wanted blocks from providers until all are stored, counted against budget. Raises NotFound if
-        none can."""
-        outstanding = set(wanted)
-        pending = _Pending(wanted)
+        none can.
+
+        ahead's blocks (ensure's) are asked for after wanted's and stored as they arrive, but not waited for:
+        whatever of them is still to ask for once wanted's are stored goes out to the providers idle by then,
+        before returning, so they keep working while the caller uses wanted's. Under walk, each block stored adds
+        its children still to fetch (_meet) to wanted's, at the back of the queue.
+        """
+        outstanding = set(wanted)  # still to store: wanted's, then ahead's
+        needed = outstanding  # what the call waits for: wanted's
+        if ahead:
+            needed = set(outstanding)
+            for cid, expects in ahead.items():
+                wanted[cid] = expects
+                outstanding.add(cid)
         in_flight = self._in_flight
+        # A CID that a request still in flight (an earlier call's ahead) asked for isn't asked for again: its
+        # result is waited for, and requeued if it doesn't bring the block
+        asked = {cid for cids, _ in in_flight.values() for cid in cids}
+        pending = _Pending(cid for cid in wanted if cid not in asked)
         self._progress_at = max(self._progress_at, self.fetcher.clock())  # it may be after a pacing wait
         give_up = self.config.lookup_timeout + self.config.stall_timeout
-        while outstanding:
+        while needed:
             self._check_cancelled()  # each pass waits at most POLL, so a cancel takes effect promptly
             # Requests and lookups have deadlines of their own; this catches whatever hangs regardless
             if self.fetcher.clock() - max(self._progress_at, self._heard_at) > give_up:
@@ -925,7 +1034,7 @@ class Fetch:
             self._assign(pending, in_flight, outstanding, wanted, budget)
             if not in_flight and not self._lookup_running and not self._waiting_for_busy():
                 if not self._rerun_lookup():
-                    raise NotFound(self._not_found_message(outstanding))
+                    raise NotFound(self._not_found_message(needed))
                 continue
             try:
                 events = [self._events.get(timeout=self._wait_time())]
@@ -938,11 +1047,17 @@ class Fetch:
                 except queue.Empty:
                     break
             for event in events:
-                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget)
+                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget, needed, walk)
+        if pending and self._usable():
+            # ahead's requests go out before the caller is handed wanted's blocks (never a lookup just for them)
+            self._assign(pending, in_flight, outstanding, wanted, budget)
 
     def _handle_event(self, event: ResultEvent | ProviderEvent | LookupDone, pending: _Pending, in_flight: dict,
-                      outstanding: set[Cid], wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
-        """Apply one event from a request thread or the lookup thread."""
+                      outstanding: set[Cid], wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget,
+                      needed: set[Cid] | None = None, walk: _Walk | None = None):
+        """Apply one event from a request thread or the lookup thread. needed is _download's, if it isn't
+        outstanding itself: the blocks stored are taken out of it too. Under walk, the children of the blocks
+        stored are met, and those still to fetch queued."""
         if isinstance(event, ProviderEvent):
             self._add_provider(event.node_id)
         elif isinstance(event, LookupDone):
@@ -951,11 +1066,30 @@ class Fetch:
         elif isinstance(event, ResultEvent):
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
+            self._sent_at.pop(event.node_id, None)
+            abandoned = event.node_id in self._abandoned
+            self._abandoned.discard(event.node_id)
+            asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
-                         event.sent_at, event.rate)
-            requeue = [cid for cid in cids if cid in outstanding and cid not in pending
-                       and not any(cid in asked for asked, _ in in_flight.values())]
+                         event.sent_at, event.rate, counted=not abandoned)
+            self._settle_duplicate(event.node_id, in_flight)
+            still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
+            requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
             pending.push_front(requeue)  # back at the front, keeping the walk's order
+            for cid in cids:
+                if cid not in still_asked:
+                    self._expects.pop(cid, None)
+            if needed is not None and needed is not outstanding:
+                needed.difference_update(cid for cid in cids if cid not in outstanding)
+            if walk is not None:
+                # In the order asked for, so the queue keeps the walk's order (breadth first, as met)
+                met = [child for cid in asked_now if cid not in outstanding
+                       for expect in wanted[cid] for child in walk.met(expect, children.pop(expect))]
+                new = self._meet(met, wanted, children, budget, walk)
+                outstanding.update(new)
+                if needed is not None and needed is not outstanding:
+                    needed.update(new)
+                pending.extend([cid for cid in new if cid not in still_asked])
 
     def _make_room(self, nbytes: int):
         """Before storing nbytes: evict other cached fetches over max_storage if not pinned (going over it if
@@ -1030,16 +1164,86 @@ class Fetch:
             batch = self._take_batch(pending, provider.node_id, wanted, budget)
             if batch:
                 in_flight[provider.node_id] = (batch, False)
+                for cid in batch:
+                    self._expects[cid] = wanted[cid]
+                self._sent_at[provider.node_id] = now
                 self._send(provider.node_id, batch)
                 busy_providers += 1
+        if not pending and busy_providers < self.fetcher.max_parallel:
+            self._duplicate(usable, in_flight, busy_providers, now)
+
+    def _duplicate(self, usable: list[_Provider], in_flight: dict, busy_providers: int, now: float):
+        """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers too
+        for the batches others have had in flight for longer than deadline_slack, oldest first, each at most
+        once, and within max_parallel requests in flight. A duplicate is sized for its own provider's link and
+        what one response carries (_take_batch)."""
+        idle = [provider for provider in usable if provider.node_id not in in_flight and provider.busy_until <= now]
+        if not idle:
+            return
+        slow = sorted((sent_at, node_id) for node_id, sent_at in self._sent_at.items()
+                      if node_id in in_flight and now - sent_at > self.config.deadline_slack
+                      and node_id not in self._duplicated and node_id not in self._duplicates
+                      and node_id not in self._abandoned)
+        for sent_at, node_id in slow:
+            if not idle or busy_providers >= self.fetcher.max_parallel:
+                return
+            # Its blocks not stored yet, as they were asked for (every CID in flight has its expectations here)
+            left = [cid for cid in in_flight[node_id][0] if cid in self._expects and not self.storage.has(cid)]
+            if not left:
+                continue
+            provider = idle[0]
+            # Not reserved against the DAG limits again: a block is counted once, whichever copy brings it
+            batch = self._take_batch(_Pending(left), provider.node_id, self._expects, None)
+            if not batch:
+                continue
+            idle.pop(0)
+            log(f"{node_name(node_id)} has been sending {plural(len(left), 'block')} of {self.root} for "
+                f"{now - sent_at:.0f}s; asking {node_name(provider.node_id)} too", LOG_VERBOSE)
+            in_flight[provider.node_id] = (batch, False)
+            self._sent_at[provider.node_id] = now
+            self._duplicated[node_id] = provider.node_id
+            self._duplicates[provider.node_id] = node_id
+            self._send(provider.node_id, batch)
+            busy_providers += 1
+
+    def _settle_duplicate(self, node_id: bytes, in_flight: dict):
+        """node_id's request has been answered: if it was one of a duplicated pair and the other copy, still in
+        flight, now carries nothing not stored, close that one's link (the first verified copy won), unless another
+        fetch has a request on it: then it is left to finish. Either way its outcome isn't counted against its
+        provider (_handle's counted). Closing the link stops the response without cancelling its Resource
+        (section 3)."""
+        other = self._duplicated.pop(node_id, None)
+        if other is not None:
+            self._duplicates.pop(other, None)
+        else:
+            other = self._duplicates.pop(node_id, None)  # the original stays marked as duplicated until answered
+        if other is None or other not in in_flight or other in self._abandoned:
+            return
+        if any(not self.storage.has(cid) for cid in in_flight[other][0]):
+            return  # it still carries blocks nobody else has sent
+        self._abandoned.add(other)
+        log(f"{node_name(node_id)} sent what {node_name(other)} was still sending; closing that link unless "
+            "another fetch uses it", LOG_VERBOSE)
+        self._close_link(other)
+
+    def _close_link(self, node_id: bytes):
+        """Close the link of this fetch's request to node_id, unless another fetch has a request on it."""
+        try:
+            if self.client.close_unless_used(node_id, set(self._threads)):
+                self._links_closed.add(node_id)
+            else:
+                log(f"leaving the request to {node_name(node_id)} to finish: another fetch uses its link", LOG_VERBOSE)
+        except Exception as e:  # noqa: BLE001 - closing is best effort; logged
+            log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
 
     def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]],
-                    budget: _DagBudget) -> list[Cid]:
+                    budget: _DagBudget | None) -> list[Cid]:
         """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
         hold, at least one.
 
         Under a DAG limit, only what the room budget leaves can take for sure (_DagBudget.room), but at least one
-        CID when no request is in flight: so a fetch downloads at most about one block beyond the limit.
+        CID when no request is in flight: so a fetch downloads at most about one block beyond the limit. With no
+        budget (a duplicate's, whose blocks are reserved already), no limit is applied.
         """
         rate = self.client.rate_estimate(node_id)
         max_bytes = rates.requester_max_bytes(rate, self.config)
@@ -1051,7 +1255,8 @@ class Fetch:
         # one count covers every batch taken from the front of pending
         mdu = self.client.link_mdu(node_id) or MAX_REQUEST_SIZE
         fit = max(1, protocol.blocks_batch_size(max_bytes, list(islice(pending, MAX_BATCH)), mdu))
-        room = budget.room((cid for cids, _ in self._in_flight.values() for cid in cids), wanted)
+        room = None if budget is None else budget.room((cid for cids, _ in self._in_flight.values() for cid in cids),
+                                                       wanted)
         batch: list[Cid] = []
         total = 0
         while pending and len(batch) < fit:
@@ -1079,6 +1284,8 @@ class Fetch:
             it was sent with (the responder's upload cap derives from the same response)."""
             sent_at = self.fetcher.clock()
             rate = None
+            ident = threading.get_ident()
+            self._threads.add(ident)  # until its request is over: the link's users that are this fetch's
             try:
                 rate = self.client.rate_estimate(node_id)
                 result = self.client.blocks(node_id, cids, on_progress=progress)
@@ -1087,6 +1294,8 @@ class Fetch:
                 # except, so the debug log has its traceback
                 log(f"/blocks to {node_name(node_id)} raised {e!r}", LOG_WARNING)
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
+            finally:
+                self._threads.discard(ident)
             if result.elapsed is not None:
                 # When it actually went out: opening the link or waiting for its /blocks slot isn't its time
                 sent_at = max(sent_at, self.fetcher.clock() - result.elapsed)
@@ -1179,11 +1388,14 @@ class Fetch:
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,
-                outstanding: set[Cid], budget: _DagBudget, sent_at: float | None = None, rate: float | None = None):
+                outstanding: set[Cid], budget: _DagBudget, sent_at: float | None = None, rate: float | None = None,
+                counted: bool = True):
         """Store a response's blocks (counted against budget) and apply the provider failure and pacing rules.
         Raises InvalidDag.
 
-        sent_at is when the request was sent and rate the link's rate estimate then (None: unknown).
+        sent_at is when the request was sent and rate the link's rate estimate then (None: unknown). A request
+        not counted (one whose link the fetch closed, as its duplicate won) has its blocks stored, but its outcome
+        applies none of the rules: closing the link isn't the provider's stall or failure.
         """
         provider = self._providers.get(node_id)
         if result.bad:
@@ -1195,10 +1407,16 @@ class Fetch:
                 provider = self._new_provider(node_id)
             self._fail(provider, "sent a block not matching its CID")
         new = {cid: block for cid, block in result.blocks.items() if cid in outstanding}
-        self._make_room(sum(len(block) for cid, block in new.items() if not self.storage.has(cid)))
+        # Asked for by an earlier _download call (a read_range's next window, while its walk fetched a file node):
+        # checked against what it was asked for as and stored, not dropped and asked for again
+        late = {cid: block for cid, block in result.blocks.items()
+                if cid not in outstanding and cid in self._expects and not self.storage.has(cid)}
+        self._make_room(sum(len(block) for cid, block in (new | late).items() if not self.storage.has(cid)))
         for cid, block in new.items():
             self._accept(cid, block, wanted, children, budget)
             outstanding.discard(cid)
+        for cid, block in late.items():
+            self._accept(cid, block, self._expects, {}, self.budget)
         if probe:
             # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised
             if result.blocks and provider is None:
@@ -1206,7 +1424,7 @@ class Fetch:
                 log(f"{node_name(node_id)} (open link) has {self.root}", LOG_VERBOSE)
                 self._pace(provider, sent_at, rate)
             return
-        if provider is None or provider.failed:
+        if provider is None or provider.failed or not counted:
             return
         now = self.fetcher.clock()
         if result.status == peer_client.OK:

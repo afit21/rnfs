@@ -723,13 +723,22 @@ and repeat.
    chunks of 4 KiB or more (one level up to 1 MiB, seven for any size): a range ends inside at most two nodes
    of a level. Otherwise it fails ("too large"); a requester counts a file node not yet received as
    `MAX_BLOCK_SIZE`, as in item 5, so a small range ending in two nodes of a level asks for them one at a
-   time.
-7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers
-   only contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or
-   misses the same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels
-   the transfer, and its blocks are requested again from another provider; providers that keep failing are
-   handled as in section 6. A fetch that fails or is cancelled closes the links of its requests still in
-   flight, so their responses don't keep using the link and hold up the next `/blocks` to those nodes.
+   time. The chunks are fetched a window (32 chunks) at a time, and the next window's are asked for before the
+   reader is handed the current one's bytes, so the providers don't wait for the reader; a reader that stops
+   early has had at most one window fetched that it didn't read.
+7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only
+   contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or misses the
+   same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels the transfer,
+   and its blocks are requested again from another provider; providers that keep failing are handled as in
+   section 6. A fetch that fails or is cancelled, or whose reader stops early (item 6), closes the links of its
+   requests still in flight, so their responses don't keep using the link and hold up the next `/blocks` to those
+   nodes, unless another fetch has a request on the same link: closing it would fail that one, so the request is
+   left to finish. It never cancels their Resources (section 3, Cooldown). When nothing is left to ask for and a
+   provider is idle, a requester MAY ask it too for a batch that has been in flight for longer than
+   `deadline_slack` (end-game duplication), so a response that keeps making just enough progress not to stall
+   doesn't hold up the fetch. The first verified copy wins; the request still sending blocks that have arrived
+   then has its link closed (left to finish, under the same rule), which doesn't count as a stall of its
+   provider. rnfs duplicates each request at most once, and not on slow nodes, which use one provider at a time.
 8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
 9. When the target is complete, the node provides it if its strategy says so (section 6).
@@ -1058,7 +1067,7 @@ as is cheap. Rules live in the sections referenced.
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
-| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection (2, 3, 7) |
+| Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection, and end-game duplication of a response still arriving after `deadline_slack` (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links, LXMF delivery links and links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
@@ -1120,8 +1129,10 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   hear them learn each `[sequence, CID]` record and when it changes, though members won't serve them the content
   (section 3). `name publish` in private mode warns of this.
 - Bans are evaded by switching identity; they only make an attacker pay for a new one.
-- A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
-  provider at a time, this can delay a fetch for a long time.
+- A provider can lower its own measured rate, and so slow a fetch from it, or drip a response just fast enough
+  not to stall: without a rate estimate its deadline assumes `unmeasured_bitrate`, hours for one 64 KiB block.
+  Once nothing else is left to ask for, another provider is asked for its blocks after `deadline_slack`
+  (section 7); on slow nodes, which use one provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
 - Many LXMF identities can keep the strangers' bucket empty (one message a minute, each from a new identity,
   is enough), so no other untrusted sender's message is kept; contacts and other trusted senders are unaffected

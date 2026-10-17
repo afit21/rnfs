@@ -139,6 +139,9 @@ class PeerLink:
         self.rate: float | None = None  # rate estimate in bits/s (section 2)
         self.requests = 0
         self.blocks = 0
+        # Threads with a request in progress on the link or waiting for a slot -> how many each: who would lose a
+        # request if the link were closed now (PeerClient.close_unless_used)
+        self.users: dict[int, int] = {}
         self.closed = False
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.cond = threading.Condition()
@@ -185,6 +188,26 @@ class PeerLink:
         """True if a request is in progress."""
         with self.cond:
             return self.requests > 0
+
+    def enter(self):
+        """The calling thread is about to wait for a slot and send a request (LinkPool.request)."""
+        ident = threading.get_ident()
+        with self.cond:
+            self.users[ident] = self.users.get(ident, 0) + 1
+
+    def leave(self):
+        """The calling thread's request is over, sent or not."""
+        ident = threading.get_ident()
+        with self.cond:
+            if self.users.get(ident, 0) <= 1:
+                self.users.pop(ident, None)
+            else:
+                self.users[ident] -= 1
+
+    def used_by_others(self, own: set[int]) -> bool:
+        """True if a thread not in own (thread idents) has a request in progress on the link or waiting for a slot."""
+        with self.cond:
+            return any(ident not in own for ident in self.users)
 
     def mark_closed(self):
         """The link closed: wake everyone waiting for a slot."""
@@ -389,6 +412,15 @@ class LinkPool:
         """Tear down the shared link to node_id, if any (e.g. after a stalled transfer)."""
         self.close_link(self.shared_peer(node_id))
 
+    def close_unless_used(self, node_id: bytes, own: set[int]) -> bool:
+        """Tear down the shared link to node_id unless a thread not in own (thread idents) has a request in
+        progress on it or waiting for a slot. True if there was nothing else on it (the link, if any, is closed)."""
+        peer = self.shared_peer(node_id)
+        if peer is not None and peer.used_by_others(own):
+            return False
+        self.close_link(peer)
+        return True
+
     def close_all(self):
         """Stop the idle sweeper and tear down every link."""
         self.stop_event.set()
@@ -477,6 +509,16 @@ class LinkPool:
         request_deadline has passed since it was sent, or if it waited that long for a slot. A request larger
         than the link's packet MDU isn't sent (the exchange is returned unanswered).
         """
+        peer.enter()
+        try:
+            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress)
+        finally:
+            peer.leave()
+
+    def _request(self, peer: PeerLink, path: str, data, blocks: bool, max_response_size: int | None,
+                 watchdog: Callable[[Exchange, float], str | None] | None,
+                 on_progress: Callable[[float], None] | None) -> Exchange:
+        """request(), with the calling thread counted among the link's users."""
         exchange = Exchange(self.clock)
         deadline = None if blocks else self.request_deadline(peer)
         if not peer.acquire(blocks, timeout=deadline):

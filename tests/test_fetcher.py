@@ -20,11 +20,12 @@ from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs import fetcher as fetcher_module
 from rnfs.fetcher import Fetcher
-from rnfs.network import protocol, server
+from rnfs.network import client as client_module, links, protocol, server
 from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
 from tests.fakes.client import BATCH, FakeClient
 from tests.fakes.log import quiet_log
 from tests.support import failing_commits, state_execute, state_rows
+import tests.test_links as link_fakes  # a module, so its test cases don't run twice
 
 OWN = bytes(16)
 P1, P2, P3, P4 = (bytes([i]) * 16 for i in (1, 2, 3, 4))
@@ -710,6 +711,269 @@ class TransferTest(FetcherTest):
         built = builder.build_bytes(os.urandom(3 * CHUNK_SIZE), self.storage.put)
         self.fetch_all(built.cid)
         self.assertEqual(self.client.requests, [])
+
+
+class ReadAheadTest(FetcherTest):
+    """read_range asks for the next window while the reader takes this one (A1); a reader closing early closes
+    the links still bringing it, and never cancels a response (NET-1)."""
+
+    def setUp(self):
+        """A file of four windows of WINDOW (6) chunks, held by three providers. Each request carries one chunk (no
+        rate estimate: CHUNK_SIZE), and one for a chunk of window k + 1 is answered only once the reader has had
+        the first bytes of window k (self.gates[k] set), so what is in flight when it gets them is seen."""
+        super().setUp()
+        patcher = mock.patch.object(fetcher_module, "WINDOW", 6)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.data = os.urandom(4 * 6 * CHUNK_SIZE)
+        self.built = self.file(self.data)
+        self.chunks = dag.decode(self.network[self.built.cid]).children
+        self.window_of = {child.cid: i // 6 for i, child in enumerate(self.chunks)}
+        self.gates = [threading.Event() for _ in range(4)]
+        for gate in self.gates:
+            self.addCleanup(gate.set)  # so no request thread outlives the test
+
+        def gated(cids):
+            """Serve as usual once the reader has had the previous window's first bytes."""
+            window = min(self.window_of.get(cid, 0) for cid in cids)
+            if window:
+                self.gates[window - 1].wait(5)
+            return None
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+            self.client.behaviour[node_id] = gated
+        self.runs.append([P1, P2, P3])
+
+    def test_every_provider_is_busy_across_window_boundaries(self):
+        busy = []
+        pieces = []
+        with self.fetcher.open(self.built.cid) as fetch:
+            for i, piece in enumerate(fetch.read_range(fetch.resolve())):
+                if i % 6 == 0:
+                    # The reader has this window's first bytes: the next window's requests are already out
+                    busy.append(sorted(node for node, (_, probe) in fetch._in_flight.items() if not probe))
+                    self.gates[i // 6].set()
+                pieces.append(piece)
+            self.assertEqual(fetch._expects, {})  # nothing left over once read
+        self.assertEqual(b"".join(pieces), self.data)
+        self.assertEqual(busy, [[P1, P2, P3]] * 3 + [[]])  # the last window has none after it
+        asked = [cid for node in (P1, P2, P3) for cid in self.client.asked(node)]
+        self.assertEqual(sorted(asked), sorted([self.built.cid] + [child.cid for child in self.chunks]))
+
+    def test_early_closing_reader_closes_its_links(self):
+        def read():
+            """What node.read does: the fetch ends when the reader closes its iterator."""
+            with self.fetcher.open(self.built.cid) as fetch:
+                self.fetch = fetch
+                yield from fetch.read_range(fetch.resolve())
+
+        reader = read()
+        self.assertEqual(next(reader), self.data[:CHUNK_SIZE])
+        in_flight = sorted(self.fetch._in_flight)
+        self.assertEqual(in_flight, [P1, P2, P3])
+        reader.close()
+        self.assertEqual(sorted(self.client.closed), in_flight)
+        # It fetched at most the window after the one it read
+        asked = [cid for node in (P1, P2, P3) for cid in self.client.asked(node)]
+        self.assertLessEqual(len(asked), 1 + 2 * 6)
+        self.assertNotIn(self.chunks[2 * 6].cid, asked)
+
+    def test_a_reader_left_unread_closes_its_links_when_the_fetch_ends(self):
+        with self.fetcher.open(self.built.cid) as fetch:
+            reader = fetch.read_range(fetch.resolve())
+            next(reader)
+            in_flight = sorted(fetch._in_flight)
+        self.assertEqual(sorted(self.client.closed), in_flight)
+        self.assertTrue(in_flight)
+        reader.close()
+
+    def test_a_block_arriving_after_its_call_is_stored(self):
+        first, second, third = walker.expand(walker.root_expect(self.built.cid), self.network[self.built.cid])[:3]
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def held(cids):
+            """Serve second only once the gate opens."""
+            if second.cid in cids:
+                gate.wait(5)
+            return None
+        for node_id in (P1, P2, P3):
+            self.client.behaviour[node_id] = held
+        with self.fetcher.open(self.built.cid) as fetch:
+            fetch.resolve()
+            fetch.ensure([first], ahead=[second])  # returns with second still in flight
+            self.assertFalse(self.storage.has(second.cid))
+            gate.set()
+            deadline = time.monotonic() + 5
+            while fetch._events.empty() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            fetch.ensure([third])  # second's result arrives during a call that doesn't want it
+            self.assertTrue(self.storage.has(second.cid))
+        asked = [cid for node in (P1, P2, P3) for cid in self.client.asked(node)]
+        self.assertEqual(asked.count(second.cid), 1)
+        self.assertEqual(self.client.closed, [])
+
+
+class ReadAheadLinkTest(unittest.TestCase):
+    """An early-closing reader over the real PeerClient and LinkPool (RNS faked as in test_links): its link is torn
+    down, which stops the response, unless another fetch has a request on it; it never cancels the response's
+    Resource (a responder would cool it down)."""
+
+    def setUp(self):
+        """A fetcher using a PeerClient whose links are FakeLinks; one provider serving a file of three windows of
+        two chunks, which holds back its answers past the first window until self.release is set (5 s at most),
+        and another file of as many chunks, which it serves at once."""
+        patcher = mock.patch.object(links, "RNS", link_fakes.fake_rns())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        window = mock.patch.object(fetcher_module, "WINDOW", 2)
+        window.start()
+        self.addCleanup(window.stop)
+        link_fakes.FakeLink.created = []
+        link_fakes.FakeLink.establish_delay = 0.0
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=tmp.name, slow="no")
+        storage = Storage(os.path.join(tmp.name, "blocks"), os.path.join(tmp.name, "state"), 10**9)
+        self.addCleanup(storage.close)
+        self.pool = links.LinkPool(object(), config)
+        self.addCleanup(self.pool.close_all)
+        network: dict[Cid, bytes] = {}
+        self.data = os.urandom(6 * CHUNK_SIZE)
+        self.root = builder.build_bytes(self.data, network.__setitem__).cid
+        self.other_data = os.urandom(6 * CHUNK_SIZE)
+        self.other = builder.build_bytes(self.other_data, network.__setitem__).cid
+        held = {child.cid for child in dag.decode(network[self.root]).children[2:]}
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+
+        def respond(link, path, data):
+            """Serve at once, but the first file's chunks past its first window only once released, as a slow
+            response would arrive."""
+            cids = [Cid.from_bytes(binary) for binary in data[1]]
+            if held.intersection(cids):
+                self.release.wait(5)
+            return [network[cid] for cid in cids]
+        link_fakes.FakeLink.responder = staticmethod(respond)
+        self.fetcher = Fetcher(storage, client_module.PeerClient(self.pool, config), config, OWN,
+                               RoutingTable(OWN, config), lambda key: FakeLookup([[P1]]))
+        self.addCleanup(self.fetcher.close)
+        self.fetches = []
+
+    def read(self, root: Cid):
+        """What node.read does: the fetch ends when the reader closes its iterator."""
+        with self.fetcher.open(root) as fetch:
+            self.fetches.append(fetch)
+            yield from fetch.read_range(fetch.resolve())
+
+    def test_closing_the_reader_tears_the_link_down(self):
+        reader = self.read(self.root)
+        self.assertEqual(next(reader), self.data[:CHUNK_SIZE])
+        link = link_fakes.FakeLink.created[0]
+        response = mock.Mock()  # the next window's response Resource, arriving
+        link.incoming_resources = [response]
+        self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
+        reader.close()
+        self.assertEqual(link.status, link_fakes.FakeLink.CLOSED)
+        response.cancel.assert_not_called()
+
+    def test_closing_a_reader_leaves_a_link_another_fetch_uses(self):
+        other = self.read(self.other)
+        self.assertEqual(next(other), self.other_data[:CHUNK_SIZE])  # its provider found, its link open
+        reader = self.read(self.root)
+        self.assertEqual(next(reader), self.data[:CHUNK_SIZE])  # its next window now holds the link's /blocks slot
+        rest = []
+        thread = threading.Thread(target=lambda: rest.append(b"".join(other)), daemon=True)
+        thread.start()
+        peer = self.pool.shared_peer(P1)
+        deadline = time.monotonic() + 5
+        while len(peer.users) < 2 and time.monotonic() < deadline:  # the other read's request waits for the slot
+            time.sleep(0.01)
+        self.assertEqual(len(peer.users), 2)
+        link = link_fakes.FakeLink.created[0]
+        response = mock.Mock()
+        link.incoming_resources = [response]
+        reader.close()  # gives up mid-window: its request is left to finish, the other's isn't failed
+        self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
+        self.release.set()
+        thread.join(10)
+        self.assertEqual(rest, [self.other_data[CHUNK_SIZE:]])
+        provider = self.fetches[0]._providers[P1]
+        self.assertEqual((provider.failed, provider.stalls, provider.busy), (False, 0, 0))
+        self.assertEqual(len(link_fakes.FakeLink.created), 1)  # the one link, never closed
+        self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
+        response.cancel.assert_not_called()
+
+
+class WalkTest(FetcherTest):
+    """fetch_dag and fetch_listing queue a block's children as soon as it is met (A4), keeping parents before their
+    children, so an interrupted fetch resumes from what it stored."""
+
+    def setUp(self):
+        """A directory of three subdirectories of four small files each; each request carries one DAG node (as
+        if each were a full block), so the subdirectories go to three providers."""
+        super().setUp()
+        patcher = mock.patch.object(fetcher_module, "DAG_NODE_GUESS", CHUNK_SIZE)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.subdirs, self.files = [], []
+        for i in range(3):
+            files = [self.file(os.urandom(100 + 10 * i + k)) for k in range(4)]
+            self.files.append([built.cid for built in files])
+            self.subdirs.append(builder.build_directory([Entry(f"f{k}", built.cid, built.size, 0)
+                                                         for k, built in enumerate(files)], self.put))
+        self.root = builder.build_directory([Entry(f"s{i}", sub.cid, sub.size, 2)
+                                             for i, sub in enumerate(self.subdirs)], self.put)
+
+    def test_children_are_asked_for_before_the_level_ends(self):
+        asked_below = threading.Event()
+        seen = []
+        early = {cid for files in self.files[:2] for cid in files}
+
+        def answer(cids):
+            """Hold the last subdirectory until files below the others are asked for (up to 3 s)."""
+            if early.intersection(cids):
+                asked_below.set()
+            if self.subdirs[2].cid in cids:
+                seen.append(asked_below.wait(3))
+            return None
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+            self.client.behaviour[node_id] = answer
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(self.root.cid)
+        self.assertTrue(self.storage.is_complete(self.root.cid))
+        self.assertEqual(seen, [True], "nothing below the level was asked for while its last block was held")
+        asked = [cid for node_id in (P1, P2, P3) for cid in self.client.asked(node_id)]
+        self.assertEqual(sorted(asked), sorted(self.network))  # each block once
+
+    def test_interrupted_walk_stores_no_child_without_its_parent(self):
+        self.hold(P1, [cid for cid in self.network if cid != self.subdirs[1].cid])
+        self.runs.append([P1])
+        with self.assertRaises(NotFound):  # P1 fails once it answers None for the second subdirectory
+            self.fetch_all(self.root.cid)
+        self.assertFalse(any(self.storage.has(cid) for cid in self.files[1]))
+        missing = [cid for cid in self.network if not self.storage.has(cid)]
+        self.hold(P2)
+        self.runs[:] = [[P2]]
+        self.fetch_all(self.root.cid)
+        self.assertTrue(self.storage.is_complete(self.root.cid))
+        self.assertEqual(sorted(self.client.asked(P2)), sorted(missing))  # resumed from what it stored
+
+    def test_listing_fetches_index_nodes_as_they_are_met(self):
+        with mock.patch("rnfs.constants.MAX_CHILDREN", 4):
+            empty = self.file(b"")
+            root = builder.build_directory([Entry(f"{i:04d}", empty.cid, 0, 0) for i in range(100)], self.put)
+        self.hold(P1)
+        self.hold(P2)
+        self.runs.append([P1, P2])
+        with self.fetcher.open(root.cid) as fetch:
+            fetch.fetch_listing(fetch.resolve())
+            entries = list(walker.list_directory(fetch.target, fetch.get, 1000))
+        self.assertEqual([entry.name for entry in entries], [f"{i:04d}" for i in range(100)])
+        asked = self.client.asked(P1) + self.client.asked(P2)
+        self.assertEqual(len(asked), len(set(asked)))
+        self.assertNotIn(empty.cid, asked)  # the entries' contents aren't fetched
 
 
 class LimitTest(FetcherTest):
