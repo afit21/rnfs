@@ -709,13 +709,23 @@ class RnfsNode:
 
     def _heard_server(self, node_id: bytes):
         """A server-mode announce (or path response) from node_id."""
+        self._count_heard(node_id, "server")
         if self.routing.heard(node_id):
             log(f"heard DHT server {node_name(node_id)} ({self.routing.node_count()} known)", LOG_VERBOSE)
             self.publisher.wake()
 
     def _heard_client(self, node_id: bytes):
         """node_id announces client mode: it doesn't belong in the routing table."""
+        self._count_heard(node_id, "client")
         self.routing.remove(node_id)
+
+    def _count_heard(self, node_id: bytes, mode: str):
+        """Count node_id's announce in the traffic counters, which `rnfs peers` reads its DHT mode and last-heard
+        time from (client-mode nodes never enter the routing table). Done here rather than by a second rnfs.dht
+        announce handler in the peers feature: RNS starts a thread per handler for every announce."""
+        traffic = getattr(self.client, "traffic", None)
+        if traffic is not None:
+            traffic.heard(node_id, mode)
 
     def _is_member_node(self, node_id: bytes) -> bool:
         """Private mode's routing table admission: node_id's identity is a member."""

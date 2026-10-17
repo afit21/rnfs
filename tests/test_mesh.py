@@ -15,6 +15,7 @@ from rnfs.config import Config
 from rnfs.constants import BLOCKS_PATH, FIND_PATH, KIB, MAX_RESPONSE_SIZE
 from rnfs.features import peers as peers_feature
 from rnfs.network import protocol, server
+from rnfs.network.announces import DhtAnnounceHandler, encode_mode
 from rnfs.network.client import BUSY, FAILED, OK, BlocksResult, PeerClient
 from rnfs.node import RnfsNode
 from tests.support import FakeClock
@@ -574,6 +575,25 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertEqual([listed[P1.hex()][key] for key in ("hops", "interface", "bitrate")], [2, "LoRa", 1200.0])
         self.assertIsNone(listed[P3.hex()]["hops"])
         self.assertEqual(list(listed), [P1.hex(), P3.hex()])  # nearest first
+
+    def test_announces_counted_once_by_the_node(self):
+        # S8: the node's rnfs.dht announce handler counts each announce; the feature registers none of its own
+        self.node.reticulum = object()
+        self.addCleanup(setattr, self.node, "reticulum", None)
+        with mock.patch.object(RNS.Transport, "register_announce_handler") as register:
+            self.feature.start()
+        register.assert_not_called()
+        handler = DhtAnnounceHandler(self.node._heard_server, self.node._heard_client, self.node.routing.is_banned,
+                                     self.node.node_id)  # as RnfsNode._start_network wires it
+        self.node.routing.ban(P4)
+        with mock.patch.object(self.feature.traffic, "heard", wraps=self.feature.traffic.heard) as heard:
+            for node_id, server in ((P1, True), (P2, False), (P4, True), (OWN, True)):
+                handler.received_announce(node_id, None, encode_mode(server))
+        self.assertEqual(heard.call_args_list, [mock.call(P1, "server"), mock.call(P2, "client")])
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        self.assertEqual((listed[P1.hex()]["mode"], listed[P1.hex()]["in_table"]), ("server", True))
+        self.assertEqual((listed[P2.hex()]["mode"], listed[P2.hex()]["in_table"]), ("client", False))
+        self.assertIsNotNone(listed[P2.hex()]["last_heard"])
 
     def test_recalled_mode_doesnt_mark_used(self):
         # A listing is a check, not a contact (C2)

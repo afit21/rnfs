@@ -2,8 +2,8 @@
 
 Counters live in a mesh.Traffic shared by the node's PeerClient (requests and verified bytes received per
 provider) and RequestServer (/blocks bytes sent, per requester where it identified, and airtime refusals);
-this feature reads them. It also registers an rnfs.dht announce handler of its own, so the DHT mode and the
-last-heard time of client-mode nodes (which never enter the routing table) are known too.
+this feature reads them. The node's rnfs.dht announce handler counts every announce in them too (Traffic.heard),
+so the DHT mode and the last-heard time of client-mode nodes (which never enter the routing table) are known.
 
 Nothing is persisted: counts are since the daemon started. Memory is bounded by mesh.MAX_PEERS.
 """
@@ -28,23 +28,6 @@ class PeersFeature(Feature):
         super().__init__(node)
         traffic = getattr(node.client, "traffic", None)
         self.traffic: mesh.Traffic = traffic if isinstance(traffic, mesh.Traffic) else mesh.Traffic()
-        self._handler = None
-
-    def start(self):
-        """Listen to rnfs.dht announces for modes and last-heard times."""
-        if getattr(self.node, "reticulum", None) is None:
-            return
-        from rnfs.network.announces import DhtAnnounceHandler
-        self._handler = DhtAnnounceHandler(lambda node_id: self.traffic.heard(node_id, "server"),
-                                           lambda node_id: self.traffic.heard(node_id, "client"),
-                                           self.node.routing.is_banned, self.node.node_id)
-        self._handler.register()
-
-    def stop(self):
-        """Stop listening to announces."""
-        if self._handler is not None:
-            self._handler.deregister()
-            self._handler = None
 
     def status(self) -> dict:
         """Traffic totals and airtime refusals for `rnfs status`."""
