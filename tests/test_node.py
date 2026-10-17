@@ -471,7 +471,7 @@ class SecurityTest(NodeTest):
         os.mkdir(theirs)
         with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
             with self.assertRaisesRegex(RnfsError, "belongs to another user"):
-                node_module._make_private_dirs(Config(rnfs_dir=theirs))
+                node_module._make_private_dirs(theirs)
         self.assertFalse(os.path.exists(os.path.join(theirs, "state")))  # nothing written there
 
     @unittest.skipUnless(POSIX_MODES, "Unix permission bits")
@@ -481,7 +481,7 @@ class SecurityTest(NodeTest):
         os.chmod(loose, 0o777)
         with mock.patch("os.chmod", side_effect=PermissionError("not permitted")):
             with self.assertRaisesRegex(RnfsError, "couldn't make .* private"):
-                node_module._make_private_dirs(Config(rnfs_dir=loose))
+                node_module._make_private_dirs(loose)
 
     def test_no_permission_fix_on_windows(self):
         # Windows' st_mode always shows others allowed: no chmod and no notice at every start
@@ -490,7 +490,7 @@ class SecurityTest(NodeTest):
         with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod, \
                 mock.patch.object(node_module, "log") as log, \
                 mock.patch("os.stat", return_value=mock.Mock(st_mode=0o40777)):
-            node_module._make_private_dirs(Config(rnfs_dir=loose))
+            node_module._make_private_dirs(loose)
         chmod.assert_not_called()
         log.assert_not_called()
 

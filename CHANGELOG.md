@@ -10,10 +10,70 @@ Security fixes, maintainability work and performance work. No wire-format or CID
 Security:
 - The release workflow's Flatpak build no longer uses the GitHub Actions cache. Any workflow run on the default
   branch can write that cache, and a poisoned one would have gone into the attested `.flatpak` bundle.
+- `rnfs inbox get` no longer quietly fetches the CID a sender put in a name link when the name can't be
+  resolved. The sender chose that CID and nothing ties it to the name, so any sender could pose as a
+  well-known name. It now fails before writing anything, unless you pass `--use-sent-cid`; then the result
+  carries a warning. Auto-fetch (trusted senders only) keeps the fallback, and records it.
+- A `/blocks` requester that rejects or cancels a response before a quarter of it was sent now cools down for
+  `blocks_cooldown`, per link and per identity, as one that rejected it unsent already did. Before, a requester
+  could take the first window of each response, cancel it and ask again at once, so the node built a whole
+  response per window. Closing the link still starts no cooldown, so an honest reader that gives up early isn't
+  held back.
+- While the deny list has file hashes (`sha256:` entries), a file that declares more than 16 times the bytes of
+  its distinct chunks, plus 64 MiB, is refused (451) before it is hashed. Hashing reads every repeat of
+  repeated content, so six blocks (128 KB) declaring 2^56 bytes made a one-byte `cat`, a gateway range request,
+  `?format=archive` or an `import` hash for about a year, holding a gateway slot. `cat` and the gateway now fetch
+  a file's whole DAG before checking it (unless its hash is already known), so `max_download_size` and the disk
+  reserve apply as they do for `get`.
+- A gateway HEAD (or a range not starting at byte 0) of a stored file the deny list blocks answers 451, like
+  GET. Before, it took its Content-Type from a denied stored chunk, and a HEAD of a file with a denied hash
+  answered 200.
+- A name whose owner is offline can still be resolved through its keepers when Sybil nodes near its keeper key
+  stall the DHT lookup. They could answer `/find` slowly with ever closer IDs, so the search used all of
+  `lookup_timeout` and the keepers then had one second to answer. Each batch of `/name` queries now has its own
+  budget (87.5 s at the defaults); the search for keepers stops once some are known and `lookup_timeout` / 5 has
+  passed, and resumes if their answers don't settle the name.
+- `get` of a directory can no longer be redirected by someone who can rename inside the output swapping one of
+  its directories for a link or junction (or another directory) while it is written. On Linux and macOS the
+  output being written is private (0700, setgid kept) and must start empty, every entry is created relative to
+  its parent's descriptor without following links, and each directory is checked by device and inode before
+  anything is written into it. On Windows it gets a private access list while it is written, and each file's
+  final path must be inside it. A swap fails the get with "output was changed while being written".
+- On Linux and macOS, `rnfs.toml` is now checked before its settings are used, as on Windows: a symlink, a FIFO
+  or anything else that isn't a regular file is refused, and so is a file another user owns; one others may
+  access is made 0600, with a warning; at most 1 MiB of it is read. Its settings choose the Reticulum config, and
+  with it programs rnfs starts, so anyone who could write it could run code as you. Reticulum's `config` gets the
+  same check when `reticulum_dir` is the rnfs dir.
+- The rnfs dir's subdirectories (`state`, `blocks`, `storage`, `names`, `lxmf`) are checked at every start: a
+  symlink, a non-directory or one another user owns stops the start before Reticulum starts; a loose one is made
+  0700, with a notice; and if others could write to it, entries another user owns are reported. Before, a user
+  who could once write in a loose rnfs dir kept their access to `blocks/` and `names/` after it was tightened.
 
 Changed:
+- `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
+  `use_sent_cid` (before, it fetched the sender's CID).
+- While the deny list has file hashes, a highly repetitive file over 64 MiB (a zero-filled disk image, say) can't
+  be read or imported (451). The user's own gateway HEAD of a file that isn't wholly stored is then typed by its
+  name only, not by its first bytes.
+- On Windows, a directory `get` output is private to the user while it is written, then inherits its folder's
+  access list again before it gets its final name (if that fails, a warning is logged and it stays private).
+- A symlinked `rnfs.toml` is refused: dotfile setups that symlink it into the rnfs dir stop working (put the
+  file itself there). A loose `rnfs.toml` (such as 0664) or subdirectory (such as 0775) is tightened at the next
+  start, with a warning; it isn't refused.
+- The daemon and `rnfs.Node` check, in order, the rnfs dir, the settings, the subdirectories, then take the lock.
+  The CLI prints settings warnings, and `rnfs.Client` raises them as `RuntimeWarning`. On Windows, a loose
+  `rnfs.toml` no longer makes the CLI or `rnfs.Client` load RNS.
+- A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
+  that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
+  nodes they complete within 12 queries); peers see fewer `/find` requests.
+- The specification now says a requester that gives up on a `/blocks` response closes its link, and never
+  cancels the Resource (0.1.5 and earlier already do so).
+- `rnfs inbox` shows the CID each name link was sent as ("sent as `<cid>`"), and marks an auto-fetch that
+  pinned the sent CID because the name didn't resolve ("auto-fetch pinned (sent CID; name unresolved)";
+  `"sent_cid": true` in the inbox record).
 
 Added:
+- `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 
 ## 0.1.5
 

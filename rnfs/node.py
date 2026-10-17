@@ -19,6 +19,7 @@ The daemon owns its process, so its Resource guards cover every link and RNS's c
 (network/guards.py, PROCESS); an embedded node scopes both to its rnfs.dht links (DHT) and leaves the host
 program's Reticulum running when it stops. Neither ever stops Reticulum: the daemon calls RNS.exit() itself.
 """
+import errno
 import hashlib
 import os
 import random
@@ -109,20 +110,26 @@ def import_remote_pins(value: list, tx) -> int:
     return count
 
 
-def _make_private_dirs(config: Config):
-    """Create the rnfs dir and the node's subdirectories readable by the owner only (0700; on Windows, a
-    protected access list for the user and SYSTEM from the moment each is created, see winacl).
+# The node's subdirectories of the rnfs dir (Config.state_dir, blocks_dir, identity_path's, names_dir; LXMF's
+# ratchets), made private at each start. Not files/, the shared folder, whose contents the user chooses
+PRIVATE_SUBDIRS = ("state", "blocks", "storage", "names", "lxmf")
+_DIRECTORY_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | fsutil.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NONBLOCK", 0))
 
-    They hold the node's identity, name keys and the local API token, so other local users must not read
-    them; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if the
-    root belongs to another user or can't be made private: its owner could swap the identity or plant a
-    config there. On Windows also if the root is a junction or symlink, or new but not empty.
+
+def make_private_root(root: str):
+    """Create the rnfs dir root readable by the owner only (0700; on Windows, a protected access list for the
+    user and SYSTEM from the moment it is created, see winacl), or check and tighten an existing one.
+
+    The first step of a start, before the settings in it are read (then _make_private_dirs, then the lock). It
+    holds the node's identity, name keys, settings and the local API token, so other local users must not read
+    or change it; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if it
+    belongs to another user or can't be made private: its owner could swap the identity or plant a config there.
+    On Windows also if it is a junction or symlink, or new but not empty.
     """
-    root = config.root
-    subdirs = (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir)
     if fsutil.IS_WINDOWS:
         # No Unix permission bits there (st_mode always shows others allowed): an explicit access list
-        winacl.secure_rnfs_dir(root, subdirs)
+        winacl.secure_rnfs_dir(root)
         return
     os.makedirs(root, mode=0o700, exist_ok=True)
     info = os.stat(root)
@@ -135,8 +142,94 @@ def _make_private_dirs(config: Config):
         except OSError as e:
             raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
         log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
-    for directory in subdirs:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+
+def _make_private_dirs(root: str):
+    """Make the rnfs dir root private (make_private_root), then each of its PRIVATE_SUBDIRS: created 0700 if
+    missing (on Windows with the private access list), else checked and tightened (audit API-1).
+
+    Tightening the root later doesn't take back a subdirectory from a user who could once write in a loose rnfs
+    dir: they may own one they created, or hold a descriptor on it, and plant blocks (trusted by their length)
+    or name keys. So on POSIX each is opened without following a link and checked through that descriptor: a
+    symlink, anything but a directory or one of another user's stops the start; a loose one is made 0700 with a
+    notice, and if others could write to it, entries in it owned by another user are reported (a warning: they
+    may be planted). Raises RnfsError for any of those, or if the root can't be made private.
+    """
+    if fsutil.IS_WINDOWS:
+        winacl.secure_rnfs_dir(root, tuple(os.path.join(root, name) for name in PRIVATE_SUBDIRS))
+        return
+    make_private_root(root)
+    for name in PRIVATE_SUBDIRS:
+        _make_private_subdir(os.path.join(root, name))
+
+
+def _make_private_subdir(path: str):
+    """_make_private_dirs on POSIX for one subdirectory at path. Raises RnfsError."""
+    try:
+        fd = _open_subdir(path)
+    except OSError as e:
+        # O_NOFOLLOW's answer for a symlink is ELOOP (EMLINK on FreeBSD), or with O_DIRECTORY on Linux ENOTDIR
+        if e.errno not in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise RnfsError(f"can't use {path}: {e}") from None
+        try:
+            link = fsutil.is_link(os.lstat(path))
+        except OSError:
+            link = False
+        what = "a symlink" if link else "not a directory"
+        raise RnfsError(f"{path} is {what}; rnfs uses only a real directory of your own there. Move it away (rnfs "
+                        f"creates a new one)") from None
+    try:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        fsutil.check_owned_fd(path, fd, info, "the rnfs dir's subdirectory")
+    except OSError as e:
+        raise RnfsError(f"{e}. rnfs uses only directories of your own there: move it away, or as root give it to "
+                        f"yourself (chown -R {os.geteuid()} {path})") from None
+    finally:
+        os.close(fd)
+    if mode & 0o077:
+        log(f"made {path} private to its owner (it had mode {mode:o})", LOG_NOTICE)
+        if mode & 0o022:
+            _warn_foreign_entries(path)
+
+
+def _open_subdir(path: str) -> int:
+    """A descriptor of the directory at path, not following a link (created 0700 if missing). Raises OSError:
+    ELOOP, EMLINK or ENOTDIR for a symlink, ENOTDIR for anything else that isn't a directory."""
+    try:
+        fd = os.open(path, _DIRECTORY_FLAGS)
+    except FileNotFoundError:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass  # made meanwhile, by another start: checked like any other
+        fd = os.open(path, _DIRECTORY_FLAGS)
+    if not stat.S_ISDIR(os.fstat(fd).st_mode):  # where O_DIRECTORY is missing
+        os.close(fd)
+        raise NotADirectoryError(errno.ENOTDIR, "not a directory", path)
+    return fd
+
+
+def _warn_foreign_entries(directory: str):
+    """Warn about entries below directory, which others could write to until now, that another user owns: they
+    may have been planted (in blocks/, a raw block is trusted by its length). One lstat pass, links not followed;
+    nothing is removed."""
+    uid = os.geteuid()
+    count, first = 0, None
+    for parent, directories, files in os.walk(directory):
+        for name in directories + files:
+            entry = os.path.join(parent, name)
+            try:
+                if os.lstat(entry).st_uid == uid:
+                    continue
+            except OSError:
+                continue  # gone meanwhile
+            count += 1
+            first = first or entry
+    if count:
+        log(f"{directory} was writable by other users, and {count} entr{'y' if count == 1 else 'ies'} in it "
+            f"belong to another user (e.g. {first}): they may have been put there to mislead rnfs. Check them, or "
+            f"delete them (rnfs fetches blocks again)", LOG_WARNING)
 
 
 class DirInUse(RnfsError):
@@ -149,12 +242,13 @@ class DirInUse(RnfsError):
 
 
 def lock_rnfs_dir(config: Config) -> int:
-    """Make the rnfs dir private (as the node would) and lock <rnfs dir>/daemon.lock without waiting, before
-    anything else uses the dir: two nodes on one dir would load and save the same state and announce the same
+    """Make the rnfs dir and its subdirectories private (as the node would) and lock <rnfs dir>/daemon.lock
+    without waiting, before anything else uses the dir (the last steps of a start: make_private_root, then the
+    settings, come first): two nodes on one dir would load and save the same state and announce the same
     node ID. The open descriptor, whose lock lasts until it is closed or the process ends. Raises DirInUse if
     another process, or another node in this one, holds it; RnfsError or OSError if the dir can't be made
     private or the file locked. The daemon and rnfs.Node both lock through here."""
-    _make_private_dirs(config)
+    _make_private_dirs(config.root)
     path = os.path.join(config.root, LOCK_FILE)
     try:
         return fsutil.lock_exclusive(path)
@@ -187,8 +281,16 @@ def _check_free_space(path: str, needed: int, blocks_dir: str | None = None, to_
                        f"while leaving {size(reserve)} free")
 
 
-def _remove_partial(path: str):
-    """Delete a partial get output (file or directory tree) if there is one; a symlink is removed, not followed."""
+def _remove_partial(path: str, identity: walker.Identity | None = None):
+    """Delete a partial get output (file or directory tree) if there is one; a symlink is removed, not followed.
+
+    With identity (a directory output's, from write_out), only if path is still that directory: whatever someone
+    put in its place isn't this get's to delete."""
+    if identity is not None:
+        try:
+            walker.check_unchanged(path, identity)
+        except (ValueError, OSError):
+            return
     try:
         if os.path.isdir(path) and not os.path.islink(path):
             shutil.rmtree(path)
@@ -196,6 +298,17 @@ def _remove_partial(path: str):
             fsutil.remove(path)
     except OSError as e:
         log(f"removing {path} failed: {e!r}", LOG_WARNING)
+
+
+def _inherit_from_parent(partial: str, output: str):
+    """On Windows, give a complete directory output the access its folder passes on, where it was private to the
+    user while written (walker._PathOutput). If that fails it stays private, which is safe, so a warning is
+    logged rather than the get failed."""
+    try:
+        winacl.inherit_from_parent(partial)
+    except OSError as e:
+        log(f"get: {output} stays private to you, as its folder's access list couldn't be applied to it: {e}",
+            LOG_WARNING)
 
 
 def _remove_created(path: str, created: os.stat_result):
@@ -311,7 +424,7 @@ class RnfsNode:
         program's running instance, or starts one if there is none; its guards cover only rnfs.dht links.
         """
         config.validate()
-        _make_private_dirs(config)  # before Reticulum and the identity, which write under it
+        _make_private_dirs(config.root)  # before Reticulum and the identity, which write under it
         self.embedded = embedded
         # Reject oversized, compressed and request Resource advertisements before RNS allocates for them; in the
         # daemon on every link, with RNS's compression off process-wide (section 3)
@@ -403,7 +516,7 @@ class RnfsNode:
                 self._bootstrap_nodes.append(parse_node_id(text))
             except ValueError as e:
                 log(f"ignoring bootstrap node: {e}", LOG_WARNING)
-        _make_private_dirs(config)
+        _make_private_dirs(config.root)
         # First, so the JSON state files of earlier versions are imported before any store loads its state
         self._db = statedb.connect(config.state_dir)
 
@@ -796,21 +909,41 @@ class RnfsNode:
                 raise Denied(f"a file with SHA-256 {digest.hex()} is on this node's deny list")
         return check
 
-    def _check_file(self, expect: walker.Expect, read: Callable[[walker.Expect], Iterator[bytes]]):
+    def _check_file(self, expect: walker.Expect, get: walker.Get):
         """Raise Denied if file expect's content hashes to a deny-list entry, before any of it is written out or
-        sent. read(expect) gives its bytes, read only if the hash isn't known yet (a one-block file's CID is
-        it; others are remembered by the deny list)."""
+        sent. get serves its whole DAG, stored and checked (fetch_dag's, or a complete root's); its bytes are read
+        only if the hash isn't known yet (a one-block file's CID is it; others are remembered by the deny list).
+
+        A file declaring more than DENY_HASH_RATIO × the bytes of its distinct chunks + DENY_HASH_SLACK is refused
+        unread: hashing reads every occurrence of repeated content, so six small blocks can declare 2^56 bytes.
+        """
         if not self.deny.hashes:
             return
         digest = expect.cid.digest if expect.cid.is_raw else self.deny.known_hash(expect.cid)
         if digest is None:
+            declared = walker.size_of(expect, get(expect))
+            if declared > denylist.DENY_HASH_SLACK:
+                # The distinct chunk bytes it needs, at least: the walk stops once they are met
+                needed = -(-(declared - denylist.DENY_HASH_SLACK) // denylist.DENY_HASH_RATIO)
+                if walker.leaf_bytes(expect, get, needed) < needed:
+                    raise Denied(f"{expect.cid} can't be checked against this node's deny-list file hashes: it "
+                                 f"repeats its content more than {denylist.DENY_HASH_RATIO}×")
             hasher = hashlib.sha256()
-            for data in read(expect):
+            for data in walker.read_range(expect, get):
                 hasher.update(data)
             digest = hasher.digest()
             self.deny.remember_hash(expect.cid, digest)
         if self.deny.denies_hash(digest):
             raise Denied(f"{expect.cid} is a file whose SHA-256 ({digest.hex()}) is on this node's deny list")
+
+    def _check_fetched(self, fetch: Fetch, expect: walker.Expect):
+        """_check_file for a file a fetch reads (cat, the gateway, a sealed get): unless its hash is known, its
+        whole DAG is fetched first (fetch_dag: max_download_size, the disk reserve, the DAG byte bound)."""
+        if not self.deny.hashes:
+            return
+        if not expect.cid.is_raw and self.deny.known_hash(expect.cid) is None:
+            fetch.fetch_dag(expect, self.config.max_output_entries)
+        self._check_file(expect, fetch.get)
 
     def _apply_deny(self):
         """Bring what is provided, cached and pinned in line with the deny list's CIDs, after a change and at
@@ -1059,6 +1192,7 @@ class RnfsNode:
         # write-out never leaves a partial output under the name the user asked for
         partial = os.path.join(os.path.dirname(os.path.abspath(output)),
                                f".rnfs-get-{secrets.token_hex(8)}{PARTIAL_SUFFIX}")
+        created: list[walker.Identity] = []  # a directory output's identity, once write_out has made it
         try:
             with self._fetching(root, names, from_node) as fetch:
                 expect = fetch.resolve()
@@ -1070,21 +1204,25 @@ class RnfsNode:
                 _check_free_space(output, content, self.config.blocks_dir, to_fetch)
                 sealed = None if raw else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:  # decrypted as it is fetched (rnfs/content/seal.py)
-                    self._check_file(expect, fetch.read_range)  # its stored (sealed) bytes, as others hold them
+                    self._check_fetched(fetch, expect)  # its stored (sealed) bytes, as others hold them
                     written = node_content.write_sealed(sealed, partial, self.config.blocks_dir, to_fetch)
                     result = {"cid": str(expect.cid), "warnings": [], **written}
                 else:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
                     # Each file is checked before it is written while the deny list has file hashes
-                    check = {"check": lambda file: self._check_file(file, lambda e: walker.read_range(e, fetch.get))
-                             } if self.deny.hashes else {}
-                    warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries, **check)
+                    check = {"check": lambda file: self._check_file(file, fetch.get)} if self.deny.hashes else {}
+                    warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries,
+                                                created=created, **check)
                     # Every skipped entry is a warning: keep a response (and a job's saved result) small
                     result = {"cid": str(expect.cid), **cap_warnings(warnings)}
+            if created:
+                # Still the directory written, not one put in its place by someone who can write beside it
+                walker.check_unchanged(partial, created[0])
+                _inherit_from_parent(partial, output)
             fsutil.rename_new(partial, output)
             return result
         finally:
-            _remove_partial(partial)
+            _remove_partial(partial, created[0] if created else None)
 
     def info(self, target: str, for_gateway: bool = False, from_node: bytes | None = None, raw: bool = False) -> dict:
         """The target's own CID, type, size and executable bit (fetching the root, path and target blocks).
@@ -1152,7 +1290,7 @@ class RnfsNode:
         """read() of a resolved target, in fetch."""
         if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == "file":
             # The whole file is fetched and hashed (once: then remembered) before any of it is sent
-            self._check_file(expect, fetch.read_range)
+            self._check_fetched(fetch, expect)
         sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
         if sealed is not None:
             yield from sealed.read(offset, length)
@@ -1187,7 +1325,8 @@ class RnfsNode:
             return False
 
     def stored_head(self, target: str, length: int) -> bytes | None:
-        """A file's first length bytes if every block they need is stored, else None. Never fetches."""
+        """A file's first length bytes if every block they need is stored, else None. Never fetches. Raises
+        Denied as a read does (node_content.stored_head)."""
         return node_content.stored_head(self, target, length)
 
     def dir_set(self, target: str, name: str, child_cid: str, executable: bool = False) -> dict:
@@ -1270,7 +1409,8 @@ class RnfsNode:
             return False
         if kind is None:
             return None
-        head = node_content.stored_head(self, str(cid), len(seal.MAGIC))
+        # The user's own list of what is stored: whether a denied pin is sealed is no secret, and isn't worth a hash
+        head = node_content.stored_head(self, str(cid), len(seal.MAGIC), deny=False)
         return None if head is None else seal.is_sealed(head)
 
     def _pin_shape(self, cid: Cid) -> tuple[str | None, str | None]:
@@ -1613,7 +1753,7 @@ class RnfsNode:
                 get = self.storage.getter()
                 for root in roots:
                     for file in walker.iter_files(walker.root_expect(root), get):
-                        self._check_file(file, lambda e: walker.read_range(e, get))
+                        self._check_file(file, get)  # a complete root: every block is stored and checked
 
         with stream, self._refusing():
             stats = archive.import_archive(stream, self.storage, check=check)
