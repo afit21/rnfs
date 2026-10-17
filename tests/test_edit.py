@@ -74,11 +74,13 @@ class EditTest(unittest.TestCase):
         self.assertEqual(result, self.directory({"readme": self.readme}).cid)
 
     def test_errors(self):
+        """A missing path is NotFound, naming it; a non-directory target, an invalid name or no path is ValueError."""
         get, put = self.blocks.get, self.blocks.put
         with self.assertRaises(NotFound):
             edit.dir_rm(self.root.cid, ["docs", "missing"], get, put)
-        with self.assertRaises(NotFound):
-            edit.dir_set(self.root.cid, ["missing"], "x", self.a.cid, False, get, put)
+        with self.assertRaises(NotFound) as caught:
+            edit.dir_set(self.root.cid, ["docs", "missing"], "x", self.a.cid, False, get, put)
+        self.assertEqual(str(caught.exception), f"{self.root.cid}/docs/missing does not exist")
         with self.assertRaises(ValueError):
             edit.dir_set(self.root.cid, ["readme"], "x", self.a.cid, False, get, put)  # not a directory
         with self.assertRaises(ValueError):
@@ -89,6 +91,7 @@ class EditTest(unittest.TestCase):
             edit.dir_rm(self.root.cid, [], get, put)
 
     def test_through_index_nodes(self):
+        """Edits inside a directory split into index nodes, and paths that step through them."""
         with mock.patch.multiple(constants, CHUNK_SIZE=4, MAX_CHILDREN=3):
             files = {f"f{i:02d}": self.file(f"{i}".encode()) for i in range(20)}
             big = self.directory(files)
@@ -100,6 +103,20 @@ class EditTest(unittest.TestCase):
             result = edit.dir_rm(root.cid, ["big", "f10"], self.blocks.get, self.blocks.put)
             remaining = {k: v for k, v in files.items() if k != "f10"}
             self.assertEqual(result, self.directory({"big": self.directory(remaining)}).cid)
+            # Paths stepping through big's index nodes: to a directory in it, a file, and a name it doesn't hold
+            sub = self.directory({"a": self.a})
+            big = self.directory({**files, "f07": sub})
+            root = self.directory({"big": big})
+            result = edit.dir_set(root.cid, ["big", "f07"], "b", self.b.cid, False, self.blocks.get, self.blocks.put)
+            edited = self.directory({"a": self.a, "b": self.b})
+            expected = self.directory({"big": self.directory({**files, "f07": edited})})
+            self.assertEqual(result, expected.cid)
+            with self.assertRaises(ValueError) as caught:
+                edit.dir_set(root.cid, ["big", "f05"], "x", new.cid, False, self.blocks.get, self.blocks.put)
+            self.assertEqual(str(caught.exception), f"{root.cid}/big/f05 is not a directory")
+            with self.assertRaises(NotFound) as caught:
+                edit.dir_set(root.cid, ["big", "f99", "x"], "y", new.cid, False, self.blocks.get, self.blocks.put)
+            self.assertEqual(str(caught.exception), f"{root.cid}/big/f99 does not exist")
 
     def test_depth_limit(self):
         with mock.patch.object(constants, "MAX_DEPTH", 3):

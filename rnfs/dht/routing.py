@@ -3,13 +3,24 @@
 Only servers that proved reachable are stored. Full buckets keep their long-lived nodes, so an attacker
 with fresh identities can't take a table over; nodes that stop answering are dropped, and a dropped node
 that comes back soon regains its seniority. Bans (section 10) also live here.
+
+Lookups also ask the table which nodes are unreliable: those whose last max_failures queries or more all
+failed, in the table or not (a node dropped, or only named in other nodes' replies). Announces don't clear
+this, only an answer does, so a far node that keeps announcing but never accepts a link stops costing every
+lookup its connection timeout. Such a node may be queried again once its backoff has passed (AVOID_AFTER,
+doubling with each further failure up to AVOID_MAX), by one lookup at a time (may_retry).
 """
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 
 from rnfs.config import Config
 from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
+
+AVOID_AFTER = 300.0  # seconds an unreliable node isn't retried after max_failures failed queries in a row ...
+AVOID_MAX = 3600.0  # ... doubling with each further failure up to this
+MAX_UNRELIABLE = 4096  # nodes whose failed queries are remembered; the least recently failed is forgotten first
 
 
 def distance(a: bytes, b: bytes) -> int:
@@ -17,9 +28,14 @@ def distance(a: bytes, b: bytes) -> int:
     return int.from_bytes(a, "big") ^ int.from_bytes(b, "big")
 
 
+def is_id(value) -> bool:
+    """True if value has the shape of a node ID or DHT key (ID_LENGTH bytes)."""
+    return isinstance(value, bytes) and len(value) == ID_LENGTH
+
+
 def check_id(node_id: bytes):
     """Raise ValueError unless node_id is an ID_LENGTH-byte bytes (node IDs and DHT keys)."""
-    if not isinstance(node_id, bytes) or len(node_id) != ID_LENGTH:
+    if not is_id(node_id):
         raise ValueError(f"node IDs and keys must be {ID_LENGTH} bytes")
 
 
@@ -40,7 +56,8 @@ class RoutingTable:
     """BUCKET_COUNT buckets of up to K servers each, by distance from own_id. Thread-safe.
 
     `clock` is monotonic seconds (nothing here is persisted). `admit(node_id)`, if given, must be True
-    for a node to be added: private mode passes a member check (section 3).
+    for a node to be added: private mode passes a member check (section 3). It is asked without the table's
+    lock held, since it may block (on RNS).
     """
 
     def __init__(self, own_id: bytes, config: Config, clock: Callable[[], float] = time.monotonic,
@@ -54,6 +71,8 @@ class RoutingTable:
         self._buckets: list[dict[bytes, _Entry]] = [{} for _ in range(BUCKET_COUNT)]
         self._dropped: dict[bytes, tuple[float, float]] = {}  # node ID -> (first seen, when dropped)
         self._bans: dict[bytes, float] = {}  # node ID -> ban end
+        # Node ID -> [failed queries in a row, when it may be retried], for any node; only an answer clears it
+        self._unanswered: OrderedDict[bytes, list] = OrderedDict()
         self._lock = threading.RLock()
 
     @property
@@ -80,50 +99,77 @@ class RoutingTable:
             del self._dropped[node_id]
 
     def heard(self, node_id: bytes) -> bool:
-        """Record that node_id proved to be a reachable server (server-mode announce, or answered /find).
+        """Record that node_id proved to be a reachable server (server-mode announce, or answered /find; for an
+        answer, call answered(), which also makes it reliable again).
 
         True if it was newly added; False if it was already in the table (now refreshed) or wasn't added
         (our own ID, banned, not admitted, or its bucket is full of healthy nodes).
         """
+        return self._hear(node_id, False)
+
+    def answered(self, node_id: bytes) -> bool:
+        """Record that node_id answered a query: heard(), and it is reliable again. True if newly added."""
+        return self._hear(node_id, True)
+
+    def _hear(self, node_id: bytes, answered: bool) -> bool:
+        """heard(), and for answered() also forget node_id's failed queries, in the same locked step.
+
+        admit is asked outside the lock (it may block on RNS), and only for a node found not in the table and
+        not banned: the table is then checked again, so the outcome is as if admit had been asked under it.
+        """
         check_id(node_id)
         if node_id == self.own_id:  # hearing our own announce is normal
             return False
-        with self._lock:
-            now = self.clock()
-            self._prune(now)
-            if node_id in self._bans:
-                return False
-            bucket = self._buckets[self.bucket_index(node_id)]
-            entry = bucket.get(node_id)
-            if entry is not None:
-                entry.last_heard = now
-                entry.failures = 0
-                return False
-            if self.admit is not None and not self.admit(node_id):
-                return False
-
-            if len(bucket) >= K:
-                # Only the least recently heard node can give up its place, and only if it has stopped
-                # answering or gone silent. Healthy long-lived nodes are never displaced by newcomers.
-                victim = min(bucket.values(), key=lambda e: e.last_heard)
-                if not self._stale(victim, now):
+        admitted = True if self.admit is None else None  # None: not asked yet
+        while True:
+            with self._lock:
+                if answered:
+                    self._unanswered.pop(node_id, None)
+                now = self.clock()
+                self._prune(now)
+                if node_id in self._bans:
                     return False
-                del bucket[victim.node_id]
-                # Displaced, not dropped for failures: it may come back with its seniority like a dropped node
-                self._dropped[victim.node_id] = (victim.first_seen, now)
+                bucket = self._buckets[self.bucket_index(node_id)]
+                entry = bucket.get(node_id)
+                if entry is not None:
+                    entry.last_heard = now
+                    entry.failures = 0
+                    return False
+                if admitted:
+                    return self._add(bucket, node_id, now)
+                if admitted is False:
+                    return False
+            admitted = bool(self.admit(node_id))
 
-            # A node dropped recently (e.g. by a lossy link) regains its seniority
-            first_seen, _ = self._dropped.pop(node_id, (now, now))
-            bucket[node_id] = _Entry(node_id, first_seen, now)
-            return True
+    def _add(self, bucket: dict[bytes, _Entry], node_id: bytes, now: float) -> bool:
+        """Add node_id, not in the table, to its bucket unless that is full of healthy nodes. True if added.
+        Caller holds the lock."""
+        if len(bucket) >= K:
+            # Only the least recently heard node can give up its place, and only if it has stopped
+            # answering or gone silent. Healthy long-lived nodes are never displaced by newcomers.
+            victim = min(bucket.values(), key=lambda e: e.last_heard)
+            if not self._stale(victim, now):
+                return False
+            del bucket[victim.node_id]
+            # Displaced, not dropped for failures: it may come back with its seniority like a dropped node
+            self._dropped[victim.node_id] = (victim.first_seen, now)
+
+        # A node dropped recently (e.g. by a lossy link) regains its seniority
+        first_seen, _ = self._dropped.pop(node_id, (now, now))
+        bucket[node_id] = _Entry(node_id, first_seen, now)
+        return True
 
     def failed(self, node_id: bytes) -> bool:
-        """Count a query node_id didn't answer; after max_failures in a row it is dropped. True if dropped."""
+        """Count a query node_id didn't answer; after max_failures in a row it is dropped. True if dropped.
+
+        Also counted towards unreliable(), whether or not node_id is in the table; hearing it doesn't reset that.
+        """
         check_id(node_id)
         if node_id == self.own_id:
             return False
         with self._lock:
             now = self.clock()
+            self._count_unanswered(node_id, now)
             bucket = self._buckets[self.bucket_index(node_id)]
             entry = bucket.get(node_id)
             if entry is None:
@@ -133,6 +179,42 @@ class RoutingTable:
                 return False
             del bucket[node_id]
             self._dropped[node_id] = (entry.first_seen, now)
+            return True
+
+    def _count_unanswered(self, node_id: bytes, now: float):
+        """One more failed query for node_id; past max_failures it isn't retried for a doubling backoff."""
+        entry = self._unanswered.pop(node_id, None) or [0, now]
+        entry[0] += 1
+        if entry[0] >= self.config.max_failures:
+            entry[1] = now + self._backoff(entry[0])
+        self._unanswered[node_id] = entry  # last: the most recently failed
+        while len(self._unanswered) > MAX_UNRELIABLE:
+            self._unanswered.popitem(last=False)
+
+    def _backoff(self, count: int) -> float:
+        """Seconds before retrying a node whose last count queries failed (at least max_failures)."""
+        return min(AVOID_MAX, AVOID_AFTER * 2 ** min(count - self.config.max_failures, 32))
+
+    def unreliable(self, node_id: bytes) -> bool:
+        """True if node_id's last max_failures queries or more all failed, however recently it was heard.
+
+        Lookups avoid such nodes unless they need them: they are queried last, and only queried before others
+        as a retry (may_retry), which no lookup waits for."""
+        with self._lock:
+            entry = self._unanswered.get(node_id)
+            return entry is not None and entry[0] >= self.config.max_failures
+
+    def may_retry(self, node_id: bytes) -> bool:
+        """True if unreliable node_id is due to be queried again, claiming that retry: other lookups see it as
+        not due until the query fails (backing off further) or is answered (reliable again)."""
+        with self._lock:
+            entry = self._unanswered.get(node_id)
+            if entry is None or entry[0] < self.config.max_failures:
+                return False
+            now = self.clock()
+            if now < entry[1]:
+                return False
+            entry[1] = now + self._backoff(entry[0] + 1)
             return True
 
     def remove(self, node_id: bytes):
@@ -171,13 +253,24 @@ class RoutingTable:
         silent over 2 × announce_interval, so departed nodes stay out of replies without a table refresh.
         """
         check_id(key)
+        # Distances to key rank whole buckets: those in key's own bucket b are under 2^b, those in every bucket
+        # below it in [2^b, 2^(b+1)), and those in a bucket i above it in [2^i, 2^(i+1)). So the buckets are
+        # walked in that order and only those needed for count are sorted, not the whole table (this answers
+        # /find requests). key is own_id: b is -1, and the buckets rank in order from 0
+        b = distance(self.own_id, key).bit_length() - 1
+        walk = ([[b]] if b >= 0 else []) + [range(max(b, 0))] + [[i] for i in range(b + 1, BUCKET_COUNT)]
+        groups: list[list[bytes]] = []
+        found = 0
         with self._lock:
             now = self.clock()
-            # The key's bucket may be sparse or empty, so rank every node rather than one bucket
-            entries = [e for bucket in self._buckets for e in bucket.values()
-                       if not (for_reply and self._stale(e, now))]
-        entries.sort(key=lambda e: distance(e.node_id, key))
-        return [e.node_id for e in entries[:count]]
+            for indices in walk:
+                group = [e.node_id for i in indices for e in self._buckets[i].values()
+                         if not (for_reply and self._stale(e, now))]
+                groups.append(group)
+                found += len(group)
+                if 0 < count <= found:
+                    break
+        return [n for group in groups for n in sorted(group, key=lambda node_id: distance(node_id, key))][:count]
 
     def seniority(self, node_id: bytes) -> float | None:
         """Seconds since node_id was first seen (kept across a short absence), or None if not in the table."""
@@ -236,6 +329,6 @@ class RoutingTable:
 
     def _find(self, node_id: bytes) -> _Entry | None:
         """The entry for node_id, or None (also for malformed IDs and our own). Caller holds the lock."""
-        if not isinstance(node_id, bytes) or len(node_id) != ID_LENGTH or node_id == self.own_id:
+        if not is_id(node_id) or node_id == self.own_id:
             return None
         return self._buckets[self.bucket_index(node_id)].get(node_id)

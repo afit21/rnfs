@@ -40,13 +40,12 @@ def parse_mode(app_data) -> int:
 class DhtAnnouncer:
     """Announces rnfs.dht at startup, after startup_announce_delay, then every announce_interval."""
 
-    def __init__(self, destination: RNS.Destination, config: Config, server: bool | None = None):
-        """Set destination's app_data to the mode (config.dht_mode unless server is given); start() announces."""
+    def __init__(self, destination: RNS.Destination, config: Config):
+        """Set destination's app_data to the mode (config.dht_mode); start() announces."""
         self.destination = destination
         self.config = config
-        self.server = (config.dht_mode == "server") if server is None else server
+        self.server = config.dht_mode == "server"
         self.stop_event = threading.Event()
-        self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
         destination.set_default_app_data(encode_mode(self.server))
 
@@ -57,15 +56,6 @@ class DhtAnnouncer:
             log(f"announced as a DHT {'server' if self.server else 'client'}", LOG_VERBOSE)
         except Exception as e:
             log(f"could not announce: {e}", LOG_WARNING)
-
-    def set_server(self, server: bool):
-        """Change the DHT mode, re-announcing if it changed."""
-        with self.lock:
-            if server == self.server:
-                return
-            self.server = server
-            self.destination.set_default_app_data(encode_mode(server))
-        self.announce()
 
     def start(self):
         """Start the announce schedule on a background thread."""

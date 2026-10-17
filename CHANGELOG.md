@@ -2,6 +2,186 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.5
+
+Performance work, a debug log, state kept in one SQLite database, deny lists, and a public API for apps. No
+wire-format or CID changes: these nodes, 0.1.4 and 0.1.3 nodes work together. The upgrade of an `<rnfs dir>` is
+automatic and one-way (an older version can't read it afterwards).
+
+Changed:
+- State is kept in one SQLite database, `<rnfs dir>/state/rnfs.db` (Python's standard `sqlite3`; no new dependency,
+  but a Python built without its `_sqlite3` module now stops at startup, saying so), instead of 17 JSON files. At
+  the first start the JSON files of 0.1.4 or 0.1.3 (pins, cache records, pin names, fetched targets, remote pins
+  waiting, invalid roots, publish state, provider records, names and the name floor, the shared folder, jobs,
+  keepers, follows, contacts, the LXMF inbox and outbox) are imported, each in one transaction, with every check
+  the old loaders applied, and kept as `<name>.migrated` (a node that skips versions upgrades the same way). A
+  damaged file is moved aside as `.damaged` as before; an unreadable `pins.json` or a damaged `names.json` still
+  stops startup. Nothing changes on the network: request paths, messages, CIDs, DAG bytes, provider and name
+  records are as before.
+- Saves write only what changed: a pin or release is one row, about 2.5 ms whatever the number of pins
+  (before: `pins.json` rewritten whole, 5 ms at 100 pins and 14 ms at 20 000); a provider-records save writes
+  the records changed since the last one (one change at 100 000 records: 0.02 ms, from 155 ms); a cache save
+  the records touched (0.02 ms, from 13 ms at 10 000 records). Startup with 20 000 pins and 100 000 provider
+  records loads in 350 ms, from 460.
+- Pins, names, jobs and the other state saved on each change are on disk when the change returns, as before.
+  State saved in batches (cache records, fetched targets, invalid roots, remote pins waiting, provider records,
+  publish state, the name floor, keepers, the LXMF inbox and outbox) is no longer synced to disk at each save:
+  a power loss (not a crash) may lose the last of those saves as well as what changed since, never part of
+  one, and never one without every earlier save.
+- A `providers.json` that can't be parsed is now kept as `.damaged` (before, the node started without its records
+  and overwrote it). Node IDs and keys in `published.json` must be 16 bytes (rnfs never wrote others).
+- The database and its `-wal` and `-shm` files are readable by their owner only. rnfs refuses to start on a
+  damaged database (it runs SQLite's `quick_check` at startup) or one written by a newer version, and says how
+  to recover: the `.migrated` files are kept for that. A state directory it can't write to now stops startup
+  too, saying so (before, the node started and every save failed).
+- Three more built-in bootstrap nodes (Johannesburg, Montreal and Stockholm; eight in all), which every node
+  contacts when joining unless `default_bootstrap = false` or it is in private mode.
+- A compressed Resource advertised on an `rnfs.dht` link is now refused before any of it is transferred (before,
+  it was transferred, then failed as corrupt and the link torn down), and a request that wouldn't fit one packet
+  is refused locally instead of being sent as a Resource for the peer to refuse. Honest peers see no change.
+
+Added:
+- A debug log file, for diagnosing problems: `debug_log = true` in `rnfs.toml`, or `rnfs daemon --debug-log`,
+  writes `<rnfs dir>/debug.log`. It begins with the daemon's version (then the Python, RNS and LXMF versions, the
+  platform and the settings changed from the defaults), and has every rnfs message at every level whatever
+  `verbosity` is; Reticulum's own messages at Info and more severe that its loglevel shows, such as an interface
+  that can't connect or a socket that drops (its Verbose and Debug detail stays on the console only); each gateway
+  request, numbered, with the headers that decide it, what was decided (stored or fetched, type, range) and its
+  status, size and time; errors with tracebacks, and threads that die; and a status line every 5 minutes (counts,
+  open links, each interface up or down). New detail, at debug level: each DHT lookup's queries (which node
+  answered or failed, and how the lookup ended), the path to each node (hops, interface), why a link closed or
+  couldn't be established, each request's outcome or why it went unanswered, and incoming links. The file is
+  readable by its owner only and never sent; each start keeps the previous run's as `debug.log.1`, and past 16 MiB
+  the file moves there too, so the two stay under 32 MiB.
+- A public API for programs, provisional until 0.2 (`rnfs.API_STATUS`): `rnfs.Node` runs an rnfs node inside a
+  program, beside the program's own Reticulum, and `rnfs.Client` uses the user's running daemon through its local
+  API. Both have the same methods (add, get, a seekable `open()` that fetches only what it reads, `ls`, `info`,
+  pins, archives, names with `publish` and `watch`, jobs with progress callbacks, the deny list), return the same
+  typed objects (`rnfs.Cid`, `Entry`, `Record`, `Job`, `Name`, ...) and raise the same errors, so a program
+  switches between them on one line. `import rnfs` stays light: `rnfs.Client` never loads Reticulum. See "Building
+  apps on rnfs" in the README and `examples/rnfs_share.py` (the source archive includes `examples/`).
+- An embedded `rnfs.Node` applies rnfs's Resource guards (no compression, no requests carried as Resources, one
+  segment, no metadata, transfer sizes) to its own `rnfs.dht` links only, so the program's own requests,
+  transfers and compressed Resources work as with RNS alone. It defaults to a DHT client with LXMF off, never
+  stops the program's Reticulum, and locks its rnfs dir as the daemon does, so the two can't share one.
+- `rnfs.apiclient`, the local API's protocol layer under `rnfs.Client` and the CLI: it finds the rnfs
+  directory, port and token as the CLI does, makes whatever listens on the API port prove it knows the token
+  before sending it, on the connection carrying each request, and raises a typed error for each failure (each also a subclass of the node's matching
+  error). Standard library only. The CLI now uses it, with the same output.
+- `GET /api/name/watch`, a long poll for newer records of names, and a `from` parameter on `GET /api/cat`
+  (specification section 11).
+- Deny lists, to keep chosen content off a node (a public gateway or provider node): `rnfs deny add|rm|ls` edits a
+  local list of CIDs and file hashes (`sha256:<hex>`) (or `GET /api/deny`, `POST /api/deny/add|rm`), and
+  `deny_lists` in `rnfs.toml` names lists to apply, by CID or `name/<name>` (followed as the name changes; each
+  version is checked, at most 4 MiB and 100 000 entries, and pinned while in use). A denied CID is never fetched,
+  read, stored, served or provided, as a root or anywhere inside a DAG; the API and gateway answer 451. Records
+  already published are withdrawn, cached copies are deleted and remote pins holding it released, and a remote pin
+  of it is refused; your own pins are kept but not served or read, and the log names them. File hashes are checked
+  where a file is assembled (`get`, `cat`, the gateway, `add`, the shared folder, `import`), after its blocks have
+  been downloaded; the SHA-256 of each file checked is remembered (10 000 files, least recently used forgotten
+  first) and kept across restarts, so a file isn't downloaded and hashed again before its first byte after a
+  restart (a stored 64 MiB file's first byte: 6.5 ms, from 60 ms). `rnfs status` shows `deny_entries` and
+  `deny_lists`, and `pin ls` the lists' own blocks under the source `deny`. Nothing changes on the network: a peer
+  asking for a denied block is told it isn't held.
+
+Fixes:
+- Anyone able to reach the node's LXMF delivery destination could pass the 256 kB message limit by sending a
+  Resource in many segments, each within the limit: RNS appended them to one file under its storage, kept
+  until the last arrived, and LXMF read the whole Resource into memory before checking its signature. A
+  delivery Resource of more than one segment is now refused before any of it is transferred (a message within
+  the limit always fits one), in an embedded node too.
+- The local API's clients proved the daemon once, then trusted the port: a program kept running across a daemon
+  restart (an `rnfs.Client`, a long `rnfs get` or job wait) sent the token and request bodies, name keys being
+  imported among them, to whatever listened on the port next, and took its answers. The daemon now proves itself
+  on the connection carrying each request (it keeps a proof request's connection open for one more request), and
+  a client reads the token again when the proof fails, so it also goes on working after the daemon restarts
+  (before, it got 403 until restarted itself). A client of this version still works with an older daemon.
+- A neighbour repeating a name's old announce could keep a node that missed the newer one on the old record
+  indefinitely: RNS remembers a repeated announce as just heard, so the record looked current, the checks of
+  followed names and deny lists skipped the network, and resolves never asked keepers. An announce now shows
+  its record current at most 2 × `announce_interval` after it was emitted (its signed time, which repeating it
+  doesn't change); past that, resolves ask keepers.
+- A far node that keeps announcing but never accepts a link cost every lookup its connection timeout (60 s or
+  more at 9–10 hops), and held lookups open long after they had their answer: its announces reset the failure
+  count that would have dropped it, and other nodes kept naming it in their replies once it was dropped. A node
+  whose last 3 (`max_failures`) queries failed is now asked only when a lookup has too few others, whatever
+  its announces; it is asked again after 5 minutes, doubling up to an hour, without the lookup waiting for
+  its answer, and an answer restores it. Nothing changes on the network.
+- A gateway or LXMF auto-fetch resolve that found a higher sequence for a name it had resolved before raised
+  the name's floor without saving it until the next re-announce pass (up to a minute later) or shutdown, and
+  so did an announce raising it with no resolve. Every raise is now saved within 5 s, as documented.
+- `gc` (and eviction) could delete blocks of a complete pin. `stat` of a DAG only partly stored remembered the
+  nodes it didn't find as listing nothing, so once the rest was fetched and pinned, collection didn't see what
+  those nodes reach. Until a restart, which cleared it.
+- `import` pins the roots an archive supplies with one save of the pins; if that save fails, none of them is
+  pinned (before, those ahead of the failure were).
+- A second daemon started on an rnfs dir already in use loaded and saved the same state and announced the same
+  node ID before stopping on "address already in use". It now stops at once, saying which process uses the
+  directory: the daemon (or an embedded `rnfs.Node`) holds a lock on `<rnfs dir>/daemon.lock`.
+- With `-v`, a requester no longer says a provider "cancelled" a `/blocks` response that may have been lost in
+  transit (it can't tell those apart): it says the response stopped arriving. The provider now logs, at debug
+  level, a response whose transfer RNS gave up on (lost in transit, or its link closed).
+- A remote pin or LXMF auto-fetch of content this node already held in full (a pin of your own, a cached
+  download) was accepted however many bytes of blocks it held, past `remote_pin_quota` or
+  `lxmf_auto_fetch_quota`: the quota was only counted for blocks fetched. It is now refused as when fetched.
+- A failed save at shutdown (a full disk) stopped the shutdown there, leaving the state database, links and an
+  embedded node's destination open; it is now logged and the rest of the shutdown goes on.
+- `rnfs pin ls` waited for a shared-folder scan in progress to finish importing (minutes for large files).
+- A shared-folder file whose import failed for a reason that passes (a full disk, a pin that couldn't be saved)
+  wasn't tried again until it changed or the daemon restarted; it is now tried again 10 minutes later. A failed
+  pin of an unchanged entry no longer ends the scan.
+- An interrupted write of a name key could leave a `names/.partial-*` file holding the private key; these are now
+  deleted at start, as the older `.tmp` leftovers were.
+- Names: a publish racing `name rm` and `name create` of the same alias could save the record under the old
+  name (it now fails); `name create` or `name import` over an alias whose key file is a dangling symlink
+  overwrote that alias's saved record (now refused as an existing alias); a failed save while applying a heard
+  record skipped waking resolves, telling keepers and watchers, and was never retried (it is now logged and
+  saved by the next save); a name key deleted by hand is released once at startup, with one warning instead of
+  two; a name resolved for the user no longer keeps a stale floor entry; `name create` no longer fails if the
+  name is removed at that moment.
+- Private mode: the routing table asked RNS whether a newly heard node is a member while holding the table's lock,
+  so a slow answer (from `rnsd`, through a shared instance) held up `/find` replies and lookups; and a node banned
+  while it was being asked about could still be added. It is now asked without the lock, and the table checked
+  again after.
+- The local API's own HTTP error pages (400 for HTTP/0.9 or a malformed request, 414, 431, 501) now carry
+  `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, like every other API response.
+
+Faster:
+- `add`, the shared folder and `import` write blocks on up to 16 threads, so the sync to disk each block needs
+  before its rename overlaps (about 11x on an SSD: 64 MB added at 165–190 MB/s, from 13–17). Every block is
+  still synced before it is named, and before anything pins it.
+- A CID's written form and DHT key are computed once. They showed up in every save of the pins, pin names and
+  publish state, and in `pin ls`.
+- The targets fetched for the user (for `roots`) are saved with the cache records (every 30 s, at `gc` and at
+  stop), not rewritten and synced under the node's lock on each fetch. Jobs are saved once per change, not twice.
+- The publish state, provider records and name floor are written outside the publisher, provider-store and
+  names locks, from a copy taken under them, so `/find`, `/provide`, resolves and name announces don't wait for
+  the write. `verify` and the size queries (`stat`, quotas, pinned bytes) read DAG
+  nodes without the storage lock, as eviction and `gc` already did.
+- Recomputing what is provided reuses the last result when no provided DAG changed (about 30 ms to 5 ms at
+  5000 pins).
+- The DHT routing table finds the closest nodes by walking buckets, not by sorting every node (about 350 µs to
+  4 µs per `/find` on a full table). Lookups start from nodes that haven't failed or gone silent, with the
+  others only to make up K, as `/find` replies do.
+- Fetches: a slow provider is paced by how long its response took from when the request was sent, not counting
+  opening the link or waiting for the link's `/blocks` slot. A request reserves only what one response can carry,
+  sized to the open link's packet size, so idle providers get the rest; and the batch is sized in one pass.
+- Serving `/blocks` no longer reads and hashes the block it then leaves out for the budget; finished responses
+  are noticed at once rather than within 10 ms; the response monitor sleeps while nothing is being sent.
+- DAG nodes decode about 15% faster (struct formats compiled once), accepting and rejecting exactly as before.
+- A DAG node decoded recently isn't decoded again (the last 256 nodes, at most 2 MiB of blocks, are remembered):
+  a read met the same file and directory nodes many times. `GET /api/cat` also resolves its target and reads in
+  one fetch, where it fetched the target's info first, then read it in a second. Reading a stored 8 MiB file
+  through `rnfs.Client`'s `open()` (one request per 64 KiB) takes 0.18 s, from 1.0 s; a 4 KiB `cat` 1.3 ms, from
+  8 ms.
+- Republishing runs up to 4 closest-nodes lookups at once instead of one after another, so a round of many due
+  keys takes about a quarter of the time (200 keys whose lookups take 0.2 s each: 10 s, from 40). `/provide`
+  requests are batched per node as before and the same messages are sent. Slow nodes keep their pacing: one
+  lookup at a time, at most 10 per round, 30 s per lookup.
+- Working out what the node provides, done after every pin, fetch, eviction, name change or deny-list change, is
+  skipped when nothing it depends on changed: 1 µs instead of 7 ms with 10 000 pins. Withdrawals are still sent
+  at once.
+
 ## 0.1.4
 
 Security release from the fifth audit: fixes for denial of service against `/blocks` serving, unbounded downloads,

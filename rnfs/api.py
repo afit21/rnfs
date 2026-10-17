@@ -7,8 +7,8 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | Method | Path | Parameters | Response / facade call |
 |---|---|---|---|
 | GET  | /api/status | | `status()`; without the token only `{"version"}` |
-| GET  | /api/info | `target` | `info(target)` |
-| GET  | /api/cat | `target`, `offset`, `length`, `raw`, `block` | the bytes of a file (`read`; sealed files decrypted unless `raw`), Content-Length set; `block=1`: the CID's own block |
+| GET  | /api/info | `target`, `from` | `info(target)` (fetched from node `from` if given) |
+| GET  | /api/cat | `target`, `offset`, `length`, `raw`, `block`, `from` | the bytes of a file (`read`; sealed files decrypted unless `raw`; fetched from node `from` if given), Content-Length set; `block=1`: the CID's own block |
 | GET  | /api/ls | `target` | `{"entries": ls(target)}` |
 | GET  | /api/stat | `target` | `stat(target)` |
 | GET  | /api/pin/ls | `cid` (optional) | `{"pins": pin_ls(cid)}` |
@@ -16,6 +16,7 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/ping | `node` | `{"rtt": seconds or null}` |
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
+| GET  | /api/name/watch | `names` (comma-separated), `after` (a sequence or `-` per name), `wait` (≤ 30 s) | `{"records": [{"name", "cid", "sequence", "age"}]}`: the records held whose sequence is above `after`, as soon as there is one or after `wait` (below) |
 | POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker` | `add_path(...)` |
 | POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`; body is the data | `add_stream(...)` |
 | POST | /api/get | JSON `target`, `output`, `from`, `raw` | `get(...)` |
@@ -35,6 +36,13 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 
 GET parameters are in the query string. Request bodies may use Content-Length or chunked encoding.
 
+Watching names (rnfs.Client's names.watch): `GET /api/name/watch` is a long poll, level-triggered so a client loses
+nothing between calls. Each call marks its names (at most MAX_WATCH_NAMES) watched until WATCH_GRACE seconds after
+it ends (NameManager.watch: their announces count as asked), waits on NameManager's record listener, and answers
+from the records held; it sends nothing to the network. At most MAX_WATCH_WAITERS calls wait at once (503 beyond;
+a `wait=0` call never waits, so it is always answered), so watchers can't take the API's connections, and at most
+MAX_WATCHED names stay watched.
+
 Security:
 - The Host header must be `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding.
 - Every request except `GET /api/status` must carry `X-Rnfs-Api: <token>`, the random token the daemon
@@ -44,12 +52,13 @@ Security:
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
   health checks and the CLI's proof check below, but without the token it answers only `{"version": ...}`:
   the node and identity hashes, LXMF address and traffic counters need the token like everything else.
-- A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.cli.api_proof>` in its
-  response, which only a server knowing the token can make. Before it first sends the token, the CLI makes
-  whatever listens on the port prove this (with a status request), so another local user listening there
-  while the daemon is down learns neither the token nor a name key being imported.
-- Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, InvalidDag 422,
-  Busy 503, StorageFull 507, other errors 500.
+- A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.apiclient.api_proof>` in its
+  response, which only a server knowing the token can make. Before it first sends the token, a client
+  (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
+  so another local user listening there while the daemon is down learns neither the token nor a name key being
+  imported.
+- Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, Denied 451 (the deny
+  list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500.
 
 Connections (both this API and the gateway, through LocalServer):
 - The request line, headers and any JSON body must arrive within request_timeout of connecting, else the
@@ -73,21 +82,25 @@ from urllib.parse import parse_qs, urlsplit
 
 from rnfs import __version__, fsutil
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
-from rnfs.cli import CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
 from rnfs.config import _HEX_ID  # exactly 32 hex digits, as names.parse_name and identity lists are checked
 from rnfs.content.cid import Cid
-from rnfs.errors import Busy, InvalidDag, NotFound, StorageFull, TooLarge
+from rnfs.errors import Busy, Denied, InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs.log import LOG_ERROR, log
 
-API_HEADER = "X-Rnfs-Api"
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
 CHALLENGE = re.compile(r"[0-9a-f]{32}")  # what the CLI sends in X-Rnfs-Challenge
 CHUNK_SIZE_LINE = re.compile(rb"[0-9A-Fa-f]{1,16}")  # a chunk size: hex digits only (no 0x, +, _ or spaces)
 MAX_TRAILER_LINES = 32
+MAX_WATCH_NAMES = 64  # names one GET /api/name/watch may list
+MAX_WATCH_WAITERS = 4  # GET /api/name/watch calls waiting at once
+MAX_WATCH_WAIT = 30  # seconds one may wait, as GET /api/jobs/get's wait=
+WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it ends
+MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500
-ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (InvalidDag, 422), (Busy, 503),
+ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), (InvalidDag, 422), (Busy, 503),
                   (StorageFull, 507)]
 
 
@@ -251,6 +264,7 @@ class BodyReader:
         return len(data)
 
     def readable(self) -> bool:
+        """True: a body is read."""
         return True
 
 
@@ -267,6 +281,7 @@ class TimedReader(io.RawIOBase):
         self.handler = handler
 
     def readable(self) -> bool:
+        """True: the connection is read."""
         return True
 
     def readinto(self, buffer) -> int:
@@ -479,6 +494,85 @@ class LocalServer:
         self.server.server_close()
 
 
+class NameWatches:
+    """GET /api/name/watch's state, one per ApiServer: the names watched for API clients, each until WATCH_GRACE
+    after the last call naming it ends, and the calls waiting. Each name in until holds exactly one
+    NameManager.watch, so its lock is held while watching and unwatching there (taken before the names lock,
+    never under it: the record listener, called with the names lock held, only sets the waiting calls' events)."""
+
+    def __init__(self, node, clock=time.monotonic):
+        """Watches on node's names (read only once a call comes)."""
+        self.node = node
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.until: dict[bytes, float] = {}  # name -> when its watch ends (each one NameManager.watch)
+        self.waiters: tuple = ()  # (names, event) of each call waiting; swapped whole, read without the lock
+        self.listening = False
+
+    def wait(self, names: list[bytes], after: list[int | None], wait: float) -> list[dict]:
+        """The records held for names above the matching after (None: any), once there is one or after wait
+        seconds. Raises Busy if wait > 0 with MAX_WATCH_WAITERS calls waiting already (a wait=0 call never
+        waits, so it holds no connection and is always answered)."""
+        manager = self.node.names
+        event = threading.Event()
+        waiter = (frozenset(names), event)
+        with self.lock:
+            if wait > 0:
+                if len(self.waiters) >= MAX_WATCH_WAITERS:
+                    raise Busy(f"{MAX_WATCH_WAITERS} name watches are waiting already")
+                if not self.listening:
+                    manager.add_record_listener(self._heard)
+                    self.listening = True
+                self.waiters = (*self.waiters, waiter)
+            self._extend(names, self.clock() + wait + WATCH_GRACE)
+        try:
+            deadline = self.clock() + wait
+            while True:
+                found = self._records(names, after)
+                remaining = deadline - self.clock()
+                if found or remaining <= 0:
+                    return found
+                event.wait(remaining)
+                event.clear()
+        finally:
+            with self.lock:
+                self.waiters = tuple(item for item in self.waiters if item is not waiter)
+                self._extend(names, self.clock() + WATCH_GRACE)
+
+    def _extend(self, names: list[bytes], until: float):
+        """Keep names (distinct) watched until at least until, unwatching those whose watch has ended, and the
+        soonest to end past MAX_WATCHED, in NameManager too. Lock held."""
+        manager = self.node.names
+        now = self.clock()
+        for name in [name for name, end in self.until.items() if end <= now and name not in names]:
+            del self.until[name]
+            manager.unwatch(name)
+        for name in names:
+            if name not in self.until:
+                manager.watch(name)
+            self.until[name] = max(self.until.get(name, until), until)
+        while len(self.until) > MAX_WATCHED:
+            name = min((item for item in self.until if item not in names), key=self.until.get)
+            del self.until[name]
+            manager.unwatch(name)
+
+    def _records(self, names: list[bytes], after: list[int | None]) -> list[dict]:
+        """The records held for names above the matching after."""
+        found = []
+        for name, sequence in zip(names, after):
+            record = self.node.names.record(name)
+            if record is not None and (sequence is None or record.sequence > sequence):
+                found.append({"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
+                              "age": max(0.0, time.time() - record.heard)})
+        return found
+
+    def _heard(self, name: bytes, record):
+        """NameManager's record listener (names lock held): wake the calls waiting for name."""
+        for names, event in self.waiters:
+            if name in names:
+                event.set()
+
+
 class ApiServer(LocalServer):
     """The local API for node (an RnfsNode, or anything with its facade methods).
 
@@ -492,22 +586,24 @@ class ApiServer(LocalServer):
         self.token = token if token is not None else secrets.token_urlsafe(32)
         if not self.token:
             raise ValueError("the API token must not be empty")
-        super().__init__(ApiHandler, port, node=node, token=self.token)
+        super().__init__(ApiHandler, port, node=node, token=self.token, watches=NameWatches(node))
 
 
 class ApiRequestError(Exception):
     """A request the API refuses before reaching the node: status and message."""
 
     def __init__(self, status: int, message: str):
+        """A refusal with status and message."""
         super().__init__(message)
         self.status = status
 
 
 class ApiHandler(TimedHandler):
-    """Handles one API request using node and token, which are set on the subclass ApiServer creates."""
+    """Handles one API request using node, token and watches, which are set on the subclass ApiServer creates."""
 
     node = None
     token: str | None = None
+    watches: NameWatches | None = None
     server_version = "rnfs"
     sys_version = ""
 
@@ -523,6 +619,7 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/ping"): "api_ping",
         ("GET", "/api/name/list"): "api_name_list",
         ("GET", "/api/name/resolve"): "api_name_resolve",
+        ("GET", "/api/name/watch"): "api_name_watch",
         ("POST", "/api/add"): "api_add",
         ("POST", "/api/add/stream"): "api_add_stream",
         ("POST", "/api/get"): "api_get",
@@ -542,6 +639,9 @@ class ApiHandler(TimedHandler):
         ("POST", "/api/import"): "api_import",
     }
     OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
+    PROOF_ROUTE = ("GET", "/api/status")
+    proved = False  # this connection had its proof request kept open: it is closed after the next request
+    keep_open = False  # the request being answered is a proof request whose connection stays open
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
@@ -565,12 +665,12 @@ class ApiHandler(TimedHandler):
     # Responses
 
     def send_common_headers(self):
-        """Headers on every API response. Deliberately no Access-Control-* headers (section 11)."""
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
+        """The proof, on every response of the API's own (end_headers adds the headers every response carries)."""
         challenge = (self.headers.get(CHALLENGE_HEADER) or "").strip()
         if CHALLENGE.fullmatch(challenge):
             self.send_header(PROOF_HEADER, api_proof(self.token, self.server.server_address[1], challenge))
+        if self.keep_open:
+            self.send_header("Connection", "keep-alive")
 
     def send_json(self, status: int, body):
         """Send body as a JSON response with the given status."""
@@ -627,7 +727,10 @@ class ApiHandler(TimedHandler):
 
     def dispatch(self):
         """Check Host and the token, route the request, and map exceptions to error responses."""
-        self.close_connection = True  # one request per connection keeps body handling simple
+        # One request per connection keeps body handling simple, but for a proof request: its client then sends
+        # its request on that connection, which can only reach this server (apiclient.ApiConnection._prove)
+        self.close_connection = True
+        self.keep_open = False
         url = urlsplit(self.path)
         self.query = parse_qs(url.query, keep_blank_values=True)
         self.headers_sent = False
@@ -647,10 +750,20 @@ class ApiHandler(TimedHandler):
                                            f"token the daemon wrote to <rnfs dir>/api_token")
             if self.command != "POST":
                 self.request_read()  # no body; POST endpoints call it once they have read theirs
+            self.keep_open = (route == self.PROOF_ROUTE and not self.proved
+                              and CHALLENGE.fullmatch((self.headers.get(CHALLENGE_HEADER) or "").strip()) is not None
+                              and "keep-alive" in (self.headers.get("Connection") or "").lower()
+                              and not self.headers.get("Content-Length") and not self.headers.get("Transfer-Encoding"))
             if feature_route is not None:
                 feature_route(self)
             else:
                 getattr(self, name)()
+            if self.keep_open:
+                # The next request on this connection gets the time limits of a new one, and is its last
+                self.proved = True
+                self.close_connection = False
+                self.deadline = time.monotonic() + self.request_timeout
+                self.phase = "request"
         except ApiRequestError as e:
             self.respond_error(e.status, str(e))
         except RequestTimeout as e:
@@ -672,7 +785,11 @@ class ApiHandler(TimedHandler):
             pass  # the client has gone away
 
     def end_headers(self):
-        """End the headers, remembering that a response has started."""
+        """Add the headers every response carries, http.server's own error pages too (400, 414, 431, 501...),
+        then end the headers, remembering that a response has started. Deliberately no Access-Control-* headers
+        (section 11)."""
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.headers_sent = True
         super().end_headers()
 
@@ -750,21 +867,25 @@ class ApiHandler(TimedHandler):
         self.send_json(200, self.node.info(parse_target(self.param("target")), from_node=from_node))
 
     def api_cat(self):
-        """GET /api/cat?target=&offset=&length=: stream a file's bytes, fetched as needed."""
+        """GET /api/cat?target=&offset=&length=&raw=&block=&from=: stream a file's bytes, fetched as needed (block=1:
+        the CID's own block)."""
         target = parse_target(self.param("target"))
         offset = parse_int(self.param("offset", False), "offset", 0)
         length = parse_int(self.param("length", False), "length", None)
         if parse_bool(self.param("block", False) or ""):
             return self.send_bytes(self.node.block(parse_cid(target)))  # cat --block: the CID's own block
-        raw = {"raw": True} if parse_bool(self.param("raw", False) or "") else {}  # sealed files: the ciphertext
-        info = self.node.info(target, **raw)
-        if info["type"] != "file":
-            raise ValueError(f"{target} is a directory")
-        # Content-Length is known up front, so a client sees a fetch failing mid-stream as a short body
-        available = max(info["size"] - offset, 0)
-        length = available if length is None else min(length, available)
-        chunks = iter(self.node.read(target, offset=offset, length=length, **raw))
+        options = {"raw": True} if parse_bool(self.param("raw", False) or "") else {}  # sealed files: the ciphertext
+        from_text = self.param("from", False)
+        if from_text:
+            options["from_node"] = parse_hex_id(from_text)
+        # One fetch resolves the target, gives its info, then reads (only once the first chunk is asked for)
+        info, chunks = self.node.read_file(target, offset=offset, length=length, **options)
         try:
+            if info["type"] != "file":
+                raise ValueError(f"{target} is a directory")
+            # Content-Length is known up front, so a client sees a fetch failing mid-stream as a short body
+            available = max(info["size"] - offset, 0)
+            length = available if length is None else min(length, available)
             # The first chunk is fetched before the status line, so early errors still get an error status
             first = next(chunks, b"")
             self.send_response(200)
@@ -817,6 +938,26 @@ class ApiHandler(TimedHandler):
         """GET /api/name/resolve?name=: the record a name (or a name contact's nick) points at, persisted."""
         from rnfs.features.keepers import parse_name_arg  # names as keep and follow take them
         self.send_json(200, self.node.name_resolve(parse_name_arg(self.node, self.param("name")).hex()))
+
+    def api_name_watch(self):
+        """GET /api/name/watch?names=&after=&wait=: the records of watched names newer than after (NameWatches)."""
+        texts = (self.param("names") or "").split(",")
+        if not 1 <= len(texts) <= MAX_WATCH_NAMES:
+            raise ValueError(f"names lists 1 to {MAX_WATCH_NAMES} names, comma-separated")
+        names = [parse_hex_id(text, "name") for text in texts]
+        after_text = self.param("after", False)
+        after = [None if text == "-" else parse_int(text, "after", None)
+                 for text in (after_text.split(",") if after_text else ["-"] * len(names))]
+        if len(after) != len(names):
+            raise ValueError("after has one sequence (or -) per name")
+        lowest: dict[bytes, int | None] = {}  # a name listed twice: above the lower of its sequences
+        for name, sequence in zip(names, after):
+            if name in lowest and (lowest[name] is None or sequence is None):
+                lowest[name] = None
+            else:
+                lowest[name] = sequence if name not in lowest else min(lowest[name], sequence)
+        wait = min(parse_int(self.param("wait", False), "wait", 0), MAX_WATCH_WAIT)
+        self.send_json(200, {"records": self.watches.wait(list(lowest), list(lowest.values()), wait)})
 
     # POST endpoints
 

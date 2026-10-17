@@ -1,13 +1,13 @@
 """NEW-2 (the same pattern in other pin sources): follow: and lxmf: pins that a crash left unrecorded were never released.
 
-- follow: unfollow saves follow.json before releasing the pin, and check() pins the new target before saving
-  follow.json and only then releases the target recorded there. A crash in between left a `follow:<name>` pin
-  that no later check, unfollow or `pin rm` released.
+- follow: unfollow saves the followed names before releasing the pin, and check() pins the new target before
+  saving the name's and only then releases the target recorded there. A crash in between left a
+  `follow:<name>` pin that no later check, unfollow or `pin rm` released.
 - lxmf: an auto-fetched pin is saved at once, the inbox only every few seconds, so a crash could leave an
   `lxmf:<sender>` pin whose message the saved inbox doesn't have; inbox removal could never release it.
 
 The crash is a BaseException from a wrapped call, and the node or feature is then built again on the same
-directory without stop(), as in a real crash.
+directory without stop(), as in a real crash (each is stopped and closed only when the test is done).
 """
 import io
 import os
@@ -17,12 +17,14 @@ from unittest import mock
 
 import RNS
 
+from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER
 from rnfs.features import lxmf
 from rnfs.features.follow import follow_source
 from rnfs.node import RnfsNode
+from tests.support import state_rows
 from tests.test_lxmf import SENDER, FeatureTestCase
 from tests.test_names import FakeNetwork
 from tests.test_names_keep import KeeperNet
@@ -56,7 +58,9 @@ class FollowCrashTest(unittest.TestCase):
         self.net = KeeperNet()
         self.net.sender = B_ID
         self.a = self.make_node("a", A_ID)
+        self.addCleanup(self.a.stop)
         self.b = self.make_node("b", B_ID)
+        self.addCleanup(self.b.stop)
         self.a.routing.heard(B_ID)
         self.b.routing.heard(A_ID)
         self.name = bytes.fromhex(self.a.name_create("site")["name"])
@@ -78,7 +82,7 @@ class FollowCrashTest(unittest.TestCase):
         return cid
 
     def test_crash_inside_unfollow_leaves_no_pin_after_restart(self):
-        """Crash after follow.json no longer lists the name, before its pin is released."""
+        """Crash after the name's row is deleted, before its pin is released."""
         follow = self.b.feature("follow")
         cid1 = self.publish(b"version one", 1, self.b)
         follow.follow(self.name)
@@ -92,7 +96,7 @@ class FollowCrashTest(unittest.TestCase):
         self.assertEqual(b.storage.pinned_by(self.source), set(), f"{cid1} stays pinned for a name not followed")
 
     def test_crash_between_pinning_and_saving_is_cleaned_up_by_the_next_move(self):
-        """Crash after pinning the new target, before follow.json records it; the name then moves again."""
+        """Crash after pinning the new target, before the name's row records it; the name then moves again."""
         follow = self.b.feature("follow")
         self.publish(b"version one", 1, self.b)
         follow.follow(self.name)
@@ -111,6 +115,35 @@ class FollowCrashTest(unittest.TestCase):
         b.feature("follow").unfollow(self.name)
         self.assertEqual(b.storage.pinned_by(self.source), set())
 
+    def test_crash_inside_the_commit_recording_the_new_target(self):
+        """The process dies inside the commit of the name's new target: nothing of it is saved, and the next
+        start and move clean up as above."""
+        follow = self.b.feature("follow")
+        cid1 = self.publish(b"version one", 1, self.b)
+        follow.follow(self.name)
+        self.assertTrue(follow.check(self.name, network=False))
+        cid2 = self.publish(b"version two", 2, self.b)
+        commit = statedb._Database._commit
+
+        def crashing(database, conn):
+            """Die in the commit that records cid2 as the name's target."""
+            if conn.execute("SELECT count(*) FROM follow WHERE pinned = ?", (cid2.binary,)).fetchone()[0]:
+                raise Crash()
+            commit(database, conn)
+
+        with mock.patch.object(statedb._Database, "_commit", crashing):
+            with self.assertRaises(Crash):
+                follow.check(self.name, network=False)
+        state = self.b.config.state_dir
+        self.assertEqual(state_rows(state, "SELECT pinned FROM follow"), [(cid1.binary,)])
+        b = self.make_node("b", B_ID)
+        self.addCleanup(b.stop)
+        b.routing.heard(A_ID)
+        self.assertEqual(b.storage.pinned_by(self.source), {cid1, cid2})  # a followed name's: kept
+        cid3 = self.publish(b"version three", 3, b)
+        self.assertTrue(b.feature("follow").check(self.name, network=False))
+        self.assertEqual(b.storage.pinned_by(self.source), {cid3})
+
 
 class LxmfCrashTest(FeatureTestCase):
     """B auto-fetches a link from a trusted sender, then crashes before its inbox is saved."""
@@ -127,7 +160,7 @@ class LxmfCrashTest(FeatureTestCase):
         self.assertEqual(feature.inbox.get(lost)["auto"][0]["state"], "pinned")
         self.b.storage.pin(other, USER)  # another source's pin is never touched
         # Crash before the inbox is saved: the feature is built again from what is on disk
-        again = lxmf.LxmfFeature(self.b)
+        again = self.reloaded()
         source = f"lxmf:{SENDER.hex()}"
         # NEW-2: fails until lxmf: pins the saved inbox doesn't record are released at start
         self.assertEqual(self.b.storage.pinned_by(source), {target})

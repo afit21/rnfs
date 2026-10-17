@@ -1,6 +1,6 @@
 """NEW-4: in private mode, /find replies listed provider records of non-members stored before the switch.
 
-NodeBackend.find filtered providers only by bans, and ProviderStore._load reloaded providers.json with no
+NodeBackend.find filtered providers only by bans, and ProviderStore._load reloaded saved records with no
 membership check. The request server refuses non-members' /provide once private mode is on, but records
 already held (stored while the node was public, or from a member removed since) kept being handed to members
 for up to PROVIDER_TTL, and a member's client then opened identified links to those outsiders.
@@ -83,7 +83,7 @@ class PrivateModeRecordsTest(unittest.TestCase):
         for publisher in (OUTSIDER, MEMBER):
             self.assertTrue(public.backend.provide(publisher, [KEY], []))
         public.records.store(KEY, OWN)
-        public.stop()  # saves providers.json
+        public.stop()  # saves the provider records
 
         private = self.open(**self.members(MEMBER))
         providers, _ = private.backend.find(KEY)

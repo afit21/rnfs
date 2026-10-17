@@ -2,8 +2,8 @@
 
 RnfsNode kept accepted /pin requests only in memory (_remote_reserved). The requester got True, but if the
 node stopped before fetching them, nothing fetched them after the restart, and nothing said so. The fixed
-node saves the pins waiting (state/remote_pins.json, in the order accepted) and resumes them at start; pins
-released before the stop, or from identities no longer on remote_pin_identities, are not resumed.
+node saves the pins waiting (the state database's remote_pins table, in the order accepted) and resumes them at
+start; pins released before the stop, or from identities no longer on remote_pin_identities, are not resumed.
 
 The tests use two offline nodes joined by tests.test_node's NetClient. The provider's /blocks answers are held
 while the pinning node stops, so its pins are still waiting then; the node is then reopened over the same

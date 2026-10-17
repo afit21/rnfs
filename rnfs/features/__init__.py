@@ -18,7 +18,8 @@ from collections.abc import Callable
 
 # Module paths, in start order. A feature may use the features before it
 FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs.features.keepers",
-                               "rnfs.features.follow", "rnfs.features.contacts", "rnfs.features.lxmf"]
+                               "rnfs.features.follow", "rnfs.features.contacts", "rnfs.features.lxmf",
+                               "rnfs.features.deny"]
 
 ApiRoute = Callable[[object], None]  # handler(api_handler)
 
@@ -41,6 +42,9 @@ class Feature:
     def save(self):
         """Save state that is written in batches (called periodically and at stop)."""
 
+    def close(self):
+        """Release the state database, once the node has saved everything at shutdown (after stop and save)."""
+
     def status(self) -> dict:
         """Fields added to `rnfs status`."""
         return {}
@@ -51,6 +55,12 @@ class Feature:
         The request server registers them at startup and applies private mode and the per-link request
         limit; a handler must strictly parse data (untrusted), never return None (RNS would send nothing),
         and return False for anything malformed or refused. An exception answers False.
+
+        The response must have a shape every requester's `protocol.response_refusal` accepts (nodes since 0.1.4
+        check it before decoding): True, False or None, a /find answer (two lists of at most K IDs), or a list of
+        at most MAX_BLOCKS_CIDS entries, each bytes of at most MAX_BLOCK_SIZE or None (a /blocks answer). Any
+        other shape (a dict, a string, a longer list) is refused as malformed, and widening that check wouldn't
+        reach the nodes already running.
         """
         return {}
 

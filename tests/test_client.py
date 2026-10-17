@@ -200,6 +200,32 @@ class PeerClientTest(unittest.TestCase):
         self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertIsNone(self.client.rate_estimate(NODE))
 
+    def test_blocks_elapsed_counts_from_sending(self):
+        """A /blocks result's elapsed time runs from sending the request, not from opening the link."""
+        cid, block = block_of(100, 1)
+
+        def answer(link, path, data):
+            """Answer after 0.1 s."""
+            time.sleep(0.1)
+            return [block]
+        self.respond(answer)
+        fakes.FakeLink.establish_delay = 0.5
+        start = time.monotonic()
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        # A tick short of 0.6 s and 0.1 s: before Python 3.13, time.monotonic on Windows ticks every 15.6 ms
+        self.assertGreaterEqual(time.monotonic() - start, 0.58)
+        self.assertGreaterEqual(result.elapsed, 0.08)
+        self.assertLess(result.elapsed, 0.5)  # opening the link isn't counted
+        self.respond(lambda link, path, data: False)
+        self.assertIsNone(self.call(lambda: self.client.blocks(NODE, [cid])).elapsed)
+
+    def test_link_mdu(self):
+        self.assertIsNone(self.client.link_mdu(NODE))
+        peer = self.call(lambda: self.pool.get(NODE))
+        self.assertEqual(self.client.link_mdu(NODE), 431)
+        self.pool.close_link(peer)
+        self.assertIsNone(self.client.link_mdu(NODE))
+
     def test_blocks_batch_cut(self):
         cids = [block_of(10, i)[0] for i in range(15)]
         self.respond(lambda link, path, data: [None] * len(data[1]))

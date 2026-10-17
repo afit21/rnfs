@@ -22,7 +22,8 @@ unchanged); readers recognise it by its magic prefix. Format version 1:
 Readers find the segment count from the ciphertext size, so the plaintext size needs the last segment
 (decrypting it shows its padding). Sealing gives confidentiality only: anyone may seal a file for you, and
 any recipient could re-seal different content for the others, so it says nothing about who wrote it.
-No RNS import at module level: crypto comes from RNS.Cryptography, loaded when first needed.
+Crypto comes from RNS.Cryptography and RNS.Identity, already loaded with RNS's bundled msgpack (importing
+RNS.vendor.umsgpack runs RNS/__init__).
 """
 import hashlib
 import hmac
@@ -33,7 +34,7 @@ from typing import BinaryIO
 from RNS.vendor import umsgpack
 
 from rnfs.constants import KIB
-from rnfs.content import dag
+from rnfs.content import chunker, dag
 
 MAGIC = b"rnfs-sealed\n"
 VERSION = 1
@@ -69,7 +70,7 @@ def is_sealed(head: bytes) -> bool:
 
 
 def _crypto():
-    """RNS's AES and HKDF (imported here so loading this module doesn't load RNS's crypto)."""
+    """RNS's AES and HKDF (already loaded with RNS, which the module's umsgpack import loads)."""
     from RNS.Cryptography import hkdf
     from RNS.Cryptography.AES import AES_256_CBC
     return AES_256_CBC, hkdf
@@ -204,21 +205,9 @@ class SealingReader:
         self._done = False
 
     def _read_segment(self) -> bytes:
-        """Up to SEGMENT_SIZE plaintext bytes (fewer only at the end)."""
-        want = SEGMENT_SIZE if self._remaining is None else min(SEGMENT_SIZE, self._remaining)
-        parts = []
-        got = 0
-        while got < want:
-            data = self._stream.read(want - got)
-            if not data:
-                break
-            parts.append(data)
-            got += len(data)
-        if self._remaining is not None:
-            if got < want:
-                raise ValueError(f"stream ended {self._remaining - got} bytes early")
-            self._remaining -= got
-        return b"".join(parts)
+        """Up to SEGMENT_SIZE plaintext bytes (fewer only at the end; ValueError if a sized stream ends early)."""
+        data, self._remaining = chunker.read_limited(self._stream, SEGMENT_SIZE, self._remaining)
+        return data
 
     def _produce(self):
         """Seal the next segment, reading one ahead to know whether it is the last."""

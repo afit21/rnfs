@@ -4,3 +4,5 @@ prune packaging
 # ...except the dependency lock, which install.sh uses when installing from an sdist
 include packaging/requirements.lock
 include packaging/build-backend.lock
+# The example program for the public API (rnfs.Node, rnfs.Client)
+recursive-include examples *.py

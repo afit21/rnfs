@@ -1,4 +1,5 @@
-"""Being considerate on shared radio meshes (the mesh feature; scratchpad spec text in docs/mesh.md).
+"""Being considerate on shared radio meshes (the mesh feature: specification.md section 3, upload budget,
+interface rules and quiet hours; design.md, "Mesh").
 
 - Provider choice: within each seniority group, providers fewer hops away are tried first, then those whose
   next hop goes out on a faster interface (provider_rank). RNS is reached only through RnsPaths, which the
@@ -290,7 +291,8 @@ class AirtimePolicy:
             return REFUSED_INTERFACE
         if self.quiet and in_quiet_hours(self.quiet, self.minute_of_day()):
             return REFUSED_QUIET
-        # Nothing at all left: refuse before building a response (spend() decides once its size is known)
+        # Nothing at all left: refuse before building a response (RequestServer._admit, through reserve(),
+        # decides once its size is known)
         if self.bucket is not None and self.bucket.available() <= 0:
             return REFUSED_BUDGET
         return None

@@ -4,12 +4,10 @@ resolved names once it held 4 × name_table_size, so that many resolves of other
 replayed old announce of a name back in.
 
 A NameManager over FakeNetwork (as tests/security/test_l4_name_rollback.py) resolves name N at sequence 5 for the
-gateway. A "crash" is a second manager on the same state directory without stop(). The floor must be on disk at once
-(within FLOOR_SAVE_INTERVAL of the last save), names resolved within FLOOR_KEEP_AGE must outlast churn up to a hard
-bound, and the file must stay bounded.
+gateway. A "crash" is a second manager on the same state directory without stop(). The floor must be committed at
+once (within FLOOR_SAVE_INTERVAL of the last save), names resolved within FLOOR_KEEP_AGE must outlast churn up to a
+hard bound, and the saved floor must stay bounded.
 """
-import json
-import os
 import tempfile
 import unittest
 
@@ -19,7 +17,7 @@ from rnfs import names
 from rnfs.config import Config
 from rnfs.content.cid import RAW, Cid
 from rnfs.names import NameManager, encode_record
-from tests.support import FakeClock
+from tests.support import FakeClock, state_rows
 from tests.test_names import FakeNetwork, FakePins
 
 N = bytes([0x4E] * 16)
@@ -53,6 +51,7 @@ class FloorTest(unittest.TestCase):
     def start_manager(self) -> NameManager:
         """A manager on the state directory, started."""
         manager = NameManager(self.config, FakePins(), network=self.network, clock=self.clock, monotonic=self.clock)
+        self.addCleanup(manager.close)
         manager.start()
         self.addCleanup(manager.stop)
         return manager
@@ -70,12 +69,8 @@ class FloorTest(unittest.TestCase):
         return manager.resolve(N, persist=False)
 
     def saved_names(self) -> set[bytes]:
-        """The names in name-floor.json (none if there is no such file)."""
-        try:
-            with open(os.path.join(self.config.state_dir, names.FLOOR_FILE), encoding="utf-8") as f:
-                return {bytes.fromhex(entry[0]) for entry in json.load(f)["floor"]}
-        except FileNotFoundError:
-            return set()
+        """The names the saved floor (the name_floor table) holds."""
+        return {name for (name,) in state_rows(self.config.state_dir, "SELECT name FROM name_floor")}
 
     def test_floor_survives_a_crash_right_after_the_resolve(self):
         crashed = self.start_manager()  # the first one never stopped, nor reached announce_due

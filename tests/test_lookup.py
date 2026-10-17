@@ -8,7 +8,8 @@ from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
-from rnfs.dht.routing import RoutingTable, distance
+from rnfs.dht.routing import AVOID_AFTER, RoutingTable, distance
+from tests.support import FakeClock, wait_for
 
 CONFIG = Config()
 
@@ -204,6 +205,26 @@ class TerminationTest(LookupTestCase):
         self.assertEqual(sorted(result), [a, b])
         self.assertEqual(sorted(net.queried), [a, b])  # each queried once
 
+    def test_reports_each_query_and_how_the_run_ended(self):
+        net = self.network()
+        a, b, gone = ident(1), ident(2), ident(3)
+        net.add(a, knows=[b, gone])
+        net.add(b, knows=[a])
+        reports: list[str] = []
+        lock = threading.Lock()
+
+        def report(text):
+            """Collect reports (query threads report too)."""
+            with lock:
+                reports.append(text)
+
+        self.lookup(net, ident(100), [a], report=report).find_closest()
+        key = ident(100).hex()
+        self.assertTrue(reports[0].startswith(f"lookup for {key}: 1 start nodes"), reports[0])
+        self.assertTrue(any(f"<{a.hex()}> answered in" in text for text in reports), reports)
+        self.assertTrue(any(f"<{gone.hex()}> failed after" in text for text in reports), reports)
+        self.assertIn("asked 3, 2 answered, 1 failed", reports[-1])
+
     def test_no_start_nodes(self):
         net = self.network()
         self.assertEqual(self.lookup(net, ident(5), []).find_closest(), [])
@@ -312,6 +333,116 @@ class UnknownIdTest(LookupTestCase):
         self.assertTrue(lookup.allow_unknown(ident(6)))
         self.assertFalse(lookup.allow_unknown(ident(7)))
         self.assertTrue(lookup.allow_unknown(ident(9)))
+
+
+class UnreliableNodeTest(LookupTestCase):
+    """Nodes whose queries keep failing are asked last, and a retry of one is never waited for."""
+
+    def setUp(self):
+        """A key with two unreliable nodes closest to it, which hang, and three reliable ones beyond them."""
+        super().setUp()
+        self.net = self.network()
+        self.key = ident(0x1000)
+        self.dead = [ident(0x1001), ident(0x1002)]
+        self.near = [ident(0x1010), ident(0x1020), ident(0x1030)]
+        for n in self.dead + self.near:
+            self.net.add(n)
+        self.net.hang.update(self.dead)
+
+    def test_not_asked_while_enough_others_answer(self):
+        """The lookup completes from the reliable nodes without asking or waiting for the unreliable ones."""
+        started = time.monotonic()
+        result = self.lookup(self.net, self.key, self.dead + self.near, timeout=30,
+                             unreliable=self.dead.__contains__).find_closest()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(result, self.near + self.dead)  # not asked: after every other node, to make up k
+        self.assertFalse(set(self.net.queried) & set(self.dead))
+
+    def test_unreliable_nodes_named_in_replies_too(self):
+        """Unreliable nodes a reply names rank last as well."""
+        for n in self.near:
+            self.net.nodes[n].table.heard(self.dead[0])
+        started = time.monotonic()
+        result = self.lookup(self.net, self.key, self.near, timeout=30,
+                             unreliable=self.dead.__contains__).find_closest()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertNotIn(self.dead[0], self.net.queried)
+        # Known but not asked: it comes after every other node in the result
+        self.assertEqual(result, self.near + [self.dead[0]])
+
+    def test_retry_is_sent_but_not_waited_for(self):
+        """A due retry is asked on top of alpha, and the lookup finishes without its answer."""
+        retries = []
+
+        def may_retry(n: bytes) -> bool:
+            """Every unreliable node is due, once."""
+            retries.append(n)
+            return True
+
+        started = time.monotonic()
+        lookup = self.lookup(self.net, self.key, self.dead + self.near, alpha=1, timeout=30,
+                             unreliable=self.dead.__contains__, may_retry=may_retry)
+        result = lookup.find_closest()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(result, self.near)
+        self.assertEqual(sorted(retries), self.dead)
+        wait_for(lambda: set(self.dead) <= set(self.net.queried), what="the retries")
+
+    def test_asked_and_waited_for_when_needed(self):
+        """With too few other nodes, unreliable ones are asked and waited for like any node."""
+        self.net.hang.clear()
+        result = self.lookup(self.net, self.key, self.dead + self.near[:1], beta=3,
+                             unreliable=self.dead.__contains__).find_closest()
+        self.assertEqual(result, sorted(self.dead + self.near[:1], key=lambda n: distance(n, self.key)))
+        self.assertEqual(set(self.net.queried), set(self.dead + self.near[:1]))
+
+
+class UnreliableRoutingTest(LookupTestCase):
+    """Lookups over a routing table: a far node that keeps announcing but never connects."""
+
+    def test_avoided_retried_and_restored(self):
+        """Asked by every lookup until max_failures, then avoided (announces don't change that), asked again
+        after the backoff, and asked like any node once it answers."""
+        net = self.network()
+        clock = FakeClock()
+        own = ident(0)
+        table = RoutingTable(own, Config(max_failures=3), clock=clock)
+        key = ident(0x1000)
+        dead = ident(0x1001)  # closest to the key, and unreachable
+        near = [ident(0x1010), ident(0x1020), ident(0x1030), ident(0x1040)]
+        for n in near:
+            net.add(n)
+            table.heard(n)
+
+        outcomes: list[bytes] = []  # every node whose query's outcome reached the table
+
+        def count(record):
+            """record (the table's failed or answered), noting the outcome."""
+            return lambda n: (record(n), outcomes.append(n))
+
+        def run() -> bool:
+            """Hear dead's announce, run a lookup from the table, and say whether it asked dead."""
+            table.heard(dead)
+            before = net.queried.count(dead)
+            lookup = self.lookup(net, key, table.closest(key), own_id=own, on_failure=count(table.failed),
+                                 on_answer=count(table.answered), unreliable=table.unreliable,
+                                 may_retry=table.may_retry)
+            self.assertLessEqual(set(near[:3]), set(lookup.find_closest()))
+            # The outcome of a retry may arrive after the run, which doesn't wait for it
+            wait_for(lambda: outcomes.count(dead) == net.queried.count(dead), what="the query's outcome")
+            return net.queried.count(dead) > before
+
+        self.assertEqual([run() for _ in range(3)], [True, True, True])
+        self.assertTrue(table.unreliable(dead))
+        self.assertFalse(run())
+        clock.now += AVOID_AFTER
+        self.assertTrue(run())  # retried, failing again
+        self.assertFalse(run())
+        net.add(dead)  # back
+        clock.now += 2 * AVOID_AFTER
+        self.assertTrue(run())
+        wait_for(lambda: not table.unreliable(dead), what="the answer")
+        self.assertTrue(run())
 
 
 class TimeoutTest(LookupTestCase):

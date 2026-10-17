@@ -17,7 +17,7 @@ from rnfs import names
 from rnfs.config import Config
 from rnfs.content.cid import RAW, Cid
 from rnfs.names import NameManager, encode_record
-from tests.support import FakeClock
+from tests.support import FakeClock, write_legacy
 from tests.test_names import FakeNetwork, FakePins
 
 N = bytes([0x4E] * 16)
@@ -46,6 +46,7 @@ class GatewayRollbackTest(unittest.TestCase):
         self.clock = FakeClock(1_000_000.0)
         self.manager = NameManager(self.config, FakePins(), network=self.network, clock=self.clock,
                                    monotonic=self.clock)
+        self.addCleanup(self.manager.close)
         self.manager.start()
         self.addCleanup(self.manager.stop)
         self.network.announce(N, encode_record(5, NEW), self.clock.now)
@@ -81,6 +82,7 @@ class GatewayRollbackTest(unittest.TestCase):
         self.manager.stop()
         self.network.app_data.clear()
         restarted = NameManager(self.config, FakePins(), network=self.network, clock=self.clock, monotonic=self.clock)
+        self.addCleanup(restarted.close)
         restarted.start()
         self.addCleanup(restarted.stop)
         self.replay_old()
@@ -99,11 +101,13 @@ class FloorChurnTest(unittest.TestCase):
         self.addCleanup(setattr, RNS, "loglevel", saved)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
         self.config = Config(rnfs_dir=tmp.name, path_timeout=0.05, name_table_size=3)
         self.network = FakeNetwork()
         self.clock = FakeClock(1_000_000.0)
         self.manager = NameManager(self.config, FakePins(), network=self.network, clock=self.clock,
                                    monotonic=self.clock)
+        self.addCleanup(self.manager.close)
         self.manager.start()
         self.addCleanup(self.manager.stop)
         self.network.announce(N, encode_record(5, NEW), self.clock.now)
@@ -128,13 +132,14 @@ class FloorChurnTest(unittest.TestCase):
         self.assertEqual(len(self.manager._floor), names.FLOOR_FACTOR * 3)
 
     def test_damaged_floor_file_is_set_aside(self):
-        self.manager.stop()
-        path = os.path.join(self.config.state_dir, names.FLOOR_FILE)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("{not json")
-        restarted = NameManager(self.config, FakePins(), network=self.network, clock=self.clock, monotonic=self.clock)
+        """A damaged name-floor.json (of rnfs 0.1.4 or earlier) found at an upgrade is moved aside, and the node
+        starts without it."""
+        config = Config(rnfs_dir=os.path.join(self.tmp, "upgraded"), path_timeout=0.05, name_table_size=3)
+        write_legacy(config.state_dir, names.FLOOR_FILE, text="{not json")
+        restarted = NameManager(config, FakePins(), network=self.network, clock=self.clock, monotonic=self.clock)
+        self.addCleanup(restarted.close)
         self.assertEqual(len(restarted._floor), 0)
-        self.assertTrue(any(entry.startswith(names.FLOOR_FILE + ".damaged") for entry in os.listdir(self.config.state_dir)))
+        self.assertTrue(any(entry.startswith(names.FLOOR_FILE + ".damaged") for entry in os.listdir(config.state_dir)))
 
 
 if __name__ == "__main__":

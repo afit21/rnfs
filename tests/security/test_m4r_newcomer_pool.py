@@ -39,9 +39,12 @@ def fill_main(store: ProviderStore, clock: FakeClock):
 class NewcomerPoolTest(unittest.TestCase):
     """Stores with provider_seniority one day and seeded eviction picks."""
 
-    def make_store(self, max_records: int, path: str | None = None) -> ProviderStore:
-        """A store on self.clock, its newcomer allowance a tenth of the full one when large enough."""
-        return ProviderStore(max_records, path, clock=self.clock, rng=random.Random(1), seniority=DAY)
+    def make_store(self, max_records: int, state: str | None = None) -> ProviderStore:
+        """A store on self.clock, its newcomer allowance a tenth of the full one when large enough (persisted in
+        state, if given, and closed when the test ends)."""
+        store = ProviderStore(max_records, state, clock=self.clock, rng=random.Random(1), seniority=DAY)
+        self.addCleanup(store.close)
+        return store
 
     def setUp(self):
         """The clock."""
@@ -62,25 +65,27 @@ class NewcomerPoolTest(unittest.TestCase):
         self.assertGreaterEqual(kept, fair, f"H kept {kept} of {len(keys)} records; a fair share of the pool is {fair}")
 
     def test_first_seen_outlasts_eviction_from_the_pool(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "providers.json")
-            store = self.make_store(10_000, path)
-            fill_main(store, self.clock)
-            self.assertTrue(store.store(ident(2 << 100), H))
-            first_seen = store.first_seen(H)
-            self.clock.now += 60
-            for i in range(3 * store.pool_size):  # fresh identities, one record each
-                self.clock.now += 1
-                store.store(ident((3 << 100) + i), ident((0x5 << 120) + i))
-            self.assertIsNone(store.first_seen(H), "H still holds a record: the flood didn't evict it")
-            store.save()
-            store = self.make_store(10_000, path)  # and a restart
-            self.clock.now += DAY
-            # M4-R: fails until first-seen times of newcomers evicted from the pool are kept
-            self.assertEqual(store.allowance(H), store.max_per_publisher,
-                             "H, first seen over a day ago, is new again after the flood")
-            self.assertTrue(store.store(ident(4 << 100), H))
-            self.assertEqual(store.first_seen(H), first_seen)
+        """A newcomer whose last record a flood evicted from the pool keeps its first-seen time, across a restart."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)  # after the stores are closed (cleanups run last first)
+        state = os.path.join(directory.name, "state")
+        store = self.make_store(10_000, state)
+        fill_main(store, self.clock)
+        self.assertTrue(store.store(ident(2 << 100), H))
+        first_seen = store.first_seen(H)
+        self.clock.now += 60
+        for i in range(3 * store.pool_size):  # fresh identities, one record each
+            self.clock.now += 1
+            store.store(ident((3 << 100) + i), ident((0x5 << 120) + i))
+        self.assertIsNone(store.first_seen(H), "H still holds a record: the flood didn't evict it")
+        store.save()
+        store = self.make_store(10_000, state)  # and a restart
+        self.clock.now += DAY
+        # M4-R: fails until first-seen times of newcomers evicted from the pool are kept
+        self.assertEqual(store.allowance(H), store.max_per_publisher,
+                         "H, first seen over a day ago, is new again after the flood")
+        self.assertTrue(store.store(ident(4 << 100), H))
+        self.assertEqual(store.first_seen(H), first_seen)
 
     def test_memory_of_evicted_newcomers_is_bounded(self):
         """Bounded, and the newcomers first seen most recently are forgotten first, so a flood can't push out H."""

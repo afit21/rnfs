@@ -91,6 +91,7 @@ class FormatTest(unittest.TestCase):
         with open(exported, "rb") as f:
             self.assertEqual(f.read(), body)
         other = Storage(os.path.join(self.tmp.name, "o", "blocks"), os.path.join(self.tmp.name, "o", "state"), 10**9)
+        self.addCleanup(other.close)
         stats = archive.import_archive(io.BytesIO(body), other)
         self.assertEqual([str(cid) for cid in stats["roots"]], [self.root])
 
@@ -100,6 +101,7 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["ETag"], f'"{target}.archive"')
         other = Storage(os.path.join(self.tmp.name, "o", "blocks"), os.path.join(self.tmp.name, "o", "state"), 10**9)
+        self.addCleanup(other.close)
         self.assertEqual([str(c) for c in archive.import_archive(io.BytesIO(body), other)["roots"]], [target])
         # A HEAD never gets an archive, stored or not (L6)
         self.assertEqual(self.get(f"/rnfs/{self.root}/sub?format=archive", method="HEAD")[0], 409)

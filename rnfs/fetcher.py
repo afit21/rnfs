@@ -31,25 +31,26 @@ asked again until as long as that request took has passed again. Refusals within
 served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
 may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
 
-Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes
-a fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
-write-outs stop at max_output_entries entries met while fetching. fetch_dag also bounds the bytes of the
-DAG's distinct blocks by what its declared size can hold (dag_bound: the size, DAG_GRANULE_OVERHEAD per
-DAG_GRANULE of it and DAG_SLACK), plus what its directory and index nodes bring (node_credit: their own
-bytes and DAG_ENTRY_OVERHEAD per entry or index child, less INDEX_NODE_COST for an index node); a
-caller's max_dag_bytes (a quota) can lower it. fetch_listing has the same bound for a size of 0, and each
-read_range call bounds the bytes of the file nodes it meets by range_bound (what the range can hold, plus two
-full file nodes per level a file of the declared size can have). A file node may list children of size 0,
-and index nodes can be chained, so without these a file declaring 1 byte, or a directory of one entry, could
-hold any number of distinct nodes. What the builder writes never comes near them (design.md, "DAG byte
-bound"). While one applies, requests ask for no more than it leaves, counting a DAG node as MAX_BLOCK_SIZE
-until it arrives (a directory or index node as nothing under the size-derived bound: see _reserve), so a
-fetch downloads at most about one block beyond it before failing with TooLarge. max_storage never refuses a
-fetch: one
-that isn't being pinned evicts other cached fetches to make room for each response, and goes over
-max_storage if nothing is evictable (the node evicts again once it ends). What refuses a fetch, pinned or
-not, with StorageFull is the disk: its remaining size, and then each response, must leave the disk reserve
-free (Storage.check_disk).
+Limits (sections 7 and 8): max_download_size bounds both the target's verified size and the DAG node bytes a
+fetch downloads (a DAG of empty files has size 0 but can hold gigabytes of directory nodes); listings and
+write-outs stop at max_output_entries entries met while fetching. fetch_dag also bounds the bytes of the DAG's
+distinct blocks by what its declared size can hold (dag_bound: the size, DAG_GRANULE_OVERHEAD per DAG_GRANULE
+of it and DAG_SLACK), plus what its directory and index nodes bring (node_credit: their own bytes and
+DAG_ENTRY_OVERHEAD per entry or index child, less INDEX_NODE_COST for an index node); a caller's max_dag_bytes
+(a quota) can lower it. fetch_listing has the same bound for a size of 0, and each read_range call bounds the
+bytes of the file nodes it meets by range_bound (what the range can hold, plus two full file nodes per level a
+file of the declared size can have). A file node may list children of size 0, and index nodes can be chained,
+so without these a file declaring 1 byte, or a directory of one entry, could hold any number of distinct nodes.
+What the builder writes never comes near them (design.md, "DAG byte bound"). While one applies, requests ask
+for no more than it leaves, counting a DAG node as MAX_BLOCK_SIZE until it arrives (a directory or index node
+as nothing under the size-derived bound: see _reserve), so a fetch downloads at most about one block beyond it
+before failing with TooLarge. max_storage never refuses a fetch: one that isn't being pinned evicts other
+cached fetches to make room for each response, and goes over max_storage if nothing is evictable (the node
+evicts again once it ends). What refuses a fetch, pinned or not, with StorageFull is the disk: its remaining
+size, and then each response, must leave the disk reserve free (Storage.check_disk). A CID the deny list denies
+(rnfs.denylist; the storage's) ends a fetch with Denied where it is met, root or child, stored or not, before
+it is asked for or read; a complete stored DAG is checked whole, since fetch_dag doesn't walk it (and its
+blocks against a quota).
 
 Requests are spread over up to max_parallel_providers providers (1 on slow nodes), one /blocks request in
 flight per provider. Request threads only call the client; all fetch state is changed by the thread that
@@ -58,21 +59,23 @@ runs the fetch, from the events they queue.
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
 """
-import os
 import queue
 import threading
 import time
 from collections import OrderedDict, deque
 from contextlib import contextmanager
+from itertools import islice
 from typing import Callable, Iterator
 
+from rnfs import statedb
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
+from rnfs.constants import (CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE,
+                            MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD)
 from rnfs.content import walker
 from rnfs.content.cid import Cid
-from rnfs.content.storage import Storage, read_json, write_json
+from rnfs.content.storage import Storage
 from rnfs.content.walker import Expect
-from rnfs.errors import InvalidDag, NotFound, RnfsError, TooLarge
+from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 from rnfs.network import client as peer_client
 from rnfs.network import protocol, rates
@@ -84,8 +87,23 @@ WINDOW = 32  # chunks fetched ahead of what a byte-range read has written out
 POLL = 0.5  # seconds between checks while waiting for responses
 DAG_NODE_GUESS = 8 * KIB  # assumed size of a DAG node block when reserving a request's batch
 MAX_BATCH = 32  # CIDs reserved for one request at most; the client sends as many as fit one packet
-INVALID_FILE = "invalid.json"
 MAX_INVALID = 10_000  # roots remembered as invalid; past this the oldest is forgotten
+
+
+def import_invalid(value: list, tx) -> int:
+    """Import invalid.json (statedb.migrate): its roots, oldest first, replace the invalid table; one that doesn't
+    parse is skipped, as rnfs 0.1.4 did, and only the newest MAX_INVALID are kept. Returns the number imported."""
+    tx.execute("DELETE FROM invalid")
+    roots: OrderedDict[Cid, None] = OrderedDict()
+    for text in value:
+        try:
+            roots[Cid.parse(text)] = None
+        except (ValueError, TypeError):
+            continue
+    kept = list(roots)[-MAX_INVALID:]
+    tx.executemany("INSERT INTO invalid (cid, position) VALUES (?, ?)",
+                   [(cid.binary, position) for position, cid in enumerate(kept)])
+    return len(kept)
 # The DAG byte bound (dag_bound and fetch_dag; design.md, "DAG byte bound"). Writers cut chunks of CHUNK_SIZE,
 # or with FastCDC of over 16 KiB, so a file has at most one chunk per 16 KiB of content beyond its last; each
 # costs at most 51 bytes of file node (a [cid, size] child), plus about 1/255 of that for the levels above
@@ -146,10 +164,6 @@ def range_bound(size: int, length: int) -> int:
     and at most two chunks' worth more.
     """
     return dag_bound(length) + 2 * file_levels(size) * FILE_NODE_MAX
-
-
-class Cancelled(RnfsError):
-    """A fetch stopped because its observer asked it to (a job cancelled, or the node stopping)."""
 
 
 class Observer:
@@ -254,17 +268,23 @@ class Fetcher:
         # RNS's (mesh.RnsPaths.info), and without it nothing is known and ranking falls back to reply order
         self.path_info: Callable[[bytes], mesh.PathInfo] = mesh.no_path_info
         self._lock = threading.Lock()
-        self._invalid_path = None if state_dir is None else os.path.join(state_dir, INVALID_FILE)
+        self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
-        self._invalid_dirty = False
-        if self._invalid_path is not None:
-            for text in read_json(self._invalid_path) or []:
+        self._invalid_saved: set = set()  # the binary CIDs the invalid table holds
+        self._invalid_position = 0  # the next root's position in the table: after every one saved
+        if self._db is not None:
+            for binary, position in self._db.query("SELECT cid, position FROM invalid ORDER BY position"):
+                self._invalid_saved.add(binary)
+                if isinstance(position, int):
+                    self._invalid_position = max(self._invalid_position, position + 1)
                 try:
-                    self._invalid[Cid.parse(text)] = None
-                except (ValueError, TypeError):
+                    self._invalid[Cid.from_bytes(binary)] = None
+                except ValueError:
                     continue
             while len(self._invalid) > MAX_INVALID:
                 self._invalid.popitem(last=False)
+        # Changed since the last save; a row that didn't parse, or past MAX_INVALID, is deleted by the next
+        self._invalid_dirty = len(self._invalid) != len(self._invalid_saved)
 
     @property
     def max_parallel(self) -> int:
@@ -277,12 +297,20 @@ class Fetcher:
 
         Raises InvalidDag if root was found invalid before. Its traversals raise StorageFull if what they
         would store doesn't fit on the disk (never because of max_storage).
+        Raises Denied if the deny list denies root; its traversals raise Denied at the first denied CID they meet,
+        stored or not, before fetching or reading it.
         """
         if self.is_invalid(root):
             error = InvalidDag(f"{root} was found to be an invalid DAG")
             error.root = root
             raise error
+        self.check_denied(root)
         return Fetch(self, root, list(names), from_node, pinned)
+
+    def check_denied(self, cid: Cid):
+        """Raise Denied if the deny list (the storage's) denies cid."""
+        if self.storage.deny.denies(cid):
+            raise Denied(f"{cid} is on this node's deny list")
 
     def is_invalid(self, root: Cid) -> bool:
         """True if root was marked invalid locally."""
@@ -301,15 +329,29 @@ class Fetcher:
         log(f"marked {root} invalid locally", LOG_WARNING)
 
     def save(self):
-        """Persist the invalid roots if they changed (the node calls this periodically and at shutdown)."""
-        if self._invalid_path is None:
+        """Persist the invalid roots added or forgotten since the last save, if any (the node calls this
+        periodically and at shutdown)."""
+        if self._db is None:
             return
         with self._lock:
             if not self._invalid_dirty:
                 return
-            # Written under the lock, so saves can't overtake each other; it is small and rarely changes
-            write_json(self._invalid_path, [str(cid) for cid in self._invalid])
+            # Written under the lock, so saves can't overtake each other; it rarely changes
+            current = [cid.binary for cid in self._invalid]
+            added = [binary for binary in current if binary not in self._invalid_saved]
+            gone = self._invalid_saved.difference(current)
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM invalid WHERE cid = ?", [(binary,) for binary in gone])
+                tx.executemany("INSERT OR REPLACE INTO invalid (cid, position) VALUES (?, ?)",
+                               [(binary, self._invalid_position + n) for n, binary in enumerate(added)])
+            self._invalid_position += len(added)
+            self._invalid_saved = set(current)
             self._invalid_dirty = False
+
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        if self._db is not None:
+            self._db.close()
 
 
 class Fetch:
@@ -469,8 +511,16 @@ class Fetch:
             self._declared = (self._declared or 0) + size
             if self.observer is not None:
                 self.observer.total(size)
-            # The root's own DAG, already complete, was checked from the same expectation when it was memoised
+            # The root's own DAG, already complete, was checked from the same expectation when it was memoised;
+            # its blocks aren't met again, so the deny list is checked against them here
             if target == walker.root_expect(self.root) and self.storage.is_complete(target.cid):
+                denied = self.storage.deny.cids
+                if denied and any(cid.binary in denied for cid in self.storage.dag_blocks(target.cid)):
+                    raise Denied(f"{target.cid} holds a block on this node's deny list")
+                # A quota counts the blocks stored as well as downloaded: a remote pin or auto-fetch of a DAG held
+                # already (a user pin, a cached fetch) gets the same answer as one fetched now
+                if self.max_dag_bytes is not None and self.storage.dag_bytes(target.cid) > self.max_dag_bytes:
+                    raise TooLarge(f"{self.root} holds more than {self.max_dag_bytes} bytes of blocks")
                 return
             # What is stored already needn't fit again (its DAG nodes make this an estimate)
             self.check_disk(target, size - self.storage.dag_bytes(target.cid))
@@ -614,6 +664,7 @@ class Fetch:
         children: dict[Expect, list[Expect]] = {}
         wanted: dict[Cid, list[Expect]] = {}
         for expect in dict.fromkeys(expects):
+            self.fetcher.check_denied(expect.cid)  # before fetching or reading it, stored or not
             walker.check_cid(expect)  # before fetching a block that can't be right
             checked = self._check_stored(expect)
             if checked is None:
@@ -863,23 +914,29 @@ class Fetch:
                 busy_providers += 1
 
     def _take_batch(self, pending: deque, node_id: bytes, wanted: dict[Cid, list[Expect]]) -> list[Cid]:
-        """The next CIDs to ask node_id for: what its budget and one request packet can hold, at least one.
+        """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
+        hold, at least one.
 
         Under a DAG limit, only what the room it leaves can take for sure (_room), but at least one CID when no
         request is in flight: so a fetch downloads at most about one block beyond the limit.
         """
         budget = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
+        # However large max_bytes is, the responder's budget is at most this (server.blocks_budget, section 7)
+        carried = min(budget, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+        # The client sends what fits its link's packet and returns the rest: the open link's MDU, else the
+        # largest request any link allows (test fakes may not know links). Whether a prefix fits only gets
+        # worse as it grows, so one count covers every batch taken from the front of pending
+        link_mdu = getattr(self.client, "link_mdu", None)
+        mdu = (link_mdu(node_id) if link_mdu is not None else None) or MAX_REQUEST_SIZE
+        fit = max(1, protocol.blocks_batch_size(budget, list(islice(pending, MAX_BATCH)), mdu))
         room = self._room(wanted)
         batch: list[Cid] = []
         total = 0
-        while pending and len(batch) < MAX_BATCH:
+        while pending and len(batch) < fit:
             cid = pending[0]
             known = wanted[cid][0].size if cid.is_raw else None
             guess = known if known is not None else (CHUNK_SIZE if cid.is_raw else DAG_NODE_GUESS)
-            if batch and total + guess > budget:
-                break
-            # The largest request any link allows; the client sends what fits its link and returns the rest
-            if batch and protocol.blocks_batch_size(budget, batch + [cid], MAX_REQUEST_SIZE) <= len(batch):
+            if batch and total + guess > carried:
                 break
             if room is not None:
                 room = self._reserve(cid, wanted, room)
@@ -905,6 +962,9 @@ class Fetch:
                 result = self.client.blocks(node_id, cids, on_progress=progress)
             except Exception as e:
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
+            if result.elapsed is not None:
+                # When it actually went out: opening the link or waiting for its /blocks slot isn't its time
+                sent_at = max(sent_at, self.fetcher.clock() - result.elapsed)
             self._events.put(("result", node_id, cids, result, sent_at, rate))
 
         threading.Thread(target=work, name="rnfs-fetch", daemon=True).start()

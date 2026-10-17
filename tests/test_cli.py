@@ -87,6 +87,8 @@ class ParsingTest(unittest.TestCase):
                          ("client", "yes", True, 2, 0))
         args = cli.build_parser().parse_args(["daemon"])
         self.assertEqual((args.bootstrap, args.private, args.dht_mode), (None, None, None))
+        self.assertIsNone(args.debug_log)  # rnfs.toml's debug_log then decides
+        self.assertTrue(cli.build_parser().parse_args(["daemon", "--debug-log"]).debug_log)
 
     def test_every_spec_command_parses(self):
         cid = str(Cid.for_block(RAW, b""))
@@ -351,12 +353,28 @@ class OtherCommandTest(CliTestCase):
         self.assertIn("invalid settings: private must be true or false", str(raised.exception.code))
 
     def test_node_that_cant_start_fails_cleanly(self):
-        # An error building the node (e.g. an rnfs dir that isn't private) is a message, not a traceback
+        """An error building the node (e.g. an rnfs dir that isn't private) is a message, not a traceback, and
+        the daemon.lock is let go."""
         from rnfs.errors import RnfsError
         with mock.patch("rnfs.node.RnfsNode", side_effect=RnfsError("the rnfs dir isn't private")), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             cli.main(["--dir", self.tmp, "daemon"])
         self.assertEqual(raised.exception.code, "rnfs: the rnfs dir isn't private")
+        self.assert_unlocked()
+
+    def test_debug_log_that_cant_open_fails_cleanly(self):
+        """A debug log that can't be written is a message, and the daemon.lock taken before it is let go."""
+        with mock.patch("rnfs.debuglog.start", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cli.main(["--dir", self.tmp, "daemon", "--debug-log"])
+        self.assertEqual(raised.exception.code, "rnfs: can't write the debug log: disk full")
+        self.assert_unlocked()
+
+    def assert_unlocked(self):
+        """The failed daemon closed its daemon.lock: this process can lock it again (an open descriptor would
+        hold the lock, and on Windows keep the temp dir from being removed)."""
+        fd = fsutil.lock_exclusive(os.path.join(self.tmp, cli.LOCK_FILE))
+        os.close(fd)
 
 
 class TokenTest(CliTestCase):
@@ -480,6 +498,41 @@ class TokenTest(CliTestCase):
         self.assertNotEqual(proof, cli.api_proof("token", 8789, "ab" * 16))
         self.assertNotEqual(proof, cli.api_proof("other", 8788, "ab" * 16))
         self.assertNotEqual(proof, cli.api_proof("token", 8788, "cd" * 16))
+
+
+
+class DaemonLockTest(unittest.TestCase):
+    """A second daemon on an rnfs dir another daemon holds (its daemon.lock) stops before touching anything."""
+
+    def test_second_daemon_stops_at_once(self):
+        """With the lock held, `rnfs daemon` exits with an error naming the holder, before writing state or
+        rotating the debug log."""
+        from rnfs.config import Config
+        from rnfs.node import _make_private_dirs
+        from tests.test_fsutil import hold_lock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rnfs_dir = os.path.join(tmp.name, "rnfs")
+        _make_private_dirs(Config(rnfs_dir=rnfs_dir))  # as the first daemon left it
+        debug_log = os.path.join(rnfs_dir, "debug.log")
+        with open(debug_log, "w", encoding="utf-8") as f:
+            f.write("the first daemon's log\n")
+        holder = hold_lock(os.path.join(rnfs_dir, cli.LOCK_FILE))
+        try:
+            result = subprocess.run([sys.executable, "rnfs.py", "--dir", rnfs_dir, "--api-port", str(free_port()),
+                                     "daemon", "--gateway-port", str(free_port()), "--debug-log"],
+                                    cwd=ROOT, capture_output=True, timeout=60, encoding="utf-8", errors="replace")
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"another rnfs daemon (process {holder.pid}) is using", result.stderr)
+        with open(debug_log, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "the first daemon's log\n")
+        self.assertFalse(os.path.exists(debug_log + ".1"))
+        self.assertFalse(os.path.exists(os.path.join(rnfs_dir, "state", "rnfs.db")))
 
 
 if __name__ == "__main__":

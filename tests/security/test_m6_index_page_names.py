@@ -43,7 +43,7 @@ class SealedNamesTest(unittest.TestCase):
         """One offline node with an identity (so it can seal to itself)."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.node, _ = helpers.make_nodes(self.tmp.name)
+        _, self.node, _ = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.node.stop)
         helpers.give_identity(self.node)
 

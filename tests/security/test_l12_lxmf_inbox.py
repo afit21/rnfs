@@ -126,7 +126,9 @@ class InboxFloodTest(test_lxmf.FeatureTestCase):
         self.assertTrue(book.has(CONTACT, "lxmf"))  # carol2 still names it
         book.add("carol2", EARLY.hex(), kind="lxmf")  # replaced
         self.assertFalse(book.has(CONTACT, "lxmf"))
-        self.assertTrue(ContactsFeature(self.b).has(EARLY, "lxmf"))  # loaded from contacts.json
+        again = ContactsFeature(self.b)
+        self.addCleanup(again.close)
+        self.assertTrue(again.has(EARLY, "lxmf"))  # loaded from the saved contacts
 
 
 if __name__ == "__main__":

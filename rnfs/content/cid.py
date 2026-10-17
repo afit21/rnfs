@@ -30,12 +30,15 @@ class Cid:
     Every constructor raises ValueError for anything that isn't a valid CID.
     """
 
-    __slots__ = ("binary", "codec")
+    # _text and _key memoise str() and .key, computed on first use (a CID never changes)
+    __slots__ = ("binary", "codec", "_text", "_key")
 
     def __init__(self, binary: bytes):
         """Use from_bytes; this assumes binary is already known to be valid."""
         self.binary = binary
         self.codec = RAW if len(binary) == len(_PREFIXES[RAW]) + _DIGEST_LENGTH else DAG
+        self._text = None
+        self._key = None
 
     @classmethod
     def from_bytes(cls, binary) -> "Cid":
@@ -76,10 +79,13 @@ class Cid:
     @property
     def key(self) -> bytes:
         """DHT key: SHA-256 of the whole binary CID, truncated to the 128-bit node ID space."""
-        return hashlib.sha256(self.binary).digest()[:ID_LENGTH]
+        if self._key is None:
+            self._key = hashlib.sha256(self.binary).digest()[:ID_LENGTH]
+        return self._key
 
     @property
     def is_raw(self) -> bool:
+        """True for a raw block's CID."""
         return self.codec == RAW
 
     def verify(self, block: bytes) -> bool:
@@ -87,7 +93,9 @@ class Cid:
         return hashlib.sha256(block).digest() == self.digest
 
     def __str__(self) -> str:
-        return "b" + base64.b32encode(self.binary).decode("ascii").lower().rstrip("=")
+        if self._text is None:
+            self._text = "b" + base64.b32encode(self.binary).decode("ascii").lower().rstrip("=")
+        return self._text
 
     def __repr__(self) -> str:
         return f"Cid({self})"

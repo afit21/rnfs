@@ -1,6 +1,8 @@
 """Tests for RnfsNode's facade and backend (rnfs/node.py), on offline nodes with a fake network client."""
+import hashlib
 import io
 import os
+import random
 import shutil
 import stat
 import tempfile
@@ -12,17 +14,17 @@ from unittest import mock
 import RNS
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES
+from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES, K
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import remote_source
 from rnfs import fetcher
-from rnfs.errors import InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
+from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
-from rnfs import fsutil, node as node_module
+from rnfs import fsutil, node as node_module, statedb
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES, wait_for
+from tests.support import POSIX_MODES, failing_commits, state_rows, wait_for
 from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
@@ -289,6 +291,50 @@ class NetworkFacadeTest(NodeTest):
         self.assertEqual(self.b.pin_add(f"{cid}/sub")["cid"], self.a.info(f"{cid}/sub")["cid"])
         self.assertEqual(len(self.b.publisher.provided()), 1)
 
+    def test_read_file_is_info_and_read_in_one_fetch(self):
+        """read_file gives info()'s answer and read()'s bytes, cut to the file's size, from one fetch session."""
+        cid = self.a.add_path(self.tree())["cid"]
+        self.advertise(cid)
+        target = f"{cid}/big.bin"
+        sessions = []
+        fetching = self.b._fetching
+        with mock.patch.object(self.b, "_fetching", lambda *args, **kwargs: sessions.append(1) or fetching(*args,
+                                                                                                         **kwargs)):
+            info, chunks = self.b.read_file(target, offset=CHUNK_SIZE + 1, length=10)
+            self.assertEqual(b"".join(chunks), self.big[CHUNK_SIZE + 1:CHUNK_SIZE + 11])
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(info, self.b.info(target))
+            for offset, length in ((len(self.big) - 5, 100), (len(self.big) + 7, None), (0, 0)):
+                info, chunks = self.b.read_file(target, offset=offset, length=length)
+                self.assertEqual(b"".join(chunks), self.big[offset:] if length is None else
+                                 self.big[offset:offset + length])
+        with self.assertRaises(ValueError):
+            self.b.read_file(target, offset=-1)
+
+    def test_read_file_of_a_directory_reads_nothing(self):
+        """A directory's info comes back; reading it raises ValueError, and closing it unread ends the fetch."""
+        cid = self.a.add_path(self.tree())["cid"]
+        self.advertise(cid)
+        info, chunks = self.b.read_file(f"{cid}/sub")
+        self.assertEqual(info["type"], "directory")
+        with self.assertRaisesRegex(ValueError, "is a directory"):
+            next(chunks)
+        info, chunks = self.b.read_file(cid)
+        chunks.close()
+        self.assertEqual(self.b.storage._sessions, [])  # its protection session ended
+        with self.assertRaises(NotFound):
+            self.b.read_file(f"{cid}/missing")
+
+    def test_read_file_checks_the_deny_list_before_the_first_byte(self):
+        """A file whose hash is denied raises Denied at the first chunk, after its info."""
+        cid = self.a.add_stream(io.BytesIO(b"unwanted" * 100))["cid"]
+        self.advertise(cid)
+        self.b.deny.add(["sha256:" + hashlib.sha256(b"unwanted" * 100).hexdigest()])
+        info, chunks = self.b.read_file(cid)
+        self.assertEqual(info["size"], 800)
+        with self.assertRaises(Denied):
+            next(chunks)
+
     def test_invalid_root_reported(self):
         self.b.fetcher.mark_invalid(Cid.for_block(RAW, b"bad"))
         with self.assertRaises(InvalidDag):
@@ -323,8 +369,11 @@ class BackendTest(NodeTest):
         other = Cid.for_block(RAW, b"cached only")
         cached.put(other, b"cached only")
         self.assertIsNone(self.a.backend.served_block(other))
+        self.assertEqual(self.a.backend.served_block_size(cid), len(self.a.backend.served_block(cid)))
+        self.assertIsNone(self.a.backend.served_block_size(other))  # sizes only of what is served
         self.a.pin_rm(str(cid))
         self.assertIsNone(self.a.backend.served_block(cid))
+        self.assertIsNone(self.a.backend.served_block_size(cid))
 
     def test_damaged_block_not_served(self):
         cid = Cid.parse(self.a.add_stream(io.BytesIO(b"will be damaged"))["cid"])
@@ -476,11 +525,10 @@ class SecurityTest(NodeTest):
         cid = self.a.add_stream(io.BytesIO(b"cached"))["cid"]
         self.advertise(cid)
         b"".join(self.b.read(cid))
-        path = os.path.join(self.b.config.state_dir, "cache.json")
-        self.assertFalse(os.path.exists(path))  # not rewritten on every fetch
+        state = self.b.config.state_dir
+        self.assertEqual(state_rows(state, "SELECT target FROM cache"), [])  # not written on every fetch
         self.b.stop()
-        with open(path, encoding="utf-8") as f:
-            self.assertIn(cid, f.read())
+        self.assertEqual(state_rows(state, "SELECT target FROM cache"), [(Cid.parse(cid).binary,)])
 
     def test_remote_pin_quota_counts_dag_blocks(self):
         self.a.config.remote_pin_quota = 50_000
@@ -491,6 +539,18 @@ class SecurityTest(NodeTest):
         self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), True)
         self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
         self.assertEqual(self.a.storage.pins(), {})
+
+    def test_remote_pin_quota_counts_dag_blocks_already_stored(self):
+        """A DAG over the quota is refused even when this node already holds all of it (a user pin here)."""
+        self.a.config.remote_pin_quota = 50_000
+        cid = self.b.add_path(self.empty_files(400))["cid"]
+        self.b.records.store(Cid.parse(cid).key, B_ID)
+        self.a.routing.heard(B_ID)
+        self.a.pin_add(cid)
+        self.assertGreater(self.a.storage.dag_bytes(Cid.parse(cid)), 50_000)
+        self.a.backend.remote_pin(IDENTITY, Cid.parse(cid), True)
+        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY))))
+        self.assertEqual(self.a.storage.pins(), {Cid.parse(cid): {"user"}})
 
     def test_remote_pins_of_one_source_are_fetched_one_at_a_time(self):
         # Two DAGs of empty files, each within the quota but not both: fetched at once, each was checked
@@ -608,6 +668,20 @@ class RestartTest(NodeTest):
         node.stop()
         return self.make_node(name, node_id, **settings)
 
+    def test_failed_saves_dont_stop_stopping(self):
+        """Saves failing at stop (a full disk) are logged; the state database is still closed, and the node's
+        directory can be used again."""
+        node = self.make_node("full", N1)
+        failing = mock.Mock(side_effect=statedb.StateDbError("disk full"))
+        with mock.patch.object(node.records, "save", failing), mock.patch.object(node.publisher, "save", failing), \
+                mock.patch.object(node.names, "_save", failing), mock.patch("rnfs.node.log") as log:
+            node.stop()
+        self.assertGreaterEqual(failing.call_count, 3)
+        self.assertEqual(sum("saving state failed" in call.args[0] for call in log.call_args_list), 3)
+        self.assertIsNone(node._db._database)
+        self.assertIsNone(node.storage._db._database)
+        self.make_node("full", N1).stop()
+
     def test_deleted_name_key_releases_its_pin_at_startup(self):
         for strategy in ("roots", "pinned"):
             with self.subTest(strategy=strategy):
@@ -640,6 +714,96 @@ class RestartTest(NodeTest):
         with mock.patch.object(self.a.storage, "cached_targets", cached_targets):
             self.a._prune_fetched()
         self.assertEqual(held, [True])
+
+    def test_fetched_targets_are_saved_with_the_state_and_kept_at_a_restart(self):
+        cid = self.a.add_stream(io.BytesIO(b"fetched for the user"))["cid"]
+        self.advertise(cid)
+        self.b.get(cid, os.path.join(self.tmp.name, "out"))
+        state = self.b.config.state_dir
+        self.assertEqual(state_rows(state, "SELECT cid FROM fetched"), [])  # not written on each fetch, under the
+        self.b._save_state()  # node's lock, but by the next state save (maintenance, gc and stop)
+        self.assertEqual(state_rows(state, "SELECT cid FROM fetched"), [(Cid.parse(cid).binary,)])
+        self.b = self.restart(self.b, "b", B_ID)
+        self.assertEqual(self.b._eligible_targets(), {Cid.parse(cid)})
+        self.assertIn(Cid.parse(cid), self.b.publisher.provided())
+
+    def test_failed_fetched_save_is_tried_again(self):
+        target = Cid.for_block(RAW, b"target")
+        self.b._note_fetched(target)
+        with failing_commits("database or disk is full"):
+            with self.assertRaises(OSError):
+                self.b._save_fetched()
+        self.b._save_fetched()
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM fetched"), [(target.binary,)])
+        # Only the change is written: one forgotten target is one row deleted
+        self.b._note_fetched(Cid.for_block(RAW, b"other"))
+        self.b._save_fetched()
+        with self.b._lock:
+            self.b._fetched.discard(target)
+            self.b._fetched_dirty = True
+        self.b._save_fetched()
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM fetched"),
+                         [(Cid.for_block(RAW, b"other").binary,)])
+
+
+class MakeRoomTest(NodeTest):
+    """Eviction for room, as each stored response batch asks for."""
+
+    def test_fetched_targets_are_pruned_only_when_cache_records_went(self):
+        cid = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(5000)), pin=False)["cid"])  # a cached fetch
+        with mock.patch.object(self.a, "_prune_fetched", wraps=self.a._prune_fetched) as prune:
+            self.a._make_room(0)  # within max_storage: nothing evicted
+            prune.assert_not_called()
+            self.a.storage.max_storage = 1
+            self.a._make_room(0)
+            prune.assert_called_once()
+            self.a._make_room(0)  # over max_storage still, but with nothing left to evict
+            prune.assert_called_once()
+        self.assertEqual(self.a._eligible_targets(), set())
+        self.assertFalse(self.a.storage.has(cid))
+
+
+class LookupStartTest(NodeTest):
+    """Where the node's lookups start."""
+
+    def test_nodes_that_failed_start_lookups_only_to_make_up_k(self):
+        rng = random.Random(7)
+        others = [bytes(rng.getrandbits(8) for _ in range(16)) for _ in range(K)]
+        for node_id in others:
+            self.assertTrue(self.b.routing.heard(node_id))
+        failed = others[0]
+        self.b.routing.failed(failed)  # the closest node to its own ID, but no longer answering
+        start = self.b._lookup(failed)._start_nodes
+        self.assertNotIn(failed, start)
+        self.assertEqual(len(start), K)  # A and the others that haven't failed
+        self.b.routing.remove(others[1])
+        self.b.routing.remove(others[2])
+        start = self.b._lookup(failed)._start_nodes
+        self.assertIn(failed, start)  # fewer than K healthy: made up from the rest
+        self.assertEqual(len(start), K - 1)
+
+    def test_unreliable_nodes_start_lookups_only_to_make_up_k(self):
+        """A node whose queries keep failing, though it keeps announcing, starts lookups only after every other."""
+        rng = random.Random(8)
+        others = [bytes(rng.getrandbits(8) for _ in range(16)) for _ in range(K + 1)]
+        for node_id in others:
+            self.assertTrue(self.b.routing.heard(node_id))
+        dead = others[0]
+        for _ in range(self.b.config.max_failures):
+            self.b.routing.heard(dead)  # announces don't clear its failures
+            self.b.routing.failed(dead)
+        self.b.routing.heard(dead)
+        lookup = self.b._lookup(dead)
+        self.assertNotIn(dead, lookup._start_nodes)
+        self.assertEqual(len(lookup._start_nodes), K)
+        self.assertTrue(lookup.unreliable(dead))
+        for node_id in others[1:4]:
+            self.b.routing.remove(node_id)
+        start = self.b._lookup(dead)._start_nodes
+        self.assertEqual(start[-1], dead)  # fewer than K others: made up with it, last
+        self.assertEqual(len(start), K - 1)
+        self.b._answered(dead)
+        self.assertFalse(self.b.routing.unreliable(dead))
 
 
 class JoinTest(NodeTest):

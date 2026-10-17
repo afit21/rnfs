@@ -33,6 +33,7 @@ class BlocksResult:
     unsent: list[Cid] = field(default_factory=list)  # not answered: cut by the batch size or budget, or not OK
     bad: list[Cid] = field(default_factory=list)  # blocks that didn't match their CID: ban the provider
     reason: str = ""  # why the request stalled or failed, for logs
+    elapsed: float | None = None  # seconds from sending the request to its answer, if OK (local, not on the wire)
 
 
 class PeerClient:
@@ -56,9 +57,13 @@ class PeerClient:
 
     def rate_estimate(self, node_id: bytes) -> float | None:
         """The rate estimate (bits/s) of the open link to node_id, or None."""
-        with self.links.lock:
-            peer = self.links.shared.get(node_id)
+        peer = self.links.shared_peer(node_id)
         return peer.rate if peer is not None else None
+
+    def link_mdu(self, node_id: bytes) -> int | None:
+        """The packet MDU of the open link to node_id, which bounds the requests sent on it, or None."""
+        peer = self.links.shared_peer(node_id)
+        return peer.mdu() if peer is not None and peer.is_active() else None
 
     def close(self, node_id: bytes):
         """Close the shared link to node_id, cancelling any transfer on it."""
@@ -159,7 +164,8 @@ class PeerClient:
 
     # /blocks
 
-    def blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None) -> BlocksResult:
+    def blocks(self, node_id: bytes, cids: list[Cid],
+               on_progress: Callable[[float], None] | None = None) -> BlocksResult:
         """_blocks(), counted in traffic (mesh): the outcome, verified bytes received and bad blocks."""
         result = self._blocks(node_id, cids, on_progress)
         if result.status != OK or result.blocks or result.missing or result.bad:
@@ -170,11 +176,11 @@ class PeerClient:
 
     def _interface(self, node_id: bytes) -> str | None:
         """The name of the interface the shared link to node_id runs over, or None."""
-        with self.links.lock:
-            peer = self.links.shared.get(node_id)
+        peer = self.links.shared_peer(node_id)
         return mesh.interface_label(getattr(getattr(peer, "link", None), "attached_interface", None))
 
-    def _blocks(self, node_id: bytes, cids: list[Cid], on_progress: Callable[[float], None] | None = None) -> BlocksResult:
+    def _blocks(self, node_id: bytes, cids: list[Cid],
+                on_progress: Callable[[float], None] | None = None) -> BlocksResult:
         """Ask node_id for blocks over its shared link, verifying each against its CID.
 
         Sends as many of cids (duplicates dropped) as fit one packet; the rest come back in .unsent.
@@ -204,8 +210,9 @@ class PeerClient:
             self.links.close_link(peer)
             return BlocksResult(STALLED, unsent=wanted, reason=exchange.stalled)
         if exchange.cancelled:
-            # The responder gave the slot to another request or ran out of time: like a refusal, not a stall
-            log(f"{name} cancelled its /blocks response", LOG_VERBOSE)
+            # The responder gave the slot to another request or ran out of time, or the transfer was lost in
+            # transit: like a refusal, not a stall
+            log(f"{name}'s /blocks response stopped arriving (cancelled by it, or lost in transit)", LOG_VERBOSE)
             return BlocksResult(BUSY, unsent=wanted, reason="cancelled")
         if not exchange.answered:
             log(f"no answer from {name} to /blocks", LOG_VERBOSE)
@@ -221,7 +228,10 @@ class PeerClient:
 
         if peer.record_rate(exchange, self.config.min_rate_sample):
             log(f"link to {name} measured at {size(peer.rate / 8)}/s", LOG_VERBOSE)
-        return self._check_blocks(name, batch, entries, rest)
+        result = self._check_blocks(name, batch, entries, rest)
+        # From when it was sent: not opening the link or waiting for its /blocks slot
+        result.elapsed = max(0.0, self.links.clock() - exchange.sent_at)
+        return result
 
     def _stall_watchdog(self, rate: float | None) -> Callable[[Exchange, float], str | None]:
         """Stall test for a /blocks response on a link with this rate estimate (section 7, step 5)."""

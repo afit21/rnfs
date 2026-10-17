@@ -16,6 +16,8 @@ from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
 DEFAULT_API_PORT = 8788
 DEFAULT_GATEWAY_PORT = 8789
 SETTINGS_FILE = "rnfs.toml"
+# In the rnfs dir, locked by the daemon or embedded node using it (node.lock_rnfs_dir), so a second can't start
+LOCK_FILE = "daemon.lock"
 
 # Core settings' types and ranges, checked by Config.validate (feature settings are checked by their features)
 WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free port (printed at start)
@@ -36,7 +38,7 @@ DURATIONS = {  # seconds: name → True if it must be above 0 (else 0 is allowed
 OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset (None)
 # Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
 MAX_DURATION = 30 * DAY
-FLAGS = ("private", "gateway_scripts", "default_bootstrap")
+FLAGS = ("private", "gateway_scripts", "default_bootstrap", "debug_log")
 IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
 _HEX_ID = re.compile(r"[0-9a-fA-F]{32}")
 
@@ -59,6 +61,7 @@ class Config:
     bootstrap_nodes: list[str] = field(default_factory=list)  # node IDs (hex) contacted first when joining
     default_bootstrap: bool = True  # also contact DEFAULT_BOOTSTRAP_NODES when joining (never in private mode)
     verbosity: int = 0  # added to Reticulum's loglevel: 1 shows per-query detail, 2 shows RNS debug output
+    debug_log: bool = False  # the daemon also writes <rnfs dir>/debug.log, every message at every level (debuglog.py)
 
     slow: str = "auto"  # "yes", "no" or "auto" (section 2)
     slow_bitrate: float = 100_000
@@ -125,6 +128,8 @@ class Config:
     lxmf_accept_from: list[str] = field(default_factory=list)  # LXMF addresses (hex); empty: everyone
     lxmf_auto_fetch_from: list[str] = field(default_factory=list)  # senders whose links are fetched and pinned
     lxmf_auto_fetch_quota: int = 1 * GIB  # per sender in lxmf_auto_fetch_from
+    # --- deny lists (rnfs/features/deny.py) ---
+    deny_lists: list[str] = field(default_factory=list)  # deny-list sources: <cid>[/path] or name/<name>[/path]
 
     # Paths
 
@@ -213,6 +218,9 @@ class Config:
         # lxmf
         from rnfs.features import lxmf  # here, like mesh: only needed once settings are checked
         lxmf.validate_settings(self)
+        # deny lists
+        from rnfs.features import deny
+        deny.validate_settings(self)
         for slow_node in (False, True):
             if self.effective_republish_interval(slow_node) >= PROVIDER_TTL / 2:
                 raise ValueError("republish_interval must be less than PROVIDER_TTL / 2")
@@ -259,9 +267,10 @@ class Config:
             raise ValueError("reticulum_dir must be a directory path")
 
     @classmethod
-    def load(cls, rnfs_dir: str = "~/.rnfs/", **overrides) -> "Config":
-        """Settings from `<rnfs_dir>/rnfs.toml` if it exists, then overrides (None values ignored), validated."""
-        values: dict = {}
+    def load(cls, rnfs_dir: str = "~/.rnfs/", defaults: dict | None = None, **overrides) -> "Config":
+        """Settings from `<rnfs_dir>/rnfs.toml` if it exists, then overrides (None values ignored), validated.
+        defaults (an embedded node's) apply where neither sets a value."""
+        values: dict = dict(defaults or {})
         path = os.path.join(os.path.expanduser(rnfs_dir), SETTINGS_FILE)
         if os.path.isfile(path):
             with open(path, "rb") as f:

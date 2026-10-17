@@ -8,9 +8,10 @@ return at once with --background); `rnfs jobs` lists, shows, waits for, cancels 
   fetcher.observing(): the fetch reports the verified size of what it fetches and each block it meets, and
   raises Cancelled at its next step (within fetcher.POLL) once the job is cancelled or the node stops.
   At most max_jobs run at once (2; 1 on slow nodes); queued jobs start oldest first.
-- Jobs are saved to <state>/jobs.json (atomically) at every state change and with the node's periodic
-  saves. At startup, jobs that were queued or running are queued again and resume where they stopped,
-  since blocks already stored are never fetched again.
+- Jobs are saved in the state database's jobs table (rnfs.statedb), durably, at every state change and with
+  the node's periodic saves (keeping a running job's progress recent); each save writes only the jobs changed
+  since the last. At startup, jobs that were queued or running are queued again and resume where they
+  stopped, since blocks already stored are never fetched again.
 - Resuming needs those blocks to stay stored: a fetch's own protection session ends with the fetch, after
   which a get's or export's blocks are evictable cache and a pin's are unreferenced. So while a job is queued
   or running, this feature holds a protection session on its root, which keeps everything stored below it
@@ -45,7 +46,6 @@ from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 
 NAME = "jobs"
-JOBS_FILE = "jobs.json"
 KINDS = ("get", "pin", "export")
 QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
 STATES = (QUEUED, RUNNING, DONE, FAILED, CANCELLED)
@@ -164,7 +164,7 @@ class Job:
         return {**self.to_record(), "state": self.state, "rate": rate, "eta": eta}
 
     def to_record(self) -> dict:
-        """The job as saved in jobs.json (a running job is saved as such, and queued again when loaded)."""
+        """The job as saved (a running job is saved as such, and queued again when loaded)."""
         return {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
                 "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht,
                 "state": self.state, "created": self.created, "started": self.started,
@@ -174,7 +174,7 @@ class Job:
 
     @classmethod
     def from_record(cls, record) -> "Job":
-        """A job from a jobs.json record. Raises ValueError if anything in it is malformed."""
+        """A job from a saved record. Raises ValueError if anything in it is malformed."""
         if not isinstance(record, dict):
             raise ValueError("not an object")
         job_id, kind, target = record.get("id"), record.get("kind"), record.get("target")
@@ -218,7 +218,7 @@ def _count(value, default):
 
 
 def _capped(result: dict) -> dict:
-    """result with at most log.MAX_WARNINGS warnings (and a count of the rest), so jobs.json stays small."""
+    """result with at most log.MAX_WARNINGS warnings (and a count of the rest), so saved jobs stay small."""
     from rnfs import log
     warnings = result.get("warnings")
     # node.get caps its own (adding warnings_total); this covers results saved before it did
@@ -252,6 +252,27 @@ def check_job_params(kind: str, target, output, from_node, sealed_name=False, fa
             raise ValueError(f"only get jobs take {name}")
 
 
+def import_jobs(value: dict, tx) -> int:
+    """Import jobs.json (statedb.migrate): its jobs, in order, replace the jobs table, each checked as rnfs 0.1.4
+    loaded it (a malformed one is logged and skipped; of a repeated id, the first is kept) and saved as
+    Job.to_record() gives it. Returns the number imported."""
+    from rnfs import statedb
+    tx.execute("DELETE FROM jobs")
+    ids: set[str] = set()
+    for record in value.get("jobs", []):
+        try:
+            job = Job.from_record(record)
+            if job.id in ids:
+                continue
+            tx.execute("INSERT INTO jobs (id, position, record) VALUES (?, ?, ?)",
+                       (job.id, len(ids), statedb.dump(job.to_record())))
+        except (ValueError, TypeError, OverflowError) as e:
+            _log(f"ignoring a saved job ({e})", LOG_WARNING)
+            continue
+        ids.add(job.id)
+    return len(ids)
+
+
 def check_job_id(text) -> str:
     """text if it is a job ID (8 hex characters), else ValueError."""
     if not isinstance(text, str) or not _JOB_ID.fullmatch(text):
@@ -266,6 +287,7 @@ class JobsFeature(Feature):
 
     def __init__(self, node):
         """Load saved jobs, queueing again those that hadn't finished and protecting their blocks."""
+        from rnfs import statedb
         super().__init__(node)
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()  # keeps saves in order without holding _lock while writing
@@ -274,8 +296,16 @@ class JobsFeature(Feature):
         self._started = False
         self._dirty = False  # jobs changed since the last save
         self._stop_event = threading.Event()
-        self._path = os.path.join(node.config.state_dir, JOBS_FILE)
-        self._load()
+        # What the jobs table holds: id -> (position, dump()ed record); and the next new job's position (after
+        # every one saved). Both used under _save_lock only
+        self._saved: dict[str, tuple[int, str]] = {}
+        self._position = 0
+        self._db = statedb.connect(node.config.state_dir)
+        try:
+            self._load()
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def max_jobs(self) -> int:
@@ -286,17 +316,22 @@ class JobsFeature(Feature):
     # Persistence
 
     def _load(self):
-        """Read jobs.json, skipping malformed records."""
-        from rnfs.content.storage import read_json, shaped
-        value = read_json(self._path, shaped("jobs", list)) or {}
-        for record in value.get("jobs", []):
+        """Read the jobs table, oldest first; a malformed row is logged and deleted."""
+        from rnfs import statedb
+        bad = []
+        for job_id, position, text in self._db.query("SELECT id, position, record FROM jobs ORDER BY position"):
             try:
-                job = Job.from_record(record)
+                if not isinstance(position, int):
+                    raise TypeError("bad position")
+                self._position = max(self._position, position + 1)
+                job = Job.from_record(statedb.load(text))
+                if job.id != job_id:
+                    raise ValueError("its id isn't its row's")
             except (ValueError, TypeError, OverflowError) as e:
                 _log(f"ignoring a saved job ({e})", LOG_WARNING)
+                bad.append((job_id,))
                 continue
-            if job.id in self._jobs:
-                continue
+            self._saved[job.id] = (position, text)
             if job.state in ACTIVE:
                 job.state = QUEUED  # interrupted: it resumes once the node runs
                 job.stop_event = self._stop_event
@@ -308,23 +343,40 @@ class JobsFeature(Feature):
         resumed = sum(1 for job in self._jobs.values() if job.state == QUEUED)
         if resumed:
             _log(f"{resumed} unfinished job(s) will resume")
+        if bad:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM jobs WHERE id = ?", bad)
 
     def save(self):
-        """Write jobs.json if jobs changed or one runs (the node calls this periodically, keeping saved
-        progress recent)."""
-        from rnfs.content.storage import write_json
+        """Save the jobs changed since the last save, and forget those gone, durably, if jobs changed or one runs
+        (the node calls this periodically, keeping saved progress recent)."""
+        from rnfs import statedb
         with self._save_lock:
             with self._lock:
                 if not self._dirty and not any(job.state == RUNNING for job in self._jobs.values()):
                     return
-                value = {"jobs": [job.to_record() for job in self._jobs.values()]}
+                records = [(job_id, statedb.dump(job.to_record())) for job_id, job in self._jobs.items()]
                 self._dirty = False
+            saved, position, rows = {}, self._position, []
+            for job_id, text in records:
+                old = self._saved.get(job_id)
+                if old is None:
+                    old = (position, None)
+                    position += 1
+                if old[1] != text:
+                    rows.append((job_id, old[0], text))
+                saved[job_id] = (old[0], text)
+            gone = [(job_id,) for job_id in self._saved if job_id not in saved]
             try:
-                write_json(self._path, value)
+                if rows or gone:
+                    with self._db.transaction(durable=True) as tx:  # a queued job must survive a crash
+                        tx.executemany("DELETE FROM jobs WHERE id = ?", gone)
+                        tx.executemany("INSERT OR REPLACE INTO jobs (id, position, record) VALUES (?, ?, ?)", rows)
             except BaseException:
                 with self._lock:
                     self._dirty = True
                 raise
+            self._saved, self._position = saved, position
 
     def _save_quietly(self):
         """save() after a change, logging rather than raising: a job's outcome mustn't be lost to a full disk."""
@@ -333,7 +385,11 @@ class JobsFeature(Feature):
         try:
             self.save()
         except OSError as e:
-            _log(f"saving {self._path} failed: {e!r}", LOG_ERROR)
+            _log(f"saving the jobs failed: {e!r}", LOG_ERROR)
+
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        self._db.close()
 
     def _cap_finished(self):
         """Forget the oldest finished jobs beyond max_finished_jobs (lock held, or before any thread runs).
@@ -341,7 +397,7 @@ class JobsFeature(Feature):
         Jobs finished less than FINISHED_GRACE ago stay regardless: the CLI following a job (or a script
         running `rnfs jobs wait`) asks for it after it ends, and a small cap mustn't make it vanish first.
         """
-        limit = getattr(self.node.config, "max_finished_jobs", 100)
+        limit = self.node.config.max_finished_jobs
         finished = [job for job in self._jobs.values() if job.state in FINISHED]
         finished.sort(key=lambda job: job.finished or job.created)
         recent = time.time() - FINISHED_GRACE
@@ -387,7 +443,7 @@ class JobsFeature(Feature):
         try:
             self.save()  # only if something changed: offline test nodes with no jobs write nothing
         except OSError as e:
-            _log(f"saving {self._path} failed: {e!r}", LOG_ERROR)
+            _log(f"saving the jobs failed: {e!r}", LOG_ERROR)
 
     def status(self) -> dict:
         """Running and queued job counts for `rnfs status`."""
@@ -395,12 +451,12 @@ class JobsFeature(Feature):
             states = [job.state for job in self._jobs.values()]
         return {"jobs_running": states.count(RUNNING), "jobs_queued": states.count(QUEUED)}
 
-    def _schedule(self):
-        """Start queued jobs, oldest first, while fewer than max_jobs run."""
+    def _schedule(self) -> bool:
+        """Start queued jobs, oldest first, while fewer than max_jobs run; True if any started (and were saved)."""
         starting = []
         with self._lock:
             if not self._started or self._stop_event.is_set():
-                return
+                return False
             running = sum(1 for job in self._jobs.values() if job.state == RUNNING)
             for job in self._jobs.values():
                 if running >= self.max_jobs:
@@ -416,6 +472,7 @@ class JobsFeature(Feature):
             thread.start()
         if starting:
             self._save_quietly()
+        return bool(starting)
 
     def _run(self, job: Job):
         """Run a job to its end on this thread, then start the next."""
@@ -476,13 +533,15 @@ class JobsFeature(Feature):
     def _fetch_to(self, job: Job, path: str) -> dict:
         """node.get of the job's target to path: from its from node, then (fallback_dht) by DHT discovery."""
         from rnfs import fetcher
-        from rnfs.errors import RnfsError, StorageFull, TooLarge
+        from rnfs.errors import Denied, RnfsError, StorageFull, TooLarge
         from_node = bytes.fromhex(job.from_node) if job.from_node else None
         try:
             return self.node.get(job.target, path, from_node=from_node)
         except RnfsError as e:
-            # Cancelled must stop the job; the content's size and the node's storage don't depend on the source
-            if from_node is None or not job.fallback_dht or isinstance(e, (fetcher.Cancelled, TooLarge, StorageFull)):
+            # Cancelled must stop the job; the content's size, the node's storage and its deny list don't depend
+            # on the source
+            if from_node is None or not job.fallback_dht or isinstance(e, (fetcher.Cancelled, TooLarge, StorageFull,
+                                                                           Denied)):
                 raise
             _log(f"job {job.id}: getting {job.target} from {job.from_node} failed ({e}); trying the DHT",
                  LOG_NOTICE)
@@ -516,8 +575,8 @@ class JobsFeature(Feature):
         if state in FINISHED:
             job.ended.set()
             _log(f"job {job.id} ({job.kind} {job.target}) {state}" + (f": {error}" if error else ""))
-        self._save_quietly()
-        self._schedule()
+        if not self._schedule():  # starting the next saves this outcome with it
+            self._save_quietly()
 
     # Operations (API)
 
@@ -551,8 +610,8 @@ class JobsFeature(Feature):
             self._protect(job)
             self._jobs[job_id] = job
         _log(f"job {job_id} queued: {kind} {target}" + (f" to {output}" if output else ""))
-        self._save_quietly()
-        self._schedule()
+        if not self._schedule():  # else saved as it started
+            self._save_quietly()
         return job.to_dict()
 
     def _job(self, job_id: str) -> Job:

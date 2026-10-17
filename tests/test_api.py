@@ -18,7 +18,7 @@ from unittest import mock
 from rnfs import cli, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content.cid import DAG, RAW, Cid
-from rnfs.errors import Busy, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
+from rnfs.errors import Busy, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from tests.support import wait_for
 
 LocalServer.poll_interval = 0.01  # so each test's server stops at once
@@ -217,6 +217,24 @@ class FakeNode:
                 yield data[i:i + self.piece]
         return pieces()
 
+    def read_file(self, target, offset=0, length=None, from_node=None, raw=False):
+        """info() and read() of target in one call, as RnfsNode.read_file: (info, its bytes cut to its size)."""
+        self.record("read_file", target, offset=offset, length=length, from_node=from_node,
+                    **self._given("read_file", raw=raw))
+        cid = self._resolve(target)
+        obj = self.objects[cid]
+        info = {"cid": cid, "type": "file" if obj[0] == "file" else "directory", "size": self._size(cid),
+                "executable": obj[0] == "file" and obj[2]}
+
+        def pieces():
+            """The bytes, piece by piece, once asked for."""
+            if obj[0] != "file":
+                raise ValueError(f"{target} is a directory")
+            data = obj[1][offset:] if length is None else obj[1][offset:offset + length]
+            for i in range(0, len(data), self.piece):
+                yield data[i:i + self.piece]
+        return info, pieces()
+
     def ls(self, target, for_gateway=False):
         self.record("ls", target, for_gateway=for_gateway)
         cid = self._resolve(target)
@@ -237,6 +255,19 @@ class FakeNode:
         self.record("is_local", target)
         path = self._path(target)
         return not (set(path) | self._dag(path[-1])) & self.remote
+
+    def stored_head(self, target, length):
+        """A file's first length bytes if it and its path are stored, else None (a directory or a bad target
+        too), as RnfsNode.stored_head. Never fetches."""
+        self.record("stored_head", target, length)
+        try:
+            path = self._path(target)
+        except (ValueError, NotFound):
+            return None
+        obj = self.objects.get(path[-1])
+        if set(path) & self.remote or obj is None or obj[0] != "file":
+            return None
+        return obj[1][:length]
 
     def dir_set(self, target, name, child_cid, executable=False):
         self.record("dir_set", target, name, child_cid, executable=executable)
@@ -480,13 +511,68 @@ class SecurityTest(ApiTestCase):
             self.assertIsNone(headers[cli.PROOF_HEADER], bad)
         self.assertIsNone(self.call("GET", "/api/status", api=False)[1][cli.PROOF_HEADER])
 
+    def test_proof_connection_kept_for_one_request(self):
+        # A proof request asking for keep-alive keeps its connection for the client's request, then closes it
+        challenge = "0123456789abcdef" * 2
+        connection = http.client.HTTPConnection("127.0.0.1", self.port)
+        self.addCleanup(connection.close)
+        connection.connect()
+        connection.auto_open = 0  # a closed connection fails rather than being opened again
+        host = f"127.0.0.1:{self.port}"
+        connection.request("GET", "/api/status", headers={"Host": host, cli.CHALLENGE_HEADER: challenge,
+                                                          "Connection": "keep-alive"})
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.getheader("Connection"), "keep-alive")
+        self.assertIsNotNone(connection.sock)
+        # A second proof on it isn't kept open again: one request follows a proof, no more
+        connection.request("GET", "/api/status", headers={"Host": host, cli.CHALLENGE_HEADER: challenge,
+                                                          "Connection": "keep-alive", "X-Rnfs-Api": self.server.token})
+        response = connection.getresponse()
+        self.assertEqual(json.loads(response.read())["node_id"], self.node.status()["node_id"])
+        self.assertIsNone(response.getheader("Connection"))
+        self.assertIsNone(connection.sock)
+        # Without a valid challenge, or asking to close, the connection closes after its one request
+        for headers in ({"Connection": "keep-alive"}, {cli.CHALLENGE_HEADER: "zz" * 16, "Connection": "keep-alive"},
+                        {cli.CHALLENGE_HEADER: challenge}, {cli.CHALLENGE_HEADER: challenge, "Connection": "close"}):
+            status, response_headers, _ = self.call("GET", "/api/status", headers=headers, api=False)
+            self.assertEqual(status, 200)
+            self.assertNotEqual(response_headers["Connection"], "keep-alive", headers)
+
     def test_http_0_9_is_refused_with_headers(self):
-        # http.server would answer HTTP/0.9 with a bare body; every answer here has a status line and headers
+        """http.server would answer HTTP/0.9 with a bare body; every answer here has a status line and the API's
+        headers."""
         for line in (b"GET /api/status\r\n", b"GET /api/status HTTP/0.9\r\n", b"GARBAGE\r\n"):
             with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
                 sock.sendall(line + f"Host: 127.0.0.1:{self.port}\r\n\r\n".encode())
                 data, _ = read_until_closed(sock)
             self.assertTrue(data.startswith(b"HTTP/1.0 400 "), (line, data[:80]))
+            self.assert_api_headers(data)
+
+    def test_http_server_errors_carry_the_headers(self):
+        """http.server's own error pages (501 for an unknown method, 414, 431) carry no-store and nosniff, as the
+        API's own responses do, each once."""
+        host = f"Host: 127.0.0.1:{self.port}\r\n".encode()
+        for request, status in ((b"OPTIONS /api/gc HTTP/1.1\r\n" + host, b"501"),
+                                (b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\n" + host, b"414"),
+                                (b"GET /api/status HTTP/1.1\r\n" + host + b"X-A: b\r\n" * 101, b"431")):
+            with self.subTest(status=status), socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+                sock.sendall(request + b"\r\n")
+                data, _ = read_until_closed(sock)
+                self.assertTrue(data.startswith(b"HTTP/1.0 " + status + b" "), data[:80])
+                self.assert_api_headers(data)
+        _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: "ab" * 16})
+        self.assertEqual(headers.get_all("Cache-Control"), ["no-store"])
+        self.assertEqual(headers.get_all("X-Content-Type-Options"), ["nosniff"])
+        self.assertEqual(len(headers.get_all(cli.PROOF_HEADER)), 1)
+
+    def assert_api_headers(self, response: bytes):
+        """The raw response carries Cache-Control: no-store and nosniff once each, and no CORS header."""
+        lines = response.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]
+        headers = [tuple(part.strip().lower() for part in line.split(b":", 1)) for line in lines]
+        self.assertEqual([value for name, value in headers if name == b"cache-control"], [b"no-store"])
+        self.assertEqual([value for name, value in headers if name == b"x-content-type-options"], [b"nosniff"])
+        self.assertFalse([name for name, _ in headers if name.startswith(b"access-control")])
 
     def test_no_cors_headers(self):
         file_cid = self.node.put_file(b"x")
@@ -584,8 +670,8 @@ class EndpointTest(ApiTestCase):
         self.assertEqual(self.call("GET", f"/api/cat?target={cid}&offset=12&length=5")[2], b"23456")
         self.assertEqual(self.call("GET", f"/api/cat?target={cid}&offset=48")[2], b"89")
         self.assertEqual(self.call("GET", f"/api/cat?target={cid}&offset=60")[2], b"")
-        self.assertEqual(self.node.called("read")[1], ((cid,), {"offset": 12, "length": 5, "for_gateway": False,
-                                                               "from_node": None}))
+        self.assertEqual(self.node.called("read_file")[1], ((cid,), {"offset": 12, "length": 5, "from_node": None}))
+        self.assertEqual(self.node.called("info") + self.node.called("read"), [])  # one fetch per request
         self.assertEqual(self.call("GET", f"/api/cat?target={cid}&offset=-1")[0], 400)
         self.assertEqual(self.call("GET", f"/api/cat?target={cid}&length=x")[0], 400)
         directory = self.node.put_dir({"a": cid})
@@ -599,7 +685,7 @@ class EndpointTest(ApiTestCase):
         def failing(*args, **kwargs):
             yield b"x" * 10
             raise NotFound("provider vanished")
-        self.node.read = failing
+        self.node.read_file = lambda *args, **kwargs: ({"type": "file", "size": 100, "cid": cid}, failing())
         logged = mock.patch("rnfs.api.log")
         logged.start()
         self.addCleanup(logged.stop)
@@ -642,7 +728,7 @@ class EndpointTest(ApiTestCase):
     def test_error_mapping(self):
         file_cid = self.node.put_file(b"abc")
         for error, status in ((ValueError("v"), 400), (NotFound("n"), 404), (TooLarge("t"), 413),
-                              (InvalidDag("i"), 422), (Busy("b"), 503), (StorageFull("s"), 507),
+                              (Denied("d"), 451), (InvalidDag("i"), 422), (Busy("b"), 503), (StorageFull("s"), 507),
                               (RnfsError("r"), 500), (RuntimeError("boom"), 500)):
             with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log"):
                 code, headers, data = self.call("GET", f"/api/stat?target={file_cid}")
@@ -823,8 +909,8 @@ class ConnectionTest(ApiTestCase):
             yield b"x"
             raise RuntimeError("boom")
         cid = self.node.put_file(b"0123456789")
-        with mock.patch.object(self.node, "info", return_value={"type": "file", "size": 10, "cid": cid}), \
-                mock.patch.object(self.node, "read", failing), mock.patch("rnfs.api.log") as log:
+        with mock.patch.object(self.node, "read_file", lambda *args, **kwargs: (
+                {"type": "file", "size": 10, "cid": cid}, failing())), mock.patch("rnfs.api.log") as log:
             with self.assertRaises(http.client.IncompleteRead):  # cut short, as the failure happened mid-stream
                 self.call("GET", f"/api/cat?target={cid}/%1b%5b2J%0a")
         (message, _), = [call.args for call in log.call_args_list]

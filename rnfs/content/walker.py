@@ -210,7 +210,8 @@ class SmallLeaves:
 
 
 def parse_target(text: str) -> tuple[Cid, list[str]]:
-    """The root CID and path names of a target "<cid>[/name...]" (one trailing slash allowed). ValueError if malformed."""
+    """The root CID and path names of a target "<cid>[/name...]" (one trailing slash allowed). ValueError if
+    malformed."""
     if not isinstance(text, str) or not text:
         raise ValueError("empty target")
     parts = text.split("/")
@@ -238,17 +239,23 @@ def size_of(expect: Expect, block: bytes) -> int:
 # Local operations, over a blocking get(expect) -> bytes that raises NotFound when a block is absent
 
 
+def step_name(expect: Expect, name: str, get: Get) -> Expect | None:
+    """The entry called name in the directory expect names, stepping through its index nodes; None if there is
+    no such name (or expect is a file)."""
+    while True:
+        child = step(expect, get(expect), name)
+        if child is None or not is_index_step(child):
+            return child
+        expect = child
+
+
 def resolve(root: Cid, names: list[str], get: Get) -> Expect:
     """The expectation for the target <root>/<names...>. Raises NotFound if a name doesn't exist."""
     expect = root_expect(root)
     for i, name in enumerate(names):
-        while True:
-            child = step(expect, get(expect), name)
-            if child is None:
-                raise NotFound(f"{root}/{'/'.join(names[:i + 1])} does not exist")
-            expect = child
-            if not is_index_step(expect):
-                break
+        expect = step_name(expect, name, get)
+        if expect is None:
+            raise NotFound(f"{root}/{'/'.join(names[:i + 1])} does not exist")
     return expect
 
 
@@ -396,13 +403,13 @@ def _count(expect: Expect, get: Get, memo: dict[Expect, int], limit: int) -> int
     return total
 
 
-def height(expect: Expect, get: Get, limit: int | None = None) -> int:
+def height(expect: Expect, get: Get) -> int:
     """DAG nodes on the longest path from expect down (0 for a raw block), checking every DAG node met.
 
     Depth isn't checked against MAX_DEPTH, since measuring it is the point; the walk stops once the
-    height is known to exceed limit (default MAX_DEPTH), returning limit + 1.
+    height is known to exceed MAX_DEPTH, returning MAX_DEPTH + 1.
     """
-    limit = constants.MAX_DEPTH if limit is None else limit
+    limit = constants.MAX_DEPTH
     memo: dict[Expect, int] = {}
     truncated = False  # a node was reached more than limit nodes down: memoised heights may be short, but it's too deep
 
@@ -433,13 +440,38 @@ def unsafe_name_reason(name: str) -> str | None:
     return fsutil.unsafe_name_reason(name)  # in fsutil so the CLI can check names without loading RNS
 
 
-def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str]:
+def iter_files(expect: Expect, get: Get) -> Iterator[Expect]:
+    """The expectation of every file in a DAG (expect itself if it is a file), each distinct one once."""
+    block = get(expect)
+    if not isinstance(decode_checked(expect, block), (DirectoryNode, IndexNode)):
+        yield expect
+        return
+    seen: set[Expect] = set()
+    memo: dict[Expect, dag.Node] = {}
+    stack = [expect]
+    while stack:
+        directory = stack.pop()
+        for entry, child in _directory_entries(directory, get, memo):
+            if child in seen:
+                continue
+            seen.add(child)
+            if entry.kind == dag.KIND_DIRECTORY:
+                stack.append(child)
+            else:
+                yield child
+
+
+def write_out(expect: Expect, get: Get, dest: str, max_entries: int,
+              check: Callable[[Expect], None] | None = None) -> list[str]:
     """Write the file or directory expect names to dest, which must not exist yet. Returns warnings.
 
+    check(file expect), if given, runs before each file is created and may raise to stop the write-out (the
+    deny list's file hashes); what was written stays for the caller to remove.
+
     Entries whose names the local filesystem would read as a path, or can't represent (it refuses to create
-    them), are skipped and reported, as are names that collide on this filesystem (e.g. case-insensitive ones). Kind 1 entries
-    get the execute bit, except on Windows, which has none. Raises TooLarge after max_entries entries,
-    counting every occurrence, or after max_entries small chunks (SmallLeaves).
+    them), are skipped and reported, as are names that collide on this filesystem (e.g. case-insensitive ones).
+    Kind 1 entries get the execute bit, except on Windows, which has none. Raises TooLarge after max_entries
+    entries, counting every occurrence, or after max_entries small chunks (SmallLeaves).
     """
     if os.path.lexists(dest):
         raise ValueError(f"{dest} already exists")
@@ -450,6 +482,8 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
     block = get(expect)
     node = decode_checked(expect, block)
     if not isinstance(node, (DirectoryNode, IndexNode)):
+        if check is not None:
+            check(expect)
         with open(dest, "xb") as out:
             _write_file(expect, get, out, small, block)
         return warnings
@@ -470,6 +504,8 @@ def write_out(expect: Expect, get: Get, dest: str, max_entries: int) -> list[str
                 warnings.append(f"skipped {entry_shown!r}: {reason}")
                 continue
             path = os.path.join(where, entry.name)
+            if check is not None and entry.kind != dag.KIND_DIRECTORY:
+                check(child)
             try:
                 if entry.kind == dag.KIND_DIRECTORY:
                     os.mkdir(path)

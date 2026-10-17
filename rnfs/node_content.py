@@ -184,10 +184,13 @@ def stored_head(node, target: str, length: int) -> bytes | None:
 
 
 def block(node, cid: str, for_gateway: bool = False) -> bytes:
-    """A CID's own block, fetched if needed and re-verified."""
+    """A CID's own block, fetched if needed and re-verified. A raw block is a whole file, so the deny list's
+    file hashes apply to it (its digest is its content's SHA-256)."""
     root = Cid.parse(cid)
     with node._fetching(root, [], None, for_gateway) as fetch:
         expect = fetch.resolve()
+        if expect.cid.is_raw:
+            node._check_file(expect, fetch.read_range)  # never reads: a raw CID carries the hash
         data = node.storage.get(expect.cid, verify=True)
     if data is None:
         raise NotFound(f"block {cid} was damaged locally and has been deleted; try again")
@@ -196,13 +199,17 @@ def block(node, cid: str, for_gateway: bool = False) -> bytes:
 
 def export_stream(node, target: str, start: Callable[[int], BinaryIO | None], for_gateway: bool = False) -> dict:
     """Fetch the target's DAG, then write its archive to start(exact archive length): the stream to write to,
-    or None to write nothing (HEAD). Limits as for export: max_download_size, max_output_entries, and the DAG
-    byte bound of fetch_dag."""
+    or None to write nothing. Limits as for export: max_download_size, max_output_entries, and the DAG
+    byte bound of fetch_dag. Every file is checked against the deny list's file hashes before anything is sent,
+    as the gateway checks what it sends."""
     root, names = walker.parse_target(target)
     with node._fetching(root, names, None, for_gateway) as fetch:
         expect = fetch.resolve()
         fetch.fetch_dag(expect, node.config.max_output_entries)
         walker.count_entries(expect, fetch.get, node.config.max_output_entries)
+        if node.deny.hashes:
+            for file in walker.iter_files(expect, fetch.get):
+                node._check_file(file, lambda e: walker.read_range(e, fetch.get))
         blocks = node.storage.dag_blocks(expect.cid)
         length = archive.archive_size([expect.cid], ((cid, node.storage.block_size(cid) or 0) for cid in blocks))
         out = start(length)

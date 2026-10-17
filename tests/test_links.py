@@ -301,6 +301,33 @@ class LinkPoolTest(unittest.TestCase):
         peer = run(self, lambda: self.pool.get(NODE))
         self.assertFalse(run(self, lambda: self.pool.request(peer, "/find", b"k")).answered)
 
+    def test_request_outcomes_are_logged_with_the_reason(self):
+        FakeLink.responder = staticmethod(lambda link, path, data: [path, data])
+        peer = run(self, lambda: self.pool.get(NODE))
+        with mock.patch.object(links, "log") as logged:
+            run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        self.assertTrue(any("answered /find in" in call.args[0] and call.args[1] == links.LOG_DEBUG
+                            for call in logged.call_args_list), logged.call_args_list)
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        with mock.patch.object(links, "log") as logged:
+            run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        message = logged.call_args_list[-1].args[0]
+        self.assertIn("/find to", message)
+        self.assertIn("not answered after", message)
+
+    def test_close_reason_names_the_end_that_closed_the_link(self):
+        def link(initiator, reason):
+            """A closed link as RNS leaves it."""
+            return types.SimpleNamespace(initiator=initiator, teardown_reason=reason)
+
+        # RNS records the role of the end that closed it: for a link opened by the other node, the roles swap
+        self.assertEqual(links.close_reason(link(True, links.INITIATOR_CLOSED)), "closed by this node")
+        self.assertEqual(links.close_reason(link(True, links.DESTINATION_CLOSED)), "closed by the other node")
+        self.assertEqual(links.close_reason(link(False, links.INITIATOR_CLOSED)), "closed by the other node")
+        self.assertEqual(links.close_reason(link(False, links.DESTINATION_CLOSED)), "closed by this node")
+        self.assertEqual(links.close_reason(link(False, links.LINK_TIMEOUT)), "timed out")
+        self.assertEqual(links.close_reason(types.SimpleNamespace()), "closed")
+
     def test_request_gives_up_when_link_closes(self):
         FakeLink.responder = staticmethod(lambda link, path, data: SILENT)
         peer = run(self, lambda: self.pool.get(NODE))

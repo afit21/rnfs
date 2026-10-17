@@ -401,6 +401,7 @@ class ArchiveFuzzTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.storage = Storage(os.path.join(self.tmp, "blocks"), os.path.join(self.tmp, "state"), 10**9)
+        self.addCleanup(self.storage.close)
 
     def read(self, data: bytes) -> list | None:
         """Every record of the archive in data, or None if it is rejected (ValueError)."""
@@ -437,6 +438,7 @@ class ArchiveFuzzTest(unittest.TestCase):
                     unique_by=lambda entry: entry[0]), st.data())
     def test_round_trip_and_mutations(self, files, data):
         source = Storage(os.path.join(self.tmp, "source"), os.path.join(self.tmp, "source-state"), 10**9)
+        self.addCleanup(source.close)
         entries = sorted((Entry(name, builder.build_bytes(content, source.put).cid, len(content), 0)
                           for name, content in files), key=lambda entry: entry.name)
         root = builder.build_directory(entries, source.put).cid

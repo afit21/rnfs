@@ -41,7 +41,7 @@ class PinLsSealedTest(unittest.TestCase):
         """One offline node with an identity, and a provider it can fetch from."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        _, self.provider, self.node = helpers.make_nodes(self.tmp.name)
+        _, self.provider, self.node = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.provider.stop)
         self.addCleanup(self.node.stop)
         helpers.give_identity(self.node)

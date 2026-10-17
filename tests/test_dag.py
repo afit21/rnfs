@@ -122,6 +122,14 @@ class StrictDecodingTest(unittest.TestCase):
             with self.subTest(reason):
                 self.assertInvalid(block)
 
+    def test_rejects_every_truncation(self):
+        # str8, bin8 and uint64 headers, and fixarray, fixstr and fixint ones
+        block = pack([2, [["n" * 40, CHUNK.binary, 2**40, 0], ["o", NODE.binary, 7, 2]]])
+        dag.decode(block)
+        for end in range(len(block)):
+            with self.subTest(end=end):
+                self.assertInvalid(block[:end])
+
     def test_rejects_invalid_utf8(self):
         block = pack([2, [["ab", CHUNK.binary, 1, 0]]]).replace(b"\xa2ab", b"\xa2\xff\xfe")
         self.assertInvalid(block)
@@ -174,6 +182,54 @@ class NameTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     dag.check_name(name)
                 self.assertFalse(dag.is_valid_name(name))
+
+
+class MemoTest(unittest.TestCase):
+    """decode() remembers the nodes of blocks it decoded, and only those."""
+
+    def setUp(self):
+        """An empty memo, restored to the module's own afterwards."""
+        saved = dag._memo
+        dag._memo = dag._Memo()
+        self.addCleanup(setattr, dag, "_memo", saved)
+
+    def node(self, i: int) -> bytes:
+        """A valid file node's block, different for each i."""
+        return dag.encode(FileNode([Child(Cid.for_block(RAW, b"%d" % i), 10)]))
+
+    def test_same_bytes_give_the_remembered_node(self):
+        """A second decode of the same bytes (as any bytes-like object) is the first's node, unchanged."""
+        block = self.node(1)
+        node = dag.decode(block)
+        self.assertIs(dag.decode(bytearray(block)), node)
+        self.assertIs(dag.decode(memoryview(block)), node)
+        self.assertEqual(node, FileNode([Child(Cid.for_block(RAW, b"1"), 10)]))
+
+    def test_invalid_blocks_are_checked_every_time(self):
+        """A block that fails to decode isn't remembered: it raises each time."""
+        bad = pack([1, [[Cid.for_block(RAW, b"x").binary, 10]], 0])
+        for _ in range(2):
+            with self.assertRaises(InvalidDag):
+                dag.decode(bad)
+        self.assertEqual(len(dag._memo._nodes), 0)
+
+    def test_bounded_by_count_and_bytes(self):
+        """At most MEMO_BLOCKS nodes and MEMO_BYTES of blocks, the least recently used forgotten first."""
+        blocks = [self.node(i) for i in range(dag.MEMO_BLOCKS + 10)]
+        first = dag.decode(blocks[0])
+        for block in blocks[1:]:
+            dag.decode(block)
+        self.assertEqual(len(dag._memo._nodes), dag.MEMO_BLOCKS)
+        self.assertIsNot(dag.decode(blocks[0]), first)  # forgotten: decoded again
+        self.assertIs(dag.decode(blocks[-1]), dag.decode(blocks[-1]))
+        size = len(dag.encode(FileNode([Child(Cid.for_block(RAW, b"0-%d" % i), 10) for i in range(2000)])))
+        for n in range(dag.MEMO_BYTES // size + 5):
+            big = dag.encode(FileNode([Child(Cid.for_block(RAW, b"%d-%d" % (n, i)), 10) for i in range(2000)]))
+            dag.decode(big)
+            dag.decode(big)  # the same block again: counted once
+        self.assertLessEqual(dag._memo._bytes, dag.MEMO_BYTES)
+        self.assertGreater(dag._memo._bytes, dag.MEMO_BYTES - 2 * size)
+        self.assertEqual(dag._memo._bytes, sum(len(block) for block in dag._memo._nodes))
 
 
 if __name__ == "__main__":

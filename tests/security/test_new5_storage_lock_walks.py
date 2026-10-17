@@ -40,6 +40,7 @@ class LockedWalkTest(unittest.TestCase):
         self.blocks = os.path.join(self.tmp.name, "blocks")
         self.state = os.path.join(self.tmp.name, "state")
         storage = Storage(self.blocks, self.state, 10**12)
+        self.addCleanup(storage.close)
         self.roots = []
         for d in range(12):
             entries = []
@@ -59,6 +60,7 @@ class LockedWalkTest(unittest.TestCase):
         storage.save()
         self.used = storage.used_bytes()
         self.storage = Storage(self.blocks, self.state, self.used // 2)
+        self.addCleanup(self.storage.close)
 
     @staticmethod
     def entry(storage: Storage, root, name: str):

@@ -12,6 +12,7 @@ from rnfs.content.cid import EMPTY_DIRECTORY, RAW, Cid
 from rnfs.content.dag import DirectoryNode, Entry
 from rnfs.content.storage import USER, Storage
 from rnfs.errors import StorageFull, TooLarge
+from tests.support import failing_commits
 
 
 class ArchiveTest(unittest.TestCase):
@@ -31,8 +32,11 @@ class ArchiveTest(unittest.TestCase):
              Entry("c", self.other.cid, 5, 0)], put)
 
     def storage(self, name: str) -> Storage:
-        """Storage under the temporary directory."""
-        return Storage(os.path.join(self.tmp.name, name, "blocks"), os.path.join(self.tmp.name, name, "state"), 10**9)
+        """Storage under the temporary directory (closed before the directory is removed)."""
+        storage = Storage(os.path.join(self.tmp.name, name, "blocks"), os.path.join(self.tmp.name, name, "state"),
+                          10**9)
+        self.addCleanup(storage.close)
+        return storage
 
     def export(self, roots) -> bytes:
         """Export roots from the source."""
@@ -73,6 +77,23 @@ class ArchiveTest(unittest.TestCase):
         # Blocks shared between roots are written once
         self.assertEqual(result["blocks"], len(self.records(data)) - 1)
         self.assertEqual(len(self.records(self.export([self.root.cid]))), len(self.records(data)))
+
+    def test_roots_are_pinned_with_one_save(self):
+        data = self.export([self.root.cid, self.other.cid, self.root.cid])
+        with mock.patch.object(self.destination, "_save_pins", wraps=self.destination._save_pins) as save:
+            result = archive.import_archive(io.BytesIO(data), self.destination)
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(result["complete"], [self.root.cid, self.other.cid, self.root.cid])
+        self.assertEqual(self.storage("destination").pins(), {self.root.cid: {USER}, self.other.cid: {USER}})
+
+    def test_failed_pin_save_pins_no_root(self):
+        data = self.export([self.root.cid, self.other.cid])
+        with failing_commits("database or disk is full"):
+            with self.assertRaises(OSError):
+                archive.import_archive(io.BytesIO(data), self.destination)
+        self.assertEqual(self.destination.pins(), {})
+        self.assertEqual(self.storage("destination").pins(), {})
+        self.assertTrue(self.destination.is_complete(self.root.cid))  # the blocks are kept, as cache
 
     def test_inner_target(self):
         target = walker.resolve(self.root.cid, ["b"], self.source.getter())

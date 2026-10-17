@@ -3,11 +3,24 @@
 A name is the hash of an `rnfs.name` destination whose RNS identity is the name's key. Its record,
 `[sequence, binary CID]` in msgpack, rides in the destination's announce app_data, which RNS signs. RNS stores
 any validly signed announce, including a replayed old one, so the highest sequence seen is persisted for every
-name this node publishes or resolves for the user, and lower sequences are never accepted from any source.
+name this node publishes or resolves for the user, and lower sequences are never accepted from any source. RNS
+also remembers a replayed announce as just heard, so an announce shows its record current only up to
+ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers.
 Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
 names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
-within seconds of a resolve raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten only past a
-hard bound.
+within seconds of a resolve or an announce raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten
+only past a hard bound.
+
+State lives in the state database (rnfs.statedb), read only at startup. The records of names published here and
+of names resolved for the user (names_published, names_held) are saved at once and durably, each save writing only
+the rows that changed; that save is a publish's commit point. A malformed one stops startup: starting without it
+would allow rollback. Floor saves (name_floor) write only the entries changed too, with synchronous=NORMAL, so a
+power loss may lose the last of them; a malformed floor entry is dropped. The names.json and name-floor.json of
+rnfs 0.1.4 and earlier are imported once (import_names, import_floor).
+
+Watching (rnfs.Node's names.watch, GET /api/name/watch): a watched name's announces count as asked for, so a full
+table never refuses them, and record listeners are told, with the lock held, of each newer record accepted for one
+(an announce, a path response, a keeper's answer, a publish here); they only queue it.
 
 Every RNS call goes through `RnsNetwork`, so tests swap in a fake and run without Reticulum.
 """
@@ -23,11 +36,10 @@ from dataclasses import dataclass
 import RNS
 from RNS.vendor import umsgpack
 
-from rnfs import fsutil
+from rnfs import fsutil, statedb
 from rnfs.config import _HEX_ID, Config  # _HEX_ID: exactly 32 hex digits, as identity lists are checked
 from rnfs.constants import APP_NAME, ID_LENGTH, NAME_ASPECT
 from rnfs.content.cid import Cid
-from rnfs.content.storage import read_json
 from rnfs.errors import NotFound, RnfsError
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, log
 
@@ -37,9 +49,8 @@ MAX_SEQUENCE = 2**64 - 1  # largest msgpack unsigned integer
 # A record is at most ~52 bytes (array header, uint64, bin header, 39-byte CID); anything longer is
 # rejected before decoding, which keeps the announce handler cheap under a flood
 MAX_RECORD_SIZE = 64
-STATE_FILE = "names.json"
-STATE_VERSION = 1
-FLOOR_FILE = "name-floor.json"
+STATE_FILE = "names.json"  # the published and held records of rnfs 0.1.4 and earlier (import_names)
+FLOOR_FILE = "name-floor.json"  # the floor of rnfs 0.1.4 and earlier (import_floor)
 FLOOR_VERSION = 1
 FLOOR_FACTOR = 4  # the floor holds up to this many times name_table_size names, so it outlasts table churn ...
 FLOOR_KEEP_AGE = 7 * 24 * 3600.0  # ... except that names resolved this recently (seconds) are kept past that ...
@@ -48,7 +59,14 @@ FLOOR_SAVE_INTERVAL = 5.0  # seconds: a resolve raising the floor saves it at on
 FLOOR_TOUCH_SAVE = 3600.0  # a resolve that only renews a floor entry's time marks it for the next save after this
 PIN_SOURCE_PREFIX = "name:"
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_PARTIAL = re.compile(re.escape(fsutil.PARTIAL_PREFIX) + r"[0-9a-f]{16}")  # a key write's temp file (write_atomic)
+_DECIMAL = re.compile(r"-?[0-9]+")  # a sequence column (decimal text: sequences don't fit SQLite's integers)
+_MAX_USED = 2**62  # floor rows' used values stay below this, so the ones after them still fit SQLite's integers
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
+# An announce shows its record current for this many announce_intervals after it was emitted, however recently
+# it was heard: RNS remembers a replayed announce as just heard (_announce_heard)
+ANNOUNCE_VALIDITY = 2
+_PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds its announces' random blobs
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up
 
 
@@ -138,9 +156,140 @@ class _Published:
 
     sequence: int
     cid: Cid | None
-    # A key imported from elsewhere (or found with no state: names.json was lost) may already have records on
-    # the network and at keepers, so its first publish asks both before choosing a sequence
+    # A key imported from elsewhere (or found with no saved record: the state was lost) may already have records
+    # on the network and at keepers, so its first publish asks both before choosing a sequence
     imported: bool = False
+
+    @property
+    def unsettled(self) -> bool:
+        """Imported and not yet published here: its records elsewhere are unknown."""
+        return self.imported and self.cid is None
+
+
+# State
+
+
+def _sequence(text) -> int:
+    """A sequence from its decimal text column. Raises ValueError (TypeError if it isn't text)."""
+    if not isinstance(text, str):
+        raise TypeError(f"sequence {text!r} isn't text")
+    if not _DECIMAL.fullmatch(text):
+        raise ValueError(f"sequence {text!r} isn't decimal")
+    return int(text)
+
+
+def _published_row(alias, sequence, cid, imported) -> _Published:
+    """A names_published row as what it records. Raises ValueError or TypeError if it is malformed."""
+    if not isinstance(alias, str) or not _ALIAS.fullmatch(alias):
+        raise ValueError(f"invalid alias {alias!r}")
+    if type(imported) is not int or imported not in (0, 1):
+        raise ValueError(f"invalid imported flag {imported!r} of {alias}")
+    return _Published(_sequence(sequence), None if cid is None else Cid.from_bytes(cid), bool(imported))
+
+
+def _held_row(name, sequence, cid, heard) -> tuple[bytes, Record]:
+    """A names_held row as (name, record). Raises ValueError or TypeError if it is malformed."""
+    name = _check_name(name)
+    if type(heard) not in (int, float):
+        raise TypeError(f"heard time {heard!r} of {name.hex()} isn't a number")
+    return name, Record(_sequence(sequence), Cid.from_bytes(cid), float(heard))
+
+
+def read_names(path: str, shape=None):
+    """names.json's value, for statedb.migrate (shape is unused), or None if there is none. Raises RnfsError if it
+    can't be read or isn't JSON, leaving it in place: starting without it would allow rollback."""
+    try:
+        with open(path, "rb") as f:
+            value = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise RnfsError(f"could not read {path}: {e}") from None
+    if not isinstance(value, dict):  # null too, which rnfs 0.1.4 refused as malformed
+        raise RnfsError(f"malformed {path}: not an object")
+    return value
+
+
+def import_names(value, tx) -> int:
+    """Import names.json (statedb.migrate): its published and held records replace the names_published and
+    names_held rows, every one checked as rnfs 0.1.4 loaded it, whether or not its key file is there. A malformed
+    record raises RnfsError, which rolls the import back and stops startup, as it did then; an alias no key file
+    can have is skipped with a warning. Returns the number of records imported."""
+    published, held = [], {}
+    try:
+        for alias, entry in value.get("published", {}).items():
+            cid = Cid.parse(entry["cid"]) if entry["cid"] is not None else None
+            row = (alias, str(int(entry["sequence"])), None if cid is None else cid.binary,
+                   int(bool(entry.get("imported", False))))
+            if not _ALIAS.fullmatch(alias):
+                # Never a key's (_load_keys reads only files so named); reconcile_pins releases any pin it has
+                log(f"skipping the record of {alias!r} in {STATE_FILE}: not a valid alias", LOG_WARNING)
+                continue
+            published.append(row)
+        for name_hex, entry in value.get("held", {}).items():
+            heard = float(entry["heard"])
+            held[parse_name(name_hex)] = (str(int(entry["sequence"])), Cid.parse(entry["cid"]).binary,
+                                          0.0 if math.isnan(heard) else heard)  # SQLite has no NaN: heard long ago
+    except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as e:
+        raise RnfsError(f"malformed {STATE_FILE}: {e}") from None
+    tx.execute("DELETE FROM names_published")
+    tx.execute("DELETE FROM names_held")
+    tx.executemany("INSERT INTO names_published (alias, sequence, cid, imported) VALUES (?, ?, ?, ?)", published)
+    tx.executemany("INSERT INTO names_held (name, sequence, cid, heard) VALUES (?, ?, ?, ?)",
+                   [(name, *row) for name, row in held.items()])
+    return len(published) + len(held)
+
+
+def _floor_shape(value) -> bool:
+    """True if value is a name-floor.json of FLOOR_VERSION: {"version", "floor": [entry, ...]}."""
+    return isinstance(value, dict) and value.get("version") == FLOOR_VERSION and isinstance(value.get("floor"), list)
+
+
+def read_floor(path: str, shape=None):
+    """name-floor.json's value, for statedb.migrate (shape is unused), or None if there is none. A damaged file is
+    moved aside and gives None: the node starts without it, since it only bounds rollback of gateway and
+    auto-fetch resolves. Raises OSError if it can't be read."""
+    return statedb.read_json(path, _floor_shape)
+
+
+def _resolve_time(rest: list) -> float:
+    """The resolve time a name-floor.json entry ends with: 0.0 (long ago) unless it is one finite number, as
+    entries written before resolve times were kept lack it."""
+    if len(rest) != 1 or type(rest[0]) not in (int, float):
+        return 0.0
+    try:
+        at = float(rest[0])
+    except OverflowError:  # an integer past float's range
+        return 0.0
+    return at if math.isfinite(at) else 0.0
+
+
+def import_floor(value: dict, tx) -> int:
+    """Import name-floor.json (statedb.migrate): its [name, sequence, resolved] entries, least recently resolved
+    first, replace the name_floor rows, each checked as rnfs 0.1.4 loaded it: one that doesn't parse is skipped
+    (and counted in a warning), one without a valid resolve time counts as resolved long ago, and a name listed
+    twice keeps the higher sequence, at its later place. Held names, future times and the floor's bound are left
+    to the load (_load_floor). Returns the number of entries imported."""
+    floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
+    skipped = 0
+    for entry in value["floor"]:
+        try:
+            name_hex, sequence, *rest = entry
+            name = parse_name(name_hex)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if type(sequence) is not int or not 0 <= sequence <= MAX_SEQUENCE:
+            skipped += 1
+            continue
+        earlier = floor.pop(name, None)
+        floor[name] = (max(sequence, earlier[0] if earlier else 0), _resolve_time(rest))
+    if skipped:
+        log(f"skipped {skipped} malformed entr{'y' if skipped == 1 else 'ies'} in {FLOOR_FILE}", LOG_WARNING)
+    tx.execute("DELETE FROM name_floor")
+    tx.executemany("INSERT INTO name_floor (name, sequence, resolved, used) VALUES (?, ?, ?, ?)",
+                   [(name, str(sequence), at, used) for used, (name, (sequence, at)) in enumerate(floor.items())])
+    return len(floor)
 
 
 # RNS access
@@ -175,6 +324,24 @@ class RnsNetwork:
     def recall_app_data(self, name: bytes) -> bytes | None:
         """The app_data of the last validly signed announce RNS heard for name."""
         return RNS.Identity.recall_app_data(name)
+
+    def emitted_time(self, name: bytes) -> float | None:
+        """When the newest announce RNS took a path to name from was emitted (its owner's clock, signed), or None.
+
+        RNS internal (Transport.path_table[hash][IDX_PT_RANDBLOBS], the random blobs of the announces it took the
+        path from, whose bytes 5-10 are each one's emission time: Transport.timebase_from_random_blobs). RNS adds an
+        announce's blob only if it was emitted later than the path's newest, so repeating an old announce, which
+        RNS still remembers as just heard (heard_time), leaves this as it was. If it changes in another RNS version
+        this returns None and callers go by the heard time alone.
+        """
+        try:
+            entry = RNS.Transport.path_table.get(name)
+            if not entry:
+                return None
+            emitted = RNS.Transport.timebase_from_random_blobs(entry[_PATH_RANDOM_BLOBS])
+            return float(emitted) if type(emitted) is int and emitted > 0 else None
+        except Exception:
+            return None
 
     def heard_time(self, name: bytes) -> float | None:
         """When RNS last stored a validly signed announce for name (wall clock), or None.
@@ -218,7 +385,8 @@ class NameManager:
     """This node's name keys and records, and the records it has heard. Thread-safe.
 
     Lifecycle: construct (loads keys and state, no RNS needed), reconcile_pins() once the node and its features
-    are set up, start() once Reticulum runs, run(stop_event) on a thread for re-announces, stop() at shutdown.
+    are set up, start() once Reticulum runs, run(stop_event) on a thread for re-announces, stop() and close() at
+    shutdown.
     """
 
     def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic):
@@ -229,7 +397,6 @@ class NameManager:
         self._clock = clock  # wall clock: heard times are persisted across restarts
         self._monotonic = monotonic  # announce schedule
         self._lock = threading.RLock()
-        self._state_path = os.path.join(config.state_dir, STATE_FILE)
 
         self._keys: dict[str, RNS.Identity] = {}
         self._names: dict[str, bytes] = {}  # alias -> name
@@ -238,6 +405,10 @@ class NameManager:
         # Highest records of names published here or resolved through the CLI or API: persisted, unbounded
         # (they only grow by the user's own actions)
         self._held: dict[bytes, Record] = {}
+        # What the names_published rows (but those of _unreadable aliases) and the names_held rows record, so a
+        # save writes only the rows that changed
+        self._saved_published: dict[str, _Published] = {}
+        self._saved_held: dict[bytes, Record] = {}
         # Every other name's record: in memory, least recently used first, at most name_table_size
         self._table: OrderedDict[bytes, Record] = OrderedDict()
         # The table's names that were only heard, never resolved here, least recently used first. An announce of a
@@ -249,11 +420,17 @@ class NameManager:
         # FLOOR_HARD_FACTOR times that) while those resolved within FLOOR_KEEP_AGE need the room. Saved, so such a
         # resolve never goes back after table churn or a restart
         self._floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
-        self._floor_path = os.path.join(config.state_dir, FLOOR_FILE)
-        self._floor_dirty = False
+        self._floor_used: dict[bytes, int] = {}  # each floor name's used value, its place in the name_floor table
+        self._floor_next_used = 0  # above every used value given out
+        self._floor_changed: set[bytes] = set()  # floor names whose row the next save writes (or deletes)
+        self._floor_dirty = False  # a floor save is due
         self._floor_saved_at = float("-inf")  # monotonic time of the last floor save
         self._floor_timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
-        self._held_dirty = False  # heard times changed without a save
+        self._closed = False  # close() has run: no floor timer is started
+        # Floor saves write without self._lock, one at a time, so an older snapshot never lands last. Taken before
+        # self._lock, never while holding it
+        self._floor_save_lock = threading.Lock()
+        self._held_dirty = False  # held records changed without a save (heard again, or a save that failed)
 
         self._destinations: dict[str, object] = {}
         self._next_announce: dict[str, float] = {}  # alias -> monotonic time
@@ -263,23 +440,33 @@ class NameManager:
         # The keepers feature (rnfs.features.keepers), if loaded: told of heard and published records, and asked
         # for signed records when the network has none. Never called with self._lock held
         self.keepers = None
+        # Names watched (rnfs.Node's names.watch, GET /api/name/watch), and how many watches each: their announces
+        # count as asked, so a full table never refuses them. Record listeners (add_record_listener) are told of
+        # each newer record accepted for a watched name; swapped whole, so they are read without the lock
+        self._watched: dict[bytes, int] = {}
+        self._record_listeners: tuple = ()
         # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
         self._gone: list[tuple[str, Cid]] = []
         # Aliases whose key file is there but couldn't be read (permissions, damage): not names this node can
-        # use, but not gone either, so their pins stay and their names.json entry (or None) is written back as
-        # it was, for when the file can be read again
-        self._unreadable: dict[str, dict | None] = {}
-        # Aliases with an entry in names.json: for these the recorded target (or none) is the only CID their pin
-        # source may hold (reconcile_pins). A key without one (names.json lost) may have pins nothing records
+        # use, but not gone either, so their pins stay and saves leave their names_published row (if any) as it
+        # is, for when the file can be read again
+        self._unreadable: set[str] = set()
+        # Aliases with a saved record: for these the recorded target (or none) is the only CID their pin source
+        # may hold (reconcile_pins). A key without one (the state was lost) may have pins nothing records
         self._recorded: set[str] = set()
         # alias -> CIDs its pin source holds that its record doesn't (left by a crash, or an unpin that failed):
         # released by its next publish or removal
         self._stale: dict[str, set[Cid]] = {}
 
         self._remove_old_temps()
-        self._load_keys()
-        self._load_state()
-        self._load_floor()
+        self._db = statedb.connect(config.state_dir)
+        try:
+            self._load_keys()
+            self._load_state()
+            self._load_floor()
+        except BaseException:
+            self._db.close()
+            raise
 
     # Keys
 
@@ -290,8 +477,9 @@ class NameManager:
             self._check_free(alias)
             identity = RNS.Identity()
             self._add_key(alias, identity, _Published(0, None))
-        log(f"created name {self._names[alias].hex()} as {alias}", LOG_NOTICE)
-        return self._names[alias]
+            name = self._names[alias]  # under the lock: a remove may follow at once
+        log(f"created name {name.hex()} as {alias}", LOG_NOTICE)
+        return name
 
     def import_key(self, alias: str, data: bytes) -> bytes:
         """Store a key exported by export_key under alias and return its name. ValueError if invalid or taken."""
@@ -342,8 +530,9 @@ class NameManager:
                     LOG_WARNING)
         log(f"removed name {name.hex()} ({alias})", LOG_NOTICE)
 
-    def release_gone(self):
-        """Release the pins of names whose key file was deleted by hand (found by the constructor).
+    def release_gone(self) -> set[tuple[str, Cid]]:
+        """Release the pins of names whose key file was deleted by hand (found by the constructor); returns the
+        (alias, CID) pins released.
 
         Not done while loading: releasing a pin recomputes what the node provides, which needs the rest of the
         node, and the features' keys (kept names), set up first.
@@ -355,24 +544,28 @@ class NameManager:
                 self._pins.unpin(cid, PIN_SOURCE_PREFIX + alias)
             if gone:
                 self._save()  # its entry is dropped only once its pin is released
+            return set(gone)
 
     def reconcile_pins(self, pins: dict[Cid, set[str]]):
-        """Make the name pins (pins: every pin and its sources, as storage.pins() gives them) match names.json,
-        once the node is set up: release_gone(), then pin each recorded target that lacks its name's pin and
-        release name pins nothing records (a crash inside publish() can leave one, and earlier rnfs versions
+        """Make the name pins (pins: every pin and its sources, as storage.pins() gives them) match the saved
+        records, once the node is set up: release_gone(), then pin each recorded target that lacks its name's pin
+        and release name pins nothing records (a crash inside publish() can leave one, and earlier rnfs versions
         could leave one that `pin rm` and `name rm` couldn't remove).
 
-        A key with no names.json entry (the file was lost) keeps its pins until its next publish or removal,
-        which release them; a pin of an alias with no key file at all is released, but one whose key file is
-        there and can't be read is kept.
+        A key with no saved record (the state was lost) keeps its pins until its next publish or removal, which
+        release them; a pin of an alias with no key file at all is released, but one whose key file is there and
+        can't be read is kept.
         """
-        self.release_gone()
+        released = self.release_gone()
         with self._lock:
             held: dict[str, set[Cid]] = {}
             for cid, sources in pins.items():
                 for source in sources:
-                    if source.startswith(PIN_SOURCE_PREFIX):
-                        held.setdefault(source[len(PIN_SOURCE_PREFIX):], set()).add(cid)
+                    if not source.startswith(PIN_SOURCE_PREFIX):
+                        continue
+                    alias = source[len(PIN_SOURCE_PREFIX):]
+                    if (alias, cid) not in released:  # pins taken before release_gone() let go of these
+                        held.setdefault(alias, set()).add(cid)
             for alias in sorted(set(held) | set(self._keys)):
                 cids = held.get(alias, set())
                 if alias in self._unreadable:
@@ -386,19 +579,20 @@ class NameManager:
                 recorded = self._published[alias].cid
                 if alias not in self._recorded:
                     if cids:
-                        log(f"name {alias} has no record in {STATE_FILE}; its pins are released at its next "
-                            "publish", LOG_WARNING)
+                        log(f"name {alias} has no saved record; its pins are released at its next publish",
+                            LOG_WARNING)
                         self._stale.setdefault(alias, set()).update(cids)
                     continue
                 if recorded is not None and recorded not in cids:
-                    log(f"pinning {recorded} again for name {alias}, as {STATE_FILE} records", LOG_WARNING)
+                    log(f"pinning {recorded} again for name {alias}, as its saved record says", LOG_WARNING)
                     try:
                         self._pins.pin(recorded, PIN_SOURCE_PREFIX + alias)
                     except OSError as e:  # e.g. a read-only state directory: start all the same
                         log(f"could not pin {recorded} for name {alias}: {e}", LOG_ERROR)
                 extra = cids - {recorded}
                 if extra:
-                    log(f"releasing {len(extra)} pin(s) of name {alias} that {STATE_FILE} doesn't record", LOG_WARNING)
+                    log(f"releasing {len(extra)} pin(s) of name {alias} that its saved record doesn't hold",
+                        LOG_WARNING)
                     self._release(alias, extra)
 
     def _release(self, alias: str, cids):
@@ -436,7 +630,7 @@ class NameManager:
             raise ValueError("publish needs a CID")
         with self._lock:
             name = self.name(alias)
-            refresh = self._published[alias].imported and self._published[alias].cid is None
+            refresh = self._published[alias].unsettled
         if refresh:
             # A freshly imported key: its previous home may have published sequences we've never heard, which
             # keepers may hold after its announces have expired (section 9: above the highest it can resolve)
@@ -447,7 +641,8 @@ class NameManager:
                     self.offer(name, sequence, kept_cid, heard)
 
         with self._lock:
-            self._identity(alias)  # removed while refreshing?
+            if self.name(alias) != name:  # NotFound if removed while refreshing
+                raise NotFound(f"name {alias} was replaced while publishing")
             self._absorb_recalled(name)
             previous = self._published[alias]
             known = self._record(name, touch=False)
@@ -456,7 +651,7 @@ class NameManager:
                 raise RnfsError(f"name {alias} has reached the highest sequence")
 
             source = PIN_SOURCE_PREFIX + alias
-            # Crash-consistent: pin the new target, then save names.json (the commit point), then release the old
+            # Crash-consistent: pin the new target, then save the records (the commit point), then release the old
             # target. A crash leaves at most an extra pin of this source, which reconcile_pins() releases at the
             # next start, and the recorded target is pinned at every step (blocks they share stay protected)
             self._pins.pin(cid, source)
@@ -466,7 +661,7 @@ class NameManager:
             try:
                 self._save()
             except Exception:
-                # Not published: back to what names.json still says (ENOSPC, EIO)
+                # Not published: back to what the database still says (ENOSPC, EIO)
                 self._published[alias] = previous
                 if held_before is None:
                     self._held.pop(name, None)
@@ -475,10 +670,11 @@ class NameManager:
                 if cid != previous.cid and cid not in self._stale.get(alias, set()):
                     self._release(alias, {cid})
                 raise
-            self._drop_from_table(name)
+            self._hold(name)
             self._release(alias, ({previous.cid} | self._stale.pop(alias, set())) - {cid, None})
             self._announce(alias)
             identity = self._keys[alias]
+            self._accepted(name, self._held[name])
         log(f"published {name.hex()} ({alias}) -> {cid}, sequence {sequence}", LOG_NOTICE)
         if self.keepers is not None:
             # This node keeps its own names, so they resolve through it while the owner's announce is gone
@@ -517,7 +713,16 @@ class NameManager:
                 self._floor_timer.cancel()
                 self._floor_timer = None
             self._save()
-            self._save_floor()
+        self._save_floor()
+
+    def close(self):
+        """Release the state database, once stop() has saved everything (idempotent)."""
+        with self._lock:
+            self._closed = True
+            if self._floor_timer is not None:
+                self._floor_timer.cancel()
+                self._floor_timer = None
+        self._db.close()
 
     def announce_due(self) -> float:
         """Re-announce every name whose announce_interval has passed; seconds until the next is due."""
@@ -528,11 +733,12 @@ class NameManager:
                     self._announce(alias)
             if self._held_dirty:
                 self._save()
-            if self._floor_dirty:
-                self._save_floor()
             if not self._next_announce:
-                return self.config.announce_interval
-            return max(0.0, min(self._next_announce.values()) - now)
+                wait = self.config.announce_interval
+            else:
+                wait = max(0.0, min(self._next_announce.values()) - now)
+        self._save_floor()
+        return wait
 
     def run(self, stop_event: threading.Event):
         """The re-announce loop, for a thread of its own; returns once stop_event is set."""
@@ -543,6 +749,48 @@ class NameManager:
                 log(f"name re-announce failed: {e}", LOG_ERROR)
                 delay = _MAX_LOOP_WAIT
             stop_event.wait(min(delay, _MAX_LOOP_WAIT))
+
+    # Watching
+
+    def watch(self, name: bytes):
+        """Watch name: its announces count as asked, and record listeners hear of its newer records."""
+        name = _check_name(name)
+        with self._lock:
+            self._watched[name] = self._watched.get(name, 0) + 1
+            self._heard_only.pop(name, None)  # asked now: no longer the first a full table gives up
+
+    def unwatch(self, name: bytes):
+        """Undo one watch(name)."""
+        with self._lock:
+            count = self._watched.get(name, 0) - 1
+            if count > 0:
+                self._watched[name] = count
+            else:
+                self._watched.pop(name, None)
+
+    def add_record_listener(self, listener):
+        """Call listener(name, record) for each newer record accepted for a watched name (an announce, a path
+        response, a keeper's answer, or a publish here). It is called with the names lock held, on whichever
+        thread accepted the record (RNS's included), so it must only hand the record on, never block or call
+        back into rnfs."""
+        with self._lock:
+            self._record_listeners = (*self._record_listeners, listener)
+
+    def remove_record_listener(self, listener):
+        """Stop calling listener."""
+        with self._lock:
+            # ==, not is: a bound method is a new object at each access, equal to the one added
+            self._record_listeners = tuple(item for item in self._record_listeners if item != listener)
+
+    def _accepted(self, name: bytes, record: Record):
+        """A newer record was accepted for name: tell the record listeners if it is watched. Lock held."""
+        if name not in self._watched:
+            return
+        for listener in self._record_listeners:
+            try:
+                listener(name, record)
+            except Exception as e:  # noqa: BLE001 - one listener mustn't break the others, or the announce
+                log(f"record listener failed: {e!r}", LOG_ERROR)
 
     # Resolving
 
@@ -562,7 +810,7 @@ class NameManager:
             fresh = held is not None and max_age > 0 and 0 <= self._clock() - held.heard < max_age
             alias = self._aliases.get(name)
             # This node's own names need no refresh, unless imported and not yet published here
-            local = alias is not None and not (self._published[alias].imported and self._published[alias].cid is None)
+            local = alias is not None and not self._published[alias].unsettled
         if not local and not fresh:
             started = self._clock()
             self._refresh(name)
@@ -577,19 +825,23 @@ class NameManager:
 
         # Again: the bounded table may have evicted it meanwhile, letting a replayed announce in
         self._offer_kept(name)
+        save_floor = False
         with self._lock:
             self._absorb_recalled(name)
             record = self._record(name, touch=True)
             if record is None:
                 return None
             if persist and name not in self._held:
-                self._drop_from_table(name)
+                self._hold(name)
                 self._held[name] = record
                 self._save()
             elif name not in self._held:
-                self._resolved(name, record.sequence)
-            return {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
-                    "age": max(0.0, self._clock() - record.heard)}
+                save_floor = self._resolved(name, record.sequence)
+            result = {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
+                      "age": max(0.0, self._clock() - record.heard)}
+        if save_floor:
+            self._save_floor()
+        return result
 
     def _offer_kept(self, name: bytes):
         """Offer the signed record keepers hold for name, so it is a floor no replayed announce gets under.
@@ -649,24 +901,37 @@ class NameManager:
             held = self._record(name, touch=False)
             same = held is not None and held.sequence == sequence and held.cid == cid
             heard = held.heard if same else self._clock()
-        self._offer(name, sequence, cid, heard)
+        self._offer(name, sequence, cid, self._announce_heard(name, heard))
+
+    def _announce_heard(self, name: bytes, heard: float) -> float:
+        """The heard time of name's record from an announce RNS heard at heard: no later than ANNOUNCE_VALIDITY
+        announce_intervals after RNS's newest announce of name was emitted. Anyone may repeat an old announce, and
+        RNS remembers it as just heard, so by its time alone a record its owner has since replaced would look
+        current, and resolves would never ask keepers for the newer one. The owner announces every
+        announce_interval, so an announce older than ANNOUNCE_VALIDITY of them no longer shows its record current.
+        """
+        emitted = self._network.emitted_time(name)
+        if emitted is None:
+            return heard
+        return min(heard, emitted + ANNOUNCE_VALIDITY * self.config.announce_interval)
 
     def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
+        name = bytes(name)
         parsed = parse_record(app_data)
         # A name kept here may take a table place like a resolved one (asked outside our lock, as always)
-        kept = parsed is not None and self.keepers is not None and self.keepers.local_record(bytes(name)) is not None
+        kept = parsed is not None and self.keepers is not None and self.keepers.local_record(name) is not None
         with self._lock:
             if parsed is not None:
-                # Unasked: not being resolved (a path response would have a waiter) nor kept
-                unasked = not kept and name not in self._waiters
-                self._offer(bytes(name), parsed[0], parsed[1], self._clock(), unasked=unasked)
+                # Unasked: not being resolved (a path response would have a waiter), kept nor watched
+                unasked = not kept and name not in self._waiters and name not in self._watched
+                self._offer(name, parsed[0], parsed[1], self._announce_heard(name, self._clock()), unasked=unasked)
             else:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):
                 event.set()
         if parsed is not None and self.keepers is not None:
-            self.keepers.heard(bytes(name), parsed[0], parsed[1], packet_hash)
+            self.keepers.heard(name, parsed[0], parsed[1], packet_hash)
 
     def offer(self, name: bytes, sequence: int, cid: Cid, heard: float) -> bool:
         """Apply a record whose signature the caller verified (a keeper's answer), under the sequence rules.
@@ -694,16 +959,15 @@ class NameManager:
             return record
         record = self._table.get(name)
         if record is not None and touch:
-            self._table.move_to_end(name)
-            if name in self._heard_only:
-                self._heard_only.move_to_end(name)
+            self._touch(name)
         return record
 
     def _offer(self, name: bytes, sequence: int, cid: Cid, heard: float, unasked: bool = False) -> bool:
         """Apply a validly signed record: True if it replaced the one held. Lower sequences (than the record held,
         or the floor of a name resolved before) are refused, and at an equal sequence the record already held is
         kept. unasked: an announce of a name this node isn't resolving or keeping, which takes a table place only
-        if it is free or held by another name that was only heard."""
+        if it is free or held by another name that was only heard. A held record whose save fails is logged and
+        saved by the next save."""
         held_here = name in self._held
         current = self._record(name, touch=False)
         floor = None if held_here or name not in self._floor else self._floor[name][0]
@@ -724,14 +988,23 @@ class NameManager:
                     self._touch(name)
                 return False
 
-        if not self._store(name, Record(sequence, cid, heard), held_here, unasked):
+        record = Record(sequence, cid, heard)
+        if not self._store(name, record, held_here, unasked):
             return False
         if held_here:
-            self._save()
+            try:
+                self._save()
+            except OSError as e:
+                # Held all the same, and saved by the next save (announce_due's within a minute): raising here
+                # would skip the waking, keepers and listeners, and on RNS's thread reach no one
+                log(f"could not save the record of name {name.hex()}: {e}", LOG_WARNING)
+                self._held_dirty = True
+        self._accepted(name, record)
         return True
 
     def _store(self, name: bytes, record: Record, held_here: bool, unasked: bool = False) -> bool:
-        """Put record in the persisted map or the bounded table, making room in the table. False if an unasked
+        """Put record in the persisted map or the bounded table, making room in the table, and raise the name's
+        floor to it (saved by the timer, since callers hold the lock, some on RNS's thread). False if an unasked
         record found no room (every place is a name resolved or kept here)."""
         if held_here:
             self._held[name] = record
@@ -753,7 +1026,9 @@ class NameManager:
         floor = self._floor.get(name)
         if floor is not None and record.sequence > floor[0]:
             self._floor[name] = (record.sequence, floor[1])
+            self._floor_changed.add(name)
             self._floor_dirty = True
+            self._save_floor_soon(inline=False)
         if len(self._table) > limit:  # name_table_size 0: nothing is kept
             self._drop_from_table(name)
         return True
@@ -765,24 +1040,38 @@ class NameManager:
             self._heard_only.move_to_end(name)
 
     def _drop_from_table(self, name: bytes):
-        """Remove name from the table (it is held now)."""
+        """Remove name from the table."""
         self._table.pop(name, None)
         self._heard_only.pop(name, None)
 
-    def _resolved(self, name: bytes, sequence: int):
+    def _hold(self, name: bytes):
+        """name's record is held now: out of the table, and out of the floor (its held record is its floor), whose
+        row the next floor save deletes."""
+        self._drop_from_table(name)
+        if self._floor.pop(name, None) is not None:
+            del self._floor_used[name]
+            self._floor_changed.add(name)
+            self._floor_dirty = True
+
+    def _resolved(self, name: bytes, sequence: int) -> bool:
         """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
         floor for later resolves (_trim_floor says which are forgotten). A floor raised (or a new one) is saved at
-        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little."""
+        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little. True if the caller
+        is to save it now, once it has released the lock."""
         self._heard_only.pop(name, None)
         now = self._clock()
         previous = self._floor.pop(name, None)
         self._floor[name] = (sequence if previous is None else max(previous[0], sequence), now)
+        self._floor_used[name] = self._floor_next_used  # last: the most recently resolved
+        self._floor_next_used += 1
+        self._floor_changed.add(name)  # written by the next save, even if this change doesn't call for one
         trimmed = self._trim_floor()
         if previous is None or self._floor[name][0] != previous[0] or trimmed:
             self._floor_dirty = True
-            self._save_floor_soon()
-        elif not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
+            return self._save_floor_soon()
+        if not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
             self._floor_dirty = True  # only its time renewed: saved with the next change or by announce_due
+        return False
 
     def _trim_floor(self) -> bool:
         """Forget the least recently resolved names over FLOOR_FACTOR × name_table_size, but not those resolved
@@ -794,26 +1083,31 @@ class NameManager:
             _, at = next(iter(self._floor.values()))
             if len(self._floor) <= FLOOR_HARD_FACTOR * size and now - at < FLOOR_KEEP_AGE:
                 break
-            self._floor.popitem(last=False)
+            name, _ = self._floor.popitem(last=False)
+            del self._floor_used[name]
+            self._floor_changed.add(name)
             trimmed = True
         return trimmed
 
-    def _save_floor_soon(self):
-        """Save the floor now if the last save was FLOOR_SAVE_INTERVAL ago, else once it is (a timer)."""
+    def _save_floor_soon(self, inline: bool = True) -> bool:
+        """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
+        has released the lock; else it is saved once it is (a timer). Without inline, a save due now is the
+        timer's too, started at once."""
         wait = self._floor_saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
-        if wait <= 0:
-            self._save_floor()
-        elif self._floor_timer is None:
-            timer = threading.Timer(wait, self._save_floor_later)
+        if wait <= 0 and inline:
+            return True
+        if self._floor_timer is None and not self._closed:
+            timer = threading.Timer(max(0.0, wait), self._save_floor_later)
             timer.daemon = True
             self._floor_timer = timer
             timer.start()
+        return False
 
     def _save_floor_later(self):
         """The timer's save."""
         with self._lock:
             self._floor_timer = None
-            self._save_floor()
+        self._save_floor()
 
     def _floor_size(self) -> int:
         """How many names the floor holds, past which only names resolved within FLOOR_KEEP_AGE are kept."""
@@ -865,8 +1159,8 @@ class NameManager:
         return identity
 
     def _check_free(self, alias: str):
-        """ValueError if alias is in use (in memory or on disk)."""
-        if alias in self._keys or os.path.exists(self._key_path(alias)):
+        """ValueError if alias is in use (in memory or on disk, a dangling symlink included)."""
+        if alias in self._keys or os.path.lexists(self._key_path(alias)):
             raise ValueError(f"alias {alias} already exists")
 
     def _add_key(self, alias: str, identity: RNS.Identity, published: _Published):
@@ -886,15 +1180,17 @@ class NameManager:
             self._open_destination(alias)
 
     def _remove_old_temps(self):
-        """Delete the temp files an interrupted write of rnfs 0.1.1 or earlier left (names.json.tmp and
-        .<alias>.tmp): it reused those names, but writes now take new ones each time."""
+        """Delete the temp files an interrupted key write left: fsutil.write_atomic's (.partial-<16 hex>), which
+        hold a private key, and those of rnfs 0.1.1 or earlier (names.json.tmp and .<alias>.tmp), which reused
+        those names. Only this node writes here (it holds the rnfs dir's lock), and not yet."""
         try:
             entries = os.listdir(self.config.names_dir)
         except OSError:
             entries = []
         old = [os.path.join(self.config.names_dir, entry) for entry in entries
-               if entry.startswith(".") and entry.endswith(".tmp") and _ALIAS.fullmatch(entry[1:-4])]
-        for path in (self._state_path + ".tmp", *old):
+               if (entry.startswith(".") and entry.endswith(".tmp") and _ALIAS.fullmatch(entry[1:-4]))
+               or _PARTIAL.fullmatch(entry)]
+        for path in (os.path.join(self.config.state_dir, STATE_FILE + ".tmp"), *old):
             try:
                 fsutil.remove(path)
             except OSError:
@@ -913,7 +1209,7 @@ class NameManager:
             identity = RNS.Identity.from_file(path) if os.path.isfile(path) else None  # None: a dangling symlink
             if identity is None:
                 log(f"could not read name key {path}; skipping it, and keeping its pins and records", LOG_ERROR)
-                self._unreadable[alias] = None
+                self._unreadable.add(alias)
                 continue
             name = name_for_identity(identity)
             if name in self._aliases:
@@ -926,89 +1222,125 @@ class NameManager:
     # State; callers hold the lock
 
     def _load_state(self):
-        """Read persisted records. A corrupt file is an error: starting afresh would allow rollback."""
+        """Read the published and held records. A malformed row is an error, as a malformed names.json was:
+        starting without it would allow rollback."""
         try:
-            with open(self._state_path, "rb") as f:
-                state = json.load(f)
-        except FileNotFoundError:
-            state = {}
-        except (OSError, ValueError) as e:
-            raise RnfsError(f"could not read {self._state_path}: {e}") from None
-        try:
-            for alias, entry in state.get("published", {}).items():
-                cid = Cid.parse(entry["cid"]) if entry["cid"] is not None else None
-                published = _Published(int(entry["sequence"]), cid, bool(entry.get("imported", False)))
+            for row in self._db.query("SELECT alias, sequence, cid, imported FROM names_published ORDER BY alias"):
+                alias, published = row[0], _published_row(*row)
+                if alias in self._unreadable:
+                    continue  # left as it is by every save, for when the key file can be read again
+                self._saved_published[alias] = published
                 if alias in self._keys:
                     self._published[alias] = published
                     self._recorded.add(alias)
-                elif alias in self._unreadable:
-                    self._unreadable[alias] = entry  # written back unchanged by _save
-                elif cid is not None:
+                elif published.cid is not None:
                     # Its key file was deleted by hand: nothing will republish it, so release its pin
-                    self._gone.append((alias, cid))
-            for name_hex, entry in state.get("held", {}).items():
-                self._held[parse_name(name_hex)] = Record(int(entry["sequence"]), Cid.parse(entry["cid"]),
-                                                          float(entry["heard"]))
-        except (AttributeError, KeyError, TypeError, ValueError) as e:
-            raise RnfsError(f"malformed {self._state_path}: {e}") from None
+                    self._gone.append((alias, published.cid))
+            for row in self._db.query("SELECT name, sequence, cid, heard FROM names_held ORDER BY name"):
+                name, record = _held_row(*row)
+                self._held[name] = record
+        except (TypeError, ValueError) as e:
+            raise RnfsError(f"malformed name record in {self._db.path} ({e}); rnfs won't start on it, since starting "
+                            "without it would let a name go back to an older record") from None
+        self._saved_held = dict(self._held)
         for alias in self._keys:
-            # A key with no state entry (names.json lost, or the key copied in by hand) may have been published
-            # elsewhere: treated as imported, so its first publish looks for its records first
+            # A key with no saved record (the state was lost, or the key copied in by hand) may have been
+            # published elsewhere: treated as imported, so its first publish looks for its records first
             self._published.setdefault(alias, _Published(0, None, imported=True))
 
     def _load_floor(self):
-        """Read the floor of names resolved without persist. A damaged file is moved aside and the node starts
-        without it (it only bounds rollback of gateway and auto-fetch resolves); entries that don't parse are
-        skipped. An entry without a valid resolve time (written before they were kept) counts as resolved long
-        ago, and one in the future as now."""
-        state = read_json(self._floor_path, shape=lambda value: isinstance(value, dict)
-                          and value.get("version") == FLOOR_VERSION and isinstance(value.get("floor"), list))
-        if state is None:
-            return
+        """Read the floor of names resolved without persist, least recently resolved first. A row that doesn't
+        parse is logged and deleted (the floor only bounds rollback of gateway and auto-fetch resolves), as are
+        those of names held for the user and those _trim_floor drops. A resolve time in the future (the clock was
+        corrected since) counts as now, and is written so by the next floor save that has a change to write."""
         now = self._clock()
-        for entry in state["floor"]:
+        dropped = []
+        for name, sequence, resolved, used in self._db.query(
+                "SELECT name, sequence, resolved, used FROM name_floor ORDER BY used"):
             try:
-                name_hex, sequence, *at = entry
-                name = parse_name(name_hex)
-            except (TypeError, ValueError):
+                _check_name(name)
+                sequence = _sequence(sequence)
+                if not 0 <= sequence <= MAX_SEQUENCE:
+                    raise ValueError(f"sequence {sequence} out of range")
+                if type(resolved) not in (int, float) or not math.isfinite(resolved):
+                    raise ValueError(f"invalid resolve time {resolved!r}")
+                if type(used) is not int or not 0 <= used < _MAX_USED:
+                    raise ValueError(f"invalid used value {used!r}")
+            except (TypeError, ValueError) as e:
+                log(f"dropping an invalid name floor entry {name!r}: {e}", LOG_WARNING)
+                dropped.append(name)
                 continue
-            at = at[0] if len(at) == 1 and type(at[0]) in (int, float) and math.isfinite(at[0]) else 0.0
-            if type(sequence) is int and 0 <= sequence <= MAX_SEQUENCE and name not in self._held:
-                earlier = self._floor.pop(name, None)  # listed twice (a damaged file): the higher sequence holds
-                self._floor[name] = (max(sequence, earlier[0] if earlier else 0), min(float(at), now))
+            if name in self._held:
+                dropped.append(name)  # resolved for the user since: its held record is its floor
+                continue
+            self._floor[name] = (sequence, min(float(resolved), now))
+            self._floor_used[name] = used
+            self._floor_next_used = max(self._floor_next_used, used + 1)
+            if resolved > now:
+                self._floor_changed.add(name)
         self._trim_floor()
+        trimmed = [name for name in self._floor_changed if name not in self._floor]
+        self._floor_changed.difference_update(trimmed)
+        if dropped or trimmed:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM name_floor WHERE name = ?", [(name,) for name in dropped + trimmed])
 
     def _save_floor(self):
-        """Write the floor atomically, least recently resolved first, as [name, sequence, resolved], if it
-        changed. Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds thousands
-        of names), announce_due (at least every minute while running) and stop()."""
-        if not self._floor_dirty:
-            return
-        state = {"version": FLOOR_VERSION,
-                 "floor": [[name.hex(), sequence, int(at)] for name, (sequence, at) in self._floor.items()]}
-        os.makedirs(self.config.state_dir, exist_ok=True)
-        try:
-            fsutil.write_atomic(self._floor_path, json.dumps(state, separators=(",", ":")).encode())
-        except OSError as e:
-            log(f"could not save {self._floor_path}: {e}", LOG_WARNING)
-            return
-        self._floor_dirty = False
-        self._floor_saved_at = self._monotonic()
+        """Write the floor entries changed (or forgotten) since the last save, if a save is due, with
+        synchronous=NORMAL. Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds
+        thousands of names), announce_due (at least every minute while running) and stop().
+
+        Called without the lock: only the rows are made under it, so resolves and announces needn't wait for
+        the write. The save counts from when they were made; a failed one is retried by the next."""
+        with self._floor_save_lock:
+            with self._lock:
+                if not self._floor_dirty:
+                    return
+                changed, self._floor_changed = self._floor_changed, set()
+                rows = [(name, str(self._floor[name][0]), self._floor[name][1], self._floor_used[name])
+                        for name in changed if name in self._floor]
+                gone = [(name,) for name in changed if name not in self._floor]
+                saved_at, self._floor_saved_at = self._floor_saved_at, self._monotonic()
+                self._floor_dirty = False
+            saved = False
+            try:
+                try:
+                    with self._db.transaction() as tx:
+                        tx.executemany("DELETE FROM name_floor WHERE name = ?", gone)
+                        tx.executemany("INSERT OR REPLACE INTO name_floor (name, sequence, resolved, used) "
+                                       "VALUES (?, ?, ?, ?)", rows)
+                    saved = True
+                except OSError as e:
+                    log(f"could not save the name floor: {e}", LOG_WARNING)
+            finally:
+                if not saved:
+                    with self._lock:
+                        self._floor_changed |= changed
+                        self._floor_dirty = True
+                        self._floor_saved_at = saved_at
 
     def _save(self):
-        """Write published and held records atomically."""
-        published = {alias: {"sequence": p.sequence, "cid": str(p.cid) if p.cid is not None else None,
-                             "imported": p.imported}
-                     for alias, p in self._published.items()}
-        for alias, entry in self._unreadable.items():
-            if entry is not None and alias not in published:
-                published[alias] = entry
-        state = {
-            "version": STATE_VERSION,
-            "published": dict(sorted(published.items())),
-            "held": {name.hex(): {"sequence": r.sequence, "cid": str(r.cid), "heard": r.heard}
-                     for name, r in sorted(self._held.items())},
-        }
-        os.makedirs(self.config.state_dir, exist_ok=True)
-        fsutil.write_atomic(self._state_path, json.dumps(state, indent=1).encode())
+        """Write the published and held records changed since the last save, durably (on disk when it returns:
+        this is a publish's commit point); the rows of _unreadable aliases are left as they are. Raises OSError if
+        the database fails, having written nothing."""
+        published = [(alias, p) for alias, p in self._published.items() if self._saved_published.get(alias) != p]
+        unpublished = [alias for alias in self._saved_published if alias not in self._published]
+        held = [(name, r) for name, r in self._held.items() if self._saved_held.get(name) != r]
+        unheld = [name for name in self._saved_held if name not in self._held]
+        if published or unpublished or held or unheld:
+            with self._db.transaction(durable=True) as tx:
+                tx.executemany("DELETE FROM names_published WHERE alias = ?", [(alias,) for alias in unpublished])
+                tx.executemany("INSERT OR REPLACE INTO names_published (alias, sequence, cid, imported) "
+                               "VALUES (?, ?, ?, ?)",
+                               [(alias, str(p.sequence), None if p.cid is None else p.cid.binary, int(p.imported))
+                                for alias, p in published])
+                tx.executemany("DELETE FROM names_held WHERE name = ?", [(name,) for name in unheld])
+                tx.executemany("INSERT OR REPLACE INTO names_held (name, sequence, cid, heard) VALUES (?, ?, ?, ?)",
+                               [(name, str(r.sequence), r.cid.binary, r.heard) for name, r in held])
+            for alias in unpublished:
+                del self._saved_published[alias]
+            self._saved_published.update(published)
+            for name in unheld:
+                del self._saved_held[name]
+            self._saved_held.update(held)
         self._held_dirty = False

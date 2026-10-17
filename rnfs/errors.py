@@ -1,4 +1,6 @@
-"""Errors shared across rnfs. The API maps them to HTTP statuses (see design.md)."""
+"""Errors shared across rnfs, and raised by its public API (rnfs.Node, rnfs.Client), which exports each as
+rnfs.<name>. The API maps them to HTTP statuses (see design.md); rnfs.apiclient's errors for those statuses are
+subclasses of these, so one except clause catches either class's."""
 
 
 class RnfsError(Exception):
@@ -17,12 +19,25 @@ class NotFound(RnfsError):
 
 
 class TooLarge(RnfsError):
-    """A fetch would exceed max_download_size, or writing out a DAG exceeded max_output_entries."""
+    """A fetch or read would exceed a bound: max_download_size, max_output_entries, the DAG byte or byte-range
+    bound (section 7), a remote pin's or auto-fetch's quota, or the free space an output needs."""
 
 
 class StorageFull(RnfsError):
-    """Pins alone fill max_storage, so a fetch that isn't being pinned is refused (section 8)."""
+    """Storing more would leave less than the disk reserve free (section 8; max_storage itself never refuses)."""
 
 
 class Busy(RnfsError):
     """A local limit (e.g. gateway_fetches) is reached; try again later."""
+
+
+class Denied(RnfsError):
+    """The content is on this node's deny list (section 8): it isn't fetched, read, stored, served or provided."""
+
+
+class Cancelled(RnfsError):
+    """A fetch stopped because its observer asked it to (a job cancelled, or the node stopping)."""
+
+
+class Closed(RnfsError):
+    """The rnfs.Node or rnfs.Client was closed."""

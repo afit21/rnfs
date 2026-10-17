@@ -9,8 +9,14 @@ beyond its bundled msgpack.
 Writers produce exactly what umsgpack.packb produces: str as str, bytes as bin, shortest headers.
 Readers accept nothing else: the decoder below understands only the few msgpack forms a node can
 contain, and a node must re-encode to identical bytes, which rules out non-shortest headers.
+
+Decoding is a pure function of the block's bytes and nodes are immutable, so decode() remembers the nodes of
+the blocks it decoded last (MEMO_BLOCKS of them, MEMO_BYTES of blocks): a read walks the same file and
+directory nodes many times (a cat of 64 KiB from a large file decoded its root node about twenty times).
 """
 import struct
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from RNS.vendor import umsgpack
@@ -25,6 +31,10 @@ KINDS = (KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY)
 
 MAX_SIZE = 2**64 - 1  # a size above this makes a DAG invalid
 MAX_NAME_BYTES = 255
+# decode()'s memo of nodes by block bytes, least recently used forgotten first: a node's Python objects take
+# several times its block's bytes, so this holds well under 20 MB
+MEMO_BLOCKS = 256
+MEMO_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -142,6 +152,13 @@ def encode(node: Node) -> bytes:
     raise TypeError(f"not a DAG node: {node!r}")
 
 
+# The big-endian lengths and integers after a msgpack type byte, by type byte (struct formats compiled once)
+_ARRAY_LENGTHS = {0xDC: struct.Struct(">H"), 0xDD: struct.Struct(">I")}
+_UINTS = {0xCC: struct.Struct(">B"), 0xCD: struct.Struct(">H"), 0xCE: struct.Struct(">I"), 0xCF: struct.Struct(">Q")}
+_BIN_LENGTHS = {0xC4: struct.Struct(">B"), 0xC5: struct.Struct(">H"), 0xC6: struct.Struct(">I")}
+_STR_LENGTHS = {0xD9: struct.Struct(">B"), 0xDA: struct.Struct(">H"), 0xDB: struct.Struct(">I")}
+
+
 class _Reader:
     """Reads the handful of msgpack forms a DAG node may contain, rejecting every other form."""
 
@@ -161,21 +178,29 @@ class _Reader:
 
     def _byte(self) -> int:
         """The next byte."""
-        return self._take(1)[0]
+        pos = self.pos
+        if pos >= len(self.data):
+            raise InvalidDag("DAG node is truncated")
+        self.pos = pos + 1
+        return self.data[pos]
 
-    def _length(self, size_format: str) -> int:
-        """A big-endian length or integer of the given struct format."""
-        return struct.unpack(size_format, self._take(struct.calcsize(size_format)))[0]
+    def _length(self, size_format: struct.Struct) -> int:
+        """A big-endian length or integer of the given compiled struct format."""
+        end = self.pos + size_format.size
+        if end > len(self.data):
+            raise InvalidDag("DAG node is truncated")
+        value = size_format.unpack_from(self.data, self.pos)[0]
+        self.pos = end
+        return value
 
     def array(self) -> int:
         """An array header; returns its length."""
         tag = self._byte()
         if 0x90 <= tag <= 0x9F:
             return tag & 0x0F
-        if tag == 0xDC:
-            return self._length(">H")
-        if tag == 0xDD:
-            return self._length(">I")
+        size_format = _ARRAY_LENGTHS.get(tag)
+        if size_format is not None:
+            return self._length(size_format)
         raise InvalidDag(f"expected a msgpack array, found type byte 0x{tag:02x}")
 
     def uint(self) -> int:
@@ -183,26 +208,26 @@ class _Reader:
         tag = self._byte()
         if tag <= 0x7F:
             return tag
-        formats = {0xCC: ">B", 0xCD: ">H", 0xCE: ">I", 0xCF: ">Q"}
-        if tag in formats:
-            return self._length(formats[tag])
+        size_format = _UINTS.get(tag)
+        if size_format is not None:
+            return self._length(size_format)
         raise InvalidDag(f"expected a non-negative msgpack integer, found type byte 0x{tag:02x}")
 
     def bin(self) -> bytes:
         """A bin."""
         tag = self._byte()
-        formats = {0xC4: ">B", 0xC5: ">H", 0xC6: ">I"}
-        if tag not in formats:
+        size_format = _BIN_LENGTHS.get(tag)
+        if size_format is None:
             raise InvalidDag(f"expected msgpack bin, found type byte 0x{tag:02x}")
-        return bytes(self._take(self._length(formats[tag])))
+        return bytes(self._take(self._length(size_format)))
 
     def text(self) -> str:
         """A str holding valid UTF-8."""
         tag = self._byte()
         if 0xA0 <= tag <= 0xBF:
             length = tag & 0x1F
-        elif tag in (0xD9, 0xDA, 0xDB):
-            length = self._length({0xD9: ">B", 0xDA: ">H", 0xDB: ">I"}[tag])
+        elif tag in _STR_LENGTHS:
+            length = self._length(_STR_LENGTHS[tag])
         else:
             raise InvalidDag(f"expected msgpack str, found type byte 0x{tag:02x}")
         try:
@@ -224,16 +249,58 @@ class _Reader:
             raise InvalidDag(f"expected an array of {count} fields, found {length}")
 
 
+class _Memo:
+    """decode()'s memo: block bytes -> node, for blocks that decoded (an invalid one is checked every time)."""
+
+    def __init__(self):
+        """Empty."""
+        self._lock = threading.Lock()
+        self._nodes: OrderedDict[bytes, Node] = OrderedDict()  # least recently used first
+        self._bytes = 0
+
+    def get(self, block: bytes) -> "Node | None":
+        """The node block decoded to, if remembered."""
+        with self._lock:
+            node = self._nodes.get(block)
+            if node is not None:
+                self._nodes.move_to_end(block)
+            return node
+
+    def put(self, block: bytes, node: Node):
+        """Remember block's node, forgetting the least recently used past MEMO_BLOCKS or MEMO_BYTES."""
+        with self._lock:
+            if block not in self._nodes:
+                self._bytes += len(block)
+            self._nodes[block] = node
+            self._nodes.move_to_end(block)
+            while len(self._nodes) > MEMO_BLOCKS or self._bytes > MEMO_BYTES:
+                forgotten, _ = self._nodes.popitem(last=False)
+                self._bytes -= len(forgotten)
+
+
+_memo = _Memo()
+
+
 def decode(block: bytes) -> Node:
     """The DAG node encoded by block, checked strictly. Raises InvalidDag for anything not exactly valid.
 
     Checks the encoding rules (types, shortest headers, no extra fields or trailing bytes), the name
     rules, sorted unique names, strictly increasing first_names, kinds and size overflow. Checks that
     need a node's context (child types, sizes against children, index bounds, depth) are walker.py's.
+    The node of a block decoded recently is remembered: the same bytes always give the same node.
     """
     if not isinstance(block, (bytes, bytearray, memoryview)):
         raise TypeError("block must be bytes")
     block = bytes(block)
+    node = _memo.get(block)
+    if node is None:
+        node = _decode(block)
+        _memo.put(block, node)
+    return node
+
+
+def _decode(block: bytes) -> Node:
+    """decode(), without the memo."""
     if len(block) > MAX_BLOCK_SIZE:
         raise InvalidDag(f"block of {len(block)} bytes exceeds MAX_BLOCK_SIZE")
     reader = _Reader(block)

@@ -5,7 +5,8 @@ import unittest
 
 from rnfs.config import Config
 from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
-from rnfs.dht.routing import RoutingTable, distance
+from rnfs.dht import routing
+from rnfs.dht.routing import AVOID_AFTER, AVOID_MAX, RoutingTable, distance
 from tests.support import FakeClock
 
 OWN_ID = bytes(ID_LENGTH)
@@ -69,6 +70,48 @@ class BucketTest(RoutingTestCase):
         self.assertFalse(table.heard(node_id(2)))
         self.assertEqual(table.nodes(), [node_id(1)])
 
+    def test_admit_is_asked_without_the_lock(self):
+        """admit may block on RNS, so heard() and answered() ask it with the table's lock free for other
+        threads (those answering /find, and lookups), and only for nodes not already in the table."""
+        asked, free = [], []
+
+        def admit(n: bytes) -> bool:
+            """Note whether another thread could take the table's lock now."""
+            def probe():
+                """Take and release the lock without waiting."""
+                if table._lock.acquire(blocking=False):
+                    table._lock.release()
+                    free.append(n)
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join()
+            asked.append(n)
+            return True
+
+        table = RoutingTable(OWN_ID, self.config, clock=self.clock, admit=admit)
+        self.assertTrue(table.heard(node_id(1)))
+        self.assertTrue(table.answered(node_id(2)))
+        self.assertFalse(table.heard(node_id(1)))  # in the table: not asked again
+        self.assertEqual(asked, [node_id(1), node_id(2)])
+        self.assertEqual(free, asked)
+
+    def test_changes_while_admit_is_asked_are_honoured(self):
+        """The table is checked again once admit answers: a node banned meanwhile isn't added, and one another
+        thread added meanwhile is only refreshed, whatever admit said."""
+        during = []
+
+        def admit(n: bytes) -> bool:
+            """Run the next change queued in during, as another thread could, then answer as it says."""
+            return during.pop()(n) if during else True
+
+        table = RoutingTable(OWN_ID, self.config, clock=self.clock, admit=admit)
+        during.append(lambda n: table.ban(n) or True)
+        self.assertFalse(table.heard(node_id(1)))
+        self.assertFalse(table.contains(node_id(1)))
+        during.append(lambda n: table.heard(n) and False)
+        self.assertFalse(table.answered(node_id(2)))
+        self.assertEqual(table.nodes(), [node_id(2)])
+
     def test_closest_ranks_every_bucket(self):
         rng = random.Random(1)
         ids = [rng.randbytes(ID_LENGTH) for _ in range(300)]
@@ -79,6 +122,38 @@ class BucketTest(RoutingTestCase):
         expected = sorted(stored, key=lambda n: distance(n, key))[:K]
         self.assertEqual(self.table.closest(key), expected)
         self.assertEqual(len(self.table.closest(key, count=3)), 3)
+
+    def test_closest_matches_ranking_every_node(self):
+        """Walking buckets from the key's gives exactly what sorting the whole table by distance gives."""
+        rng = random.Random(3)
+        for _ in range(60):
+            own = rng.randbytes(ID_LENGTH)
+            own_value = int.from_bytes(own, "big")
+            table = RoutingTable(own, self.config, clock=self.clock)
+            # Random IDs fill the far buckets; IDs sharing a prefix with own reach the near ones, some left empty
+            ids = [rng.randbytes(ID_LENGTH) for _ in range(rng.randrange(0, 300))]
+            for bucket in rng.sample(range(BUCKET_COUNT), rng.randrange(0, BUCKET_COUNT)):
+                for _ in range(rng.randrange(1, K + 3)):
+                    ids.append((own_value ^ (1 << bucket) ^ rng.getrandbits(bucket)).to_bytes(ID_LENGTH, "big"))
+            for n in ids:
+                table.heard(n)
+            stored = table.nodes()
+            # Some go silent or fail a query, so replies leave them out
+            self.clock.now += 2 * ANNOUNCE + 1
+            for n in stored:
+                if rng.random() < 0.5:
+                    table.heard(n)
+                    if rng.random() < 0.3:
+                        table.failed(n)
+            live = [n for n in stored if table.standing(n, 0) < 2]
+            keys = [own, rng.randbytes(ID_LENGTH)] + rng.sample(stored, min(3, len(stored)))
+            keys += [(own_value ^ rng.getrandbits(rng.randrange(1, 129))).to_bytes(ID_LENGTH, "big") for _ in range(3)]
+            for key in keys:
+                for count in (0, 1, 3, K, len(stored) + 5):
+                    expected = sorted(stored, key=lambda n: distance(n, key))[:count]
+                    self.assertEqual(table.closest(key, count), expected)
+                    expected = sorted(live, key=lambda n: distance(n, key))[:count]
+                    self.assertEqual(table.closest(key, count, for_reply=True), expected)
 
 
 class ReplacementTest(RoutingTestCase):
@@ -222,6 +297,92 @@ class ReplyFilterTest(RoutingTestCase):
         self.assertEqual(self.table.live_count(), 2)
 
 
+class UnreliableTest(RoutingTestCase):
+    """Nodes whose queries keep failing are unreliable however often they announce, until one is answered."""
+
+    def fail_queries(self, n: bytes, times: int):
+        """Count times failed queries for n, hearing its announce before each, as a far node that keeps
+        announcing but never connects is heard."""
+        for _ in range(times):
+            self.table.heard(n)
+            self.table.failed(n)
+
+    def test_announces_do_not_reset_the_count(self):
+        """A node heard before every failure is unreliable after max_failures of them, and stays in the table."""
+        n = node_id(42)
+        self.fail_queries(n, 2)
+        self.assertFalse(self.table.unreliable(n))
+        self.fail_queries(n, 1)
+        self.assertTrue(self.table.unreliable(n))
+        self.table.heard(n)
+        self.assertTrue(self.table.unreliable(n))
+        self.assertTrue(self.table.contains(n))  # the table's own failure count was reset by the announce
+
+    def test_nodes_outside_the_table_count_too(self):
+        """A node only named in replies (never in the table) is remembered as unreliable."""
+        n = node_id(42)
+        for _ in range(3):
+            self.assertFalse(self.table.failed(n))
+        self.assertFalse(self.table.contains(n))
+        self.assertTrue(self.table.unreliable(n))
+
+    def test_retried_after_a_doubling_backoff(self):
+        """may_retry is True once the backoff has passed, for one caller; each failure doubles it up to AVOID_MAX."""
+        n = node_id(42)
+        self.fail_queries(n, 3)
+        self.assertFalse(self.table.may_retry(n))
+        self.clock.now += AVOID_AFTER
+        self.assertTrue(self.table.may_retry(n))
+        self.assertFalse(self.table.may_retry(n))  # claimed: another lookup doesn't retry it too
+        self.fail_queries(n, 1)
+        self.clock.now += 2 * AVOID_AFTER - 1
+        self.assertFalse(self.table.may_retry(n))
+        self.clock.now += 1
+        self.assertTrue(self.table.may_retry(n))
+        self.fail_queries(n, 20)
+        self.clock.now += AVOID_MAX - 1
+        self.assertFalse(self.table.may_retry(n))
+        self.clock.now += 1
+        self.assertTrue(self.table.may_retry(n))
+
+    def test_an_answer_restores_it(self):
+        """answered() makes the node reliable again: no retry needed, and failures count from zero."""
+        n = node_id(42)
+        self.fail_queries(n, 5)
+        self.assertFalse(self.table.answered(n))  # already in the table
+        self.assertFalse(self.table.unreliable(n))
+        self.clock.now += AVOID_MAX
+        self.assertFalse(self.table.may_retry(n))
+        self.fail_queries(n, 2)
+        self.assertFalse(self.table.unreliable(n))
+
+    def test_answered_adds_like_heard(self):
+        """answered() adds a node not yet in the table, as hearing it would."""
+        n = node_id(42)
+        self.assertTrue(self.table.answered(n))
+        self.assertTrue(self.table.contains(n))
+        self.assertFalse(self.table.answered(OWN_ID))
+
+    def test_reliable_nodes_are_unaffected(self):
+        """Fewer than max_failures failures in a row leave a node reliable, with no retry to claim."""
+        n = node_id(42)
+        self.fail_queries(n, 2)
+        self.assertFalse(self.table.unreliable(n))
+        self.assertFalse(self.table.may_retry(n))
+        self.assertFalse(self.table.unreliable(node_id(43)))
+
+    def test_memory_is_bounded(self):
+        """At most MAX_UNRELIABLE nodes are remembered; the least recently failed is forgotten first."""
+        old = routing.MAX_UNRELIABLE
+        routing.MAX_UNRELIABLE = 4
+        self.addCleanup(setattr, routing, "MAX_UNRELIABLE", old)
+        ids = [node_id(100 + i) for i in range(5)]
+        for n in ids:
+            self.fail_queries(n, 3)
+        self.assertFalse(self.table.unreliable(ids[0]))
+        self.assertTrue(all(self.table.unreliable(n) for n in ids[1:]))
+
+
 class BanTest(RoutingTestCase):
     """Bans drop a node and ignore it for ban_time."""
 
@@ -251,6 +412,8 @@ class ThreadSafetyTest(RoutingTestCase):
     """Concurrent use from announce, request and lookup threads."""
 
     def test_concurrent_heard_failed_closest(self):
+        """Four threads hearing, failing and ranking nodes leave a consistent table: every node once, in its own
+        bucket, no bucket over K, and never our own ID."""
         rng = random.Random(2)
         ids = [rng.randbytes(ID_LENGTH) for _ in range(400)]
         errors = []
@@ -277,7 +440,13 @@ class ThreadSafetyTest(RoutingTestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
-        self.assertEqual(self.table.node_count(), len(self.table.nodes()))
+        nodes = self.table.nodes()
+        self.assertEqual(len(set(nodes)), self.table.node_count())  # each node once
+        self.assertNotIn(OWN_ID, nodes)
+        for n in nodes:
+            self.assertIn(n, self.table._buckets[self.table.bucket_index(n)])
+        self.assertTrue(all(len(bucket) <= K for bucket in self.table._buckets))
+        self.assertGreater(len(nodes), 0)
 
 
 if __name__ == "__main__":

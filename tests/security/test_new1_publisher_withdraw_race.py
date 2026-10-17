@@ -66,11 +66,13 @@ class WithdrawRaceTest(unittest.TestCase):
         state = os.path.join(self.tmp.name, "state")
         config = Config(rnfs_dir=self.tmp.name, republish_interval=1000)
         self.storage = Storage(os.path.join(self.tmp.name, "blocks"), state, 10**9)
+        self.addCleanup(self.storage.close)
         self.records = ProviderStore(1000, None)
         self.client = HoldingClient()
         self.clock = FakeClock(1_000_000.0)
         self.publisher = Publisher(OWN, config, self.storage, self.records, self.client,
                                    lambda key: FakeLookup(NODES), False, state, clock=self.clock)
+        self.addCleanup(self.publisher.close)
         self.cid = builder.build_bytes(b"some content", self.storage.put).cid
         self.storage.pin(self.cid, USER)
         self.publisher.refresh()

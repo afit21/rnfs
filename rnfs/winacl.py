@@ -1,7 +1,7 @@
 """Owner-only access on Windows: an explicit, protected DACL for the rnfs dir and its secret files (audit L7).
 
 POSIX systems get this from mode bits (a 0700 rnfs dir, 0600 key and token files, checked by
-node._make_private_dirs and cli.read_token), and there everything here does nothing. Windows ignores mode bits,
+node._make_private_dirs and apiclient.read_token), and there everything here does nothing. Windows ignores mode bits,
 so a new file just inherits its directory's access list: under the user's profile that is the user,
 Administrators and SYSTEM, but elsewhere (another drive, C:\\ProgramData) it usually lets every local user read
 the API token, the node's identity and the name keys. So on Windows:
@@ -400,9 +400,13 @@ def outside_profile(path: str) -> bool:
     return not fsutil.is_below(os.path.realpath(path), os.path.realpath(profile))
 
 
+_warned_outside: set[str] = set()  # roots already warned about as outside the profile (one warning per process)
+
+
 def secure_rnfs_dir(root: str, subdirs: tuple[str, ...] = ()):
     """On Windows, node._make_private_dirs: create the rnfs dir root and subdirs (below it) private from the
-    start, or check and tighten an existing root, and warn about a root outside the user's profile.
+    start, or check and tighten an existing root, and warn (once per process) about a root outside the user's
+    profile: a start makes the dirs private more than once (the lock, then the node).
 
     A new root is created with the protected owner-only DACL in the same call (make_private_dir), and must
     then be empty: anything in it was put there by someone else. An existing one is made private if others
@@ -440,7 +444,8 @@ def secure_rnfs_dir(root: str, subdirs: tuple[str, ...] = ()):
             _make_private_below(path, os.path.abspath(directory))
     except OSError as e:
         raise RnfsError(f"couldn't make the rnfs dir {root} private to you: {e}") from None
-    if outside_profile(root):
+    if outside_profile(root) and os.path.normcase(path) not in _warned_outside:
+        _warned_outside.add(os.path.normcase(path))
         log(f"the rnfs dir {root} is outside your user profile. rnfs has made it private to you, but accounts "
             f"that can change its parent folder could replace it: keep it in a folder only you can change",
             LOG_WARNING)

@@ -1,4 +1,5 @@
-"""Provider records stored for other nodes (specification section 6). No RNS dependency.
+"""Provider records stored for other nodes (specification section 6). No network access (RNS is loaded
+only through rnfs.log, for logging).
 
 A record says "publisher provides key". Records expire PROVIDER_TTL after they were last stored and keep
 their first-stored time across republishes. At most max_records are kept, a tenth of them in a newcomer
@@ -20,12 +21,16 @@ is kept for a TTL after its last record goes, so one that was away for a while i
 newcomer whose last record was evicted from the pool is kept too, in a smaller memory that forgets the most
 recently first seen first, so a flood can't keep a new publisher new forever.
 
-Times are wall clock and persisted, so a time in the future (the clock ran ahead, then was corrected) is
-clamped to now on load and at each expire(); otherwise such records would outlive their TTL.
+Records, first-seen times and departures are persisted in the state database (rnfs.statedb: the
+provider_records, provider_publishers, provider_departed and provider_evicted tables) by save(), which the node
+calls periodically and at shutdown, writing only the rows changed since the last save; they are read from it
+only at startup. Times are wall clock and persisted, so a time in the future (the clock ran ahead, then was
+corrected) is clamped to now on load and at each expire(); otherwise such records would outlive their TTL.
 """
 import heapq
 import itertools
 import json
+import math
 import os
 import random
 import threading
@@ -33,11 +38,12 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 
-from rnfs import fsutil
-from rnfs.constants import ID_LENGTH, K, PROVIDER_TTL
-from rnfs.dht.routing import check_id
+from rnfs import statedb
+from rnfs.constants import K, PROVIDER_TTL
+from rnfs.dht.routing import check_id, is_id
+from rnfs.log import LOG_ERROR, LOG_WARNING, log, plural
 
-_STATE_VERSION = 1
+_STATE_VERSION = 1  # of providers.json, which rnfs 0.1.4 and earlier wrote
 _EXPIRE_INTERVAL = 60  # when full, scan for expired records at most this often (seconds), not on every store
 PUBLISHER_SHARE = 100  # a publisher may hold at most max_records // PUBLISHER_SHARE records ...
 MIN_PER_PUBLISHER = 10  # ... but at least this many, so small stores still work
@@ -51,6 +57,96 @@ EVICTED_SHARE = 10  # ... and for newcomers evicted from the pool: at most pool_
 def _never(node_id: bytes) -> bool:
     """Default exclude predicate: excludes nothing."""
     return False
+
+
+def _number(value) -> float | None:
+    """A saved time as a float, or None if it isn't a number or is NaN (infinities are kept, as the JSON file's
+    float() kept them: the load's clamping and TTL check deal with them)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
+        return None
+    return float(value)
+
+
+# Migration of providers.json (rnfs 0.1.4 and earlier)
+
+
+def _parse_state(state) -> tuple[dict[bytes, float], list, list, list]:
+    """(first seen by publisher, records, departures, evictions) of a providers.json value, converted as rnfs
+    0.1.4 loaded it: records are (key, publisher, first stored, last stored, pooled), files written before the
+    newcomer pool having four fields per record and no departures or evictions. Raises ValueError (a version
+    other than _STATE_VERSION), KeyError, TypeError, AttributeError, OverflowError or IndexError if anything in it
+    is malformed: those versions then started empty."""
+    if state.get("version") != _STATE_VERSION:
+        raise ValueError(f"version {state.get('version')!r}, not {_STATE_VERSION}")
+    first_seen = {bytes.fromhex(p): float(t) for p, t in state["publishers"].items()}
+    records = [(bytes.fromhex(r[0]), bytes.fromhex(r[1]), float(r[2]), float(r[3]), len(r) > 4 and bool(r[4]))
+               for r in state["records"]]
+    departed = [(bytes.fromhex(p), float(seen), float(left)) for p, seen, left in state.get("departed", [])]
+    evicted = [(bytes.fromhex(p), float(seen), float(left)) for p, seen, left in state.get("evicted", [])]
+    return first_seen, records, departed, evicted
+
+
+_MALFORMED = (ValueError, KeyError, TypeError, AttributeError, OverflowError, IndexError)  # _parse_state's errors
+
+
+def read_records(path: str, shape=None):
+    """providers.json's value, for statedb.migrate (shape is unused), or None if there is none to import.
+
+    rnfs 0.1.4 started empty on any problem with it, and the next save overwrote it. Now one that isn't JSON, is
+    of another version or holds a malformed record is moved aside as damaged (the node starts without its
+    records, which publishers republish), and one that can't be read is logged and left, to import at the next
+    start.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return None
+    except ValueError as e:
+        statedb.set_aside(path, str(e))
+        return None
+    except OSError as e:
+        if os.path.isdir(path):  # Windows reports opening a directory as PermissionError
+            statedb.set_aside(path, "it is a directory")
+        else:
+            log(f"providers: could not read {path} ({e}); starting without its records, and importing it at the "
+                "next start", LOG_ERROR)
+        return None
+    try:
+        _parse_state(state)
+    except _MALFORMED as e:
+        statedb.set_aside(path, f"malformed: {e!r}")
+        return None
+    return state
+
+
+def import_records(value: dict, tx) -> int:
+    """Import providers.json (statedb.migrate): its publishers, records, departures and evictions replace the
+    four provider tables, converted as rnfs 0.1.4 loaded them. What that load dropped whatever the clock and
+    limits were (NaN times, IDs of the wrong length, a record repeated: the first stored is kept) is left out;
+    the rest (expiry, future times, limits, records of unknown publishers) is the load's. Returns the number of
+    records imported."""
+    for table in ("provider_publishers", "provider_records", "provider_departed", "provider_evicted"):
+        tx.execute(f"DELETE FROM {table}")
+    try:
+        first_seen, records, departed, evicted = _parse_state(value)
+    except _MALFORMED as e:  # read_records checked it: not expected
+        log(f"providers: not importing providers.json ({e!r}); starting without its records", LOG_ERROR)
+        return 0
+    tx.executemany("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)",
+                   [(p, t) for p, t in first_seen.items() if is_id(p) and t == t])
+    kept: dict[tuple[bytes, bytes], tuple] = {}
+    for key, publisher, first, last, pooled in sorted(records, key=lambda record: record[2]):
+        if is_id(key) and is_id(publisher) and first == first and last == last:
+            kept.setdefault((key, publisher), (key, publisher, first, last, int(pooled)))
+    tx.executemany("INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
+                   " VALUES (?, ?, ?, ?, ?)", list(kept.values()))
+    for table, entries in (("provider_departed", departed), ("provider_evicted", evicted)):
+        # The load applied them oldest first, a later one replacing an earlier one of the same publisher
+        tx.executemany(f"INSERT OR REPLACE INTO {table} (publisher, first_seen, at) VALUES (?, ?, ?)",
+                       [(p, seen, left) for p, seen, left in sorted(entries, key=lambda item: item[2])
+                        if is_id(p) and seen == seen and left == left])
+    return len(kept)
 
 
 class _Record:
@@ -85,17 +181,17 @@ class _Publisher:
 class ProviderStore:
     """Provider records, publishers' first-seen times, and /find reply selection. Thread-safe.
 
-    `clock` is wall-clock seconds, since times are persisted. `state_path` (None: memory only) is where
-    save() writes records and first-seen times as JSON; it is loaded on construction. `rng` picks the
+    `clock` is wall-clock seconds, since times are persisted. `state_dir` (None: memory only) holds the state
+    database save() writes records and first-seen times to; they are loaded on construction. `rng` picks the
     random half of /find replies, the publisher a full key evicts and, among the publishers holding the most
     pooled records, the one a full pool evicts from.
     """
 
-    def __init__(self, max_records: int, state_path: str | None, ttl: float = PROVIDER_TTL,
+    def __init__(self, max_records: int, state_dir: str | None, ttl: float = PROVIDER_TTL,
                  clock: Callable[[], float] = time.time, rng: random.Random = random,
                  max_per_publisher: int | None = None, max_per_key: int = MAX_PUBLISHERS_PER_KEY,
                  own_id: bytes | None = None, seniority: float = 0.0):
-        """Store of at most max_records records, loaded from state_path if it exists.
+        """Store of at most max_records records, loaded from the state database in state_dir if given.
 
         max_per_publisher defaults to max(MIN_PER_PUBLISHER, max_records // PUBLISHER_SHARE); a publisher
         seen for less than `seniority` seconds (the node passes provider_seniority; 0: no ramp-up) may hold
@@ -112,7 +208,6 @@ class ProviderStore:
         self.max_per_key = max_per_key
         self.own_id = own_id
         self.seniority = seniority
-        self.state_path = state_path
         self.ttl = ttl
         self.clock = clock
         self.rng = rng
@@ -139,12 +234,22 @@ class ProviderStore:
         self._evicted_size = max(MIN_PER_PUBLISHER, self.pool_size // EVICTED_SHARE)
         self._count = 0
         self._main_count = 0
-        self._dirty = False
+        # Rows changed since the last save (only tracked when persisted): records by (key, publisher), publishers,
+        # and publishers whose departed or evicted entry changed. save() writes each as memory has it then, or
+        # deletes it if memory has none
+        self._dirty_records: set[tuple[bytes, bytes]] = set()
+        self._dirty_publishers: set[bytes] = set()
+        self._dirty_gone: set[bytes] = set()
         self._last_expire = float("-inf")
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
-        if state_path is not None:
-            self._load()
+        self._db = None if state_dir is None else statedb.connect(state_dir)
+        if self._db is not None:
+            try:
+                self._load()
+            except BaseException:
+                self._db.close()
+                raise
 
     # Storing and withdrawing
 
@@ -155,9 +260,10 @@ class ProviderStore:
         while it has been seen for less than `seniority`; expired records don't count; own_id is exempt). A
         key with max_per_key publishers evicts one at random, never one of the K/2 oldest records (those
         /find replies list first). Then, if the store outside the pool is full, a publisher seen before the
-        newest one there evicts a record of that newest publisher; any other goes into the pool, evicting a
-        random pooled record if it is full (refused if that record is its own, so it can't churn its own
-        records). So new identities can't displace older publishers, and a new publisher always gets in.
+        newest one there evicts a record of that newest publisher; any other goes into the pool. A full pool
+        evicts the record pooled first by one of the publishers holding the most pooled records, and refuses a
+        publisher already holding that many (so it can't churn its own records). So new identities can't
+        displace older publishers, and a new publisher always gets in.
         """
         check_id(key)
         check_id(publisher)
@@ -168,7 +274,7 @@ class ProviderStore:
                 record.last_stored = now
                 if record.pooled and self._main_count < self.main_size:
                     self._unpool(key, publisher, record)  # room outside the pool: it leaves random eviction
-                self._dirty = True
+                self._touch(key, publisher)
                 return True
             # An expired record still counted is replaced, starting a new first-stored time
             self._remove(key, publisher)
@@ -184,10 +290,10 @@ class ProviderStore:
             entry = self._publishers.get(publisher)
             if entry is None:
                 first_seen = self._departed_first_seen(publisher, now)
-                self._departed.pop(publisher, None)
-                self._evicted.pop(publisher, None)
+                self._forget_gone(publisher)
                 entry = self._publishers[publisher] = _Publisher(now if first_seen is None else first_seen,
                                                                  next(self._order))
+                self._touch_publisher(publisher)
             entry.keys.add(key)
             record = self._records.setdefault(key, {})[publisher] = _Record(now, now, pooled)
             self._count += 1
@@ -195,15 +301,13 @@ class ProviderStore:
                 self._pool_add(key, publisher)
             else:
                 self._add_main(publisher, entry)
-            self._dirty = True
+            self._touch(key, publisher)
             return True
 
     def withdraw(self, key: bytes, publisher: bytes) -> bool:
         """Remove publisher's record for key. True if there was one."""
         with self._lock:
-            removed = self._remove(key, publisher)
-            self._dirty = self._dirty or removed
-            return removed
+            return self._remove(key, publisher)
 
     def provide(self, publisher: bytes, keys: Iterable[bytes], withdrawn: Iterable[bytes] = ()) -> int:
         """Apply one /provide batch from publisher: withdraw `withdrawn`, then store `keys`.
@@ -237,9 +341,7 @@ class ProviderStore:
                 for key in list(entry.keys) if entry is not None else ():
                     removed += self._remove(key, publisher)
                 # Not kept as departed either: its standing here came from records it shouldn't have had
-                self._departed.pop(publisher, None)
-                self._evicted.pop(publisher, None)
-            self._dirty = self._dirty or removed > 0
+                self._forget_gone(publisher)
         return removed
 
     def allowance(self, publisher: bytes) -> int | None:
@@ -282,7 +384,6 @@ class ProviderStore:
                 senior = min(K // 2, self.max_per_key - 1)
                 victim = list(records)[self.rng.randrange(senior, len(records))]
                 self._remove(key, victim)
-                self._dirty = True
         return True
 
     def _sweep_publisher(self, publisher: bytes, entry: _Publisher, now: float):
@@ -292,7 +393,6 @@ class ProviderStore:
             record = self._records[key][publisher]
             if now - record.last_stored >= self.ttl:
                 self._remove(key, publisher)
-                self._dirty = True
             else:
                 earliest = min(earliest, record.last_stored)
         entry.sweep_after = earliest + self.ttl
@@ -303,7 +403,6 @@ class ProviderStore:
             record = self._records.get(key, {}).get(publisher)
             if record is not None and now - record.last_stored >= self.ttl:
                 self._remove(key, publisher)
-                self._dirty = True
 
     def _make_room(self, publisher: bytes, now: float) -> bool | None:
         """Where a new record of publisher goes: False outside the pool, True in it, None if refused. Evicts
@@ -438,6 +537,7 @@ class ProviderStore:
         if not records:
             del self._records[key]
         self._count -= 1
+        self._touch(key, publisher)
         entry = self._publishers[publisher]
         entry.keys.discard(key)
         if record.pooled:
@@ -447,6 +547,7 @@ class ProviderStore:
             entry.main -= 1
         if not entry.keys:
             del self._publishers[publisher]
+            self._touch_publisher(publisher)
             self._depart(publisher, entry.first_seen, self.clock(), evicted)
         return True
 
@@ -455,23 +556,48 @@ class ProviderStore:
         `seniority` (a younger one has no standing to lose, and leaving those out means a flood of fresh
         identities can't push the others out). A younger one whose last record a full pool evicted is kept
         in a memory of its own, so being pushed out doesn't make it new again. Caller holds the lock."""
-        self._departed.pop(publisher, None)
-        self._evicted.pop(publisher, None)
+        self._forget_gone(publisher)
         if now - first_seen < self.seniority:
             if evicted:
                 self._remember_evicted(publisher, first_seen, now)
             return
         self._departed[publisher] = (first_seen, now)
+        self._touch_gone(publisher)
         while len(self._departed) > self._departed_size:
-            self._departed.popitem(last=False)
+            self._touch_gone(self._departed.popitem(last=False)[0])
 
     def _remember_evicted(self, publisher: bytes, first_seen: float, now: float):
         """Keep a pool-evicted newcomer's first-seen time; when the memory is full, the one first seen most
         recently (perhaps this one) is forgotten. Caller holds the lock."""
         self._evicted[publisher] = (first_seen, now)
+        self._touch_gone(publisher)
         if len(self._evicted) > self._evicted_size:
             newest = max(self._evicted, key=lambda p: self._evicted[p][0])
             del self._evicted[newest]
+            self._touch_gone(newest)
+
+    def _forget_gone(self, publisher: bytes):
+        """Drop publisher's departed or evicted entry, if it has one. Caller holds the lock."""
+        departed = self._departed.pop(publisher, None)
+        evicted = self._evicted.pop(publisher, None)
+        if departed is not None or evicted is not None:
+            self._touch_gone(publisher)
+
+    def _touch(self, key: bytes, publisher: bytes):
+        """Note that publisher's record for key changed (or went), for the next save. Caller holds the lock."""
+        if self._db is not None:
+            self._dirty_records.add((key, publisher))
+
+    def _touch_publisher(self, publisher: bytes):
+        """Note that publisher's first-seen time changed (or went), for the next save. Caller holds the lock."""
+        if self._db is not None:
+            self._dirty_publishers.add(publisher)
+
+    def _touch_gone(self, publisher: bytes):
+        """Note that publisher's departed or evicted entry changed (or went), for the next save. Caller holds the
+        lock."""
+        if self._db is not None:
+            self._dirty_gone.add(publisher)
 
     def _departed_first_seen(self, publisher: bytes, now: float) -> float | None:
         """First-seen time of a publisher whose last record went less than a TTL ago, else None. Caller holds
@@ -505,40 +631,38 @@ class ProviderStore:
             self._remove(key, publisher)
         # Departures are in order, oldest first
         while self._departed and now - next(iter(self._departed.values()))[1] >= self.ttl:
-            self._departed.popitem(last=False)
-            self._dirty = True
+            self._touch_gone(self._departed.popitem(last=False)[0])
         while self._evicted and now - next(iter(self._evicted.values()))[1] >= self.ttl:
-            del self._evicted[next(iter(self._evicted))]
-            self._dirty = True
-        self._dirty = self._dirty or bool(expired)
+            publisher = next(iter(self._evicted))
+            del self._evicted[publisher]
+            self._touch_gone(publisher)
         return len(expired)
 
     def _clamp(self, now: float):
         """Bring every time after now back to now (the clock was corrected backwards). Caller holds the lock."""
         stored_moved = False
-        for records in self._records.values():
-            for record in records.values():
-                if record.last_stored > now:
-                    record.last_stored = now
-                    stored_moved = self._dirty = True
-                if record.first_stored > now:
-                    record.first_stored = now
-                    self._dirty = True
+        for key, records in self._records.items():
+            for publisher, record in records.items():
+                if record.last_stored > now or record.first_stored > now:
+                    stored_moved = stored_moved or record.last_stored > now
+                    record.last_stored = min(record.last_stored, now)
+                    record.first_stored = min(record.first_stored, now)
+                    self._touch(key, publisher)
         moved = False
-        for entry in self._publishers.values():
+        for publisher, entry in self._publishers.items():
             if stored_moved:
                 entry.sweep_after = float("-inf")  # expiries moved earlier: its next sweep can't be skipped
             if entry.first_seen > now:
                 entry.first_seen = now
+                self._touch_publisher(publisher)
                 moved = True
         for memory in (self._departed, self._evicted):
             for publisher, (first_seen, departed) in list(memory.items()):
                 if first_seen > now or departed > now:
                     memory[publisher] = (min(first_seen, now), min(departed, now))
-                    self._dirty = True
+                    self._touch_gone(publisher)
         if moved:
             self._rebuild_newest()
-            self._dirty = True
 
     # Queries
 
@@ -606,71 +730,95 @@ class ProviderStore:
     # Persistence
 
     def save(self):
-        """Write records and first-seen times to state_path atomically, if anything changed since the last save.
+        """Write the records, first-seen times and departures changed since the last save, if any.
 
-        Call it periodically and at shutdown; storing doesn't save, since a full store is megabytes.
+        Call it periodically and at shutdown; storing doesn't save, since records change with every /provide.
         """
-        if self.state_path is None:
+        if self._db is None:
             return
         # Saves come from the maintenance thread and from stop(): one at a time, or a snapshot taken before
-        # the other's could be written last, with _dirty already cleared
+        # the other's could be written last, with the changes it holds already cleared
         with self._save_lock:
             with self._lock:
-                if not self._dirty:
+                records, publishers, gone = self._dirty_records, self._dirty_publishers, self._dirty_gone
+                if not (records or publishers or gone):
                     return
-                state = {
-                    "version": _STATE_VERSION,
-                    "publishers": {publisher.hex(): entry.first_seen
-                                   for publisher, entry in self._publishers.items()},
-                    "records": [[key.hex(), publisher.hex(), record.first_stored, record.last_stored,
-                                 int(record.pooled)]
-                                for key, records in self._records.items() for publisher, record in records.items()],
-                    "departed": [[publisher.hex(), first_seen, departed]
-                                 for publisher, (first_seen, departed) in self._departed.items()],
-                    "evicted": [[publisher.hex(), first_seen, evicted]
-                                for publisher, (first_seen, evicted) in self._evicted.items()],
-                }
-                self._dirty = False
-            directory = os.path.dirname(os.path.abspath(self.state_path))
-            os.makedirs(directory, exist_ok=True)
+                self._dirty_records, self._dirty_publishers, self._dirty_gone = set(), set(), set()
+                # Only copied under the lock (records change in place); written without it
+                stored, removed = [], []
+                for key, publisher in records:
+                    record = self._records.get(key, {}).get(publisher)
+                    if record is None:
+                        removed.append((key, publisher))
+                    else:
+                        stored.append((key, publisher, record.first_stored, record.last_stored, int(record.pooled)))
+                seen = [(p, self._publishers[p].first_seen) for p in publishers if p in self._publishers]
+                unseen = [(p,) for p in publishers if p not in self._publishers]
+                departed = [(p, *self._departed[p]) for p in gone if p in self._departed]
+                evicted = [(p, *self._evicted[p]) for p in gone if p in self._evicted]
+                no_longer = [(p,) for p in gone]
+            stored.sort()  # in key order, as the table is: a full save writes a third faster
             try:
-                fsutil.write_atomic(self.state_path, json.dumps(state, separators=(",", ":")).encode(), mode=0o600)
+                with self._db.transaction() as tx:
+                    tx.executemany("DELETE FROM provider_records WHERE key = ? AND publisher = ?", removed)
+                    tx.executemany("INSERT OR REPLACE INTO provider_records (key, publisher, first_stored, last_stored,"
+                                   " pooled) VALUES (?, ?, ?, ?, ?)", stored)
+                    tx.executemany("DELETE FROM provider_publishers WHERE publisher = ?", unseen)
+                    tx.executemany("INSERT OR REPLACE INTO provider_publishers (publisher, first_seen) VALUES (?, ?)",
+                                   seen)
+                    tx.executemany("DELETE FROM provider_departed WHERE publisher = ?", no_longer)
+                    tx.executemany("DELETE FROM provider_evicted WHERE publisher = ?", no_longer)
+                    tx.executemany("INSERT OR REPLACE INTO provider_departed (publisher, first_seen, at)"
+                                   " VALUES (?, ?, ?)", departed)
+                    tx.executemany("INSERT OR REPLACE INTO provider_evicted (publisher, first_seen, at)"
+                                   " VALUES (?, ?, ?)", evicted)
             except BaseException:
-                with self._lock:
-                    self._dirty = True  # try again next time
+                with self._lock:  # try again next time
+                    self._dirty_records |= records
+                    self._dirty_publishers |= publishers
+                    self._dirty_gone |= gone
                 raise
 
-    def _load(self):
-        """Load state_path if it exists. A missing or unreadable file starts empty: records get republished.
+    def close(self):
+        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        if self._db is not None:
+            self._db.close()
 
-        Files written before the newcomer pool (four fields per record, no departures) load with every record
-        outside the pool, as far as it has room.
+    def _load(self):
+        """Load the saved records, first-seen times and departures, applying the TTL and limits as configured now.
+
+        Rows that don't load (malformed, expired, past a limit, of a publisher left without records) or that load
+        changed (times clamped, a record moved in or out of the pool) are marked changed, so the next save deletes
+        or rewrites them and the tables hold what memory does. Files rnfs 0.1.3 wrote, before the newcomer pool,
+        were imported with every record outside it: those load outside the pool, as far as it has room.
         """
-        try:
-            with open(self.state_path, encoding="utf-8") as f:
-                state = json.load(f)
-            if state.get("version") != _STATE_VERSION:
-                return
-            first_seen = {bytes.fromhex(p): float(t) for p, t in state["publishers"].items()}
-            records = [(bytes.fromhex(r[0]), bytes.fromhex(r[1]), float(r[2]), float(r[3]),
-                        len(r) > 4 and bool(r[4])) for r in state["records"]]
-            departed = [(bytes.fromhex(p), float(seen), float(left)) for p, seen, left in state.get("departed", [])]
-            evicted = [(bytes.fromhex(p), float(seen), float(left)) for p, seen, left in state.get("evicted", [])]
-        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, IndexError):
-            return
+        publisher_rows = self._db.query("SELECT publisher, first_seen FROM provider_publishers")
+        record_rows = self._db.query("SELECT key, publisher, first_stored, last_stored, pooled FROM provider_records")
+        departed_rows = self._db.query("SELECT publisher, first_seen, at FROM provider_departed")
+        evicted_rows = self._db.query("SELECT publisher, first_seen, at FROM provider_evicted")
         now = self.clock()
+        malformed = 0
         # Times in the future (a clock that ran ahead, since corrected) count as now; NaN is dropped
-        first_seen = {p: min(t, now) for p, t in first_seen.items() if t == t}
-        records = [(k, p, min(first, now), min(last, now), pooled) for k, p, first, last, pooled in records
-                   if first == first and last == last]
+        first_seen = {}
+        for publisher, seen in publisher_rows:
+            seen = _number(seen)
+            if seen is None or not is_id(publisher):
+                malformed += 1
+                continue
+            first_seen[publisher] = min(seen, now)
+        records = []
+        for key, publisher, first, last, pooled in record_rows:
+            first, last = _number(first), _number(last)
+            if first is None or last is None or not is_id(key) or not isinstance(pooled, int):
+                malformed += 1
+                continue
+            records.append((key, publisher, min(first, now), min(last, now), bool(pooled)))
         # Rebuild first-seen order, oldest publisher first
         for publisher, seen in sorted(first_seen.items(), key=lambda item: item[1]):
-            if len(publisher) == ID_LENGTH:
-                self._publishers[publisher] = _Publisher(seen, next(self._order))
+            self._publishers[publisher] = _Publisher(seen, next(self._order))
         # Oldest records first, so each key's records are in first-stored order and the limits keep the oldest
         for key, publisher, first, last, pooled in sorted(records, key=lambda record: record[2]):
-            if (len(key) != ID_LENGTH or publisher not in self._publishers or now - last >= self.ttl
-                    or publisher in self._records.get(key, {})
+            if (publisher not in self._publishers or now - last >= self.ttl
                     or (publisher != self.own_id
                         and len(self._publishers[publisher].keys) >= self.max_per_publisher)
                     or len(self._records.get(key, ())) >= self.max_per_key):
@@ -693,11 +841,34 @@ class ProviderStore:
         for publisher in [p for p, entry in self._publishers.items() if not entry.keys]:
             del self._publishers[publisher]
         self._rebuild_newest()
+        departed, evicted = [], []
+        for rows, entries in ((departed_rows, departed), (evicted_rows, evicted)):
+            for publisher, seen, left in rows:
+                seen, left = _number(seen), _number(left)
+                if seen is None or left is None or not is_id(publisher):
+                    malformed += 1
+                    continue
+                entries.append((publisher, seen, left))
         for publisher, seen, left in sorted(departed, key=lambda item: item[2]):
-            if (len(publisher) == ID_LENGTH and seen == seen and left == left and publisher not in self._publishers
-                    and now - min(left, now) < self.ttl):
+            if publisher not in self._publishers and now - min(left, now) < self.ttl:
                 self._depart(publisher, min(seen, now), min(left, now))
         for publisher, seen, left in sorted(evicted, key=lambda item: item[2]):
-            if (len(publisher) == ID_LENGTH and seen == seen and left == left and publisher not in self._publishers
-                    and publisher not in self._departed and now - min(left, now) < self.ttl):
+            if (publisher not in self._publishers and publisher not in self._departed
+                    and now - min(left, now) < self.ttl):
                 self._remember_evicted(publisher, min(seen, now), min(left, now))
+        if malformed:
+            log(f"providers: ignoring {plural(malformed, 'malformed row')} in the state database", LOG_WARNING)
+        # The rows memory doesn't hold as they are
+        self._dirty_publishers = {publisher for publisher, seen in publisher_rows
+                                  if getattr(self._publishers.get(publisher), "first_seen", None) != seen}
+        self._dirty_records = {(key, publisher) for key, publisher, first, last, pooled in record_rows
+                               if self._saved_differs(key, publisher, first, last, pooled)}
+        self._dirty_gone = ({publisher for publisher, seen, left in departed_rows
+                             if self._departed.get(publisher) != (seen, left)}
+                            | {publisher for publisher, seen, left in evicted_rows
+                               if self._evicted.get(publisher) != (seen, left)})
+
+    def _saved_differs(self, key, publisher, first, last, pooled) -> bool:
+        """True unless memory holds a record of publisher for key with exactly these saved values (_load)."""
+        record = self._records.get(key, {}).get(publisher)
+        return record is None or (record.first_stored, record.last_stored, int(record.pooled)) != (first, last, pooled)

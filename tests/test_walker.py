@@ -318,6 +318,7 @@ class WalkTest(unittest.TestCase):
         self.assertEqual(len(data), 3 * constants.CHUNK_SIZE)
 
     def test_resolve_through_index(self):
+        """Every name in a directory split into index nodes resolves; a missing one is NotFound, naming it."""
         with small_tree():
             blocks = Blocks()
             names = [f"f{i:02d}" for i in range(40)]
@@ -331,18 +332,21 @@ class WalkTest(unittest.TestCase):
                     self.assertEqual(expect.kind, dag.KIND_FILE)
             for missing in ("a", "f00a", "f39z", "zz", "f1"):
                 with self.subTest(missing=missing):
-                    with self.assertRaises(NotFound):
+                    with self.assertRaises(NotFound) as caught:
                         walker.resolve(root, [missing], blocks.get)
+                    self.assertEqual(str(caught.exception), f"{root}/{missing} does not exist")
 
     def test_resolve_nested_and_into_file(self):
+        """Nested names resolve, no names give the root, and a name below a file is NotFound, naming the path."""
         blocks = Blocks()
         leaf = builder.build_bytes(b"leaf", blocks.put)
         inner = builder.wrap("leaf", leaf, blocks.put)
         outer = builder.wrap("inner", inner, blocks.put)
         self.assertEqual(walker.resolve(outer.cid, ["inner", "leaf"], blocks.get).cid, leaf.cid)
         self.assertEqual(walker.resolve(outer.cid, [], blocks.get), root_expect(outer.cid))
-        with self.assertRaises(NotFound):
+        with self.assertRaises(NotFound) as caught:
             walker.resolve(outer.cid, ["inner", "leaf", "deeper"], blocks.get)
+        self.assertEqual(str(caught.exception), f"{outer.cid}/inner/leaf/deeper does not exist")
 
     def test_list_directory(self):
         with small_tree():

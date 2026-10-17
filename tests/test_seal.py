@@ -14,6 +14,7 @@ from rnfs.content.seal import SEGMENT_SIZE, NotRecipient, SealError
 from rnfs.errors import TooLarge
 from rnfs.node import RnfsNode
 
+from tests.test_builder import ShortReads
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -125,6 +126,20 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(open_all(b"".join(pieces))[0], data)
         with self.assertRaises(ValueError):  # a sized stream that ends early
             seal.SealingReader(io.BytesIO(b"abc"), self.keys, size=10).read()
+
+    def test_streaming_reader_reads_whole_segments(self):
+        """SealingReader fills each segment through short reads, reads no more than a size allows, and says how
+        many bytes a sized stream lacked."""
+        data = os.urandom(2 * SEGMENT_SIZE)
+        stream = ShortReads(data + b"extra", 1000)
+        self.assertEqual(open_all(seal.SealingReader(stream, self.keys, size=len(data)).read())[0], data)
+        self.assertEqual((stream.pos, stream.largest_request), (len(data), SEGMENT_SIZE))
+        self.assertEqual(open_all(seal.SealingReader(ShortReads(data, 1000), self.keys).read())[0], data)
+        with self.assertRaisesRegex(ValueError, "^stream ended 7 bytes early$"):
+            seal.SealingReader(io.BytesIO(b"abc"), self.keys, size=10)
+        sealing = seal.SealingReader(ShortReads(data[:SEGMENT_SIZE + 3], 1000), self.keys, size=SEGMENT_SIZE + 10)
+        with self.assertRaisesRegex(ValueError, "^stream ended 7 bytes early$"):
+            sealing.read()
 
     def test_recipients(self):
         blob = seal.seal_bytes(b"secret", self.keys)
@@ -282,6 +297,23 @@ class NodeSealTest(unittest.TestCase):
         self.assertEqual(b"".join(self.b.read(cid, raw=True)), ciphertext)
         self.assertEqual(b"".join(self.b.read(cid, for_gateway=True)), ciphertext)  # the gateway never decrypts
         self.assertNotIn("sealed", self.b.info(cid, for_gateway=True))
+
+    def test_read_file_of_a_sealed_file(self):
+        """read_file gives a recipient the plaintext size and bytes, raw the ciphertext, and anyone else the
+        stored size, then NotRecipient at the first chunk (GET /api/cat)."""
+        data = os.urandom(SEGMENT_SIZE + 99)
+        cid = self.a.add_stream(io.BytesIO(data), to=[BOB.get_public_key().hex()], seal_name="note")["cid"]
+        self.advertise(cid)
+        info, chunks = self.b.read_file(cid, offset=SEGMENT_SIZE - 3, length=10)
+        self.assertEqual((info["sealed"], info["size"]), (True, len(data)))
+        self.assertEqual(b"".join(chunks), data[SEGMENT_SIZE - 3:SEGMENT_SIZE + 7])
+        info, chunks = self.b.read_file(cid, raw=True)
+        self.assertEqual(b"".join(chunks), b"".join(self.b.read(cid, raw=True)))
+        self.assertEqual(len(b"".join(self.b.read(cid, raw=True))), info["size"])
+        info, chunks = self.c.read_file(cid)
+        self.assertEqual((info["sealed"], info["recipient"], info["size"]), (True, False, info["stored_size"]))
+        with self.assertRaises(NotRecipient):
+            next(chunks)
 
     def test_non_recipient(self):
         cid = self.a.add_stream(io.BytesIO(b"for bob only"), to=[BOB.get_public_key().hex()], seal_name="note")["cid"]

@@ -89,7 +89,7 @@ class RemotePinWakeupTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         # make_nodes' second node (B) already knows the first (A): here A provides and B is asked to pin
-        _, self.provider, self.a = helpers.make_nodes(self.tmp.name)
+        _, self.provider, self.a = helpers.make_nodes(self.tmp.name, test=self)
         self.addCleanup(self.provider.stop)
         self.addCleanup(self.a.stop)
         self.cids = []

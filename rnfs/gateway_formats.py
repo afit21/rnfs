@@ -1,8 +1,8 @@
 """Trustless gateway responses (rnfs/gateway.py calls serve_format for any /rnfs/ request with ?format=):
 
-GET/HEAD /rnfs/<cid>?format=raw              the CID's own block, re-verified; application/vnd.rnfs.raw
-GET/HEAD /rnfs/<cid>[/path]?format=archive   an archive (spec section 8) of the target's DAG;
-                                             application/vnd.rnfs.archive, Content-Disposition attachment
+GET /rnfs/<cid>?format=raw              the CID's own block, re-verified; application/vnd.rnfs.raw
+GET /rnfs/<cid>[/path]?format=archive   an archive (spec section 8) of the target's DAG;
+                                        application/vnd.rnfs.archive, Content-Disposition attachment
 
 The client can verify either without trusting the gateway: a raw block hashes to its CID, and an archive's
 blocks are checked by `rnfs import` (or any reader) from the root down. Every gateway header rule still
@@ -73,14 +73,14 @@ def serve_format(handler, segments: list[str], names: list[str]):
                "Content-Disposition": f'attachment; filename="{cid}.rnfs-archive"'}
 
     def start(length: int):
-        """Send the headers once the archive's length is known; where to write it (None for HEAD)."""
+        """Send the headers once the archive's length is known; where to write it."""
         handler.send_response(200)
         handler.send_header("Content-Type", ARCHIVE_TYPE)
         handler.send_header("Content-Length", str(length))
         for name, value in headers.items():
             handler.send_header(name, value)
         handler.end_headers()
-        return None if handler.command == "HEAD" else handler.wfile
+        return handler.wfile
 
     try:
         # The fetch runs on this thread, so the observer sees it and cancels it once the client has gone

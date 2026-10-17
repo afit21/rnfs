@@ -1,0 +1,32 @@
+{
+ "version": 1,
+ "published": {
+  "imported": {
+   "sequence": 0,
+   "cid": null,
+   "imported": true
+  },
+  "photos": {
+   "sequence": 1,
+   "cid": "bagaibqabciqfbyihpeqy3nfafzl4qcbevvbpvtgaak2wxadkneio5dfclm3m6hi",
+   "imported": false
+  }
+ },
+ "held": {
+  "05c7214ca11e7646c79340c6b6d9866c": {
+   "sequence": 1,
+   "cid": "bagaibqabciqfbyihpeqy3nfafzl4qcbevvbpvtgaak2wxadkneio5dfclm3m6hi",
+   "heard": 1792055220.0
+  },
+  "a9f96ee8afd8b8bee788a442a84e555e": {
+   "sequence": 3,
+   "cid": "bafkreiherkniycepddysts7hctkszprpeyqcb35geojps2mcapym6x46zi",
+   "heard": 1792055820.0
+  },
+  "bcc7900726de195e4cc4b09e67f02966": {
+   "sequence": 12,
+   "cid": "bafkreigyxunorje5oovwdvvvtsjcb5tjmvi4lcsyabxv7t5ngcuabk3xh4",
+   "heard": 1792055640.0
+  }
+ }
+}
