@@ -1,12 +1,13 @@
 """Tests for Storage (specification section 8): pins and sources, cached fetches, protection, eviction, GC."""
 import os
+import random
 import shutil
 import tempfile
 import threading
 import unittest
 from unittest import mock
 
-from rnfs import fsutil, statedb
+from rnfs import constants, fsutil, statedb
 from rnfs.content import builder, dag, storage as storage_module, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
@@ -481,6 +482,49 @@ class EvictionTest(StorageTest):
         self.assertEqual(lost, set())  # a is still complete; b was never a target
         self.assertEqual(self.storage.cached_fetches(), [(root.cid, ("a",), a.cid)])
 
+    def test_warm_reads_what_the_path_walk_reaches(self):
+        """_warm and _path_cids share one path walk: warming reads exactly the stored nodes a record's path
+        reaches, through index nodes, missing names, files and nodes not stored, and the locked walk then reads
+        nothing."""
+        with mock.patch.multiple(constants, MAX_CHILDREN=3):
+            files = [self.add(b"%02d" % i * 20) for i in range(10)] + [self.add(b"G" * 70000)]  # raw blocks; a node
+            names = [f"f{i:02d}" for i in range(10)] + ["g"]
+            big = builder.build_directory([Entry(n, f.cid, f.size, 0) for n, f in zip(names, files)],
+                                          self.storage.put)  # index nodes over groups of 3 entries
+            inner = builder.wrap("big", big, self.storage.put)
+            root = builder.wrap("inner", inner, self.storage.put)
+        absent = builder.wrap("x", builder.build_bytes(b"absent", builder.NO_PUT), builder.NO_PUT)
+        missing = builder.wrap("absent", absent, self.storage.put)  # its one entry isn't stored
+        paths = [(root.cid, ("inner", "big", "f05")), (root.cid, ("inner", "big", "g")),
+                 (root.cid, ("inner", "big", "a")), (root.cid, ("inner", "big", "zz")),
+                 (root.cid, ("inner", "nothing")), (root.cid, ("inner", "big", "f00", "below a raw block")),
+                 (root.cid, ("inner", "big", "g", "below a file node")), (missing.cid, ("absent", "x")),
+                 (root.cid, ()), (files[0].cid, ("x",))]
+        for path in paths:
+            with self.subTest(path=path):
+                self.storage = self.open()  # nothing memoised
+                read = set()
+                real = Storage._read_node
+                with mock.patch.object(Storage, "_read_node", lambda s, cid: (read.add(cid), real(s, cid))[1]):
+                    self.storage._warm(set(), [path])
+                    stored = {cid for cid in read if self.storage.has(cid)}
+                    read.clear()
+                    with self.storage._lock:
+                        reached = self.storage._path_cids(*path)
+                self.assertEqual(reached, stored)
+                self.assertEqual(read, set())  # warmed: the walk under the lock read nothing
+        # What the walk reaches is what walker.step passes through
+        expected, expect = set(), walker.root_expect(root.cid)
+        for name in ("inner", "big", "f05"):
+            while True:
+                expected.add(expect.cid)
+                expect = walker.step(expect, self.storage.get(expect.cid), name)
+                if not walker.is_index_step(expect):
+                    break
+        self.assertGreater(len(expected), 4)  # through index nodes
+        with self.storage._lock:
+            self.assertEqual(self.storage._path_cids(root.cid, ("inner", "big", "f05")), expected)
+
     def test_lru_eviction(self):
         first = self.add(b"1" * 1000)
         second = self.add(b"2" * 1000)
@@ -650,6 +694,40 @@ class EvictionTest(StorageTest):
         self.assertEqual(held, [False])
         self.assertEqual(set(stats["bad"]), damaged)
         self.assertEqual(stats["incomplete"], {pinned.cid})  # not partial: it was incomplete before
+
+    def test_every_record_removal_is_saved_counted_and_collected(self):
+        """The cap, eviction, drop_denied and gc each remove records with the same bookkeeping (_drop_records):
+        the cache generation moves, the next save deletes their rows, and their blocks are garbage."""
+        files = [self.add(b"%d" % i * 1000) for i in range(6)]
+        for built in files:
+            self.storage.record_fetch(built.cid, [], built.cid)
+
+        def removed(operation) -> set[Cid]:
+            """The targets operation removed from the records, checked against a reopened storage."""
+            before = self.storage.cached_targets()
+            generation = self.storage.cache_generation()
+            operation()
+            gone = before - self.storage.cached_targets()
+            self.assertGreater(self.storage.cache_generation(), generation)
+            self.storage.save()
+            self.assertEqual(self.open().cached_fetches(), self.storage.cached_fetches())
+            if any(self.storage.has(cid) for cid in gone):
+                self.assertTrue(self.storage._maybe_garbage)  # the next collection takes them
+                self.storage.collect()
+            self.assertFalse(any(self.storage.has(cid) for cid in gone))
+            return gone
+
+        with mock.patch.object(storage_module, "MAX_CACHE_RECORDS", 5):
+            # Touching files[0] leaves files[1] the oldest, past the cap
+            self.assertEqual(removed(lambda: self.storage.record_fetch(files[0].cid, [], files[0].cid)),
+                             {files[1].cid})
+        self.storage.max_storage = self.storage.used_bytes() - 500
+        self.assertEqual(removed(self.storage.evict), {files[2].cid})
+        stats = {}
+        self.assertEqual(removed(lambda: stats.update(self.storage.drop_denied(frozenset({files[3].cid.binary})))),
+                         {files[3].cid})
+        self.assertEqual((stats["uncached"], stats["incomplete"]), ({files[3].cid}, {files[3].cid}))
+        self.assertEqual(removed(self.storage.gc), {files[0].cid, files[4].cid, files[5].cid})
 
     def test_cache_generation(self):
         files = [self.add(b"%d" % i * 1000) for i in range(4)]
@@ -834,6 +912,214 @@ class SizeTest(StorageTest):
                 self.assertNotIn(True, held)
                 self.assertFalse(any(cid.is_raw for cid in self.storage._links))  # raw blocks list nothing
 
+
+def walked_reach(storage: Storage, roots, known=frozenset(), damaged=None, partial=frozenset()) -> set[Cid]:
+    """Storage._reach as it was before D3: always a walk, never a complete DAG taken whole (the reference)."""
+    reached: set[Cid] = set()
+    stack = [cid for cid in roots if cid in storage._sizes and cid not in known]
+    while stack:
+        cid = stack.pop()
+        if cid in reached:
+            continue
+        reached.add(cid)
+        listed = storage._children(cid)
+        if listed is None:
+            if damaged is not None:
+                damaged.add(cid)
+            continue
+        stack.extend(child for child in listed if child in storage._sizes and child not in reached and child not in known)
+    return reached
+
+
+class CompletenessMemoTest(StorageTest):
+    """D3: complete DAGs taken whole, their byte totals and incomplete DAGs' missing blocks remembered; each memo
+    exact through every way blocks go (deletion, verify, eviction, unpin and gc) and come back."""
+
+    def scenario(self, seed: int) -> list[builder.Built]:
+        """Files shared between pinned and cached directories, records through paths, a block missing; the files."""
+        rng = random.Random(seed)
+        files = [self.add(b"%d.%d." % (seed, i) * rng.choice((10, 2000, 30000))) for i in range(12)]
+        dirs = []
+        for _ in range(5):
+            chosen = rng.sample(range(len(files)), rng.randint(1, 5))
+            dirs.append(builder.build_directory([Entry(f"f{i:02d}", files[i].cid, files[i].size, 0) for i in chosen],
+                                                self.storage.put))
+        top = builder.build_directory([Entry(f"d{i}", d.cid, d.size, 2) for i, d in enumerate(dirs)], self.storage.put)
+        # Older, another directory over some of the same: its DAG holds the path nodes of newer records
+        other = builder.build_directory([Entry(f"x{i}", dirs[i].cid, dirs[i].size, 2) for i in rng.sample(range(5), 3)],
+                                        self.storage.put)
+        self.storage.record_fetch(other.cid, [], other.cid)
+        self.storage.pin(dirs[0].cid, USER)
+        self.storage.pin(files[rng.randrange(len(files))].cid, USER)
+        self.storage.record_fetch(top.cid, [], top.cid)
+        for d in rng.sample(dirs[1:], 2):
+            self.storage.record_fetch(d.cid, [], d.cid)
+        for i, d in enumerate(dirs):
+            entries = dag.decode(self.storage.get(d.cid)).entries
+            entry = entries[rng.randrange(len(entries))]
+            self.storage.record_fetch(top.cid, [f"d{i}", entry.name], entry.cid)
+        for root, names, _ in rng.sample(self.storage.cached_fetches(), 3):
+            self.storage.touch(root, names)
+        self.storage._delete({files[rng.randrange(len(files))].cid})  # a file incomplete or gone
+        return files
+
+    def copy(self, name: str) -> Storage:
+        """A storage over a copy of this one's blocks and state."""
+        self.storage.save()
+        for part in ("blocks", "state"):
+            shutil.copytree(os.path.join(self.tmp.name, part), os.path.join(self.tmp.name, name, part))
+        storage = Storage(os.path.join(self.tmp.name, name, "blocks"), os.path.join(self.tmp.name, name, "state"),
+                          self.storage.max_storage)
+        self.addCleanup(storage.close)
+        return storage
+
+    def test_collections_decide_as_the_walk_does(self):
+        """Eviction, gc and drop_denied delete, keep and report exactly what they did when every DAG was walked,
+        including records whose target holds a newer record's path node (kept without its other children)."""
+        for seed in range(16):
+            for operation in ("evict", "gc", "drop_denied"):
+                with self.subTest(seed=seed, operation=operation):
+                    self.tmp = tempfile.TemporaryDirectory()
+                    self.addCleanup(self.tmp.cleanup)
+                    self.storage = self.open()
+                    files = self.scenario(seed)
+                    results = []
+                    for name, reach in (("memo", Storage._reach), ("walk", walked_reach)):
+                        storage = self.copy(name)
+                        for cid in storage.cached_targets() | set(storage.pins()):
+                            storage.is_complete(cid)  # memoised, as the publisher and earlier evictions leave them
+                        storage.max_storage = storage.used_bytes() * (seed + 2) // 18
+                        with mock.patch.object(Storage, "_reach", reach):
+                            if operation == "evict":
+                                result = storage.evict()
+                            elif operation == "gc":
+                                result = storage.gc()
+                            else:
+                                result = storage.drop_denied(frozenset({files[seed % 12].cid.binary}))
+                        results.append((result, storage.cached_fetches(), sorted(cid for cid, _ in storage.blocks.scan())))
+                    self.assertEqual(results[0], results[1])
+
+    def test_complete_dags_are_taken_whole(self):
+        root, a, b = self.tree()
+        self.storage.pin(root.cid, USER)
+        expected = self.storage.pinned_bytes()
+        self.storage = self.open()
+        self.assertTrue(self.storage.is_complete(root.cid))
+        visits = []
+        real = Storage._children
+        with mock.patch.object(Storage, "_children", lambda s, cid: (visits.append(cid), real(s, cid))[1]):
+            self.assertEqual(self.storage.pinned_bytes(), expected)
+            with self.storage._lock:
+                self.assertEqual(self.storage._reach([root.cid]), self.blocks_of(root.cid))
+                self.assertEqual(self.storage._reach([root.cid], {a.cid} | self.blocks_of(a.cid)),
+                                 self.blocks_of(root.cid) - self.blocks_of(a.cid))
+        self.assertEqual(visits, [])
+        # A partial block of known (a path node kept without its other children) stops the DAG being taken whole
+        with self.storage._lock:
+            self.assertEqual(self.storage._reach([root.cid], {root.cid}), set())
+            self.assertEqual(self.storage._reach([root.cid], {a.cid}, partial={a.cid}),
+                             walked_reach(self.storage, [root.cid], {a.cid}))
+            self.assertEqual(self.storage._reach([root.cid], {a.cid}, partial={a.cid}),
+                             self.blocks_of(root.cid) - self.blocks_of(a.cid))
+
+    def test_dag_bytes_memo_follows_every_deletion(self):
+        """dag_bytes of a complete DAG is summed once, and forgotten whenever one of its blocks goes: deleted,
+        found bad by verify, evicted with a cached fetch, or collected after an unpin."""
+        def check(cid: Cid, remembered: bool):
+            """dag_bytes is what a walk on a storage that has memoised nothing finds, from the memo or not."""
+            self.storage.is_complete(cid)
+            self.assertEqual(self.storage.dag_bytes(cid), self.open().dag_bytes(cid))
+            self.assertEqual(cid in self.storage._complete_bytes, remembered)
+
+        root, a, b = self.tree()
+        self.storage.pin(root.cid, USER)
+        check(root.cid, True)
+        self.storage._delete({dag.decode(self.storage.get(a.cid)).children[0].cid})
+        check(root.cid, False)
+        self.storage.unpin(root.cid, USER)
+
+        root, a, b = self.tree()  # a's lost chunk is back
+        self.storage.pin(root.cid, USER)
+        check(root.cid, True)
+        with open(self.storage.blocks.path(b.cid), "wb") as f:
+            f.write(b"damaged")
+        self.storage.verify()
+        check(root.cid, False)
+        self.storage.unpin(root.cid, USER)
+
+        cached = self.add(b"C" * 70000)
+        self.storage.record_fetch(cached.cid, [], cached.cid)
+        check(cached.cid, True)
+        self.storage.max_storage = 1
+        self.assertEqual(self.storage.evict(), {cached.cid})
+        check(cached.cid, False)
+        self.storage.max_storage = 10**9
+
+        pinned = self.add(b"P" * 70000)
+        self.storage.pin(pinned.cid, USER)
+        check(pinned.cid, True)
+        self.storage.unpin(pinned.cid, USER)
+        self.storage.gc()
+        check(pinned.cid, False)
+        self.assertEqual(self.storage.dag_bytes(pinned.cid), 0)
+
+    def test_missing_block_is_remembered(self):
+        """An incomplete DAG stays incomplete while the block found missing is: asked again it reads nothing,
+        and it is walked again once that block is back."""
+        built = self.add(os.urandom(300 * 64 * 1024))  # a root over two file nodes
+        nodes = dag.decode(self.storage.get(built.cid)).children
+        first = dag.decode(self.storage.get(nodes[0].cid)).children[0].cid  # the walk meets it last
+        last = dag.decode(self.storage.get(nodes[1].cid)).children[-1].cid
+        blocks = {cid: self.storage.get(cid) for cid in (first, last)}
+        self.storage._delete({first})
+        self.assertFalse(self.storage.is_complete(built.cid))
+        self.assertEqual(self.storage._missing, {built.cid: first})
+        with mock.patch.object(self.storage.blocks, "get", side_effect=AssertionError("read")), \
+                mock.patch.object(Storage, "block_size", side_effect=AssertionError("sized")):
+            self.assertFalse(self.storage.is_complete(built.cid))
+            with self.assertRaises(NotFound):
+                self.storage.dag_blocks(built.cid)
+        self.storage._delete({last})  # another block goes too: still incomplete, still remembered
+        self.assertFalse(self.storage.is_complete(built.cid))
+        self.storage.put(first, blocks[first])  # back: walked again, finding the other
+        self.assertFalse(self.storage.is_complete(built.cid))
+        self.assertEqual(self.storage._missing, {built.cid: last})
+        self.storage.put(last, blocks[last])
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.storage._missing, {})
+        # A root that isn't stored
+        absent = Cid.for_block(RAW, b"absent")
+        self.assertFalse(self.storage.is_complete(absent))
+        self.storage.put(absent, b"absent")
+        self.assertTrue(self.storage.is_complete(absent))
+
+    def test_missing_block_memo_is_bounded_and_notes_deletions_during_the_walk(self):
+        files = [self.add(b"%d" % i * 70000) for i in range(4)]
+        for f in files:
+            self.storage._delete({dag.decode(self.storage.get(f.cid)).children[0].cid})
+        with mock.patch.object(storage_module, "MISSING_MEMO", 2):
+            for f in files:
+                self.assertFalse(self.storage.is_complete(f.cid))
+            self.assertEqual(list(self.storage._missing), [files[2].cid, files[3].cid])
+            self.assertFalse(self.storage.is_complete(files[0].cid))  # forgotten: walked again
+        # A block of the DAG deleted while the walk runs, after the walk counted it, is remembered as missing
+        whole = self.add(b"W" * 70000)
+        chunks = dag.decode(self.storage.get(whole.cid)).children
+        real = self.storage.block_size
+
+        def block_size(cid):
+            """Storage.block_size; the last chunk's (met first) deletes it once counted."""
+            size = real(cid)
+            if cid == chunks[-1].cid and size is not None:
+                self.storage._delete({cid})
+            return size
+
+        with mock.patch.object(self.storage, "block_size", block_size):
+            with self.assertRaises(NotFound) as caught:
+                self.storage.dag_blocks(whole.cid)
+        self.assertEqual(str(caught.exception), f"a block of {whole.cid} was deleted")
+        self.assertEqual(self.storage._missing[whole.cid], chunks[-1].cid)
+        self.assertFalse(self.storage.is_complete(whole.cid))
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,16 @@ class FileNode:
         """Content bytes below this node: the sum of its children's sizes."""
         return sum(child.size for child in self.children)
 
+    @property
+    def child_cids(self) -> tuple[Cid, ...]:
+        """The CIDs this node lists, in order."""
+        return tuple(child.cid for child in self.children)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The names this node lists: none, for a file node."""
+        return ()
+
 
 @dataclass(frozen=True)
 class DirectoryNode:
@@ -95,6 +105,16 @@ class DirectoryNode:
         """Content bytes below this node: the sum of its entries' sizes."""
         return sum(entry.size for entry in self.entries)
 
+    @property
+    def child_cids(self) -> tuple[Cid, ...]:
+        """The CIDs this node lists (its entries'), in order."""
+        return tuple(entry.cid for entry in self.entries)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Its entries' names, in order."""
+        return tuple(entry.name for entry in self.entries)
+
 
 @dataclass(frozen=True)
 class IndexNode:
@@ -110,6 +130,16 @@ class IndexNode:
     def size(self) -> int:
         """Content bytes below this node: the sum of its children's sizes."""
         return sum(child.size for child in self.children)
+
+    @property
+    def child_cids(self) -> tuple[Cid, ...]:
+        """The CIDs this node lists, in order."""
+        return tuple(child.cid for child in self.children)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Its children's first names, in order."""
+        return tuple(child.first_name for child in self.children)
 
 
 Node = FileNode | DirectoryNode | IndexNode
@@ -343,14 +373,10 @@ def _decode(block: bytes) -> Node:
 def _check_node(node: Node):
     """The checks a decoded node must pass on its own. Raises InvalidDag."""
     if isinstance(node, DirectoryNode):
-        names = [entry.name for entry in node.entries]
         for entry in node.entries:
             if entry.kind not in KINDS:
                 raise InvalidDag(f"entry {entry.name!r} has unknown kind {entry.kind}")
-    elif isinstance(node, IndexNode):
-        names = [child.first_name for child in node.children]
-    else:
-        names = []
+    names = node.names
     for name in names:
         try:
             check_name(name)

@@ -55,6 +55,14 @@ class EncodingTest(unittest.TestCase):
         self.assertEqual(DirectoryNode([Entry("a", CHUNK, 3, 0), Entry("b", CHUNK, 4, 0)]).size, 7)
         self.assertEqual(IndexNode([IndexChild("a", NODE, 3)]).size, 3)
 
+    def test_child_cids_and_names(self):
+        file = FileNode([Child(CHUNK, 3), Child(NODE, 4)])
+        directory = DirectoryNode([Entry("a", CHUNK, 3, 0), Entry("b", NODE, 4, 2)])
+        index = IndexNode([IndexChild("a", NODE, 3), IndexChild("m", CHUNK, 4)])
+        self.assertEqual((file.child_cids, file.names), ((CHUNK, NODE), ()))
+        self.assertEqual((directory.child_cids, directory.names), ((CHUNK, NODE), ("a", "b")))
+        self.assertEqual((index.child_cids, index.names), ((NODE, CHUNK), ("a", "m")))
+
 
 class StrictDecodingTest(unittest.TestCase):
     """Every way a node can break the encoding rules is rejected."""

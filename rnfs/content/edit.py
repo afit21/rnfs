@@ -34,7 +34,9 @@ def _rebuild(chain: list[walker.Expect], names: list[str], entries: list[Entry],
         siblings = [entry for entry in walker.list_directory(parent, get) if entry.name != name]
         siblings.append(Entry(name, built.cid, built.size, dag.KIND_DIRECTORY))
         built = builder.build_directory(siblings, put)
-    # The builder can't see the depth of subtrees it didn't build, so check the finished tree
+    # The builder can't see the depth of subtrees it didn't build, so check the finished tree: walker.height
+    # remembers the subtrees it measured before, so once a tree has been measured an edit of it reads only the
+    # directories it rebuilt (rather than every node: building a directory one entry at a time was O(n²))
     if walker.height(walker.root_expect(built.cid), get) > constants.MAX_DEPTH:
         raise TooLarge(f"the edited tree would be deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     return built.cid
