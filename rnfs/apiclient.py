@@ -14,7 +14,8 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   Connecting and proving take at most PROOF_TIMEOUT seconds, reading at most PROOF_READ_LIMIT bytes. The proof
   is made on the connection that then carries the request (the daemon keeps it open for that one request), for
   every request, so a client used for a long time sends nothing to a program listening on the port after the
-  daemon stopped.
+  daemon stopped. Only a daemon proved older than 0.1.5, which closes every connection, gets the request on a
+  new one (KEEPS_PROOF_OPEN_SINCE, until 0.1.7).
 - That proof request is also where the daemon's version is read (Client.daemon_version), and check_daemon is the
   one place to refuse a daemon by it; every version is accepted for now.
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
@@ -33,6 +34,7 @@ import hmac
 import http.client
 import json
 import os
+import re
 import secrets
 import stat
 import warnings
@@ -50,6 +52,9 @@ PROOF_HEADER = "X-Rnfs-Proof"
 PROOF_TIMEOUT = 15  # seconds to connect and prove (at most the client's timeout): a listener mustn't hang a client
 PROOF_READ_LIMIT = 64 * 1024  # the most read of a proof's response (the daemon's is a few dozen bytes)
 COPY_SIZE = 64 * 1024  # what a Stream reads at a time when iterated
+# A daemon before 0.1.5 closes the connection it proved itself on; only one proved that old gets the request on a
+# new connection (the fallback is to be dropped in 0.1.7)
+KEEPS_PROOF_OPEN_SINCE = (0, 1, 5)
 
 
 class ApiError(errors.RnfsError):
@@ -123,6 +128,12 @@ def error_for(status: int, message: str) -> ApiError:
     """The ApiError subclass for an error response's status, with its message."""
     error_class = STATUS_ERRORS.get(status) or (ServerError if status >= 500 else ApiError)
     return error_class(message, status)
+
+
+def version_numbers(version) -> tuple[int, ...] | None:
+    """The numbers a version string starts with ("0.1.4.post1": (0, 1, 4)); None if it isn't one that does."""
+    match = re.match(r"\d+(?:\.\d+)*", version) if isinstance(version, str) else None
+    return tuple(int(number) for number in match.group().split(".")) if match else None
 
 
 def token_path(rnfs_dir: str = DEFAULT_DIR) -> str:
@@ -344,29 +355,36 @@ class ApiConnection:
         open for one more request, so the token and the request's body can only reach it: a proof made once,
         on another connection, would hold no longer than the daemon, and any local user can listen on its port
         once it stops. The token read is kept, and read again if the proof fails (a daemon restarted since
-        wrote a new one)."""
+        wrote a new one). A daemon that closes the connection anyway gets the request on a new one only if it
+        proved a version before 0.1.5 (whose daemons close every connection); for any other, ConnectionFailed."""
         token = self.token or read_token(self.token_file)
         try:
-            self.verify_daemon(token, connection)
+            version = self.verify_daemon(token, connection)
         except AuthFailed:
             fresh = read_token(self.token_file)
             if fresh == token:
                 raise
             connection.close()
             connection = self._connect(self._proof_timeout())
-            self.verify_daemon(fresh, connection)
+            version = self.verify_daemon(fresh, connection)
             token = fresh
         self.token = token
         if connection.sock is None:
-            # A daemon before 0.1.5 closes every connection: the request goes on a new one, as its clients sent it
+            # A new connection could reach another listener (the daemon may stop in between), so only a daemon too
+            # old to keep it open gets the request on one, as its clients sent it
+            numbers = version_numbers(version)
+            if numbers is None or numbers >= KEEPS_PROOF_OPEN_SINCE:
+                raise ConnectionFailed(f"the daemon on API port {self.port} closed the connection it proved itself "
+                                       f"on, so the request wasn't sent; see its log")
             connection = self._connect()
         else:
             connection.auto_open = 0  # never reconnect: a new connection could reach another listener
         return connection, token
 
-    def verify_daemon(self, token: str, connection: http.client.HTTPConnection | None = None):
+    def verify_daemon(self, token: str, connection: http.client.HTTPConnection | None = None) -> str | None:
         """Raise AuthFailed unless whatever listens on the API port (on connection, else a new one) proves it
-        knows token, before the token (or a name key) is sent to it. Then check_daemon() with its version.
+        knows token, before the token (or a name key) is sent to it. Then check_daemon() with its version, which
+        is returned (None if it didn't say) and kept in daemon_version.
 
         The proof is checked before anything else of the answer is believed: a listener that can't prove itself
         chooses neither the error (a 503 is Busy, as a daemon full of connections answers before reading the
@@ -404,12 +422,14 @@ class ApiConnection:
             version = json.loads(data).get("version")
         except (ValueError, AttributeError):
             version = None
-        self.daemon_version = version if isinstance(version, str) else None
+        version = version if isinstance(version, str) else None
+        self.daemon_version = version
         try:
-            self.check_daemon(self.daemon_version)
+            self.check_daemon(version)
         except ApiError:
             connection.close()
             raise
+        return version
 
     def check_daemon(self, version: str | None):
         """The one place to refuse a daemon by its version (None if it didn't say), before the token is sent;

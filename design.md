@@ -329,7 +329,9 @@ check goes. `verify_daemon` checks `X-Rnfs-Proof` before anything else of the an
 `503` is `Busy` and every other status `AuthFailed`, both in the client's own words, so a program on the port
 chooses neither the error nor its text; it reads at most `PROOF_READ_LIMIT` (64 KiB), and connecting and proving
 take at most `PROOF_TIMEOUT` (15 s, or the client's timeout if shorter), after which the request gets the client's
-own timeout. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
+own timeout. A daemon that closes the proved connection gets the request on a new one only if the version it proved
+is below 0.1.5 (`KEEPS_PROOF_OPEN_SINCE`; such daemons close every connection), else `ConnectionFailed`: a new
+connection could reach another listener. That fallback goes in 0.1.7. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
 failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
 `Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
