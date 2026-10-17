@@ -175,6 +175,11 @@ Changed:
   match `packaging/requirements.lock` runs on every push and pull request, and the release builds (Flatpak,
   Windows exe, arm64 .deb, Debian 12 smoke test) also run, without publishing, on pull requests that touch
   packaging and weekly. The Flatpak build no longer copies local debris from a checkout.
+- A block that doesn't match its CID raises `BlockMismatch`, and a damaged sealed file `SealError`: both are
+  `RnfsError`s and still `ValueError`s, so the API keeps answering 400 (and logs a `BlockMismatch` as a warning,
+  as it means a bug rather than a bad request). A shared-folder entry that fails with an unexpected `ValueError`
+  is logged and tried again after 10 minutes rather than skipped until the file changes. `dir rm` refuses a
+  target without a path in the node itself, before fetching anything.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -244,6 +249,9 @@ Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 - `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
   `status` (messages from untrusted senders dropped by the rate limits since the start).
+- `rnfs.BlockMismatch`, `rnfs.SealError` and `rnfs.NotRecipient`, to catch these errors by class. `ApiConnection`
+  has a typed method for every core API route (`dir_set`, `dir_rm`, `pin_remote`, `providers`, `ping`,
+  `name_import`, `name_export`, `name_rm`, `export`, `import_archive`, `gc`, `verify`).
 - `tests/security/README.md`: an index from each security finding's audit ID to its regression tests, the code they
   guard and the commits that fixed it, grouped by subsystem (a test checks that every security test is listed).
 - CONTRIBUTING.md: running the tests and their options, lint, the dependency locks, adding a schema step or an
