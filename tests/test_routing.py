@@ -408,6 +408,76 @@ class BanTest(RoutingTestCase):
         self.assertFalse(self.table.is_banned(node_id(43)))
 
 
+
+class PruneTest(RoutingTestCase):
+    """Expired bans and dropped nodes are forgotten from the front of their expiry order (S4), and the outcome is
+    the same when an entry is out of order."""
+
+    def drop(self, n: bytes):
+        """Add n and fail it until it is dropped."""
+        self.table.heard(n)
+        self.assertTrue(self.table.contains(n))
+        while not self.table.failed(n):
+            pass
+
+    def test_expired_entries_are_forgotten_when_a_node_is_heard(self):
+        dropped, banned = [node_id(100 + i) for i in range(3)], [node_id(200 + i) for i in range(3)]
+        for d, b in zip(dropped, banned):
+            self.drop(d)
+            self.table.ban(b)
+            self.clock.now += 10
+        self.clock.now = 1000 + 3600 + 15  # the first two bans have ended
+        self.table.heard(node_id(5))
+        self.assertEqual(list(self.table._bans), banned[2:])
+        self.assertEqual(list(self.table._dropped), dropped)
+        self.clock.now = 1000 + 2 * ANNOUNCE + 5  # the first drop has expired, and every ban
+        self.table.heard(node_id(5))
+        self.assertEqual(list(self.table._bans), [])
+        self.assertEqual(list(self.table._dropped), dropped[1:])
+
+    def test_setting_again_moves_an_entry_to_the_end(self):
+        first, second = node_id(42), node_id(43)
+        self.table.ban(first)
+        self.clock.now += 10
+        self.table.ban(second)
+        self.clock.now += 10
+        self.table.ban(first)  # ends after second's ban now
+        self.assertEqual(list(self.table._bans), [second, first])
+        self.clock.now += 3600 - 5  # second's ban has ended, not first's
+        self.assertTrue(self.table.heard(second))
+        self.assertNotIn(second, self.table._bans)
+        self.assertFalse(self.table.heard(first))
+        first, second = node_id(44), node_id(45)
+        self.drop(first)
+        self.clock.now += 10
+        self.drop(second)
+        self.clock.now += 10
+        self.drop(first)  # back, then dropped again: after second
+        self.assertEqual(list(self.table._dropped), [second, first])
+
+    def test_out_of_order_entries_still_expire(self):
+        # A changed ban_time (or a clock step) can put a later-ending entry first: it then holds the ones behind it
+        # in memory, but they no longer count
+        long_ban, short_ban = node_id(42), node_id(43)
+        self.table.ban(long_ban)
+        self.config.ban_time = 10
+        self.table.ban(short_ban)
+        self.clock.now += 11
+        self.assertTrue(self.table.heard(short_ban))
+        self.assertFalse(self.table.heard(long_ban))
+        late, early = node_id(44), node_id(45)
+        self.clock.now = 5000
+        self.drop(late)
+        self.clock.now = 1000  # stepped back
+        self.drop(early)
+        self.clock.now = 1000 + 2 * ANNOUNCE + 1  # early's seniority has expired, late's hasn't
+        self.table.heard(node_id(5))
+        self.assertEqual(list(self.table._dropped), [late, early])  # held behind late
+        self.assertTrue(self.table.heard(early))
+        self.assertEqual(self.table.seniority(early), 0)
+        self.assertTrue(self.table.heard(late))
+        self.assertEqual(self.table.seniority(late), 1000 + 2 * ANNOUNCE + 1 - 5000)
+
 class ThreadSafetyTest(RoutingTestCase):
     """Concurrent use from announce, request and lookup threads."""
 

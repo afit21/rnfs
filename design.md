@@ -253,6 +253,9 @@ the next one back a further backoff, so concurrent lookups don't all retry it), 
 min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
 dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
 `nodes()`, `node_count()`, `live_count()` (nodes `/find` replies would include).
+Every `heard` forgets expired bans and dropped nodes' seniority, looking only at the front of each: both are kept
+in expiry order (an entry set again is moved to the end), and their readers check expiry too, so an entry out of
+order (after a clock step or a changed setting) only lingers in memory.
 
 `providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
 max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
