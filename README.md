@@ -65,6 +65,8 @@ See documentation for more in depth information.
 
 ### GUI Application (Planned)
 
+Comming soon, stay tuned
+
 ### Project Gutenberg Nomadnet Mirror
 
 Visit '78d812594409fc12489f3d392974bec9:/page/index.mu' on NomadNet.
