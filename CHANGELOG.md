@@ -182,6 +182,11 @@ Faster:
 - An add makes one durable commit instead of two: the pin is committed durably first, and the name `pin ls` shows
   for it is written after it without a sync of its own, so a power loss can lose at most the latest names, never
   a pin. 4 KiB adds 12.9 → 10.5 ms, 1 MiB adds 18.9 → 16.4 ms on a local SSD.
+- The shared folder re-reads only the files that changed inside a changed entry: a per-file cache keyed by
+  device, inode, size, modification time and execute bit reuses a file's CID while all its blocks are stored and
+  none is denied, and its remembered content hash still goes through the deny list. Rescanning a 5000-file, 1 GiB
+  folder after a 4 KiB change: 1.20 → 0.10 s (256 MiB: 0.33 → 0.10 s). The cache is kept in the state database (a
+  new `shared_folder_files` table, added by the upgrade), so it holds right after a restart too.
 - Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
   over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
   there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
