@@ -1260,7 +1260,8 @@ gateway can never reach the API.
     its first byte, so the user's own `GET` fetches the whole DAG first, within `max_download_size` and
     `max_output_entries` (413 otherwise), and the fetch is cancelled if the client disconnects.
   - Every format is answered only to the user's own `GET`, which fetches what isn't stored. A request that
-    isn't the user's own navigation (`Sec-Fetch-Site` present and not `none`) and any `HEAD` get
+    isn't the user's own (`Sec-Fetch-Site` present and not `none`, or absent with a browser's `User-Agent`;
+    below) and any `HEAD` get
     `409 Conflict`, whether the target is stored or not, without the node fetching anything. A browser
     downloads both types, and a frame of a download fires no load event while an error page does, so an
     answer that depended on what is stored (a download for stored content, a fetch that fails or a `503` for
@@ -1289,7 +1290,12 @@ gateway can never reach the API.
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
   `gateway_fetches` network fetches or name resolutions at a time. Content already stored is served without
   limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
-  user started (address bar, bookmark); a request without it comes from a local tool the user runs.
+  user started (address bar, bookmark). A request without it is the user's own only if its `User-Agent`
+  doesn't start with `Mozilla/` (rnfs ignores case and leading spaces): then it comes from a local tool the
+  user runs, such as curl. Every browser's `User-Agent` starts with `Mozilla/`, and browsers without Fetch
+  Metadata (Safari before 16.4, Firefox before 90) send no `Sec-Fetch-Site` for a web page's requests either,
+  so all their requests are treated as a web page's: in them even the user's own navigation gets `409` for
+  `?format=` and is held to `gateway_fetches`.
 - Apart from timing, the `gateway_fetches` limit and content no provider has, a web page's request gets the
   same answer whether the node stores the content or has to fetch it. The limit is a known, accepted leak: while a
   page keeps every slot busy with fetches, stored content is still served and content that needs a fetch gets 503,
