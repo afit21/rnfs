@@ -844,7 +844,8 @@ class ImportTest(unittest.TestCase):
     def test_client_loads_no_rns(self):
         """rnfs.Client, the objects and errors load no RNS."""
         code = ("import sys, rnfs; rnfs.Client(port=1); rnfs.Cid, rnfs.Record, rnfs.NotFound, rnfs.ApiError, "
-                "rnfs.Job, rnfs.File; print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
+                "rnfs.Job, rnfs.File, rnfs.SealError, rnfs.NotRecipient, rnfs.BlockMismatch; "
+                "print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
         self.assertEqual(self.run_python(code), "False")
 
     def test_node_loads_rns_when_used(self):
@@ -856,6 +857,11 @@ class ImportTest(unittest.TestCase):
         """API_STATUS, the exported names, and an unknown one."""
         self.assertEqual(rnfs.API_STATUS, "provisional")
         self.assertIs(rnfs.NotFound, __import__("rnfs.errors").errors.NotFound)
+        # The errors programs could only catch as ValueError before (XC4): the classes rnfs raises
+        from rnfs.content import blockstore, seal
+        self.assertIs(rnfs.SealError, seal.SealError)
+        self.assertIs(rnfs.NotRecipient, seal.NotRecipient)
+        self.assertIs(rnfs.BlockMismatch, blockstore.BlockMismatch)
         self.assertIs(rnfs.Client, remote.Client)
         self.assertIn("Node", dir(rnfs))
         with self.assertRaises(AttributeError):

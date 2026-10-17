@@ -425,13 +425,25 @@ class ErrorTest(ClientTestCase):
                  (errors.TooLarge("t"), TooLarge, 413), (errors.InvalidDag("i"), InvalidDag, 422),
                  (errors.Denied("d"), Denied, 451),
                  (errors.Busy("b"), Busy, 503), (errors.StorageFull("s"), StorageFull, 507),
-                 (errors.RnfsError("r"), ServerError, 500))
+                 (errors.RnfsError("r"), ServerError, 500), (errors.BlockMismatch("m"), BadRequest, 400),
+                 (errors.SealError("s"), BadRequest, 400), (errors.NotRecipient("n"), BadRequest, 400))
         for error, expected, status in cases:
             with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log"):
                 with self.assertRaises(expected) as raised:
                     self.api.stat(cid)
             self.assertEqual((str(raised.exception), raised.exception.status), (str(error), status))
             self.assertIsInstance(raised.exception, ApiError)
+
+    def test_status_table_follows_the_node_errors(self):
+        """STATUS_ERRORS comes from rnfs.errors.STATUSES (XC4): each status's error is an ApiError and a subclass of
+        the node's class for it, so one except clause catches a Node's error and a Client's; 403 is AuthFailed."""
+        self.assertEqual(set(apiclient.STATUS_ERRORS), {status for _, status in errors.STATUSES} | {403})
+        for error_class, status in errors.STATUSES:
+            with self.subTest(status):
+                client_class = apiclient.STATUS_ERRORS[status]
+                self.assertTrue(issubclass(client_class, ApiError) and issubclass(client_class, error_class))
+                self.assertIs(type(apiclient.error_for(status, "x")), client_class)
+        self.assertIs(apiclient.STATUS_ERRORS[403], AuthFailed)
 
     def test_refused_without_the_token(self):
         """A protected endpoint asked without the token is AuthFailed (403); an unknown one NotFound."""

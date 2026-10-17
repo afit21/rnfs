@@ -20,11 +20,11 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   one place to refuse a daemon by it; every version is accepted for now.
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
   (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
-  refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS: 400
-  BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507 StorageFull, other 5xx
-  ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a subclass of the node's own
-  (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except clause catches what rnfs.Node
-  and rnfs.Client raise alike.
+  refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS, from
+  rnfs.errors.STATUSES: 400 BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507
+  StorageFull, other 5xx ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a
+  subclass of the node's own (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except
+  clause catches what rnfs.Node and rnfs.Client raise alike.
 - Each request opens its own connection (its proof, then the request), with no timeout for the request unless
   one is given (fetches can take hours), so an ApiConnection may be used from several threads. Paths are on the
   daemon's machine, which is this one: they are made absolute here.
@@ -119,9 +119,22 @@ class ServerError(ApiError):
     """500 or another 5xx: the daemon failed (see its log)."""
 
 
+# The client's error for each of the node's (errors.STATUSES), a subclass of both ApiError and the node's class
+_STATUS_CLASSES = (BadRequest, NotFound, TooLarge, InvalidDag, Denied, Busy, StorageFull)
+
+
+def _status_errors() -> dict[int, type[ApiError]]:
+    """Each API error status's ApiError subclass: errors.STATUSES' statuses, each to the client class of its node
+    error, and 403 (the token refused) to AuthFailed. A status added there without a class here fails here, at
+    import."""
+    table: dict[int, type[ApiError]] = {403: AuthFailed}
+    for error_class, status in errors.STATUSES:
+        table[status] = next(client for client in _STATUS_CLASSES if issubclass(client, error_class))
+    return table
+
+
 # The API's error statuses (design.md, "Node facade"); other 4xx raise ApiError, other 5xx ServerError
-STATUS_ERRORS = {400: BadRequest, 403: AuthFailed, 404: NotFound, 413: TooLarge, 422: InvalidDag, 451: Denied,
-                 503: Busy, 507: StorageFull}
+STATUS_ERRORS = _status_errors()
 
 
 def error_for(status: int, message: str) -> ApiError:

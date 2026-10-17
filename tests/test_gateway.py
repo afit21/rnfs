@@ -5,10 +5,11 @@ import time
 import unittest
 from unittest import mock
 
+from rnfs import errors
 from rnfs.config import Config
 from rnfs.errors import NotFound
-from rnfs.gateway import (CSP_NO_SCRIPTS, CSP_SCRIPTS, IMMUTABLE, GatewayServer, etag_matches, listing_html,
-                          parse_range, sniff)
+from rnfs.gateway import (CSP_NO_SCRIPTS, CSP_SCRIPTS, ERROR_MESSAGES, IMMUTABLE, GatewayServer, etag_matches,
+                          listing_html, parse_range, sniff)
 
 from tests.support import wait_for
 from tests.test_api import FakeNode, free_slots, held_connections, raw_request, read_until_closed
@@ -209,6 +210,18 @@ class FileTest(GatewayTestCase):
         self.assertIn("No space left on device", log.call_args.args[0])
         with mock.patch.object(self.node, "info", side_effect=ValueError("bad target")):
             self.assertEqual(self.get(f"/rnfs/{self.text}")[2], b"invalid request\n")  # a fixed message per status
+
+    def test_a_fixed_message_for_every_status(self):
+        """ERROR_MESSAGES has a message for every status of rnfs.errors.STATUSES (XC4), and for 500; a node error
+        gets its status's, never its own text."""
+        self.assertLessEqual({status for _, status in errors.STATUSES} | {500}, set(ERROR_MESSAGES))
+        for error_class, status in errors.STATUSES:
+            if error_class is NotFound:
+                continue  # its own text is shown (a 404 says what wasn't found)
+            with self.subTest(status), mock.patch.object(self.node, "info", side_effect=error_class("/home/alice")), \
+                    mock.patch("rnfs.gateway.log"):
+                code, _, body = self.get(f"/rnfs/{self.text}")
+            self.assertEqual((code, body), (status, ERROR_MESSAGES[status].encode() + b"\n"))
 
     def test_http_0_9_gets_headers(self):
         # A bare body for an HTTP/0.9 request would have no CSP: it is refused, with the usual headers

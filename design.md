@@ -431,9 +431,13 @@ nodes) and re-records the node's own record, and a round sends only withdrawals 
 each node, so a withdrawal queued while the key was briefly unprovided never follows a store of it.
 `protocol.provide_batches` puts withdrawals before stores, and a key in both lists is only stored.
 
-Errors: `ValueError` → 400, `NotFound` → 404, `TooLarge` → 413, `InvalidDag` → 422, `Busy` → 503,
-`StorageFull` → 507, `Denied` → 451, other `RnfsError` → 500. Paths passed to `add_path`, `get`, `export` and `import_archive`
-are absolute paths on the daemon's machine (the CLI resolves them); stdin is uploaded as a request body.
+Errors (`errors.STATUSES`, the one table: `api.ERROR_STATUSES` is it, `apiclient.STATUS_ERRORS` and the gateway's
+`ERROR_MESSAGES` follow it): `ValueError` → 400 (with `BlockMismatch`, `SealError` and `NotRecipient`, which
+subclass it), `NotFound` → 404, `TooLarge` → 413, `InvalidDag` → 422, `Busy` → 503, `StorageFull` → 507, `Denied`
+→ 451, other `RnfsError` → 500. The API logs a 500 as an error and a `BlockMismatch` (a block the node itself
+handed the store not matching its CID: a bug, not a bad request) as a warning. Paths passed to `add_path`, `get`,
+`export` and `import_archive` are absolute paths on the daemon's machine (the CLI resolves them); stdin is uploaded
+as a request body.
 
 **Core API routes** (`rnfs/api.py` `ROUTES`): `GET /api/status` (open), `/api/info`, `/api/cat`, `/api/ls`,
 `/api/stat`, `/api/pin/ls`, `/api/providers`, `/api/ping`, `/api/name/list`, `/api/name/resolve`,
@@ -486,8 +490,9 @@ that then carries the token: `ApiHandler.dispatch` keeps one open after a proof 
 `keep-alive` (`keep_open`, once per connection: `proved`), giving the next request a new request deadline. Both HTTP servers (`TimedHandler`) time out slow requests, cap concurrent connections (API
 32, gateway 64) and refuse HTTP/0.9 with a 400 carrying the usual headers (both add them in `end_headers`, so
 http.server's own error pages, 400, 414, 431 and 501, carry them too). Gateway errors raised by the node
-(anything but `GatewayError` and `NotFound`: 400, 413, 422, 503, 507, 500) say only a fixed message per status
-(`gateway.ERROR_MESSAGES`; the detail goes to the log); malformed `Range` headers are ignored.
+(anything but `GatewayError` and `NotFound`: 400, 413, 422, 451, 503, 507, 500) say only a fixed message per status
+(`gateway.ERROR_MESSAGES`, which has one for every status of `errors.STATUSES`; the detail goes to the log);
+malformed `Range` headers are ignored.
 
 Neither server sends CORS headers. Gateway pages run sandboxed in an opaque origin, so they load their DAG's
 files as subresources but can't read any gateway response with `fetch()`; an earlier rule allowing a gateway
@@ -673,7 +678,9 @@ before submitting, as the CLI resolves a nick. Jobs are persisted, resumed at th
 LXMF). Not in the typed interface for 0.2: keep/follow, contacts, peers/stats, LXMF.
 
 **Errors.** One hierarchy in `rnfs.errors`, every class importable as `rnfs.<Name>`: `RnfsError` ⊃
-`NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`.
+`NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`, and
+`BlockMismatch` and `SealError` (a sealed file malformed or tampered with), which are `ValueError`s too, as is
+`NotRecipient` (this node can't open a sealed file).
 `ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning`, `ConnectionFailed`, `TokenError`,
 `AuthFailed`, `SettingsError`, `ServerError` (500, or another 5xx), and the API statuses, each also a subclass
 of the node's class: `apiclient.NotFound(ApiError, errors.NotFound)` and so on, `BadRequest(ApiError,
@@ -1274,10 +1281,12 @@ Everything in the specification is implemented, with these simplifications and a
   RNS 1.5.6 that reaches the provider as a rejection, which before a quarter of the response is sent cools the
   requester down there (`RequestServer._concluded`), while a closed link doesn't. In private mode, incoming
   links not identified as a member's are closed first to make room.
-- A shared-folder entry that fails to import because of its content (an invalid name, the deny list, too large)
-  isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a pin the
-  state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, and an unchanged
-  entry whose pin fails is logged without ending the scan.
+- A shared-folder entry that fails to import because of its content (an `RnfsError`: the deny list, too large or
+  too deep) isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a
+  pin the state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, as is one
+  failing with a `ValueError` (a bug, such as a `BlockMismatch`: invalid names and special files inside an entry
+  are skipped, so the content doesn't cause one), logged with its type; an unchanged entry whose pin fails is
+  logged without ending the scan.
 - Inside an entry whose signature changed, the scan reads only the files that changed (audit D1):
   `SharedFolder.files` (a `FolderFiles`) maps each file's `builder.file_state` (device, inode, size, `mtime_ns`,
   execute bit; the open file's `fstat`, taken before it is read) to the `Built` it gave, grouped by top-level
