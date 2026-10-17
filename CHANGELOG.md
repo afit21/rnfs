@@ -14,10 +14,17 @@ Security:
   resolved. The sender chose that CID and nothing ties it to the name, so any sender could pose as a
   well-known name. It now fails before writing anything, unless you pass `--use-sent-cid`; then the result
   carries a warning. Auto-fetch (trusted senders only) keeps the fallback, and records it.
+- A `/blocks` requester that rejects or cancels a response before a quarter of it was sent now cools down for
+  `blocks_cooldown`, per link and per identity, as one that rejected it unsent already did. Before, a requester
+  could take the first window of each response, cancel it and ask again at once, so the node built a whole
+  response per window. Closing the link still starts no cooldown, so an honest reader that gives up early isn't
+  held back.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
   `use_sent_cid` (before, it fetched the sender's CID).
+- The specification now says a requester that gives up on a `/blocks` response closes its link, and never
+  cancels the Resource (0.1.5 and earlier already do so).
 - `rnfs inbox` shows the CID each name link was sent as ("sent as `<cid>`"), and marks an auto-fetch that
   pinned the sent CID because the name didn't resolve ("auto-fetch pinned (sent CID; name unresolved)";
   `"sent_cid": true` in the inbox record).
