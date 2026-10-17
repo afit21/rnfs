@@ -190,8 +190,10 @@ class NamesTestCase(unittest.TestCase):
         self.manager = self.make_manager()
 
     def make_manager(self) -> NameManager:
-        """A manager over the same directory (as after a restart), sharing the fakes; closed after the test."""
-        manager = NameManager(self.config, self.pins, network=self.network, clock=self.clock, monotonic=self.clock)
+        """A manager over the same directory (as after a restart), sharing the fakes; closed after the test. Its
+        refreshes wait in virtual time: path_timeout passes at once unless an answer has already arrived."""
+        manager = NameManager(self.config, self.pins, network=self.network, clock=self.clock, monotonic=self.clock,
+                              wait=lambda event, timeout: event.is_set())
         self.addCleanup(manager.close)
         return manager
 

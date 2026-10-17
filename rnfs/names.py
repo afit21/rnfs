@@ -604,6 +604,11 @@ class _NameFloor(Mapping):
 # Names
 
 
+def _wait_event(event: threading.Event, timeout: float) -> bool:
+    """Wait up to timeout seconds for event to be set: True if it was."""
+    return event.wait(timeout)
+
+
 class NameManager:
     """This node's name keys and records, and the records it has heard. Thread-safe.
 
@@ -612,13 +617,17 @@ class NameManager:
     shutdown.
     """
 
-    def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic):
-        """Names under config.names_dir and config.state_dir; pins has pin(cid, source) and unpin(cid, source)."""
+    def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic,
+                 wait=_wait_event):
+        """Names under config.names_dir and config.state_dir; pins has pin(cid, source) and unpin(cid, source).
+        wait(event, timeout) is how a refresh waits for an answer (_wait_event; tests pass one that doesn't
+        block)."""
         self.config = config
         self._pins = pins
         self._network = network if network is not None else RnsNetwork()
         self._clock = clock  # wall clock: heard times are persisted across restarts
         self._monotonic = monotonic  # announce schedule
+        self._wait = wait
         self._lock = threading.RLock()
 
         self._keys: dict[str, RNS.Identity] = {}
@@ -1081,12 +1090,13 @@ class NameManager:
         started = self._clock()
         try:
             self._network.request_path(name)
-            # Real time, not the injected clock: this is an actual wait
-            deadline = time.monotonic() + self.config.path_timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or event.wait(min(_POLL_INTERVAL, remaining)):
+            # Counted in the steps waited rather than read from a clock, so a test's wait runs it in virtual time
+            remaining = self.config.path_timeout
+            while remaining > 0:
+                step = min(_POLL_INTERVAL, remaining)
+                if self._wait(event, step):
                     break
+                remaining -= step
                 # A path response repeating an announce RNS already has doesn't change the path table, so it
                 # never reaches the handler; RNS still records when it heard it
                 heard = self._network.heard_time(name)
