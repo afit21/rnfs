@@ -96,6 +96,16 @@ Security:
   bytes of its DAG's blocks, fit in `follow_quota` (default 1 GiB); otherwise the check fails, the follow's state
   says why, and the previous target stays pinned. While one target replaces another both are held, so a followed
   name can use up to twice the quota for a time. Targets already pinned over the quota stay.
+- An auto-fetch sender can no longer push another auto-fetch sender's pinned messages out of the inbox.
+  Re-linking a CID it already pins costs no quota, so about 500 such messages filled the inbox with protected
+  records, and each further message dropped the oldest record of anyone, releasing its pin. Each of the n senders
+  in `lxmf_auto_fetch_from` now keeps at most 1/n of the inbox's messages and bytes, messages holding pins
+  included, and when every other message holds pins, a new one may push out only its own sender's.
+- Auto-fetches still queued for a sender removed from `lxmf_auto_fetch_from` are refused at the next start (with
+  LXMF off too) and when their turn comes. Before, up to 64 of them were fetched and pinned after a restart.
+- `rnfs inbox` shows each sender's address before its display name, marked `untrusted`, `trusted` or
+  `contact <nick>`; the display name, which the sender chooses, comes last, quoted and escaped. Before, a display
+  name like `alice <trusted address>` came first and pushed the real address off to the right.
 - A node's own provider records can no longer be evicted from its own store: about 1000 Sybil stores to a key it
   provides pushed its record out, and a full newcomer pool could take it too. Its own records don't count toward
   the publishers a key keeps and are never chosen for eviction.
@@ -135,6 +145,12 @@ Changed:
 - The specification documents that the API's proof keep-open lets one connection hold an API slot about twice as
   long as one request, and the measured cost of grinding node IDs near a key (raising it needs a change to how
   node IDs are derived, so it is deferred).
+- `rnfs inbox` prints each message as number, time, address, trust, method, then the quoted display name (the
+  text format isn't a stable interface; scripts should use the API). Display names are also escaped for
+  backslashes, blank filler characters (U+115F, U+1160, U+3164, U+FFA0, U+2800), stacked or leading combining
+  marks, and names of only spaces.
+- The specification documents that many LXMF identities can keep the strangers' bucket empty; contacts and other
+  trusted senders are unaffected.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -146,6 +162,8 @@ Changed:
 
 Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
+- `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
+  `status` (messages from untrusted senders dropped by the rate limits since the start).
 - The `follow_quota` setting: bytes a followed name's target may take (default 1 GiB; `0` stops fetching
   followed names).
 - `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and
