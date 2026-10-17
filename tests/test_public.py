@@ -274,6 +274,16 @@ class PublicTests:
                 self.rnfs.dir_rm(target)
         self.assertFalse(self.b.storage.has(remote))  # not fetched
 
+    def test_remote_pin_providers_and_ping(self):
+        """pin_remote asks the node (as /pin), providers finds the provider, ping times a node or answers None."""
+        cid = self.share(b"provided")
+        self.assertIs(self.rnfs.pin_remote(A_ID, cid), True)
+        self.assertIs(self.rnfs.pin_remote(A_ID, cid, pin=False), True)
+        self.assertEqual(self.net.pins, [(A_ID, cid, True), (A_ID, cid, False)])
+        self.assertIn(A_ID, self.rnfs.providers(cid))
+        self.assertEqual(self.rnfs.ping(A_ID), 0.1)
+        self.assertIsNone(self.rnfs.ping(OTHER))
+
     def test_errors_are_one_hierarchy(self):
         """The same exception classes whichever class raises them."""
         data = os.urandom(1000)

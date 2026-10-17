@@ -376,8 +376,10 @@ connection could reach another listener. That fallback goes in 0.1.7. `request()
 failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
 `Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
-`ls`, `stat`, `pin_*`, `name_*` (with `name_watch`), `submit_job`, `job`, `jobs`, `cancel_job`, `clear_jobs`,
-`deny*`) send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
+`ls`, `stat`, `dir_set`, `dir_rm`, `export`, `import_archive`, `gc`, `verify`, `pin_*` (with `pin_remote`),
+`providers`, `ping`, `name_*` (with `name_watch`, `name_import`, `name_export`, `name_rm`), `submit_job`, `job`,
+`jobs`, `cancel_job`, `clear_jobs`, `deny*`) cover every core route (`ApiHandler.ROUTES`; checked by
+test_apiclient), so `remote.py` writes no path itself, and send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
 node's own too (`NotFound` of `errors.NotFound`, `BadRequest` of `ValueError`, ...). The CLI's `ApiClient`
 subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are the library's.
 

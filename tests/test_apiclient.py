@@ -1,5 +1,6 @@
 """Tests for the client library of the local API (rnfs/apiclient.py), against a live ApiServer with a FakeNode."""
 import http.server
+import inspect
 import io
 import os
 import subprocess
@@ -10,7 +11,7 @@ import unittest
 from unittest import mock
 
 from rnfs import apiclient, cli
-from rnfs.api import ApiServer
+from rnfs.api import ApiHandler, ApiServer
 from rnfs.apiclient import (ApiConnection, ApiError, AuthFailed, BadRequest, Busy, ConnectionFailed, DaemonNotRunning,
                             Denied, InvalidDag, NotFound, ServerError, SettingsError, StorageFull, TokenError, TooLarge)
 from rnfs.config import DEFAULT_API_PORT
@@ -219,6 +220,56 @@ class OperationsTest(ClientTestCase):
         self.assertEqual([entry["alias"] for entry in self.api.name_list()], ["site"])
         with self.assertRaises(NotFound):
             self.api.name_resolve("ab" * 16)
+
+    def test_directories_archives_and_maintenance(self):
+        """dir_set and dir_rm, export and import_archive (paths made absolute), gc and verify (ND4)."""
+        file_cid = self.node.put_file(b"abc")
+        directory = self.node.put_dir({"a": file_cid})
+        edited = self.api.dir_set(directory, "b", file_cid, executable=True)["cid"]
+        self.assertEqual(self.node.called("dir_set")[0], ((directory, "b", file_cid), {"executable": True}))
+        self.assertEqual(self.api.dir_rm(f"{edited}/b"), {"cid": directory})
+        with self.assertRaises(BadRequest):
+            self.api.dir_rm(directory)
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, ROOT)
+        self.assertEqual(self.api.export(directory, "archive")["roots"], [directory])
+        sent = self.node.called("export")[0][0][1]
+        self.assertEqual(real(sent), real(os.path.join(self.tmp, "archive")))
+        self.assertEqual(len(self.api.import_archive("archive")["roots"]), 1)
+        self.assertTrue(os.path.isabs(self.node.called("import_archive")[0][0][0]))
+        self.assertEqual(self.api.gc(), {"removed_blocks": 3, "freed_bytes": 300})
+        self.assertEqual(self.api.verify()["bad"], [])
+
+    def test_remote_pins_providers_and_ping(self):
+        """pin_remote, providers and ping, node IDs in hex (ND4)."""
+        cid = self.node.put_file(b"abc")
+        self.assertIs(self.api.pin_remote("ab" * 16, cid), True)
+        self.assertIs(self.api.pin_remote("ff" * 16, cid, pin=False), False)
+        self.assertEqual(self.node.called("pin_remote"), [((bytes.fromhex("ab" * 16), cid, True), {}),
+                                                          ((bytes.fromhex("ff" * 16), cid, False), {})])
+        self.node.provider_map[cid] = [bytes.fromhex("cd" * 16)]
+        self.assertEqual(self.api.providers(cid), ["cd" * 16])
+        self.assertEqual(self.api.ping("cd" * 16), 0.25)
+        self.assertIsNone(self.api.ping("ff" * 16))
+
+    def test_name_keys(self):
+        """name_export, name_rm and name_import (the key as the body) (ND4)."""
+        name = self.api.name_create("site")["name"]
+        key = self.api.name_export("site")
+        self.assertEqual(key, self.node.keys["site"])
+        self.api.name_rm("site")
+        with self.assertRaises(NotFound):
+            self.api.name_rm("site")
+        self.assertEqual(self.api.name_import("again", memoryview(key)), {"alias": "again", "name": name})
+
+    def test_every_core_route_has_a_method(self):
+        """Each of the API's own routes is sent by one of ApiConnection's methods, so neither rnfs.Client nor
+        another program writes a path by hand (ND4); the features' routes are reached through get() and post()."""
+        source = inspect.getsource(ApiConnection)
+        for method, path in ApiHandler.ROUTES:
+            with self.subTest(f"{method} {path}"):
+                self.assertRegex(source, rf'self\.(call|request)\("{method}", "{path}"|'
+                                         rf'self\._?{method.lower()}\("{path}"')
 
     def test_jobs(self):
         """submit_job, job, jobs, cancel_job and clear_jobs reach the job manager."""
