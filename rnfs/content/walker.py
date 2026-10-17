@@ -339,6 +339,44 @@ def read_range(expect: Expect, get: Get, offset: int = 0, length: int | None = N
         stack.extend((child, o, n, None) for child, o, n in reversed(parts))
 
 
+def leaf_bytes(expect: Expect, get: Get, stop_at: int | None = None) -> int:
+    """Bytes of the distinct raw chunks of the file expect names: each distinct raw CID's size once, as the file
+    node listing it first gives it. What hashing the file costs beyond this is repetition (the deny list's bound).
+
+    Only file nodes are read, each distinct one once; raw blocks never are (but a one-block file, whose length
+    this is), so get must serve a DAG whose chunks are all stored and checked (fetch_dag's, a complete root's) for
+    the count to be what they hold. Stops once
+    stop_at bytes are counted, returning at least stop_at. Raises ValueError for a directory, InvalidDag for a
+    node that breaks a reader check or a chunk said to be larger than MAX_BLOCK_SIZE.
+    """
+    if expect.cid.is_raw:
+        return size_of(expect, get(expect))
+    counted: set[Cid] = set()  # raw chunks counted
+    nodes: set[Cid] = {expect.cid}  # file nodes met
+    total = 0
+    stack = [expect]
+    while stack:
+        current = stack.pop()
+        check_cid(current)
+        node = decode_checked(current, get(current))
+        if not isinstance(node, FileNode):
+            raise ValueError(f"{expect.cid} is a directory")
+        for child in children(current, node):
+            if child.cid.is_raw:
+                if child.cid not in counted:
+                    # Its block isn't read, so its parent's claim is what counts: the cap keeps a claim from
+                    # counting more than any chunk can hold (reading it would find the DAG invalid anyway)
+                    check_raw(child, child.size)
+                    counted.add(child.cid)
+                    total += child.size
+                    if stop_at is not None and total >= stop_at:
+                        return total
+            elif child.cid not in nodes:
+                nodes.add(child.cid)
+                stack.append(child)
+    return total
+
+
 def _directory_entries(expect: Expect, get: Get, memo: dict | None = None) -> Iterator[tuple[Entry, Expect]]:
     """Every entry of a directory (through its index nodes) in name order, with the entry's expectation.
 

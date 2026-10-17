@@ -796,21 +796,41 @@ class RnfsNode:
                 raise Denied(f"a file with SHA-256 {digest.hex()} is on this node's deny list")
         return check
 
-    def _check_file(self, expect: walker.Expect, read: Callable[[walker.Expect], Iterator[bytes]]):
+    def _check_file(self, expect: walker.Expect, get: walker.Get):
         """Raise Denied if file expect's content hashes to a deny-list entry, before any of it is written out or
-        sent. read(expect) gives its bytes, read only if the hash isn't known yet (a one-block file's CID is
-        it; others are remembered by the deny list)."""
+        sent. get serves its whole DAG, stored and checked (fetch_dag's, or a complete root's); its bytes are read
+        only if the hash isn't known yet (a one-block file's CID is it; others are remembered by the deny list).
+
+        A file declaring more than DENY_HASH_RATIO × the bytes of its distinct chunks + DENY_HASH_SLACK is refused
+        unread: hashing reads every occurrence of repeated content, so six small blocks can declare 2^56 bytes.
+        """
         if not self.deny.hashes:
             return
         digest = expect.cid.digest if expect.cid.is_raw else self.deny.known_hash(expect.cid)
         if digest is None:
+            declared = walker.size_of(expect, get(expect))
+            if declared > denylist.DENY_HASH_SLACK:
+                # The distinct chunk bytes it needs, at least: the walk stops once they are met
+                needed = -(-(declared - denylist.DENY_HASH_SLACK) // denylist.DENY_HASH_RATIO)
+                if walker.leaf_bytes(expect, get, needed) < needed:
+                    raise Denied(f"{expect.cid} can't be checked against this node's deny-list file hashes: it "
+                                 f"repeats its content more than {denylist.DENY_HASH_RATIO}×")
             hasher = hashlib.sha256()
-            for data in read(expect):
+            for data in walker.read_range(expect, get):
                 hasher.update(data)
             digest = hasher.digest()
             self.deny.remember_hash(expect.cid, digest)
         if self.deny.denies_hash(digest):
             raise Denied(f"{expect.cid} is a file whose SHA-256 ({digest.hex()}) is on this node's deny list")
+
+    def _check_fetched(self, fetch: Fetch, expect: walker.Expect):
+        """_check_file for a file a fetch reads (cat, the gateway, a sealed get): unless its hash is known, its
+        whole DAG is fetched first (fetch_dag: max_download_size, the disk reserve, the DAG byte bound)."""
+        if not self.deny.hashes:
+            return
+        if not expect.cid.is_raw and self.deny.known_hash(expect.cid) is None:
+            fetch.fetch_dag(expect, self.config.max_output_entries)
+        self._check_file(expect, fetch.get)
 
     def _apply_deny(self):
         """Bring what is provided, cached and pinned in line with the deny list's CIDs, after a change and at
@@ -1070,14 +1090,13 @@ class RnfsNode:
                 _check_free_space(output, content, self.config.blocks_dir, to_fetch)
                 sealed = None if raw else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:  # decrypted as it is fetched (rnfs/content/seal.py)
-                    self._check_file(expect, fetch.read_range)  # its stored (sealed) bytes, as others hold them
+                    self._check_fetched(fetch, expect)  # its stored (sealed) bytes, as others hold them
                     written = node_content.write_sealed(sealed, partial, self.config.blocks_dir, to_fetch)
                     result = {"cid": str(expect.cid), "warnings": [], **written}
                 else:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
                     # Each file is checked before it is written while the deny list has file hashes
-                    check = {"check": lambda file: self._check_file(file, lambda e: walker.read_range(e, fetch.get))
-                             } if self.deny.hashes else {}
+                    check = {"check": lambda file: self._check_file(file, fetch.get)} if self.deny.hashes else {}
                     warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries, **check)
                     # Every skipped entry is a warning: keep a response (and a job's saved result) small
                     result = {"cid": str(expect.cid), **cap_warnings(warnings)}
@@ -1152,7 +1171,7 @@ class RnfsNode:
         """read() of a resolved target, in fetch."""
         if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == "file":
             # The whole file is fetched and hashed (once: then remembered) before any of it is sent
-            self._check_file(expect, fetch.read_range)
+            self._check_fetched(fetch, expect)
         sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
         if sealed is not None:
             yield from sealed.read(offset, length)
@@ -1613,7 +1632,7 @@ class RnfsNode:
                 get = self.storage.getter()
                 for root in roots:
                     for file in walker.iter_files(walker.root_expect(root), get):
-                        self._check_file(file, lambda e: walker.read_range(e, get))
+                        self._check_file(file, get)  # a complete root: every block is stored and checked
 
         with stream, self._refusing():
             stats = archive.import_archive(stream, self.storage, check=check)

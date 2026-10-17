@@ -820,6 +820,13 @@ off their node. Nothing on the wire changes.
   doesn't stop those blocks being fetched (by `pin add`, `export` to a file, a remote pin or a followed name), stored,
   served or provided: deny the CID for that. A file of one block has its content's hash as its CID's digest,
   so either entry stops it; a sealed file matches by its sealed bytes, as stored, not by what it decrypts to.
+- Hashing a file reads every occurrence of content its DAG repeats, so a few small blocks can declare a file of
+  2^56 bytes. While there are file-hash entries, a file whose hash isn't known yet and whose declared size is
+  more than 16 times the bytes of its distinct chunks plus 64 MiB (`DENY_HASH_RATIO`, `DENY_HASH_SLACK`,
+  section 12) can't be checked, and is refused as if denied, before any chunk is read (`451`; an add or import
+  fails as above). The chunks are counted from the file nodes, so a range read (`cat`, the gateway) fetches the
+  whole DAG first. Honest files repeat less, except highly repetitive ones over 64 MiB such as a zero-filled disk
+  image.
 - Provider records other nodes store here for a denied CID are kept and handed out as usual (`/find` sees
   only keys).
 
@@ -983,7 +990,7 @@ as is cheap. Rules live in the sections referenced.
 | Threat | Protection |
 |---|---|
 | Forged or corrupted data | Every block verified against its CID (7) |
-| Size lies, repeated or empty-subtree bombs, deep trees | Verified sizes, `max_download_size`, `max_output_entries`, the DAG byte bounds of whole-DAG fetches, listings and byte-range reads, `MAX_DEPTH`, each block fetched once (5, 7) |
+| Size lies, repeated or empty-subtree bombs, deep trees | Verified sizes, `max_download_size`, `max_output_entries`, the DAG byte bounds of whole-DAG fetches, listings and byte-range reads, `MAX_DEPTH`, each block fetched once; while the deny list has file hashes, a file repeating its content more than `DENY_HASH_RATIO` times (beyond `DENY_HASH_SLACK`) is refused rather than hashed (5, 7, 8) |
 | Malformed DAG nodes | Strict msgpack types, re-encoding and per-node checks (5). The tree rule gives honest writers one CID per content; readers don't enforce it |
 | Advertising on someone else's behalf | Records name only the identified requester (6) |
 | Advertising content it doesn't have, or stale records | Failed providers removed; the search runs again; withdrawals (6, 7) |
@@ -1374,6 +1381,13 @@ setting.
 | `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`lxmf:<address>`) |
 | `lxmf_auto_fetch_quota` | 1 GiB per sender | Storage the pins of one auto-fetch sender may use |
 | `deny_lists` | empty | Deny-list sources: `<cid>[/path]` or `name/<name>[/path]`, each a file (section 8) |
+
+**Local limits.** Fixed by this implementation rather than set; other implementations may choose their own.
+
+| Name | Value | Notes |
+|---|---|---|
+| `DENY_HASH_RATIO` | 16 | While the deny list has file hashes, a file declaring more than this times the bytes of its distinct chunks, plus `DENY_HASH_SLACK`, is refused unhashed (section 8) |
+| `DENY_HASH_SLACK` | 64 MiB | Any file up to this size can be hashed, however much it repeats |
 
 ## 13. rnfs URIs and LXMF
 

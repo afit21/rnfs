@@ -190,7 +190,7 @@ def block(node, cid: str, for_gateway: bool = False) -> bytes:
     with node._fetching(root, [], None, for_gateway) as fetch:
         expect = fetch.resolve()
         if expect.cid.is_raw:
-            node._check_file(expect, fetch.read_range)  # never reads: a raw CID carries the hash
+            node._check_file(expect, fetch.get)  # never reads: a raw CID carries the hash
         data = node.storage.get(expect.cid, verify=True)
     if data is None:
         raise NotFound(f"block {cid} was damaged locally and has been deleted; try again")
@@ -209,7 +209,7 @@ def export_stream(node, target: str, start: Callable[[int], BinaryIO | None], fo
         walker.count_entries(expect, fetch.get, node.config.max_output_entries)
         if node.deny.hashes:
             for file in walker.iter_files(expect, fetch.get):
-                node._check_file(file, lambda e: walker.read_range(e, fetch.get))
+                node._check_file(file, fetch.get)
         blocks = node.storage.dag_blocks(expect.cid)
         length = archive.archive_size([expect.cid], ((cid, node.storage.block_size(cid) or 0) for cid in blocks))
         out = start(length)
