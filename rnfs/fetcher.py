@@ -1013,7 +1013,10 @@ class Fetch:
             try:
                 rate = self.client.rate_estimate(node_id)
                 result = self.client.blocks(node_id, cids, on_progress=progress)
-            except Exception as e:  # noqa: BLE001 - any client failure is a failed request, retried elsewhere
+            except Exception as e:  # noqa: BLE001 - any client failure is a failed request, retried elsewhere; logged
+                # The client reports network failures in its result, so this is a bug: logged here, inside the
+                # except, so the debug log has its traceback
+                log(f"/blocks to {node_name(node_id)} raised {e!r}", LOG_WARNING)
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
             if result.elapsed is not None:
                 # When it actually went out: opening the link or waiting for its /blocks slot isn't its time

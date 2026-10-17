@@ -23,14 +23,19 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
   `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set
-  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel.
+  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel. `ThrottledLog(interval, clock)`
+  logs one line about a kind of event at most every interval (60 s), with a count of those left out; `due()` is
+  the check alone. The response guards, the request rate limit (`RequestServer._over_rate`), `RnsPaths` and the
+  peers listing use it. An unexpected exception caught by a broad `except` (a `# noqa: BLE001` reason says why
+  it's caught) is logged at `LOG_WARNING` inside the `except`, so the debug log gets its traceback: among them the
+  fetcher's `/blocks` worker, the lookup's routing-table callbacks and `LinkPool.request`.
 - `rnfs/debuglog.py` — the debug log file (`debug_log`, `daemon --debug-log`), `<rnfs dir>/debug.log` (0600),
   started by the daemon before the node: version first, then every rnfs message (warnings and errors logged in
   an `except` block with their traceback), RNS's own log lines at Info or more severe (`RNS_LEVEL`; copied from
   `RNS.logdest = LOG_CALLBACK`, which still prints all of them), threads that die (`threading.excepthook`), a status line every 5 minutes (`status_line`:
   the node's status, open links, each interface up or down), and gateway requests, numbered (`tag`). Each start
   and every 16 MiB moves the file to `debug.log.1`. Lookups report their queries through `Lookup(report=)` (dht
-  stays free of RNS), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
+  stays free of RNS at import), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
 - `rnfs/fsutil.py` — the one platform switch (`IS_WINDOWS`), `O_BINARY`, and `replace`/`remove` that retry for
   about a second on Windows while another handle holds the file; `rename_new` (rename onto a path that must not
   exist; atomic through `renameat2(RENAME_NOREPLACE)` on Linux or a hard link, else check then rename);
@@ -831,7 +836,11 @@ and in total, never persisted.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
-  nothing for; `_over_rate` counts them and logs at most once a minute.
+  nothing for; `_over_rate` counts them and logs at most once a minute. Every handler but `/blocks` runs its
+  work through `RequestServer._in_slot(link_id, answer)` after its own checks (so a refusal by those takes no
+  slot): it takes one of the link's `MAX_REQUESTS_PER_LINK` slots (`IncomingLinks.start_request`), answers
+  `False` if none is free, and frees it when `answer()` returns or raises. A `/blocks` slot outlives its handler
+  (until the response's Resource concludes), so `_handle_blocks` keeps its own.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
   caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
   (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
@@ -878,7 +887,8 @@ its own threads and stops them, in reverse, before its own services. A feature m
 and the last save), `status()` (fields merged into `rnfs status`), `requests()` (new `rnfs.dht` paths; the request
 server applies private mode and the per-link limit, and turns `None` or an exception into `False`; a response must
 be a shape `protocol.response_refusal` accepts, True/False/None, a `/find` answer, or at most `MAX_BLOCKS_CIDS` bins
-or nils, since nodes since 0.1.4 refuse any other), `api_routes()` (all token-protected) and `cli_commands()`.
+or nils, since nodes since 0.1.4 refuse any other: the server checks each with `protocol.body_refusal` and answers
+`False`, logged as an error, instead of one they'd refuse), `api_routes()` (all token-protected) and `cli_commands()`.
 Feature modules don't import RNS at module level (the CLI imports them to build its parser) and their constructors
 work on `RnfsNode.offline` test nodes.
 

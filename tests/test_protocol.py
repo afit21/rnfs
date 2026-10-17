@@ -1,13 +1,19 @@
-"""Tests for encoding and strictly validating rnfs.dht messages, and for request batch sizes."""
+"""Tests for encoding and strictly validating rnfs.dht messages (keepers' /name responses too), and for request
+batch sizes."""
 import unittest
 
 import RNS
 from RNS.vendor import umsgpack
 
+from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KIB, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE,
                             MAX_RESPONSE_SIZE, PROVIDE_PATH)
 from rnfs.content.cid import DAG, RAW, Cid
-from rnfs.network import protocol
+from rnfs.features import keepers
+from rnfs.names import encode_record, name_for_identity
+from rnfs.network import protocol, server
+from tests.support import FakeClock
+from tests.test_server import FakeBackend, FakeDestination, FakeLink
 
 KEY = bytes(range(ID_LENGTH))
 RAW_CID = Cid.for_block(RAW, b"raw block")
@@ -206,6 +212,69 @@ class PinTest(unittest.TestCase):
         for reason, data in bad.items():
             with self.subTest(reason):
                 self.assertIsNone(protocol.parse_pin_request(data))
+
+
+class BodyRefusalTest(unittest.TestCase):
+    """protocol.body_refusal: the shape check on a response alone, which response_refusal applies after the
+    framing and the request server applies to its features' responses."""
+
+    ACCEPTED = (True, False, None, [], [b"block", None], [[KEY] * K, [KEY]], [None] * protocol.MAX_BLOCKS_CIDS,
+                [bytes(MAX_BLOCK_SIZE)])
+    REFUSED = ({"a": 1}, "text", 1, [1], [None] * (protocol.MAX_BLOCKS_CIDS + 1), [bytes(MAX_BLOCK_SIZE + 1)],
+               [[KEY] * (K + 1), []], [{}])
+
+    def test_agrees_with_response_refusal(self):
+        for accepted, responses in ((True, self.ACCEPTED), (False, self.REFUSED)):
+            for response in responses:
+                with self.subTest(response=repr(response)[:40]):
+                    body = protocol.body_refusal(umsgpack.packb(response))
+                    framed = protocol.response_refusal(umsgpack.packb([bytes(protocol.REQUEST_ID_LENGTH), response]))
+                    self.assertEqual(body, framed)
+                    self.assertEqual(body is None, accepted)
+
+    def test_at_a_position_and_nothing_after(self):
+        packed = b"junk" + umsgpack.packb([b"block"])
+        self.assertIsNone(protocol.body_refusal(packed, 4))
+        self.assertIsNotNone(protocol.body_refusal(packed))
+        self.assertEqual(protocol.body_refusal(umsgpack.packb(True) + b"\x00"), "1 bytes after the response")
+        self.assertEqual(protocol.body_refusal(b""), "no response")
+        self.assertEqual(protocol.body_refusal(packed, len(packed)), "no response")
+
+
+class NameResponseTest(unittest.TestCase):
+    """Every /name response keepers sends is a shape requesters accept (/name is in the module's table; nodes since
+    0.1.4 refuse other shapes before decoding them), and the request server sends it as it is."""
+
+    def responses(self) -> dict:
+        """Each kind of /name answer: a kept record (real, and of the largest fields), none kept, malformed."""
+        identity = RNS.Identity()
+        record = keepers.sign_record(identity, name_for_identity(identity), encode_record(2 ** 63, DAG_CID))
+        largest = keepers.SignedRecord(KEY, bytes(keepers.PUBLIC_KEY_LENGTH), bytes(keepers.RANDOM_HASH_LENGTH),
+                                       bytes(keepers.RATCHET_LENGTH), bytes(keepers.SIGNATURE_LENGTH),
+                                       bytes(keepers.MAX_APP_DATA), 1, DAG_CID)
+        return {"record": keepers.encode_response(record), "largest": keepers.encode_response(largest),
+                "none kept": keepers.encode_response(None), "malformed": False}
+
+    def test_accepted_by_requesters(self):
+        for kind, response in self.responses().items():
+            with self.subTest(kind):
+                framed = umsgpack.packb([bytes(keepers.REQUEST_ID_LENGTH), response])
+                self.assertIsNone(protocol.body_refusal(umsgpack.packb(response)))
+                self.assertIsNone(protocol.response_refusal(framed))
+                self.assertLessEqual(len(framed), keepers.max_response_size())
+
+    def test_sent_as_they_are(self):
+        for kind, response in self.responses().items():
+            with self.subTest(kind):
+                backend = FakeBackend()
+                backend.feature_requests = lambda answer=response: {keepers.NAME_PATH: lambda data, identity: answer}
+                destination = FakeDestination()
+                server.RequestServer(destination, Config(), backend, clock=FakeClock(), start_monitor=False)
+                link = FakeLink(b"l" * 16)
+                destination.links.append(link)
+                destination.established(link)
+                handler = destination.handlers[keepers.NAME_PATH][0]
+                self.assertEqual(handler(keepers.NAME_PATH, KEY, bytes(16), link.link_id, None, 0.0), response)
 
 
 if __name__ == "__main__":

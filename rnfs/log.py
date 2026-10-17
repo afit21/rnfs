@@ -3,6 +3,8 @@
 With `debug_log` on, every message also goes to the debug log file (rnfs/debuglog.py), whatever RNS's loglevel.
 """
 import threading
+import time
+from typing import Callable
 
 import RNS
 
@@ -46,6 +48,40 @@ def set_debug_sink(sink):
 def passing_through() -> bool:
     """True while this thread's rnfs message is inside RNS.log (it reaches the debug log by its sink)."""
     return getattr(_passing, "active", False)
+
+
+class ThrottledLog:
+    """Log lines about one kind of event at most one every interval seconds, counting the events left out, so
+    whatever causes them (often another node) can't flood the log. Thread-safe.
+
+    Called inside an except block, a line logged at LOG_WARNING or more severe carries the exception's traceback
+    to the debug log, like any other.
+    """
+
+    def __init__(self, interval: float = 60.0, clock: Callable[[], float] = time.monotonic):
+        """Nothing logged yet."""
+        self.interval = interval
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.logged_at: float | None = None
+        self.skipped = 0
+
+    def due(self) -> int | None:
+        """For an event now: how many were left out since the last line, if a line is due (the next is then due
+        interval seconds from now); None, counting this one as left out, if not."""
+        with self.lock:
+            now = self.clock()
+            if self.logged_at is not None and now - self.logged_at < self.interval:
+                self.skipped += 1
+                return None
+            skipped, self.skipped, self.logged_at = self.skipped, 0, now
+            return skipped
+
+    def __call__(self, message: str, level: int):
+        """Log message at level, with how many were left out since the last line, if a line is due."""
+        skipped = self.due()
+        if skipped is not None:
+            log(message + (f" ({skipped} more since the last)" if skipped else ""), level)
 
 
 def node_name(node_id: bytes | None) -> str:

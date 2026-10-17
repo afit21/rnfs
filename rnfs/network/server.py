@@ -23,12 +23,13 @@ from collections import Counter, OrderedDict
 from typing import Callable, Protocol
 
 import RNS
+from RNS.vendor import umsgpack
 
 from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
                             MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
-from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
+from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
 from rnfs.network.identity import node_id_for_identity
 from rnfs.network.links import close_reason
@@ -727,8 +728,7 @@ class RequestServer:
         self.wake = threading.Event()
         self.pin_identities = {h.strip().strip("<>").lower() for h in config.remote_pin_identities}
         self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
-        self.over_rate_logged_at: float | None = None
-        self.over_rate_logged = 0
+        self.over_rate_log = ThrottledLog(OVER_RATE_LOG_INTERVAL, clock)
 
         # Reject request Resources, compressed ones and advertisements whose transfer outgrows their size: on
         # every link in the daemon, which also turns RNS's compression off process-wide, or on rnfs.dht links
@@ -865,32 +865,43 @@ class RequestServer:
         """Count a request over its link's rate limit, logging at most once a minute."""
         with self.lock:
             self.over_rate += 1
-            now = self.clock()
-            if self.over_rate_logged_at is not None and now - self.over_rate_logged_at < OVER_RATE_LOG_INTERVAL:
-                return
-            dropped, self.over_rate_logged, self.over_rate_logged_at = (self.over_rate - self.over_rate_logged,
-                                                                        self.over_rate, now)
-        log(f"refused or dropped {plural(dropped, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
+        skipped = self.over_rate_log.due()
+        if skipped is None:
+            return
+        log(f"refused or dropped {plural(skipped + 1, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
             f"once, {REQUEST_RATE:g} a second)", LOG_WARNING)
 
     def _is_member(self, remote_identity) -> bool:
         """True if the requester identified as a member (private mode)."""
         return remote_identity is not None and bool(self.backend.is_member(remote_identity.hash))
 
+    def _in_slot(self, link_id: bytes, answer: Callable[[], object]):
+        """answer() run in one of the link's MAX_REQUESTS_PER_LINK request slots, which is freed when it returns
+        or raises; False at once if the link has none free.
+
+        Every handler but /blocks (whose slot outlives the handler, until its Resource concludes) runs its
+        work here, after its own checks: a refusal from those comes first and takes no slot.
+        """
+        if not self.incoming.start_request(link_id, blocks=False):
+            return False
+        try:
+            return answer()
+        finally:
+            self.incoming.finish_request(link_id, blocks=False)
+
     def _handle_find(self, path, data, request_id, link_id, remote_identity):
         """Answer /find with providers of the key and the servers closest to it."""
         key = protocol.parse_find_request(data)
         if key is None or not self.backend.is_dht_server():
             return False
-        if not self.incoming.start_request(link_id, blocks=False):
-            return False
-        try:
+
+        def answer():
+            """Look the key up."""
             providers, nodes = self.backend.find(key)
             log(f"/find {key.hex()}: {plural(len(providers), 'provider')}, {plural(len(nodes), 'node')}",
                 LOG_VERBOSE)
             return protocol.encode_find_response(list(providers), list(nodes))
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        return self._in_slot(link_id, answer)
 
     def _handle_provide(self, path, data, request_id, link_id, remote_identity):
         """Record the identified requester as a provider of the keys, and withdraw the withdrawn ones."""
@@ -898,29 +909,37 @@ class RequestServer:
         if remote_identity is None or not self.backend.is_dht_server():
             return False
         parsed = protocol.parse_provide_request(data)
-        if parsed is None or not self.incoming.start_request(link_id, blocks=False):
+        if parsed is None:
             return False
-        try:
+
+        def answer():
+            """Record the keys and withdraw the withdrawn ones."""
             keys, withdrawn = parsed
             publisher = node_id_for_identity(remote_identity)
             recorded = self.backend.provide(publisher, keys, withdrawn) is True
             log(f"/provide from {node_name(publisher)}: {plural(len(keys), 'key')}, {len(withdrawn)} withdrawn, "
                 f"{'recorded' if recorded else 'refused'}", LOG_VERBOSE)
             return recorded
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        return self._in_slot(link_id, answer)
 
     def _feature_handler(self, handler):
-        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, and never answering None."""
+        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, never answering None, and
+        answering False rather than a response requesters would refuse."""
         def handle(path, data, request_id, link_id, remote_identity):
             """Run the feature's handler(data, remote_identity) inside the per-link request limit."""
-            if not self.incoming.start_request(link_id, blocks=False):
-                return False
-            try:
+            def answer():
+                """The feature's response, False for None or a shape no requester accepts."""
                 response = handler(data, remote_identity)
-                return False if response is None else response
-            finally:
-                self.incoming.finish_request(link_id, blocks=False)
+                if response is None:
+                    return False
+                # Requesters since 0.1.4 check every response's shape before decoding it (protocol.response_refusal):
+                # one they refuse would fail every request to this path, so it's a bug in the feature, said here
+                refusal = protocol.body_refusal(umsgpack.packb(response))
+                if refusal is not None:
+                    log(f"refused to answer {path} with a response no requester accepts: {refusal}", LOG_ERROR)
+                    return False
+                return response
+            return self._in_slot(link_id, answer)
         return handle
 
     def _handle_pin(self, path, data, request_id, link_id, remote_identity):
@@ -928,13 +947,10 @@ class RequestServer:
         if remote_identity is None or remote_identity.hash.hex() not in self.pin_identities:
             return False
         parsed = protocol.parse_pin_request(data)
-        if parsed is None or not self.incoming.start_request(link_id, blocks=False):
+        if parsed is None:
             return False
-        try:
-            cid, pin = parsed
-            return self.backend.remote_pin(remote_identity.hash, cid, pin) is True
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        cid, pin = parsed
+        return self._in_slot(link_id, lambda: self.backend.remote_pin(remote_identity.hash, cid, pin) is True)
 
     def _handle_blocks(self, path, data, request_id, link_id, remote_identity):
         """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget."""

@@ -60,7 +60,8 @@ class Feature:
         check it before decoding): True, False or None, a /find answer (two lists of at most K IDs), or a list of
         at most MAX_BLOCKS_CIDS entries, each bytes of at most MAX_BLOCK_SIZE or None (a /blocks answer). Any
         other shape (a dict, a string, a longer list) is refused as malformed, and widening that check wouldn't
-        reach the nodes already running.
+        reach the nodes already running. The request server checks each response the same way
+        (`protocol.body_refusal`) and answers False instead of one requesters would refuse, logging an error.
         """
         return {}
 

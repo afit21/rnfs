@@ -1,5 +1,6 @@
 """Iterative DHT lookups (specification section 6). No RNS dependency: network access, identity knowledge
-and time are injected, so lookups run over in-memory networks in tests.
+and time are injected, so lookups run over in-memory networks in tests. (Only a callback raising, a bug, is
+logged through rnfs.log, which loads RNS, imported then.)
 
 A lookup keeps up to `alpha` /find queries in flight, always to the closest known nodes not yet queried,
 and merges the nodes each reply returns. It is complete once the `beta` closest nodes it knows of have all
@@ -386,8 +387,11 @@ class Lookup:
                     else f"answered in {took:.1f}s: {len(reply[0])} providers, {len(reply[1])} nodes"))
             try:
                 (self.on_failure if reply is None else self.on_answer)(node_id)
-            except Exception:  # noqa: BLE001 - a caller's callback must not end the lookup
-                pass
+            except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged
+                # A bug in the routing table (private mode's admit, say): logged inside the except, so the debug
+                # log has its traceback. rnfs.log loads RNS, which this module doesn't at import
+                from rnfs.log import LOG_WARNING, log
+                log(f"lookup for {self.key.hex()}: the callback for {_name(node_id)} raised {e!r}", LOG_WARNING)
             results.put((node_id, reply))
 
         # Daemon threads rather than a ThreadPoolExecutor: a query hung past the deadline is abandoned

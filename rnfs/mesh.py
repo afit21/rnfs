@@ -90,6 +90,9 @@ class RnsPaths:
         # the end when stored, so expired entries and those evicted beyond MAX_CACHED_PATHS are at the front
         self._names: OrderedDict[bytes, tuple[float, str | None]] = OrderedDict()
         self._names_lock = threading.Lock()
+        from rnfs.log import ThrottledLog  # here, not at module level: it loads RNS
+        # RNS failing to answer is a bug or an RNS change, asked about per provider and per peer: a line a minute
+        self._failure_log = ThrottledLog()
 
     def info(self, node_id: bytes) -> PathInfo:
         """Hops and next-hop interface of the path to node_id; NO_PATH if RNS has none or fails."""
@@ -106,7 +109,9 @@ class RnsPaths:
                 interface = RNS.Transport.next_hop_interface(node_id)
                 name, bitrate = interface_label(interface), _bitrate(getattr(interface, "bitrate", None))
             return PathInfo(hops, name, bitrate)
-        except Exception:  # noqa: BLE001 - RNS internals: no path known if they fail
+        except Exception as e:  # noqa: BLE001 - RNS internals: no path known if they fail; logged
+            # Inside the except, so the debug log has the traceback
+            self._failure_log(f"couldn't read the path to {RNS.prettyhexrep(node_id)} from RNS: {e!r}", RNS.LOG_WARNING)
             return NO_PATH
 
     def infos(self, node_ids: list[bytes]) -> dict[bytes, PathInfo]:
@@ -308,15 +313,6 @@ class TokenBucket:
             self._refill()
             return self.tokens
 
-    def take(self, nbytes: int) -> bool:
-        """Spend nbytes if allowed (see the class). False, spending nothing, if not."""
-        with self.lock:
-            self._refill()
-            if self.tokens >= nbytes or self.tokens >= self.capacity:
-                self.tokens -= nbytes
-                return True
-            return False
-
     def give_back(self, nbytes: int):
         """Return bytes spent on a response that wasn't sent after all."""
         with self.lock:
@@ -377,10 +373,6 @@ class AirtimePolicy:
         if available >= self.bucket.capacity and committed <= 0:
             return limit
         return max(0, min(limit, int(available - committed) - RESPONSE_OVERHEAD))
-
-    def spend(self, nbytes: int) -> bool:
-        """Charge a response of nbytes to the upload budget. False if it must be refused."""
-        return self.bucket is None or self.bucket.take(nbytes)
 
     def reserve(self, nbytes: int, reservation: int, committed: int = 0) -> bool:
         """Admit a response of nbytes, charging reservation of it now (the rest is charged as it is sent).
