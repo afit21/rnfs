@@ -1060,7 +1060,7 @@ class AuditFixesTest(FeatureTestCase):
         for number in range(20):
             feature.received(self.link_message(number=number, source=bytes([number]) * 16,
                                                text=("é" * 3000).encode()))
-        sizes = [lxmf._json_bytes(e) for e in feature.inbox_list()]
+        sizes = [lxmf._json_bytes(e) for e in feature.inbox.entries()]
         self.assertLessEqual(sum(sizes), 20_000)
         self.assertEqual(feature.inbox_list()[-1]["id"], 20)
         feature.save()

@@ -1552,6 +1552,11 @@ unreserved, pct-encoded: as in RFC 3986
   on a line of its own is read whole; elsewhere, trailing punctuation (`.,;:!?)]}'"`) is taken as the
   sentence's. At most 8 links, 4000 characters of text, 256 of title and 64 of display name are kept. Text
   from messages MUST be shown with control characters escaped.
+- A sender's display name is its own word, so it MUST NOT be shown where it could pass for the sender's address
+  or trust. `inbox` shows each message's sender address first, then `untrusted`, `trusted` or `contact <nick>`
+  (the API's computed `trusted` and `contact` fields; `?` from a daemon that doesn't give them), and the display
+  name last, quoted, with backslashes, quotes, blank fillers (U+115F, U+1160, U+3164, U+FFA0, U+2800), a
+  combining mark that follows nothing printed or is the third in a row, and a name of only spaces escaped too.
 - At most 500 messages and 4 MiB (as JSON) are kept, and at most 50 from one sender not in
   `lxmf_auto_fetch_from`. To make room, the oldest message holding no auto-fetched pins (none pinned or
   queued) is dropped; a message holding pins is not dropped for others' messages: if every kept message holds

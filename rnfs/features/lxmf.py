@@ -1325,8 +1325,20 @@ class LxmfFeature(features.Feature):
             return True
 
     def inbox_list(self) -> list[dict]:
-        """Inbox messages, oldest first."""
-        return self.inbox.entries()
+        """Inbox messages, oldest first, each with "trusted" (whether its sender is trusted now) and "contact" (the
+        nick of the LXMF contact with its address, or None) added: the display name is the sender's own word, so
+        `rnfs inbox` shows these instead."""
+        contacts = getattr(self.node, "features", {}).get("contacts")
+        entries = self.inbox.entries()
+        for entry in entries:
+            entry["trusted"] = self._trusted_hex(entry.get("from"))
+            entry["contact"] = None
+            if contacts is not None and hasattr(contacts, "nick_of") and entry["trusted"]:
+                try:
+                    entry["contact"] = contacts.nick_of(bytes.fromhex(entry["from"]), "lxmf")
+                except (TypeError, ValueError):
+                    pass
+        return entries
 
     def outbox_list(self) -> list[dict]:
         """Sent messages, oldest first."""
@@ -1811,18 +1823,35 @@ def _run_send(args):
     print(cli.printable(result["hash"]))
 
 
+def _trust_label(entry: dict) -> str:
+    """How `rnfs inbox` marks a message's sender: "contact <nick>", "trusted" or "untrusted"; "?" when the daemon
+    (older than 0.1.6) doesn't say."""
+    if isinstance(entry.get("contact"), str):
+        return f"contact {fsutil.printable_label(entry['contact'])}"
+    if isinstance(entry.get("trusted"), bool):
+        return "trusted" if entry["trusted"] else "untrusted"
+    return "?"
+
+
+def _quoted_label(name) -> str:
+    """A display name, the sender's own word, in double quotes and escaped as a label (fsutil.printable_label,
+    which escapes backslashes, so an escaped quote can't be faked either)."""
+    return '"' + fsutil.printable_label(name).replace('"', '\\"') + '"'
+
+
 def _run_inbox(args):
-    """List inbox messages: number, time, sender, links and text."""
+    """List inbox messages: number, time, the sender's address and whether it is a contact or trusted, method,
+    then the display name it announced (last and quoted: it is the sender's own word, and could otherwise pose as
+    another address), links and text."""
     from rnfs import cli
     messages = cli.client(args).get("/api/lxmf/inbox")["messages"]
     if not messages:
         print("no messages")
     for entry in messages:
-        sender = entry.get("from") or "?"
         name = entry.get("display_name")
-        who = f"{cli.printable(name)} <{cli.printable(sender)}>" if name else f"<{cli.printable(sender)}>"
-        print(f"#{cli.printable(entry.get('id'))}  {_when(entry.get('received'))}  {who}  "
-              f"{cli.printable(entry.get('method') or '')}")
+        print(f"#{cli.printable(entry.get('id'))}  {_when(entry.get('received'))}  "
+              f"<{cli.printable(entry.get('from') or '?')}>  {_trust_label(entry)}  "
+              f"{cli.printable(entry.get('method') or '?')}" + (f"  {_quoted_label(name)}" if name else ""))
         _print_links(entry, cli.printable)
         _print_text(_strip_links(entry), cli.printable)
 

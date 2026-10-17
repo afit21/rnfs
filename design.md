@@ -927,6 +927,10 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 `TooLarge` or `StorageFull`, is retried once through the DHT). `POST /api/lxmf/send` and `/api/lxmf/sync` take
 `nearest`; `POST /api/lxmf/inbox/get` takes `use_sent_cid` (without it, an unresolvable name link is 404);
 `GET /api/lxmf/address` returns `propagation_node` (the configured one only) and `nearest_propagation_node`.
+`GET /api/lxmf/inbox` adds to each record, computed when listed, `trusted` (`LxmfFeature._trusted_hex`) and
+`contact` (`ContactsFeature.nick_of(address, "lxmf")`, the first nick naming it, or null); `rnfs inbox` prints the
+address, then `contact <nick>`, `trusted` or `untrusted` (`?` without the fields), the method, and last the
+display name quoted and escaped with `fsutil.printable_label`.
 Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 `chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`; `GET /api/cat`
 `raw=1`, `block=1`; `GET /api/info` `from`.
