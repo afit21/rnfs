@@ -111,7 +111,8 @@ rnfs/
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
-    rates.py          rate estimates, slow links, slow node detection (section 2)
+    rates.py          rate estimates, slow links, slow node detection (section 2); the /blocks size rules both
+                      ends share: response_capacity, default_upload_cap (sections 3, 7)
     links.py          LinkPool: shared unidentified links, identified one-shot links, idle close (section 3)
     guards.py         guards rejecting oversized, compressed or request Resource advertisements (on every
                       link in the daemon, on rnfs.dht links only in an embedded node) and, on rnfs.dht links,

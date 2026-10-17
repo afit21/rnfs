@@ -71,8 +71,7 @@ from typing import Callable, Iterator, NamedTuple
 
 from rnfs import statedb
 from rnfs.config import Config
-from rnfs.constants import (CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE,
-                            MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD)
+from rnfs.constants import CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
 from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
@@ -1042,9 +1041,11 @@ class Fetch:
         Under a DAG limit, only what the room budget leaves can take for sure (_DagBudget.room), but at least one
         CID when no request is in flight: so a fetch downloads at most about one block beyond the limit.
         """
-        max_bytes = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
-        # However large max_bytes is, the responder's budget is at most this (server.blocks_budget, section 7)
-        carried = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+        rate = self.client.rate_estimate(node_id)
+        max_bytes = rates.requester_max_bytes(rate, self.config)
+        # However large max_bytes is, the responder's budget is at most this (section 7); its upload cap isn't
+        # known here, and a lower one only cuts the response short (the rest comes back unsent)
+        carried = rates.response_capacity(max_bytes, rate, None, self.config.response_target)
         # The client sends what fits its link's packet and returns the rest: the open link's MDU, else (no link
         # open yet) the largest request any link allows. Whether a prefix fits only gets worse as it grows, so
         # one count covers every batch taken from the front of pending
@@ -1239,12 +1240,16 @@ class Fetch:
             return
         now = self.fetcher.clock()
         took = max(0.0, now - sent_at)  # about the response's transfer time at the link's rate, plus its RTT
+        # Refusals until 4 × took after sending count as pacing: at the default cap the next response may start
+        # 2 × took after the last one did (rates.UPLOAD_CAP_DIVISOR), and twice that leaves room for a responder
+        # whose rate estimate or cap is lower than ours and the default. Retrying them every eighth of took loses
+        # at most that much once the responder is ready, for one refusal (a request packet) each time
         provider.pacing_until = sent_at + 4 * took
         provider.pacing_retry = max(self.fetcher.busy_delay, took / 8)
         if rate is not None and rate < self.config.slow_bitrate:
-            # At the default cap (half the rate estimate) the next response may start once the last one's
-            # transfer time has passed twice since it started
-            provider.busy_until = max(provider.busy_until, now + took)
+            # At the default cap (rates.default_upload_cap) the next response may start once the last one's
+            # transfer time has passed UPLOAD_CAP_DIVISOR times since it started: took has passed once already
+            provider.busy_until = max(provider.busy_until, now + (rates.UPLOAD_CAP_DIVISOR - 1) * took)
             self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
 
 
