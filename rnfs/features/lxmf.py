@@ -884,7 +884,6 @@ class LxmfFeature(features.Feature):
         self._auto_wanted = threading.Condition()
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self._threads: list[threading.Thread] = []
         self.inbox = MessageLog(config.state_dir, INBOX, INBOX_LIMIT, MAX_INBOX_BYTES, protect=_holds_pins,
                                 valid=_valid_inbox_entry, holds=_held)
         try:
@@ -999,23 +998,20 @@ class LxmfFeature(features.Feature):
         self.attach(network)
         self._requeue_auto_fetches()
         for name, target in (("rnfs-lxmf", self._run), ("rnfs-lxmf-fetch", self._run_auto_fetch)):
-            thread = threading.Thread(target=target, name=name, daemon=True)
-            thread.start()
-            self._threads.append(thread)
+            self._spawn(target, name)
         _log(f"LXMF address {network.address.hex()} ({network.display_name})", LOG_NOTICE)
 
     def attach(self, network):
         """Use network (LxmfNetwork, or a stand-in in tests) for sending and receiving."""
         self.network = network
 
-    def stop(self):
-        """Stop the loops, LXMF's router, and save."""
+    def stop(self, deadline: float | None = None):
+        """Stop the loops (waiting for them until deadline, as Feature.stop), LXMF's router, and save."""
         self._stop.set()
         self._wake.set()
         with self._auto_wanted:
             self._auto_wanted.notify_all()
-        for thread in self._threads:
-            thread.join(2.0)
+        self._join(deadline)
         if self.network is not None:
             try:
                 self.network.stop()

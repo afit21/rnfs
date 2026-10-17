@@ -94,7 +94,6 @@ class FollowFeature(Feature):
         self._resolved: set[bytes] = set()  # names whose last check resolved them (a failed fetch, then)
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._keepers = node.feature("keepers")
         self._keepers.add_listener(self._changed)
         try:
@@ -191,13 +190,14 @@ class FollowFeature(Feature):
         with self._lock:
             for name in self._pinned:
                 self._due[name] = (first, True)
-        self._thread = threading.Thread(target=self._loop, name="rnfs-follow", daemon=True)
-        self._thread.start()
+        self._spawn(self._loop, "rnfs-follow")
 
-    def stop(self):
-        """Stop the background thread (a fetch in progress stops at its next network wait)."""
+    def stop(self, deadline: float | None = None):
+        """Stop the background thread and wait for it until deadline (a fetch in progress stops at its next network
+        wait), so the node doesn't close the state database under it."""
         self._stop.set()
         self._wake.set()
+        self._join(deadline)
 
     def close(self):
         """Release the state database."""

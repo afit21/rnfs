@@ -161,6 +161,19 @@ class ContactsNodeTest(unittest.TestCase):
         self.book.remove("bnode")
         self.assertEqual(self.rows(), [])
 
+    def test_changes_are_durable_and_a_failed_one_is_written_by_save(self):
+        """Each change is committed durably as it is made; one whose commit failed is written by the node's next
+        save of its features (periodic, and at stop)."""
+        real = self.book._db.transaction
+        with mock.patch.object(self.book._db, "transaction", side_effect=real) as opened:
+            self.book.add("anode", A_ID.hex(), "node")
+        self.assertEqual([call.args for call in opened.call_args_list], [(True,)])
+        with failing_commits(), self.assertRaises(OSError):
+            self.book.remove("anode")
+        self.assertEqual(self.rows(), [("anode", "node", A_ID)])
+        self.b._save_state()
+        self.assertEqual(self.rows(), [])
+
     def test_kind_detection(self):
         self.assertEqual(self.book.add("alice", self.name.hex())["kind"], "name")  # a record B holds
         self.assertEqual(self.book.add("anode", A_ID.hex())["kind"], "node")  # in B's routing table

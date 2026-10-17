@@ -64,7 +64,16 @@ pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lx
 Persistent state lives in the state database. Each store keeps its state in memory, which is all reads use,
 loads it once at startup (checking every row as the JSON loaders checked every record: a malformed row is
 logged, skipped and deleted) and then writes only what changed: a pin is one row inserted or deleted, batched
-stores write the records changed since their last save. At every `connect`, `statedb.migrate` first imports
+stores write the records changed since their last save. The shared parts are in statedb: `open_store(state_dir,
+load)` connects and loads, releasing the reference if the load fails; `delete_rows` deletes the rows a load found
+malformed; and a `RowStore(db, table, key_cols, *, durable, mode)` keeps the keys a store changed (`changed(key)`,
+under the store's lock) and not yet written, and writes their rows (`row(key)`, None once gone) in one
+transaction: `write_through` at once, under the store's lock, raising if it fails; `snapshot` at `save()`, taking
+the rows under the lock and writing them outside it, one save at a time so an older snapshot never lands last.
+Either way a failed write keeps the keys for the next one, and the change stays in memory. pin_names, contacts,
+jobs and the publisher are built on it (the other stores move over later). `reconcile_pins` is the start-up
+check of a feature's pins against its saved state (released if it was saved whole, recorded again if not).
+At every `connect`, `statedb.migrate` first imports
 the JSON state files of 0.1.4 and earlier (`LEGACY`): each through its owner's importer, which checks every
 record as the old loader did, in one transaction that also records the file in the `migrated` table; then the
 file is renamed `<name>.migrated` and the directory synced. A file the table already lists (a crash between
@@ -882,7 +891,11 @@ and in total, never persisted.
 
 `rnfs/features/__init__.py` defines `Feature` and `FEATURE_MODULES` (in start order: peers, jobs, keepers, follow,
 contacts, lxmf, deny). The node builds every feature in its constructor (`node.feature(name)`), starts them after
-its own threads and stops them, in reverse, before its own services. A feature may override: `start()`, `stop()`,
+its own threads and stops them, in reverse, before its own services. A feature may override: `start()`,
+`stop(deadline=None)` (asks its threads to end, then waits for them until `deadline`, a `time.monotonic()` value:
+the node passes its stop budget's, so `STOP_TIMEOUT`, 5 s, bounds the features' threads and its own together;
+`None` waits `features.STOP_WAIT`; the base's `_spawn(target, name)` starts a thread that `_join(deadline)` waits
+for; the node calls a `stop()` with no `deadline` parameter as before, `features.stop_feature`),
 `save()` (called with the node's periodic saves), `close()` (releases the state database at shutdown, after `stop()`
 and the last save), `status()` (fields merged into `rnfs status`), `requests()` (new `rnfs.dht` paths; the request
 server applies private mode and the per-link limit, and turns `None` or an exception into `False`; a response must
@@ -979,7 +992,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's lookups (up to 4 at once, ended with the round; none on slow nodes) |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
-| `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits ≤ 2 s |
+| `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
 | `rnfs-follow` | follow | every check and fetch, one at a time |
 | `rnfs-deny` | deny | every deny-list source's check and fetch, one at a time, once joined |
@@ -1028,7 +1041,9 @@ runs while a lock is held:
 change returns, "NORMAL" ones are batched saves a power loss may lose the last of:
 - storage: `pins` (one row per source; each pin and release FULL, after the blocks are synced) and `cache`
   (cached fetches, LRU order in `used`, at most 10 000; NORMAL every 30 s and at stop, changed records only);
-- `pin_names` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin list; FULL);
+- `pin_names` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin list; NORMAL,
+  each change written at once, after the pin it names was committed FULL: a power loss can lose a name, never the
+  pin, and an add costs one durable commit, not two);
 - node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
   pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
   `invalid` (invalid roots, oldest first; with the cache records);
@@ -1052,6 +1067,14 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   stop, changed rows only; a CID's content never changes, so a row never goes stale);
 - `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
   requires; each box's `next_id`) and `migrated` (JSON files imported).
+
+The node lists its stores as `_setup` makes them (`RnfsNode._add_store`; the `node.Store` protocol: `save()`
+writes what changed since the last save, raising `OSError` and keeping the change if the database fails, and
+`close()` releases the store's reference to the state database). A store is batched (`_save_state`: every 30 s
+and at gc) or saves on a schedule of its own (provider records, the publisher, the remote pins waiting, the
+write-through stores); the features are stores too, batched. Stop saves every store in the order made, then
+`_close_state` closes them in reverse, the node's own reference last; after a `_setup` that failed, only those it
+made. A new store needs only its `_add_store` call.
 
 Free text that may hold lone surrogates (file names, LXMF records, cache paths) is stored as JSON text
 (`statedb.dump`). Rows that fail the checks the JSON loaders applied are dropped at load with a warning and
@@ -1199,7 +1222,9 @@ Everything in the specification is implemented, with these simplifications and a
   exits starts a new one; if `Thread.start()` fails the pin is given back and refused. The pins waiting are
   saved to the `remote_pins` table by maintenance (when changed; rewritten whole, a few rows) and at stop, and `_resume_remote_pins` queues
   them again at start (skipping those already pinned or whose identity left `remote_pin_identities`); workers
-  wait for the first join before fetching, and a fetch cut short by stopping stays queued.
+  wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
+  fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
+  (`_remote_workers` maps each source to its thread) within its budget.
 - Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks at a time ahead of what has been
   written out. A read may meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds
   files built from repeated tiny or empty subtrees without limiting honest large files.

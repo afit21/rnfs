@@ -103,22 +103,20 @@ class ContactsFeature(Feature):
         self._lock = threading.Lock()
         self._contacts: dict[str, tuple[str, bytes]] = {}  # nick -> (kind, hash)
         self._nicks: dict[tuple[str, bytes], set[str]] = {}  # (kind, hash) -> the nicks naming it, for has()
-        self._dirty: set[str] = set()  # nicks changed (or deleted) whose save failed, written with the next change
         # name -> (CID, monotonic time of the resolve that found it), reused for EXPAND_AGE
         self._expanded: dict[bytes, tuple[str, float]] = {}
-        self._db = statedb.connect(node.config.state_dir)
-        try:
-            self._load()
-        except BaseException:
-            self.close()
-            raise
+        self._db = statedb.open_store(node.config.state_dir, self._load)
 
     # State
 
-    def _load(self):
+    def _load(self, db):
         """Read the contacts table, by nick; malformed rows are logged and deleted, as are any past MAX_CONTACTS."""
+        from rnfs import statedb
+        # Written through, durably: a change is on disk when it returns; one whose write failed is written with the
+        # next change, or by save()
+        self._store = statedb.RowStore(db, "contacts", ("nick",), durable=True, lock=self._lock, row=self._row)
         bad = []
-        for nick, kind, ident in self._db.query("SELECT nick, kind, id FROM contacts ORDER BY nick"):
+        for nick, kind, ident in db.query("SELECT nick, kind, id FROM contacts ORDER BY nick"):
             if len(self._contacts) >= MAX_CONTACTS:
                 bad.append((nick,))  # never added (the address book is full): dropped, as from contacts.json
                 continue
@@ -130,9 +128,12 @@ class ContactsFeature(Feature):
             except (TypeError, ValueError):
                 self._log(f"ignoring malformed contact {nick!r}", LOG_WARNING)
                 bad.append((nick,))
-        if bad:
-            with self._db.transaction() as tx:
-                tx.executemany("DELETE FROM contacts WHERE nick = ?", bad)
+        statedb.delete_rows(db, "contacts", ("nick",), bad)
+
+    def _row(self, nick: str) -> tuple | None:
+        """nick's contacts row, or None if there is no such contact (lock held)."""
+        entry = self._contacts.get(nick)
+        return None if entry is None else (nick, *entry)
 
     def _set(self, nick: str, value: tuple[str, bytes] | None):
         """Set or (None) delete a contact, keeping _nicks in step (lock held, or loading)."""
@@ -146,15 +147,13 @@ class ContactsFeature(Feature):
             self._nicks.setdefault(value, set()).add(nick)
 
     def _save(self, nick: str):
-        """Write nick's row, and those of earlier changes whose save failed, durably (lock held). If it fails they
-        are written with the next change."""
-        self._dirty.add(nick)
-        rows = [(other, *self._contacts[other]) for other in self._dirty if other in self._contacts]
-        gone = [(other,) for other in self._dirty if other not in self._contacts]
-        with self._db.transaction(durable=True) as tx:
-            tx.executemany("DELETE FROM contacts WHERE nick = ?", gone)
-            tx.executemany("INSERT OR REPLACE INTO contacts (nick, kind, id) VALUES (?, ?, ?)", rows)
-        self._dirty.clear()
+        """Write nick's row, and those of earlier changes whose save failed, durably (lock held). Raises OSError if
+        it fails (the change stays in memory); they are then written with the next change, or by save()."""
+        self._store.changed(nick)
+
+    def save(self):
+        """Write the contacts whose write failed, if any (each change is written as it is made)."""
+        self._store.save()
 
     def close(self):
         """Release the state database (the node calls this once it has saved everything at shutdown)."""

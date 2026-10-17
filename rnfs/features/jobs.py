@@ -26,7 +26,8 @@ return at once with --background); `rnfs jobs` lists, shows, waits for, cancels 
 - Finished jobs (done, failed, cancelled) are kept for `rnfs jobs`, at most max_finished_jobs, but each
   for at least FINISHED_GRACE: a CLI following a fast job must still find it once it ends.
 - Job threads are daemon threads, so they never hold up the process; stop() asks running fetches to stop
-  and waits at most STOP_WAIT for them. A job interrupted by the shutdown is saved as queued.
+  and waits for them until the deadline the node passes (Feature.stop: its stop budget). A job interrupted by
+  the shutdown is saved as queued.
 
 No RNS at module level (the CLI imports this module): node-side modules are imported inside functions.
 """
@@ -54,7 +55,6 @@ FINISHED = frozenset({DONE, FAILED, CANCELLED})
 MAX_ACTIVE = 1000  # queued and running jobs at most, so a script can't queue without bound
 RATE_WINDOW = 300.0  # seconds the rate is averaged over: LoRa responses can arrive minutes apart
 SAMPLE_INTERVAL = 1.0  # seconds between rate samples
-STOP_WAIT = 2.0  # seconds stop() waits for running jobs to notice they must stop
 MAX_WAIT = 30  # longest wait= a GET /api/jobs/get may ask for, in seconds
 POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
@@ -98,6 +98,7 @@ class Job:
         self.ended = threading.Event()  # set once finished, for waiters
         self.stop_event: threading.Event | None = None  # the feature's, set when the node stops
         self.protection: ExitStack | None = None  # the session keeping its blocks while queued or running
+        self.position: int | None = None  # its row's place in the jobs table (creation order), once queued or loaded
         self._lock = threading.Lock()  # guards _samples and _seen
         self._samples: deque[tuple[float, int]] = deque()  # (monotonic time, downloaded_bytes)
         self._seen: set = set()  # CIDs met this run, so each counts once
@@ -297,22 +298,12 @@ class JobsFeature(Feature):
         from rnfs import statedb
         super().__init__(node)
         self._lock = threading.Lock()
-        self._save_lock = threading.Lock()  # keeps saves in order without holding _lock while writing
         self._jobs: dict[str, Job] = {}  # in creation order
         self._threads: dict[str, threading.Thread] = {}
         self._started = False
-        self._dirty = False  # jobs changed since the last save
         self._stop_event = threading.Event()
-        # What the jobs table holds: id -> (position, dump()ed record); and the next new job's position (after
-        # every one saved). Both used under _save_lock only
-        self._saved: dict[str, tuple[int, str]] = {}
-        self._position = 0
-        self._db = statedb.connect(node.config.state_dir)
-        try:
-            self._load()
-        except BaseException:
-            self.close()
-            raise
+        self._position = 0  # the next new job's position (after every one saved)
+        self._db = statedb.open_store(node.config.state_dir, self._load)
 
     @property
     def max_jobs(self) -> int:
@@ -322,11 +313,15 @@ class JobsFeature(Feature):
 
     # Persistence
 
-    def _load(self):
+    def _load(self, db):
         """Read the jobs table, oldest first; a malformed row is logged and deleted."""
         from rnfs import statedb
+        # Saved durably at each change and periodically (a running job's progress), outside the lock; only the
+        # jobs whose record changed are written
+        self._store = statedb.RowStore(db, "jobs", ("id",), durable=True, mode=statedb.SNAPSHOT, lock=self._lock,
+                                       row=self._row, skip_unchanged=True)
         bad = []
-        for job_id, position, text in self._db.query("SELECT id, position, record FROM jobs ORDER BY position"):
+        for job_id, position, text in db.query("SELECT id, position, record FROM jobs ORDER BY position"):
             try:
                 if not isinstance(position, int):
                     raise TypeError("bad position")
@@ -338,8 +333,10 @@ class JobsFeature(Feature):
                 _log(f"ignoring a saved job ({e})", LOG_WARNING)
                 bad.append((job_id,))
                 continue
-            self._saved[job.id] = (position, text)
+            job.position = position
             if job.state in ACTIVE:
+                if job.state == RUNNING:
+                    self._store.changed(job.id)  # saved as queued by the next save
                 job.state = QUEUED  # interrupted: it resumes once the node runs
                 job.stop_event = self._stop_event
                 self._protect(job)
@@ -350,45 +347,25 @@ class JobsFeature(Feature):
         resumed = sum(1 for job in self._jobs.values() if job.state == QUEUED)
         if resumed:
             _log(f"{resumed} unfinished job(s) will resume")
-        if bad:
-            with self._db.transaction() as tx:
-                tx.executemany("DELETE FROM jobs WHERE id = ?", bad)
+        statedb.delete_rows(db, "jobs", ("id",), bad)
+
+    def _row(self, job_id: str) -> tuple | None:
+        """job_id's jobs row, or None once it is forgotten (lock held)."""
+        from rnfs import statedb
+        job = self._jobs.get(job_id)
+        return None if job is None else (job_id, job.position, statedb.dump(job.to_record()))
 
     def save(self):
-        """Save the jobs changed since the last save, and forget those gone, durably, if jobs changed or one runs
-        (the node calls this periodically, keeping saved progress recent)."""
-        from rnfs import statedb
-        with self._save_lock:
-            with self._lock:
-                if not self._dirty and not any(job.state == RUNNING for job in self._jobs.values()):
-                    return
-                records = [(job_id, statedb.dump(job.to_record())) for job_id, job in self._jobs.items()]
-                self._dirty = False
-            saved, position, rows = {}, self._position, []
-            for job_id, text in records:
-                old = self._saved.get(job_id)
-                if old is None:
-                    old = (position, None)
-                    position += 1
-                if old[1] != text:
-                    rows.append((job_id, old[0], text))
-                saved[job_id] = (old[0], text)
-            gone = [(job_id,) for job_id in self._saved if job_id not in saved]
-            try:
-                if rows or gone:
-                    with self._db.transaction(durable=True) as tx:  # a queued job must survive a crash
-                        tx.executemany("DELETE FROM jobs WHERE id = ?", gone)
-                        tx.executemany("INSERT OR REPLACE INTO jobs (id, position, record) VALUES (?, ?, ?)", rows)
-            except BaseException:
-                with self._lock:
-                    self._dirty = True
-                raise
-            self._saved, self._position = saved, position
+        """Save the jobs changed since the last save, and forget those gone, durably (a queued job must survive a
+        crash); running jobs whose progress changed too (the node calls this periodically, keeping saved progress
+        recent). Each change is noted with _store.changed(job ID), under the lock."""
+        with self._lock:
+            self._store.changed(*(job_id for job_id, job in self._jobs.items() if job.state == RUNNING))
+        self._store.save()
 
     def _save_quietly(self):
-        """save() after a change, logging rather than raising: a job's outcome mustn't be lost to a full disk."""
-        with self._lock:
-            self._dirty = True
+        """save() after a change, logging rather than raising: a job's outcome mustn't be lost to a full disk (it
+        is saved again by the next save)."""
         try:
             self.save()
         except OSError as e:
@@ -411,6 +388,7 @@ class JobsFeature(Feature):
         for job in finished[:max(0, len(finished) - limit)]:
             if (job.finished or job.created) < recent:
                 del self._jobs[job.id]
+                self._store.changed(job.id)
 
     # Protection
 
@@ -438,15 +416,14 @@ class JobsFeature(Feature):
             self._started = True
         self._schedule()
 
-    def stop(self):
-        """Ask running jobs to stop (they are saved as queued, to resume), wait briefly, save."""
+    def stop(self, deadline: float | None = None):
+        """Ask running jobs to stop (they are saved as queued, to resume), wait for them until deadline (as
+        Feature.stop), save."""
         with self._lock:
             self._started = False
             threads = list(self._threads.values())
         self._stop_event.set()
-        deadline = time.monotonic() + STOP_WAIT
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
+        self._join(deadline, threads)
         try:
             self.save()  # only if something changed: offline test nodes with no jobs write nothing
         except OSError as e:
@@ -471,6 +448,7 @@ class JobsFeature(Feature):
                 if job.state != QUEUED:
                     continue
                 job.begin_run()
+                self._store.changed(job.id)
                 thread = threading.Thread(target=self._run, args=(job,), name=f"rnfs-job-{job.id}", daemon=True)
                 self._threads[job.id] = thread
                 starting.append(thread)
@@ -578,6 +556,7 @@ class JobsFeature(Feature):
             if state in FINISHED:
                 job.finished = time.time()
             self._threads.pop(job.id, None)
+            self._store.changed(job.id)
             self._cap_finished()
         if state in FINISHED:
             job.ended.set()
@@ -614,8 +593,11 @@ class JobsFeature(Feature):
                 job_id = secrets.token_hex(4)
             job = Job(job_id, kind, target, output, from_node, sealed_name=sealed_name, fallback_dht=fallback_dht)
             job.stop_event = self._stop_event
+            job.position = self._position
+            self._position += 1
             self._protect(job)
             self._jobs[job_id] = job
+            self._store.changed(job_id)
         _log(f"job {job_id} queued: {kind} {target}" + (f" to {output}" if output else ""))
         if not self._schedule():  # else saved as it started
             self._save_quietly()
@@ -651,6 +633,7 @@ class JobsFeature(Feature):
             if job.state == QUEUED:
                 job.state = CANCELLED
                 job.finished = time.time()
+                self._store.changed(job.id)
                 ended = True
             elif job.state == RUNNING:
                 job.cancel_requested = True
@@ -671,6 +654,7 @@ class JobsFeature(Feature):
                        if job.state in FINISHED and (job_id is None or jid == job_id)]
             for jid in removed:
                 del self._jobs[jid]
+            self._store.changed(*removed)
         if removed:
             self._save_quietly()
         return len(removed)

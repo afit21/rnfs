@@ -3,6 +3,8 @@ import io
 import os
 import tempfile
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest import mock
 
 from rnfs.cli import display_name
@@ -11,6 +13,22 @@ from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
 from rnfs.pin_names import MAX_NAME_LENGTH, PinNames
 from tests.support import failing_commits, state_execute, state_rows, write_legacy
+
+
+@contextmanager
+def recorded_transactions(db, label: str, opened: list | None = None) -> Iterator[list]:
+    """Within the with block, each transaction opened through the StateDb reference db appends (label, durable)
+    to opened (a new list if None), which is yielded."""
+    opened = [] if opened is None else opened
+    real = db.transaction
+
+    def transaction(durable: bool = False):
+        """The real transaction, noted."""
+        opened.append((label, durable))
+        return real(durable)
+
+    with mock.patch.object(db, "transaction", transaction):
+        yield opened
 
 
 class PinNamesStoreTest(unittest.TestCase):
@@ -81,6 +99,25 @@ class PinNamesStoreTest(unittest.TestCase):
         names.record(self.other, "second")
         self.assertEqual(self.rows(), {self.other: '"second"'})
 
+    def test_failed_save_is_written_by_save(self):
+        """save() writes a name whose write failed (the node saves its stores at stop)."""
+        names = self.open()
+        with failing_commits(), self.assertRaises(OSError):
+            names.record(self.cid, "first")
+        self.assertEqual(self.rows(), {})
+        names.save()
+        self.assertEqual(self.rows(), {self.cid: '"first"'})
+
+    def test_names_are_written_at_once_but_not_durably(self):
+        """Each change is committed as it is made, with synchronous=NORMAL (S3): the pin it names is durable."""
+        names = self.open()
+        with recorded_transactions(names._db, "name") as opened:
+            names.record(self.cid, "a")
+            self.assertEqual(self.rows(), {self.cid: '"a"'})
+            names.prune(set())
+            self.assertEqual(self.rows(), {})
+        self.assertEqual(opened, [("name", False), ("name", False)])
+
 
 class PinLsNamesTest(unittest.TestCase):
     """The node's pin_ls reports type and name for each way a pin can be made."""
@@ -104,6 +141,25 @@ class PinLsNamesTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(data)
         return path
+
+    def test_an_add_commits_durably_once_pin_first(self):
+        """S3: an add makes one durable commit, the pin's; the name is written after it, not durably, so a power
+        loss can lose at most the name, never the pin."""
+        with recorded_transactions(self.node.storage._db, "pin") as opened, \
+                recorded_transactions(self.node.pin_names._db, "name", opened):
+            cid = self.node.add_path(self.write("notes.txt", b"hello"))["cid"]
+            self.node.add_stream(io.BytesIO(b"streamed"), name="report.pdf")
+        self.assertEqual(opened, [("pin", True), ("name", False)] * 2)
+        self.assertEqual(self.entry(cid)["name"], os.path.abspath(os.path.join(self.dir, "notes.txt")))
+
+    def test_stop_saves_a_name_whose_write_failed(self):
+        """The node saves pin names at stop: a name whose write failed is written then."""
+        cid = Cid.for_block("raw", b"x")
+        with failing_commits(), self.assertRaises(OSError):
+            self.node.pin_names.record(cid, "/home/u/a.txt")
+        self.node.stop()
+        rows = state_rows(self.node.config.state_dir, "SELECT cid, name FROM pin_names")
+        self.assertEqual(rows, [(cid.binary, '"/home/u/a.txt"')])
 
     def test_added_file_shows_its_path(self):
         path = self.write("notes.txt", b"hello")

@@ -755,6 +755,67 @@ class RestartTest(NodeTest):
                          [(Cid.for_block(RAW, b"other").binary,)])
 
 
+class StopTest(NodeTest):
+    """stop() runs every step whatever raises, and waits for the threads it ends (audit XC5)."""
+
+    def test_a_raising_service_still_closes_the_state_and_releases_the_destination(self):
+        """An embedded node whose announcer fails to stop: its state database is still closed and its rnfs.dht
+        destination still released, so a later node in the process can use both."""
+        node = self.make_node("embedded", N1)
+        node.embedded = True
+        node.destination = mock.Mock(links=[])
+        node.announcer = mock.Mock(**{"stop.side_effect": RuntimeError("announcer broke")})
+        with mock.patch.object(RNS.Transport, "deregister_destination") as deregister, \
+                mock.patch("rnfs.node.log") as log:
+            node.stop()
+        deregister.assert_called_once_with(node.destination)
+        self.assertIsNone(node._db._database)
+        self.assertTrue(any("announcer broke" in call.args[0] for call in log.call_args_list))
+        self.make_node("embedded", N1).stop()
+
+    def test_a_raising_feature_or_save_skips_nothing(self):
+        """A feature's stop and a store's save raising something other than OSError: the other stores are still
+        saved and the state closed."""
+        node = self.make_node("broken", N1)
+        cid = node.add_stream(io.BytesIO(b"cached"), pin=False)["cid"]
+        node._note_fetched(Cid.parse(cid))
+        with mock.patch.object(node.feature("follow"), "stop", side_effect=RuntimeError("follow broke")), \
+                mock.patch.object(node.storage, "save", side_effect=ValueError("bad row")), \
+                mock.patch("rnfs.node.log") as log:
+            node.stop()
+        logged = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(any("follow broke" in line for line in logged), logged)
+        self.assertTrue(any("bad row" in line for line in logged), logged)
+        self.assertEqual(state_rows(node.config.state_dir, "SELECT cid FROM fetched"), [(Cid.parse(cid).binary,)])
+        self.assertIsNone(node._db._database)
+
+    def test_stop_cancels_remote_pin_fetches_and_waits_for_their_workers(self):
+        """A remote pin being fetched when the node stops: its fetch watches stop_event, stop waits for its worker,
+        and the pin is saved as waiting, for the next start."""
+        cid = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"])
+        self.advertise(str(cid))
+        asked, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+
+        def held(node_id, cids, on_progress=None):
+            """Hold every /blocks until the test ends, then fail it."""
+            asked.set()
+            go.wait(30)
+            return BlocksResult("failed", unsent=list(cids))
+
+        self.net.blocks = held
+        before = set(threading.enumerate())
+        self.assertTrue(self.b.backend.remote_pin(IDENTITY, cid, True))
+        self.assertTrue(asked.wait(10))
+        workers = [t for t in threading.enumerate() if t not in before and t.name == "rnfs-remote-pin"]
+        self.assertEqual(len(workers), 1)
+        started = time.monotonic()
+        self.b.stop()
+        self.assertFalse(workers[0].is_alive(), "stop didn't wait for the remote-pin worker")
+        self.assertLess(time.monotonic() - started, node_module.STOP_TIMEOUT)
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM remote_pins"), [(cid.binary,)])
+
+
 class MakeRoomTest(NodeTest):
     """Eviction for room, as each stored response batch asks for."""
 
