@@ -836,7 +836,8 @@ and in total, never persisted.
   `MAX_BLOCKS_CIDS` (26) entries of `bin` up to `MAX_BLOCK_SIZE` or `nil`, and nothing after it. A refused
   response is handed to `Link.handle_response` as `None`, which every parser refuses, so the request fails as
   malformed; refusals are logged at most once a minute. `guarded_receive` drops a response packet on an
-  incoming `rnfs.dht` link without decrypting it. Everything else goes to RNS's own methods unchanged.
+  incoming `rnfs.dht` link, and a request packet on one this node opened (`link.initiator`), without
+  decrypting it. Everything else goes to RNS's own methods unchanged.
 - `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
   instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
   RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in

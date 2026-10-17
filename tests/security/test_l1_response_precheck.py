@@ -235,7 +235,8 @@ class ResponsePacketTest(_Guarded):
         link.decrypt.assert_not_called()
 
     def test_other_packets_and_destinations_untouched(self):
-        link = ResponseLink()
+        # A request on an incoming link, where the node's server takes them (NET-3 drops one on a link it opened)
+        link = ResponseLink(initiator=False)
         request = types.SimpleNamespace(context=RNS.Packet.REQUEST, packet_type=RNS.Packet.DATA, data=b"x" * 600)
         RNS.Link.receive(link, request)
         lxmf_link = ResponseLink(LXMF, initiator=False)

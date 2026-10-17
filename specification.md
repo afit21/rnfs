@@ -241,7 +241,9 @@ pass a `max_response_size` just above their largest honest answer.
   nothing after it. rnfs checks responses sent as a Resource, and those sent as one packet larger than RNS's
   default MTU (only links that negotiated a larger MTU carry them; smaller ones decode to little). A refused
   response fails its request as a malformed one does. A responder sends no requests, so a response packet on
-  an incoming `rnfs.dht` link is dropped unread.
+  an incoming `rnfs.dht` link is dropped unread. Likewise a node serves requests only on incoming links, so it
+  SHOULD drop, unread, a request packet on an `rnfs.dht` link it opened: the remote destination of such a link
+  has no request size limit or handlers, and RNS would decode the request and start a thread for it first.
 - `max_upload_rate` caps bytes sent for `/blocks` on a link once it has a rate estimate. RNS paces a Resource
   by its receiver, so the cap is applied between responses: the response budget uses the lower of the rate
   estimate and `max_upload_rate`, and the next response on that link starts no sooner than
