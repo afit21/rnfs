@@ -841,7 +841,9 @@ off their node. Nothing on the wire changes.
   (so a range fetches the whole file first; its hash is then remembered; the gateway's `?format=raw` and
   `?format=archive` too), and as `add`, the shared folder or `import` read it (the add or import fails). By then the file's blocks have been downloaded. A file-hash entry
   doesn't stop those blocks being fetched (by `pin add`, `export` to a file, a remote pin or a followed name), stored,
-  served or provided: deny the CID for that. A file of one block has its content's hash as its CID's digest,
+  served or provided (a file of several chunks is still served chunk by chunk, by `/blocks` and by the gateway's
+  `?format=raw` of each block's CID): deny the CID for that. The first time a node refuses a file by its hash it
+  logs a notice naming the command that does (`rnfs deny add <file cid>`). A file of one block has its content's hash as its CID's digest,
   so either entry stops it; a sealed file matches by its sealed bytes, as stored, not by what it decrypts to.
 - Hashing a file reads every occurrence of content its DAG repeats, so a few small blocks can declare a file of
   2^56 bytes. While there are file-hash entries, a file whose hash isn't known yet and whose declared size is

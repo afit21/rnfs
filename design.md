@@ -1268,7 +1268,8 @@ Everything in the specification is implemented, with these simplifications and a
   `_check_file(expect, get)` (get's write-out check, a sealed get, `read` before its first byte,
   `node_content.block` for a raw block, `export_stream` for every file before `start` and `import_archive` for the
   complete roots; a raw file's digest is its CID's, others are hashed once and remembered, across restarts:
-  `deny_hashes`). `get` serves the file's whole DAG, stored and checked: `_check_fetched` (a sealed get, `read`)
+  `deny_hashes`; a refusal by hash logs a NOTICE suggesting `rnfs deny add <cid>`, since the file's blocks are still
+  served, once per file CID in `_hash_noticed`, cleared at `HASH_NOTICES` (1024)). `get` serves the file's whole DAG, stored and checked: `_check_fetched` (a sealed get, `read`)
   runs `fetch_dag` first unless the hash is known, which also brings `max_download_size` and `check_disk`. Before
   hashing, a file declaring more than `DENY_HASH_RATIO` (16) × `walker.leaf_bytes` + `DENY_HASH_SLACK` (64 MiB) is
   refused as `Denied`, so `_refusing` collects what a refused import stored: hashing reads every occurrence of
