@@ -882,7 +882,11 @@ and in total, never persisted.
 
 `rnfs/features/__init__.py` defines `Feature` and `FEATURE_MODULES` (in start order: peers, jobs, keepers, follow,
 contacts, lxmf, deny). The node builds every feature in its constructor (`node.feature(name)`), starts them after
-its own threads and stops them, in reverse, before its own services. A feature may override: `start()`, `stop()`,
+its own threads and stops them, in reverse, before its own services. A feature may override: `start()`,
+`stop(deadline=None)` (asks its threads to end, then waits for them until `deadline`, a `time.monotonic()` value:
+the node passes its stop budget's, so `STOP_TIMEOUT`, 5 s, bounds the features' threads and its own together;
+`None` waits `features.STOP_WAIT`; the base's `_spawn(target, name)` starts a thread that `_join(deadline)` waits
+for; the node calls a `stop()` with no `deadline` parameter as before, `features.stop_feature`),
 `save()` (called with the node's periodic saves), `close()` (releases the state database at shutdown, after `stop()`
 and the last save), `status()` (fields merged into `rnfs status`), `requests()` (new `rnfs.dht` paths; the request
 server applies private mode and the per-link limit, and turns `None` or an exception into `False`; a response must
@@ -979,7 +983,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's lookups (up to 4 at once, ended with the round; none on slow nodes) |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
-| `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits ≤ 2 s |
+| `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
 | `rnfs-follow` | follow | every check and fetch, one at a time |
 | `rnfs-deny` | deny | every deny-list source's check and fetch, one at a time, once joined |
@@ -1207,7 +1211,9 @@ Everything in the specification is implemented, with these simplifications and a
   exits starts a new one; if `Thread.start()` fails the pin is given back and refused. The pins waiting are
   saved to the `remote_pins` table by maintenance (when changed; rewritten whole, a few rows) and at stop, and `_resume_remote_pins` queues
   them again at start (skipping those already pinned or whose identity left `remote_pin_identities`); workers
-  wait for the first join before fetching, and a fetch cut short by stopping stays queued.
+  wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
+  fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
+  (`_remote_workers` maps each source to its thread) within its budget.
 - Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks at a time ahead of what has been
   written out. A read may meet at most `max_output_entries` pieces much shorter than `CHUNK_SIZE`, which bounds
   files built from repeated tiny or empty subtrees without limiting honest large files.

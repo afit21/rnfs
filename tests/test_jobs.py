@@ -20,7 +20,7 @@ from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.features import jobs
-from rnfs.node import RnfsNode
+from rnfs.node import STOP_TIMEOUT, RnfsNode
 from tests.support import failing_commits, real, state_execute, state_rows, wait_for, write_legacy
 from tests.test_api import FakeNode
 from tests.test_names import FakeNetwork
@@ -490,7 +490,8 @@ class JobsTest(JobsBase):
         self.assertTrue(wait_for(lambda: self.net.waiting > 0))
         started = time.monotonic()
         self.b.stop()
-        self.assertLess(time.monotonic() - started, jobs.STOP_WAIT + 2)
+        # Its fetch notices the stop at its next step, well within the node's stop budget
+        self.assertLess(time.monotonic() - started, STOP_TIMEOUT - 1)
 
 
 class ApiBase(JobsBase):

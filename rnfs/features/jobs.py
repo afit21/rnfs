@@ -26,7 +26,8 @@ return at once with --background); `rnfs jobs` lists, shows, waits for, cancels 
 - Finished jobs (done, failed, cancelled) are kept for `rnfs jobs`, at most max_finished_jobs, but each
   for at least FINISHED_GRACE: a CLI following a fast job must still find it once it ends.
 - Job threads are daemon threads, so they never hold up the process; stop() asks running fetches to stop
-  and waits at most STOP_WAIT for them. A job interrupted by the shutdown is saved as queued.
+  and waits for them until the deadline the node passes (Feature.stop: its stop budget). A job interrupted by
+  the shutdown is saved as queued.
 
 No RNS at module level (the CLI imports this module): node-side modules are imported inside functions.
 """
@@ -54,7 +55,6 @@ FINISHED = frozenset({DONE, FAILED, CANCELLED})
 MAX_ACTIVE = 1000  # queued and running jobs at most, so a script can't queue without bound
 RATE_WINDOW = 300.0  # seconds the rate is averaged over: LoRa responses can arrive minutes apart
 SAMPLE_INTERVAL = 1.0  # seconds between rate samples
-STOP_WAIT = 2.0  # seconds stop() waits for running jobs to notice they must stop
 MAX_WAIT = 30  # longest wait= a GET /api/jobs/get may ask for, in seconds
 POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
@@ -438,15 +438,14 @@ class JobsFeature(Feature):
             self._started = True
         self._schedule()
 
-    def stop(self):
-        """Ask running jobs to stop (they are saved as queued, to resume), wait briefly, save."""
+    def stop(self, deadline: float | None = None):
+        """Ask running jobs to stop (they are saved as queued, to resume), wait for them until deadline (as
+        Feature.stop), save."""
         with self._lock:
             self._started = False
             threads = list(self._threads.values())
         self._stop_event.set()
-        deadline = time.monotonic() + STOP_WAIT
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
+        self._join(deadline, threads)
         try:
             self.save()  # only if something changed: offline test nodes with no jobs write nothing
         except OSError as e:

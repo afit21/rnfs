@@ -10,7 +10,9 @@ through NodeBackend. Background threads: the announcer, the join (bootstrap node
 repeated while too few servers are known), the publish loop, the name re-announce loop, the features' own, a
 worker per source with remote pins waiting, and maintenance (shared-folder scans, provider record expiry and
 saves, max_storage enforcement, periodic state saves, publisher refreshes asked for, deny-list changes retried,
-the remote pins waiting saved).
+the remote pins waiting saved). Stopping ends the features, then the node's services and threads (waiting for
+them, the features' too, at most STOP_TIMEOUT in all), saves every store and closes the state, each step guarded:
+one that fails skips none of the others.
 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
@@ -29,6 +31,7 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
+from functools import partial
 from typing import BinaryIO, Callable, Iterator, Protocol, TypeVar
 
 import RNS
@@ -45,8 +48,8 @@ from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_rese
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
-from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, TooLarge
-from rnfs.fetcher import Fetch, Fetcher, describe
+from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, TooLarge
+from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
 from rnfs.names import NameManager, parse_name
@@ -64,7 +67,7 @@ STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched ta
 ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the block (msgpack framing, CID)
 EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else triggers one
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
-STOP_TIMEOUT = 5.0
+STOP_TIMEOUT = 5.0  # seconds stop() waits in all for the threads it ends (the features' and the node's)
 REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetched; more are refused
 BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many have answered
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
@@ -607,7 +610,8 @@ class RnfsNode:
         # Remote source -> CIDs waiting or being fetched for it, in the order accepted (fetched one at a time)
         self._remote_reserved: dict[str, dict[Cid, None]] = {}
         self._remote_released: set[tuple[str, Cid]] = set()  # remote pins released while still being fetched
-        self._remote_workers: set[str] = set()  # remote sources with a thread fetching their pins
+        # Remote source -> the thread fetching its pins (one at most); stop waits for them
+        self._remote_workers: dict[str, threading.Thread] = {}
         self._remote_pins_dirty = False  # changed since last saved (by maintenance, and at stop)
         self._remote_pins_save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         # Saved about every second (maintain); closed with self._db
@@ -670,37 +674,49 @@ class RnfsNode:
                 log(f"feature {feature.name} failed to start: {e!r}", LOG_ERROR)
 
     def stop(self, timeout: float = STOP_TIMEOUT):
-        """Stop background work, save state and close links. Work still waiting on the network is abandoned."""
+        """Stop background work, save state and close links. Work still waiting on the network is abandoned.
+
+        The features' threads and the node's are waited for at most timeout seconds in all. Each step is guarded:
+        one that raises is logged and the rest still run, so the state is saved and closed, and an embedded
+        node's destination released, whatever failed before.
+        """
         if self._stopped:
             return
         self._stopped = True
         log("stopping", LOG_NOTICE)
-        for feature in reversed(list(self.features.values())):
-            try:
-                feature.stop()
-            except Exception as e:  # noqa: BLE001 - keep stopping the rest
-                log(f"feature {feature.name} failed to stop: {e!r}", LOG_ERROR)
-        self.stop_event.set()
-        self.publisher.wake()
-        if self.announcer is not None:
-            self.announcer.stop()
-        if self.announce_handler is not None:
-            self.announce_handler.deregister()
-        if self.server is not None:
-            self.server.stop()
-        try:
-            self.names.stop()  # saves the names state
-        except OSError as e:  # stopping goes on: the rest is saved, the state closed and the links too
-            log(f"saving state failed: {e!r}", LOG_ERROR)
         deadline = time.monotonic() + timeout
-        for thread in self.threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        self._save_state(self._every_store())
-        self._close_state()
+        steps: list[tuple[str, Callable[[], object]]] = [
+            (f"stopping feature {feature.name}", partial(features.stop_feature, feature, deadline))
+            for feature in reversed(list(self.features.values()))]
+        steps += [("signalling the threads to stop", self.stop_event.set),
+                  ("waking the publisher", self.publisher.wake)]
+        if self.announcer is not None:
+            steps.append(("stopping the announcer", self.announcer.stop))
+        if self.announce_handler is not None:
+            steps.append(("deregistering the announce handler", self.announce_handler.deregister))
+        if self.server is not None:
+            steps.append(("stopping the request server", self.server.stop))
+        steps.append(("deregistering names, saving state", self.names.stop))  # names.stop saves the names state
+        steps.append(("waiting for the background threads", partial(self._join_threads, deadline)))
+        steps += [("saving state", store.save) for store in self._every_store()]
+        steps.append(("closing state", self._close_state))
         if self.links is not None:
-            self.links.close_all()
+            steps.append(("closing links", self.links.close_all))
         if self.embedded:
-            self._release_destination()
+            steps.append(("releasing the rnfs.dht destination", self._release_destination))
+        for label, step in steps:
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 - the later steps run: the state is closed, the destination released
+                log(f"{label} failed: {e!r}", LOG_ERROR)
+
+    def _join_threads(self, deadline: float):
+        """Wait until deadline (a time.monotonic() value) for the background loops and the remote-pin workers to
+        end, once stop_event is set."""
+        with self._lock:
+            workers = list(self._remote_workers.values())
+        for thread in (*self.threads, *workers):
+            thread.join(max(0.0, deadline - time.monotonic()))
 
     def _release_destination(self):
         """An embedded node's last step: RNS stops answering for its rnfs.dht destination and the links to it
@@ -723,11 +739,11 @@ class RnfsNode:
             except Exception as e:  # noqa: BLE001 - release the rest
                 log(f"closing state failed: {e!r}", LOG_ERROR)
 
-    def _save_state(self, stores: "list[Store] | None" = None):
-        """Save what changed in stores, by default the batched ones (cache records, fetched targets, invalid roots,
-        remembered file hashes and the features' state: each change isn't written at once). A failing save is
-        logged, and the rest are still saved."""
-        for store in self._every_store(batched=True) if stores is None else stores:
+    def _save_state(self):
+        """Save what changed in the batched stores (cache records, fetched targets, invalid roots, remembered file
+        hashes and the features' state: each change isn't written at once). A failing save is logged, and the rest
+        are still saved."""
+        for store in self._every_store(batched=True):
             try:
                 store.save()
             except OSError as e:
@@ -1578,7 +1594,7 @@ class RnfsNode:
             log(f"refused remote pin of {cid} for {source}: couldn't start its fetch: {e}", LOG_ERROR)
             return False
         # Registered after start() succeeds, still under the lock, so the worker can't look before it is
-        self._remote_workers.add(source)
+        self._remote_workers[source] = thread
         return True
 
     def _remote_pin_worker(self, source: str):
@@ -1597,13 +1613,13 @@ class RnfsNode:
                 if cid is None:
                     # Deregistered in the same critical section that saw nothing waiting: a /pin arriving after
                     # it starts a new worker instead of relying on this one, which is about to return
-                    self._remote_workers.discard(source)
+                    self._remote_workers.pop(source, None)
                     return
             try:
                 self._remote_pin_fetch(cid, source)  # removes cid from _remote_reserved when done
             except BaseException:
                 with self._lock:
-                    self._remote_workers.discard(source)
+                    self._remote_workers.pop(source, None)
                 raise
 
     def _save_remote_pins(self):
@@ -1676,13 +1692,15 @@ class RnfsNode:
 
     def _remote_pin_fetch(self, cid: Cid, source: str):
         """Fetch cid for a remote pin, dropping it as soon as its verified size, or the bytes of its DAG's
-        blocks met so far, would exceed the quota."""
+        blocks met so far, would exceed the quota. The fetch ends at its next step once the node stops."""
         quota = self.config.remote_pin_quota
+        observer = Observer()
+        observer.cancelled = self.stop_event.is_set
         try:
             with self._lock:
                 if (source, cid) in self._remote_released:
                     return  # released while it waited
-            with self.fetcher.open(cid, pinned=True) as fetch:
+            with observing(observer), self.fetcher.open(cid, pinned=True) as fetch:
                 expect = fetch.resolve()
                 content = fetch.size_of(expect)
                 # Nothing else is being fetched for source (_remote_pin_worker), so its pins are all it uses
@@ -1708,6 +1726,9 @@ class RnfsNode:
                     self.storage.pin(cid, source)
             log(f"pinned {cid} for {source}", LOG_NOTICE)
             self.publisher.refresh()
+        except Cancelled:
+            log(f"remote pin of {cid} for {source} stopped with the node: it is fetched after the next start",
+                LOG_VERBOSE)
         except RnfsError as e:
             log(f"remote pin of {cid} for {source} failed: {e}", LOG_WARNING)
         except Exception as e:  # noqa: BLE001 - the pin waits for the next try; logged

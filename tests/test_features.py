@@ -1,5 +1,9 @@
 """Tests for the feature framework (rnfs.features): loading, node wiring, API routes and CLI commands."""
+import os
 import sys
+import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -39,6 +43,28 @@ class DummyFeature(features.Feature):
         """One subcommand."""
         sub = command(commands, "dummy", lambda args: print("dummy ran"), "a test command")
         sub.add_argument("--who")
+
+
+class DeadlineFeature(DummyFeature):
+    """A feature whose stop takes the node's deadline, with one thread that runs until stopped."""
+
+    name = "deadline"
+
+    def __init__(self, node):
+        """Not stopped yet."""
+        super().__init__(node)
+        self.deadlines = []
+        self.ended = threading.Event()
+
+    def start(self):
+        """Start the thread."""
+        self._spawn(self.ended.wait, "test-deadline-feature")
+
+    def stop(self, deadline=None):
+        """Record the deadline, end the thread and wait for it."""
+        self.deadlines.append(deadline)
+        self.ended.set()
+        self._join(deadline)
 
 
 def install_dummy():
@@ -88,3 +114,66 @@ class FeatureFrameworkTest(unittest.TestCase):
                 conn.close()
                 self.assertEqual(response.status, expected, body)
             self.assertEqual(body, {"hello": "me"})
+
+
+class FeatureLifecycleTest(unittest.TestCase):
+    """Feature.stop(deadline): the base's _spawn and _join, and the node passing its stop budget (audit XC5)."""
+
+    def test_join_waits_until_the_deadline_at_most(self):
+        feature = features.Feature(node=None)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        thread = feature._spawn(release.wait, "test-feature-thread")
+        started = time.monotonic()
+        feature.stop(time.monotonic() + 0.2)  # the base's stop only waits
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(thread.is_alive())
+        self.assertFalse(feature._join(time.monotonic()))
+        release.set()
+        self.assertTrue(feature._join())
+        self.assertFalse(thread.is_alive())
+
+    def test_spawn_forgets_ended_threads(self):
+        feature = features.Feature(node=None)
+        first = feature._spawn(lambda: None, "test-feature-thread")
+        first.join(5)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        second = feature._spawn(release.wait, "test-feature-thread")
+        self.assertEqual(feature._spawned, [second])
+
+    def test_stop_feature_is_call_compatible(self):
+        """A stop without a deadline parameter (written before 0.1.6) is called as before; a new one gets it."""
+        legacy, current = DummyFeature(node=None), DeadlineFeature(node=None)
+        features.stop_feature(legacy, 123.0)
+        features.stop_feature(current, 123.0)
+        self.assertEqual(legacy.calls, ["init", "stop"])
+        self.assertEqual(current.deadlines, [123.0])
+        current.stop()  # a host program calling stop() itself
+        self.assertEqual(current.deadlines, [123.0, None])
+
+    def test_node_passes_its_stop_budget(self):
+        from rnfs.config import Config
+        from rnfs.node import STOP_TIMEOUT, RnfsNode
+        from tests.test_names import FakeNetwork
+        from tests.test_node import N1, NetClient
+        legacy_module, current_module = types.ModuleType("rnfs_test_legacy"), types.ModuleType("rnfs_test_deadline")
+        legacy_module.FEATURE, current_module.FEATURE = DummyFeature, DeadlineFeature
+        modules = {legacy_module.__name__: legacy_module, current_module.__name__: current_module}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(features, "FEATURE_MODULES", list(modules)):
+            node = RnfsNode.offline(Config(rnfs_dir=os.path.join(tmp.name, "n"), slow="no"), N1, NetClient(),
+                                    FakeNetwork())
+            self.addCleanup(node.stop)
+        current = node.feature("deadline")
+        current.start()
+        before = time.monotonic()
+        with mock.patch("rnfs.node.log"):
+            node.stop()
+        after = time.monotonic()
+        self.assertEqual(node.feature("dummy").calls, ["init", "stop"])
+        self.assertEqual(len(current.deadlines), 1)
+        self.assertTrue(before + STOP_TIMEOUT <= current.deadlines[0] <= after + STOP_TIMEOUT, current.deadlines)
+        self.assertEqual([t.is_alive() for t in current._spawned], [False])

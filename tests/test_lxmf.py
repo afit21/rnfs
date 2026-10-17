@@ -961,7 +961,7 @@ class DisabledTest(FeatureTestCase):
             feature.start()
         self.assertIsNone(feature.network)
         self.assertIn("not installed", feature.off_reason)
-        self.assertEqual(feature._threads, [])
+        self.assertEqual(feature._spawned, [])
         self.assertIsNone(self.b.status()["lxmf_address"])
         with self.assertRaisesRegex(ValueError, "not installed"):
             feature.send(SENDER.hex(), str(self.cid))
