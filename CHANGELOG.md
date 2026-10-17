@@ -187,6 +187,13 @@ Faster:
   none is denied, and its remembered content hash still goes through the deny list. Rescanning a 5000-file, 1 GiB
   folder after a 4 KiB change: 1.20 → 0.10 s (256 MiB: 0.33 → 0.10 s). The cache is kept in the state database (a
   new `shared_folder_files` table, added by the upgrade), so it holds right after a restart too.
+- `dir set` and `dir rm` no longer walk the whole tree to check its depth: subtree heights are remembered, so an
+  edit reads only the directories it rebuilds. On a 16 GiB tree, an edit after the first went from about 0.9 s to
+  0.3 ms (30 edits: 27.5 → 0.89 s).
+- Storage no longer walks complete DAGs again under its lock: eviction takes a DAG known to be complete as a
+  whole, `dag_bytes` sums it once, and `is_complete` remembers an incomplete DAG's missing block until it
+  arrives. With about 550 000 blocks an eviction pass holds the lock for about 240 ms instead of 900 ms;
+  `is_complete` on a 4 GiB file missing its first chunk went from 530 ms per call to 0.002 ms after the first.
 - Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
   over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
   there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
