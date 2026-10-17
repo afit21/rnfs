@@ -33,7 +33,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import partial
-from typing import BinaryIO, Callable, Iterator, Protocol, TypeVar
+from typing import BinaryIO, Callable, Iterator, Literal, Protocol, TypeVar, overload
 
 import RNS
 
@@ -448,9 +448,9 @@ class NodeBackend:
         return identity_hash.hex() in self.node.members
 
     def feature_requests(self) -> dict:
-        """Request paths added by features (Feature.requests): {path: handler(data, remote_identity)}."""
-        return {path: handler for feature in self.node.features.values()
-                for path, handler in feature.requests().items()}
+        """Request paths added by features (Feature.requests): {path: handler(data, remote_identity)}, as checked
+        when the node loaded them."""
+        return dict(self.node._feature_requests)
 
 
 class RnfsNode:
@@ -644,8 +644,12 @@ class RnfsNode:
         self.threads: list[threading.Thread] = []
         self._stopped = False
         self.features: dict[str, features.Feature] = {}
-        for cls in features.feature_classes():
+        # In order, each made before the next, which may use it (requires); a feature that can't be loaded as it
+        # declares stops the node here
+        for cls in features.checked_classes():
             self.features[cls.name] = cls(self)
+        # Their request paths, checked now: one rnfs serves itself, or two features adding the same, stops the node
+        self._feature_requests = features.request_handlers(self.features.values())
         # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
         # name pins are made to match the names state, which a crash inside a publish can leave them disagreeing with
         self.names.reconcile_pins(self.storage.pins())
@@ -672,7 +676,12 @@ class RnfsNode:
         stores = getattr(self, "_batched" if batched else "_stores", [])
         return [*stores, *getattr(self, "features", {}).values()]
 
-    def feature(self, name: str) -> "features.Feature":
+    @overload
+    def feature(self, name: Literal["contacts"]) -> "features.ContactsApi": ...
+    @overload
+    def feature(self, name: str) -> "features.Feature": ...
+
+    def feature(self, name):
         """The feature called name (rnfs.features). Raises KeyError if it isn't loaded."""
         return self.features[name]
 
@@ -685,6 +694,11 @@ class RnfsNode:
             thread.start()
             self.threads.append(thread)
         self._resume_remote_pins()
+        self._start_features()
+
+    def _start_features(self):
+        """Start every feature, in order. One whose start() raises is logged and the rest still start, where one
+        whose constructor raises stopped the node from being made (_setup)."""
         for feature in self.features.values():
             try:
                 feature.start()

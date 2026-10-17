@@ -941,13 +941,33 @@ or nils, since nodes since 0.1.4 refuse any other: the server checks each with `
 Feature modules don't import RNS at module level (the CLI imports them to build its parser) and their constructors
 work on `RnfsNode.offline` test nodes.
 
+A feature declares the features it uses: `requires` (it can't work without them; each must come before it in
+`FEATURE_MODULES`) and `optional` (used when loaded). The node loads them through `features.checked_classes()`,
+which raises `features.FeatureError` before making any if a required feature is missing or later, or two features
+share a name; a feature reaches another only with `self.dependency(name)`, which raises `FeatureError` for a name it
+didn't declare and returns `None` for an optional one not loaded. Today follow requires keepers; jobs, keepers,
+follow and lxmf use contacts, contacts uses keepers and lxmf uses jobs, all optionally. What the others call on
+contacts is the `features.ContactsApi` Protocol (`lookup`, `has`, `nick_of`, `resolve_id`, `expand_target`), which
+types `node.feature("contacts")`, `self.dependency("contacts")` and `features.find(node, "contacts")`;
+`tests/test_contacts.py` checks `ContactsFeature` against it, so a renamed method fails there instead of silently
+turning off LXMF's contact trust. LXMF resolves a recipient's nick with `ContactsFeature.resolve_id(nick, "lxmf")`.
+
+The node checks the features' names too when it loads them, with one error style (`FeatureError`, "feature
+<name>: <problem>"), so nothing is shadowed or dropped silently: `checked_classes()` checks every API route
+(`features.api_routes()`: GET or POST of a path matching `API_PATH`, under `/api/`, with a handler, defined neither
+by `ApiHandler.ROUTES` nor by another feature), and once the features are made, `features.request_handlers()`
+checks their request paths (`/` and a name, `REQUEST_PATH`, with a handler, neither one of rnfs's own,
+`CORE_REQUEST_PATHS`, nor another feature's). `NodeBackend.feature_requests()` hands the request server the paths
+checked then. A feature's constructor raising stops the node from being made (those made before it are closed);
+its `start()` raising is logged and the others still start (`RnfsNode._start_features`).
+
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic` | reads `Traffic`, the routing table, links, paths |
 | `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job`, CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
-| `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
+| `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
 | `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `LXMF_PREFIX` in `storage.check_source` |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 
