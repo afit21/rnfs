@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 
@@ -104,6 +105,33 @@ class InstallScriptTest(unittest.TestCase):
         self.assertLess(uninstall.index("if unit_ours; then"), uninstall.index('rm -f "$UNIT"'))
         write = shell_function("write_unit")
         self.assertIn('$UNIT_MARK', write)
+
+    @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
+    def test_release_wheel_is_of_the_tag(self):
+        """A release install takes only a wheel of the tag's version: an older release's sdist renamed to this
+        release's file name builds an older one (SUP-2). Without a release (RNFS_SOURCE, --main) any rnfs wheel."""
+        def find(directory, tag):
+            script = shell_function("find_wheel") + '\nfind_wheel "$1"'
+            return subprocess.run(["sh", "-c", script, "sh", directory], capture_output=True, text=True, check=True,
+                                  env={**os.environ, "RELEASE_TAG": tag}).stdout
+        with tempfile.TemporaryDirectory() as wheels:
+            older = os.path.join(wheels, "rnfs-0.1.4-py3-none-any.whl")
+            open(older, "w").close()
+            self.assertEqual(find(wheels, "v0.1.6"), "")
+            self.assertEqual(find(wheels, ""), older + "\n")
+            wheel = os.path.join(wheels, "rnfs-0.1.6-py3-none-any.whl")
+            open(wheel, "w").close()
+            self.assertEqual(find(wheels, "v0.1.6"), wheel + "\n")
+        install = shell_function("do_install")
+        self.assertIn('wheel=$(find_wheel "$wheels")', install)
+        self.assertLess(install.index('build_wheel "$wheels"'), install.index('wheel=$(find_wheel "$wheels")'))
+
+    def test_provenance_names_the_tag(self):
+        """The provenance check asks for this tag's build on a GitHub-hosted runner, where gh can (SUP-2; the
+        check itself is run in tests/security/test_l15_install_release_check.py)."""
+        verify = shell_function("verify_release")
+        self.assertIn('*--source-ref*) options="$options --source-ref=refs/tags/$RELEASE_TAG"', verify)
+        self.assertIn('*--deny-self-hosted-runners*) options="$options --deny-self-hosted-runners"', verify)
 
     def test_unit_matches_contrib(self):
         """install.sh's unit has the same [Unit] limits and [Service] settings as contrib/rnfs.service."""

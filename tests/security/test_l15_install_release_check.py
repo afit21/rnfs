@@ -24,14 +24,15 @@ die() { printf 'rnfs installer: %s\n' "$*" >&2; exit 1; }
 REPO=afit21/rnfs
 """
 # A gh that logs its arguments and answers as FAKE_GH says: "old" (no attestation command), "logged-out", "fail"
-# (verification fails) or "ok"
+# (verification fails) or "ok". Its verify --help lists FAKE_GH_HELP's options (by default only --signer-workflow,
+# as in gh 2.49)
 FAKE_GH = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_GH_LOG"
 case "$1 $2" in
     "auth status") [ "$FAKE_GH" != logged-out ] ;;
     "attestation verify")
         [ "$FAKE_GH" != old ] || { echo 'unknown command "attestation" for "gh"' >&2; exit 1; }
-        case " $* " in *" --help "*) echo "  --signer-workflow string"; exit 0 ;; esac
+        case " $* " in *" --help "*) printf '%s\n' "${FAKE_GH_HELP:-  --signer-workflow string}"; exit 0 ;; esac
         [ "$FAKE_GH" = ok ] || { echo "Error: no attestations found" >&2; exit 1; } ;;
     *) exit 2 ;;
 esac
@@ -141,6 +142,20 @@ class ReleaseCheckTest(unittest.TestCase):
         local = os.path.join(self.work, "release", "rnfs-9.9.9.tar.gz")
         self.assertIn(f"attestation verify {local} --repo afit21/rnfs "
                       f"--signer-workflow=afit21/rnfs/.github/workflows/release.yml", self.gh_calls())
+
+    def test_attestation_names_the_tag(self):
+        """SUP-2: where gh has the options, the check asks for a build of this release's tag on a GitHub-hosted
+        runner, so an older release's attested sdist renamed to this one's file name is refused."""
+        self.install_gh("ok")
+        result = self.fetch(FAKE_GH_HELP="  --signer-workflow string\n  --source-ref string\n"
+                                         "  --deny-self-hosted-runners")
+        self.assert_installs_checked_file(result)
+        local = os.path.join(self.work, "release", "rnfs-9.9.9.tar.gz")
+        self.assertIn(f"attestation verify {local} --repo afit21/rnfs "
+                      f"--signer-workflow=afit21/rnfs/.github/workflows/release.yml --source-ref=refs/tags/v9.9.9 "
+                      f"--deny-self-hosted-runners", self.gh_calls())
+        # gh is asked for its options once
+        self.assertEqual(len([call for call in self.gh_calls() if "--help" in call]), 1)
 
     def test_failed_attestation_is_refused(self):
         self.install_gh("fail")

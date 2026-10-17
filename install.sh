@@ -32,9 +32,9 @@
 # The latest release is installed from its source archive (rnfs-X.Y.Z.tar.gz, a release file, not the archive
 # GitHub makes of the tag), which must match the release's SHA256SUMS. Where the GitHub CLI (gh 2.49 or newer)
 # is installed and logged in, its signed build provenance is checked too (gh attestation verify, made by
-# release.yml for this repository), and a failed check stops the install. Without gh the install goes ahead with
-# a warning: SHA256SUMS shows the download is whole, but whoever could replace the release's files could
-# replace it too.
+# release.yml for this repository from this release's tag), and a failed check stops the install. Without gh
+# the install goes ahead with a warning: SHA256SUMS shows the download is whole, but whoever could replace the
+# release's files could replace it too.
 #
 # Dependencies (rns, lxmf, cryptography, ...) are installed as wheels at the versions and sha256 hashes
 # pinned in the source's packaging/requirements.lock (pip --require-hashes --only-binary=:all:), and rnfs
@@ -348,13 +348,17 @@ EOF
     # SHA256SUMS is a release file like any other: whoever can replace the sdist can replace it too. The signed
     # provenance can't be made outside this repository's release workflow
     if gh_can_verify; then
-        # Older gh versions can only name the repository, not the workflow
-        signer=""
-        if gh attestation verify --help 2>&1 | grep -q -e '--signer-workflow'; then
-            signer="--signer-workflow=$REPO/.github/workflows/release.yml"
-        fi
-        # shellcheck disable=SC2086  # signer is one word or nothing
-        if ! gh attestation verify "$1" --repo "$REPO" $signer >"$1.attestation" 2>&1; then
+        # Older gh versions can only name the repository, not the workflow or the tag (gh_help, read by
+        # gh_can_verify, lists the options this one has)
+        options=""
+        case "$gh_help" in
+            *--signer-workflow*) options="--signer-workflow=$REPO/.github/workflows/release.yml" ;;
+        esac
+        # A build of this tag, not an older release's attested sdist renamed to this release's file name
+        case "$gh_help" in *--source-ref*) options="$options --source-ref=refs/tags/$RELEASE_TAG" ;; esac
+        case "$gh_help" in *--deny-self-hosted-runners*) options="$options --deny-self-hosted-runners" ;; esac
+        # shellcheck disable=SC2086  # options are words without spaces (REPO and RELEASE_TAG have none)
+        if ! gh attestation verify "$1" --repo "$REPO" $options >"$1.attestation" 2>&1; then
             cat "$1.attestation" >&2
             die "gh attestation verify found no valid signed provenance for $(basename -- "$1") (above), so it wasn't
 installed: it must have been built by $REPO's release workflow. Please report this at $REPO_URL/issues."
@@ -370,8 +374,8 @@ signed provenance is checked too. Set RNFS_REQUIRE_ATTESTATION=1 to refuse to in
     fi
 }
 
-gh_can_verify() {  # the GitHub CLI is here, logged in, and new enough to have gh attestation (2.49)
-    command -v gh >/dev/null 2>&1 && gh attestation verify --help >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+gh_can_verify() {  # the GitHub CLI is here, logged in, and new enough to have gh attestation (2.49); sets gh_help
+    command -v gh >/dev/null 2>&1 && gh_help=$(gh attestation verify --help 2>&1) && gh auth status >/dev/null 2>&1
 }
 
 fetch_release() {  # fetch_release WORKDIR: download the release's sdist and SHA256SUMS, check them, and install that file
@@ -476,6 +480,17 @@ build_wheel() {  # build_wheel WORKDIR: build (or fetch) the rnfs wheel from bui
     fi
 }
 
+find_wheel() {  # find_wheel WORKDIR: print the rnfs wheel built in WORKDIR (a release's: of its version), or nothing
+    # An older release's sdist renamed to this release's file name passes SHA256SUMS and, with a gh too old for
+    # --source-ref, the provenance check too; but it builds a wheel of its own, older version
+    pattern="rnfs-*.whl"
+    if [ -n "$RELEASE_TAG" ]; then pattern="rnfs-${RELEASE_TAG#v}-*.whl"; fi
+    # shellcheck disable=SC2086  # pattern is a glob (RELEASE_TAG has no glob characters)
+    for found in "$1"/$pattern; do
+        if [ -f "$found" ]; then printf '%s\n' "$found"; return 0; fi
+    done
+}
+
 install_locked() {  # install_locked LOCK WORKDIR: rnfs's dependencies, as LOCK pins them (versions and hashes)
     # Wheels only: building an sdist would fetch its build tools (setuptools, ...) unpinned
     only_binary=:all:
@@ -531,11 +546,8 @@ do_install() {
     if [ -n "$RELEASE_TAG" ]; then fetch_release "$wheels"; fi
     fetch_source "$wheels"
     build_wheel "$wheels"
-    wheel=""
-    for found in "$wheels"/rnfs-*.whl; do
-        if [ -f "$found" ]; then wheel=$found; break; fi
-    done
-    [ -n "$wheel" ] || die "building $SOURCE didn't produce an rnfs wheel"
+    wheel=$(find_wheel "$wheels")
+    [ -n "$wheel" ] || die "building $SOURCE didn't produce an rnfs wheel${RELEASE_TAG:+ of version ${RELEASE_TAG#v}}"
     if [ -n "$lock" ]; then
         install_locked "$lock" "$wheels"
     else
