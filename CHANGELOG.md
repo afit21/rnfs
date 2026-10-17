@@ -167,6 +167,28 @@ Faster:
 - `open()` on `rnfs.Client` or `rnfs.Node` reads ahead while reads are sequential, doubling each refill from 64
   KiB up to 4 MiB; a seek that moves starts again with a read of only what it covers. Sequential 64 KiB reads: 33
   → 560 MB/s through `rnfs.Client`, 79 → 1219 MB/s on `rnfs.Node`; `read()` of a whole file 310 → 589 MB/s.
+- Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
+  over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
+  there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
+  from one path-table RPC. A 1000-peer `rnfs peers` went from 41.4 s to 95 ms, and the path lookups of 20 open
+  links at the start of a fetch from 825 ms to one RPC (under 0.1 ms within 15 s of the last).
+- Read-only identity checks no longer mark destinations as used in RNS (the peers listing, the DHT lookup's
+  known-identity check, private-mode routing admission, the link opener's polls while it waits for an identity):
+  on a shared instance each mark was an RPC. A link actually opened still marks its destination.
+- The peers feature no longer registers a second `rnfs.dht` announce handler: the node's own records what `rnfs
+  peers` shows, which halves the threads RNS starts per announce (2 → 1; about 130 → 62 µs of dispatch each).
+- Opening a node scans its block directory about twice as fast: block file names are checked for canonical CID
+  form without being encoded again (10.4 → 4.5 µs per block, about 6 s less per million blocks).
+- Hearing a DHT announce no longer scans every remembered ban and dropped node: 201 → 0.9 µs with 3000 dropped
+  nodes (247 → 0.9 µs with 3000 bans as well).
+- A background job nobody polls no longer keeps a rate sample for every second it runs (about 10 MB a day): it
+  keeps the last 5 minutes' (301 samples), and reports the same rate.
+- An LXMF auto-fetch checks whether its sender already pins a target with one lookup instead of copying every
+  pin: 1.96 ms → 0.24 µs per link at 10 000 pins.
+- An idle node no longer wakes every second: the LXMF loop polls only while a message is being sent or held or a
+  propagation-node download runs (a newly queued message is polled at once), and on Linux and macOS the daemon's
+  main thread waits for SIGINT/SIGTERM with no timeout (Windows still wakes each second to run signal
+  handlers): 120 fewer wakeups a minute on an idle daemon.
 
 Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
