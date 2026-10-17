@@ -151,6 +151,11 @@ Changed:
   marks, and names of only spaces.
 - The specification documents that many LXMF identities can keep the strangers' bucket empty; contacts and other
   trusted senders are unaffected.
+- The request server checks a feature path's response (keepers' `/name`) as requesters do, and answers `False`,
+  logging an error, rather than send one they would refuse. Unexpected errors at five places that catch broadly
+  (the fetcher's `/blocks` worker, the lookup's routing-table callbacks, sending a request on a link, path
+  lookups, the peers listing) are logged as warnings with their traceback in the debug log (the last two at most
+  once a minute).
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
