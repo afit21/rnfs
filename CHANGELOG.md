@@ -7,6 +7,28 @@
 Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,
 0.1.4 and 0.1.3 nodes work together. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
+Upgrade notes (each is described in full below):
+- **Settings and the rnfs dir:** a symlinked `rnfs.toml`, or one or a subdirectory owned by another user, stops the
+  start; a loose one (such as a 0664 `rnfs.toml` or 0775 `blocks/`) is made owner-only, with a warning.
+- **The shared folder:** one that leads into the rnfs dir (or a directory holding it) is refused, and its
+  pins with source `folder` are released.
+- **Following names:** a followed name's target may take at most `follow_quota` (new, default 1 GiB).
+- **Deny lists:** while the deny list has `sha256:` entries, a file repeating its content more than 16 times
+  (beyond 64 MiB) can't be read or imported (451).
+- **Local API:** `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the
+  request sets `use_sent_cid`.
+- **Gateway:** browsers that send no `Sec-Fetch-Site` (Safari before 16.4, Firefox before 90) are treated as web
+  pages, so `?format=` downloads give them 409.
+- **`rnfs inbox`:** its message line is reordered (address and trust first, the display name last, quoted).
+- **install.sh:** it stops when the GitHub CLI can check provenance but isn't logged in; log in with
+  `gh auth login`, or set `RNFS_REQUIRE_ATTESTATION=0`.
+- **Flatpak:** after updating, the Flatpak no longer sees the rest of your home folder or any device. Grant what
+  you used again: `flatpak override --user --device=all io.github.afit21.rnfs` for an RNode or other serial
+  interface, and `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` for other folders,
+  `~/.config/reticulum` included if your Reticulum config is there.
+- **State:** the state database gains a table (the shared folder's file cache); an older rnfs can't open it
+  afterwards.
+
 Security:
 - The release workflow's Flatpak build no longer uses the GitHub Actions cache. Any workflow run on the default
   branch can write that cache, and a poisoned one would have gone into the attested `.flatpak` bundle.
@@ -134,10 +156,6 @@ Changed:
 - When a file is refused because its SHA-256 is on the deny list, the log suggests `rnfs deny add <file cid>`
   (once per file): a `sha256:` entry doesn't stop the file's blocks being served one by one, and denying its CID
   does.
-- **Upgrade note (Flatpak):** after updating, the Flatpak no longer sees the rest of your home folder or any
-  device. Grant what you used again: `flatpak override --user --device=all io.github.afit21.rnfs` for an RNode or
-  other serial interface, and `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` for other
-  folders, `~/.config/reticulum` included if your Reticulum config is there.
 - The README says plainly that pipx and plain `pip install` resolve dependencies unpinned, not at the versions in
   `packaging/requirements.lock`.
 - The gateway treats a request without `Sec-Fetch-Site` as the user's own only if its `User-Agent` doesn't start
