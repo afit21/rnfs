@@ -19,13 +19,9 @@ import subprocess
 import time
 import unicodedata
 
-# Descriptions shown under each file, keyed by CID (a CID never changes, unlike a file name).
+# Descriptions shown under each file, keyed by CID (a CID never changes, unlike a file name). For example:
+#   "bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya": "Marx and Engels, 1848. PDF.",
 DESCRIPTIONS = {
-    "bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya": "Marx and Engels, 1848. PDF.",
-    "bagaibqabciqh5e4vsvwazopdfypoiflpfjvbfqionjko7cvxsmzmumsdoppzixy": "Alpine Linux 3.24.2 ISOs.",
-    "bagaibqabciqaiphoe7qtscjuqprvwpr2ifr3hgnvuk5rgeh53mpk4ntapwutr3a": "MeshChat v2.4.0 release files",
-    "bagaibqabciqospcwo756sqjp7yl3h2vukd3ijkvffy4nyh2umljg4yluwp2ce6a": "The Original SCP-106 image",
-    "bagaibqabciqd6s6yrwpp6eemv27sa7ud4l3r7rjcyu5oh4fgziopqa432htdxma": "The Reticulum source code taken from GitHub on 11/10/2026",
 }
 
 # CIDs to leave off the page.

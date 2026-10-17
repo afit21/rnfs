@@ -260,6 +260,19 @@ class BuildScriptsTest(unittest.TestCase):
         release = read(os.path.join(WORKFLOWS, "release.yml"))
         self.assertNotIn("flatpak-sources", release.replace("tests.yml's flatpak-sources job", ""))
 
+    def test_flatpak_copies_no_local_debris(self):
+        """The Flatpak's copy of the checkout skips what local builds, tests and lint leave: every .gitignore entry
+        that isn't a pattern (flatpak-builder's skip entries are paths), and the egg-info (TS12)."""
+        manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
+        block = re.search(r"(?m)^        path: \.\./\.\.\n        skip:\n((?:          - .*\n)+)", manifest)
+        self.assertTrue(block)
+        skipped = set(re.findall(r"- (\S+)", block.group(1)))
+        ignored = {line.strip().rstrip("/") for line in read(os.path.join(REPO, ".gitignore")).splitlines()
+                   if line.strip() and not line.startswith("#") and not set("*?[") & set(line)}
+        self.assertTrue(ignored)
+        self.assertEqual(ignored - skipped, set())
+        self.assertIn("rnfs.egg-info", skipped)
+
     def test_flatpak_sandbox_is_narrow(self):
         """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
         manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
