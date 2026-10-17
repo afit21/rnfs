@@ -615,8 +615,13 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 `read()` of the rest is one read. Reads
 go by the target as opened, root and path, since providers announce roots and the file's own CID may have none;
 an `rnfs:name/` URI is resolved once, at `open`, and a contact nick is expanded by the node (which reuses its
-CID for 60 s). It is an `io.BufferedReader` of 64 KiB over `_FileReader`, whose every `readinto` is one `read`
-(or one `GET /api/cat`) of `[position, position + its length)`, so only the chunks covering it are fetched; a sealed file reads its plaintext unless `raw`. Raises fetch errors as reads happen. Not
+CID for 60 s). It is an `io.BufferedReader` of 64 KiB (`FILE_BUFFER`) over `_FileReader`, whose refill after
+`open` or a seek is one `read` (or one `GET /api/cat`) of `[position, position + its length)`, so only the chunks
+covering it are fetched. While reads are sequential (a refill starting where the last read ended), each refill
+reads ahead twice as far as the last, up to `READ_AHEAD` (4 MiB), and keeps the rest for the next `readinto`s: a
+sequential reader makes few requests and fetches beyond what it reads at most about what it has read already. A
+seek that moves the position drops what was read ahead and starts again at 64 KiB. A sealed file reads its
+plaintext unless `raw`. Raises fetch errors as reads happen. Not
 thread-safe, like any file object. `Job`, `Name` and every object are snapshots as of their last `refresh()`,
 `wait()` or callback.
 
@@ -678,7 +683,7 @@ Rules, the same for both:
 |---|---|
 | A Node's events come from in-process hooks; a Client's from polling (jobs, 1 s) and the long poll (names) | Documented; the same callbacks and rules. A daemon older than the endpoint can't watch names (`NotFound` at `watch()`) |
 | Paths (`add`, `get`, `export`, `import_archive`, a job's output) are opened by the daemon for a Client | Same machine and user (the token requires it); made absolute on the app's side, as now |
-| `open()` costs one API request per buffer refill for a Client | Accepted; the 64 KiB buffer bounds the requests |
+| `open()` costs one API request per buffer refill for a Client | Accepted; the 64 KiB buffer bounds the requests, and sequential reads read ahead up to 4 MiB a request |
 | Settings, DHT mode, LXMF, lifecycle: a Node's own; the daemon's for a Client | Documented: a Client can't change them; `close()` only ends the Client |
 | No gateway or API in a Node | Not offered in 0.2 (decision 6) |
 | The API's `GET /api/info` has no `raw` | A Client's `info(raw=True)` (and `open(raw=True)`) takes a sealed file's `stored_size` as its size |
