@@ -24,7 +24,7 @@ import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from rnfs.config import _HEX_ID
+from rnfs import ids
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
@@ -45,7 +45,7 @@ def node_hex(node_id) -> str | None:
         return None
     if isinstance(node_id, (bytes, bytearray)) and len(node_id) == 16:
         return bytes(node_id).hex()
-    if isinstance(node_id, str) and _HEX_ID.fullmatch(node_id):
+    if isinstance(node_id, str) and ids.HEX16.fullmatch(node_id):
         return node_id.lower()
     raise ValueError(f"invalid node ID or name {node_id!r}: 16 bytes or 32 hex characters")
 
@@ -829,7 +829,7 @@ class Names:
         """The newest record of name (16 bytes, 32 hex characters, a Name or a name contact's nick), after
         asking the network; persisted, so it never goes back. Raises NotFound (unresolved), ValueError."""
         self._owner._check()
-        text = name if isinstance(name, str) and not _HEX_ID.fullmatch(name) else node_hex(name_bytes(name))
+        text = name if isinstance(name, str) and not ids.HEX16.fullmatch(name) else node_hex(name_bytes(name))
         return Record.from_dict(self._owner._backend.name_resolve(text))
 
     def watch(self, name, callback) -> Watch:

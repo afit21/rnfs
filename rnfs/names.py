@@ -39,8 +39,8 @@ from dataclasses import dataclass
 import RNS
 from RNS.vendor import umsgpack
 
-from rnfs import fsutil, statedb
-from rnfs.config import _HEX_ID, Config  # _HEX_ID: exactly 32 hex digits, as identity lists are checked
+from rnfs import fsutil, ids, statedb
+from rnfs.config import Config
 from rnfs.constants import APP_NAME, ID_LENGTH, NAME_ASPECT
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError
@@ -117,13 +117,7 @@ def parse_record(app_data) -> tuple[int, Cid] | None:
 
 def parse_name(text: str) -> bytes:
     """A name from its 32 hex character form, with or without RNS's <angle brackets>. Raises ValueError."""
-    if not isinstance(text, str):
-        raise ValueError("name must be a string")
-    stripped = text.strip().strip("<>")
-    # Hex digits only: bytes.fromhex alone would skip whitespace between them, giving a shorter name
-    if not _HEX_ID.fullmatch(stripped):
-        raise ValueError(f"name must be {NAME_LENGTH * 2} hex characters: {text!r}")
-    return bytes.fromhex(stripped)
+    return ids.parse_hex16(text, "name", brackets=True)
 
 
 def check_alias(alias) -> str:

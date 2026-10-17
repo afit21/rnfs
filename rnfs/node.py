@@ -548,7 +548,7 @@ class RnfsNode:
         self.client = client
         self.slow = slow
         self._is_known = is_known
-        self.members = {h.strip().strip("<>").lower() for h in config.members}
+        self.members = config.member_set
         # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)
         self._member_publishers: set[bytes] = set()
         self._bootstrap_nodes: list[bytes] = []  # bootstrap_nodes that parse, in the order given
@@ -1741,7 +1741,7 @@ class RnfsNode:
     def _load_remote_pins(self) -> list[tuple[str, Cid]]:
         """Remote pins saved as waiting, oldest first, from identities still on remote_pin_identities (at most
         REMOTE_PIN_QUEUE each); others are dropped. Caller holds no lock (it reads the database)."""
-        allowed = {remote_source(h.strip().strip("<>")) for h in self.config.remote_pin_identities}
+        allowed = {remote_source(h) for h in self.config.remote_pin_set}
         try:
             saved = self._db.query("SELECT source, cid FROM remote_pins ORDER BY position")
         except OSError as e:

@@ -721,7 +721,7 @@ class RequestServer:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.wake = threading.Event()
-        self.pin_identities = {h.strip().strip("<>").lower() for h in config.remote_pin_identities}
+        self.pin_identities = config.remote_pin_set
         self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
         self.over_rate_log = ThrottledLog(OVER_RATE_LOG_INTERVAL, clock)
 

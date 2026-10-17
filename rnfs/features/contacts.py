@@ -21,6 +21,7 @@ import re
 import threading
 import time
 
+from rnfs import ids
 from rnfs.content.cid import is_valid as is_valid_cid
 from rnfs.errors import NotFound
 from rnfs.features import Feature, _common
@@ -32,7 +33,6 @@ KINDS = ("name", "node", "lxmf")
 MAX_CONTACTS = 10_000  # an address book is typed in by hand; this only bounds the saved state
 EXPAND_AGE = 60.0  # seconds a nick's resolved CID is reused when a target starts with a contact's nick
 _NICK = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
-_HEX_ID = re.compile(r"[0-9a-f]{32}")
 # RNS destination aspects a hash is checked against to tell its kind
 _KIND_ASPECTS = {"name": ("rnfs", "name"), "node": ("rnfs", "dht"), "lxmf": ("lxmf", "delivery")}
 # Each kind in resolve_id's errors: (article, noun, the word before "contact")
@@ -46,7 +46,7 @@ def _log(message: str, level: int = LOG_INFO):
 
 def check_nick(nick) -> str:
     """nick if it is a valid contact nick; ValueError otherwise."""
-    if not isinstance(nick, str) or not _NICK.fullmatch(nick) or _HEX_ID.fullmatch(nick) or is_valid_cid(nick):
+    if not isinstance(nick, str) or not _NICK.fullmatch(nick) or ids.HEX16_LOWER.fullmatch(nick) or is_valid_cid(nick):
         raise ValueError(f"invalid nick {nick!r}: use 1-32 lowercase letters, digits, '-', '_' or '.', starting "
                          "with a letter or digit (and not 32 hex digits)")
     return nick
@@ -63,11 +63,7 @@ def is_nick(text) -> bool:
 
 def parse_hex(text) -> bytes:
     """A 16-byte destination hash from 32 hex characters (RNS's <angle brackets> allowed). ValueError."""
-    if isinstance(text, str):
-        text = text.strip().strip("<>").lower()
-        if _HEX_ID.fullmatch(text):
-            return bytes.fromhex(text)
-    raise ValueError(f"invalid hash {text!r}: must be 32 hex characters")
+    return ids.parse_hex16(text, "hash", brackets=True)
 
 
 def check_kind(kind) -> str:
@@ -412,7 +408,7 @@ def node_arg(args, text: str | None) -> str | None:
 
     For the CLI's --from, ping and pin remote. Fails the command for an unknown nick.
     """
-    if text is None or _HEX_ID.fullmatch(text.strip().strip("<>").lower()) or not is_nick(text):
+    if text is None or ids.is_hex16(text, brackets=True) or not is_nick(text):
         return text  # hex, or something the API will reject with its own message
     import rnfs.cli
     contact = rnfs.cli.client(args).get("/api/contacts/get", nick=text)  # exits with "no contact <nick>"

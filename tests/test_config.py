@@ -80,6 +80,16 @@ class ValidateTest(unittest.TestCase):
                 self.assert_invalid(**{name: value})
             Config(**{name: [ID, f"<{ID.upper()}>", f" {ID} "]}).validate()
 
+    def test_identity_sets(self):
+        """member_set and remote_pin_set hold each list once, as identity.hash.hex() writes it, so the node, the
+        link pool and the server all agree on who is listed; they follow later changes to the lists."""
+        other = "cd" * 16
+        config = Config(members=[f" <{ID.upper()}>", ID], remote_pin_identities=[f"{other.upper()}\n"])
+        self.assertEqual(config.member_set, frozenset({ID}))
+        self.assertEqual(config.remote_pin_set, frozenset({other}))
+        config.remote_pin_identities = []
+        self.assertEqual(config.remote_pin_set, frozenset())
+
     def test_other_lists_and_paths(self):
         for value in (ID, [1], None):
             self.assert_invalid(bootstrap_nodes=value)

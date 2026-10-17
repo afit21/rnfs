@@ -233,7 +233,7 @@ class LinkPool:
         self.config = config
         self.clock = clock
         # Private mode links only to members: every link identifies, and an outsider mustn't learn who we are
-        self.members = {h.strip().strip("<>").lower() for h in config.members}
+        self.members = config.member_set
         self.shared: dict[bytes, PeerLink] = {}
         self.oneshot: set[PeerLink] = set()
         self.connecting: dict[bytes, threading.Event] = {}  # one thread opens a node's shared link at a time
