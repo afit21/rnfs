@@ -931,8 +931,9 @@ released; your own pins are kept, but not served or read, and the log names each
 
 A file hash is only known once the file has been downloaded, so it stops `get`, `cat` and the gateway from
 handing the file out (they check before writing or sending anything, which makes them fetch the whole file
-first) and `add`, the shared folder or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served.
-Deny the CID to stop that. Lists larger than 4 MiB, with over 100 000 entries, not UTF-8 text, with a line that
+first) and `add`, the shared folder or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served
+(a file of several chunks can still be fetched from your node chunk by chunk). Deny the CID to stop that: the first
+time rnfs refuses a file by its hash, the log names the command (`rnfs deny add <cid>`). Lists larger than 4 MiB, with over 100 000 entries, not UTF-8 text, with a line that
 isn't an entry, or that are a directory are refused, and the previous version stays in use.
 
 # Example use cases

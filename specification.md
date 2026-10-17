@@ -782,7 +782,12 @@ and repeat.
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
 old pin. Unlike `add`, a scan MUST skip (with a log line) a regular file that has other hard links, at the
 top level and inside shared directories: it is also a file elsewhere, which whoever may write to the folder
-could have linked in. It is imported at the next scan after its other links are gone.
+could have linked in. It is imported at the next scan after its other links are gone. `files/` may be a
+symlink, but a scan MUST NOT import from a folder that resolves, as opened, to the rnfs dir, to a directory
+holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, which hold the node's keys and state:
+rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin
+with source `folder` is released (including those an earlier version made from it). rnfs also warns, once, when
+a directory above the folder can be changed by other users, who could replace the folder with another.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
@@ -837,7 +842,9 @@ off their node. Nothing on the wire changes.
   (so a range fetches the whole file first; its hash is then remembered; the gateway's `?format=raw` and
   `?format=archive` too), and as `add`, the shared folder or `import` read it (the add or import fails). By then the file's blocks have been downloaded. A file-hash entry
   doesn't stop those blocks being fetched (by `pin add`, `export` to a file, a remote pin or a followed name), stored,
-  served or provided: deny the CID for that. A file of one block has its content's hash as its CID's digest,
+  served or provided (a file of several chunks is still served chunk by chunk, by `/blocks` and by the gateway's
+  `?format=raw` of each block's CID): deny the CID for that. The first time a node refuses a file by its hash it
+  logs a notice naming the command that does (`rnfs deny add <file cid>`). A file of one block has its content's hash as its CID's digest,
   so either entry stops it; a sealed file matches by its sealed bytes, as stored, not by what it decrypts to.
 - Hashing a file reads every occurrence of content its DAG repeats, so a few small blocks can declare a file of
   2^56 bytes. While there are file-hash entries, a file whose hash isn't known yet and whose declared size is
