@@ -107,8 +107,8 @@ class Backend(Protocol):
         """cid's block if it's in the DAG of a CID this node provides, re-verified; else None."""
 
     def served_block_size(self, cid: Cid) -> int | None:
-        """Optional (looked up with getattr): the stored length of the block served_block(cid) would return, or
-        None if it isn't served (or isn't known). Lets /blocks stop at the block over its budget unread."""
+        """The stored length of the block served_block(cid) would return, or None if it isn't served (or isn't
+        known). Lets /blocks stop at the block over its budget unread."""
 
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept (True) or refuse a /pin from the identity with this 16-byte hash."""
@@ -117,8 +117,8 @@ class Backend(Protocol):
         """In private mode, True if the identity with this 16-byte hash is a member."""
 
     def feature_requests(self) -> dict:
-        """Optional (looked up with getattr): request paths added by features, {path: handler(data,
-        remote_identity)}, served within the same per-link limits; a path rnfs serves itself is ignored."""
+        """Request paths added by features, {path: handler(data, remote_identity)} ({} for none), served within the
+        same per-link limits; a path rnfs serves itself is ignored."""
 
 
 # Pure policy
@@ -740,7 +740,7 @@ class RequestServer:
             PIN_PATH: self._handle_pin,
         }
         # Paths added by features (rnfs.features: Feature.requests), within the same per-link limit
-        for path, handler in getattr(backend, "feature_requests", dict)().items():
+        for path, handler in backend.feature_requests().items():
             if path not in handlers:
                 handlers[path] = self._feature_handler(handler)
         for path, handler in handlers.items():
@@ -1010,8 +1010,7 @@ class RequestServer:
                     log("refused /blocks: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
                     return False
                 limit = min(limit, max(0, share - RESPONSE_OVERHEAD))
-            entries = select_blocks(cids, self.backend.served_block, limit,
-                                    getattr(self.backend, "served_block_size", None))
+            entries = select_blocks(cids, self.backend.served_block, limit, self.backend.served_block_size)
             body = protocol.encode_blocks_response(entries)
             packed = protocol.packed_response_size(request_id, body)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
