@@ -24,7 +24,6 @@ eviction, gc and the size queries read the DAG nodes they will walk beforehand (
 """
 import itertools
 import os
-import re
 import shutil
 import threading
 from collections import OrderedDict
@@ -32,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Iterator
 
-from rnfs import denylist, statedb
+from rnfs import denylist, ids, statedb
 from rnfs.constants import MIB
 from rnfs.content import blockstore, dag, walker
 from rnfs.content.blockstore import BlockStore
@@ -59,7 +58,9 @@ DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unrea
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 
-_IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
+# The ID in a remote:, follow: or lxmf: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as
+# a pin row that fails is deleted
+_IDENTITY_HASH = ids.HEX16_LOWER
 
 
 def disk_reserve(total: int) -> int:

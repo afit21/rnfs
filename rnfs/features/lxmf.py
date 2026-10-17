@@ -44,7 +44,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
 
-from rnfs import features, fsutil
+from rnfs import features, fsutil, ids
 from rnfs.features import _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
@@ -105,7 +105,6 @@ IDENTITY_WAIT = 15.0  # seconds `send` waits for an unknown recipient's identity
 TICK = 1.0  # seconds between polls of outbound message states (while any is followed, held or downloading)
 SYNC_TIMEOUT = 900.0  # a propagation node download still unfinished after this is abandoned
 
-_HEX32 = re.compile(r"[0-9a-fA-F]{32}")
 _SEGMENT = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+")
 _QUERY_VALUE = re.compile(r"(?:[A-Za-z0-9\-._~!$'()*+,;=:@/]|%[0-9A-Fa-f]{2})*")  # "&" separates parameters
 # An rnfs: link in free text: not glued to a preceding word, ending at whitespace or a character URIs never hold
@@ -135,9 +134,7 @@ def _check_name(name: str):
 
 def parse_address(text) -> bytes:
     """An LXMF address (destination hash) from 32 hex characters, with or without <angle brackets>."""
-    if not isinstance(text, str) or not _HEX32.fullmatch(text.strip().strip("<>")):
-        raise ValueError(f"invalid LXMF address {text!r}: must be 32 hex characters")
-    return bytes.fromhex(text.strip().strip("<>"))
+    return ids.parse_hex16(text, "LXMF address", brackets=True)
 
 
 def validate_settings(config):
@@ -254,7 +251,7 @@ def parse_uri(text) -> Link:
         segments.pop()  # "<cid>/dir/" names the same directory as "<cid>/dir"
     cid = name = None
     if segments[0] == NAME_SEGMENT:
-        if len(segments) < 2 or not _HEX32.fullmatch(segments[1]):
+        if len(segments) < 2 or not ids.HEX16.fullmatch(segments[1]):
             raise ValueError("rnfs:name/ must be followed by a name: 32 hex characters")
         name = bytes.fromhex(segments[1])
         segments = segments[2:]
@@ -284,7 +281,7 @@ def parse_uri(text) -> Link:
             if key == "from":
                 if from_node is not None:
                     raise ValueError("from is given twice")
-                if not _HEX32.fullmatch(value):
+                if not ids.HEX16.fullmatch(value):
                     raise ValueError("from must be a node ID: 32 hex characters")
                 from_node = bytes.fromhex(value)
     return Link(cid, name, tuple(names), None, from_node)
@@ -718,7 +715,7 @@ def _valid_inbox_entry(entry: dict) -> bool:
     """Whether a loaded inbox record has the shape received() gives it."""
     auto = entry.get("auto")
     return (isinstance(entry.get("hash"), str) and isinstance(entry.get("from"), str)
-            and _HEX32.fullmatch(entry["from"]) is not None and _valid_links(entry.get("links"))
+            and ids.HEX16.fullmatch(entry["from"]) is not None and _valid_links(entry.get("links"))
             and (auto is None or (isinstance(auto, list) and len(auto) == len(entry["links"])
                                   and all(isinstance(a, dict) and _str_or_none(a.get("state")) for a in auto)))
             and all(_str_or_none(entry.get(key)) for key in ("display_name", "title", "text", "method")))
@@ -951,7 +948,7 @@ class LxmfFeature(features.Feature):
         """Keep sender's lxmf: pins of cids, which an inbox that didn't load whole doesn't record: add an inbox
         message from sender recording them as pinned, and save the inbox."""
         listed = ", ".join(str(cid) for cid in cids)
-        if _HEX32.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
+        if ids.HEX16.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
             _log(f"keeping {listed}, pinned for {sender!r}, which isn't an LXMF address", LOG_WARNING)
             return
         _log(f"the saved inbox is missing, damaged or incomplete: keeping {listed}, pinned for a message from "
@@ -1120,7 +1117,7 @@ class LxmfFeature(features.Feature):
         """An LXMF address, or the LXMF address of a contact nick (contacts.resolve_id)."""
         if not isinstance(to, str) or not to.strip():
             raise ValueError("a recipient is required: an LXMF address or a contact")
-        if _HEX32.fullmatch(to.strip().strip("<>")):
+        if ids.is_hex16(to, brackets=True):
             return parse_address(to)
         contacts = self.dependency("contacts")
         if contacts is None:

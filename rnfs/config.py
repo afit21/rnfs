@@ -7,12 +7,11 @@ the node (or link) is slow; use the `effective_*` helpers rather than reading th
 import errno
 import math
 import os
-import re
 import stat
 import tomllib
 from dataclasses import dataclass, field, fields
 
-from rnfs import fsutil
+from rnfs import fsutil, ids
 from rnfs.constants import DAY, GIB, HOUR, KIB, MIB, PROVIDER_TTL
 
 DEFAULT_API_PORT = 8788
@@ -43,7 +42,7 @@ OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset 
 MAX_DURATION = 30 * DAY
 FLAGS = ("private", "gateway_scripts", "default_bootstrap", "debug_log")
 IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
-_HEX_ID = re.compile(r"[0-9a-fA-F]{32}")
+_HEX_ID = ids.HEX16  # the name other modules used before rnfs.ids
 
 
 def _is_number(value) -> bool:
@@ -178,6 +177,19 @@ class Config:
         """rnfs's own persistent state: pins, cache records, provider records, sequences."""
         return os.path.join(self.root, "state")
 
+    # Identity lists, each normalised once here for its users: two sets differently normalised could disagree
+    # about who is a member
+
+    @property
+    def member_set(self) -> frozenset[str]:
+        """members as lowercase hex (as identity.hash.hex() writes them), for private mode's membership checks."""
+        return frozenset(ids.normal_hex16(value) for value in self.members)
+
+    @property
+    def remote_pin_set(self) -> frozenset[str]:
+        """remote_pin_identities as lowercase hex (as identity.hash.hex() writes them): who may send /pin."""
+        return frozenset(ids.normal_hex16(value) for value in self.remote_pin_identities)
+
     # Values that depend on whether the node is slow (section 2)
 
     def effective_alpha(self, slow_node: bool) -> int:
@@ -272,8 +284,7 @@ class Config:
                 raise ValueError(f"{name} must be true or false")
         for name in IDENTITY_LISTS:
             values = getattr(self, name)
-            if not isinstance(values, list) or not all(
-                    isinstance(value, str) and _HEX_ID.fullmatch(value.strip().strip("<>")) for value in values):
+            if not isinstance(values, list) or not all(ids.is_hex16(value, brackets=True) for value in values):
                 raise ValueError(f"{name} must be a list of RNS identity hashes (32 hex characters each)")
         # Node IDs that don't parse are skipped with a warning when joining, but a string isn't a list of them
         if not isinstance(self.bootstrap_nodes, list) or not all(isinstance(v, str) for v in self.bootstrap_nodes):

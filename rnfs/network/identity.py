@@ -4,8 +4,8 @@ import stat
 
 import RNS
 
-from rnfs import fsutil
-from rnfs.constants import APP_NAME, DHT_ASPECT, ID_LENGTH
+from rnfs import fsutil, ids
+from rnfs.constants import APP_NAME, DHT_ASPECT
 from rnfs.errors import RnfsError
 from rnfs.log import LOG_WARNING, log
 
@@ -134,9 +134,6 @@ def node_id_for_identity(identity: RNS.Identity) -> bytes:
 
 
 def parse_node_id(hex_id: str) -> bytes:
-    """Node ID from its hex form, with or without RNS's <angle brackets>. Raises ValueError if malformed."""
-    node_id = bytes.fromhex(hex_id.strip().strip("<>"))
-    if len(node_id) != ID_LENGTH:
-        raise ValueError(f"node ID must be {ID_LENGTH * 2} hex characters: {hex_id}")
-    return node_id
+    """Node ID from its 32 hex digits, with or without RNS's <angle brackets>. Raises ValueError if malformed."""
+    return ids.parse_hex16(hex_id, "node ID", brackets=True)
 

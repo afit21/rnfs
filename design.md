@@ -5,13 +5,23 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 
 ## Shared foundation
 
-- `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes.
+- `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes, and
+  `MISSED_ANNOUNCES` (2): the announces a node or name may miss before the routing table, name resolves, follows
+  and deny lists count it gone or stale (`2 × announce_interval` in the spec).
 - `rnfs/config.py` — `Config`: every local setting (section 12), paths under `<rnfs dir>`, and the `effective_*`
   helpers for settings that depend on slow nodes or links. Loaded from `<rnfs dir>/rnfs.toml` plus command-line
   overrides (and `defaults` beneath the file: an embedded node's); `validate()` checks every core setting's type and
   range (`WHOLE_NUMBERS`, `RATES`, `DURATIONS`, `FLAGS`, `IDENTITY_LISTS`), and the daemon exits on an invalid one.
   Reticulum is started from `reticulum_dir`, by default RNS's own config directory, so the node attaches to `rnsd`
-  with the matching RPC key.
+  with the matching RPC key. `member_set` and `remote_pin_set` are `members` and `remote_pin_identities` as
+  frozensets of lowercase hex, normalised once there for the node, the link pool and the request server.
+- `rnfs/ids.py` — stdlib only: the one parser of 16-byte IDs written as 32 hex digits (node IDs, names, identity
+  hashes, LXMF addresses). `parse_hex16(text, what, *, brackets=False, upper=True)` takes whitespace around the
+  digits, RNS's `<angle brackets>` only where `brackets`, and nothing between them (`bytes.fromhex` alone would skip
+  whitespace there); `is_hex16` is its check and `normal_hex16` the lowercase form. `api.parse_hex_id`,
+  `names.parse_name`, `identity.parse_node_id`, `contacts.parse_hex`, `lxmf.parse_address` and `Config.validate`
+  use it. Persisted rows are checked against its patterns (`HEX16`, `HEX16_LOWER`) as they are, unstripped, so
+  what loaded before still loads.
 - `rnfs/errors.py` — `RnfsError` and subclasses `InvalidDag`, `NotFound`, `TooLarge`, `StorageFull`, `Busy`,
   `Denied`, `Cancelled` (a fetch stopped by its observer), `Closed` (an `rnfs.Node` or `rnfs.Client` used after
   `close()`).
@@ -89,7 +99,7 @@ locks internally.
 ```
 rnfs.py, rnfs/__main__.py   entry points (python3 rnfs.py, python3 -m rnfs); the installed command is rnfs.cli:main
 rnfs/
-  constants.py config.py errors.py log.py          shared foundation
+  constants.py config.py ids.py errors.py log.py   shared foundation
   debuglog.py         the debug log file, <rnfs dir>/debug.log (debug_log)
   fsutil.py           cross-platform file operations: replace/remove retried on Windows, O_BINARY, IS_WINDOWS
   statedb.py          the state database, <rnfs dir>/state/rnfs.db: schema, transactions, JSON state migration
@@ -161,7 +171,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 ## Content layer interfaces
 
 `dag.py`
-- `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`.
+- `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`, and `KIND_NAMES`
+  (`file`, `executable`, `directory`: how `ls` shows them).
 - Frozen dataclasses `Child(cid, size)`, `Entry(name, cid, size, kind)`, `IndexChild(first_name, cid, size)`;
   nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`, each with `child_cids` (the CIDs it
   lists, in order) and `names` (its entries' names or children's first names; none for a file node).

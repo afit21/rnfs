@@ -42,6 +42,7 @@ import time
 from collections import deque
 from contextlib import ExitStack
 
+from rnfs import ids
 from rnfs.constants import PARTIAL_SUFFIX
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
@@ -61,7 +62,7 @@ POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
 FINISHED_GRACE = 60.0  # seconds a finished job is kept whatever max_finished_jobs says
 _JOB_ID = re.compile(r"[0-9a-f]{8}")
-_NODE_ID = re.compile(r"[0-9a-f]{32}")
+_NODE_ID = ids.HEX16_LOWER  # a saved job's from_node, as bytes.hex() writes it (a row that fails is deleted)
 
 
 def _log(message: str, level: int = LOG_INFO):
