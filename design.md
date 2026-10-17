@@ -190,7 +190,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   depth-first), `read_range(expect, get, offset, length) -> Iterator[bytes]`, `leaf_bytes(expect, get, stop_at)`
   (the bytes of a file's distinct chunks, from its file nodes only: the deny list's hash bound),
   `list_directory(expect, get, max_entries=None) -> Iterator[Entry]` (`TooLarge` past
-  `max_entries`), `write_out(expect, get, dest, max_entries, check=None, created=None) -> warnings`
+  `max_entries`), `height(expect, get)` (DAG nodes on the longest path, checking every node; `dir set` and
+  `dir rm` check the edited tree's depth with it, and it remembers each subtree it measured by its expectation,
+  `HEIGHT_MEMO` 32768 least recently used, so an edit reads only the directories it rebuilt), `write_out(expect, get, dest, max_entries, check=None, created=None) -> warnings`
   (`created` gets a directory output's `(st_dev, st_ino)`, for `check_unchanged(dest, identity)` before it is
   renamed; a directory replaced while written raises `ValueError("output was changed while being written")`).
 

@@ -15,6 +15,8 @@ import bisect
 import errno
 import os
 import stat
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import BinaryIO, Callable, Iterator
 
@@ -32,6 +34,9 @@ RAW_TYPE, FILE_TYPE, DIRECTORY_TYPE, INDEX_TYPE = "raw", "file", "directory", "i
 ANY_TYPES = frozenset({RAW_TYPE, FILE_TYPE, DIRECTORY_TYPE, INDEX_TYPE})
 FILE_TYPES = frozenset({RAW_TYPE, FILE_TYPE})  # an entry of kind 0 or 1, or a file node's child
 DIRECTORY_TYPES = frozenset({DIRECTORY_TYPE, INDEX_TYPE})  # an entry of kind 2, or an index's child
+# height()'s memo of checked subtrees' heights, kept across calls (least recently used forgotten first): every
+# entry of a directory of tens of thousands, in about 11 MB when full
+HEIGHT_MEMO = 32768
 
 
 @dataclass(frozen=True)
@@ -439,11 +444,46 @@ def _count(expect: Expect, get: Get, memo: dict[Expect, int], limit: int) -> int
     return total
 
 
+class _Heights:
+    """height()'s memo across calls: the height of a subtree that passed every check, by the expectation it was
+    checked under (depth set to 1), so `dir set` and `dir rm` don't walk a whole tree again for each edit.
+
+    Exact forever: a CID's content never changes, and the checks a subtree passes and its height depend only on
+    its blocks and that expectation. Least recently used forgotten first, past HEIGHT_MEMO entries.
+    """
+
+    def __init__(self):
+        """Empty."""
+        self._lock = threading.Lock()
+        self._heights: OrderedDict[Expect, int] = OrderedDict()
+
+    def get(self, expect: Expect) -> int | None:
+        """The height remembered for expect, if any."""
+        with self._lock:
+            known = self._heights.get(expect)
+            if known is not None:
+                self._heights.move_to_end(expect)
+            return known
+
+    def update(self, heights: dict[Expect, int]):
+        """Remember heights, forgetting the least recently used past HEIGHT_MEMO."""
+        with self._lock:
+            for expect, known in heights.items():
+                self._heights[expect] = known
+                self._heights.move_to_end(expect)
+            while len(self._heights) > HEIGHT_MEMO:
+                self._heights.popitem(last=False)
+
+
+_heights = _Heights()
+
+
 def height(expect: Expect, get: Get) -> int:
     """DAG nodes on the longest path from expect down (0 for a raw block), checking every DAG node met.
 
     Depth isn't checked against MAX_DEPTH, since measuring it is the point; the walk stops once the
-    height is known to exceed MAX_DEPTH, returning MAX_DEPTH + 1.
+    height is known to exceed MAX_DEPTH, returning MAX_DEPTH + 1. A subtree measured (and checked) before under
+    the same expectation isn't walked again (_Heights), so a tree edited in one place costs only the new nodes.
     """
     limit = constants.MAX_DEPTH
     memo: dict[Expect, int] = {}
@@ -460,12 +500,19 @@ def height(expect: Expect, get: Get) -> int:
             return 1
         current = replace(current, depth=1)  # every node is checked as if at the top, so depth can't trip
         if current not in memo:
-            child_expects = expand(current, get(current))
-            memo[current] = 1 + max((visit(child, level + 1) for child in child_expects), default=0)
+            known = _heights.get(current)
+            if known is None:
+                child_expects = expand(current, get(current))
+                known = 1 + max((visit(child, level + 1) for child in child_expects), default=0)
+            memo[current] = known
         return memo[current]
 
     result = visit(expect, 1)
-    return limit + 1 if truncated else result
+    if truncated:
+        return limit + 1  # nothing kept: heights found below a cut-off walk may be short
+    _heights.update(memo)  # every one exact, the walk having reached the bottom of each
+    # A remembered subtree can make the tree too deep without the walk going below limit
+    return min(result, limit + 1)
 
 
 # Writing out. A directory output must stay where it was made while it is written: anyone who could rename inside

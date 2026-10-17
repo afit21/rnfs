@@ -413,6 +413,74 @@ class WalkTest(unittest.TestCase):
             built = builder.build_bytes(bytes(50), blocks.put)
             self.assertEqual(walker.height(root_expect(built.cid), blocks.get), built.height)
 
+    def chain(self, blocks: Blocks, depth: int) -> builder.Built:
+        """depth directories, each the one entry of the next, over a one-chunk file: height depth."""
+        built = builder.build_bytes(b"leaf %d" % depth, blocks.put)
+        for _ in range(depth):
+            built = builder.wrap("d", built, blocks.put)
+        return built
+
+    def test_height_remembers_checked_subtrees(self):
+        """A subtree measured before isn't read again, so an edited tree costs only its new nodes (D2)."""
+        with mock.patch.object(walker, "_heights", walker._Heights()):
+            blocks = Blocks()
+            subtrees = [self.chain(blocks, 3), self.chain(blocks, 5), builder.build_bytes(bytes(70000), blocks.put)]
+            entries = [Entry(f"e{i}", b.cid, b.size, b.kind) for i, b in enumerate(subtrees)]
+            root = builder.build_directory(entries, blocks.put)
+            self.assertEqual(walker.height(root_expect(root.cid), blocks.get), 6)
+            self.assertEqual(walker.height(root_expect(root.cid), blocks.get), 6)
+            self.assertEqual(sum(blocks.reads.values()), 10)  # each DAG node once: the second call read nothing
+            blocks.reads.clear()
+            edited = builder.build_directory(entries[1:] + [Entry("new", subtrees[0].cid, subtrees[0].size, 2)],
+                                             blocks.put)
+            self.assertEqual(walker.height(root_expect(edited.cid), blocks.get), 6)
+            self.assertEqual(blocks.reads, {edited.cid: 1})
+            # A changed file is a new CID, so it is read
+            changed = builder.build_bytes(bytes(70001), blocks.put)
+            edited = builder.build_directory(entries[:2] + [Entry("e2", changed.cid, changed.size, 0)], blocks.put)
+            blocks.reads.clear()
+            self.assertEqual(walker.height(root_expect(edited.cid), blocks.get), 6)
+            self.assertEqual(set(blocks.reads), {edited.cid, changed.cid})
+
+    def test_height_memo_is_per_expectation(self):
+        """A subtree remembered under one expectation is still checked under another."""
+        with mock.patch.object(walker, "_heights", walker._Heights()):
+            blocks = Blocks()
+            inner = self.chain(blocks, 2)
+            self.assertEqual(walker.height(root_expect(inner.cid), blocks.get), 2)
+            lying = blocks.node(DirectoryNode([Entry("x", inner.cid, inner.size + 1, dag.KIND_DIRECTORY)]))
+            for _ in range(2):  # and an invalid tree isn't remembered
+                with self.assertRaises(InvalidDag):
+                    walker.height(root_expect(lying), blocks.get)
+            as_file = blocks.node(DirectoryNode([Entry("x", inner.cid, inner.size, dag.KIND_FILE)]))
+            with self.assertRaises(InvalidDag):
+                walker.height(root_expect(as_file), blocks.get)
+
+    def test_height_past_max_depth_remembers_nothing_short(self):
+        """A walk cut off at MAX_DEPTH keeps no heights (they may be short), and a remembered subtree that
+        makes a tree too deep still gives MAX_DEPTH + 1."""
+        with mock.patch.object(walker, "_heights", walker._Heights()):
+            blocks = Blocks()
+            deep = self.chain(blocks, 6)
+            with mock.patch.object(constants, "MAX_DEPTH", 3):
+                self.assertEqual(walker.height(root_expect(deep.cid), blocks.get), 4)
+            self.assertEqual(walker.height(root_expect(deep.cid), blocks.get), 6)  # not a short memo
+            with mock.patch.object(constants, "MAX_DEPTH", 3):
+                blocks.reads.clear()
+                self.assertEqual(walker.height(root_expect(deep.cid), blocks.get), 4)
+                self.assertEqual(blocks.reads, {})  # remembered, and capped at MAX_DEPTH + 1
+                outer = builder.wrap("o", self.chain(blocks, 2), blocks.put)
+                self.assertEqual(walker.height(root_expect(outer.cid), blocks.get), 3)
+
+    def test_height_memo_is_bounded(self):
+        with mock.patch.object(walker, "_heights", walker._Heights()), mock.patch.object(walker, "HEIGHT_MEMO", 2):
+            blocks = Blocks()
+            built = [self.chain(blocks, depth) for depth in (3, 4, 5)]
+            for _ in range(2):
+                for b in built:
+                    self.assertEqual(walker.height(root_expect(b.cid), blocks.get), b.height)
+            self.assertEqual(len(walker._heights._heights), 2)
+
     def test_parse_target(self):
         cid = Cid.for_block(RAW, b"x")
         self.assertEqual(walker.parse_target(str(cid)), (cid, []))
