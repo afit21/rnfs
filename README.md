@@ -974,7 +974,9 @@ rnfs get <cid>              # recipients get the decrypted file under its origin
 ```
 
 For a fully closed group, run every node with `private = true` and the same `members` list (their identity
-hashes). Members then answer, store records for and serve only each other.
+hashes). Members then answer, store records for and serve only each other. Names are the exception: a name's
+announce still reaches everyone, so outsiders can see which CID it points at and when it changes (though not
+fetch it), and `rnfs name publish` warns of this in private mode.
 
 **Offline sneakernet.** Carry content where there's no link at all:
 

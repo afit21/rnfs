@@ -58,6 +58,10 @@ FLOOR_HARD_FACTOR = 2  # ... up to this many times as many in all (the file stay
 FLOOR_SAVE_INTERVAL = 5.0  # seconds: a resolve raising the floor saves it at once, or this long after the last save
 FLOOR_TOUCH_SAVE = 3600.0  # a resolve that only renews a floor entry's time marks it for the next save after this
 PIN_SOURCE_PREFIX = "name:"
+# Private mode restricts rnfs's links, not RNS announces: a name's record rides in its announce, which RNS
+# propagates to every node that hears it (specification sections 3 and 10)
+PRIVATE_NAME_WARNING = ("private mode doesn't hide names: this name's announce, with its sequence and target CID, "
+                        "is visible outside the private network, though its content is served to members only")
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _PARTIAL = re.compile(re.escape(fsutil.PARTIAL_PREFIX) + r"[0-9a-f]{16}")  # a key write's temp file (write_atomic)
 _DECIMAL = re.compile(r"-?[0-9]+")  # a sequence column (decimal text: sequences don't fit SQLite's integers)
@@ -625,7 +629,8 @@ class NameManager:
     # Publishing
 
     def publish(self, alias: str, cid: Cid) -> dict:
-        """Point alias's name at cid, pin it, announce it. Returns {"name", "cid", "sequence"}."""
+        """Point alias's name at cid, pin it, announce it. Returns {"name", "cid", "sequence"}, and in private mode
+        a "warning" (PRIVATE_NAME_WARNING): the announce reaches outsiders all the same."""
         if not isinstance(cid, Cid):
             raise ValueError("publish needs a CID")
         with self._lock:
@@ -679,7 +684,10 @@ class NameManager:
         if self.keepers is not None:
             # This node keeps its own names, so they resolve through it while the owner's announce is gone
             self.keepers.published(name, identity, encode_record(sequence, cid))
-        return {"name": name.hex(), "cid": str(cid), "sequence": sequence}
+        result = {"name": name.hex(), "cid": str(cid), "sequence": sequence}
+        if self.config.private:
+            result["warning"] = PRIVATE_NAME_WARNING
+        return result
 
     def start(self):
         """Register the announce handler, re-create every local name's destination and announce published ones."""

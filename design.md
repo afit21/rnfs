@@ -363,7 +363,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name"}` |
 | `name_rm(alias)`, `name_export(alias)` | `None`, key bytes |
 | `name_list()` | `[{"alias", "name", "cid" or None, "sequence"}]` |
-| `name_publish(alias, target)` | `{"name", "cid", "sequence"}` |
+| `name_publish(alias, target)` | `{"name", "cid", "sequence"}`, plus `"warning"` in private mode (the name's announce reaches outsiders: `names.PRIVATE_NAME_WARNING`) |
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}` |
 | `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |

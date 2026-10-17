@@ -309,6 +309,11 @@ across shared interfaces and transport nodes, a node MAY run in private mode:
 - outgoing links go only to nodes whose identity is a member, so the node never identifies itself to an
   outsider (one listed as a provider anywhere, say).
 
+Private mode restricts rnfs's links, not RNS announces. A member's names are announced as anywhere else (section
+9), and RNS carries those announces to every node that hears them, so outsiders learn each name's
+`[sequence, CID]` record and can follow its changes; only the content stays member-only. `name publish` in
+private mode warns of this (rnfs: the result carries a `warning`, section 9).
+
 ## 4. Content identifiers
 
 A CID is 36 (raw) or 39 (rnfs-dag) bytes, written as `b` + lowercase unpadded base32 for people (CLI, API,
@@ -881,7 +886,9 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
    resolve, and persist it. If that fails, the publish fails and a pin step 2 added is released.
 4. Release that source from the previous target (only now, so a crash leaves the target the persisted record
    names pinned; any other pin of the source is released at the next start, section 8).
-5. Announce, and re-announce every `announce_interval`.
+5. Announce, and re-announce every `announce_interval`. In private mode the announce reaches outsiders all the
+   same (section 3), and the publish warns of it: rnfs adds a `warning` to the result (`POST /api/name/publish`
+   and `rnfs name publish`, which prints it to stderr).
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
@@ -1087,6 +1094,9 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
   newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
   while fewer than the bounded number of newcomers first seen before it were evicted too.
+- Private mode doesn't hide names: a member's names are announced over RNS like any other, so outsiders who
+  hear them learn each `[sequence, CID]` record and when it changes, though members won't serve them the content
+  (section 3). `name publish` in private mode warns of this.
 - Bans are evaded by switching identity; they only make an attacker pay for a new one.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
