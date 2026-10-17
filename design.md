@@ -64,7 +64,16 @@ pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lx
 Persistent state lives in the state database. Each store keeps its state in memory, which is all reads use,
 loads it once at startup (checking every row as the JSON loaders checked every record: a malformed row is
 logged, skipped and deleted) and then writes only what changed: a pin is one row inserted or deleted, batched
-stores write the records changed since their last save. At every `connect`, `statedb.migrate` first imports
+stores write the records changed since their last save. The shared parts are in statedb: `open_store(state_dir,
+load)` connects and loads, releasing the reference if the load fails; `delete_rows` deletes the rows a load found
+malformed; and a `RowStore(db, table, key_cols, *, durable, mode)` keeps the keys a store changed (`changed(key)`,
+under the store's lock) and not yet written, and writes their rows (`row(key)`, None once gone) in one
+transaction: `write_through` at once, under the store's lock, raising if it fails; `snapshot` at `save()`, taking
+the rows under the lock and writing them outside it, one save at a time so an older snapshot never lands last.
+Either way a failed write keeps the keys for the next one, and the change stays in memory. pin_names, contacts,
+jobs and the publisher are built on it (the other stores move over later). `reconcile_pins` is the start-up
+check of a feature's pins against its saved state (released if it was saved whole, recorded again if not).
+At every `connect`, `statedb.migrate` first imports
 the JSON state files of 0.1.4 and earlier (`LEGACY`): each through its owner's importer, which checks every
 record as the old loader did, in one transaction that also records the file in the `migrated` table; then the
 file is renamed `<name>.migrated` and the directory synced. A file the table already lists (a crash between
