@@ -68,18 +68,20 @@ class PeersFeature(Feature):
         node = self.node
         routing = node.routing
         paths = getattr(node, "paths", None)
-        path_info = paths.info if paths is not None else mesh.no_path_info
         counters = self.traffic.peers()
         try:
             linked = set(node.client.open_links())
         except Exception:  # noqa: BLE001 - a listing shows what it can
             linked = set()
         ids = [n for n in dict.fromkeys([*routing.nodes(), *linked, *reversed(list(counters))]) if n != node.node_id]
+        ids = ids[:mesh.MAX_PEERS]
+        # All at once: attached to a shared instance, RnsPaths reads the interfaces from one RPC, not one each
+        known = paths.infos(ids) if paths is not None else {}
         peers = []
-        for node_id in ids[:mesh.MAX_PEERS]:
+        for node_id in ids:
             counts = counters.get(node_id) or {}
             seniority = routing.seniority(node_id)
-            path = path_info(node_id)
+            path = known.get(node_id, mesh.NO_PATH)
             rate = None
             if node_id in linked:
                 try:

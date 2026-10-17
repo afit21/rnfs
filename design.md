@@ -780,7 +780,9 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 ## Mesh
 
 `mesh.py` (no RNS at module level): `PathInfo`, `provider_rank` and `RnsPaths` (hops and next-hop
-interfaces from `RNS.Transport`, or through a shared instance's RPC with its interface stats cached for 30 s);
+interfaces from `RNS.Transport`, or through a shared instance's RPC with its interface stats cached for 30 s
+and each node's next-hop interface name for 15 s, `PATH_CACHE`, in an LRU of at most 1024 nodes; `infos()` fills
+the names of many nodes from one `get_path_table` RPC, for `rnfs peers`);
 the airtime policy (`TokenBucket`, `AirtimePolicy`, interface matching, quiet-hours parsing, all with
 injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 1000), per interface (at most 64)
 and in total, never persisted.

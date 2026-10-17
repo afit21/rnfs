@@ -574,7 +574,9 @@ and repeat.
   4. **Reply order.**
 
   With no hops or bitrates known, this is seniority, then reply order. Path information is read once per
-  provider per fetch, when the provider is found.
+  provider per fetch, when the provider is found. Through a shared instance, a node MAY reuse the instance's
+  answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
+  there is a path at all, are read fresh.
 
   A provider *fails* when its link fails, it answers `None` for a block of the root it advertised, it answers
   `False` (busy or refused) `max_failures` times in a row, or it stalls twice (section 7). A `False` is retried
