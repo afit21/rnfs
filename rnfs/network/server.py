@@ -26,8 +26,8 @@ import RNS
 from RNS.vendor import umsgpack
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
-                            MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, PIN_PATH,
+                            PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
@@ -125,14 +125,9 @@ class Backend(Protocol):
 
 def blocks_budget(max_bytes: int, rate_estimate: float | None, upload_cap: float | None,
                   response_target: float) -> int:
-    """Total block bytes a /blocks response may hold after its first served block (section 7)."""
-    limit = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
-    if rate_estimate is None:
-        # What a requester asks for until the link has a rate estimate (section 7), enforced: otherwise one
-        # small request could ask for a ~1 MiB response with a deadline of many hours
-        return min(limit, CHUNK_SIZE)
-    rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
-    return min(limit, rates.transfer_bytes(response_target, rate))
+    """Total block bytes a /blocks response may hold after its first served block (section 7): the rule the
+    requester sizes its batches by too (rates.response_capacity)."""
+    return rates.response_capacity(max_bytes, rate_estimate, upload_cap, response_target)
 
 
 def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], limit: int,
