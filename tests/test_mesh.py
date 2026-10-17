@@ -6,6 +6,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 import RNS
 
@@ -14,6 +15,7 @@ from rnfs.config import Config
 from rnfs.constants import BLOCKS_PATH, FIND_PATH, KIB, MAX_RESPONSE_SIZE
 from rnfs.features import peers as peers_feature
 from rnfs.network import protocol, server
+from rnfs.network.announces import DhtAnnounceHandler, encode_mode
 from rnfs.network.client import BUSY, FAILED, OK, BlocksResult, PeerClient
 from rnfs.node import RnfsNode
 from tests.support import FakeClock
@@ -110,6 +112,122 @@ class FetcherOrderTest(FetcherTest):
         self.runs.append([P1])
         self.fetch_all(self.block.cid)
         self.assertTrue(self.storage.is_complete(self.block.cid))
+
+
+HUB = "TCPInterface[Hub/10.0.0.1:4242]"
+RADIO = "RNodeInterface[LoRa]"
+
+
+class FakeInstance:
+    """A Reticulum attached to a shared instance: path answers come by RPC, counted in calls."""
+
+    is_connected_to_shared_instance = True
+
+    def __init__(self, names: dict):
+        """The instance's next-hop interface name per node ({node_id: str(interface)})."""
+        self.names = names
+        self.calls = {"next_hop": 0, "path_table": 0, "stats": 0}
+        self.table_fails = False
+
+    def get_next_hop_if_name(self, node_id: bytes) -> str:
+        """One RPC: str() of the next-hop interface, "None" for a node the instance has no path to."""
+        self.calls["next_hop"] += 1
+        return self.names.get(node_id, "None")
+
+    def get_path_table(self, max_hops=None) -> list[dict]:
+        """One RPC: the instance's whole path table."""
+        self.calls["path_table"] += 1
+        if self.table_fails:
+            raise ConnectionError("rpc failed")
+        return [{"hash": node_id, "timestamp": 0, "via": b"\0" * 16, "hops": 2, "expires": 0, "interface": name}
+                for node_id, name in self.names.items()]
+
+    def get_interface_stats(self) -> dict:
+        """One RPC: the instance's interfaces."""
+        self.calls["stats"] += 1
+        return {"interfaces": [{"name": HUB, "short_name": "Hub", "bitrate": 10_000_000},
+                               {"name": RADIO, "short_name": "LoRa", "bitrate": 1200}]}
+
+
+class RnsPathsTest(unittest.TestCase):
+    """RnsPaths attached to a shared instance: next-hop interfaces cached for at most PATH_CACHE (C1)."""
+
+    def setUp(self):
+        """Local paths to P1-P3 (P4 has none), and an instance knowing P1 and P2's interfaces."""
+        self.local = {P1: 1, P2: 3, P3: 2}  # node -> hops in this process's own path table
+        for name, fake in (("has_path", lambda node_id: node_id in self.local),
+                           ("hops_to", lambda node_id: self.local.get(node_id, mesh.PATHFINDER_M))):
+            patcher = mock.patch.object(RNS.Transport, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.instance = FakeInstance({P1: HUB, P2: RADIO})
+        self.clock = FakeClock()
+        self.paths = mesh.RnsPaths(self.instance, clock=self.clock)
+
+    def test_info(self):
+        self.assertEqual(self.paths.info(P1), mesh.PathInfo(1, "Hub", 10_000_000.0))
+        self.assertEqual(self.paths.info(P2), mesh.PathInfo(3, "LoRa", 1200.0))
+        self.assertEqual(self.paths.info(P3), mesh.PathInfo(2, None, None))  # the instance has no path
+        self.assertEqual(self.paths.info(P4), mesh.NO_PATH)
+        self.assertEqual(self.instance.calls["next_hop"], 3)  # none for P4: no local path, no question
+
+    def test_interface_reused_for_at_most_path_cache(self):
+        self.paths.info(P1)
+        self.instance.names[P1] = RADIO  # the path moved to another interface
+        self.clock.now += mesh.PATH_CACHE
+        self.assertEqual(self.paths.info(P1).interface, "Hub")  # stale, within PATH_CACHE
+        self.assertEqual(self.instance.calls["next_hop"], 1)
+        self.clock.now += 0.001
+        self.assertEqual(self.paths.info(P1).interface, "LoRa")  # never older than PATH_CACHE
+        self.assertEqual(self.instance.calls["next_hop"], 2)
+
+    def test_path_and_hops_always_fresh(self):
+        self.paths.info(P1)
+        self.local[P1] = 4
+        self.assertEqual(self.paths.info(P1).hops, 4)
+        del self.local[P1]
+        self.assertEqual(self.paths.info(P1), mesh.NO_PATH)
+        self.assertEqual(self.instance.calls["next_hop"], 1)
+
+    def test_cache_bounded(self):
+        many = [bytes([5, i]) * 8 for i in range(20)]
+        self.local.update(dict.fromkeys(many, 1))
+        with mock.patch.object(mesh, "MAX_CACHED_PATHS", 8):
+            for node_id in many:
+                self.paths.info(node_id)
+            self.assertEqual(len(self.paths._names), 8)
+            self.assertEqual(list(self.paths._names), many[-8:])  # the oldest are forgotten first
+            self.clock.now += mesh.PATH_CACHE + 1
+            self.paths.info(P1)
+            self.assertEqual(list(self.paths._names), [P1])  # expired entries are dropped too
+
+    def test_infos_reads_one_path_table(self):
+        ids = [P1, P2, P3, P4]
+        expected = {node_id: mesh.RnsPaths(FakeInstance(dict(self.instance.names))).info(node_id) for node_id in ids}
+        self.assertEqual(self.paths.infos(ids), expected)
+        # P3 has a local path the instance's table lacks: asked on its own, as info() would
+        self.assertEqual(self.instance.calls, {"next_hop": 1, "path_table": 1, "stats": 1})
+        self.assertEqual(self.paths.infos(ids), expected)
+        self.assertEqual(self.instance.calls, {"next_hop": 1, "path_table": 1, "stats": 1})  # all cached
+        self.clock.now += mesh.PATH_CACHE + 1
+        self.instance.names[P1] = RADIO
+        self.assertEqual(self.paths.infos(ids)[P1].interface, "LoRa")
+        self.assertEqual(self.instance.calls["path_table"], 2)
+
+    def test_infos_without_the_table_asks_each_node(self):
+        self.instance.table_fails = True
+        self.assertEqual(self.paths.infos([P1, P2, P4]),
+                         {P1: mesh.PathInfo(1, "Hub", 10_000_000.0), P2: mesh.PathInfo(3, "LoRa", 1200.0),
+                          P4: mesh.NO_PATH})
+        self.assertEqual(self.instance.calls["next_hop"], 2)
+
+    def test_own_transport_needs_no_rpc(self):
+        interface = types.SimpleNamespace(name="LoRa", bitrate=1200)
+        self.instance.is_connected_to_shared_instance = False
+        with mock.patch.object(RNS.Transport, "next_hop_interface", lambda node_id: interface):
+            self.assertEqual(self.paths.infos([P1, P2]), {P1: mesh.PathInfo(1, "LoRa", 1200.0),
+                                                         P2: mesh.PathInfo(3, "LoRa", 1200.0)})
+        self.assertEqual(self.instance.calls, {"next_hop": 0, "path_table": 0, "stats": 0})
 
 
 # Airtime policy
@@ -438,6 +556,51 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertIsNone(listed[P1.hex()]["hops"])  # offline: no paths known
         lines = peers_feature.format_peers(list(listed.values()), 0)
         self.assertEqual(len(lines), 5)
+
+    def test_paths_from_one_lookup(self):
+        asked = []
+
+        class Paths:
+            """RnsPaths' bulk lookup, recording what it is asked."""
+
+            def infos(self, node_ids):
+                """A path to P1 only."""
+                asked.append(list(node_ids))
+                return {node_id: mesh.PathInfo(2, "LoRa", 1200.0) if node_id == P1 else mesh.NO_PATH
+                        for node_id in node_ids}
+        self.node.paths = Paths()
+        self.node.routing.heard(P1)
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        self.assertEqual(asked, [[P1, P3]])
+        self.assertEqual([listed[P1.hex()][key] for key in ("hops", "interface", "bitrate")], [2, "LoRa", 1200.0])
+        self.assertIsNone(listed[P3.hex()]["hops"])
+        self.assertEqual(list(listed), [P1.hex(), P3.hex()])  # nearest first
+
+    def test_announces_counted_once_by_the_node(self):
+        # S8: the node's rnfs.dht announce handler counts each announce; the feature registers none of its own
+        self.node.reticulum = object()
+        self.addCleanup(setattr, self.node, "reticulum", None)
+        with mock.patch.object(RNS.Transport, "register_announce_handler") as register:
+            self.feature.start()
+        register.assert_not_called()
+        handler = DhtAnnounceHandler(self.node._heard_server, self.node._heard_client, self.node.routing.is_banned,
+                                     self.node.node_id)  # as RnfsNode._start_network wires it
+        self.node.routing.ban(P4)
+        with mock.patch.object(self.feature.traffic, "heard", wraps=self.feature.traffic.heard) as heard:
+            for node_id, server in ((P1, True), (P2, False), (P4, True), (OWN, True)):
+                handler.received_announce(node_id, None, encode_mode(server))
+        self.assertEqual(heard.call_args_list, [mock.call(P1, "server"), mock.call(P2, "client")])
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        self.assertEqual((listed[P1.hex()]["mode"], listed[P1.hex()]["in_table"]), ("server", True))
+        self.assertEqual((listed[P2.hex()]["mode"], listed[P2.hex()]["in_table"]), ("client", False))
+        self.assertIsNotNone(listed[P2.hex()]["last_heard"])
+
+    def test_recalled_mode_doesnt_mark_used(self):
+        # A listing is a check, not a contact (C2)
+        self.node.reticulum = object()
+        with mock.patch.object(RNS.Identity, "recall_app_data", return_value=None) as recall:
+            self.assertIsNone(self.feature._recalled_mode(P1))
+        recall.assert_called_once_with(P1, _no_use=True)
 
     def test_status_and_stats(self):
         status = self.node.status()

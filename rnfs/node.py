@@ -324,7 +324,8 @@ def _remove_created(path: str, created: os.stat_result):
 
 def _rns_is_known(node_id: bytes) -> bool:
     """True if RNS knows node_id's identity, so contacting it needs no path request for the key."""
-    return RNS.Identity.recall(node_id) is not None
+    # A check, not a contact: don't mark the destination used (an RPC each on a shared instance)
+    return RNS.Identity.recall(node_id, _no_use=True) is not None
 
 
 def _warn_unused_reticulum_config(config: Config):
@@ -708,17 +709,28 @@ class RnfsNode:
 
     def _heard_server(self, node_id: bytes):
         """A server-mode announce (or path response) from node_id."""
+        self._count_heard(node_id, "server")
         if self.routing.heard(node_id):
             log(f"heard DHT server {node_name(node_id)} ({self.routing.node_count()} known)", LOG_VERBOSE)
             self.publisher.wake()
 
     def _heard_client(self, node_id: bytes):
         """node_id announces client mode: it doesn't belong in the routing table."""
+        self._count_heard(node_id, "client")
         self.routing.remove(node_id)
+
+    def _count_heard(self, node_id: bytes, mode: str):
+        """Count node_id's announce in the traffic counters, which `rnfs peers` reads its DHT mode and last-heard
+        time from (client-mode nodes never enter the routing table). Done here rather than by a second rnfs.dht
+        announce handler in the peers feature: RNS starts a thread per handler for every announce."""
+        traffic = getattr(self.client, "traffic", None)
+        if traffic is not None:
+            traffic.heard(node_id, mode)
 
     def _is_member_node(self, node_id: bytes) -> bool:
         """Private mode's routing table admission: node_id's identity is a member."""
-        identity = RNS.Identity.recall(node_id)
+        # Runs on every admission: a check, not a contact, so it doesn't mark the destination used
+        identity = RNS.Identity.recall(node_id, _no_use=True)
         return identity is not None and identity.hash.hex() in self.members
 
     def _is_member_publisher(self, node_id: bytes) -> bool:
