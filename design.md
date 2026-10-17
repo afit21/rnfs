@@ -1053,6 +1053,14 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
   requires; each box's `next_id`) and `migrated` (JSON files imported).
 
+The node lists its stores as `_setup` makes them (`RnfsNode._add_store`; the `node.Store` protocol: `save()`
+writes what changed since the last save, raising `OSError` and keeping the change if the database fails, and
+`close()` releases the store's reference to the state database). A store is batched (`_save_state`: every 30 s
+and at gc) or saves on a schedule of its own (provider records, the publisher, the remote pins waiting, the
+write-through stores); the features are stores too, batched. Stop saves every store in the order made, then
+`_close_state` closes them in reverse, the node's own reference last; after a `_setup` that failed, only those it
+made. A new store needs only its `_add_store` call.
+
 Free text that may hold lone surrogates (file names, LXMF records, cache paths) is stored as JSON text
 (`statedb.dump`). Rows that fail the checks the JSON loaders applied are dropped at load with a warning and
 deleted. The JSON files of 0.1.4 and earlier, once imported, stay as `<name>.migrated`. Elsewhere:
