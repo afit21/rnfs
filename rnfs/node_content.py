@@ -113,26 +113,35 @@ def open_sealed(node, fetch, expect: walker.Expect, unlock: bool = True) -> seal
         # would show "of ?": its stored size is what the chunks met add up to
         fetch.observer.total(stored_size)
     if sealed is not None and unlock:
-        identity = getattr(node, "identity", None)
-        if identity is None:
-            raise seal.NotRecipient("this node has no identity to open sealed files with (use --raw)")
-        sealed.unlock(identity)
+        unlock_sealed(node, sealed)
     return sealed
 
 
-def sealed_info(node, fetch, expect: walker.Expect, info: dict) -> dict:
-    """info, plus for a sealed file "sealed", "recipient" and "stored_size", and when this node is a
-    recipient its plaintext "size" and sealed "name"."""
-    if info.get("type") != "file":
-        return info
-    sealed = open_sealed(node, fetch, expect, unlock=False)
+def unlock_sealed(node, sealed: seal.SealedFile):
+    """Unlock sealed with the node's identity. Raises NotRecipient if the node has none or isn't a recipient,
+    SealError if the content key sealed for it doesn't decrypt."""
+    identity = getattr(node, "identity", None)
+    if identity is None:
+        raise seal.NotRecipient("this node has no identity to open sealed files with (use --raw)")
+    sealed.unlock(identity)
+
+
+def is_recipient(node, sealed: seal.SealedFile) -> bool:
+    """True if the node's identity is one of sealed's recipients."""
+    identity = getattr(node, "identity", None)
+    return identity is not None and bytes(identity.hash) in sealed.recipients
+
+
+def sealed_info(node, info: dict, sealed: seal.SealedFile | None) -> dict:
+    """A file's info, plus when it is sealed (sealed, as open_sealed opened it without unlocking) "sealed",
+    "recipient" and "stored_size", and when this node is a recipient its plaintext "size" and sealed "name"
+    (sealed is then unlocked)."""
     if sealed is None:
         return info
-    identity = getattr(node, "identity", None)
-    recipient = identity is not None and bytes(identity.hash) in sealed.recipients
+    recipient = is_recipient(node, sealed)
     info = {**info, "sealed": True, "recipient": recipient, "stored_size": info["size"]}
     if recipient:
-        sealed.unlock(identity)
+        unlock_sealed(node, sealed)
         info.update(size=sealed.size, name=sealed_name(sealed))
     return info
 

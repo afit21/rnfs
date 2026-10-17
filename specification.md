@@ -921,7 +921,8 @@ the name through the network and asks keepers (below), since the key's earlier r
 - To refresh, call `Transport.request_path(name)`, wait up to `path_timeout`, then read
   `Identity.recall_app_data(name)`.
 - If the path request heard nothing within `path_timeout`, or heard only an announce emitted more than
-  2 × `announce_interval` ago (or always, with `keeper_query = always`), ask keepers (below). Storing a provider record is free, and so is answering `/find`, so neither a record's age,
+  2 × `announce_interval` ago or a suspected replay (below), or always with `keeper_query = always`, ask keepers
+  (below). Storing a provider record is free, and so is answering `/find`, so neither a record's age,
   nor the order a reply lists it in, nor how many nodes list it may decide which keepers are asked. Standing
   is read from the routing table as it was when the query started: a node the lookup meets doesn't gain rank
   from answering it, and one that fails a query meanwhile loses rank. An *established* node is one that was
@@ -962,6 +963,18 @@ the name through the network and asks keepers (below), since the key's earlier r
   newest emission time (signed) RNS holds for the name, which repeating an old announce doesn't change (rnfs:
   from RNS's path table). A neighbour repeating an old announce can then keep a replaced record current for
   at most that long, plus the age a caller accepts (a follow's or deny list's 2 × `announce_interval`).
+- An announce RNS stored that was emitted before the newest one its path to the name holds, or that carries
+  another record than the announce the path was taken from, is a *suspected replay* (rnfs: read from RNS's
+  announce cache, which holds the announces paths were taken from). Its record is heard no later than its own
+  emission time, or the path's if its own is no longer known, and the resolve asks keepers. Without a path
+  nothing is compared.
+- A resolve that accepts a record up to some age (the gateway's 60 s, a follow's or deny list's
+  2 × `announce_interval`) skips the refresh while the record held was heard within that age, or while a
+  refresh of the name ended within it and the record it left is still held (rnfs: one that found nothing
+  counts too, a short negative cache; one that left a suspected replay doesn't). With the owner offline a
+  keeper's record keeps its old emission time, so it would otherwise go to the network every time. A resolve
+  of a name being refreshed waits for that refresh, whatever age it accepts, and takes the record it leaves.
+  A name republished moments ago may so show its older record on the gateway for up to 60 s.
 
 **Sequence.** RNS stores any validly signed announce, including a replayed old one, so persisted sequences are
 what prevent rollback.
@@ -1041,9 +1054,11 @@ followed name is checked when a newer record is heard and every `announce_interv
   6), so a name can be updated about once an hour sustained.
 - RNS orders announces by a signed emission timestamp from the publisher's clock, so a publisher whose clock
   goes backwards can't update its name until old paths expire.
-- A resolver's first resolution of a name, through an announce or a keeper, can't detect a replayed old
-  record. A node that missed a name's newer announces and is next to someone repeating an older one gets the
-  newer record from keepers only once the repeated announce is 2 × `announce_interval` old (above).
+- A resolver can't detect a replayed old record when RNS holds no newer path to the name (a first resolution
+  with no path, or after the path expired), nor when RNS's announce cache can't be read (a shared instance's
+  client whose cache isn't the instance's). A node that missed a name's newer announces and is next to someone
+  repeating an older one then gets the newer record from keepers only once the repeated announce is
+  2 × `announce_interval` old (above).
 - The same name key used on two machines can produce two records with one sequence; each resolver keeps the
   one it heard first.
 

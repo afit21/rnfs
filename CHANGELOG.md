@@ -33,6 +33,9 @@ Security:
   `lookup_timeout` and the keepers then had one second to answer. Each batch of `/name` queries now has its own
   budget (87.5 s at the defaults); the search for keepers stops once some are known and `lookup_timeout` / 5 has
   passed, and resumes if their answers don't settle the name.
+- A neighbour replaying an older, validly signed name announce no longer makes its record look current: rnfs
+  reads the replayed announce's own emission time from RNS's announce cache, treats one older than the path's
+  (or carrying another record) as a suspected replay, gives its real age and asks keepers.
 - `get` of a directory can no longer be redirected by someone who can rename inside the output swapping one of
   its directories for a link or junction (or another directory) while it is written. On Linux and macOS the
   output being written is private (0700, setgid kept) and must start empty, every entry is created relative to
@@ -163,6 +166,10 @@ Changed:
   and remote-pin fetches stop with the node (their pins are fetched at the next start).
 - A pin name or contact whose save failed (a full disk, say) is written again by the node's next save, at the
   latest at stop, rather than only at the next change.
+- Gateway and other resolves with a `max_age` (60 s on the gateway) reuse a network refresh of the name for that
+  long, including one that found nothing, and simultaneous resolves of a name share one refresh: a page with many
+  `/name/<n>/…` assets whose owner is offline costs one path request and one keeper query, not one each. A name
+  republished moments ago may show its older record on the gateway for up to 60 s. CLI resolves always refresh.
 - GitHub releases take their notes from the version's section of this file instead of generated notes, and the
   release workflow refuses a tag whose section is still marked unreleased. The check that the Flatpak's wheels
   match `packaging/requirements.lock` runs on every push and pull request, and the release builds (Flatpak,
@@ -199,6 +206,17 @@ Faster:
   whole, `dag_bytes` sums it once, and `is_complete` remembers an incomplete DAG's missing block until it
   arrives. With about 550 000 blocks an eviction pass holds the lock for about 240 ms instead of 900 ms;
   `is_complete` on a 4 GiB file missing its first chunk went from 530 ms per call to 0.002 ms after the first.
+- Expiring provider records no longer checks every record for a time in the future unless the clock went back
+  since a time was taken: one expiry pass at 100 000 records went from 16.6 to 8.7 ms, held under the store's
+  lock.
+- `cat`, `info` and `GET /api/cat` remember which files aren't sealed (at most 4096; forgotten when the deny
+  list changes), so reading one again doesn't read its first bytes to check, and `GET /api/cat` opens a sealed
+  file once instead of twice: a 64 KiB read of a stored file 0.32 → 0.19 ms (through the API 0.47 → 0.21 ms).
+- `pin ls` remembers each complete pin's type, name and whether it is sealed instead of reading its blocks again
+  at every call: 68 → 3.8 ms at 2000 pins after the first.
+- The publisher's refresh after an add reads a cached set of pinned CIDs instead of copying every pin, and
+  gathers the keys of queued withdrawals once: the first refresh with 10 000 CIDs and withdrawals queued for 300
+  nodes 71 → 14.5 ms; a refresh after a pin at 3000 pins 2.25 → 1.69 ms.
 - Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
   over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
   there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
