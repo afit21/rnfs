@@ -14,12 +14,17 @@ Rules for feature modules:
   functions talk to the daemon with `rnfs.cli.client(args)` (import rnfs.cli inside the function).
 - Background threads are started with `self._spawn(...)`; `stop(deadline)` asks them to end, then waits for them
   with `self._join(deadline)`, so the node's stop budget bounds every feature's.
+- A feature that uses another declares it: in `requires` if it can't work without it (that feature must come
+  before it in FEATURE_MODULES, or the node refuses to load), in `optional` if it uses it when loaded. It
+  reaches it with `self.dependency(name)`, which refuses a name it didn't declare. What the contacts feature
+  offers the others is the ContactsApi Protocol (tests/test_contacts.py checks the feature against it).
 """
 import importlib
 import inspect
 import threading
 import time
 from collections.abc import Callable
+from typing import Literal, Protocol, overload, runtime_checkable
 
 # Module paths, in start order. A feature may use the features before it
 FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs.features.keepers",
@@ -31,16 +36,68 @@ ApiRoute = Callable[[object], None]  # handler(api_handler)
 STOP_WAIT = 5.0  # seconds stop() waits for a feature's threads when given no deadline (the node's own budget)
 
 
+class FeatureError(RuntimeError):
+    """A feature that can't be loaded as declared (raised while the node loads its features, before any runs), or
+    one reaching a feature it didn't declare."""
+
+
+@runtime_checkable
+class ContactsApi(Protocol):
+    """What other features may call on the contacts feature (rnfs.features.contacts.ContactsFeature, which
+    tests/test_contacts.py checks against this): a renamed method fails that test instead of silently turning
+    off what used it."""
+
+    def lookup(self, nick: str, kind: str | None = None) -> bytes | None:
+        """The hash of contact nick (of that kind, if given), or None."""
+
+    def has(self, ident: bytes, kind: str) -> bool:
+        """Whether some contact of that kind has hash ident."""
+
+    def nick_of(self, ident: bytes, kind: str) -> str | None:
+        """The nick of the contact of that kind with hash ident, or None."""
+
+    def resolve_id(self, text: str, kind: str) -> bytes:
+        """32 hex characters as bytes, or the hash of a contact of kind with that nick. ValueError otherwise."""
+
+    def expand_target(self, target):
+        """target with a leading name contact's nick replaced by the CID its name points at now."""
+
+
+@overload
+def find(node, name: Literal["contacts"]) -> ContactsApi | None: ...
+@overload
+def find(node, name: str) -> "Feature | None": ...
+
+
+def find(node, name):
+    """node's feature called name, or None if it isn't loaded (or node is a stand-in without features)."""
+    return (getattr(node, "features", None) or {}).get(name)
+
+
 class Feature:
     """Base class: override what the feature needs."""
 
     name: str = ""  # unique, used for node.feature(name) and in status
+    requires: tuple[str, ...] = ()  # features this one can't work without, each before it in FEATURE_MODULES
+    optional: tuple[str, ...] = ()  # features this one uses when they are loaded
 
     def __init__(self, node):
         """Set up state from node.config without touching the network."""
         self.node = node
         self._spawned: list[threading.Thread] = []  # started by _spawn and not yet seen ended; _join waits for them
         self._spawned_lock = threading.Lock()
+
+    @overload
+    def dependency(self, name: Literal["contacts"]) -> ContactsApi | None: ...
+    @overload
+    def dependency(self, name: str) -> "Feature | None": ...
+
+    def dependency(self, name):
+        """The node's feature called name, which this one declares in requires or optional; None if it isn't
+        loaded. FeatureError for a name not declared, so a use the load-time check doesn't know of can't slip in."""
+        if name not in self.requires and name not in self.optional:
+            raise FeatureError(f"feature {self.name} uses feature {name} without declaring it")
+        return find(self.node, name)
 
     def start(self):
         """Start background work, once the node's own services run. Not called on offline test nodes."""
@@ -127,6 +184,27 @@ def stop_feature(feature: Feature, deadline: float):
 def feature_classes() -> list[type[Feature]]:
     """The Feature subclass of every module in FEATURE_MODULES, in order."""
     return [importlib.import_module(path).FEATURE for path in FEATURE_MODULES]
+
+
+def checked_classes() -> list[type[Feature]]:
+    """feature_classes(), for the node to load in order, once checked: FeatureError if two share a name or one
+    has none, or if one requires a feature that isn't loaded before it."""
+    classes = feature_classes()
+    loaded: list[str] = []
+    for cls in classes:
+        if not isinstance(cls.name, str) or not cls.name:
+            raise FeatureError(f"feature {cls.__module__}.{cls.__qualname__} has no name")
+        if cls.name in loaded:
+            raise FeatureError(f"feature name {cls.name!r} is used by two features")
+        for kind in ("requires", "optional"):
+            names = getattr(cls, kind)
+            if not isinstance(names, tuple) or not all(isinstance(name, str) for name in names):
+                raise FeatureError(f"feature {cls.name}: {kind} must be a tuple of feature names")
+        for name in cls.requires:
+            if name not in loaded:
+                raise FeatureError(f"feature {cls.name} requires feature {name}, which isn't loaded before it")
+        loaded.append(cls.name)
+    return classes
 
 
 def api_routes() -> dict[tuple[str, str], ApiRoute]:

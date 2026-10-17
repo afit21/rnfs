@@ -859,6 +859,8 @@ class LxmfFeature(features.Feature):
     """Sends and receives rnfs links over LXMF; see the module docstring."""
 
     name = NAME
+    # contacts: send to a nick, trust LXMF contacts, name senders in the inbox; jobs: links fetched in the background
+    optional = ("contacts", "jobs")
 
     def __init__(self, node):
         """Load the inbox and outbox; LXMF itself is started in start()."""
@@ -1106,26 +1108,20 @@ class LxmfFeature(features.Feature):
                 "nearest_propagation_node": nearest.hex() if nearest is not None else None}
 
     def _recipient(self, to: str) -> bytes:
-        """An LXMF address, or the LXMF address of a contact nick."""
+        """An LXMF address, or the LXMF address of a contact nick (contacts.resolve_id)."""
         if not isinstance(to, str) or not to.strip():
             raise ValueError("a recipient is required: an LXMF address or a contact")
         if _HEX32.fullmatch(to.strip().strip("<>")):
             return parse_address(to)
-        # A contact nick, through rnfs/features/contacts.py when that feature is loaded
-        contacts = getattr(self.node, "features", {}).get("contacts")
-        if contacts is not None and hasattr(contacts, "lookup"):
-            found = contacts.lookup(to, "lxmf")
-            if isinstance(found, (bytes, bytearray)) and len(found) == ID_LENGTH:
-                return bytes(found)
-            if contacts.lookup(to) is not None:
-                raise ValueError(f"contact {to} is not an LXMF address")
-            raise ValueError(f"no LXMF contact {to!r}, and it isn't an LXMF address (32 hex characters)")
-        raise ValueError(f"{to!r} is not an LXMF address (32 hex characters), and contacts aren't available")
+        contacts = self.dependency("contacts")
+        if contacts is None:
+            raise ValueError(f"{to!r} is not an LXMF address (32 hex characters), and contacts aren't available")
+        return contacts.resolve_id(to, "lxmf")
 
     def _contact_target(self, target):
         """target with a leading name contact's nick replaced by name/<name>, so the link follows the name."""
-        contacts = getattr(self.node, "features", {}).get("contacts")
-        if not isinstance(target, str) or contacts is None or not hasattr(contacts, "lookup"):
+        contacts = self.dependency("contacts")
+        if not isinstance(target, str) or contacts is None:
             return target
         first, slash, rest = target.partition("/")
         if first == NAME_SEGMENT or target[:len(URI_SCHEME)].lower() == URI_SCHEME:
@@ -1300,8 +1296,8 @@ class LxmfFeature(features.Feature):
         """trusted() for an address as 32 hex characters (an inbox record's "from")."""
         if sender in self.accept_from or sender in self.auto_fetch_from:
             return True
-        contacts = getattr(self.node, "features", {}).get("contacts")
-        if contacts is None or not hasattr(contacts, "has") or not isinstance(sender, str):
+        contacts = self.dependency("contacts")
+        if contacts is None or not isinstance(sender, str):
             return False
         try:
             return bool(contacts.has(bytes.fromhex(sender), "lxmf"))
@@ -1336,12 +1332,12 @@ class LxmfFeature(features.Feature):
         """Inbox messages, oldest first, each with "trusted" (whether its sender is trusted now) and "contact" (the
         nick of the LXMF contact with its address, or None) added: the display name is the sender's own word, so
         `rnfs inbox` shows these instead."""
-        contacts = getattr(self.node, "features", {}).get("contacts")
+        contacts = self.dependency("contacts")
         entries = self.inbox.entries()
         for entry in entries:
             entry["trusted"] = self._trusted_hex(entry.get("from"))
             entry["contact"] = None
-            if contacts is not None and hasattr(contacts, "nick_of") and entry["trusted"]:
+            if contacts is not None and entry["trusted"]:
                 try:
                     entry["contact"] = contacts.nick_of(bytes.fromhex(entry["from"]), "lxmf")
                 except (TypeError, ValueError):
@@ -1502,8 +1498,8 @@ class LxmfFeature(features.Feature):
 
         Like a fetch here: the link's provider hint first, then (fallback_dht) ordinary DHT discovery.
         """
-        jobs = getattr(self.node, "features", {}).get("jobs")
-        if jobs is None or not hasattr(jobs, "submit"):
+        jobs = self.dependency("jobs")
+        if jobs is None:
             return None
         from_node = self._hints(link)[0]
         if from_node is None:

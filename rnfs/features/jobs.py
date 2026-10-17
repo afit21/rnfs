@@ -292,6 +292,7 @@ class JobsFeature(Feature):
     """The job manager: queue, threads, persistence, protection of resumable blocks. Thread-safe."""
 
     name = NAME
+    optional = ("contacts",)  # a target may start with a name contact's nick
 
     def __init__(self, node):
         """Load saved jobs, queueing again those that hadn't finished and protecting their blocks."""
@@ -574,7 +575,7 @@ class JobsFeature(Feature):
         by DHT discovery if from_node fails.
         """
         from rnfs.errors import Busy
-        contacts = getattr(self.node, "features", {}).get("contacts")
+        contacts = self.dependency("contacts")
         if contacts is not None:
             # `alice/docs`: a name contact's nick becomes the CID its name points at now (rnfs.features.contacts)
             target = contacts.expand_target(target)

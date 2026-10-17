@@ -79,6 +79,8 @@ class FollowFeature(Feature):
     """Followed names and their pins. Thread-safe."""
 
     name = NAME
+    requires = ("keepers",)  # a followed name is kept
+    optional = ("contacts",)  # a name contact's nick names a name (parse_name_arg)
 
     def __init__(self, node):
         """Load followed names; no network."""
@@ -94,7 +96,7 @@ class FollowFeature(Feature):
         self._resolved: set[bytes] = set()  # names whose last check resolved them (a failed fetch, then)
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._keepers = node.feature("keepers")
+        self._keepers = self.dependency("keepers")
         self._keepers.add_listener(self._changed)
         try:
             self._reconcile(self._load())

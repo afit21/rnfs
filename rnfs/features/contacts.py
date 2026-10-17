@@ -9,8 +9,9 @@
 - A target may start with a name contact's nick: `rnfs get alice/docs/report.pdf` resolves alice's name to
   its CID first (RnfsNode._parse_target calls expand_target; never for the gateway, so web pages can't use
   or probe the address book). Wherever the CLI takes a node ID (`get --from`, `ping`, `pin remote`), a node
-  contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf"), trusts
-  senders that has(address, "lxmf") finds, and names them in the inbox listing with nick_of(address, "lxmf").
+  contact's nick works too (node_arg). The LXMF feature resolves a recipient's nick with resolve_id(nick, "lxmf"),
+  trusts senders that has(address, "lxmf") finds, and names them in the inbox listing with nick_of(address,
+  "lxmf"). What other features may call is rnfs.features.ContactsApi (tests/test_contacts.py checks it).
 - Stored in the state database's contacts table (rnfs.statedb), each change written at once, durably; at most
   MAX_CONTACTS entries.
 
@@ -34,6 +35,8 @@ _NICK = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
 _HEX_ID = re.compile(r"[0-9a-f]{32}")
 # RNS destination aspects a hash is checked against to tell its kind
 _KIND_ASPECTS = {"name": ("rnfs", "name"), "node": ("rnfs", "dht"), "lxmf": ("lxmf", "delivery")}
+# Each kind in resolve_id's errors: (article, noun, the word before "contact")
+_KIND_WORDS = {"name": ("a", "name", "name"), "node": ("a", "node", "node"), "lxmf": ("an", "LXMF address", "LXMF")}
 
 
 def check_nick(nick) -> str:
@@ -95,6 +98,7 @@ class ContactsFeature(Feature):
     """The address book. Thread-safe."""
 
     name = NAME
+    optional = ("keepers",)  # a name it keeps is a name (detect_kind)
 
     def __init__(self, node):
         """Load the address book from the state database."""
@@ -231,20 +235,24 @@ class ContactsFeature(Feature):
         return {"nick": nick, "kind": entry[0], "id": entry[1].hex()}
 
     def resolve_id(self, text: str, kind: str) -> bytes:
-        """32 hex characters as bytes, or the hash of a contact of kind with that nick. ValueError otherwise."""
+        """32 hex characters as bytes, or the hash of a contact of kind with that nick. ValueError otherwise.
+
+        Other features call it too (keepers' and follow's names, LXMF's recipients), so they all word it alike.
+        """
         try:
             return parse_hex(text)
         except ValueError:
             pass
+        article, noun, word = _KIND_WORDS.get(kind, ("a", kind, kind))
         if is_nick(text):
             ident = self.lookup(text, kind)
             if ident is not None:
                 return ident
             known = self.lookup(text)
             if known is not None:
-                raise ValueError(f"contact {text} is not a {kind}")
-            raise ValueError(f"no {kind} contact {text}")
-        raise ValueError(f"invalid {kind} {text!r}: give 32 hex characters or a contact's nick")
+                raise ValueError(f"contact {text} is not {article} {noun}")
+            raise ValueError(f"no {word} contact {text}")
+        raise ValueError(f"invalid {noun} {text!r}: give 32 hex characters or a contact's nick")
 
     # Kinds
 
@@ -254,7 +262,7 @@ class ContactsFeature(Feature):
         names = node.names
         if any(entry["name"] == ident.hex() for entry in names.list()) or names.record(ident) is not None:
             return "name"
-        keepers = node.features.get("keepers")
+        keepers = self.dependency("keepers")
         if keepers is not None and keepers.is_kept(ident):
             return "name"
         if ident == node.node_id or node.routing.contains(ident):

@@ -33,7 +33,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import partial
-from typing import BinaryIO, Callable, Iterator, Protocol, TypeVar
+from typing import BinaryIO, Callable, Iterator, Literal, Protocol, TypeVar, overload
 
 import RNS
 
@@ -644,7 +644,9 @@ class RnfsNode:
         self.threads: list[threading.Thread] = []
         self._stopped = False
         self.features: dict[str, features.Feature] = {}
-        for cls in features.feature_classes():
+        # In order, each made before the next, which may use it (requires); a feature that can't be loaded as it
+        # declares stops the node here
+        for cls in features.checked_classes():
             self.features[cls.name] = cls(self)
         # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
         # name pins are made to match the names state, which a crash inside a publish can leave them disagreeing with
@@ -672,7 +674,12 @@ class RnfsNode:
         stores = getattr(self, "_batched" if batched else "_stores", [])
         return [*stores, *getattr(self, "features", {}).values()]
 
-    def feature(self, name: str) -> "features.Feature":
+    @overload
+    def feature(self, name: Literal["contacts"]) -> "features.ContactsApi": ...
+    @overload
+    def feature(self, name: str) -> "features.Feature": ...
+
+    def feature(self, name):
         """The feature called name (rnfs.features). Raises KeyError if it isn't loaded."""
         return self.features[name]
 

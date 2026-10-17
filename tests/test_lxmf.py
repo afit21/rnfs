@@ -836,20 +836,19 @@ class SendTest(FeatureTestCase):
         self.assertEqual(self.network.sent, [])
 
     def test_contact_nick(self):
+        # The node's own address book (contacts.resolve_id finds the recipient)
         feature = self.feature_node()
-        contacts = mock.Mock()
-        contacts.lookup.side_effect = lambda nick, kind=None: SENDER if nick == "alice" and kind in ("lxmf", None) \
-            else (OTHER if nick == "bob" else None)
-        self.addCleanup(self.b.features["contacts"].close)  # the node closes the stand-in instead
-        self.b.features["contacts"] = contacts
+        contacts = self.b.feature("contacts")
+        contacts.add("alice", SENDER.hex(), "lxmf")
+        contacts.add("bob", OTHER.hex(), "node")
+        contacts.add("site", NAME.hex(), "name")
         feature.send("alice", str(self.cid))
         self.assertEqual(self.network.sent[0][0], SENDER)
-        contacts.lookup.side_effect = lambda nick, kind=None: OTHER if kind is None else None
-        with self.assertRaisesRegex(ValueError, "not an LXMF address"):
+        with self.assertRaisesRegex(ValueError, "contact bob is not an LXMF address"):
             feature.send("bob", str(self.cid))
+        with self.assertRaisesRegex(ValueError, "no LXMF contact carol"):
+            feature.send("carol", str(self.cid))
         # A name contact as the target: the link follows the name
-        contacts.lookup.side_effect = lambda nick, kind=None: {("alice", "lxmf"): SENDER,
-                                                               ("site", "name"): NAME}.get((nick, kind))
         feature.send("alice", "site/docs/a.txt")
         self.assertEqual(lxmf.decode_field(self.network.sent[1][2]),
                          [Link(name=NAME, path=("docs", "a.txt"), from_node=B_ID)])

@@ -116,6 +116,106 @@ class FeatureFrameworkTest(unittest.TestCase):
             self.assertEqual(body, {"hello": "me"})
 
 
+def install(*classes):
+    """Make rnfs.features load classes, in that order, each from a fake module of its own."""
+    modules = {}
+    for i, cls in enumerate(classes):
+        module = types.ModuleType(f"rnfs_test_feature_{i}")
+        module.FEATURE = cls
+        modules[module.__name__] = module
+    return (mock.patch.dict(sys.modules, modules), mock.patch.object(features, "FEATURE_MODULES", list(modules)))
+
+
+def feature_class(name, base=DummyFeature, **attributes):
+    """A subclass of base called name, with the class attributes given."""
+    return type(f"{name.title()}Feature", (base,), {"name": name, **attributes})
+
+
+class FeatureDependencyTest(unittest.TestCase):
+    """requires and optional, checked when the node loads its features; dependency() (audit FT4)."""
+
+    def classes(self, *classes):
+        """features.checked_classes() with only classes installed."""
+        patchers = install(*classes)
+        for patcher in patchers:
+            patcher.start()
+        try:
+            return features.checked_classes()
+        finally:
+            for patcher in reversed(patchers):
+                patcher.stop()
+
+    def test_the_shipped_features_load(self):
+        classes = features.checked_classes()
+        names = [cls.name for cls in classes]
+        self.assertEqual(len(set(names)), len(names))
+        for cls in classes:
+            for name in (*cls.requires, *cls.optional):
+                self.assertIn(name, names, cls.name)
+
+    def test_requires_a_feature_loaded_before(self):
+        base, user = feature_class("base"), feature_class("user", requires=("base",))
+        self.assertEqual(self.classes(base, user), [base, user])
+        for order in ((user,), (user, base)):
+            with self.assertRaisesRegex(features.FeatureError, "feature user requires feature base"):
+                self.classes(*order)
+        # An optional one may be missing, or come later
+        optional = feature_class("user", optional=("base", "absent"))
+        self.assertEqual(self.classes(optional, base), [optional, base])
+
+    def test_names_and_declarations_are_checked(self):
+        cases = ((("dummy", "dummy"), "used by two features"), (("",), "has no name"))
+        for names, message in cases:
+            with self.subTest(names), self.assertRaisesRegex(features.FeatureError, message):
+                self.classes(*(feature_class(name) for name in names))
+        for kind, value in (("requires", "base"), ("optional", ["base"]), ("optional", (1,))):
+            with self.subTest(kind=kind, value=value), \
+                    self.assertRaisesRegex(features.FeatureError, f"{kind} must be a tuple"):
+                self.classes(feature_class("user", **{kind: value}))
+
+    def test_node_refuses_to_load_a_missing_requirement(self):
+        """Before any feature is made: none is half made, and the state is released (a retry can open it)."""
+        from rnfs.config import Config
+        from rnfs.node import RnfsNode
+        from tests.test_names import FakeNetwork
+        from tests.test_node import N1, NetClient
+        made = []
+
+        def init(self, node):
+            """Record that it was made."""
+            DummyFeature.__init__(self, node)
+            made.append(self)
+
+        user = feature_class("user", requires=("base",), __init__=init)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=os.path.join(tmp.name, "n"), slow="no")
+        patchers = install(user, feature_class("base"))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with self.assertRaisesRegex(features.FeatureError, "feature user requires feature base"):
+            RnfsNode.offline(config, N1, NetClient(), FakeNetwork())
+        self.assertEqual(made, [])
+        features.FEATURE_MODULES.reverse()  # base before user: it loads
+        node = RnfsNode.offline(config, N1, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        self.assertEqual(made, [node.feature("user")])
+        self.assertIs(node.feature("user").dependency("base"), node.feature("base"))
+
+    def test_dependency_refuses_an_undeclared_feature(self):
+        node = types.SimpleNamespace(features={})
+        user = feature_class("user", requires=("base",), optional=("extra",))(node)
+        base = feature_class("base")(node)
+        node.features.update(base=base, user=user)
+        self.assertIs(user.dependency("base"), base)
+        self.assertIsNone(user.dependency("extra"))  # optional, not loaded
+        with self.assertRaisesRegex(features.FeatureError, "feature user uses feature dummy without declaring"):
+            user.dependency("dummy")
+        # A stand-in node without features (some tests use one)
+        self.assertIsNone(feature_class("user", optional=("base",))(types.SimpleNamespace()).dependency("base"))
+
+
 class FeatureLifecycleTest(unittest.TestCase):
     """Feature.stop(deadline): the base's _spawn and _join, and the node passing its stop budget (audit XC5)."""
 
