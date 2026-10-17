@@ -53,6 +53,30 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 * ***📃 Nodes automatically split up lookup data between themselves -*** Lookup 'Kademlia' for more in depth information, however all nodes on the RNFS network will take responsibility for remembering a part of the overall 'address book' of nodes and a list of which files they host. Assignment of the information is automatic.
 * ***🌱 Automatically find seeders -*** No file of known seeders is needed, RNFS will automatically ask it's peers "who has this file". Kademlia is very efficient at doing this. In a 1 million node network, this would only take 6 hops to find a seeder.
 
+# Ways To Use RNFS
+
+Things made using RNFS & applications wrapping RNFS
+
+### Standard Install (Command line + HTML gateway)
+
+See the quickstart section bellow to install this project and get started with RNFS.
+
+See documentation for more in depth information.
+
+### GUI Application (Planned)
+
+### Project Gutenberg Nomadnet Mirror
+
+Visit '78d812594409fc12489f3d392974bec9:/page/index.mu' on NomadNet.
+
+This is essentially a site that indexes a mirror of Project Gutenberg (libary of over 70k public domain books). It serves files through a gateway rather than RNFS but also provides CIDs.
+
+### Public RNFS NomadNet Gateway 
+
+Access file on RNFS via the nomadnet gateway at 14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu
+
+A use case is that you can host files on rnfs and share them via 14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu'cid=<CID>|o=<File Name>
+
 # Quick start
 
 This section covers the basics to get you using rnfs.
