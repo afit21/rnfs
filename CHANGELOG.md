@@ -19,10 +19,30 @@ Security:
   could take the first window of each response, cancel it and ask again at once, so the node built a whole
   response per window. Closing the link still starts no cooldown, so an honest reader that gives up early isn't
   held back.
+- While the deny list has file hashes (`sha256:` entries), a file that declares more than 16 times the bytes of
+  its distinct chunks, plus 64 MiB, is refused (451) before it is hashed. Hashing reads every repeat of
+  repeated content, so six blocks (128 KB) declaring 2^56 bytes made a one-byte `cat`, a gateway range request,
+  `?format=archive` or an `import` hash for about a year, holding a gateway slot. `cat` and the gateway now fetch
+  a file's whole DAG before checking it (unless its hash is already known), so `max_download_size` and the disk
+  reserve apply as they do for `get`.
+- A gateway HEAD (or a range not starting at byte 0) of a stored file the deny list blocks answers 451, like
+  GET. Before, it took its Content-Type from a denied stored chunk, and a HEAD of a file with a denied hash
+  answered 200.
+- A name whose owner is offline can still be resolved through its keepers when Sybil nodes near its keeper key
+  stall the DHT lookup. They could answer `/find` slowly with ever closer IDs, so the search used all of
+  `lookup_timeout` and the keepers then had one second to answer. Each batch of `/name` queries now has its own
+  budget (87.5 s at the defaults); the search for keepers stops once some are known and `lookup_timeout` / 5 has
+  passed, and resumes if their answers don't settle the name.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
   `use_sent_cid` (before, it fetched the sender's CID).
+- While the deny list has file hashes, a highly repetitive file over 64 MiB (a zero-filled disk image, say) can't
+  be read or imported (451). The user's own gateway HEAD of a file that isn't wholly stored is then typed by its
+  name only, not by its first bytes.
+- A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
+  that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
+  nodes they complete within 12 queries); peers see fewer `/find` requests.
 - The specification now says a requester that gives up on a `/blocks` response closes its link, and never
   cancels the Resource (0.1.5 and earlier already do so).
 - `rnfs inbox` shows the CID each name link was sent as ("sent as `<cid>`"), and marks an auto-fetch that
