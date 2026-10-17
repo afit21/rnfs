@@ -21,6 +21,7 @@ import time
 
 from rnfs import interface
 from rnfs.apiclient import ApiConnection, read_all
+from rnfs.fsutil import printable
 from rnfs.objects import Record
 
 MAX_WATCH_WAIT = 30  # seconds one GET /api/name/watch or /api/jobs/get waits (the API's cap)
@@ -63,8 +64,9 @@ class Client(interface.Rnfs):
         return self._api
 
     def _report(self, message: str):
-        """Log through Python's logging (logger "rnfs")."""
-        _logger.error("rnfs: %s", message)
+        """Log through Python's logging (logger "rnfs"), escaped: the daemon's message can quote names from
+        other people's DAGs."""
+        _logger.error("rnfs: %s", printable(message))
 
     def _close(self):
         """Wake the name poller so it ends."""
