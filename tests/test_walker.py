@@ -533,26 +533,32 @@ class WriteOutTest(unittest.TestCase):
             """real(path, ...), but OSError(error) for the names given."""
             refused = dict(names_and_errors)
 
-            def operation(path, *args):
+            def operation(path, *args, **kwargs):
                 """Refuse some names as the filesystem would."""
                 error = refused.get(os.path.basename(path))
                 if error is not None:
                     raise OSError(error, os.strerror(error), path)
-                return real(path, *args)
+                return real(path, *args, **kwargs)
 
             return operation
 
-        with mock.patch.object(walker, "open", refusing(open, ("a?b", errno.EINVAL), ("long", errno.ENAMETOOLONG)),
-                               create=True), \
-                mock.patch("os.mkdir", refusing(os.mkdir, ("d?", errno.EINVAL))):
-            warnings = walker.write_out(root_expect(root.cid), self.blocks.get, self.path("out"), 10)
-        self.assertEqual(os.listdir(self.path("out")), ["good"])
-        self.assertEqual(len(warnings), 3)
-        self.assertTrue(all("can't represent" in warning for warning in warnings))
-        # Any other error (a full disk) still fails the whole get
-        with mock.patch.object(walker, "open", refusing(open, ("good", errno.ENOSPC)), create=True), \
-                self.assertRaises(OSError):
-            walker.write_out(root_expect(root.cid), self.blocks.get, self.path("out2"), 10)
+        def files_refusing(*names_and_errors):
+            """Patch how write_out creates files (os.open by descriptor, or open by path) to refuse some names."""
+            if walker.FD_WRITE and not fsutil.IS_WINDOWS:
+                return mock.patch("os.open", refusing(os.open, *names_and_errors))
+            return mock.patch.object(walker, "open", refusing(open, *names_and_errors), create=True)
+
+        for fd_write in dict.fromkeys((walker.FD_WRITE, False)):  # by descriptor (Linux, macOS), by path (Windows)
+            with self.subTest(fd_write=fd_write), mock.patch.object(walker, "FD_WRITE", fd_write):
+                with files_refusing(("a?b", errno.EINVAL), ("long", errno.ENAMETOOLONG)), \
+                        mock.patch("os.mkdir", refusing(os.mkdir, ("d?", errno.EINVAL))):
+                    warnings = walker.write_out(root_expect(root.cid), self.blocks.get, self.path(f"out{fd_write}"), 10)
+                self.assertEqual(os.listdir(self.path(f"out{fd_write}")), ["good"])
+                self.assertEqual(len(warnings), 3)
+                self.assertTrue(all("can't represent" in warning for warning in warnings))
+                # Any other error (a full disk) still fails the whole get
+                with files_refusing(("good", errno.ENOSPC)), self.assertRaises(OSError):
+                    walker.write_out(root_expect(root.cid), self.blocks.get, self.path(f"err{fd_write}"), 10)
 
     @unittest.skipUnless(POSIX_MODES, "Windows has no execute bit")
     def test_execute_bit_is_set_through_the_descriptor(self):

@@ -1177,7 +1177,16 @@ links and messages) MUST be printed and logged with non-printable characters esc
 terminal escapes or fake log lines. A name chosen by someone else is used as a default output name only under
 the `get` rule above. `get` writes out under a temporary hidden name in the output's directory and renames
 it to the output once complete (refusing if the output appeared meanwhile), so a failed or interrupted
-write-out never leaves a partial output under the requested name.
+write-out never leaves a partial output under the requested name. A directory's entries MUST end up inside
+it even if someone who can write beside or inside it swaps one of its directories for a link or another
+directory while it is written; such a swap fails the `get`. rnfs: on POSIX the temporary directory is made
+mode 0700 (setgid kept) and must still be empty once it is, every entry is created relative to its parent's
+open directory without following links, and each directory is reopened from the root, component by
+component, and checked against the device and inode it had when made; the temporary directory gets back the
+mode it was created with when complete. On Windows it is created with the protected access list of the rnfs
+directory (the user and SYSTEM only), every file's final path must be inside it, and once complete it
+inherits its folder's access list again. Either way, it must still be the directory made before it is
+renamed. A single file is created directly in the output's directory.
 
 **API** (`127.0.0.1:8788`) and **gateway** (`127.0.0.1:8789`) are separate ports, so pages served by the
 gateway can never reach the API.

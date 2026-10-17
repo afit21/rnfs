@@ -187,8 +187,16 @@ def _check_free_space(path: str, needed: int, blocks_dir: str | None = None, to_
                        f"while leaving {size(reserve)} free")
 
 
-def _remove_partial(path: str):
-    """Delete a partial get output (file or directory tree) if there is one; a symlink is removed, not followed."""
+def _remove_partial(path: str, identity: walker.Identity | None = None):
+    """Delete a partial get output (file or directory tree) if there is one; a symlink is removed, not followed.
+
+    With identity (a directory output's, from write_out), only if path is still that directory: whatever someone
+    put in its place isn't this get's to delete."""
+    if identity is not None:
+        try:
+            walker.check_unchanged(path, identity)
+        except (ValueError, OSError):
+            return
     try:
         if os.path.isdir(path) and not os.path.islink(path):
             shutil.rmtree(path)
@@ -196,6 +204,17 @@ def _remove_partial(path: str):
             fsutil.remove(path)
     except OSError as e:
         log(f"removing {path} failed: {e!r}", LOG_WARNING)
+
+
+def _inherit_from_parent(partial: str, output: str):
+    """On Windows, give a complete directory output the access its folder passes on, where it was private to the
+    user while written (walker._PathOutput). If that fails it stays private, which is safe, so a warning is
+    logged rather than the get failed."""
+    try:
+        winacl.inherit_from_parent(partial)
+    except OSError as e:
+        log(f"get: {output} stays private to you, as its folder's access list couldn't be applied to it: {e}",
+            LOG_WARNING)
 
 
 def _remove_created(path: str, created: os.stat_result):
@@ -1079,6 +1098,7 @@ class RnfsNode:
         # write-out never leaves a partial output under the name the user asked for
         partial = os.path.join(os.path.dirname(os.path.abspath(output)),
                                f".rnfs-get-{secrets.token_hex(8)}{PARTIAL_SUFFIX}")
+        created: list[walker.Identity] = []  # a directory output's identity, once write_out has made it
         try:
             with self._fetching(root, names, from_node) as fetch:
                 expect = fetch.resolve()
@@ -1097,13 +1117,18 @@ class RnfsNode:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
                     # Each file is checked before it is written while the deny list has file hashes
                     check = {"check": lambda file: self._check_file(file, fetch.get)} if self.deny.hashes else {}
-                    warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries, **check)
+                    warnings = walker.write_out(expect, fetch.get, partial, self.config.max_output_entries,
+                                                created=created, **check)
                     # Every skipped entry is a warning: keep a response (and a job's saved result) small
                     result = {"cid": str(expect.cid), **cap_warnings(warnings)}
+            if created:
+                # Still the directory written, not one put in its place by someone who can write beside it
+                walker.check_unchanged(partial, created[0])
+                _inherit_from_parent(partial, output)
             fsutil.rename_new(partial, output)
             return result
         finally:
-            _remove_partial(partial)
+            _remove_partial(partial, created[0] if created else None)
 
     def info(self, target: str, for_gateway: bool = False, from_node: bytes | None = None, raw: bool = False) -> dict:
         """The target's own CID, type, size and executable bit (fetching the root, path and target blocks).

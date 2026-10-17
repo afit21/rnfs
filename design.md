@@ -172,7 +172,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   depth-first), `read_range(expect, get, offset, length) -> Iterator[bytes]`, `leaf_bytes(expect, get, stop_at)`
   (the bytes of a file's distinct chunks, from its file nodes only: the deny list's hash bound),
   `list_directory(expect, get, max_entries=None) -> Iterator[Entry]` (`TooLarge` past
-  `max_entries`), `write_out(expect, get, dest, max_entries) -> warnings`.
+  `max_entries`), `write_out(expect, get, dest, max_entries, check=None, created=None) -> warnings`
+  (`created` gets a directory output's `(st_dev, st_ino)`, for `check_unchanged(dest, identity)` before it is
+  renamed; a directory replaced while written raises `ValueError("output was changed while being written")`).
 
 `storage.py` — `Storage(blocks_dir, state_dir, max_storage)`, thread-safe:
 - blocks: `has(cid)`, `get(cid, verify=False) -> bytes | None` (with `verify`, a block no longer matching its
@@ -338,7 +340,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 |---|---|
 | `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`) |
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
-| `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` |
+| `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw`; a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`; the sealed name is None unless `safe_default_name` accepts it) |
 | `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
 | `read(target, offset=0, length=None, for_gateway=False, from_node=None, raw=False)` | iterator of bytes of a file (range fetched only; sealed files decrypted unless `raw` or `for_gateway`) |
@@ -992,7 +994,19 @@ deleted. The JSON files of 0.1.4 and earlier, once imported, stay as `<name>.mig
 delivered-message IDs, stamp costs), `api_token` (while the daemon runs), `daemon.lock` (locked while the daemon, or an embedded `rnfs.Node`, uses the
 dir: `node.lock_rnfs_dir`).
 Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`) or `.rnfs-job-<id>.partial` (get jobs) until renamed; a failed, cancelled or shut-down job removes its partial,
-and a resumed job removes one left by a crash.
+and a resumed job removes one left by a crash. A get job runs `RnfsNode.get` with its `.rnfs-job-<id>.partial` as
+the output, so it is written in a `.rnfs-get-<random>.partial` beside that and renamed twice.
+A directory partial is private while written (audit CONT-2), so nobody can swap one of its directories for a
+link and have the DAG's files created elsewhere: on POSIX (`walker._FdOutput`, where `FD_WRITE`) it is made with
+`mkdir`, opened `O_DIRECTORY | O_NOFOLLOW`, checked to be this user's, `fchmod`ed to 0700 (setgid kept, so
+entries still get a shared directory's group) and must then be empty; entries are created relative to their
+parent's descriptor (`mkdir(dir_fd=)`, files `O_CREAT | O_EXCL | O_NOFOLLOW`), and a directory is reopened from
+the root, one component at a time, checked against the device and inode recorded when it was made. The stack
+of directories still to write holds those names and identities, not descriptors, so only a few are open
+however many directories a DAG has. The root gets its original mode back when complete. On Windows
+(`walker._PathOutput`) the root is made with `winacl.make_private_dir`, entries by path, and each file's final
+path must be inside the root; `RnfsNode.get` then restores inheritance (`winacl.inherit_from_parent`) before
+the rename.
 
 ## Tests
 

@@ -43,8 +43,8 @@ SHARED = Dacl(USER, [allow(SYSTEM), allow(ADMINISTRATORS), allow(USER), allow(US
 
 
 class FakeAcl:
-    """A winacl backend: a DACL per file, set_private's and create_private_dir's calls, and `inherited` for files
-    never set."""
+    """A winacl backend: a DACL per file, set_private's, create_private_dir's and inherit's calls, and `inherited`
+    for files never set (or made to inherit again)."""
 
     def __init__(self, inherited: Dacl = SHARED):
         self.inherited = inherited
@@ -52,6 +52,7 @@ class FakeAcl:
         self.set_calls: list[tuple[str, bool]] = []
         self.created: list[str] = []
         self.read_fds: list[int | None] = []
+        self.inherit_calls: list[str] = []
 
     @staticmethod
     def key(path: str, fd: int | None = None) -> tuple[int, int]:
@@ -83,6 +84,11 @@ class FakeAcl:
     def set(self, path: str, dacl: Dacl):
         """Give path dacl, as someone else (or an older rnfs) left it."""
         self.dacls[self.key(path)] = dacl
+
+    def inherit(self, path: str):
+        """Drop path's own DACL, so it inherits its parent's (`inherited`) again."""
+        self.inherit_calls.append(path)
+        self.dacls.pop(self.key(path), None)
 
 
 class WindowsTestCase(unittest.TestCase):
