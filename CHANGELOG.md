@@ -33,6 +33,9 @@ Security:
   `lookup_timeout` and the keepers then had one second to answer. Each batch of `/name` queries now has its own
   budget (87.5 s at the defaults); the search for keepers stops once some are known and `lookup_timeout` / 5 has
   passed, and resumes if their answers don't settle the name.
+- A neighbour replaying an older, validly signed name announce no longer makes its record look current: rnfs
+  reads the replayed announce's own emission time from RNS's announce cache, treats one older than the path's
+  (or carrying another record) as a suspected replay, gives its real age and asks keepers.
 - `get` of a directory can no longer be redirected by someone who can rename inside the output swapping one of
   its directories for a link or junction (or another directory) while it is written. On Linux and macOS the
   output being written is private (0700, setgid kept) and must start empty, every entry is created relative to
@@ -163,6 +166,10 @@ Changed:
   and remote-pin fetches stop with the node (their pins are fetched at the next start).
 - A pin name or contact whose save failed (a full disk, say) is written again by the node's next save, at the
   latest at stop, rather than only at the next change.
+- Gateway and other resolves with a `max_age` (60 s on the gateway) reuse a network refresh of the name for that
+  long, including one that found nothing, and simultaneous resolves of a name share one refresh: a page with many
+  `/name/<n>/…` assets whose owner is offline costs one path request and one keeper query, not one each. A name
+  republished moments ago may show its older record on the gateway for up to 60 s. CLI resolves always refresh.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
