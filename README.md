@@ -69,15 +69,15 @@ Comming soon, stay tuned
 
 ### Project Gutenberg Nomadnet Mirror
 
-Visit '78d812594409fc12489f3d392974bec9:/page/index.mu' on NomadNet.
+Visit `78d812594409fc12489f3d392974bec9:/page/index.mu` on NomadNet.
 
 This is essentially a site that indexes a mirror of Project Gutenberg (libary of over 70k public domain books). It serves files through a gateway rather than RNFS but also provides CIDs.
 
 ### Public RNFS NomadNet Gateway 
 
-Access file on RNFS via the nomadnet gateway at 14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu
+Access file on RNFS via the nomadnet gateway at `14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu`
 
-A use case is that you can host files on rnfs and share them via 14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu'cid=<CID>|o=<File Name>
+A use case is that you can host files on rnfs and share them via `14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu'cid=<CID>|o=<File Name>`
 
 # Quick start
 
