@@ -1,5 +1,5 @@
 """Direct tests of a keeper query (rnfs/features/keepers.py, _KeeperQuery): the search for a name's keepers, the
-choice of each batch, the answers kept, and when they settle the name.
+choice of each batch, the answers kept, when they settle the name, and when the search stops and resumes.
 
 The keepers resolution as a whole (resolve, kept records, forgeries) is tested through offline nodes in
 tests/test_names_keep.py and tests/security/test_m3*.py; here resolver B is an offline node over KeeperNet, whose
@@ -7,13 +7,14 @@ tests/test_names_keep.py and tests/security/test_m3*.py; here resolver B is an o
 """
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 import RNS
 
 from rnfs.config import Config
-from rnfs.features.keepers import _UNVOUCHED, _KeeperQuery, name_key
+from rnfs.features.keepers import _UNVOUCHED, SEARCH_SHARE, _KeeperQuery, name_key
 from rnfs.names import name_for_identity
 from rnfs.node import RnfsNode
 from tests.test_names import FakeNetwork
@@ -98,6 +99,50 @@ class KeeperQueryTest(unittest.TestCase):
         query = self.query()
         query.search()
         self.assertEqual(query.floor, 2)
+
+    def test_soft_budget_stops_a_search_with_candidates(self):
+        """Once lookup_timeout / SEARCH_SHARE has passed, any candidate in hand stops the search (cut short)."""
+        query = self.query()
+        query._search_started = time.monotonic() - self.b.config.lookup_timeout / SEARCH_SHARE
+        self.assertFalse(query.should_stop())  # nothing found yet
+        query.add(K1)
+        self.assertTrue(query.should_stop())
+        self.assertTrue(query.cut_short)
+        query._search_started = time.monotonic()
+        query.cut_short = False
+        self.assertFalse(query.should_stop())  # too early for one candidate
+
+    def test_resume_only_after_a_search_stopped_early_and_a_batch_asked(self):
+        self.assertTrue(self.b.records.store(self.key, K1))
+        query = self.query()
+        with mock.patch.object(query.lookup, "find_providers") as find:
+            self.assertEqual(query.search(), [K1])
+            self.assertFalse(query.resume())  # the search ended by itself (the lookup ended it)
+            query.cut_short = True
+            self.assertFalse(query.resume())  # none of its candidates asked yet
+            self.assertEqual(query.next_batch(), [K1])
+            self.assertFalse(query.resume())  # resumed, but nothing new found
+            self.assertEqual(find.call_count, 2)
+
+    def test_resumed_search_asks_only_new_candidates(self):
+        self.assertTrue(self.b.records.store(self.key, K1))
+        query = self.query()
+        with mock.patch.object(query.lookup, "find_providers"):
+            query.search()
+        self.assertEqual(query.next_batch(), [K1])
+
+        def found_more(on_provider, should_stop):
+            """A resumed run finding K1 again, and K2."""
+            on_provider(K1)
+            on_provider(K2)
+            should_stop()
+            return [K2]
+
+        query.cut_short = True
+        with mock.patch.object(query.lookup, "find_providers", side_effect=found_more):
+            self.assertTrue(query.resume())
+        self.assertEqual(query.candidates, [K2])
+        self.assertEqual(query.next_batch(), [K2])
 
     # Batches
 

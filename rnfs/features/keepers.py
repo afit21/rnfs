@@ -16,11 +16,13 @@ A name resolves through RNS only while its owner is online or a transport node s
   36- or 39-byte binary CID). A name is advertised only once a record of it is held.
 - **Resolving** (NameManager.resolve): when the path request heard nothing (or always, with keeper_query =
   "always"), find providers of the name's key (past the first alpha, with local records only candidates, until
-  two established servers list some), rank them by routing-table standing as it was before the search, then at
-  random, and ask them with /name a batch of alpha at a time, each batch drawing first on sources no earlier
-  pick came from, asking another batch (up to a bound) while no answer reaches the sequence already known or
-  only one keeper (one established keeper, when no sequence is known) answered; only verifying records are
-  offered to the usual sequence rules (persisted highest sequence, no rollback).
+  two established servers list some, or some are known and lookup_timeout / 5 has passed), rank them by
+  routing-table standing as it was before the search, then at random, and ask them with /name a batch of alpha
+  at a time, each batch drawing first on sources no earlier pick came from and waited for at least name_wait
+  (87.5 s), asking another batch (up to a bound) while no answer reaches the sequence already known or only one
+  keeper (one established keeper, when no sequence is known) answered, resuming a search stopped early when the
+  candidates run out; only verifying records are offered to the usual sequence rules (persisted highest
+  sequence, no rollback).
 - **What is kept.** Names kept by the user (`rnfs name keep`), followed names (rnfs.features.follow), and
   this node's own published names, which it signs itself. At most keep_max_names, own names not counted.
 - **Refreshing.** On hearing an announce with a higher sequence for a kept name, the signed announce is read
@@ -68,6 +70,8 @@ RNS_CACHE_WAIT = 0.5
 LOOP_INTERVAL = 60.0  # the background thread syncs own names and saves at least this often
 KEEPER_CANDIDATES = 3  # the search for a name's keepers runs until 3 × alpha are known (from 2+ sources)
 KEEPER_ROUNDS = 3  # batches of alpha keepers one query asks at most (2 on slow nodes)
+SEARCH_SHARE = 5  # with candidates in hand, the search for keepers stops once lookup_timeout / 5 has passed
+NAME_HOPS = 5  # hops of RNS link establishment timeout a /name batch allows for
 REQUEST_ID_LENGTH = 16
 _UNVOUCHED = b""  # ask_keepers: the source of candidates no established node (nor this one) listed
 
@@ -75,6 +79,16 @@ _UNVOUCHED = b""  # ask_keepers: the source of candidates no established node (n
 def name_key(name: bytes) -> bytes:
     """The DHT key keepers of name provide: SHA-256(b"rnfs-name" + name), truncated to 128 bits."""
     return hashlib.sha256(KEY_DOMAIN + name).digest()[:ID_LENGTH]
+
+
+def name_wait(config) -> float:
+    """How long a batch of /name queries is waited for at least, apart from the lookup's budget: a path request
+    (path_timeout), a link set up over NAME_HOPS hops with LinkPool's grace, and the request (LinkPool's deadline
+    for a request other than /blocks, before an RTT is measured). 87.5 s at the defaults."""
+    import RNS
+    from rnfs.network import links, protocol
+    return (config.path_timeout + links.ESTABLISH_GRACE + NAME_HOPS * RNS.Link.ESTABLISHMENT_TIMEOUT_PER_HOP
+            + links.DEADLINE_FACTOR * protocol.REQUEST_TIMEOUT_WITHOUT_RTT)
 
 
 def _log(message: str, level: int = LOG_VERBOSE):
@@ -425,7 +439,7 @@ class _KeeperQuery:
     found, and the verifying records they answered with so far.
 
     The search and the choice of batches run in the calling thread; ask runs on a thread per keeper asked, so the
-    answers are guarded by a lock.
+    answers are guarded by a lock. A search stopped early may be resumed for more candidates (resume).
     """
 
     def __init__(self, feature: "KeepersFeature", name: bytes):
@@ -440,6 +454,7 @@ class _KeeperQuery:
         self.before = node.routing.standings(node.config.provider_seniority)
         self.local = [p for p in node.records.providers(self.key, exclude=self.banned) if p != node.node_id]
         self.found = dict.fromkeys(self.local)  # every provider of the key found, in the order found
+        self.considered: set[bytes] = set()  # providers found by an earlier search: made candidates then
         self.lookup = node._lookup(self.key)
         self.wanted = KEEPER_CANDIDATES * self.alpha
         # Records stored here count as a source only if an established publisher stored one, so identities
@@ -449,6 +464,9 @@ class _KeeperQuery:
         self.vouched: dict[bytes, set[bytes]] = {}  # candidate -> the sources that listed it
         self.floor: int | None = None  # the highest sequence known for the name when the search ended
         self.asked = 0
+        self.cut_short = False  # the last search was stopped by should_stop, not ended by the lookup
+        self._search_started = 0.0
+        self._asked_since_search = False  # a batch was taken from the last search's candidates
         self._lock = threading.Lock()
         self._results: list[SignedRecord] = []
         self._answered: set[bytes] = set()  # keepers that answered with a verifying record
@@ -465,29 +483,61 @@ class _KeeperQuery:
         if provider != self.node.node_id and provider not in self.found and not self.banned(provider):
             self.found[provider] = None
 
+    def _fresh(self) -> list[bytes]:
+        """Providers found that no earlier search made candidates, in the order found."""
+        return [provider for provider in self.found if provider not in self.considered]
+
     def enough(self) -> bool:
-        """Enough candidates, listed by more than one established source."""
-        if len(self.found) < self.wanted:
+        """Enough new candidates, listed by more than one established source."""
+        if len(self._fresh()) < self.wanted:
             return False
         sources = sum(1 for lister in self.lookup.listing_nodes() if self.established(lister))
         return sources + (1 if self.local_source else 0) >= 2
 
+    def should_stop(self) -> bool:
+        """True if the search should stop: enough new candidates, or some once lookup_timeout / SEARCH_SHARE has
+        passed since it started. Candidates are asked only once it stops, so reply order doesn't choose them."""
+        if not self._fresh():
+            return False
+        budget = self.node.config.lookup_timeout / SEARCH_SHARE
+        if self.enough() or time.monotonic() - self._search_started >= budget:
+            self.cut_short = True
+        return self.cut_short
+
     def search(self) -> list[bytes]:
-        """Find providers of the name's key and rank them; the candidates, in the order to ask them.
+        """Find providers of the name's key and rank those no earlier search found; those candidates, in the order
+        to ask them.
 
         Who vouches for each candidate: established nodes that listed it, and this node if it holds a record of
         it; candidates nobody established vouches for count as one source between them.
         """
-        self.lookup.find_providers(self.add, should_stop=self.enough)
-        self.candidates = self.feature.rank_keepers(list(self.found), self.before)
-        if not self.candidates:
+        self._search_started = time.monotonic()
+        self.cut_short = self._asked_since_search = False
+        self.lookup.find_providers(self.add, should_stop=self.should_stop)
+        fresh = self._fresh()
+        self.considered.update(fresh)
+        ranked = self.feature.rank_keepers(fresh, self.before)
+        if not ranked:
             return []
         here = set(self.local)
-        self.vouched = {provider: ({lister for lister in self.lookup.listers(provider) if self.established(lister)}
-                                   | ({self.node.node_id} if provider in here else set())) or {_UNVOUCHED}
-                        for provider in self.candidates}
+        self.vouched.update({provider: ({lister for lister in self.lookup.listers(provider)
+                                         if self.established(lister)}
+                                        | ({self.node.node_id} if provider in here else set())) or {_UNVOUCHED}
+                             for provider in ranked})
+        self.candidates.extend(ranked)
         self.floor = self.feature._known_sequence(self.name)
-        return self.candidates
+        return ranked
+
+    def resume(self) -> bool:
+        """Search again, once the candidates have run out without settling the name; True if it found new ones.
+
+        Only a search that was stopped early, not ended by the lookup (complete, bounded or out of time), is
+        resumed, and only after some of its candidates were asked: each resume is followed by a batch, so the
+        batch bound also bounds the resumes, all within the lookup's deadline.
+        """
+        if not (self.cut_short and self._asked_since_search) or self.lookup.remaining() <= 0:
+            return False
+        return bool(self.search())
 
     def may_ask(self, provider: bytes) -> bool:
         """True if provider's identity is known, or the unknown-keeper budget has room."""
@@ -513,6 +563,8 @@ class _KeeperQuery:
                     batch.append(provider)
                     self._used.update(self.vouched[provider])
         self.asked += len(batch)
+        if batch:
+            self._asked_since_search = True
         return batch
 
     def ask(self, provider: bytes):
@@ -842,33 +894,43 @@ class KeepersFeature(Feature):
         (a node the lookup meets doesn't gain rank from answering it; one that fails meanwhile loses rank), and
         an *established* node is one senior and healthy then. Keepers recorded here are candidates, never a
         reason to skip the search, which runs until KEEPER_CANDIDATES × alpha are known and two established
-        sources listed some (this node counts as one if an established publisher stored a record here), or
-        the lookup is complete. Candidates are ranked by standing then at random (rank_keepers), and each batch
-        takes first, in that order, those listed by a source no earlier pick was listed by (this node, an
-        established listing node, or, as one source, nobody established), then the rest in rank order. Unknown
-        keepers (a path request each) get a budget of alpha of their own, apart from the lookup's. Another batch
-        is asked, up to keeper_rounds() in all, while no answer reaches the highest sequence already known for
-        the name (from an announce, a resolve or a kept record), or fewer than two keepers answered (when no
-        sequence is known, two established keepers; on a slow node a second batch is asked for this only when
-        nothing is known to compare against). Each verifying record is returned; the caller keeps the highest
-        sequence.
+        sources listed some (this node counts as one if an established publisher stored a record here), until
+        some are known and lookup_timeout / SEARCH_SHARE has passed, or until the lookup ends. Candidates are
+        asked only once the search stops, never as they arrive, and are ranked by standing then at random
+        (rank_keepers), and each batch takes first, in that order, those listed by a source no earlier pick was
+        listed by (this node, an established listing node, or, as one source, nobody established), then the rest
+        in rank order. Unknown keepers (a path request each) get a budget of alpha of their own, apart from the
+        lookup's. Another batch is asked, up to keeper_rounds() in all, while no answer reaches the highest
+        sequence already known for the name (from an announce, a resolve or a kept record), or fewer than two
+        keepers answered (when no sequence is known, two established keepers; on a slow node a second batch is
+        asked for this only when nothing is known to compare against). Each batch is waited for the lookup's
+        time left or name_wait, whichever is longer, so a search that used all of lookup_timeout still leaves
+        keepers time to answer. If the candidates run out first, a search stopped early is resumed for more
+        (_KeeperQuery.resume). Each verifying record is returned; the caller keeps the highest sequence.
         """
         query = _KeeperQuery(self, name)
         if not query.search():
             _log(f"no keepers found for name {name.hex()}")
             return []
-        deadline = time.monotonic() + max(1.0, query.lookup.remaining())
-        for _ in range(self.keeper_rounds()):
+        wait = name_wait(self.node.config)
+        batches = 0
+        while batches < self.keeper_rounds():
             batch = query.next_batch()
             if not batch:
+                if query.resume():
+                    continue
                 break
+            batches += 1
+            # /name has a budget of its own: a link to a keeper may take many seconds to set up, however long
+            # the search took
+            deadline = time.monotonic() + max(query.lookup.remaining(), wait)
             threads = [threading.Thread(target=query.ask, args=(provider,), name="rnfs-keeper-query", daemon=True)
                        for provider in batch]
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
-            if query.settled() or time.monotonic() >= deadline:
+            if query.settled():
                 break
         records = query.records()
         _log(f"asked {query.asked} of {query.asked + len(query.candidates)} keepers of name {name.hex()}: "

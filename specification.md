@@ -527,7 +527,15 @@ and repeat.
   live servers are unchanged.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
-  answered, or once every known node has been queried without finding new ones.
+  answered, or once every known node has been queried without finding new ones. Nodes near a key can keep
+  answering with ever closer IDs, generated or ground for it, so a lookup also ends, without being complete:
+  - once it has sent 8 × `K` (80) `/find` queries in one run (counting retries of unreliable nodes), and the
+    answers to those still out are in;
+  - after 3 × max(`alpha`, `beta`) answers in a row (9 at the defaults) that don't shorten the bit length of
+    the distance from the key to the `beta`-th closest node it knows.
+
+  Neither bound ends an honest lookup: over a simulated network of 2000 nodes, each of 2500 lookups (`alpha`
+  and `beta` 3) completed within 12 queries and at most 8 such answers in a row.
 - **Finding the closest nodes** (for publishing) runs until the lookup is complete. The result is the `K`
   closest nodes known; the stores sent to them also show which are reachable.
 - **Finding providers.** Downloading starts with the first provider found. The search ends when
@@ -869,9 +877,11 @@ the name through the network and asks keepers (below), since the key's earlier r
   in the table for over `provider_seniority` then, and hasn't failed a query since last heard nor been silent
   for 2 × `announce_interval`.
   - Find providers of the name's key (section 6). Providers recorded locally are candidates, never a reason
-    to skip the search, which runs until 3 × `alpha` are known and two established sources listed some, or
-    until the lookup is complete. A source is a node whose `/find` answer listed providers, or this node if
-    it holds a record stored by an established publisher.
+    to skip the search, which runs until 3 × `alpha` are known and two established sources listed some, until
+    some are known and `lookup_timeout` / 5 has passed, or until the lookup ends. A source is a node whose
+    `/find` answer listed providers, or this node if it holds a record stored by an established publisher.
+    Candidates are asked only once the search has stopped, never as they arrive, so reply order doesn't choose
+    them.
   - Rank the candidates by routing-table seniority, as providers are (section 6): established servers first,
     then other servers in the table, then servers that failed a query or went silent (an owner that has
     left), then IDs not in the table; at random within each group.
@@ -885,6 +895,13 @@ the name through the network and asks keepers (below), since the key's earlier r
     keepers have answered; when no sequence is known, only established keepers' answers count toward those
     two. At most 3 batches. A slow node (`alpha` 1) asks at most 2 batches, and asks the second for want of a
     second answer only when it knows no sequence to compare the first against.
+  - Each batch is waited for up to the lookup's time left or, if longer, a `/name` budget of its own:
+    `path_timeout` + 5 s + 5 hops × RNS's link establishment timeout per hop (6 s) + 2 × RNS's request timeout
+    without a measured round trip (11.25 s), 87.5 s at the defaults. A search that used all of
+    `lookup_timeout` still leaves keepers time to set up a link and answer.
+  - If the candidates run out before the answers settle the name, with batches left, and the search was
+    stopped early (not ended by the lookup) and some of its candidates asked, the search resumes within the
+    lookup's time left, stopping by the same rules for the candidates it newly finds, which are then asked.
 
   A keeper query (a DHT lookup plus a few requests) costs roughly ten to twenty times the airtime of a
   resolve a path response answers, so `always` SHOULD NOT be used on slow links.
