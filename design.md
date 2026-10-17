@@ -302,7 +302,10 @@ from a heap of (first seen, arrival) with stale entries dropped lazily. First-se
 (seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order; those of younger
 publishers whose last record the pool evicted (`_evicted`) for a TTL too, at most `pool_size` // 10 (at least
 10), forgetting the one first seen most recently when full (an O(n) scan, only on such evictions). Times later than now
-(a clock corrected backwards) are clamped to now at load and at each `expire()`.
+(a clock corrected backwards) are clamped to now at load and at each `expire()`. Records are added only through
+`_insert`, by `store` and by the load alike, so the indexes beside `_records` (each publisher's keys and count
+outside the pool, the counts, `_pooled`, `_holders`, `_newest`) are kept in step in one place;
+`_check_consistency()` recomputes them from `_records`, and test_providers runs it after every test.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).

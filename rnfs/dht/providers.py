@@ -298,15 +298,24 @@ class ProviderStore:
                 entry = self._publishers[publisher] = _Publisher(now if first_seen is None else first_seen,
                                                                  next(self._order))
                 self._touch_publisher(publisher)
-            entry.keys.add(key)
-            record = self._records.setdefault(key, {})[publisher] = _Record(now, now, pooled)
-            self._count += 1
-            if pooled:
-                self._pool_add(key, publisher)
-            else:
-                self._add_main(publisher, entry)
-            self._touch(key, publisher)
+            self._insert(key, publisher, _Record(now, now, pooled))
             return True
+
+    def _insert(self, key: bytes, publisher: bytes, record: _Record, loading: bool = False):
+        """Add a new record of publisher (which has an entry) for key, in the pool if record.pooled, keeping every
+        index in step: store() and _load() both add records through here, so the indexes can't drift apart after a
+        restart. loading: _load's, which rebuilds the newest-publisher heap once at the end and works out the rows
+        to save from what it read, so neither is kept up record by record. Caller holds the lock."""
+        entry = self._publishers[publisher]
+        entry.keys.add(key)
+        self._records.setdefault(key, {})[publisher] = record
+        self._count += 1
+        if record.pooled:
+            self._pool_add(key, publisher)
+        else:
+            self._add_main(publisher, entry, loading)
+        if not loading:
+            self._touch(key, publisher)
 
     def withdraw(self, key: bytes, publisher: bytes) -> bool:
         """Remove publisher's record for key. True if there was one."""
@@ -490,11 +499,12 @@ class ProviderStore:
             heapq.heappush(self._newest, item)
         return found
 
-    def _add_main(self, publisher: bytes, entry: _Publisher):
-        """Count a record of publisher outside the pool. Caller holds the lock."""
+    def _add_main(self, publisher: bytes, entry: _Publisher, loading: bool = False):
+        """Count a record of publisher outside the pool (loading: _load's, which rebuilds the heap of newest
+        publishers at the end rather than push to it here). Caller holds the lock."""
         self._main_count += 1
         entry.main += 1
-        if entry.main == 1:
+        if entry.main == 1 and not loading:
             heapq.heappush(self._newest, (-entry.first_seen, -entry.order, publisher))
             if len(self._newest) > 2 * len(self._publishers) + 64:
                 self._rebuild_newest()
@@ -749,6 +759,68 @@ class ProviderStore:
             entry = self._publishers.get(publisher)
             return None if entry is None else entry.first_seen
 
+    def _check_consistency(self):
+        """Recompute every index from _records and raise AssertionError where one differs (for tests: test_providers
+        runs it after each test). An index added to the store belongs here too."""
+        def check(condition: bool, what: str):
+            """Raise AssertionError(what) unless condition holds."""
+            if not condition:
+                raise AssertionError(f"ProviderStore inconsistent: {what}")
+
+        with self._lock:
+            keys: dict[bytes, set[bytes]] = {}
+            main: dict[bytes, int] = {}
+            pooled: dict[bytes, set[bytes]] = {}
+            for key, records in self._records.items():
+                check(bool(records), f"key {key.hex()} has an empty record dict")
+                for publisher, record in records.items():
+                    keys.setdefault(publisher, set()).add(key)
+                    if record.pooled:
+                        pooled.setdefault(publisher, set()).add(key)
+                    else:
+                        main[publisher] = main.get(publisher, 0) + 1
+            count = sum(len(held) for held in keys.values())
+            pool_count = sum(len(held) for held in pooled.values())
+            check(self._count == count, f"_count {self._count}, records {count}")
+            check(self._pool_count == pool_count, f"_pool_count {self._pool_count}, pooled records {pool_count}")
+            check(self._main_count == count - pool_count,
+                  f"_main_count {self._main_count}, records outside the pool {count - pool_count}")
+            check(set(self._publishers) == set(keys), "_publishers isn't the publishers with records")
+            for publisher, entry in self._publishers.items():
+                check(entry.keys == keys[publisher], f"{publisher.hex()}'s keys")
+                check(entry.main == main.get(publisher, 0), f"{publisher.hex()}'s main count")
+            check({publisher: set(held) for publisher, held in self._pooled.items()} == pooled,
+                  "_pooled isn't the pooled records")
+            # Holders by pooled count: each publisher listed once, under its count, at its index
+            listed = {}
+            for held, holders in self._holders.items():
+                check(bool(holders), f"empty holder list for {held}")
+                for index, publisher in enumerate(holders):
+                    check(publisher not in listed, f"{publisher.hex()} listed twice among holders")
+                    listed[publisher] = held
+                    check(self._holder_index.get(publisher) == index, f"{publisher.hex()}'s holder index")
+            check(listed == {publisher: len(held) for publisher, held in pooled.items()},
+                  "_holders isn't the pooled counts")
+            check(set(self._holder_index) == set(listed), "_holder_index lists publishers holding nothing pooled")
+            check(self._most_pooled == max(listed.values(), default=0),
+                  f"_most_pooled {self._most_pooled}, most held {max(listed.values(), default=0)}")
+            # The newest-publisher heap: a heap, holding a current entry for each publisher with records outside
+            # the pool (stale ones are allowed: they are dropped as they reach the top)
+            heap = self._newest
+            check(all(heap[(i - 1) // 2] <= heap[i] for i in range(1, len(heap))), "_newest isn't a heap")
+            current = {(-entry.first_seen, -entry.order, publisher) for publisher, entry in self._publishers.items()
+                       if entry.main > 0}
+            check(current <= set(heap), "_newest lacks a publisher with records outside the pool")
+            # First-seen memories: only of publishers without records, each in at most one, within their sizes
+            check(not set(self._departed) & set(self._publishers), "a departed publisher has records")
+            check(not set(self._evicted) & set(self._publishers), "an evicted publisher has records")
+            check(not set(self._departed) & set(self._evicted), "a publisher is both departed and evicted")
+            check(len(self._departed) <= self._departed_size, "_departed over its size")
+            check(len(self._evicted) <= self._evicted_size, "_evicted over its size")
+            if self._db is None:
+                check(not (self._dirty_records or self._dirty_publishers or self._dirty_gone),
+                      "changes tracked with no state database")
+
     # Persistence
 
     def save(self):
@@ -855,15 +927,7 @@ class ProviderStore:
                 continue
             if main_room or pool_room:
                 pooled = pool_room if pooled or not main_room else False
-            entry = self._publishers[publisher]
-            self._records.setdefault(key, {})[publisher] = _Record(first, last, pooled)
-            entry.keys.add(key)
-            self._count += 1
-            if pooled:
-                self._pool_add(key, publisher)
-            else:
-                self._main_count += 1
-                entry.main += 1
+            self._insert(key, publisher, _Record(first, last, pooled), loading=True)
         for publisher in [p for p, entry in self._publishers.items() if not entry.keys]:
             del self._publishers[publisher]
         self._rebuild_newest()
