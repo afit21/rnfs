@@ -7,6 +7,7 @@ from unittest import mock
 
 from RNS.vendor import umsgpack
 
+from rnfs.constants import MAX_BLOCK_SIZE
 from rnfs.content import archive, builder, dag, walker
 from rnfs.content.cid import EMPTY_DIRECTORY, RAW, Cid
 from rnfs.content.dag import DirectoryNode, Entry
@@ -202,6 +203,24 @@ class ArchiveTest(unittest.TestCase):
         data = self.export([self.other.cid] * archive.MAX_ROOTS)
         self.assertEqual(len(archive.import_archive(io.BytesIO(data), self.destination)["complete"]),
                          archive.MAX_ROOTS)
+
+    def test_archive_size_matches_export_at_msgpack_header_boundaries(self):
+        # archive_size computes the bin headers itself: 2 bytes up to 255 bytes, 3 up to 65535, 5 above (CT5)
+        roots = []
+        for length in (0, 1, 255, 256, 65535, 65536, MAX_BLOCK_SIZE):
+            block = bytes([length % 251]) * length
+            cid = Cid.for_block(RAW, block)
+            self.source.put(cid, block)
+            roots.append(cid)
+            with self.subTest(length=length):
+                self.assertEqual(archive.archive_size([cid], [(cid, length)]), len(self.export([cid])))
+        blocks = [(e.cid, len(block)) for e, block in walker.iter_dags([walker.root_expect(cid) for cid in roots],
+                                                                       self.source.getter())]
+        self.assertEqual(archive.archive_size(roots, blocks), len(self.export(roots)))
+        tree = [self.root.cid, self.other.cid]
+        blocks = [(e.cid, len(block)) for e, block in walker.iter_dags([walker.root_expect(cid) for cid in tree],
+                                                                       self.source.getter())]
+        self.assertEqual(archive.archive_size(tree, blocks), len(self.export(tree)))
 
     def test_empty_file_root(self):
         empty = builder.build_bytes(b"", self.source.put)
