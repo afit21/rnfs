@@ -272,8 +272,11 @@ publishers whose last record the pool evicted (`_evicted`) for a TTL too, at mos
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
-unreliable, may_retry)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) ->
-list[bytes]`. A run ranks the nodes `unreliable` named when it learnt of them (`doubtful`) after every other, for
+unreliable, may_retry, max_queries)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop)
+-> list[bytes]`. Besides completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries`
+(`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha,
+beta) answers in a row that leave the bit length of the beta-th closest known distance (`_reach`) unchanged ("no
+progress"). A run ranks the nodes `unreliable` named when it learnt of them (`doubtful`) after every other, for
 its queries, its termination and `find_closest`'s result; one that distance alone would rank within the query
 window is asked again when `may_retry` says so, as a query beyond `alpha` (`retrying`) that the run waits for
 only if the node comes to rank within the window by `rank` (it is then counted in flight). `is_known(id)`
@@ -1182,8 +1185,14 @@ Everything in the specification is implemented, with these simplifications and a
   an answer reaches the highest known sequence (`NameManager.record` or the kept record) from two keepers
   (two established ones when no sequence is known), at most `keeper_rounds()` batches (3; 2 on slow nodes,
   where one current answer is enough once a sequence is known). On a slow node that is still at most two
-  `/name`; a fast node with no known sequence and no established keepers asks all 3 batches (up to 9), and the
-  lookup runs to completion unless two established nodes list keepers.
+  `/name`; a fast node with no known sequence and no established keepers asks all 3 batches (up to 9). The
+  query's state is a `_KeeperQuery` (`search`, `next_batch`, `ask` on a thread per keeper, `settled`, `resume`).
+  Its search stops (`should_stop`) once enough candidates are found, or once some are and `lookup_timeout` /
+  `SEARCH_SHARE` (5) has passed; candidates aren't asked while it runs. Each batch is joined for
+  max(`Lookup.remaining()`, `name_wait(config)`), the latter 87.5 s at the defaults. When the candidates run out
+  unsettled with batches left, `resume` runs `find_providers` again, but only if the last search was stopped
+  early (`cut_short`) and some of its candidates were asked, so resumes stay within the batch bound and the
+  lookup's deadline.
 - **Names.** A key imported, or found without a `names_published` row, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins the new
   target, saves its row (the commit point; a failed commit rolls the record back and releases the new pin) and only

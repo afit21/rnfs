@@ -6,7 +6,7 @@ import unittest
 
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
-from rnfs.dht.lookup import Lookup
+from rnfs.dht.lookup import MAX_QUERIES, STALL_WINDOWS, Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import AVOID_AFTER, RoutingTable, distance
 from tests.support import FakeClock, wait_for
@@ -584,6 +584,95 @@ class FindProvidersTest(LookupTestCase):
         self.assertTrue(second)  # new providers from the random half
         self.assertFalse(set(first) & set(second))  # already reported ones aren't reported again
         self.assertIn(holder, self.net.queried[len(self.net.queried) - 20:])  # re-queried
+
+
+class BoundsTest(LookupTestCase):
+    """Nodes that keep answering with ever closer IDs (made up, or ground for the key) can't hold a run open: it
+    ends at the query cap, or after STALL_WINDOWS windows of answers in a row that bring the key no nearer."""
+
+    def grinding(self, next_distance) -> tuple[list[bytes], object]:
+        """A query function for key ident(0), and the nodes it was asked: every node answers with K fresh IDs at
+        distances next_distance(n) + 0..K-1, n counting the answers so far."""
+        asked: list[bytes] = []
+        lock = threading.Lock()
+
+        def query(node_id, key):
+            """A made-up answer, nearer the key as next_distance says."""
+            with lock:
+                asked.append(node_id)
+                distance_ = next_distance(len(asked))
+            return [], [ident(distance_ + i) for i in range(K)]
+        return asked, query
+
+    def run_grinding(self, next_distance, start: int = 1 << 120, **kwargs) -> tuple[list[bytes], str]:
+        """find_closest over grinding nodes from three start nodes at distance start; the nodes asked, and how the
+        run ended."""
+        asked, query = self.grinding(next_distance)
+        reports: list[str] = []
+        lookup = Lookup(ident(0), [ident(start + i) for i in range(3)], query, ident(1 << 127), timeout=30,
+                        poll_interval=0.05, report=reports.append, **kwargs)
+        lookup.find_closest()
+        ends = [text for text in reports if "s; asked" in text]
+        self.assertEqual(len(ends), 1, reports)
+        return asked, ends[0]
+
+    def test_ever_closer_answers_end_at_the_query_cap(self):
+        asked, end = self.run_grinding(lambda n: 1 << max(8, 119 - n))  # each answer a bit nearer
+        self.assertIn(": query cap after", end)
+        self.assertEqual(len(asked), MAX_QUERIES)
+        self.assertEqual(MAX_QUERIES, 8 * K)
+
+    def test_query_cap_is_a_parameter(self):
+        asked, end = self.run_grinding(lambda n: 1 << max(8, 119 - n), max_queries=10)
+        self.assertIn(": query cap after", end)
+        self.assertEqual(len(asked), 10)
+
+    def test_answers_that_bring_the_key_no_nearer_end_the_run(self):
+        """Each answer is nearer, but within the same power of two: the beta-th closest distance keeps its bit
+        length, so the run ends after 3 windows (9 answers), with at most alpha more queries out."""
+        start = (1 << 120) + (1 << 119)
+        asked, end = self.run_grinding(lambda n: start - 1000 * n, start=start)
+        self.assertIn(": no progress after", end)
+        self.assertGreaterEqual(len(asked), STALL_WINDOWS * 3)
+        self.assertLessEqual(len(asked), STALL_WINDOWS * 3 + 3)
+
+    def test_progress_resets_the_count(self):
+        """A bit nearer every 5th answer is progress enough: such a run goes on to the query cap."""
+        asked, end = self.run_grinding(lambda n: (1 << max(8, 119 - n // 5)) + (1 << max(7, 118 - n // 5)) - n)
+        self.assertIn(": query cap after", end)
+        self.assertEqual(len(asked), MAX_QUERIES)
+
+
+class HonestBoundsTest(LookupTestCase):
+    """The bounds never end an honest lookup: over a 2000-node network every run completes, as it did before them, so
+    its result is unchanged (only completion, a deadline, or running out of nodes ends a run the bounds don't)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """One 2000-node network for the class (it takes seconds to build)."""
+        cls.net = FakeNetwork(2000, seed=21)
+
+    def test_lookups_in_2000_nodes_complete(self):
+        rng = random.Random(22)
+        ids = list(self.net.nodes)
+        for alpha, beta in ((3, 3), (1, 3), (5, 3), (3, 1)):
+            for _ in range(25):
+                key = rng.randbytes(ID_LENGTH)
+                reports: list[str] = []
+                lock = threading.Lock()
+
+                def report(text, reports=reports, lock=lock):
+                    """Collect reports (query threads report too)."""
+                    with lock:
+                        reports.append(text)
+
+                result = Lookup(key, rng.sample(ids, 3), self.net.query, ident(0), alpha=alpha, beta=beta, timeout=30,
+                                poll_interval=0.05, report=report).find_closest()
+                with lock:
+                    ends = [text for text in reports if "s; asked" in text]
+                self.assertEqual(len(ends), 1)
+                self.assertIn(": complete after", ends[0], f"alpha {alpha}, beta {beta}")
+                self.assertEqual(result[:beta], self.net.true_closest(key, beta))
 
 
 if __name__ == "__main__":
