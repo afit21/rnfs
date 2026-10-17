@@ -877,20 +877,33 @@ class RequestServer:
         """True if the requester identified as a member (private mode)."""
         return remote_identity is not None and bool(self.backend.is_member(remote_identity.hash))
 
+    def _in_slot(self, link_id: bytes, answer: Callable[[], object]):
+        """answer() run in one of the link's MAX_REQUESTS_PER_LINK request slots, which is freed when it returns
+        or raises; False at once if the link has none free.
+
+        Every handler but /blocks (whose slot outlives the handler, until its Resource concludes) runs its
+        work here, after its own checks: a refusal from those comes first and takes no slot.
+        """
+        if not self.incoming.start_request(link_id, blocks=False):
+            return False
+        try:
+            return answer()
+        finally:
+            self.incoming.finish_request(link_id, blocks=False)
+
     def _handle_find(self, path, data, request_id, link_id, remote_identity):
         """Answer /find with providers of the key and the servers closest to it."""
         key = protocol.parse_find_request(data)
         if key is None or not self.backend.is_dht_server():
             return False
-        if not self.incoming.start_request(link_id, blocks=False):
-            return False
-        try:
+
+        def answer():
+            """Look the key up."""
             providers, nodes = self.backend.find(key)
             log(f"/find {key.hex()}: {plural(len(providers), 'provider')}, {plural(len(nodes), 'node')}",
                 LOG_VERBOSE)
             return protocol.encode_find_response(list(providers), list(nodes))
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        return self._in_slot(link_id, answer)
 
     def _handle_provide(self, path, data, request_id, link_id, remote_identity):
         """Record the identified requester as a provider of the keys, and withdraw the withdrawn ones."""
@@ -898,29 +911,28 @@ class RequestServer:
         if remote_identity is None or not self.backend.is_dht_server():
             return False
         parsed = protocol.parse_provide_request(data)
-        if parsed is None or not self.incoming.start_request(link_id, blocks=False):
+        if parsed is None:
             return False
-        try:
+
+        def answer():
+            """Record the keys and withdraw the withdrawn ones."""
             keys, withdrawn = parsed
             publisher = node_id_for_identity(remote_identity)
             recorded = self.backend.provide(publisher, keys, withdrawn) is True
             log(f"/provide from {node_name(publisher)}: {plural(len(keys), 'key')}, {len(withdrawn)} withdrawn, "
                 f"{'recorded' if recorded else 'refused'}", LOG_VERBOSE)
             return recorded
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        return self._in_slot(link_id, answer)
 
     def _feature_handler(self, handler):
         """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, and never answering None."""
         def handle(path, data, request_id, link_id, remote_identity):
             """Run the feature's handler(data, remote_identity) inside the per-link request limit."""
-            if not self.incoming.start_request(link_id, blocks=False):
-                return False
-            try:
+            def answer():
+                """The feature's response, False for None."""
                 response = handler(data, remote_identity)
                 return False if response is None else response
-            finally:
-                self.incoming.finish_request(link_id, blocks=False)
+            return self._in_slot(link_id, answer)
         return handle
 
     def _handle_pin(self, path, data, request_id, link_id, remote_identity):
@@ -928,13 +940,10 @@ class RequestServer:
         if remote_identity is None or remote_identity.hash.hex() not in self.pin_identities:
             return False
         parsed = protocol.parse_pin_request(data)
-        if parsed is None or not self.incoming.start_request(link_id, blocks=False):
+        if parsed is None:
             return False
-        try:
-            cid, pin = parsed
-            return self.backend.remote_pin(remote_identity.hash, cid, pin) is True
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        cid, pin = parsed
+        return self._in_slot(link_id, lambda: self.backend.remote_pin(remote_identity.hash, cid, pin) is True)
 
     def _handle_blocks(self, path, data, request_id, link_id, remote_identity):
         """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget."""

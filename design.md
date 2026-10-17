@@ -831,7 +831,11 @@ and in total, never persisted.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
-  nothing for; `_over_rate` counts them and logs at most once a minute.
+  nothing for; `_over_rate` counts them and logs at most once a minute. Every handler but `/blocks` runs its
+  work through `RequestServer._in_slot(link_id, answer)` after its own checks (so a refusal by those takes no
+  slot): it takes one of the link's `MAX_REQUESTS_PER_LINK` slots (`IncomingLinks.start_request`), answers
+  `False` if none is free, and frees it when `answer()` returns or raises. A `/blocks` slot outlives its handler
+  (until the response's Resource concludes), so `_handle_blocks` keeps its own.
 - `RequestServer.airtime` checks interface rules, quiet hours and an empty budget before taking any slot,
   caps the block budget, and charges the bucket as responses are sent. Each `Response` records its `cost`
   (packed size), what has been `charged` so far and its requester (identity hash, else link ID). `_admit`
