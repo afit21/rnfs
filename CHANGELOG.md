@@ -180,6 +180,9 @@ Changed:
   as it means a bug rather than a bad request). A shared-folder entry that fails with an unexpected `ValueError`
   is logged and tried again after 10 minutes rather than skipped until the file changes. `dir rm` refuses a
   target without a path in the node itself, before fetching anything.
+- `rnfs jobs` (`--background`, `cancel`, `clear` and the progress line), `rnfs peers` and `rnfs stats` escape every
+  field the daemon sends, as the other feature commands already did. Internally, features declare the features
+  they use, and the node checks those and every feature's API routes and request paths when it loads them.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
