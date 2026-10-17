@@ -975,9 +975,12 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | `rnfs-deny` | deny | every deny-list source's check and fetch, one at a time, once joined |
 | `rnfs-events`, `rnfs-job-watch` | rnfs.Node | callbacks into the program, one at a time; polling watched jobs (both started on first use) |
 | `rnfs-client-events`, `rnfs-client-job-watch`, `rnfs-client-name-watch` | rnfs.Client (in the program) | callbacks; polling watched jobs; the `GET /api/name/watch` long poll |
-| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second; auto-fetch, one at a time, senders in turn (LXMF runs its own job thread) |
+| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second while a message is followed or held or a download runs (otherwise it sleeps until the next announce or download; `LxmfNetwork.send`, `_hold` and `sync` wake it); auto-fetch, one at a time, senders in turn (LXMF runs its own job thread) |
 
-The API and gateway run one thread per connection, capped (32 and 64).
+The API and gateway run one thread per connection, capped (32 and 64). The daemon's main thread waits for
+SIGINT, SIGTERM or SIGBREAK (`cli.wait_until_stopping`): on POSIX a signal interrupts the wait, so it has no
+timeout and wakes only for the debug log's status line; on Windows a wait isn't interrupted for signal handlers,
+so it wakes each second.
 
 Locks are taken in this order, never the reverse: `names._lock` → `publisher._lock` → `node._lock` → `storage._lock`
 → the state database's lock (`statedb`, innermost: a store opens a transaction only once it holds every lock the

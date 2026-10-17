@@ -18,6 +18,7 @@ import json
 import os
 import stat
 import sys
+import time
 
 from rnfs import __version__, apiclient, fsutil
 from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
@@ -168,13 +169,30 @@ def print_warnings(result: dict):
 # Daemon
 
 
+def wait_until_stopping(stopping, interval: float = 0.0, task=None):
+    """Return once stopping is set (by a signal handler), calling task every interval seconds meanwhile, if given.
+
+    Python runs signal handlers in the main thread. On POSIX a signal interrupts the wait, so this sleeps until the
+    task is due, or without one until stopped: an idle daemon's main thread doesn't wake. On Windows a wait isn't
+    interrupted for them, so it wakes each second there."""
+    due = time.monotonic() + interval if task is not None else None
+    while True:
+        timeout = None if due is None else max(0.0, due - time.monotonic())
+        if fsutil.IS_WINDOWS:
+            timeout = 1.0 if timeout is None else min(timeout, 1.0)
+        if stopping.wait(timeout):
+            return
+        if due is not None and time.monotonic() >= due:
+            due = time.monotonic() + interval
+            task()
+
+
 def run_daemon(args):
     """Run a node with its API and gateway until SIGINT, SIGTERM or SIGBREAK, then shut everything down cleanly."""
     # Imported here so client commands don't pay for loading RNS
     import faulthandler
     import signal
     import threading
-    import time
     import traceback
 
     import RNS
@@ -279,15 +297,15 @@ def run_daemon(args):
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), lambda *_: stopping.set())
-    # Python runs handlers in the main thread, and on Windows a wait isn't interrupted for them: wake each second
-    status_due = time.monotonic() + debuglog.STATUS_INTERVAL
-    while not stopping.wait(1):
-        if debug is not None and time.monotonic() >= status_due:
-            status_due = time.monotonic() + debuglog.STATUS_INTERVAL
-            try:
-                debug.note(debuglog.status_line(node), LOG_NOTICE)
-            except Exception as e:  # noqa: BLE001 - a status line mustn't stop the daemon
-                debug.note(f"status line failed: {e!r}", LOG_ERROR)
+
+    def status():
+        """Write the debug log's periodic status line."""
+        try:
+            debug.note(debuglog.status_line(node), LOG_NOTICE)
+        except Exception as e:  # noqa: BLE001 - a status line mustn't stop the daemon
+            debug.note(f"status line failed: {e!r}", LOG_ERROR)
+
+    wait_until_stopping(stopping, debuglog.STATUS_INTERVAL, status if debug is not None else None)
 
     for server in servers:
         server.stop()
