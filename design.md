@@ -96,8 +96,8 @@ rnfs/
   content/            no networking; uses RNS's bundled msgpack and RNS logging, so importing it loads RNS
     cid.py            CIDs (section 4)
     dag.py            DAG node encoding, strict decoding, names (section 5)
-    chunker.py        fixed and FastCDC chunkers; chunker.using(name) picks one per context (section 5)
-    builder.py        building trees: files, directories, wrap, only-hash (section 5)
+    chunker.py        fixed and FastCDC chunkers (section 5)
+    builder.py        building trees: files, directories, wrap, only-hash; BuildOptions (section 5)
     seal.py           sealed files: SealingReader, open_sealed/SealedFile, recipients (section 5, Sealed files)
     walker.py         Expect, reader checks, path lookup, byte ranges, listing, writing out (sections 5, 7)
     edit.py           dir set / dir rm (section 11)
@@ -162,7 +162,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `dag.py`
 - `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`.
 - Frozen dataclasses `Child(cid, size)`, `Entry(name, cid, size, kind)`, `IndexChild(first_name, cid, size)`;
-  nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`.
+  nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`, each with `child_cids` (the CIDs it
+  lists, in order) and `names` (its entries' names or children's first names; none for a file node).
 - `encode(node) -> bytes`; `decode(block) -> node`, strict (types, shortest headers, re-encodes identically),
   raising `InvalidDag`. Nodes are immutable and decoding is a pure function of the bytes, so `decode` remembers
   the nodes of the blocks it decoded last (`MEMO_BLOCKS` 256, `MEMO_BYTES` 2 MiB of blocks, least recently used
@@ -178,7 +179,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - `expand(expect, block) -> list[Expect]` — check a verified block against its expectation (type, size, names,
   index bounds, depth) and return its children's expectations. Raises `InvalidDag`. Raw blocks have none.
 - `step(expect, block, name) -> Expect | None` — one path step in a directory or index node (for an index, the
-  child that would hold `name`; keep stepping until a directory entry is reached).
+  child that would hold `name`; keep stepping until a directory entry is reached). `index_child(node, name)` is
+  that index rule (the child with the greatest first name <= `name`), shared with `Storage`'s path walk.
 - `range_children(expect, block, offset, length) -> list[tuple[Expect, int, int]]` — children of a file node
   overlapping a byte range, with the range relative to each child.
 - `parse_target(text) -> tuple[Cid, list[str]]` for `<cid>[/name…]` (ValueError if malformed).
@@ -188,7 +190,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   depth-first), `read_range(expect, get, offset, length) -> Iterator[bytes]`, `leaf_bytes(expect, get, stop_at)`
   (the bytes of a file's distinct chunks, from its file nodes only: the deny list's hash bound),
   `list_directory(expect, get, max_entries=None) -> Iterator[Entry]` (`TooLarge` past
-  `max_entries`), `write_out(expect, get, dest, max_entries, check=None, created=None) -> warnings`
+  `max_entries`), `height(expect, get)` (DAG nodes on the longest path, checking every node; `dir set` and
+  `dir rm` check the edited tree's depth with it, and it remembers each subtree it measured by its expectation,
+  `HEIGHT_MEMO` 32768 least recently used, so an edit reads only the directories it rebuilt), `write_out(expect, get, dest, max_entries, check=None, created=None) -> warnings`
   (`created` gets a directory output's `(st_dev, st_ino)`, for `check_unchanged(dest, identity)` before it is
   renamed; a directory replaced while written raises `ValueError("output was changed while being written")`).
 
@@ -220,7 +224,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - `evict() -> set[Cid]` enforce `max_storage` (LRU cached fetches); `gc() -> stats` evicts every cached fetch;
   both delete unreachable blocks and report targets no longer complete, so the node can withdraw them. Both
   first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
-  memos; completeness via `dag_blocks`), then decide and delete under the lock from the pins, sessions and
+  memos, its path walk the one `_path_cids` makes under the lock, `_walk_path`; completeness via `dag_blocks`),
+  then decide and delete under the lock from the pins, sessions and
   records current then, so `get` (and `/blocks` serving) waits only for that in-memory walk and the deletions,
   and a block that became reachable meanwhile is kept. The size queries (`pinned_bytes`, `dag_bytes`,
   `source_usage`, `stat`) read their DAG nodes the same way first. `_links` memoises only stored DAG nodes: a
@@ -235,6 +240,13 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.
 - `dag_blocks(cid) -> frozenset[Cid]` the blocks of a complete DAG (memoised), used for "what a node serves".
+  For an incomplete DAG it remembers the block it found missing (`_missing`, `MISSING_MEMO` 10 000, oldest
+  forgotten first): a CID's content never changes, so the DAG stays incomplete while that block isn't stored,
+  and `is_complete` is a lookup until it arrives. The walks under the lock take a DAG memoised as complete
+  whole (`_reach`: the memo's set, less what is already kept) rather than walking it, except one holding a path
+  node eviction kept without its other children, which is walked as before; `dag_bytes` of a complete DAG is
+  summed once (`_complete_bytes`). `_delete` forgets the complete memos a deleted block breaks, which is how
+  every deletion (eviction, gc, verify, `drop_denied`) keeps them exact.
 
 `denylist.py` — `parse_entry(text) -> (canonical, binary CID | None, digest | None)`, `parse_list(bytes) -> (binary
 CIDs, digests)` (ValueError naming the line; `MAX_LIST_BYTES` 4 MiB, `MAX_LIST_ENTRIES` 100 000).
@@ -247,8 +259,8 @@ CID's content SHA-256, `MAX_KNOWN_HASHES` LRU, kept across restarts in `deny_has
 `_save_state`, writes the rows changed since the last one outside the lock, behind a save lock); `add_listener(fn)`,
 called after each change outside its lock; `DENY_HASH_RATIO` and `DENY_HASH_SLACK` bound what `_check_file` hashes.
 `walker.write_out(..., check)` and `walker.iter_files` and
-`builder.checking(check)` (a ContextVar: `build_file` hashes each file and passes the digest before the file's root
-node is stored) are its hooks in the content layer; `archive.import_archive(..., check)` runs on the complete roots
+`builder.BuildOptions(chunker, check)` (`build_file` hashes each file and passes the digest to check before the
+file's root node is stored) are its hooks in the content layer; `archive.import_archive(..., check)` runs on the complete roots
 before they are pinned.
 
 ## DHT layer interfaces
@@ -770,9 +782,12 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 
 ## Content additions
 
-- `content/chunker.py` — `chunks(stream, size)` yields chunks from the chunker chosen with the context
-  manager `chunker.using(name)` (a ContextVar, so the shared-folder scan on its own thread keeps fixed
-  chunks); `builder.build_file` takes its chunks from it. FastCDC computes gear hashes for 8 KiB at a time on
+- `content/chunker.py` — `fixed_chunks` and `fastcdc_stream` cut a stream into chunks. Which one a build uses
+  is `builder.BuildOptions.chunker`, frozen with the deny check (`check`) and passed explicitly down through
+  `add_path`, `add_stream`, `build_open`, `build_file` and `SharedFolder.scan`: a ContextVar isn't copied to a
+  worker thread, so a build moved onto one would silently get other CIDs and skip the check. `chunker.using(name)`
+  and `builder.checking(check)` remain as wrappers setting them for the current context, which a build given no
+  options takes (`builder.current_options()`). FastCDC computes gear hashes for 8 KiB at a time on
   a big integer of 9-byte lanes (≈ 39 MB/s in CPython 3.12, against ≈ 15 MB/s for the byte-by-byte reference
   `cut_point_simple` it is tested against, and ≈ 2 GB/s for fixed chunking).
 - `content/seal.py` — the sealed-file format: `SealingReader` (file-like, one segment in memory),
@@ -1056,7 +1071,11 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at
   most 4 × `name_table_size`, or 8 × for names resolved within 7 days; NORMAL, saved by a resolve or record
   raising it, at most every 5 s, and by the re-announce loop when changed);
-- `shared_folder` (FULL); `jobs` (record per job in creation order; FULL, including progress saves; results keep
+- `shared_folder` (FULL) and `shared_folder_files` (the shared folder's per-file cache, `FolderFiles`: one row per
+  file per top-level entry, the `dump()`ed entry name and `[device, inode, size, mtime_ns, execute bit]` as text,
+  the CID, its height and the content SHA-256 if one was computed; a `RowStore` in SNAPSHOT mode, NORMAL with the
+  periodic saves and at stop, changed rows only: a power loss costs at most reading some files again);
+- `jobs` (record per job in creation order; FULL, including progress saves; results keep
   at most 100 warnings plus `warnings_total`, older results capped at load); `keepers` (records re-verified at
   load; NORMAL); `follow` (FULL); `contacts` (FULL); `lxmf_messages` (inbox: 500 messages, 4 MiB, 50 per
   non-auto-fetch sender, 16 KiB per record; outbox 200, unfinished messages marked failed at a restart; NORMAL,
@@ -1244,6 +1263,18 @@ Everything in the specification is implemented, with these simplifications and a
   isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a pin the
   state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, and an unchanged
   entry whose pin fails is logged without ending the scan.
+- Inside an entry whose signature changed, the scan reads only the files that changed (audit D1):
+  `SharedFolder.files` (a `FolderFiles`) maps each file's `builder.file_state` (device, inode, size, `mtime_ns`,
+  execute bit; the open file's `fstat`, taken before it is read) to the `Built` it gave, grouped by top-level
+  entry so an entry imported again keeps only what it holds now and one gone takes its files along; a file moved
+  to another entry is found too. `build_open(..., cache=)` asks it (`builder.FileCache`) before reading each
+  regular file: a known file stands in only while `is_complete` holds for its CID (protected in the import's
+  session first) and no block of it is denied (`denied_roots`; else it is read again and its put refuses the
+  import, as before), and its remembered content hash still goes to `BuildOptions.check`; one remembered without
+  a hash (built while the deny list had none) is read again when there is a check. A file whose state changed
+  while it was read isn't remembered. Only fixed-chunker builds use it. It sits behind CONT-3's target check: a
+  refused folder is scanned as empty, which empties it. It is a store of its own (`shared_folder_files`, saved
+  with the node's batched stores, `RnfsNode._add_store`), so a restart doesn't read the folder's files again.
 - The shared-folder scan and `add` walk directories by file descriptor (`O_NOFOLLOW`, `O_NONBLOCK`, type and
   inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. The scan (not `add`)
   skips regular files whose opened descriptor has `st_nlink > 1` (`builder.hard_links`, `build_open`'s

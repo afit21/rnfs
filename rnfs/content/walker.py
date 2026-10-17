@@ -11,9 +11,12 @@ Repeated CIDs: every occurrence is checked against its own expectation, but iden
 (the same CID listed the same way at the same depth) are checked once, which is what keeps DAGs that
 repeat subtrees cheap to walk.
 """
+import bisect
 import errno
 import os
 import stat
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import BinaryIO, Callable, Iterator
 
@@ -31,6 +34,9 @@ RAW_TYPE, FILE_TYPE, DIRECTORY_TYPE, INDEX_TYPE = "raw", "file", "directory", "i
 ANY_TYPES = frozenset({RAW_TYPE, FILE_TYPE, DIRECTORY_TYPE, INDEX_TYPE})
 FILE_TYPES = frozenset({RAW_TYPE, FILE_TYPE})  # an entry of kind 0 or 1, or a file node's child
 DIRECTORY_TYPES = frozenset({DIRECTORY_TYPE, INDEX_TYPE})  # an entry of kind 2, or an index's child
+# height()'s memo of checked subtrees' heights, kept across calls (least recently used forgotten first): every
+# entry of a directory of tens of thousands, in about 11 MB when full
+HEIGHT_MEMO = 32768
 
 
 @dataclass(frozen=True)
@@ -94,12 +100,7 @@ def check_node(expect: Expect, node: dag.Node):
         raise InvalidDag(f"{expect.cid} is deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     if expect.size is not None and node.size != expect.size:
         raise InvalidDag(f"{expect.cid} holds {node.size} bytes, but its parent says {expect.size}")
-    if isinstance(node, DirectoryNode):
-        names = [entry.name for entry in node.entries]
-    elif isinstance(node, IndexNode):
-        names = [child.first_name for child in node.children]
-    else:
-        names = None
+    names = node.names
     if expect.first_name is not None:
         if not names or names[0] != expect.first_name:
             raise InvalidDag(f"{expect.cid}: first name below an index child isn't its first_name")
@@ -144,6 +145,14 @@ def is_index_step(expect: Expect) -> bool:
     return expect.first_name is not None
 
 
+def index_child(node: IndexNode, name: str) -> int | None:
+    """The position of the child of an index node that would hold name, if any is: the one with the greatest
+    first_name <= name (first names are strictly increasing in a decoded node); None if name sorts before them
+    all. The one rule for stepping through an index, here and in Storage."""
+    position = bisect.bisect_right(node.names, name) - 1
+    return None if position < 0 else position
+
+
 def step(expect: Expect, block: bytes, name: str) -> Expect | None:
     """One path step: the entry called name in a directory node, or for an index the child that would hold it.
 
@@ -159,14 +168,8 @@ def step(expect: Expect, block: bytes, name: str) -> Expect | None:
             if entry.name == name:
                 return child
         return None
-    # The name is in the child with the greatest first_name <= name, if anywhere
-    found = None
-    for index_child, child in zip(node.children, child_expects):
-        if index_child.first_name <= name:
-            found = child
-        else:
-            break
-    return found
+    position = index_child(node, name)
+    return None if position is None else child_expects[position]
 
 
 def range_children(expect: Expect, block: bytes, offset: int, length: int) -> list[tuple[Expect, int, int]]:
@@ -441,11 +444,46 @@ def _count(expect: Expect, get: Get, memo: dict[Expect, int], limit: int) -> int
     return total
 
 
+class _Heights:
+    """height()'s memo across calls: the height of a subtree that passed every check, by the expectation it was
+    checked under (depth set to 1), so `dir set` and `dir rm` don't walk a whole tree again for each edit.
+
+    Exact forever: a CID's content never changes, and the checks a subtree passes and its height depend only on
+    its blocks and that expectation. Least recently used forgotten first, past HEIGHT_MEMO entries.
+    """
+
+    def __init__(self):
+        """Empty."""
+        self._lock = threading.Lock()
+        self._heights: OrderedDict[Expect, int] = OrderedDict()
+
+    def get(self, expect: Expect) -> int | None:
+        """The height remembered for expect, if any."""
+        with self._lock:
+            known = self._heights.get(expect)
+            if known is not None:
+                self._heights.move_to_end(expect)
+            return known
+
+    def update(self, heights: dict[Expect, int]):
+        """Remember heights, forgetting the least recently used past HEIGHT_MEMO."""
+        with self._lock:
+            for expect, known in heights.items():
+                self._heights[expect] = known
+                self._heights.move_to_end(expect)
+            while len(self._heights) > HEIGHT_MEMO:
+                self._heights.popitem(last=False)
+
+
+_heights = _Heights()
+
+
 def height(expect: Expect, get: Get) -> int:
     """DAG nodes on the longest path from expect down (0 for a raw block), checking every DAG node met.
 
     Depth isn't checked against MAX_DEPTH, since measuring it is the point; the walk stops once the
-    height is known to exceed MAX_DEPTH, returning MAX_DEPTH + 1.
+    height is known to exceed MAX_DEPTH, returning MAX_DEPTH + 1. A subtree measured (and checked) before under
+    the same expectation isn't walked again (_Heights), so a tree edited in one place costs only the new nodes.
     """
     limit = constants.MAX_DEPTH
     memo: dict[Expect, int] = {}
@@ -462,12 +500,19 @@ def height(expect: Expect, get: Get) -> int:
             return 1
         current = replace(current, depth=1)  # every node is checked as if at the top, so depth can't trip
         if current not in memo:
-            child_expects = expand(current, get(current))
-            memo[current] = 1 + max((visit(child, level + 1) for child in child_expects), default=0)
+            known = _heights.get(current)
+            if known is None:
+                child_expects = expand(current, get(current))
+                known = 1 + max((visit(child, level + 1) for child in child_expects), default=0)
+            memo[current] = known
         return memo[current]
 
     result = visit(expect, 1)
-    return limit + 1 if truncated else result
+    if truncated:
+        return limit + 1  # nothing kept: heights found below a cut-off walk may be short
+    _heights.update(memo)  # every one exact, the walk having reached the bottom of each
+    # A remembered subtree can make the tree too deep without the walk going below limit
+    return min(result, limit + 1)
 
 
 # Writing out. A directory output must stay where it was made while it is written: anyone who could rename inside

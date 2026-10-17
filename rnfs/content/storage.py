@@ -20,7 +20,7 @@ are synced), and cache records (which change on every fetch) by save(), which th
 at shutdown, writing only the records changed since the last save. Thread-safe: one lock guards the
 indexes; long walks run outside it: completeness walks are discarded if blocks were deleted meanwhile, and
 eviction, gc and the size queries read the DAG nodes they will walk beforehand (_warm), deciding what to delete
-(or counting) under the lock.
+(or counting) under the lock, where a DAG memoised as complete is taken whole rather than walked again.
 """
 import itertools
 import os
@@ -46,6 +46,7 @@ DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
 LXMF_PREFIX = "lxmf:"
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
+MISSING_MEMO = 10_000  # incomplete DAGs whose missing block dag_blocks remembers; past this the oldest is forgotten
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
 DISK_RESERVE_MIN = 256 * MIB  # free disk space fetches always leave on the blocks' filesystem...
 DISK_RESERVE_FRACTION = 0.02  # ...or this fraction of the filesystem, if larger
@@ -56,6 +57,7 @@ WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB 
 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
+_NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 
 _IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
 
@@ -116,25 +118,67 @@ def import_pins(value: dict, tx) -> int:
     return count
 
 
+CacheKey = tuple[Cid, tuple[str, ...]]  # a cached fetch's root and path names
+
+
+def _cache_names(names) -> tuple[str, ...]:
+    """A cache record's path names, checked: a list of valid names. Raises TypeError or ValueError."""
+    if not isinstance(names, list):
+        raise TypeError("names aren't a list")
+    for name in names:
+        dag.check_name(name)
+    return tuple(names)
+
+
+def _cache_row(key: CacheKey) -> tuple[bytes, str]:
+    """The cache table's key columns (root, path) for a record's key."""
+    root, names = key
+    return root.binary, statedb.dump(list(names))
+
+
+def _parse_cache_row(root: bytes, path: str) -> CacheKey:
+    """A record's key from the cache table's key columns, checked. Raises TypeError or ValueError."""
+    return Cid.from_bytes(root), _cache_names(statedb.load(path))
+
+
 def import_cache(value: dict, tx) -> int:
     """Import cache.json (statedb.migrate): its records, least recently used first, replace the cache table, each
     checked as rnfs 0.1.4 loaded it. Returns the number of records imported."""
     tx.execute("DELETE FROM cache")
-    records: OrderedDict[tuple[Cid, tuple[str, ...]], Cid] = OrderedDict()
+    records: OrderedDict[CacheKey, Cid] = OrderedDict()
     for record in value.get("fetches", []):
         try:
             root, names, target = record
-            if not isinstance(names, list):
-                raise TypeError("names aren't a list")
-            for name in names:
-                dag.check_name(name)
-            records[(Cid.parse(root), tuple(names))] = Cid.parse(target)  # a repeated key keeps its first place
+            names = _cache_names(names)
+            records[(Cid.parse(root), names)] = Cid.parse(target)  # a repeated key keeps its first place
         except (ValueError, TypeError):
             log(f"storage: ignoring invalid cache record {record!r}", LOG_ERROR)
     tx.executemany("INSERT INTO cache (root, path, target, used) VALUES (?, ?, ?, ?)",
-                   [(root.binary, statedb.dump(list(names)), target.binary, used)
-                    for used, ((root, names), target) in enumerate(records.items())])
+                   [(*_cache_row(key), target.binary, used) for used, (key, target) in enumerate(records.items())])
     return len(records)
+
+
+def _walk_path(root: Cid, names: tuple[str, ...], step: Callable[[Cid, str], tuple[Cid, bool] | None]) \
+        -> Iterator[Cid]:
+    """The DAG nodes a walk along <root>/<names> passes through (not the target it reaches), in order: the walk
+    that keeps a cached fetch's path, written once for Storage._path_cids (under the lock) and Storage._warm
+    (without it), so warming covers exactly what the locked walk reads.
+
+    step(cid, name) is where name leads from the node cid (Storage._step_in's answer), or None if the walk ends
+    there: no such name, not a directory, or cid can't be read. The walk also ends at a raw block, unyielded.
+    """
+    current = root
+    for name in names:
+        while True:
+            if current.is_raw:
+                return
+            yield current
+            answer = step(current, name)
+            if answer is None:
+                return
+            current, through_directory = answer
+            if through_directory:
+                break  # the next name
 
 
 class Session:
@@ -232,17 +276,21 @@ class Storage:
         self._sizes: dict[Cid, int] = dict(self.blocks.scan())
         self._used = sum(self._sizes.values())
         self._pins: dict[Cid, set[str]] = {}
-        self._cache: OrderedDict[tuple[Cid, tuple[str, ...]], Cid] = OrderedDict()  # oldest first
+        self._cache: OrderedDict[CacheKey, Cid] = OrderedDict()  # oldest first
         self._sessions: list[Session] = []
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
         # Where a path step leads from a stored DAG node: node -> {name: _step_in's answer}; memoised like _links
         self._steps: dict[Cid, dict[str, tuple[Cid, bool] | None]] = {}
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
+        self._complete_bytes: dict[Cid, int] = {}  # dag_bytes memo: the bytes of _complete's DAGs, as asked for
+        # dag_blocks memo for incomplete DAGs: root -> a block of its DAG found missing. A CID's content never
+        # changes, so the DAG is incomplete for as long as that block isn't stored (checked at each lookup)
+        self._missing: dict[Cid, Cid] = {}
         self._generation = 0  # incremented whenever blocks are deleted, invalidating walks in progress
         self._cache_generation = 0  # incremented whenever cache records are removed or retargeted
         self._changes = 0  # incremented with each block stored, pin, release and new cache record (changes())
         # Cache records changed (or removed) since the last save(); every one is among the most recently used
-        self._cache_dirty: set[tuple[Cid, tuple[str, ...]]] = set()
+        self._cache_dirty: set[CacheKey] = set()
         self._cache_used = 0  # the cache table's next used value: larger than every one saved
         # False only when nothing has happened since the last collection that could leave a block unreached,
         # so eviction over max_storage with nothing to evict needn't walk everything again
@@ -273,21 +321,14 @@ class Storage:
         bad_cache = []
         for root, path, target, used in self._db.query("SELECT root, path, target, used FROM cache ORDER BY used"):
             try:
-                names = statedb.load(path)
-                if not isinstance(names, list):
-                    raise TypeError("names aren't a list")
-                for name in names:
-                    dag.check_name(name)
-                key = (Cid.from_bytes(root), tuple(names))
-                self._cache[key] = Cid.from_bytes(target)
+                self._cache[_parse_cache_row(root, path)] = Cid.from_bytes(target)
             except (ValueError, TypeError):
                 log(f"storage: ignoring invalid cache record {root!r} {path!r}", LOG_ERROR)
                 bad_cache.append((root, path))
                 continue
             if isinstance(used, int):
                 self._cache_used = max(self._cache_used, used + 1)
-        capped = [(root.binary, statedb.dump(list(names))) for root, names in
-                  list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
+        capped = [_cache_row(key) for key in list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
         self._cap_cache()
         self._cache_dirty.clear()
         if bad_pins or bad_cache or capped:
@@ -314,11 +355,10 @@ class Storage:
                 # record to the end), so those still cached are the last ones, in order
                 kept = sum(1 for key in dirty if key in self._cache)
                 changed = list(itertools.islice(reversed(self._cache.items()), kept))[::-1]
-                rows = [(root.binary, statedb.dump(list(names)), target.binary, self._cache_used + n)
-                        for n, ((root, names), target) in enumerate(changed)]
+                rows = [(*_cache_row(key), target.binary, self._cache_used + n)
+                        for n, (key, target) in enumerate(changed)]
                 self._cache_used += len(rows)
-                gone = [(root.binary, statedb.dump(list(names))) for root, names in dirty if
-                        (root, names) not in self._cache]
+                gone = [_cache_row(key) for key in dirty if key not in self._cache]
             try:
                 self.blocks.sync()
                 with self._db.transaction() as tx:
@@ -492,31 +532,41 @@ class Storage:
 
         Returns the targets of records dropped to stay within MAX_CACHE_RECORDS, no longer cached.
         """
-        key = (root, tuple(names))
         with self._lock:
-            previous = self._cache.get(key)
-            if previous is None:
-                self._changes += 1
-            elif previous != target:
-                self._maybe_garbage = True
-                self._cache_generation += 1
-            self._cache[key] = target
-            self._cache.move_to_end(key)
-            self._cache_dirty.add(key)
+            self._set_record((root, tuple(names)), target)
             dropped = self._cap_cache()
             return dropped - set(self._cache.values())
 
-    def _cap_cache(self) -> set[Cid]:
-        """Drop the least recently used records past MAX_CACHE_RECORDS; their targets (lock held)."""
-        dropped = set()
-        while len(self._cache) > MAX_CACHE_RECORDS:
-            key, target = self._cache.popitem(last=False)
-            dropped.add(target)
-            self._cache_dirty.add(key)
-        if dropped:
+    def _set_record(self, key: CacheKey, target: Cid):
+        """Record key -> target as the most recently used, with the bookkeeping a new or retargeted record needs:
+        a retargeted one may leave its old target's blocks unreached (lock held)."""
+        previous = self._cache.get(key)
+        if previous is None:
+            self._changes += 1
+        elif previous != target:
             self._maybe_garbage = True
             self._cache_generation += 1
-        return dropped
+        self._cache[key] = target
+        self._cache.move_to_end(key)
+        self._cache_dirty.add(key)
+
+    def _drop_records(self, keys) -> list[Cid]:
+        """Remove the records of keys, with the bookkeeping every removal needs: the save deletes their rows
+        (_cache_dirty), _prune_fetched runs (_cache_generation), and the next collection looks for what they
+        left unreached (_maybe_garbage); their targets, in order, a target once per record (lock held)."""
+        targets = []
+        for key in keys:
+            targets.append(self._cache.pop(key))
+            self._cache_dirty.add(key)
+        if targets:
+            self._maybe_garbage = True
+            self._cache_generation += 1
+        return targets
+
+    def _cap_cache(self) -> set[Cid]:
+        """Drop the least recently used records past MAX_CACHE_RECORDS; their targets (lock held)."""
+        excess = max(0, len(self._cache) - MAX_CACHE_RECORDS)
+        return set(self._drop_records(list(itertools.islice(self._cache, excess))))
 
     def touch(self, root: Cid, names: list[str] | tuple[str, ...]) -> bool:
         """Mark a cached fetch as used now; False if there is no such record."""
@@ -599,22 +649,19 @@ class Storage:
     @staticmethod
     def _listed(node) -> tuple[Cid, ...]:
         """The CIDs a decoded DAG node lists; none for None (raw, missing or invalid)."""
-        if node is None:
-            return ()
-        if isinstance(node, DirectoryNode):
-            return tuple(entry.cid for entry in node.entries)
-        return tuple(child.cid for child in node.children)
+        return () if node is None else node.child_cids
 
     @staticmethod
     def _step_in(node, name: str) -> tuple[Cid, bool] | None:
         """Where the path step name leads from a decoded node: (entry, True) through a directory, (child, False)
-        to the index node child that may hold it, or None (no such entry, or not a directory)."""
+        to the index node child that may hold it (walker.index_child), or None (no such entry, or not a
+        directory)."""
         if isinstance(node, DirectoryNode):
             entry = next((e for e in node.entries if e.name == name), None)
             return None if entry is None else (entry.cid, True)
         if isinstance(node, IndexNode):
-            candidates = [c for c in node.children if c.first_name <= name]
-            return (candidates[-1].cid, False) if candidates else None
+            position = walker.index_child(node, name)
+            return None if position is None else (node.children[position].cid, False)
         return None
 
     def _children(self, cid: Cid) -> tuple[Cid, ...] | None:
@@ -631,14 +678,24 @@ class Storage:
         return listed
 
     def _reach(self, roots, known: set[Cid] | frozenset[Cid] = frozenset(),
-               damaged: set[Cid] | None = None) -> set[Cid]:
+               damaged: set[Cid] | None = None, partial: set[Cid] | frozenset[Cid] = frozenset()) -> set[Cid]:
         """Stored blocks reachable from roots through stored DAG nodes, not passing through known; damaged
-        nodes reached are added to damaged (lock held)."""
+        nodes reached are added to damaged (lock held).
+
+        A DAG memoised as complete (_complete) is taken whole, less known, rather than walked: every block of it
+        is stored, and the walk would reach exactly those not in known, since known holds the whole DAG below
+        each of its blocks, except partial ones: blocks of known whose stored children may not all be in known
+        (a kept record's path nodes, in _evict_to). A complete DAG holding one of those is walked as before.
+        """
         reached: set[Cid] = set()
         stack = [cid for cid in roots if cid in self._sizes and cid not in known]
         while stack:
             cid = stack.pop()
             if cid in reached:
+                continue
+            blocks = self._complete.get(cid)
+            if blocks is not None and partial.isdisjoint(blocks):
+                reached |= blocks - known if known else blocks
                 continue
             reached.add(cid)
             listed = self._children(cid)
@@ -653,27 +710,22 @@ class Storage:
     def _path_cids(self, root: Cid, names: tuple[str, ...], damaged: set[Cid] | None = None) -> set[Cid]:
         """The stored nodes along <root>/<names> (not their other children), as far as they're stored; damaged
         nodes met are added to damaged (lock held)."""
-        found: set[Cid] = set()
-        current = root
-        for name in names:
-            while True:
-                if current.is_raw or current not in self._sizes:
-                    return found
-                found.add(current)
-                step = self._steps.get(current, {}).get(name, MISSING)
-                if step is MISSING:
-                    node = self._node(current)
-                    if node is DAMAGED:
-                        if damaged is not None:
-                            damaged.add(current)
-                        return found  # not memoised, as in _children
-                    step = self._steps.setdefault(current, {})[name] = self._step_in(node, name)
-                if step is None:
-                    return found
-                current, through_directory = step
-                if through_directory:
-                    break  # the next name
-        return found
+
+        def step(cid: Cid, name: str) -> tuple[Cid, bool] | None:
+            """_step_in's answer at cid, memoised (_steps); None if cid isn't stored, or is damaged."""
+            if cid not in self._sizes:
+                return None
+            answer = self._steps.get(cid, {}).get(name, _NO_MEMO)
+            if answer is _NO_MEMO:
+                node = self._node(cid)
+                if node is DAMAGED:
+                    if damaged is not None:
+                        damaged.add(cid)
+                    return None  # not memoised, as in _children
+                answer = self._steps.setdefault(cid, {})[name] = self._step_in(node, name)
+            return answer
+
+        return {cid for cid in _walk_path(root, names, step) if cid in self._sizes}
 
     def _warm(self, roots: set[Cid], paths: list[tuple[Cid, tuple[str, ...]]]):
         """Read and decode, without the lock, the DAG nodes a collection will walk from roots and along paths,
@@ -705,29 +757,20 @@ class Storage:
                 listed = found_links[cid] = self._listed(node)
             stack.extend(child for child in listed if child not in seen and not child.is_raw)
 
-        def step(cid: Cid, name: str):
-            """_step_in's answer for cid, memoised or read; MISSING if cid can't be read."""
-            known = steps.get(cid, {}).get(name, found_steps.get((cid, name), MISSING))
-            if known is MISSING:
+        def step(cid: Cid, name: str) -> tuple[Cid, bool] | None:
+            """_step_in's answer at cid, memoised or read; None if cid can't be read (the walk under the lock
+            reads it)."""
+            known = steps.get(cid, {}).get(name, found_steps.get((cid, name), _NO_MEMO))
+            if known is _NO_MEMO:
                 node = self._read_node(cid)
                 if node is MISSING or node is DAMAGED:
-                    return MISSING
+                    return None
                 known = found_steps[(cid, name)] = self._step_in(node, name)
             return known
 
         for root, names in paths:
-            current, ended = root, False
-            for name in names:
-                while not ended:
-                    result = None if current.is_raw else step(current, name)
-                    if result is None or result is MISSING:
-                        ended = True  # the path ends here, or the walk under the lock reads it
-                    else:
-                        current, through_directory = result
-                        if through_directory:
-                            break  # the next name
-                if ended:
-                    break
+            for _ in _walk_path(root, names, step):
+                pass  # step memoises as the walk goes: the same walk _path_cids makes under the lock
         with self._lock:
             for cid, listed in found_links.items():
                 if cid in self._sizes:
@@ -783,6 +826,7 @@ class Storage:
             self._used -= freed
             self._generation += 1
             self._complete = {root: blocks for root, blocks in self._complete.items() if not blocks & deleted}
+            self._complete_bytes = {root: n for root, n in self._complete_bytes.items() if root in self._complete}
         if deleted or deferred:
             # A deleted DAG node no longer reaches its children; a deferred block is still garbage
             self._maybe_garbage = True
@@ -810,25 +854,29 @@ class Storage:
             return set(), 0, 0  # only pins and sessions hold blocks: there is nothing to evict
         damaged: set[Cid] = set()
         live = self._reach(self._roots(), damaged=damaged)
-        kept = sum(self._sizes[cid] for cid in live)
+        # What pins and sessions don't reach, rather than what they do: the bytes kept follow from it with one
+        # pass over the stored blocks, and the blocks to delete are what is left of it once records are kept
+        dead = self._sizes.keys() - live
+        kept = self._used - sum(map(self._sizes.__getitem__, dead))
+        partial: set[Cid] = set()  # path nodes kept without the rest of their DAG: see _reach
         records = list(self._cache.items())  # oldest first
         keep = 0
         for (root, names), target in reversed(records):
-            more = self._reach({target}, live, damaged) | (self._path_cids(root, names, damaged) - live)
-            more_bytes = sum(self._sizes[cid] for cid in more)
+            reached = self._reach({target}, live, damaged, partial)
+            path = self._path_cids(root, names, damaged) - live
+            more = reached | path
+            more_bytes = sum(map(self._sizes.__getitem__, more))
             if kept + more_bytes > limit:
                 break
             live |= more
+            dead -= more
+            partial |= path - reached
             kept += more_bytes
             keep += 1
         if self._held_back(damaged):
             return set(), 0, 0
         evicted = len(records) - keep
-        for _ in range(evicted):
-            self._cache_dirty.add(self._cache.popitem(last=False)[0])
-        if evicted:
-            self._cache_generation += 1
-        dead = {cid for cid in self._sizes if cid not in live}
+        self._drop_records([key for key, _ in records[:evicted]])
         deleted, freed = self._delete(dead)
         self._maybe_garbage = deleted != dead  # anything deferred is collected on a later pass
         return deleted, freed, evicted
@@ -838,11 +886,17 @@ class Storage:
     def dag_blocks(self, cid: Cid) -> frozenset[Cid]:
         """The blocks of cid's DAG, which must be completely stored and valid (memoised).
 
-        Raises NotFound if a block is missing, InvalidDag if the DAG breaks a reader check.
+        Raises NotFound if a block is missing, InvalidDag if the DAG breaks a reader check. A missing block is
+        remembered (_missing), so asking again while it is still missing walks nothing.
         """
         with self._lock:
             if cid in self._complete:
                 return self._complete[cid]
+            missing = self._missing.get(cid)
+            if missing is not None:
+                if missing not in self._sizes:
+                    raise NotFound(f"block {missing} is not stored")
+                del self._missing[cid]  # stored since: walk again
             generation = self._generation
         found: set[Cid] = set()
         seen: set[walker.Expect] = set()
@@ -855,12 +909,12 @@ class Storage:
             if expect.cid.is_raw:
                 length = self.block_size(expect.cid)
                 if length is None:
-                    raise NotFound(f"block {expect.cid} is not stored")
+                    self._lacks(cid, expect.cid)
                 walker.check_raw(expect, length)  # stored blocks were verified, so their length is enough
             else:
                 block = self.get(expect.cid)
                 if block is None:
-                    raise NotFound(f"block {expect.cid} is not stored")
+                    self._lacks(cid, expect.cid)
                 stack.extend(walker.expand(expect, block))
             found.add(expect.cid)
         result = frozenset(found)
@@ -868,9 +922,21 @@ class Storage:
             # A deletion during the walk may have removed a block already counted
             if self._generation == generation:
                 self._complete[cid] = result
-            elif not all(block in self._sizes for block in result):
-                raise NotFound(f"a block of {cid} was deleted")
+            else:
+                gone = next((block for block in result if block not in self._sizes), None)
+                if gone is not None:
+                    self._lacks(cid, gone, f"a block of {cid} was deleted")
         return result
+
+    def _lacks(self, root: Cid, block: Cid, message: str | None = None):
+        """Remember that block, part of root's DAG, isn't stored (_missing), and raise NotFound (with message,
+        if given)."""
+        with self._lock:
+            if block not in self._sizes:  # else stored meanwhile: nothing to remember
+                if root not in self._missing and len(self._missing) >= MISSING_MEMO:
+                    del self._missing[next(iter(self._missing))]  # the oldest
+                self._missing[root] = block
+        raise NotFound(message or f"block {block} is not stored")
 
     def collect(self) -> int:
         """Delete every block nothing reaches (what an add or import refused left behind); how many."""
@@ -904,25 +970,23 @@ class Storage:
             targets = self._targets()
         if not denied or not records:
             return {"uncached": set(), "removed_blocks": 0, "freed_bytes": 0, "incomplete": set()}
-        before = self._complete_sets(targets)
-        self._warm(set(records.values()) | {root for root, _ in records}, [key for key in records if key[1]])
-        with self._lock:
-            before = self._with_memoised(before)
-            dropped = [key for key, target in self._cache.items()
-                       if any(cid.binary in denied
-                              for cid in {key[0], target} | self._path_cids(*key) | self._reach([target]))]
-            uncached = set()
-            for key in dropped:
-                uncached.add(self._cache.pop(key))
-                self._cache_dirty.add(key)
-            uncached -= set(self._cache.values())
-            if dropped:
-                self._cache_generation += 1
-                self._maybe_garbage = True
-            deleted, freed = self._collect() if dropped else (set(), 0)
-            incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
-            return {"uncached": uncached, "removed_blocks": len(deleted), "freed_bytes": freed,
-                    "incomplete": incomplete}
+        stats = {}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Drop the records reaching a denied block and collect; the blocks deleted."""
+            self._warm(set(records.values()) | {root for root, _ in records}, [key for key in records if key[1]])
+            with self._lock:
+                self._add_memoised(before)
+                dropped = [key for key, target in self._cache.items()
+                           if any(cid.binary in denied
+                                  for cid in {key[0], target} | self._path_cids(*key) | self._reach([target]))]
+                uncached = set(self._drop_records(dropped)) - set(self._cache.values())
+                deleted, freed = self._collect() if dropped else (set(), 0)
+                stats.update(uncached=uncached, removed_blocks=len(deleted), freed_bytes=freed)
+                return deleted
+
+        stats["incomplete"] = self._newly_incomplete(targets, act)
+        return stats
 
     def is_complete(self, cid: Cid) -> bool:
         """True if every block of cid's DAG is stored and the DAG is valid."""
@@ -931,6 +995,18 @@ class Storage:
             return True
         except (NotFound, InvalidDag):
             return False
+
+    def _newly_incomplete(self, targets: set[Cid], act: Callable[[dict[Cid, frozenset[Cid]]], set[Cid]]) -> set[Cid]:
+        """Those of targets complete before act and not after: the one sequence for every operation that deletes
+        blocks a pin or cached fetch may need (eviction, gc, drop_denied, verify), so the node can withdraw them.
+
+        Which targets are complete is found first, without the lock (dag_blocks walks their DAGs, reading blocks);
+        then act(before) runs, deletes blocks and returns those it deleted. An act that deletes under one hold of
+        the lock adds the targets memoised as complete by then (_add_memoised(before)) just before deleting.
+        """
+        before = self._complete_sets(targets)
+        deleted = act(before)
+        return {cid for cid, blocks in before.items() if blocks & deleted}
 
     def _complete_sets(self, cids) -> dict[Cid, frozenset[Cid]]:
         """dag_blocks for those of cids that are complete."""
@@ -991,19 +1067,22 @@ class Storage:
             targets = self._targets()
             roots = self._roots() | set(self._cache.values())
             paths = [key for key in self._cache if key[1]]
-        # The long part, reading DAG nodes from disk, runs without the lock (_warm)
-        before = self._complete_sets(targets)
-        self._warm(roots, paths)
-        with self._lock:
-            if not wanted():
-                return set()  # another eviction did it meanwhile
-            before = self._with_memoised(before)
-            limit = self.max_storage - needed - self.max_storage // EVICT_MARGIN
-            deleted, freed, evicted = self._evict_to(max(0, limit))
-            if deleted:
-                log(f"storage: evicted {plural(evicted, 'cached fetch')}, freeing {size(freed)} "
-                    f"in {plural(len(deleted), 'block')}", LOG_VERBOSE)
-            return {cid for cid, blocks in before.items() if blocks & deleted}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Evict; the blocks deleted."""
+            self._warm(roots, paths)  # the long part, reading DAG nodes from disk, runs without the lock
+            with self._lock:
+                if not wanted():
+                    return set()  # another eviction did it meanwhile
+                self._add_memoised(before)
+                limit = self.max_storage - needed - self.max_storage // EVICT_MARGIN
+                deleted, freed, evicted = self._evict_to(max(0, limit))
+                if deleted:
+                    log(f"storage: evicted {plural(evicted, 'cached fetch')}, freeing {size(freed)} "
+                        f"in {plural(len(deleted), 'block')}", LOG_VERBOSE)
+                return deleted
+
+        return self._newly_incomplete(targets, act)
 
     def _roots(self) -> set[Cid]:
         """What pins and sessions hold (lock held)."""
@@ -1012,14 +1091,12 @@ class Storage:
             roots |= session.cids
         return roots
 
-    def _with_memoised(self, before: dict[Cid, frozenset[Cid]]) -> dict[Cid, frozenset[Cid]]:
-        """before (complete DAGs found without the lock) plus the targets memoised as complete now, which a
+    def _add_memoised(self, before: dict[Cid, frozenset[Cid]]):
+        """Add to before (complete DAGs found without the lock) the targets memoised as complete now, which a
         deletion about to happen may make incomplete (lock held)."""
-        result = dict(before)
         for cid in self._targets():
             if cid in self._complete:
-                result[cid] = self._complete[cid]
-        return result
+                before[cid] = self._complete[cid]
 
     def gc(self) -> dict:
         """Evict every cached fetch and delete every block no pin or session reaches.
@@ -1030,20 +1107,22 @@ class Storage:
         with self._lock:
             targets = self._targets()
             roots = self._roots()
-        # The long part without the lock, as in evict(); every cached fetch goes, so only pins and sessions count
-        before = self._complete_sets(targets)
-        self._warm(roots, [])
-        with self._lock:
-            before = self._with_memoised(before)
-            uncached = set(self._cache.values())
-            if self._cache:
-                self._cache_dirty.update(self._cache)
-                self._cache.clear()
-                self._cache_generation += 1
-            deleted, freed = self._collect()
-            incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
-            return {"removed_blocks": len(deleted), "freed_bytes": freed, "incomplete": incomplete,
-                    "uncached": uncached}
+        stats = {}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Drop every record and collect; the blocks deleted."""
+            # The long part without the lock, as in evict(); every cached fetch goes, so only pins and sessions count
+            self._warm(roots, [])
+            with self._lock:
+                self._add_memoised(before)
+                stats["uncached"] = set(self._drop_records(list(self._cache)))
+                deleted, freed = self._collect()
+                stats.update(removed_blocks=len(deleted), freed_bytes=freed)
+                return deleted
+
+        incomplete = self._newly_incomplete(targets, act)
+        return {"removed_blocks": stats["removed_blocks"], "freed_bytes": stats["freed_bytes"],
+                "incomplete": incomplete, "uncached": stats["uncached"]}
 
     def verify(self) -> dict:
         """Re-check every stored block against its CID, deleting bad ones.
@@ -1053,21 +1132,24 @@ class Storage:
         with self._lock:
             cids = list(self._sizes)
             targets = self._targets()
-        before = self._complete_sets(targets)  # without the lock, as in evict(); dag_blocks checks for deletions
         bad = []
-        for cid in cids:
-            if self.blocks.verify(cid):
-                continue
-            with self._lock:
-                # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
-                if cid in self._sizes and not self.blocks.verify(cid):
-                    self._delete({cid})  # reported either way; one Windows defers stays until a later try
-                    bad.append(cid)
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Re-check every block, deleting bad ones, each under its own hold of the lock; the bad ones."""
+            for cid in cids:
+                if self.blocks.verify(cid):
+                    continue
+                with self._lock:
+                    # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
+                    if cid in self._sizes and not self.blocks.verify(cid):
+                        self._delete({cid})  # reported either way; one Windows defers stays until a later try
+                        bad.append(cid)
+            return set(bad)
+
+        incomplete = self._newly_incomplete(targets, act)  # completeness without the lock, as in evict()
         if bad:
             log(f"storage: verify removed {plural(len(bad), 'damaged block')}", LOG_ERROR)
-        bad_set = set(bad)
-        return {"checked": len(cids), "bad": bad,
-                "incomplete": {cid for cid, blocks in before.items() if blocks & bad_set}}
+        return {"checked": len(cids), "bad": bad, "incomplete": incomplete}
 
     # Sizes, for stat and the remote-pin quota
 
@@ -1086,6 +1168,12 @@ class Storage:
 
     def dag_bytes(self, cid: Cid) -> int:
         """Bytes of the stored blocks of cid's DAG (each block once), as far as its stored nodes reach."""
+        with self._lock:
+            # A DAG memoised as complete is all stored: its total, summed once (_delete forgets it with the DAG)
+            if cid in self._complete:
+                if cid not in self._complete_bytes:
+                    self._complete_bytes[cid] = sum(map(self._sizes.__getitem__, self._complete[cid]))
+                return self._complete_bytes[cid]
         self._warm({cid}, [])  # the DAG nodes are read without the lock, as in gc()
         with self._lock:
             return sum(self._sizes[block] for block in self._reach({cid}))

@@ -137,6 +137,29 @@ class SharedFolderTargetTest(unittest.TestCase):
         self.logged.clear()
         self.assert_refused(folder)
 
+    def test_file_cache_sits_behind_the_guard(self):
+        """The per-file cache (audit D1) is consulted only after the folder passed the check: a retargeted folder's
+        scan looks nothing up in it, and forgets what it held, so going back reads every file again."""
+        target = self.directory("shared", "x", content=b"the owner's shared file")
+        os.makedirs(os.path.join(target, "sub"))
+        with open(os.path.join(target, "sub", "b.txt"), "wb") as f:
+            f.write(b"another")
+        self.point_at(target)
+        folder = self.open()
+        self.assertEqual(len(folder.scan()), 2)
+        moved = target + ".moved"
+        os.rename(target, moved)
+        os.symlink(os.path.join(self.root, "names"), target, target_is_directory=True)
+        self.logged.clear()
+        with mock.patch.object(shared_folder.FolderFiles, "get", side_effect=AssertionError("cache consulted")):
+            self.assert_refused(folder)
+        self.assertEqual(folder.files._index, {})
+        os.remove(target)
+        os.rename(moved, target)
+        with mock.patch.object(builder, "build_file", wraps=builder.build_file) as build_file:
+            self.assertEqual(len(folder.scan()), 2)
+        self.assertEqual(build_file.call_count, 2)
+
     def test_upgrade_releases_keys_an_earlier_scan_imported(self):
         """A 0.1.5 node whose files/ already led into names/ imported, pinned and provided the name key. The first
         0.1.6 scan (over the same state) releases that pin and empties the shared_folder table."""

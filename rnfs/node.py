@@ -42,7 +42,6 @@ from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MOD
 from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
-from rnfs.content import chunker as content_chunker
 from rnfs.content.shared_folder import SharedFolder
 from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_reserve, remote_source
 from rnfs.dht.lookup import Lookup
@@ -576,9 +575,11 @@ class RnfsNode:
         self.storage.deny = self.deny
         self.deny.reload(self._read_deny_list)
         self._hash_noticed: set[Cid] = set()  # files _check_file refused by hash and logged the NOTICE for
-        # The shared folder is written through: nothing to save
+        # The shared folder is written through: nothing to save. Its per-file cache (what the files inside its entries
+        # were built as) is saved with the batched stores; the shared folder's close releases it too
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
         self._add_store(_StoreParts(close=self.shared_folder.close), batched=False)
+        self._add_store(self.shared_folder.files)
         # Where pins came from, for pin ls (local only). Written through, not durably: a power loss can lose a
         # name, never the pin it names, which is committed durably first; its save writes a name whose write failed
         self.pin_names = self._add_store(PinNames(config.state_dir), batched=False)
@@ -947,8 +948,7 @@ class RnfsNode:
         if now - last.get("scan", float("-inf")) >= self.config.scan_interval:
             last["scan"] = now
             try:
-                with builder.checking(self._hash_check()):
-                    self.shared_folder.scan()
+                self.shared_folder.scan(builder.BuildOptions(check=self._hash_check()))
                 self.publisher.refresh()
             except Exception as e:  # noqa: BLE001 - the next scan tries again; logged
                 log(f"shared folder scan failed: {e!r}", LOG_ERROR)
@@ -985,8 +985,8 @@ class RnfsNode:
         return b"".join(walker.read_range(expect, get))
 
     def _hash_check(self):
-        """What builder.checking takes for an add or import: raises Denied for a file whose content hash is
-        denied; None while the deny list has no file hashes (so nothing is hashed)."""
+        """The check of an add's or the shared folder's builder.BuildOptions: raises Denied for a file whose content
+        hash is denied; None while the deny list has no file hashes (so nothing is hashed)."""
         if not self.deny.hashes:
             return None
 
@@ -1206,21 +1206,22 @@ class RnfsNode:
         if not os.path.lexists(path):
             raise NotFound(f"no such file or directory: {path}")
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
-        with content_chunker.using(chunker):
-            if only_hash:
-                built, warnings = builder.add_path(path, builder.NO_PUT, wrap)
-            else:
-                with self._refusing(), self.storage.protect() as session:
-                    with session.writer() as put:
-                        if recipients:
-                            built = node_content.add_sealed_path(path, put, wrap, recipients, seal_name)
-                            warnings = []
-                        else:
-                            built, warnings = builder.add_path(path, put, wrap)
-                    node_content.keep_added(self, built.cid, pin)
-                if pin:
-                    self.pin_names.record(built.cid, os.path.abspath(path))
-                self._added(built)
+        options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
+        if only_hash:
+            built, warnings = builder.add_path(path, builder.NO_PUT, wrap, options)
+        else:
+            options = builder.BuildOptions(options.chunker, self._hash_check())
+            with self._refusing(), self.storage.protect() as session:
+                with session.writer() as put:
+                    if recipients:
+                        built = node_content.add_sealed_path(path, put, wrap, recipients, seal_name, options)
+                        warnings = []
+                    else:
+                        built, warnings = builder.add_path(path, put, wrap, options)
+                node_content.keep_added(self, built.cid, pin)
+            if pin:
+                self.pin_names.record(built.cid, os.path.abspath(path))
+            self._added(built)
         return {"cid": str(built.cid), "size": built.size, "warnings": warnings, **({"sealed": True} if recipients else {})}
 
     def add_stream(self, stream: BinaryIO, size: int | None = None, name: str | None = None,
@@ -1230,17 +1231,18 @@ class RnfsNode:
         only_hash; sealed for to/to_self (with seal_name inside) if given; chunker as for add_path."""
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
         stream, size = node_content.sealing_stream(stream, size, recipients, seal_name)
-        with content_chunker.using(chunker):
-            if only_hash:
-                built = builder.add_stream(stream, builder.NO_PUT, size, name)
-            else:
-                with self._refusing(), self.storage.protect() as session:
-                    with session.writer() as put:
-                        built = builder.add_stream(stream, put, size, name)
-                    node_content.keep_added(self, built.cid, pin)
-                if pin:
-                    self.pin_names.record(built.cid, name or seal_name or "(stdin)")
-                self._added(built)
+        options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
+        if only_hash:
+            built = builder.add_stream(stream, builder.NO_PUT, size, name, options=options)
+        else:
+            options = builder.BuildOptions(options.chunker, self._hash_check())
+            with self._refusing(), self.storage.protect() as session:
+                with session.writer() as put:
+                    built = builder.add_stream(stream, put, size, name, options=options)
+                node_content.keep_added(self, built.cid, pin)
+            if pin:
+                self.pin_names.record(built.cid, name or seal_name or "(stdin)")
+            self._added(built)
         return {"cid": str(built.cid), "size": built.size, "warnings": [], **({"sealed": True} if recipients else {})}
 
     def block(self, cid: str, for_gateway: bool = False) -> bytes:
@@ -1254,11 +1256,11 @@ class RnfsNode:
 
     @contextmanager
     def _refusing(self) -> Iterator[None]:
-        """Around an add or import: files whose content hash is denied stop it (builder.checking), and when the
-        deny list stops it, the blocks it stored are deleted once nothing reaches them."""
+        """Around an add or import, which the deny list may stop (a denied block, or a file whose content hash is
+        denied: an add's BuildOptions check, _hash_check): when it does, the blocks it stored are deleted once
+        nothing reaches them."""
         try:
-            with builder.checking(self._hash_check()):
-                yield
+            yield
         except Denied:
             self.storage.collect()
             raise
