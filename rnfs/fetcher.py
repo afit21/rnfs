@@ -24,6 +24,13 @@ that isn't a valid DAG node marks the root invalid locally and fails the fetch (
 longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
 block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
 
+End-game duplication (NET-4; section 7): once nothing is left to ask for, an idle provider is also asked for a
+batch another has had in flight for longer than deadline_slack, so a response dripping in (never stalling, its
+deadline hours away at unmeasured_bitrate) doesn't hold the fetch up. Each request is duplicated at most once,
+and only while fewer than max_parallel_providers requests are in flight (never on a slow node). The first
+verified copy wins: the request still sending what has arrived has its link closed, which isn't counted against
+its provider.
+
 Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
 the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
 would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
@@ -615,6 +622,13 @@ class Fetch:
         # What each CID of a request in flight (not a probe) was asked for as, so a block arriving after the
         # _download call that asked for it has returned is checked and stored rather than dropped
         self._expects: dict[Cid, list[Expect]] = {}
+        # End-game duplication (_duplicate): when each request in flight (not a probe) was sent, by the fetch
+        # thread's clock; a request duplicated -> its duplicate, and back, while each is in flight; and the
+        # requests whose links were closed because the other copy won, whose outcome isn't counted
+        self._sent_at: dict[bytes, float] = {}
+        self._duplicated: dict[bytes, bytes] = {}
+        self._duplicates: dict[bytes, bytes] = {}
+        self._abandoned: set[bytes] = set()
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -664,7 +678,7 @@ class Fetch:
             if isinstance(event, ResultEvent):
                 self._in_flight.pop(event.node_id, None)
         for node_id, (_, probe) in list(self._in_flight.items()):
-            if exc_type is None and probe:
+            if (exc_type is None and probe) or node_id in self._abandoned:  # an abandoned one's is closed already
                 continue
             try:
                 self.client.close(node_id)
@@ -1047,9 +1061,13 @@ class Fetch:
         elif isinstance(event, ResultEvent):
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
+            self._sent_at.pop(event.node_id, None)
+            abandoned = event.node_id in self._abandoned
+            self._abandoned.discard(event.node_id)
             asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
-                         event.sent_at, event.rate)
+                         event.sent_at, event.rate, counted=not abandoned)
+            self._settle_duplicate(event.node_id, in_flight)
             still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
             pending.push_front(requeue)  # back at the front, keeping the walk's order
@@ -1143,16 +1161,76 @@ class Fetch:
                 in_flight[provider.node_id] = (batch, False)
                 for cid in batch:
                     self._expects[cid] = wanted[cid]
+                self._sent_at[provider.node_id] = now
                 self._send(provider.node_id, batch)
                 busy_providers += 1
+        if not pending and busy_providers < self.fetcher.max_parallel:
+            self._duplicate(usable, in_flight, busy_providers, now)
+
+    def _duplicate(self, usable: list[_Provider], in_flight: dict, busy_providers: int, now: float):
+        """End-game duplication (NET-4; section 7, item 7): with nothing left to ask for, ask idle providers too
+        for the batches others have had in flight for longer than deadline_slack, oldest first, each at most
+        once, and within max_parallel requests in flight. A duplicate is sized for its own provider's link and
+        what one response carries (_take_batch)."""
+        idle = [provider for provider in usable if provider.node_id not in in_flight and provider.busy_until <= now]
+        if not idle:
+            return
+        slow = sorted((sent_at, node_id) for node_id, sent_at in self._sent_at.items()
+                      if node_id in in_flight and now - sent_at > self.config.deadline_slack
+                      and node_id not in self._duplicated and node_id not in self._duplicates
+                      and node_id not in self._abandoned)
+        for sent_at, node_id in slow:
+            if not idle or busy_providers >= self.fetcher.max_parallel:
+                return
+            # Its blocks not stored yet, as they were asked for (every CID in flight has its expectations here)
+            left = [cid for cid in in_flight[node_id][0] if cid in self._expects and not self.storage.has(cid)]
+            if not left:
+                continue
+            provider = idle[0]
+            # Not reserved against the DAG limits again: a block is counted once, whichever copy brings it
+            batch = self._take_batch(_Pending(left), provider.node_id, self._expects, None)
+            if not batch:
+                continue
+            idle.pop(0)
+            log(f"{node_name(node_id)} has been sending {plural(len(left), 'block')} of {self.root} for "
+                f"{now - sent_at:.0f}s; asking {node_name(provider.node_id)} too", LOG_VERBOSE)
+            in_flight[provider.node_id] = (batch, False)
+            self._sent_at[provider.node_id] = now
+            self._duplicated[node_id] = provider.node_id
+            self._duplicates[provider.node_id] = node_id
+            self._send(provider.node_id, batch)
+            busy_providers += 1
+
+    def _settle_duplicate(self, node_id: bytes, in_flight: dict):
+        """node_id's request has been answered: if it was one of a duplicated pair and the other copy, still in
+        flight, now carries nothing not stored, close that one's link (the first verified copy won). Closing the
+        link stops the response without cancelling its Resource (section 3), and its outcome isn't counted
+        against its provider (_handle's counted)."""
+        other = self._duplicated.pop(node_id, None)
+        if other is not None:
+            self._duplicates.pop(other, None)
+        else:
+            other = self._duplicates.pop(node_id, None)  # the original stays marked as duplicated until answered
+        if other is None or other not in in_flight or other in self._abandoned:
+            return
+        if any(not self.storage.has(cid) for cid in in_flight[other][0]):
+            return  # it still carries blocks nobody else has sent
+        self._abandoned.add(other)
+        log(f"closing the link to {node_name(other)}: {node_name(node_id)} sent what it was still sending",
+            LOG_VERBOSE)
+        try:
+            self.client.close(other)
+        except Exception as e:  # noqa: BLE001 - closing is best effort; logged
+            log(f"could not close the link to {node_name(other)}: {e}", LOG_WARNING)
 
     def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]],
-                    budget: _DagBudget) -> list[Cid]:
+                    budget: _DagBudget | None) -> list[Cid]:
         """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
         hold, at least one.
 
         Under a DAG limit, only what the room budget leaves can take for sure (_DagBudget.room), but at least one
-        CID when no request is in flight: so a fetch downloads at most about one block beyond the limit.
+        CID when no request is in flight: so a fetch downloads at most about one block beyond the limit. With no
+        budget (a duplicate's, whose blocks are reserved already), no limit is applied.
         """
         rate = self.client.rate_estimate(node_id)
         max_bytes = rates.requester_max_bytes(rate, self.config)
@@ -1164,7 +1242,8 @@ class Fetch:
         # one count covers every batch taken from the front of pending
         mdu = self.client.link_mdu(node_id) or MAX_REQUEST_SIZE
         fit = max(1, protocol.blocks_batch_size(max_bytes, list(islice(pending, MAX_BATCH)), mdu))
-        room = budget.room((cid for cids, _ in self._in_flight.values() for cid in cids), wanted)
+        room = None if budget is None else budget.room((cid for cids, _ in self._in_flight.values() for cid in cids),
+                                                       wanted)
         batch: list[Cid] = []
         total = 0
         while pending and len(batch) < fit:
@@ -1292,11 +1371,14 @@ class Fetch:
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,
-                outstanding: set[Cid], budget: _DagBudget, sent_at: float | None = None, rate: float | None = None):
+                outstanding: set[Cid], budget: _DagBudget, sent_at: float | None = None, rate: float | None = None,
+                counted: bool = True):
         """Store a response's blocks (counted against budget) and apply the provider failure and pacing rules.
         Raises InvalidDag.
 
-        sent_at is when the request was sent and rate the link's rate estimate then (None: unknown).
+        sent_at is when the request was sent and rate the link's rate estimate then (None: unknown). A request
+        not counted (one whose link the fetch closed, as its duplicate won) has its blocks stored, but its outcome
+        applies none of the rules: closing the link isn't the provider's stall or failure.
         """
         provider = self._providers.get(node_id)
         if result.bad:
@@ -1325,7 +1407,7 @@ class Fetch:
                 log(f"{node_name(node_id)} (open link) has {self.root}", LOG_VERBOSE)
                 self._pace(provider, sent_at, rate)
             return
-        if provider is None or provider.failed:
+        if provider is None or provider.failed or not counted:
             return
         now = self.fetcher.clock()
         if result.status == peer_client.OK:
