@@ -194,6 +194,9 @@ Faster:
   whole, `dag_bytes` sums it once, and `is_complete` remembers an incomplete DAG's missing block until it
   arrives. With about 550 000 blocks an eviction pass holds the lock for about 240 ms instead of 900 ms;
   `is_complete` on a 4 GiB file missing its first chunk went from 530 ms per call to 0.002 ms after the first.
+- Expiring provider records no longer checks every record for a time in the future unless the clock went back
+  since a time was taken: one expiry pass at 100 000 records went from 16.6 to 8.7 ms, held under the store's
+  lock.
 - Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
   over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
   there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
