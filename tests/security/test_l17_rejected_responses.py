@@ -4,8 +4,9 @@ and asking again at once: a rejected Resource concludes immediately, freeing the
 Fixed: a response whose Resource is rejected with nothing sent counts as making no progress, so its link (and
 identity) cools down for blocks_cooldown, as after one cancelled for making none (H1). These tests drive the
 server on a FakeClock with fake Resources concluding as RNS's do on a rejection (status REJECTED, then the
-callback): the loop builds one response per cooldown, and honest outcomes (completed, or rejected mid-transfer)
-start no cooldown.
+callback): the loop builds one response per cooldown, and honest outcomes (completed, or rejected once a good
+part of it was sent) start no cooldown. NET-1 extends the cooldown to a rejection before a quarter of the
+response was sent (tests/security/test_net1_cancelled_responses.py).
 """
 import unittest
 
@@ -14,20 +15,10 @@ import RNS
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
-from tests.security._server_helpers import ServerHarness
+from tests.security._server_helpers import ServerHarness, reject
 
 BLOCK = bytes(CHUNK_SIZE)
 CID = Cid.for_block(RAW, BLOCK)
-
-
-def reject(resource, progress: float = 0.0):
-    """The requester rejects (or, mid-transfer, cancels) the response: RNS's Resource._rejected on an outgoing
-    Resource sets REJECTED, leaves the link's outgoing Resources and runs the callback."""
-    resource.progress = progress
-    resource.status = RNS.Resource.REJECTED
-    resource.conclude()
-    if resource.callback:
-        resource.callback(resource)
 
 
 class RejectedResponseTest(unittest.TestCase):
@@ -82,7 +73,7 @@ class RejectedResponseTest(unittest.TestCase):
         self.respond(link).complete()
         resource = self.respond(link)
         self.assertIsNotNone(resource)
-        # Rejected after some of it was sent (RNS's receiver gives up mid-transfer the same way): it made progress
+        # Rejected after half of it was sent (RNS's receiver gives up mid-transfer the same way): it made progress
         reject(resource, progress=0.5)
         self.assertIsNotNone(self.respond(link))
         self.assertFalse(self.harness.server.cooldowns.active(link.link_id))

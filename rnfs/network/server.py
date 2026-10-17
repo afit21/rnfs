@@ -64,6 +64,13 @@ FLOOR_FRACTION = 1 / 1000
 # A response displaced for a newcomer while making progress at less than this fraction of the rate it needs to
 # be done when it is due (Response.due) counts as making none: its requester cools down
 FAR_BEHIND = 1 / 4
+# A response whose Resource its requester rejects or cancels before this fraction of it was sent made no real
+# progress: its requester cools down (section 3). Otherwise one could take the first window of parts of each
+# response, cancel it and ask again, having the node read, hash, pack and encrypt a whole response per window
+# (on a slow link, a window of RNS.Resource.WINDOW_MAX_SLOW parts is about 7% of a 64 KiB response). An honest
+# 0.1.5 fetcher never cancels a Resource (a reader giving up closes the link), so only RNS running out of
+# retries on a lossy path does
+NO_PROGRESS_FRACTION = 1 / 4
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
 # Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
 # An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
@@ -1243,7 +1250,7 @@ class RequestServer:
 
     def _concluded(self, response: Response, link, resource):
         """The response's Resource concluded: record the rate if it completed, start a cooldown if its requester
-        rejected it with nothing sent, and free the slots."""
+        rejected or cancelled it before it made real progress (_made_progress), and free the slots."""
         with self.lock:
             # The Resource's callback, the monitor and the next request may all notice; handle it once
             first, response.concluded = not response.concluded, True
@@ -1251,28 +1258,34 @@ class RequestServer:
         status = getattr(resource, "status", None)
         if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
-        elif first and status == RNS.Resource.REJECTED and not self._sent_any(response, resource):
-            # Turned down at its advertisement (no honest requester does that): no progress, so its requester
-            # cools down as for a response cancelled for making none, rather than having the node build another
-            # at once (section 3)
-            log("a /blocks response was rejected with nothing sent: its requester cools down", LOG_VERBOSE)
+        elif first and status == RNS.Resource.REJECTED and not self._made_progress(response, resource):
+            # Turned down at its advertisement or cancelled by its requester (on RNS 1.5.6 both arrive as
+            # REJECTED) before a quarter of it was sent: no honest 0.1.5 fetcher does that, it closes the link.
+            # So no real progress, and its requester cools down as for a response cancelled for making none,
+            # rather than having the node build another at once (section 3)
+            log(f"a /blocks response ({size(response.size or 0)}) was rejected before a quarter of it was sent: "
+                "its requester cools down", LOG_VERBOSE)
             self.cooldowns.add(response.link_id, response.identity)
         elif first and not cancelled and status in (RNS.Resource.FAILED, RNS.Resource.CORRUPT):
-            # Not cancelled here: RNS gave up on the transfer, so the requester sees it stop arriving
+            # Not cancelled here: RNS gave up on the transfer, or the requester closed the link, so the requester
+            # sees it stop arriving. No cooldown, however little was sent: an honest reader that gives up early
+            # closes its links, and in private mode a cooldown would hold back its own identity
             log(f"a /blocks response ({size(response.size or 0)}) failed after {size(int(response.sent))} sent: "
                 f"{'its link closed' if getattr(link, 'status', None) == RNS.Link.CLOSED else 'lost in transit'}",
                 LOG_DEBUG)
         self._finish(response)  # charges what was sent: all of a completed Resource
 
     @staticmethod
-    def _sent_any(response: Response, resource) -> bool:
-        """Whether any of response's Resource was sent (or that can't be read)."""
-        if response.sent > 0:
+    def _made_progress(response: Response, resource) -> bool:
+        """Whether at least NO_PROGRESS_FRACTION of response was sent: the more of what the monitor last saw and
+        what its Resource reads now. True if its size or the Resource's progress can't be read."""
+        if response.size is None:
             return True
         try:
-            return resource.get_progress() > 0
+            sent = max(response.sent, resource.get_progress() * response.size)
         except Exception:  # noqa: BLE001 - progress unknown counts as progress
             return True
+        return sent >= NO_PROGRESS_FRACTION * response.size
 
     def _cancel(self, response: Response, reason: str):
         """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""
