@@ -667,8 +667,11 @@ class RequestServerTest(unittest.TestCase):
         bound = server.MAX_PACING_WAIT
         sleeps = []
         with mock.patch.object(self.server, "_pace", lambda response, wait: sleeps.append(wait)):
-            self.blocks(link)  # no rate estimate yet: no cap, no pacing
+            self.blocks(link)  # no rate estimate yet: the explicit cap applies all the same (NET-2)
             self.send(link).complete()
+            self.assertGreater(self.server.pacer.wait_time(link.link_id), bound)
+            self.assertIs(self.blocks(link, request_id=b"q" * 16), False)
+            self.clock.now += 11
             self.assertEqual(self.server.pacer.wait_time(link.link_id), 0)
             self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)
             self.assertNotEqual(self.blocks(link, request_id=b"s" * 16), False)

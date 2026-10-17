@@ -986,8 +986,9 @@ class RequestServer:
                 if response.finished:
                     return False  # displaced, or its link closed, while it waited
 
-            # The upload cap applies once the link has a rate estimate (section 3)
-            cap = self.config.effective_max_upload_rate(slow, rate) if rate is not None else None
+            # An explicit max_upload_rate applies to every response, also one sent as a single packet, which
+            # never gives a rate estimate; the default cap (half the estimate on slow links) needs one (section 3)
+            cap = self.config.effective_max_upload_rate(slow, rate)
             limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target),
                                        self._committed(response))
             response.requester = identity if identity is not None else link_id

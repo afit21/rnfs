@@ -244,10 +244,12 @@ pass a `max_response_size` just above their largest honest answer.
   an incoming `rnfs.dht` link is dropped unread. Likewise a node serves requests only on incoming links, so it
   SHOULD drop, unread, a request packet on an `rnfs.dht` link it opened: the remote destination of such a link
   has no request size limit or handlers, and RNS would decode the request and start a thread for it first.
-- `max_upload_rate` caps bytes sent for `/blocks` on a link once it has a rate estimate. RNS paces a Resource
-  by its receiver, so the cap is applied between responses: the response budget uses the lower of the rate
-  estimate and `max_upload_rate`, and the next response on that link starts no sooner than
-  `bytes × 8 / max_upload_rate` seconds after the previous one started.
+- `max_upload_rate` caps bytes sent for `/blocks` on a link. An explicit one applies to every `/blocks`
+  response, including one sent as a single packet (which never gives a rate estimate: on a link with a large
+  MTU every response may be one); the default, half the rate estimate on slow links, applies once the link has
+  one. RNS paces a Resource by its receiver, so the cap is applied between responses: the response budget uses
+  the lower of the rate estimate and `max_upload_rate`, and the next response on that link starts no sooner
+  than `bytes × 8 / max_upload_rate` seconds after the previous one started.
   - A responder holds an accepted request back for this at most 5.625 s (half of RNS's request timeout
     without RTT, 1.125 × `RNS.Resource.RESPONSE_MAX_GRACE_TIME` (10 s), so the requester doesn't give up
     meanwhile; not RTT-based, since the requester can inflate the RTT), and refuses it at once if it would
@@ -1405,7 +1407,7 @@ setting.
 | `max_incoming_links` | 128 | |
 | `max_blocks_responses` | 4 | `/blocks` responses in progress on slow links: half of this; the rest for other links, unless `fast_blocks_responses` is more. At least 2 |
 | `fast_blocks_responses` | 16 | `/blocks` responses in progress on links that aren't slow, if more than the rest of `max_blocks_responses` |
-| `max_upload_rate` | none; half the rate estimate on slow links that have one | |
+| `max_upload_rate` | none; half the rate estimate on slow links that have one | An explicit value applies to every `/blocks` response, with or without a rate estimate |
 | `max_records` | 100 000 | |
 | `ban_time` | 1 h | |
 | `max_storage` | 10 GiB | |
