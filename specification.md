@@ -796,7 +796,12 @@ and repeat.
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
 old pin. Unlike `add`, a scan MUST skip (with a log line) a regular file that has other hard links, at the
 top level and inside shared directories: it is also a file elsewhere, which whoever may write to the folder
-could have linked in. It is imported at the next scan after its other links are gone. `files/` may be a
+could have linked in. It is imported at the next scan after its other links are gone. A scan recognises
+unchanged content by its metadata rather than by reading it: an entry whose files' names, sizes, modification
+times and execute bits are as before isn't read, nor, inside an entry that changed, a file imported before whose
+device, inode, size, modification time and execute bit are as they were (its CID is reused while every block of it
+is still stored and none is denied, and its content hash still goes through the deny list). Content rewritten in
+place keeping all of these goes unnoticed until one changes. `files/` may be a
 symlink, but a scan MUST NOT import from a folder that resolves, as opened, to the rnfs dir, to a directory
 holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, which hold the node's keys and state:
 rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin

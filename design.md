@@ -1247,6 +1247,17 @@ Everything in the specification is implemented, with these simplifications and a
   isn't tried again until it changes; one that fails for a reason that may pass (`OSError`, including a pin the
   state database couldn't save, or `StorageFull`) is tried again `RETRY_AFTER` (600 s) later, and an unchanged
   entry whose pin fails is logged without ending the scan.
+- Inside an entry whose signature changed, the scan reads only the files that changed (audit D1):
+  `SharedFolder.files` (a `FolderFiles`) maps each file's `builder.file_state` (device, inode, size, `mtime_ns`,
+  execute bit; the open file's `fstat`, taken before it is read) to the `Built` it gave, grouped by top-level
+  entry so an entry imported again keeps only what it holds now and one gone takes its files along; a file moved
+  to another entry is found too. `build_open(..., cache=)` asks it (`builder.FileCache`) before reading each
+  regular file: a known file stands in only while `is_complete` holds for its CID (protected in the import's
+  session first) and no block of it is denied (`denied_roots`; else it is read again and its put refuses the
+  import, as before), and its remembered content hash still goes to `BuildOptions.check`; one remembered without
+  a hash (built while the deny list had none) is read again when there is a check. A file whose state changed
+  while it was read isn't remembered. Only fixed-chunker builds use it. It sits behind CONT-3's target check: a
+  refused folder is scanned as empty, which empties it.
 - The shared-folder scan and `add` walk directories by file descriptor (`O_NOFOLLOW`, `O_NONBLOCK`, type and
   inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. The scan (not `add`)
   skips regular files whose opened descriptor has `st_nlink > 1` (`builder.hard_links`, `build_open`'s

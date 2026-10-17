@@ -26,8 +26,8 @@ import os
 import stat
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import BinaryIO, Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from typing import BinaryIO, Callable, Iterable, Iterator, Protocol
 
 from rnfs import constants, fsutil
 from rnfs.content import chunker, dag
@@ -50,6 +50,8 @@ class Built:
     size: int  # content bytes below the root
     kind: int  # the kind a directory entry for it would have: dag.KIND_FILE, KIND_EXECUTABLE or KIND_DIRECTORY
     height: int  # DAG nodes on the longest path from the root down, all types counted; 0 for a raw block
+    # A file's content SHA-256, when the build computed it (its BuildOptions had a check); None otherwise
+    digest: bytes | None = field(default=None, compare=False)
 
 
 class _Levels:
@@ -193,19 +195,21 @@ def build_file(stream: BinaryIO, put: Put, size: int | None = None, kind: int = 
             digest.update(chunk)
         put(cid, chunk)
         levels.add(Child(cid, len(chunk)), 0)
+    content_hash = None
     if check is not None:
-        check(digest.digest())
+        content_hash = digest.digest()
+        check(content_hash)
 
     level, pairs = levels.finish()
     if level == 0 and not pairs:
         put(EMPTY_FILE, b"")
-        return Built(EMPTY_FILE, 0, kind, 0)
+        return Built(EMPTY_FILE, 0, kind, 0, content_hash)
     if level == 0 and len(pairs) == 1:
         chunk_child = pairs[0][0]
-        return Built(chunk_child.cid, chunk_child.size, kind, 0)
+        return Built(chunk_child.cid, chunk_child.size, kind, 0, content_hash)
     child, height = make_group(level, pairs)
     _check_depth(height)
-    return Built(child.cid, child.size, kind, height)
+    return Built(child.cid, child.size, kind, height, content_hash)
 
 
 def build_bytes(data: bytes, put: Put, kind: int = dag.KIND_FILE, options: BuildOptions | None = None) -> Built:
@@ -480,6 +484,27 @@ def build_path(path: str, put: Put, warnings: list[str], options: BuildOptions |
         close(handle)
 
 
+FileState = tuple[int, int, int, int, bool]
+
+
+def file_state(st: os.stat_result) -> FileState:
+    """What a FileCache knows a regular file by: (device, inode, size, mtime in ns, execute bit). The trust is the
+    shared folder's signature's: a file rewritten with the same size and modification time looks unchanged."""
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, is_executable(st.st_mode)
+
+
+class FileCache(Protocol):
+    """What build_open asks about each regular file before reading it, and tells after reading one (the shared
+    folder's per-file cache, audit D1). st is the open file's stat, taken before it is read."""
+
+    def lookup(self, st: os.stat_result, kind: int) -> Built | None:
+        """The Built of the file whose stat is st, from an earlier build, if it may stand for the file now: its
+        blocks all stored, and protected for this build. None to read the file."""
+
+    def remember(self, st: os.stat_result, built: Built):
+        """The file whose stat was st, unchanged while it was read, was built as built."""
+
+
 def hard_links(handle: Handle) -> int:
     """How many hard links the open regular file handle has beyond one (0 for a directory)."""
     if not isinstance(handle, int):
@@ -489,25 +514,49 @@ def hard_links(handle: Handle) -> int:
 
 
 def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings: list[str],
-               depth: int = 1, skip_hard_links: bool = False, options: BuildOptions | None = None) -> Built:
+               depth: int = 1, skip_hard_links: bool = False, options: BuildOptions | None = None,
+               cache: FileCache | None = None) -> Built:
     """Build the regular file or directory open as handle (from open_path or open_child), whose stat is st.
 
     path is only for messages (and for directories without FD_WALK); depth as for _build_tree. With
     skip_hard_links, files below a directory that have other hard links are skipped with a warning (the shared
     folder: someone who may write to it could link a file of yours there that you never put in it). options as
-    for build_file, taken from this context once, here, if not given: the whole tree is built with them.
+    for build_file, taken from this context once, here, if not given: the whole tree is built with them. cache,
+    if given, may stand in for reading each regular file (_build_cached).
     """
     options = _resolve(options)
     if stat.S_ISDIR(st.st_mode):
-        return _build_tree(handle, path, put, warnings, depth, skip_hard_links, options)
+        return _build_tree(handle, path, put, warnings, depth, skip_hard_links, options, cache)
     kind = dag.KIND_EXECUTABLE if is_executable(st.st_mode) else dag.KIND_FILE
+    if cache is not None:
+        return _build_cached(handle, put, kind, options, cache)
     # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
     with os.fdopen(handle, "rb", closefd=False) as f:
         return build_file(f, put, kind=kind, options=options)
 
 
+def _build_cached(handle: Handle, put: Put, kind: int, options: BuildOptions, cache: FileCache) -> Built:
+    """build_open of the regular file open as handle, through cache: a file it knows isn't read again.
+
+    Its remembered content hash still goes to options.check, so a hash denied since is refused as if the file
+    were read; a file remembered without one (built when there was no check) is read again when there is a check.
+    """
+    before = os.fstat(handle)
+    known = cache.lookup(before, kind)
+    if known is not None and (options.check is None or known.digest is not None):
+        if options.check is not None:
+            options.check(known.digest)
+        return known
+    with os.fdopen(handle, "rb", closefd=False) as f:
+        built = build_file(f, put, kind=kind, options=options)
+    # Changed while being read, what was read may be neither version: not remembered, so it is read again next time
+    if built.size == before.st_size and file_state(os.fstat(handle)) == file_state(before):
+        cache.remember(before, built)
+    return built
+
+
 def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], depth: int,
-                skip_hard_links: bool, options: BuildOptions) -> Built:
+                skip_hard_links: bool, options: BuildOptions, cache: FileCache | None = None) -> Built:
     """Build the open directory at path, which sits depth directories from the root (1 for the root)."""
     # Every directory level adds at least one DAG node, so this bounds the recursion before it gets deep
     if depth > constants.MAX_DEPTH:
@@ -537,7 +586,7 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
             if skip_hard_links and (links := hard_links(handle)):
                 warnings.append(f"skipped {shown}: {hard_link_reason(links)}")
                 continue
-            child = build_open(handle, st, child_path, put, warnings, depth + 1, skip_hard_links, options)
+            child = build_open(handle, st, child_path, put, warnings, depth + 1, skip_hard_links, options, cache)
         except Changed:
             # A directory walked by path, swapped when it was listed (see list_directory)
             warnings.append(f"skipped {shown}: it changed while being added")
