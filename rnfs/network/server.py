@@ -231,7 +231,44 @@ def progress_floor(bitrate: float | None, hops: int | None, config: Config) -> f
 
 
 class Response:
-    """A /blocks response in progress, holding a slot in one of the pools."""
+    """A /blocks response in progress, holding a slot in one of the pools.
+
+    Threads and locks. A response is touched by its request's handler thread (RNS starts one per request), the
+    next request's handler on the same link (_previous_done), the monitor thread (check_responses), RNS's threads
+    (the outgoing-Resource registration hook on the packet thread; the Resource's callback on the packet thread,
+    on a Resource's watchdog, on the thread RNS starts for a rejection's callback, or on whichever thread
+    cancelled it) and link-closed callbacks (_link_closed, on the thread that tore the link down). Python
+    assigns attributes atomically; what matters is who may write a field, under which lock, and in what order:
+    - link_id, request_id, pool and started: set at construction, never changed.
+    - grace, floor, interface and identity: set by ResponsePools.reserve under ResponsePools.lock, before the
+      response is visible to any other thread. grace is set again, with no lock, by the handler thread at
+      handover, dropping the pacing wait it covered until then: a reader sees one value or the other.
+    - size, deadline, due, find_until and untracked: written once each, with no lock, by the handler thread at
+      handover, size first and the others after it, before it returns the body (so before RNS can build the
+      Resource) and before it wakes the monitor. Readers take size None to mean not yet handed over and skip
+      the response (check_responses), so a reader that sees size set but an older deadline (inf) or
+      find_until (inf) only waits one more pass. requester is likewise set once by the handler, before _admit.
+    - sent and first_progress: written by the monitor thread only (note_progress), with no lock. Other threads
+      read them as a snapshot: a stale value only makes a response look slower than it is.
+    - grace_start and progress_at: moved forward only (max), with no lock, by the handler at handover, by
+      _attach (on the packet thread or the monitor) and, for progress_at, by the monitor. A lost update loses
+      at most the gap between two near-simultaneous "now"s.
+    - resource: set by _attach, with no lock, from the registration hook (packet thread) or the monitor's
+      poll, whichever sees the Resource first; both check it is still None and would attach the same
+      Resource, so a race only runs _hook twice, which installs the callback once (and _concluded runs once).
+    - idle: set under ResponsePools.lock when a newcomer displaces it (_displaceable), or with no lock by the
+      monitor (_check_progress) just before it cancels it, and read by the _cancel that follows. A displaced
+      response has left the pool, so only a monitor pass whose snapshot predates that can still reach it; both
+      then cancel it, which _finish makes harmless, and either one's idle decides the cooldown.
+    - finished and concluded: check-and-set under RequestServer.lock (_finish, _concluded), so each runs once
+      whichever thread gets there first. Read without the lock elsewhere as a hint: neither ever goes back to
+      False, so a stale False only means that thread's later _finish (or _concluded) call returns early.
+    - cost, charged and settled: written under RequestServer.lock (_admit, _charge_progress, _settle, and the
+      handler's settled=True for single-packet and untracked responses). Read without it by commitment() and
+      _committed() outside _admit, where a stale value only shifts an admission estimate.
+    - done: a threading.Event, set by _finish.
+    NW2's later steps (in a later release) give a response its own lock; until then, keep to these owners.
+    """
 
     def __init__(self, link_id: bytes, request_id: bytes, pool: str, started: float):
         """A response that has just taken a slot; its size and deadline follow once it's built."""
