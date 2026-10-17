@@ -391,7 +391,8 @@ class Lookup:
             results.put((node_id, reply))
 
         # Daemon threads rather than a ThreadPoolExecutor: a query hung past the deadline is abandoned
-        # and must not delay process exit. At most alpha run at a time per run.
+        # and must not delay process exit. A run waits for at most alpha at a time; retries of unreliable nodes
+        # run on top of those (each node once per run, every query within max_queries).
         threading.Thread(target=work, name="rnfs-lookup", daemon=True).start()
 
     def _clean(self, reply) -> tuple[list[bytes], list[bytes]] | None:
