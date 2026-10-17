@@ -626,7 +626,7 @@ class RnfsNode:
         """
         try:
             entries = list(RNS.Identity.known_destinations.items())
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no seeding if they fail
             return
         horizon = time.time() - 2 * self.config.announce_interval
         added = 0
@@ -638,7 +638,7 @@ class RnfsNode:
                 identity.load_public_key(entry[2])
                 if RNS.Destination.hash(identity, APP_NAME, DHT_ASPECT) == destination_hash:
                     added += self.routing.heard(bytes(destination_hash))
-            except Exception:
+            except Exception:  # noqa: BLE001 - one bad entry is skipped
                 continue
         if added:
             log(f"{plural(added, 'DHT server')} known from announces heard before", LOG_VERBOSE)
@@ -653,7 +653,7 @@ class RnfsNode:
             if self.reticulum is not None:
                 self._seed_routing()
             self.join()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - joining is retried; logged
             log(f"joining the DHT failed: {e!r}", LOG_ERROR)
         finally:
             self.joined.set()
@@ -664,7 +664,7 @@ class RnfsNode:
                 continue
             try:
                 self.join()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - joining is retried; logged
                 log(f"joining the DHT failed: {e!r}", LOG_ERROR)
             delay = min(2 * delay, self.config.announce_interval)
 
@@ -707,7 +707,7 @@ class RnfsNode:
             contacted.add(node_id)
             try:
                 reply = self.client.find(node_id, self.node_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - an unanswering bootstrap node is skipped
                 reply = None
             if reply is None:
                 log(f"bootstrap node {node_name(node_id)} didn't answer", LOG_VERBOSE)
@@ -750,7 +750,7 @@ class RnfsNode:
                 with builder.checking(self._hash_check()):
                     self.shared_folder.scan()
                 self.publisher.refresh()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the next scan tries again; logged
                 log(f"shared folder scan failed: {e!r}", LOG_ERROR)
         if now - last.get("save", now) >= SAVE_INTERVAL:
             last["save"] = now
@@ -863,7 +863,7 @@ class RnfsNode:
         while not self.stop_event.is_set():
             try:
                 self.maintain(time.monotonic(), last)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the maintenance thread keeps running; logged
                 log(f"maintenance failed: {e!r}", LOG_ERROR)
             self.stop_event.wait(1.0)
 
@@ -944,7 +944,7 @@ class RnfsNode:
         finally:
             try:
                 self._enforce_storage()
-            except Exception as e:  # never hide the fetch's own outcome
+            except Exception as e:  # noqa: BLE001 - never hide the fetch's own outcome
                 log(f"enforcing max_storage after a fetch failed: {e!r}", LOG_ERROR)
 
     def _record_fetch(self, fetch: Fetch, for_gateway: bool):
@@ -1490,7 +1490,7 @@ class RnfsNode:
             self.publisher.refresh()
         except RnfsError as e:
             log(f"remote pin of {cid} for {source} failed: {e}", LOG_WARNING)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - the pin waits for the next try; logged
             log(f"remote pin of {cid} for {source} failed: {e!r}", LOG_ERROR)
         finally:
             with self._lock:

@@ -2,6 +2,19 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.6 (unreleased)
+
+Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,
+0.1.4 and 0.1.3 nodes work together. The upgrade of an `<rnfs dir>` is automatic and one-way.
+
+Security:
+- The release workflow's Flatpak build no longer uses the GitHub Actions cache. Any workflow run on the default
+  branch can write that cache, and a poisoned one would have gone into the attested `.flatpak` bundle.
+
+Changed:
+
+Added:
+
 ## 0.1.5
 
 Performance work, a debug log, state kept in one SQLite database, deny lists, and a public API for apps. No

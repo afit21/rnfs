@@ -85,7 +85,7 @@ def parse_record(app_data) -> tuple[int, Cid] | None:
     app_data = bytes(app_data)
     try:
         value = umsgpack.unpackb(app_data)
-    except Exception:
+    except Exception:  # noqa: BLE001 - umsgpack raises several types for hostile bytes
         return None
     if not isinstance(value, list) or len(value) != 2:
         return None
@@ -340,7 +340,7 @@ class RnsNetwork:
                 return None
             emitted = RNS.Transport.timebase_from_random_blobs(entry[_PATH_RANDOM_BLOBS])
             return float(emitted) if type(emitted) is int and emitted > 0 else None
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
 
     def heard_time(self, name: bytes) -> float | None:
@@ -353,7 +353,7 @@ class RnsNetwork:
         try:
             entry = RNS.Identity.known_destinations.get(name)
             return float(entry[0]) if entry else None
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
 
 
@@ -745,7 +745,7 @@ class NameManager:
         while not stop_event.is_set():
             try:
                 delay = self.announce_due()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the announce thread keeps running; logged
                 log(f"name re-announce failed: {e}", LOG_ERROR)
                 delay = _MAX_LOOP_WAIT
             stop_event.wait(min(delay, _MAX_LOOP_WAIT))
@@ -874,7 +874,7 @@ class NameManager:
                 heard = self._network.heard_time(name)
                 if heard is not None and heard >= started:
                     break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - the resolve goes on with what is held; logged
             log(f"path request for name {name.hex()} failed: {e}", LOG_WARNING)
         finally:
             with self._lock:
@@ -888,7 +888,7 @@ class NameManager:
         """Offer the record RNS last stored for name (which may be a replay) to the sequence rules."""
         try:
             app_data = self._network.recall_app_data(name)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - the resolve goes on with what is held; logged
             log(f"could not recall name {name.hex()}: {e}", LOG_WARNING)
             return
         parsed = parse_record(app_data)
@@ -1119,7 +1119,7 @@ class NameManager:
         """Register alias's destination with its record as default app_data (so path responses carry it)."""
         try:
             destination = self._network.name_destination(self._keys[alias])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one name's failure doesn't stop the others; logged
             log(f"could not open name {alias}: {e}", LOG_ERROR)
             return
         self._destinations[alias] = destination
@@ -1138,7 +1138,7 @@ class NameManager:
         try:
             destination.set_default_app_data(encode_record(published.sequence, published.cid))
             destination.announce()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one name's failure doesn't stop the others; logged
             log(f"could not announce name {alias}: {e}", LOG_ERROR)
             return False
         log(f"announced name {self._names[alias].hex()} ({alias}), sequence {published.sequence}", LOG_VERBOSE)

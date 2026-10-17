@@ -27,7 +27,7 @@ def within(seconds: float, function, *args):
         """Call function, keeping its result or exception."""
         try:
             outcome.append(("result", function(*args)))
-        except BaseException as e:  # noqa: B902 - handed back to the test
+        except BaseException as e:  # handed back to the test
             outcome.append(("error", e))
 
     thread = threading.Thread(target=run, daemon=True)  # a hung call mustn't keep the test run alive

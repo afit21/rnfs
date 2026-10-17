@@ -148,6 +148,32 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertFalse([line for line in uploads if "--clobber" in line])
         self.assertRegex(text, r"actions/attest-build-provenance@[0-9a-f]{40}")
 
+    def test_e2e_step_runs_every_gated_module(self):
+        """Every test module gated on RNFS_E2E is run by the workflow's end-to-end step (else it never runs in CI)."""
+        step = re.search(r"(?m)^      - name: End-to-end tests.*\n(?:        .*\n)*?        run: >-\n((?:          .*\n)+)",
+                         read(os.path.join(WORKFLOWS, "tests.yml")))
+        self.assertTrue(step)
+        listed = set(step.group(1).split())
+        gated = set()
+        for top, _dirs, files in os.walk(os.path.join(REPO, "tests")):
+            for name in files:
+                path = os.path.join(top, name)
+                if name.endswith(".py") and path != os.path.abspath(__file__) and 'environ.get("RNFS_E2E")' in read(path):
+                    gated.add(os.path.relpath(path, REPO)[:-3].replace(os.sep, "."))
+        self.assertIn("tests.test_e2e", gated)
+        self.assertEqual(gated - listed, set())
+
+    def test_flatpak_builds_skip_the_actions_cache(self):
+        """Every flatpak-builder step turns the Actions cache off: a cache any workflow run can write must not
+        reach a release bundle."""
+        steps = 0
+        for name in os.listdir(WORKFLOWS):
+            text = read(os.path.join(WORKFLOWS, name))
+            for step in re.finditer(r"(?m)^( *)- uses: [^\n]*/flatpak-builder@.*\n((?:\1  .*\n)*)", text):
+                steps += 1
+                self.assertRegex(step.group(2), r"(?m)^ +cache: false$", f"{name}: {step.group(0)}")
+        self.assertTrue(steps)
+
     def test_release_waits_for_the_tests(self):
         """The release job needs the whole tests workflow, called from release.yml."""
         release = read(os.path.join(WORKFLOWS, "release.yml"))
@@ -178,7 +204,7 @@ class DependencyLockTest(unittest.TestCase):
         """The build locks are hashed, agree with each other and with requirements.lock, and fit pyproject.toml."""
         backend, tools, runtime = read_lock(BACKEND_LOCK), read_lock(TOOLS_LOCK), read_lock()
         self.assertEqual(list(backend), ["setuptools"])
-        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib", "ruff"):
+        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib", "ruff", "coverage"):
             self.assertIn(name, tools)
         self.assertEqual(backend["setuptools"], tools["setuptools"])
         for name, (version, hashes) in [*backend.items(), *tools.items()]:

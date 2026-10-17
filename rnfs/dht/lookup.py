@@ -341,7 +341,7 @@ class Lookup:
             started = self.clock()
             try:
                 reply = self._clean(self.query(node_id, self.key))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one broken node must not abort the lookup
                 reply = None  # one broken node must not abort the lookup
                 self.report(f"lookup for {self.key.hex()}: asking {_name(node_id)} raised {e!r}")
             else:
@@ -351,7 +351,7 @@ class Lookup:
                     else f"answered in {took:.1f}s: {len(reply[0])} providers, {len(reply[1])} nodes"))
             try:
                 (self.on_failure if reply is None else self.on_answer)(node_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - a caller's callback must not end the lookup
                 pass
             results.put((node_id, reply))
 

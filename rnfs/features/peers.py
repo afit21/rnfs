@@ -72,7 +72,7 @@ class PeersFeature(Feature):
         counters = self.traffic.peers()
         try:
             linked = set(node.client.open_links())
-        except Exception:
+        except Exception:  # noqa: BLE001 - a listing shows what it can
             linked = set()
         ids = [n for n in dict.fromkeys([*routing.nodes(), *linked, *reversed(list(counters))]) if n != node.node_id]
         peers = []
@@ -84,7 +84,7 @@ class PeersFeature(Feature):
             if node_id in linked:
                 try:
                     rate = node.client.rate_estimate(node_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - a listing shows what it can
                     rate = None
             peers.append({
                 "node_id": node_id.hex(),
@@ -122,7 +122,7 @@ class PeersFeature(Feature):
             if app_data is None:
                 return None
             return "server" if parse_mode(app_data) == MODE_SERVER else "client"
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
 
     def _recalled_heard(self, node_id: bytes) -> float | None:
@@ -133,7 +133,7 @@ class PeersFeature(Feature):
             import RNS
             entry = RNS.Identity.known_destinations.get(node_id)
             return float(entry[0]) if entry else None
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
 
     # API

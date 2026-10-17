@@ -373,7 +373,7 @@ def _decode_header(header: bytes) -> tuple[dict[bytes, bytes], bytes | None]:
     """{identity hash: wrapped key} and the sealed name of a strictly encoded header. Raises SealError."""
     try:
         value = umsgpack.unpackb(header)
-    except Exception:
+    except Exception:  # noqa: BLE001 - umsgpack raises several types for hostile bytes
         raise SealError("sealed file header isn't valid msgpack") from None
     if not (isinstance(value, list) and len(value) == 3):
         raise SealError("sealed file header must be [segment_size, recipients, name]")

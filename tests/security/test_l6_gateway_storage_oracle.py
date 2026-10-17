@@ -55,7 +55,7 @@ class NetworkNode(FakeNode):
         self.record("stored_head", target, length)
         try:
             path = self._path(target)
-        except Exception:  # noqa: BLE001 - "invalid" is None too, as for RnfsNode
+        except Exception:  # "invalid" is None too, as for RnfsNode
             return None
         obj = self.objects.get(path[-1])
         if obj is None or obj[0] != "file" or set(path) & self.remote:

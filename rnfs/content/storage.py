@@ -199,7 +199,7 @@ class _Writer:
         """Store one block on a writer thread, keeping the first error."""
         try:
             self._session._storage._put(cid, block, protected=True)
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001 - kept and raised on the caller's thread
             if self._error is None:
                 self._error = e
         finally:

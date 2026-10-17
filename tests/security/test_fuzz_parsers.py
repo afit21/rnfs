@@ -125,7 +125,7 @@ def unpacked(data: bytes):
     """(True, value) if data is msgpack umsgpack decodes, else (False, None): wire bytes as RNS hands them on."""
     try:
         return True, umsgpack.unpackb(data)
-    except Exception:  # noqa: BLE001 - anything umsgpack rejects never reaches a parser
+    except Exception:  # anything umsgpack rejects never reaches a parser
         return False, None
 
 
