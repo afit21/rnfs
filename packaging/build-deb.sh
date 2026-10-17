@@ -197,7 +197,8 @@ cat > "$ROOT/DEBIAN/postinst" <<'EOF'
 set -e
 if [ "$1" = configure ]; then
     # Byte-compile for the installed python3, so starting rnfs doesn't recompile on every run
-    python3 -m compileall -q -j 0 /opt/rnfs/lib >/dev/null 2>&1 || true
+    # -I: as root, so no module from the current directory or PYTHON* variables may be used
+    python3 -I -m compileall -q -j 0 /opt/rnfs/lib >/dev/null 2>&1 || true
 fi
 exit 0
 EOF

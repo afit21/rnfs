@@ -276,6 +276,10 @@ RestrictSUIDSGID=yes
 # is left out: libffi closures, which cffi (under cryptography) can use, may need writable executable memory.
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
+# ProtectSystem and PrivateTmp are left out: in a user unit they need unprivileged user namespaces, which some
+# systems turn off. Where that works, add them with the drop-in in contrib/rnfs.service.d/hardening.conf
+# (https://github.com/afit21/rnfs/blob/main/contrib/rnfs.service.d/hardening.conf). UMask is left out too: what
+# `rnfs get` writes gets its permissions from your umask.
 
 [Install]
 WantedBy=default.target
@@ -314,6 +318,13 @@ the main branch instead with --main."
         SOURCE=$REPO_URL/releases/download/$tag/rnfs-${tag#v}.tar.gz
         say "Installing rnfs $tag, the latest release"
     fi
+}
+
+warn_plain_http() {  # warn when SOURCE (from RNFS_SOURCE) is, or names, a plain http:// URL
+    case "$SOURCE" in
+        *[Hh][Tt][Tt][Pp]://*) warn "$SOURCE is fetched over plain http://, so anyone on the network path can replace
+what gets installed (no checksum or provenance is checked for RNFS_SOURCE). Use an https:// URL or a local file." ;;
+    esac
 }
 
 download() {  # download URL FILE: save URL's content as FILE
@@ -536,6 +547,7 @@ do_install() {
     check_launcher
     check_unit
     choose_source
+    warn_plain_http
     updating=no
     if venv_ok; then
         say "Updating rnfs in $VENV"

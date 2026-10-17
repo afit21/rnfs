@@ -312,7 +312,9 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   The branch has no checksums or provenance to check.
 - **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
   `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
-  `loginctl enable-linger $USER`.
+  `loginctl enable-linger $USER`. More sandboxing (`ProtectSystem`, `PrivateTmp`) needs unprivileged user
+  namespaces, so it is an optional drop-in, for this unit or the `.deb`'s:
+  [`contrib/rnfs.service.d/hardening.conf`](contrib/rnfs.service.d/hardening.conf) says how to add it.
 - **For all users:** run it as root with `--system`
   (`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sudo sh -s -- --system`).
   This installs to `/opt/rnfs` and `/usr/local/bin/rnfs`.
@@ -320,7 +322,8 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
 - `--force` replaces an existing `~/.local/bin/rnfs`, for example one installed by pipx.
 - `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the latest release (it
   overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
-  installed unpinned (newest), with a warning.
+  installed unpinned (newest), with a warning. Nothing checks what it downloads, so a plain `http://` URL
+  gets a warning too.
 
 ### pipx from GitHub
 
