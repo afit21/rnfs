@@ -76,6 +76,7 @@ ANNOUNCE_VALIDITY = 2
 _PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds its announces' random blobs
 _PATH_PACKET = 6  # RNS's IDX_PT_PACKET: where a path table entry holds the packet hash of the path's announce
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up
+REFRESHED_SIZE = 4096  # how many names' last network refresh a resolve remembers (E1), least recent forgotten first
 
 
 # Records and names
@@ -705,6 +706,11 @@ class NameManager:
         self._destinations: dict[str, object] = {}
         self._next_announce: dict[str, float] = {}  # alias -> monotonic time
         self._waiters: dict[bytes, list[threading.Event]] = {}
+        # A resolve's network refresh of each name (E1): when it last finished (monotonic) and whether a record was
+        # held after it, least recent first, at most REFRESHED_SIZE; and the refreshes running, which other
+        # resolves of the name wait for rather than refresh again
+        self._refreshed: OrderedDict[bytes, tuple[float, bool]] = OrderedDict()
+        self._refreshing: dict[bytes, threading.Event] = {}
         self._handler = NameAnnounceHandler(self._heard)
         self._started = False
         # The keepers feature (rnfs.features.keepers), if loaded: told of heard and published records, and asked
@@ -1067,8 +1073,9 @@ class NameManager:
 
         persist is True for the CLI and API (the highest sequence is then kept forever) and False for the gateway
         and LXMF auto-fetch (the record goes only into the bounded table, and its sequence into the bounded floor).
-        The network refresh, which can take path_timeout, is skipped for this node's own names and when the held
-        record was heard less than max_age seconds ago.
+        The network refresh, which can take path_timeout and then a keeper query, is skipped for this node's own
+        names, when the held record was heard less than max_age seconds ago, and when a refresh of the name ended
+        less than max_age ago (_shared_refresh). A resolve finding a refresh of the name running waits for it.
         """
         name = _check_name(name)
         self._offer_kept(name)
@@ -1080,7 +1087,7 @@ class NameManager:
             # This node's own names need no refresh, unless imported and not yet published here
             local = alias is not None and not self._published[alias].unsettled
         if not local and not fresh:
-            self._refresh_name(name, ask="if_unheard")
+            self._shared_refresh(name, max_age)
 
         # Again: the bounded table may have evicted it meanwhile, letting a replayed announce in
         self._offer_kept(name)
@@ -1101,6 +1108,49 @@ class NameManager:
         if save_floor:
             self._floor.save()
         return result
+
+    def _shared_refresh(self, name: bytes, max_age: float):
+        """A resolve's network refresh of name (_refresh_name, asking keepers if nothing was heard), shared (E1).
+
+        Skipped if one ended less than max_age ago (never for max_age 0, the CLI's), unless it left a record that
+        has gone since (the bounded table evicted it): with the owner offline, a keeper's record shows its old
+        emission time, so going by heard times alone every gateway request would refresh again. Nothing found
+        counts too, a short negative cache. A refresh leaving a suspected replay (DHT-2) isn't remembered.
+        Resolves of a name being refreshed wait for that refresh, whatever their max_age, then each takes the
+        record held. Called without the lock."""
+        with self._lock:
+            if max_age > 0 and self._refreshed_within(name, max_age):
+                return
+            running = self._refreshing.get(name)
+            if running is None:
+                running = self._refreshing[name] = threading.Event()
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            running.wait()
+            return
+        suspect = True  # a refresh that raised isn't remembered
+        try:
+            suspect = self._refresh_name(name, ask="if_unheard")
+        finally:
+            with self._lock:
+                del self._refreshing[name]
+                if not suspect:
+                    self._refreshed.pop(name, None)
+                    self._refreshed[name] = (self._monotonic(), self._record(name, touch=False) is not None)
+                    while len(self._refreshed) > REFRESHED_SIZE:
+                        self._refreshed.popitem(last=False)
+            running.set()
+
+    def _refreshed_within(self, name: bytes, max_age: float) -> bool:
+        """True if a refresh of name ended less than max_age ago, and the record it left (if any) is still held.
+        Lock held."""
+        refreshed = self._refreshed.get(name)
+        if refreshed is None:
+            return False
+        at, found = refreshed
+        return 0 <= self._monotonic() - at < max_age and (not found or self._record(name, touch=False) is not None)
 
     def _refresh_name(self, name: bytes, *, ask: str) -> bool:
         """Ask the network for name's newest record (_refresh), then keepers, offering what they answer. ask is

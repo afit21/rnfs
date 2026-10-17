@@ -963,6 +963,13 @@ the name through the network and asks keepers (below), since the key's earlier r
   announce cache, which holds the announces paths were taken from). Its record is heard no later than its own
   emission time, or the path's if its own is no longer known, and the resolve asks keepers. Without a path
   nothing is compared.
+- A resolve that accepts a record up to some age (the gateway's 60 s, a follow's or deny list's
+  2 × `announce_interval`) skips the refresh while the record held was heard within that age, or while a
+  refresh of the name ended within it and the record it left is still held (rnfs: one that found nothing
+  counts too, a short negative cache; one that left a suspected replay doesn't). With the owner offline a
+  keeper's record keeps its old emission time, so it would otherwise go to the network every time. A resolve
+  of a name being refreshed waits for that refresh, whatever age it accepts, and takes the record it leaves.
+  A name republished moments ago may so show its older record on the gateway for up to 60 s.
 
 **Sequence.** RNS stores any validly signed announce, including a replayed old one, so persisted sequences are
 what prevent rollback.

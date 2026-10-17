@@ -790,6 +790,7 @@ class ResolveTest(NamesTestCase):
         name = other_name(1)
         self.network.announce(name, encode_record(1, CID_A), self.clock.now)
         self.manager.resolve(name, persist=True)
+        self.clock.now += 60  # past the first resolve's refresh, which a resolve reuses for max_age (E1)
         with self.manager._lock:  # as loaded from a record saved while the clock ran ahead
             self.manager._held[name] = names.Record(1, CID_A, self.clock.now + 10**6)
         self.network.path_requests.clear()
@@ -809,6 +810,115 @@ class ResolveTest(NamesTestCase):
         """Names must be 16 bytes."""
         with self.assertRaises(ValueError):
             self.manager.resolve(b"short", persist=False)
+
+
+class RefreshCacheTest(NamesTestCase):
+    """A resolve's network refresh is reused for max_age and shared by the resolves running alongside it (E1): a
+    name whose owner is offline, with keepers answering."""
+
+    AGE = 60.0  # the gateway's max_age (node.GATEWAY_NAME_AGE)
+
+    def setUp(self):
+        """A started manager with keepers holding sequence 4; RNS remembers the owner's last announce, of 3,
+        emitted two days ago (it never shows current)."""
+        super().setUp()
+        self.manager.start()
+        self.name = other_name(1)
+        emitted = self.clock.now - 2 * 24 * 3600
+        self.network.store(self.name, encode_record(3, CID_A), emitted, emitted=emitted)
+        self.keepers = self.manager.keepers = FakeKeepers()
+        self.keepers.answers[self.name] = [(4, CID_B, emitted + 10)]
+
+    def gateway(self) -> dict | None:
+        """A gateway resolve."""
+        return self.manager.resolve(self.name, persist=False, max_age=self.AGE)
+
+    def work(self) -> tuple[int, int]:
+        """(path requests, keeper queries) so far."""
+        return len(self.network.path_requests), len(self.keepers.queried)
+
+    def test_gateway_resolves_reuse_a_refresh_for_max_age(self):
+        """Gateway resolves within max_age of a refresh go to neither the network nor keepers; after it they do."""
+        for _ in range(5):
+            self.assertEqual(self.gateway()["sequence"], 4)
+            self.clock.now += self.AGE / 5 - 1
+        self.assertEqual(self.work(), (1, 1))
+        self.clock.now += 5
+        self.assertEqual(self.gateway()["sequence"], 4)
+        self.assertEqual(self.work(), (2, 2))
+
+    def test_cli_resolves_always_refresh(self):
+        """A resolve with max_age 0 (the CLI's) never reuses a refresh, nor does it leave one the gateway can't."""
+        for _ in range(3):
+            self.assertEqual(self.manager.resolve(self.name, persist=True)["sequence"], 4)
+        self.assertEqual(self.work(), (3, 3))
+        self.assertEqual(self.gateway()["sequence"], 4)
+        self.assertEqual(self.work(), (3, 3))
+
+    def test_nothing_found_is_reused_too(self):
+        """A name nothing answers for resolves to None, and again to None without the network for max_age."""
+        self.keepers.answers.clear()
+        self.network.app_data.clear()
+        self.assertIsNone(self.gateway())
+        self.assertIsNone(self.gateway())
+        self.assertEqual(self.work(), (1, 1))
+
+    def test_a_record_evicted_since_is_looked_for_again(self):
+        """A refresh that found a record isn't reused once the bounded table has dropped it."""
+        self.assertEqual(self.gateway()["sequence"], 4)
+        for i in range(2, 2 + self.config.name_table_size):
+            self.manager.offer(other_name(i), 1, CID_A, self.clock.now)
+        self.assertIsNone(self.manager.record(self.name))
+        self.assertEqual(self.gateway()["sequence"], 4)
+        self.assertEqual(self.work(), (2, 2))
+
+    def test_a_suspected_replay_is_not_reused(self):
+        """A refresh leaving a record that is a suspected replay (DHT-2: older than the path's announce) isn't
+        reused, so each resolve asks keepers again."""
+        self.keepers.answers.clear()
+        self.network.store(self.name, encode_record(3, CID_A), self.clock.now, emitted=self.clock.now - 3600)
+        self.network.emitted[self.name] = self.clock.now - 60  # the path holds a newer announce
+        for _ in range(3):
+            self.assertEqual(self.gateway()["sequence"], 3)
+        self.assertEqual(self.work(), (3, 3))
+
+    def test_simultaneous_resolves_share_one_refresh(self):
+        """Resolves of a name being refreshed, the CLI's included, wait for that refresh and take its record: one
+        path request and one keeper query for all of them. Each persists as it asked."""
+        gate = threading.Lock()
+        gate.acquire()
+        keepers = self.keepers
+        real_query = keepers.query
+
+        def query(name):
+            """The keepers' answer, once the test opens the gate."""
+            with gate:
+                return real_query(name)
+
+        keepers.query = query
+        joined, real_wait = [], threading.Event.wait
+
+        def wait(event, timeout=None):
+            """Event.wait, noting a resolve waiting for a refresh running."""
+            if event in self.manager._refreshing.values():
+                joined.append(event)
+            return real_wait(event, timeout)
+
+        results = {}
+        persist = {i: i == 0 for i in range(8)}  # resolve 0 is the CLI's; the rest the gateway's
+        threads = [threading.Thread(target=lambda i=i: results.__setitem__(i, self.manager.resolve(
+            self.name, persist=persist[i], max_age=0.0 if persist[i] else self.AGE))) for i in range(8)]
+        with mock.patch.object(threading.Event, "wait", wait):
+            for thread in threads:
+                thread.start()
+            wait_for(lambda: len(joined) == 7, what="seven resolves waiting for the eighth's refresh")
+            gate.release()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(self.work(), (1, 1))
+        self.assertEqual({i: result["sequence"] for i, result in results.items()}, {i: 4 for i in range(8)})
+        self.assertEqual(self.manager._held[self.name].sequence, 4)  # the CLI's resolve persisted it
+        self.assertEqual(self.manager._refreshing, {})
 
 
 class StateTest(NamesTestCase):
