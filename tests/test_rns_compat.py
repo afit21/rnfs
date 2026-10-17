@@ -159,8 +159,12 @@ INTERNALS = [
                               "random_blobs.append(random_blob)",
                               "path_table_entry = [now, received_from, announce_hops, expires, random_blobs, "
                               "packet.receiving_interface, packet.packet_hash]"))),
-    Internal("node_content.py", "Identity.recall(hash, from_identity_hash=, _no_use=), raising AttributeError "
-             "without a Reticulum instance unless _no_use", lambda: _recall()),
+    Internal("node_content.py, node.py, features/peers.py, network/links.py",
+             "Identity.recall(hash, from_identity_hash=, _no_use=), raising AttributeError without a Reticulum "
+             "instance unless _no_use (read-only checks pass _no_use=True so they don't mark the destination used)",
+             lambda: _recall()),
+    Internal("features/peers.py", "Identity.recall_app_data(hash, _no_use=)",
+             lambda: _params(RNS.Identity.recall_app_data, "_no_use")),
     Internal("features/keepers.py", "Transport.get_cached_packet(packet_hash, packet_type=\"announce\") and the "
              "signed announce in it: public key, name hash, random hash (emission time in its last 5 bytes), "
              "ratchet, signature, app_data", lambda: _cached_announce()),
@@ -178,6 +182,12 @@ INTERNALS = [
                       _has(RNS.Transport, "hops_to", "next_hop_interface"),
                       _has(RNS.Reticulum, "get_next_hop_if_name", "get_instance", "configdir"),
                       _assigns(RNS.Reticulum.__init__, "is_connected_to_shared_instance"))),
+    Internal("mesh.py", "Reticulum.get_path_table() entries {hash, interface}, interface being the str() of the "
+             "interface that get_next_hop_if_name gives (RnsPaths.infos)",
+             lambda: (_source(RNS.Reticulum.get_path_table, "'hash': dst_hash",
+                              "'interface': str(RNS.Transport.path_table[dst_hash][5])"),
+                      _source(RNS.Reticulum.get_next_hop_if_name,
+                              "return str(RNS.Transport.next_hop_interface(destination))"))),
     Internal("mesh.py, network/rates.py", "Reticulum.get_interface_stats() {\"interfaces\": [{name, short_name, "
              "type, status, bitrate}]}, with LocalServerInterface and LocalClientInterface types",
              lambda: (_source(RNS.Reticulum.get_interface_stats, "ifstats['name'] = str(interface)",
