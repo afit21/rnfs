@@ -1562,7 +1562,8 @@ unreserved, pct-encoded: as in RFC 3986
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or
-  removing the message stops a fetch in progress. The fetch is refused if the target's verified size plus what
+  removing the message stops a fetch in progress. A waiting link whose sender is no longer in
+  `lxmf_auto_fetch_from` is refused, not fetched: at the next start (with LXMF off too) and when its turn comes. The fetch is refused if the target's verified size plus what
   that source already pins would exceed `lxmf_auto_fetch_quota`, or if the blocks of its DAG would (as for
   remote pins, section 8); `max_download_size` applies too. A `name/` link is resolved without persisting
   the name's sequence (only the capped table of section 9 holds it), so names arriving unasked don't grow

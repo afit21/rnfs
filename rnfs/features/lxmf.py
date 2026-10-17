@@ -692,6 +692,11 @@ def _valid_outbox_entry(entry: dict) -> bool:
             and _valid_links(entry.get("links")) and all(_str_or_none(entry.get(key)) for key in ("text", "error")))
 
 
+def _unlisted() -> dict:
+    """The auto-fetch result of a link whose sender was taken off lxmf_auto_fetch_from before it was fetched."""
+    return {"state": "refused", "error": "the sender is no longer in lxmf_auto_fetch_from"}
+
+
 def _holds_pins(entry: dict) -> bool:
     """Whether an inbox record has auto-fetched pins, or is about to (queued): a flood mustn't release them."""
     return any(isinstance(a, dict) and a.get("state") in ("queued", "pinned") for a in entry.get("auto") or [])
@@ -844,6 +849,7 @@ class LxmfFeature(features.Feature):
                     self.outbox.update(entry["id"], state="failed",
                                        error="the daemon stopped before it was delivered")
             self._release_unrecorded()
+            self._refuse_unlisted()
         except BaseException:
             self.close()
             raise
@@ -877,6 +883,17 @@ class LxmfFeature(features.Feature):
                     self.node.storage.unpin(cid, LXMF_PREFIX + sender)
                 except OSError as e:  # e.g. a read-only state directory: tried again at the next start
                     _log(f"could not release {cid}: {e}", LOG_ERROR)
+
+    def _refuse_unlisted(self):
+        """Mark "refused" the auto-fetches still queued for senders no longer in lxmf_auto_fetch_from: the user took
+        them off the list since, and a queued link holds its message in the inbox like a pin. Runs whether or not
+        LXMF then starts."""
+        for entry in self.inbox.entries():
+            if entry.get("from") in self.auto_fetch_from:
+                continue
+            for index, result in enumerate(entry.get("auto") or []):
+                if isinstance(result, dict) and result.get("state") == "queued":
+                    self._set_auto(entry["id"], index, _unlisted())
 
     def _record_kept(self, sender: str, cids: list[Cid]):
         """Keep sender's lxmf: pins of cids, which an inbox that didn't load whole doesn't record: add an inbox
@@ -1428,6 +1445,8 @@ class LxmfFeature(features.Feature):
         """Queue again, oldest first, the auto-fetches still "queued" when the daemon stopped (also one that
         was running then): the queue itself isn't saved, and a queued record is never dropped for others."""
         for entry in self.inbox.entries():
+            if entry.get("from") not in self.auto_fetch_from:
+                continue  # refused at construction (_refuse_unlisted)
             for index, result in enumerate(entry.get("auto") or []):
                 if isinstance(result, dict) and result.get("state") == "queued":
                     self._queue_auto_fetch(entry["id"], index, entry["from"])
@@ -1469,12 +1488,17 @@ class LxmfFeature(features.Feature):
         The sender is trusted, so a name link whose name can't be resolved falls back to the CID it was sent with;
         the result then records "sent_cid": true, which the inbox listing shows. The fetch stops (within
         fetcher.POLL) when the node stops, leaving the link queued for the next start, or when the message is
-        removed."""
+        removed. A sender taken off lxmf_auto_fetch_from while the link waited is refused."""
         from rnfs import fetcher
         from rnfs.content.storage import LXMF_PREFIX
         from rnfs.errors import Denied, InvalidDag, RnfsError, StorageFull, TooLarge
         entry = self.inbox.get(entry_id)
         if entry is None:
+            return
+        if entry.get("from") not in self.auto_fetch_from:  # taken off the list while the link waited
+            _log(f"auto-fetch of inbox #{entry_id} link {index + 1}: refused: the sender is no longer in "
+                 f"lxmf_auto_fetch_from", LOG_NOTICE)
+            self._set_auto(entry_id, index, _unlisted())
             return
         observer = fetcher.Observer()
         observer.cancelled = lambda: self._stop.is_set() or self.inbox.get(entry_id) is None
