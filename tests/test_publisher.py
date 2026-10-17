@@ -869,6 +869,18 @@ class PublisherTest(unittest.TestCase):
         restarted.refresh()
         self.assertEqual(restarted.publish_due()["published"], [])
 
+    def test_saves_are_one_transaction_not_durable(self):
+        """A save writes published, published_earlier and withdrawals in one transaction, not durably (NORMAL)."""
+        cid = self.pinned(b"normal")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.storage.unpin(cid, USER)
+        real = self.publisher._db.transaction
+        with mock.patch.object(self.publisher._db, "transaction", side_effect=real) as opened:
+            self.publisher.refresh()  # the item's rows deleted and its withdrawals queued, in one save
+        self.assertEqual([call.args for call in opened.call_args_list], [(False,)])
+        self.assertEqual(self.saved(), self.held(self.publisher))
+
 
 if __name__ == "__main__":
     unittest.main()
