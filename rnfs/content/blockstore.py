@@ -115,7 +115,7 @@ class BlockStore:
                 if entry.name.startswith(PARTIAL_PREFIX):
                     continue
                 try:
-                    cid = Cid.parse(entry.name)
+                    cid = Cid.from_block_name(entry.name)
                     if entry.is_file(follow_symlinks=False):
                         yield cid, entry.stat(follow_symlinks=False).st_size
                 except (ValueError, OSError):

@@ -17,7 +17,9 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   `close()`).
 - `rnfs/content/cid.py` — `Cid` (binary form `.binary`, `.codec` `RAW`/`DAG`, `.key` DHT key, `.verify(block)`,
   `str()` written form, `Cid.parse`, `Cid.from_bytes`, `Cid.for_block`). Code passes `Cid` objects everywhere;
-  strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire.
+  strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire. `Cid.from_block_name` is the
+  block store's scan at startup: it accepts exactly what `parse` accepts, but checks the canonical form with one
+  regular expression and decodes with `int(..., 32)` instead of re-encoding, keeping the name as the written form.
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
   `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set
