@@ -2,7 +2,7 @@
 permanently pin an unbounded DAG, bypassing the page's 200 KB MAX_SIZE check. A file root may truthfully
 declare 1 byte while carrying many zero-size children (L3: no reader rejects size-0 file-node children). The
 page's size_of() read that declared 1 byte, so the MAX_SIZE check passed; `pin add` then fetched the whole
-DAG with no max_dag_bytes and pinned it USER (node.py:821-826), bounded only by the disk reserve.
+DAG with no max_dag_bytes and pinned it USER (RnfsNode.pin_add), bounded only by the disk reserve.
 
 The tests run the page's real script against an offline victim that could fetch the crafted DAG from an
 offline provider, and assert the node did not store far more than MAX_SIZE: for a visitor's CID (which the
@@ -19,7 +19,7 @@ from rnfs.constants import MAX_BLOCK_SIZE
 from rnfs.content.storage import USER
 from tests.security import _pages_helpers as helpers
 
-MAX_SIZE = 200 * 1024  # display-mu-file index.mu:18
+MAX_SIZE = 200 * 1024  # display-mu-file's MAX_SIZE
 OVERHEAD = MAX_BLOCK_SIZE  # generous per-view slack: even one extra full block stays well under the bomb
 
 _saved_loglevel = RNS.loglevel

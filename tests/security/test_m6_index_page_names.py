@@ -1,6 +1,6 @@
 """M6: the file-index-node page publishes sealed files' plaintext names and pins that didn't come from the
 operator. Spec section 5 promises a sealed file's name stays confidential, yet a sealed add records its
-plaintext path/seal_name (node.py:650, 669) and the page prints the basename to every visitor; a directory
+plaintext path/seal_name (RnfsNode.add_path and add_stream) and the page prints the basename to every visitor; a directory
 pinned from a contact (remote:/lxmf:/follow:) always gets a name from _pin_shape, so it is shown too.
 
 The page's own entry() is run over the real pin_ls() of an offline node (JSON round-tripped, as the page
