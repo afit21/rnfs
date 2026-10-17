@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 from rnfs.config import Config
-from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
+from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K, MISSED_ANNOUNCES
 
 AVOID_AFTER = 300.0  # seconds an unreliable node isn't retried after max_failures failed queries in a row ...
 AVOID_MAX = 3600.0  # ... doubling with each further failure up to this
@@ -79,8 +79,8 @@ class RoutingTable:
 
     @property
     def _silence_limit(self) -> float:
-        """Silence after which a node is presumed gone: it missed two announces."""
-        return 2 * self.config.announce_interval
+        """Silence after which a node is presumed gone: it missed MISSED_ANNOUNCES (two) announces."""
+        return MISSED_ANNOUNCES * self.config.announce_interval
 
     def bucket_index(self, node_id: bytes) -> int:
         """Index of the bucket node_id belongs in: i for distance in [2^i, 2^(i+1)). ValueError for own_id."""

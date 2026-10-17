@@ -41,7 +41,7 @@ from RNS.vendor import umsgpack
 
 from rnfs import fsutil, ids, statedb
 from rnfs.config import Config
-from rnfs.constants import APP_NAME, ID_LENGTH, NAME_ASPECT
+from rnfs.constants import APP_NAME, ID_LENGTH, MISSED_ANNOUNCES, NAME_ASPECT
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, log
@@ -72,7 +72,7 @@ _MAX_USED = 2**62  # floor rows' used values stay below this, so the ones after 
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
 # An announce shows its record current for this many announce_intervals after it was emitted, however recently
 # it was heard: RNS remembers a replayed announce as just heard (_announce_heard)
-ANNOUNCE_VALIDITY = 2
+ANNOUNCE_VALIDITY = MISSED_ANNOUNCES
 _PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds its announces' random blobs
 _PATH_PACKET = 6  # RNS's IDX_PT_PACKET: where a path table entry holds the packet hash of the path's announce
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up

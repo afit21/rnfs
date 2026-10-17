@@ -5,7 +5,9 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 
 ## Shared foundation
 
-- `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes.
+- `rnfs/constants.py` — protocol constants (spec section 12), request paths, aspects, DHT modes, and
+  `MISSED_ANNOUNCES` (2): the announces a node or name may miss before the routing table, name resolves, follows
+  and deny lists count it gone or stale (`2 × announce_interval` in the spec).
 - `rnfs/config.py` — `Config`: every local setting (section 12), paths under `<rnfs dir>`, and the `effective_*`
   helpers for settings that depend on slow nodes or links. Loaded from `<rnfs dir>/rnfs.toml` plus command-line
   overrides (and `defaults` beneath the file: an embedded node's); `validate()` checks every core setting's type and
@@ -169,7 +171,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 ## Content layer interfaces
 
 `dag.py`
-- `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`.
+- `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`, and `KIND_NAMES`
+  (`file`, `executable`, `directory`: how `ls` shows them).
 - Frozen dataclasses `Child(cid, size)`, `Entry(name, cid, size, kind)`, `IndexChild(first_name, cid, size)`;
   nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`, each with `child_cids` (the CIDs it
   lists, in order) and `names` (its entries' names or children's first names; none for a file node).

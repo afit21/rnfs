@@ -39,7 +39,8 @@ import RNS
 
 from rnfs import __version__, denylist, features, fsutil, statedb, winacl
 from rnfs.config import LOCK_FILE, Config
-from rnfs.constants import APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MODE_SERVER, PARTIAL_SUFFIX
+from rnfs.constants import (APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MISSED_ANNOUNCES, MODE_SERVER,
+                            PARTIAL_SUFFIX)
 from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
@@ -81,7 +82,6 @@ NOT_SEALED_MEMO = 4096
 # past it are read each time
 PIN_MEMO = 16384
 _UNOPENED = object()  # _read's opened when nothing has been opened yet
-KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
 
 def import_fetched(value: list, tx) -> int:
@@ -850,7 +850,8 @@ class RnfsNode:
         return self.config.private and not self._is_member_publisher(node_id)
 
     def _seed_routing(self):
-        """Add servers whose announces RNS heard (and cached) within 2 × announce_interval, before a restart.
+        """Add servers whose announces RNS heard (and cached) within MISSED_ANNOUNCES (2) × announce_interval
+        (the routing table's silence limit), before a restart.
 
         RNS internal (Identity.known_destinations: hash -> [time heard, packet hash, public key, app_data, ...]);
         skipped if it isn't there. Each is checked to be an rnfs.dht destination of the announced key.
@@ -859,7 +860,7 @@ class RnfsNode:
             entries = list(RNS.Identity.known_destinations.items())
         except Exception:  # noqa: BLE001 - RNS internals: no seeding if they fail
             return
-        horizon = time.time() - 2 * self.config.announce_interval
+        horizon = time.time() - MISSED_ANNOUNCES * self.config.announce_interval
         added = 0
         for destination_hash, entry in entries:
             try:
@@ -1468,7 +1469,7 @@ class RnfsNode:
             if walker.kind_of(expect, fetch.get(expect)) != walker.DIRECTORY_TYPE:
                 raise ValueError(f"{target} is not a directory")
             fetch.fetch_listing(expect)
-            return [{"name": entry.name, "kind": KIND_NAMES[entry.kind], "size": entry.size, "cid": str(entry.cid)}
+            return [{"name": entry.name, "kind": dag.KIND_NAMES[entry.kind], "size": entry.size, "cid": str(entry.cid)}
                     for entry in walker.list_directory(expect, fetch.get, self.config.max_output_entries)]
 
     def stat(self, target: str) -> dict:
