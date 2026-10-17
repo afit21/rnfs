@@ -1,6 +1,7 @@
 """Tests for the state database (rnfs.statedb): opening and checking it, transactions, references, and the
 migration of the JSON state files earlier versions wrote."""
 import builtins
+import hashlib
 import json
 import os
 import sqlite3
@@ -14,6 +15,11 @@ import RNS
 from rnfs import statedb
 from rnfs.errors import RnfsError
 from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
+
+# The schema steps rnfs 0.1.5 released: a database 0.1.5 wrote has them already, so an edit to one would never
+# reach it. Never change this digest: append a step instead.
+RELEASED_0_1_5 = "50bd4ec20bbf10e408a9313cb168d35915af0f9d2afcf850d812dd1a7b7fb72b"
+RELEASED_0_1_5_STEPS = 16
 
 _saved_loglevel = RNS.loglevel
 
@@ -102,6 +108,43 @@ class OpenTest(StateDbTest):
         self.assertEqual(db.query("PRAGMA user_version"), [(len(statedb.SCHEMA),)])
         self.assertEqual(db.query("SELECT cid, source FROM pins"), [(b"x", "user")])
         self.assertEqual(db.query("SELECT count(*) FROM lxmf_messages"), [(0,)])
+
+    def test_released_steps_are_unchanged(self):
+        """The steps 0.1.5 released are exactly as released (statedb.SCHEMA's comment): new steps are appended."""
+        released = statedb.SCHEMA[:RELEASED_0_1_5_STEPS]
+        self.assertTrue(all(isinstance(step, str) for _, steps in released for step in steps))
+        digest = hashlib.sha256(json.dumps([[label, list(steps)] for label, steps in released]).encode()).hexdigest()
+        self.assertEqual(digest, RELEASED_0_1_5)
+
+    def test_callable_step_runs_in_the_upgrade_transaction(self):
+        """A step's callable gets the upgrade's transaction: its writes commit with the step, and a raise rolls the
+        whole step back (user_version included) and stops startup."""
+        calls = []
+
+        def copy_pins(tx):
+            calls.append(tx)
+            tx.execute("INSERT INTO extra (cid) SELECT cid FROM pins")
+
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:2]):
+            db = statedb.connect(self.state)
+            with db.transaction() as tx:
+                tx.execute("INSERT INTO pins (cid, source) VALUES (?, ?)", (b"x", "user"))
+            db.close()
+        extra = ("extra", ("CREATE TABLE extra (cid BLOB PRIMARY KEY) WITHOUT ROWID", copy_pins))
+
+        def failing(tx):
+            raise RuntimeError("migration failed")
+
+        with mock.patch.object(statedb, "SCHEMA", (*statedb.SCHEMA[:2], ("broken", (
+                "CREATE TABLE broken (x)", failing)))), self.assertRaises(RuntimeError):
+            statedb.connect(self.state)
+        self.assertEqual(state_rows(self.state, "PRAGMA user_version"), [(2,)])
+        self.assertEqual(state_rows(self.state, "SELECT name FROM sqlite_master WHERE name = 'broken'"), [])
+        with mock.patch.object(statedb, "SCHEMA", (*statedb.SCHEMA[:2], extra)):
+            self.connect().close()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state_rows(self.state, "PRAGMA user_version"), [(3,)])
+        self.assertEqual(state_rows(self.state, "SELECT cid FROM extra"), [(b"x",)])
 
     def test_file_that_isnt_a_database_stops_startup(self):
         """A file that isn't an SQLite database is refused with what to do, and left as it was."""

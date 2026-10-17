@@ -1,0 +1,1382 @@
+{
+ "now": 1792141200.0,
+ "settings": {
+  "deny_lists": [
+   "bafkreifuszzqadwxrcdl3baszyh4qizgboeanf4vfm6ly6p4vnsgonvoma"
+  ],
+  "lookup_timeout": 2,
+  "lxmf_auto_fetch_from": [
+   "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+  ],
+  "max_records": 40,
+  "path_timeout": 2,
+  "remote_pin_identities": [
+   "0123456789abcdef0123456789abcdef"
+  ],
+  "slow": "no"
+ },
+ "tables": {
+  "cache": [
+   [
+    {
+     "blob": "015512202a5740f76cb8e47558a10cd85a03f563be8da273306a54594ec4535f210d949b"
+    },
+    "[]",
+    {
+     "blob": "015512202a5740f76cb8e47558a10cd85a03f563be8da273306a54594ec4535f210d949b"
+    },
+    5
+   ],
+   [
+    {
+     "blob": "01551220bb062752be144924cc42d662cf9c6d5ab7cc5c5be4ca26eb8596c9a8a98f7c1b"
+    },
+    "[]",
+    {
+     "blob": "01551220bb062752be144924cc42d662cf9c6d5ab7cc5c5be4ca26eb8596c9a8a98f7c1b"
+    },
+    8
+   ],
+   [
+    {
+     "blob": "01551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f"
+    },
+    "[]",
+    {
+     "blob": "01551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f"
+    },
+    6
+   ],
+   [
+    {
+     "blob": "01551220e48a9a8c088f18f129cbe714d52cbe2f262020efa62392f9698203f0cf5f9eca"
+    },
+    "[]",
+    {
+     "blob": "01551220e48a9a8c088f18f129cbe714d52cbe2f262020efa62392f9698203f0cf5f9eca"
+    },
+    7
+   ],
+   [
+    {
+     "blob": "01551220f5130ee371cf7fc477243e10005c9ff101a67322e18e45099b9a22377282ba6c"
+    },
+    "[]",
+    {
+     "blob": "01551220f5130ee371cf7fc477243e10005c9ff101a67322e18e45099b9a22377282ba6c"
+    },
+    0
+   ],
+   [
+    {
+     "blob": "018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d"
+    },
+    "[]",
+    {
+     "blob": "018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d"
+    },
+    4
+   ],
+   [
+    {
+     "blob": "018080c00112209794acef0b890c1785d26330a941725abb059635df25d5831a9c786f085e6fae"
+    },
+    "[\"café.txt\"]",
+    {
+     "blob": "015512204b5c2fdf195a98c4819c1b0991f08ac2771feaeb884f555c32b0e8ef61975f01"
+    },
+    9
+   ],
+   [
+    {
+     "blob": "018080c00112209794acef0b890c1785d26330a941725abb059635df25d5831a9c786f085e6fae"
+    },
+    "[\"Ελληνικά\", \"αρχείο.txt\"]",
+    {
+     "blob": "0155122024a8cef76b030c400a45a986ed3ca0025864c83e14c1fcd992402fd6c7549cac"
+    },
+    3
+   ],
+   [
+    {
+     "blob": "018080c00112209794acef0b890c1785d26330a941725abb059635df25d5831a9c786f085e6fae"
+    },
+    "[\"日本語\", \"メモ.md\"]",
+    {
+     "blob": "01551220350b6a3eac2aff841d8a1bedbffb6bba0f14e881893b79af5b1bba71aab5fec4"
+    },
+    2
+   ],
+   [
+    {
+     "blob": "018080c00112209794acef0b890c1785d26330a941725abb059635df25d5831a9c786f085e6fae"
+    },
+    "[]",
+    {
+     "blob": "018080c00112209794acef0b890c1785d26330a941725abb059635df25d5831a9c786f085e6fae"
+    },
+    1
+   ]
+  ],
+  "contacts": [
+   [
+    "alice",
+    "name",
+    {
+     "blob": "bcc7900726de195e4cc4b09e67f02966"
+    }
+   ],
+   [
+    "bob",
+    "lxmf",
+    {
+     "blob": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+    }
+   ],
+   [
+    "relay.1",
+    "node",
+    {
+     "blob": "10101010101010101010101010101010"
+    }
+   ]
+  ],
+  "deny_entries": [
+   [
+    "bafkreig5r66w4f7qbtvtsqwwlfvfql6cmsnhp42vymrhjfiwhtestirgie",
+    1792235740.439997
+   ],
+   [
+    "sha256:b4c04cf45324f820d1061ae8f3955b3c5f9d4079553d52e6624dcc9386879bcb",
+    1792235740.439997
+   ]
+  ],
+  "deny_hashes": [
+   [
+    {
+     "blob": "018080c00112204049843d091df303313be2a6b054a172c90ccf64856626f28508897f3763c63a"
+    },
+    {
+     "blob": "1a82694689881e1a2d798d52132fe43d091a5236d063c603b151f1a2ea7d9c65"
+    },
+    0
+   ]
+  ],
+  "deny_lists": [
+   [
+    "\"bafkreifuszzqadwxrcdl3baszyh4qizgboeanf4vfm6ly6p4vnsgonvoma\"",
+    {
+     "blob": "01551220b49673000ed78886bd8412ce0fc823260b880697952b3cbc79fcab646736ae60"
+    },
+    1792235740.4456954
+   ]
+  ],
+  "fetched": [
+   [
+    {
+     "blob": "0155122024a8cef76b030c400a45a986ed3ca0025864c83e14c1fcd992402fd6c7549cac"
+    }
+   ],
+   [
+    {
+     "blob": "015512202a5740f76cb8e47558a10cd85a03f563be8da273306a54594ec4535f210d949b"
+    }
+   ],
+   [
+    {
+     "blob": "01551220bb062752be144924cc42d662cf9c6d5ab7cc5c5be4ca26eb8596c9a8a98f7c1b"
+    }
+   ],
+   [
+    {
+     "blob": "01551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f"
+    }
+   ],
+   [
+    {
+     "blob": "01551220e48a9a8c088f18f129cbe714d52cbe2f262020efa62392f9698203f0cf5f9eca"
+    }
+   ],
+   [
+    {
+     "blob": "01551220f5130ee371cf7fc477243e10005c9ff101a67322e18e45099b9a22377282ba6c"
+    }
+   ],
+   [
+    {
+     "blob": "018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d"
+    }
+   ],
+   [
+    {
+     "blob": "018080c00112209794acef0b890c1785d26330a941725abb059635df25d5831a9c786f085e6fae"
+    }
+   ]
+  ],
+  "follow": [
+   [
+    {
+     "blob": "bcc7900726de195e4cc4b09e67f02966"
+    },
+    {
+     "blob": "01551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f"
+    }
+   ]
+  ],
+  "invalid": [
+   [
+    {
+     "blob": "0155122054c919d0a40be32c9e2999056b9741479e27cfb33f9ee720c25680dc724d5cb7"
+    },
+    0
+   ],
+   [
+    {
+     "blob": "01551220907dfadbd64c4e67dad7ea57c7a153edd2b1bc6dd47bd602948d0c2fc8386065"
+    },
+    1
+   ],
+   [
+    {
+     "blob": "01551220c22a55cf19e692c717ed51a8b0da88c0d43a0f667e07d7f983393f822198224d"
+    },
+    2
+   ]
+  ],
+  "jobs": [
+   [
+    "3bd70342",
+    0,
+    "{\"id\": \"3bd70342\", \"kind\": \"get\", \"target\": \"bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq/café.txt\", \"output\": \"/home/alice/Downloads/café 😀.txt\", \"from\": null, \"sealed_name\": false, \"fallback_dht\": false, \"state\": \"done\", \"created\": 1792056540.0, \"started\": 1792056540.0, \"finished\": 1792056545.0, \"error\": null, \"result\": {\"cid\": \"bafkreicllqx56gk2tdcidha3bgi7bcwco4p6v24ij5kvymvq5dxwdf27ae\", \"size\": 7, \"warnings\": [\"skipped symlink café/link → elsewhere\", \"kept 😀 as is\"], \"output\": \"/home/alice/Downloads/café 😀.txt\"}, \"runs\": 1, \"total_bytes\": 7, \"done_bytes\": 7, \"blocks\": 1, \"blocks_total\": null, \"downloaded_bytes\": 7}"
+   ],
+   [
+    "6a322a52",
+    1,
+    "{\"id\": \"6a322a52\", \"kind\": \"pin\", \"target\": \"bafkreiemqpndzewx4bioklzfvhtiegsfny5fxuc3nkjk2vmcpjxiammsti\", \"output\": null, \"from\": null, \"sealed_name\": false, \"fallback_dht\": false, \"state\": \"failed\", \"created\": 1792056605.0, \"started\": 1792056605.0, \"finished\": 1792056605.0, \"error\": \"no providers found for this CID\", \"result\": null, \"runs\": 1, \"total_bytes\": null, \"done_bytes\": 0, \"blocks\": 0, \"blocks_total\": null, \"downloaded_bytes\": 0}"
+   ],
+   [
+    "da44b5c5",
+    2,
+    "{\"id\": \"da44b5c5\", \"kind\": \"pin\", \"target\": \"bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq/Ελληνικά\", \"output\": null, \"from\": null, \"sealed_name\": false, \"fallback_dht\": false, \"state\": \"queued\", \"created\": 1792056665.0, \"started\": null, \"finished\": null, \"error\": null, \"result\": null, \"runs\": 0, \"total_bytes\": null, \"done_bytes\": 0, \"blocks\": 0, \"blocks_total\": null, \"downloaded_bytes\": 0}"
+   ]
+  ],
+  "keepers": [
+   [
+    {
+     "blob": "05c7214ca11e7646c79340c6b6d9866c"
+    },
+    "[\"own\"]",
+    "[\"e5ee52baf6bf767a65fc00d5acf5231c3ab7509438494eec22e4cdb9eae33d3cb4d1e823db4955856e0f57c46987475752a2aa95721399815e3f955d98e23cb2\", \"783c4f3005a78c29de83\", \"2e62f40c0a006ad097b4\", \"\", \"eb5f4d8539b58b495781c8ba83765ed04318d1718032b8d2af0ad694b340480aa6a9863e4fa057aedb7681f7e41145be6a61a8091e4dd02d10c71920ad932701\", \"9201c427018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d\"]"
+   ],
+   [
+    {
+     "blob": "07defa27cdd333a37d1c1f425770a541"
+    },
+    "[\"user\"]",
+    null
+   ],
+   [
+    {
+     "blob": "bcc7900726de195e4cc4b09e67f02966"
+    },
+    "[\"follow\"]",
+    "[\"8e6e4ec6192178ce7ea841c1603ee6756fe9bed343f7780234889a6fb4da5414274d5caf3ca30bb9017e5ac96eb3a75622171754072025b11210c98a0e8e546a\", \"783c4f3005a78c29de83\", \"ff7788273d006ad09958\", \"\", \"9c523b5797fa9e96ebcf18a1fef4e33aa25c682c158b34592f3942a63ab98dff38b8e8f890649ad259d3c1ce6ea25490077b1c26ed7ec0a891b4f0ae0d31db00\", \"920cc42401551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f\"]"
+   ],
+   [
+    {
+     "blob": "f35e61151054781eb9f985f470691a77"
+    },
+    "[\"user\"]",
+    "[\"8db0daa5ca4c0979d432ce2b7ffac8f5057a4a77245494128a636f961309e54f4b2b7e004d1888419fa0de6e61ee896a40996edf79ecd1da36a56ac982962f3b\", \"783c4f3005a78c29de83\", \"d2a612e452006ad098e0\", \"\", \"f1cf556174e0341ee785bf34f236f06aae1cbda68547a6c5716ace79d29711641ac8b7afde40eb3ef226fad4ce416e4e6a343546be4c1de920fda5004b3d250d\", \"9207c424015512202a5740f76cb8e47558a10cd85a03f563be8da273306a54594ec4535f210d949b\"]"
+   ]
+  ],
+  "lxmf_messages": [
+   [
+    "inbox",
+    1,
+    "{\"hash\": \"7b4121eec4d068e3eeee0a668158e14ad322a1ef925c0be28aa6a26a9dde4ebf\", \"from\": \"a0a1a2a3a4a5a6a7a8a9aaabacadaeaf\", \"display_name\": \"Zoë\", \"sent\": 1792056030.0, \"received\": 1792056060.0, \"title\": \"Grüße 🌻\", \"text\": \"Fotos vom Wochenende 📷\\n\\nrnfs:bafkreif3aytvfpqujesmyqwwmlhzy3k2w7gfyw7ezitoxbmwzguktd34dm?from=11111111111111111111111111111111\\nrnfs:bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq/caf%C3%A9.txt\", \"method\": \"direct\", \"links\": [{\"uri\": \"rnfs:bafkreif3aytvfpqujesmyqwwmlhzy3k2w7gfyw7ezitoxbmwzguktd34dm?from=11111111111111111111111111111111\", \"cid\": \"bafkreif3aytvfpqujesmyqwwmlhzy3k2w7gfyw7ezitoxbmwzguktd34dm\", \"name\": null, \"path\": [], \"size\": 36, \"from\": \"11111111111111111111111111111111\"}, {\"uri\": \"rnfs:bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq/caf%C3%A9.txt\", \"cid\": \"bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq\", \"name\": null, \"path\": [\"café.txt\"], \"size\": null, \"from\": null}], \"auto\": [{\"state\": \"pinned\", \"cid\": \"bafkreif3aytvfpqujesmyqwwmlhzy3k2w7gfyw7ezitoxbmwzguktd34dm\"}, {\"state\": \"pinned\", \"cid\": \"bafkreicllqx56gk2tdcidha3bgi7bcwco4p6v24ij5kvymvq5dxwdf27ae\"}], \"id\": 1}"
+   ],
+   [
+    "inbox",
+    2,
+    "{\"hash\": \"b20fef4fb2d0e2869b3570019d9c05a64870b737d86a2e8d13660e452ef87c13\", \"from\": \"b0b1b2b3b4b5b6b7b8b9babbbcbdbebf\", \"display_name\": \"Bøb 🦊\", \"sent\": 1792056115.0, \"received\": 1792056120.0, \"title\": \"Привет\", \"text\": \"Посмотри это: rnfs:name/05c7214ca11e7646c79340c6b6d9866c/2026/%C3%A9t%C3%A9.jpg\", \"method\": \"propagated\", \"links\": [{\"uri\": \"rnfs:name/05c7214ca11e7646c79340c6b6d9866c/2026/%C3%A9t%C3%A9.jpg\", \"cid\": null, \"name\": \"05c7214ca11e7646c79340c6b6d9866c\", \"path\": [\"2026\", \"été.jpg\"], \"size\": null, \"from\": null}], \"auto\": null, \"id\": 2}"
+   ],
+   [
+    "inbox",
+    3,
+    "{\"hash\": \"584b41e5ba4074842544bf3368769200656aaddbca1d2863f897e6f2817952b6\", \"from\": \"b0b1b2b3b4b5b6b7b8b9babbbcbdbebf\", \"display_name\": null, \"sent\": null, \"received\": 1792056180.0, \"title\": \"\", \"text\": \"𝄞 music 🎵 rnfs:bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da\", \"method\": \"opportunistic\", \"links\": [{\"uri\": \"rnfs:bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da\", \"cid\": \"bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da\", \"name\": null, \"path\": [], \"size\": null, \"from\": null}], \"auto\": null, \"id\": 3}"
+   ],
+   [
+    "outbox",
+    1,
+    "{\"hash\": \"93d3f14fa1ad9e4c7b89988e68d6449f0b47b1bce1299bdb6fd33f26743991bd\", \"to\": \"b0b1b2b3b4b5b6b7b8b9babbbcbdbebf\", \"time\": 1792056240.0, \"links\": [{\"uri\": \"rnfs:bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da?from=4e0de1d04e0de1d04e0de1d04e0de1d0\", \"cid\": \"bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da\", \"name\": null, \"path\": [], \"size\": 16, \"from\": \"4e0de1d04e0de1d04e0de1d04e0de1d0\"}], \"text\": \"Voilà le fichier ✅\", \"method\": \"direct\", \"state\": \"delivered\", \"progress\": 1.0, \"id\": 1}"
+   ],
+   [
+    "outbox",
+    2,
+    "{\"hash\": \"59ae57cd8477123689cd483035d3386230f1a708b1d45dbb71338b2ac5a2197c\", \"to\": \"b0b1b2b3b4b5b6b7b8b9babbbcbdbebf\", \"time\": 1792056300.0, \"links\": [{\"uri\": \"rnfs:name/05c7214ca11e7646c79340c6b6d9866c/2026?from=4e0de1d04e0de1d04e0de1d04e0de1d0\", \"cid\": \"bagaibqabciqfbyihpeqy3nfafzl4qcbevvbpvtgaak2wxadkneio5dfclm3m6hi\", \"name\": \"05c7214ca11e7646c79340c6b6d9866c\", \"path\": [\"2026\"], \"size\": 19, \"from\": \"4e0de1d04e0de1d04e0de1d04e0de1d0\"}], \"text\": \"via the propagation node 📡\", \"method\": \"propagated\", \"state\": \"sent\", \"progress\": 0.0, \"id\": 2}"
+   ],
+   [
+    "outbox",
+    3,
+    "{\"hash\": \"64bfcf1cb5c0b71e992de816e697e5ce0cb0f744b8a707bf8eb8fd602399cab0\", \"to\": \"b0b1b2b3b4b5b6b7b8b9babbbcbdbebf\", \"time\": 1792056360.0, \"links\": [{\"uri\": \"rnfs:bagaibqabciqen3e7u4m7fn7ak6q4vwpeihbka3hewbvwwkt7njnzaex4ifrk3pi?from=4e0de1d04e0de1d04e0de1d04e0de1d0\", \"cid\": \"bagaibqabciqen3e7u4m7fn7ak6q4vwpeihbka3hewbvwwkt7njnzaex4ifrk3pi\", \"name\": null, \"path\": [], \"size\": 22, \"from\": \"4e0de1d04e0de1d04e0de1d04e0de1d0\"}], \"text\": \"\", \"method\": \"propagated\", \"state\": \"failed\", \"progress\": 0.0, \"id\": 3, \"direct_hash\": \"e57ea396179755a3aa63ca5fdafa8ac20a47ab4cd2134df99da0535ef6d548ca\", \"fallback\": true, \"error\": \"the daemon stopped before it was delivered\"}"
+   ],
+   [
+    "outbox",
+    4,
+    "{\"hash\": \"75146bd05a2bb4c374a1490dc343371d424723b23f3073177d8cf35e5ceb431a\", \"to\": \"a0a1a2a3a4a5a6a7a8a9aaabacadaeaf\", \"time\": 1792056420.0, \"links\": [{\"uri\": \"rnfs:bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq/%E6%97%A5%E6%9C%AC%E8%AA%9E?from=4e0de1d04e0de1d04e0de1d04e0de1d0\", \"cid\": \"bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq\", \"name\": null, \"path\": [\"日本語\"], \"size\": 7, \"from\": \"4e0de1d04e0de1d04e0de1d04e0de1d0\"}], \"text\": \"not delivered yet ⏳\", \"method\": \"direct\", \"state\": \"failed\", \"progress\": 0.0, \"id\": 4, \"error\": \"the daemon stopped before it was delivered\"}"
+   ],
+   [
+    "outbox",
+    5,
+    "{\"hash\": \"ae6c0f21ba27ea8a47bfb3607738da601e19cc3ff3eb58744c4c26ff89e27358\", \"to\": \"a0a1a2a3a4a5a6a7a8a9aaabacadaeaf\", \"time\": 1792056480.0, \"links\": [{\"uri\": \"rnfs:bafkreif2bqifzcfpnduaemjb275npgbk37jmomt3mugspfq2ewxz7ogjcm?from=4e0de1d04e0de1d04e0de1d04e0de1d0\", \"cid\": \"bafkreif2bqifzcfpnduaemjb275npgbk37jmomt3mugspfq2ewxz7ogjcm\", \"name\": null, \"path\": [], \"size\": 23, \"from\": \"4e0de1d04e0de1d04e0de1d04e0de1d0\"}], \"text\": \"half way 🚚\", \"method\": \"direct\", \"state\": \"failed\", \"progress\": 0.457, \"id\": 5, \"error\": \"the daemon stopped before it was delivered\"}"
+   ]
+  ],
+  "meta": [
+   [
+    "follow",
+    "clean",
+    1
+   ],
+   [
+    "inbox",
+    "clean",
+    1
+   ],
+   [
+    "inbox",
+    "next_id",
+    4
+   ],
+   [
+    "outbox",
+    "clean",
+    1
+   ],
+   [
+    "outbox",
+    "next_id",
+    6
+   ]
+  ],
+  "migrated": [
+   [
+    "cache.json",
+    10,
+    1792141200.0
+   ],
+   [
+    "contacts.json",
+    3,
+    1792141200.0
+   ],
+   [
+    "fetched.json",
+    8,
+    1792141200.0
+   ],
+   [
+    "follow.json",
+    1,
+    1792141200.0
+   ],
+   [
+    "invalid.json",
+    3,
+    1792141200.0
+   ],
+   [
+    "jobs.json",
+    3,
+    1792141200.0
+   ],
+   [
+    "keepers.json",
+    4,
+    1792141200.0
+   ],
+   [
+    "lxmf_inbox.json",
+    3,
+    1792141200.0
+   ],
+   [
+    "lxmf_outbox.json",
+    5,
+    1792141200.0
+   ],
+   [
+    "name-floor.json",
+    2,
+    1792141200.0
+   ],
+   [
+    "names.json",
+    5,
+    1792141200.0
+   ],
+   [
+    "pin_names.json",
+    5,
+    1792141200.0
+   ],
+   [
+    "pins.json",
+    10,
+    1792141200.0
+   ],
+   [
+    "providers.json",
+    39,
+    1792141200.0
+   ],
+   [
+    "published.json",
+    28,
+    1792141200.0
+   ],
+   [
+    "remote_pins.json",
+    2,
+    1792141200.0
+   ],
+   [
+    "shared_folder.json",
+    1,
+    1792141200.0
+   ]
+  ],
+  "name_floor": [
+   [
+    {
+     "blob": "2a7485ee7ccbd5e2196e208cfaef1b9b"
+    },
+    "5",
+    1792055880.0,
+    0
+   ],
+   [
+    {
+     "blob": "49154ef17f86f5401d7d07b4bf8f96f4"
+    },
+    "18446744073709551615",
+    1792055940.0,
+    1
+   ]
+  ],
+  "names_held": [
+   [
+    {
+     "blob": "05c7214ca11e7646c79340c6b6d9866c"
+    },
+    "1",
+    {
+     "blob": "018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d"
+    },
+    1792055220.0
+   ],
+   [
+    {
+     "blob": "a9f96ee8afd8b8bee788a442a84e555e"
+    },
+    "3",
+    {
+     "blob": "01551220e48a9a8c088f18f129cbe714d52cbe2f262020efa62392f9698203f0cf5f9eca"
+    },
+    1792055820.0
+   ],
+   [
+    {
+     "blob": "bcc7900726de195e4cc4b09e67f02966"
+    },
+    "12",
+    {
+     "blob": "01551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f"
+    },
+    1792055640.0
+   ]
+  ],
+  "names_published": [
+   [
+    "imported",
+    "0",
+    null,
+    1
+   ],
+   [
+    "photos",
+    "1",
+    {
+     "blob": "018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d"
+    },
+    0
+   ]
+  ],
+  "pin_names": [
+   [
+    {
+     "blob": "01551220558abc6a7776d1f5ba7566a4ee1354b2ff53ede67bf18fa66b809fd413b532b9"
+    },
+    "\"(stdin)\""
+   ],
+   [
+    {
+     "blob": "015512209cbf7c8bbb9697dfec87c2bfe1f2cc01c55493cd4c3c6da7960939fce7322d66"
+    },
+    "\"/home/alice/Downloads/b\\udcffd name.txt\""
+   ],
+   [
+    {
+     "blob": "01551220ba0c105c88af68e8023121d7fad7982adfd2c7327b650d27961a25af9fb8c913"
+    },
+    "\"(stdin)\""
+   ],
+   [
+    {
+     "blob": "018080c001122046ec9fa719f2b7e057a1cad9e441c2a06ce4b06b6b2a7f6a5b9012fc4162adbd"
+    },
+    "\"/home/alice/Pictures/Fête à Montréal/photo 🎉.jpg\""
+   ],
+   [
+    {
+     "blob": "018080c001122086c1708170e6b241e782e2788e9e447818f56afb80cb72f0a453990628ec003a"
+    },
+    "\"large.bin\""
+   ],
+   [
+    {
+     "blob": "018080c0011220b45b2792066d55160f297def05ba8a29eadd21d21ba107a842f4921f72ab1f0c"
+    },
+    "\"Résumé – 2026.txt\""
+   ]
+  ],
+  "pins": [
+   [
+    {
+     "blob": "015512204b5c2fdf195a98c4819c1b0991f08ac2771feaeb884f555c32b0e8ef61975f01"
+    },
+    "lxmf:a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+   ],
+   [
+    {
+     "blob": "0155122084503737f15d2adbf191a708b0bdfecd6db1a0ec9321022247e4085ddbf38e92"
+    },
+    "folder"
+   ],
+   [
+    {
+     "blob": "015512209cbf7c8bbb9697dfec87c2bfe1f2cc01c55493cd4c3c6da7960939fce7322d66"
+    },
+    "user"
+   ],
+   [
+    {
+     "blob": "01551220b49673000ed78886bd8412ce0fc823260b880697952b3cbc79fcab646736ae60"
+    },
+    "deny"
+   ],
+   [
+    {
+     "blob": "01551220ba0c105c88af68e8023121d7fad7982adfd2c7327b650d27961a25af9fb8c913"
+    },
+    "user"
+   ],
+   [
+    {
+     "blob": "01551220bb062752be144924cc42d662cf9c6d5ab7cc5c5be4ca26eb8596c9a8a98f7c1b"
+    },
+    "lxmf:a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+   ],
+   [
+    {
+     "blob": "01551220d8bd1ae8a49d73ab61d6b59c9220f6696551c58a58006f5fcfad30a800ab773f"
+    },
+    "follow:bcc7900726de195e4cc4b09e67f02966"
+   ],
+   [
+    {
+     "blob": "01551220f5130ee371cf7fc477243e10005c9ff101a67322e18e45099b9a22377282ba6c"
+    },
+    "remote:0123456789abcdef0123456789abcdef"
+   ],
+   [
+    {
+     "blob": "018080c001122046ec9fa719f2b7e057a1cad9e441c2a06ce4b06b6b2a7f6a5b9012fc4162adbd"
+    },
+    "user"
+   ],
+   [
+    {
+     "blob": "018080c001122050e10779218db4a02e57c80824ad42faccc002b56b806a6910ee8ca25b36cf1d"
+    },
+    "name:photos"
+   ],
+   [
+    {
+     "blob": "018080c001122086c1708170e6b241e782e2788e9e447818f56afb80cb72f0a453990628ec003a"
+    },
+    "user"
+   ],
+   [
+    {
+     "blob": "018080c0011220b45b2792066d55160f297def05ba8a29eadd21d21ba107a842f4921f72ab1f0c"
+    },
+    "user"
+   ]
+  ],
+  "provider_departed": [
+   [
+    {
+     "blob": "32000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791925200.0
+   ],
+   [
+    {
+     "blob": "34000000000000000000000000000000"
+    },
+    1791925920.0,
+    1792055520.0
+   ],
+   [
+    {
+     "blob": "35000000000000000000000000000000"
+    },
+    1791926580.0,
+    1792054920.0
+   ]
+  ],
+  "provider_evicted": [
+   [
+    {
+     "blob": "36000000000000000000000000000000"
+    },
+    1792051260.0,
+    1792051500.0
+   ]
+  ],
+  "provider_publishers": [
+   [
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0
+   ],
+   [
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0
+   ],
+   [
+    {
+     "blob": "33000000000000000000000000000000"
+    },
+    1791925260.0
+   ],
+   [
+    {
+     "blob": "37000000000000000000000000000000"
+    },
+    1792051320.0
+   ],
+   [
+    {
+     "blob": "38000000000000000000000000000000"
+    },
+    1792051380.0
+   ],
+   [
+    {
+     "blob": "39000000000000000000000000000000"
+    },
+    1792051440.0
+   ],
+   [
+    {
+     "blob": "3a000000000000000000000000000000"
+    },
+    1792051500.0
+   ],
+   [
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792054860.0
+   ]
+  ],
+  "provider_records": [
+   [
+    {
+     "blob": "005bed22d2fd8d322fb80b140598a0c3"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055160.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "075d5889d921fccee0f78cb9a3257b24"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055340.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "0918207803da9867093b2cffe7b7bb2f"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792054860.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "24b2f721abc9dd6f9f7b8be02b20e1f8"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055580.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "368f11e51cc31ac9cb717a07d8d12139"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055280.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "5e3615897e5aabcf904002aa1c8c239c"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055100.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "64f4edd9e5e844b50f7a0ae8b85a898f"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055040.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "71e49204eaa570f938d3ba5bc497bdba"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792141200.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "7973a606727dce5446b2f0242d1c401e"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055460.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "80000000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1792056845.0,
+    0
+   ],
+   [
+    {
+     "blob": "80010000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80020000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80030000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80040000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80040000000000000000000000000000"
+    },
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80050000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80050000000000000000000000000000"
+    },
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80060000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80060000000000000000000000000000"
+    },
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80070000000000000000000000000000"
+    },
+    {
+     "blob": "30000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80070000000000000000000000000000"
+    },
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80080000000000000000000000000000"
+    },
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80090000000000000000000000000000"
+    },
+    {
+     "blob": "31000000000000000000000000000000"
+    },
+    1791795600.0,
+    1791795600.0,
+    0
+   ],
+   [
+    {
+     "blob": "80250000000000000000000000000000"
+    },
+    {
+     "blob": "33000000000000000000000000000000"
+    },
+    1791925680.0,
+    1791925680.0,
+    0
+   ],
+   [
+    {
+     "blob": "80260000000000000000000000000000"
+    },
+    {
+     "blob": "33000000000000000000000000000000"
+    },
+    1791925740.0,
+    1791925740.0,
+    0
+   ],
+   [
+    {
+     "blob": "80270000000000000000000000000000"
+    },
+    {
+     "blob": "33000000000000000000000000000000"
+    },
+    1791925800.0,
+    1791925800.0,
+    0
+   ],
+   [
+    {
+     "blob": "80650000000000000000000000000000"
+    },
+    {
+     "blob": "37000000000000000000000000000000"
+    },
+    1792051320.0,
+    1792051320.0,
+    1
+   ],
+   [
+    {
+     "blob": "80660000000000000000000000000000"
+    },
+    {
+     "blob": "38000000000000000000000000000000"
+    },
+    1792051380.0,
+    1792051380.0,
+    1
+   ],
+   [
+    {
+     "blob": "80670000000000000000000000000000"
+    },
+    {
+     "blob": "39000000000000000000000000000000"
+    },
+    1792051440.0,
+    1792051440.0,
+    1
+   ],
+   [
+    {
+     "blob": "80680000000000000000000000000000"
+    },
+    {
+     "blob": "3a000000000000000000000000000000"
+    },
+    1792051500.0,
+    1792051500.0,
+    1
+   ],
+   [
+    {
+     "blob": "8d616737498993836c17fa8fbc37cf05"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792056060.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "9fb861bafe2a0229fa850594ffa8d4e9"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055760.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "b14a6a65ed6d7fd082f130f7d0c00ba9"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055640.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "b362bf1c891e9f8bf935854c9a4a89da"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055520.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "b60b450b4d0bfdb631405273f3800390"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055460.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "b6a2e77295bec80e226b3d3c734bdecb"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792056000.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "bbbb4c2f859ccfb2b75447e3138b9695"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792141200.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "bf641d47a118e7693be211176667d353"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792054920.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "cc92f5dd8433c61479d0463e6adf4b50"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792054980.0,
+    1792141200.0,
+    0
+   ],
+   [
+    {
+     "blob": "ff3e2155432da6e46f967c4c688053b2"
+    },
+    {
+     "blob": "4e0de1d04e0de1d04e0de1d04e0de1d0"
+    },
+    1792055220.0,
+    1792141200.0,
+    0
+   ]
+  ],
+  "published": [
+   [
+    "bafkreibevdhpo2ydbraaurnjq3wtziaclbsmqpquyh6ntesaf7lmove4vq",
+    1792056785.0,
+    {
+     "blob": "1010101010101010101010101010101011111111111111111111111111111111"
+    }
+   ],
+   [
+    "bafkreibkk5apo3fy4r2vriim3bnah5ldx2g2e4zqnjkfstweknpscdmutm",
+    1792053185.0,
+    {
+     "blob": "1111111111111111111111111111111112121212121212121212121212121212"
+    }
+   ],
+   [
+    "bafkreicllqx56gk2tdcidha3bgi7bcwco4p6v24ij5kvymvq5dxwdf27ae",
+    1792049585.0,
+    {
+     "blob": "1212121212121212121212121212121213131313131313131313131313131313"
+    }
+   ],
+   [
+    "bafkreie4x56ixo4ws7p6zb6cx7q7ftabyvkjhtkmhrw2pfqjhh6oomrnmy",
+    1792042385.0,
+    {
+     "blob": "1010101010101010101010101010101011111111111111111111111111111111"
+    }
+   ],
+   [
+    "bafkreieeka3tp4k5fln7denhbcyl37wnnwy2b3eteebcer7ebbo5x44osi",
+    1792038785.0,
+    {
+     "blob": "1111111111111111111111111111111112121212121212121212121212121212"
+    }
+   ],
+   [
+    "bafkreif2bqifzcfpnduaemjb275npgbk37jmomt3mugspfq2ewxz7ogjcm",
+    1792035185.0,
+    {
+     "blob": "1212121212121212121212121212121213131313131313131313131313131313"
+    }
+   ],
+   [
+    "bafkreif3aytvfpqujesmyqwwmlhzy3k2w7gfyw7ezitoxbmwzguktd34dm",
+    1792031585.0,
+    {
+     "blob": "1313131313131313131313131313131310101010101010101010101010101010"
+    }
+   ],
+   [
+    "bafkreigyxunorje5oovwdvvvtsjcb5tjmvi4lcsyabxv7t5ngcuabk3xh4",
+    1792027985.0,
+    {
+     "blob": "1010101010101010101010101010101011111111111111111111111111111111"
+    }
+   ],
+   [
+    "bafkreiherkniycepddysts7hctkszprpeyqcb35geojps2mcapym6x46zi",
+    1792024385.0,
+    {
+     "blob": "1111111111111111111111111111111112121212121212121212121212121212"
+    }
+   ],
+   [
+    "bafkreihvcmhog4opp7chojb6caafzh7ragthgixbrzcqtg42ei3xfav2nq",
+    1792020785.0,
+    {
+     "blob": "1212121212121212121212121212121213131313131313131313131313131313"
+    }
+   ],
+   [
+    "bagaibqabciqen3e7u4m7fn7ak6q4vwpeihbka3hewbvwwkt7njnzaex4ifrk3pi",
+    1792017185.0,
+    {
+     "blob": "1313131313131313131313131313131310101010101010101010101010101010"
+    }
+   ],
+   [
+    "bagaibqabciqfbyihpeqy3nfafzl4qcbevvbpvtgaak2wxadkneio5dfclm3m6hi",
+    1792013585.0,
+    {
+     "blob": "1010101010101010101010101010101011111111111111111111111111111111"
+    }
+   ],
+   [
+    "bagaibqabciqjpffm54fysdaxqxjggmfjifzfvoyfsy256jovqmnjy6dpbbpg7lq",
+    1792009985.0,
+    {
+     "blob": "1111111111111111111111111111111112121212121212121212121212121212"
+    }
+   ],
+   [
+    "bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da",
+    1792006385.0,
+    {
+     "blob": "1212121212121212121212121212121213131313131313131313131313131313"
+    }
+   ],
+   [
+    "key:b14a6a65ed6d7fd082f130f7d0c00ba9",
+    1792002785.0,
+    {
+     "blob": "1313131313131313131313131313131310101010101010101010101010101010"
+    }
+   ],
+   [
+    "key:b362bf1c891e9f8bf935854c9a4a89da",
+    1791999185.0,
+    {
+     "blob": "1010101010101010101010101010101011111111111111111111111111111111"
+    }
+   ],
+   [
+    "key:ff3e2155432da6e46f967c4c688053b2",
+    1791995585.0,
+    {
+     "blob": "1111111111111111111111111111111112121212121212121212121212121212"
+    }
+   ]
+  ],
+  "published_earlier": [
+   [
+    "bafkreibevdhpo2ydbraaurnjq3wtziaclbsmqpquyh6ntesaf7lmove4vq",
+    {
+     "blob": "12121212121212121212121212121212"
+    },
+    1791797585.0
+   ],
+   [
+    "bafkreicllqx56gk2tdcidha3bgi7bcwco4p6v24ij5kvymvq5dxwdf27ae",
+    {
+     "blob": "10101010101010101010101010101010"
+    },
+    1791797585.0
+   ],
+   [
+    "bafkreie4x56ixo4ws7p6zb6cx7q7ftabyvkjhtkmhrw2pfqjhh6oomrnmy",
+    {
+     "blob": "12121212121212121212121212121212"
+    },
+    1791797585.0
+   ],
+   [
+    "bafkreif2bqifzcfpnduaemjb275npgbk37jmomt3mugspfq2ewxz7ogjcm",
+    {
+     "blob": "10101010101010101010101010101010"
+    },
+    1791797585.0
+   ],
+   [
+    "bafkreigyxunorje5oovwdvvvtsjcb5tjmvi4lcsyabxv7t5ngcuabk3xh4",
+    {
+     "blob": "12121212121212121212121212121212"
+    },
+    1791797585.0
+   ],
+   [
+    "bafkreihvcmhog4opp7chojb6caafzh7ragthgixbrzcqtg42ei3xfav2nq",
+    {
+     "blob": "10101010101010101010101010101010"
+    },
+    1791797585.0
+   ],
+   [
+    "bagaibqabciqfbyihpeqy3nfafzl4qcbevvbpvtgaak2wxadkneio5dfclm3m6hi",
+    {
+     "blob": "12121212121212121212121212121212"
+    },
+    1791797585.0
+   ],
+   [
+    "bagaibqabciqliwzhsidg2viwb4ux33yfxkfct2w5ehjbxiihvbbpjeq7okvr6da",
+    {
+     "blob": "10101010101010101010101010101010"
+    },
+    1791797585.0
+   ],
+   [
+    "key:b362bf1c891e9f8bf935854c9a4a89da",
+    {
+     "blob": "12121212121212121212121212121212"
+    },
+    1791797585.0
+   ]
+  ],
+  "remote_pins": [
+   [
+    0,
+    "remote:0123456789abcdef0123456789abcdef",
+    {
+     "blob": "015512209cfccdac5b4788e89d7eea492ee1d93f1615baa4f00a2e7105209703ea98d5a5"
+    }
+   ],
+   [
+    1,
+    "remote:0123456789abcdef0123456789abcdef",
+    {
+     "blob": "01551220b680d83a4b43738cf36c6b8e965d8b32d3b0fd2e1b643ee59cf4e0b787f394ee"
+    }
+   ]
+  ],
+  "shared_folder": [
+   [
+    "\"notes.txt\"",
+    "6baeb78e6b0bb791f691f2860e2fc0be964fc2d89cb04c82f1378c1f257c398e",
+    {
+     "blob": "0155122084503737f15d2adbf191a708b0bdfecd6db1a0ec9321022247e4085ddbf38e92"
+    }
+   ]
+  ],
+  "withdrawals": [
+   [
+    {
+     "blob": "10101010101010101010101010101010"
+    },
+    {
+     "blob": "ffe8f9db57e41110e0abce7a6ce6bba0"
+    }
+   ],
+   [
+    {
+     "blob": "13131313131313131313131313131313"
+    },
+    {
+     "blob": "ffe8f9db57e41110e0abce7a6ce6bba0"
+    }
+   ]
+  ]
+ },
+ "user_version": 16
+}

@@ -42,7 +42,11 @@ MIGRATED_SUFFIX = ".migrated"
 
 # Each step brings PRAGMA user_version from its index to its index + 1, in one transaction. Steps are only ever
 # appended: a store whose layout changes gets a new step (ALTER TABLE, or a new table and an INSERT ... SELECT).
-SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
+# The steps released in 0.1.5 (the first 16) are pinned by a digest in tests/test_statedb.py: a database 0.1.5
+# wrote has them already, so an edit there would never reach it. A step's item is an SQL statement, or a callable
+# taking the transaction's connection, for a migration SQL alone can't express.
+Step = str | Callable[[object], None]
+SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
     ("statedb", (
         # JSON state files imported, so each is imported once (migrate)
         "CREATE TABLE migrated (file TEXT PRIMARY KEY, records INTEGER NOT NULL, at REAL NOT NULL)",
@@ -232,8 +236,11 @@ class _Database:
                             "one (rnfs never moves state back to an older format)")
         for number in range(version, len(SCHEMA)):
             with self.transaction(durable=True) as tx:
-                for statement in SCHEMA[number][1]:
-                    tx.execute(statement)
+                for step in SCHEMA[number][1]:
+                    if callable(step):
+                        step(tx)
+                    else:
+                        tx.execute(step)
                 tx.execute(f"PRAGMA user_version = {number + 1}")
 
     @contextmanager
