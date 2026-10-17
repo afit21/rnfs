@@ -43,7 +43,7 @@ file of the declared size can have). A file node may list children of size 0, an
 so without these a file declaring 1 byte, or a directory of one entry, could hold any number of distinct nodes.
 What the builder writes never comes near them (design.md, "DAG byte bound"). While one applies, requests ask
 for no more than it leaves, counting a DAG node as MAX_BLOCK_SIZE until it arrives (a directory or index node
-as nothing under the size-derived bound: see _reserve), so a fetch downloads at most about one block beyond it
+as nothing under the size-derived bound: see _DagBudget.reserve), so a fetch downloads at most about one block beyond it
 before failing with TooLarge. max_storage never refuses a fetch: one that isn't being pinned evicts other
 cached fetches to make room for each response, and goes over max_storage if nothing is evictable (the node
 evicts again once it ends). What refuses a fetch, pinned or not, with StorageFull is the disk: its remaining
@@ -53,8 +53,10 @@ it is asked for or read; a complete stored DAG is checked whole, since fetch_dag
 blocks against a quota).
 
 Requests are spread over up to max_parallel_providers providers (1 on slow nodes), one /blocks request in
-flight per provider. Request threads only call the client; all fetch state is changed by the thread that
-runs the fetch, from the events they queue.
+flight per provider. Request threads only call the client and note when a response last made progress
+(Fetch._heard_at, which the no-progress deadline reads with the fetch thread's own _progress_at); all other
+fetch state is changed by the thread that runs the fetch, from the events they queue (ResultEvent, and the
+lookup thread's ProviderEvent and LookupDone).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
@@ -65,7 +67,7 @@ import time
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from itertools import islice
-from typing import Callable, Iterator
+from typing import Callable, Iterator, NamedTuple
 
 from rnfs import statedb
 from rnfs.config import Config
@@ -197,27 +199,149 @@ def observing(observer: Observer):
         _observers.current = previous
 
 
-class _RangeBudget:
-    """The file node bytes one read_range call may still meet (range_bound), and the nodes it has met."""
+class _DagBudget:
+    """The byte limits on the distinct blocks a fetch meets, and what it has counted against them (the module
+    docstring's "Limits"). Pure bookkeeping: no storage, network or clock, and only the fetch thread uses it.
 
-    __slots__ = ("limit", "length", "used", "counted")
+    A fetch's own budget (Fetch.budget) bounds the distinct blocks of its DAG, each counted once: by max_dag_bytes
+    (a quota its caller sets) and, once fetch_dag or fetch_listing runs, by dag_bound of the size their targets
+    declare plus what the directory and index nodes counted bring (node_credit). A read_range call passes
+    Fetch.ensure a budget of its own (for_range), which also bounds the file nodes that call meets by range_bound,
+    each counted once per call, and counts every block against the fetch's own budget as well.
 
-    def __init__(self, limit: int, length: int):
-        """A budget of limit bytes for reading length bytes."""
-        self.limit = limit
-        self.length = length
-        self.used = 0
+    The room a budget leaves is a tuple (bytes under the size-derived bound, under max_dag_bytes, under the
+    read_range call's bound), each None if that limit doesn't apply: room() computes it, reserve() takes from it
+    what a block not yet received may add, and fits() checks it.
+    """
+
+    __slots__ = ("root", "whole", "max_dag_bytes", "declared", "credit", "used", "counted", "range_limit",
+                 "range_length", "range_used", "range_counted")
+
+    def __init__(self, root: Cid):
+        """A fetch's own budget for root's DAG, with no limit until one is set (max_dag_bytes) or declared."""
+        self.root = root
+        self.whole = self  # the fetch's own budget, which a read_range call's counts against too
+        self.max_dag_bytes: int | None = None
+        self.declared: int | None = None  # content bytes fetch_dag's targets declare (fetch_listing's count as 0)
+        self.credit = 0  # what the counted directory and index nodes bring to the bound (node_credit)
+        self.used = 0  # bytes of the distinct blocks counted
         self.counted: set[Cid] = set()
+        self.range_limit: int | None = None  # a read_range call's: range_bound for its range_length bytes
+        self.range_length = 0
+        self.range_used = 0
+        self.range_counted: set[Cid] = set()
 
-    def count(self, root: Cid, cid: Cid, length: int):
-        """Count a DAG node of length bytes once. Raises TooLarge once over the limit."""
-        if cid in self.counted:
+    def for_range(self, limit: int, length: int) -> "_DagBudget":
+        """The budget of a read_range call reading length bytes: limit bytes of the file nodes it meets, and this
+        fetch's own budget."""
+        budget = _DagBudget(self.root)
+        budget.whole = self.whole
+        budget.range_limit = limit
+        budget.range_length = length
+        return budget
+
+    def declare(self, size: int):
+        """Bound the DAG by what size more content bytes can hold (fetch_dag; fetch_listing declares 0)."""
+        whole = self.whole
+        whole.declared = (whole.declared or 0) + size
+
+    def limit(self) -> int | None:
+        """Bytes the distinct blocks of the DAG may hold: max_dag_bytes, and once declared, dag_bound of the size
+        declared plus what the directory and index nodes counted bring (node_credit), whichever is lower. None
+        if neither applies."""
+        whole = self.whole
+        limits = [] if whole.max_dag_bytes is None else [whole.max_dag_bytes]
+        if whole.declared is not None:
+            limits.append(dag_bound(whole.declared) + whole.credit)
+        return min(limits, default=None)
+
+    def count(self, cid: Cid, length: int, children: list[Expect] = ()):
+        """Count a DAG node of length bytes against a read_range call's bound, once per call, then any block of the
+        DAG against the fetch's limits, once, with what it brings to them (node_credit). Raises TooLarge once over
+        either."""
+        if self.range_limit is not None and not cid.is_raw and cid not in self.range_counted:
+            self.range_counted.add(cid)
+            self.range_used += length
+            if self.range_used > self.range_limit:
+                raise TooLarge(f"reading {plural(self.range_length, 'byte')} of {self.root} would take more than "
+                               f"{self.range_limit} bytes of file nodes, more than such a range can need: refusing it")
+        whole = self.whole
+        if (whole.max_dag_bytes is None and whole.declared is None) or cid in whole.counted:
             return
-        self.counted.add(cid)
-        self.used += length
-        if self.used > self.limit:
-            raise TooLarge(f"reading {plural(self.length, 'byte')} of {root} would take more than {self.limit} "
-                           "bytes of file nodes, more than such a range can need: refusing it")
+        whole.counted.add(cid)
+        whole.used += length
+        whole.credit += node_credit(length, children)
+        limit = self.limit()
+        if whole.used > limit:
+            if limit == whole.max_dag_bytes:
+                raise TooLarge(f"{self.root} holds more than {limit} bytes of blocks")
+            content = f"its {plural(whole.declared, 'byte')} of content and " if whole.declared else ""
+            raise TooLarge(f"{self.root} holds more than {limit} bytes of blocks, more than {content}its "
+                           "directory entries can take: refusing it")
+
+    def room(self, in_flight, wanted: dict[Cid, list[Expect]]) -> tuple | None:
+        """What the limits leave for blocks not yet asked for, after the most the CIDs in_flight (asked for, not
+        yet received) can bring; None if no limit applies."""
+        whole = self.whole
+        if whole.declared is None and whole.max_dag_bytes is None and self.range_limit is None:
+            return None
+        bound = None if whole.declared is None else dag_bound(whole.declared) + whole.credit - whole.used
+        quota = None if whole.max_dag_bytes is None else whole.max_dag_bytes - whole.used
+        budget = None if self.range_limit is None else self.range_limit - self.range_used
+        room = (bound, quota, budget)
+        for cid in in_flight:
+            room = self.reserve(cid, wanted, room)
+        return room
+
+    def reserve(self, cid: Cid, wanted: dict[Cid, list[Expect]], room: tuple) -> tuple:
+        """room after the most cid can add to the bytes counted: a raw chunk's declared size, otherwise
+        MAX_BLOCK_SIZE, and nothing for a raw chunk under a read_range call's bound.
+
+        Under the size-derived bound a directory or index node takes nothing: a directory node brings more
+        than it takes, and an index node takes at most INDEX_NODE_COST, so a request of MAX_BATCH of them
+        overshoots by at most 2 KiB. Holding them to INDEX_NODE_COST each would ask for a directory's
+        subdirectories a few at a time.
+        """
+        bound, quota, budget = room
+        if budget is not None and not cid.is_raw and cid not in self.range_counted:
+            budget -= MAX_BLOCK_SIZE
+        if cid in self.whole.counted:
+            return bound, quota, budget
+        expects = wanted.get(cid)
+        worst = MAX_BLOCK_SIZE
+        if expects and cid.is_raw and expects[0].size is not None:
+            worst = expects[0].size
+        if bound is not None and not (expects and not cid.is_raw
+                                      and not any(walker.FILE_TYPE in expect.types for expect in expects)):
+            bound -= worst
+        return bound, None if quota is None else quota - worst, budget
+
+    @staticmethod
+    def fits(room: tuple) -> bool:
+        """True if room leaves nothing below zero."""
+        return all(left is None or left >= 0 for left in room)
+
+
+class ResultEvent(NamedTuple):
+    """A /blocks request's result, queued by its request thread."""
+
+    node_id: bytes
+    cids: list[Cid]  # what it asked for
+    result: peer_client.BlocksResult
+    sent_at: float | None  # when it went out (None: unknown)
+    rate: float | None  # the link's rate estimate it was sent with (the responder's upload cap derives from it)
+
+
+class ProviderEvent(NamedTuple):
+    """A provider the lookup found, queued by the lookup thread as its reply arrives."""
+
+    node_id: bytes
+
+
+class LookupDone(NamedTuple):
+    """A lookup run ended, queued by the lookup thread."""
+
+    found: int  # providers it reported
 
 
 class _Pending:
@@ -417,16 +541,11 @@ class Fetch:
         self.downloaded_blocks = 0
         self.downloaded_bytes = 0
         self.node_bytes = 0  # DAG node bytes downloaded, which max_download_size also bounds
-        # Set by the caller to bound the bytes of the distinct blocks of the DAG met, stored or downloaded
-        # (a remote pin's quota); TooLarge once over. fetch_dag adds the bound its target's size implies
-        self.max_dag_bytes: int | None = None
-        self.dag_bytes = 0
-        # Content bytes the targets of fetch_dag declare, once it runs (fetch_listing's count as 0)
-        self._declared: int | None = None
-        self._credit = 0  # what the counted directory and index nodes bring to the bound (node_credit)
-        self._counted: set[Cid] = set()
-        self._range: _RangeBudget | None = None  # the budget of the read_range call ensuring blocks, if any
-        self._progress_at = fetcher.clock()  # last verified block or response progress, for the no-progress deadline
+        self.budget = _DagBudget(root)  # the DAG byte limits (max_dag_bytes, dag_limit())
+        # For the no-progress deadline: the fetch thread's last verified block (or pacing wait), and the last
+        # response progress a request thread heard; the deadline counts from the later of the two
+        self._progress_at = fetcher.clock()
+        self._heard_at = self._progress_at
         self.root_delivered = False
         self.closed = False
         self.session = None
@@ -442,6 +561,22 @@ class Fetch:
         self._in_flight: dict[bytes, tuple[list[Cid], bool]] = {}
         if from_node is not None:
             self._new_provider(from_node)
+
+    @property
+    def max_dag_bytes(self) -> int | None:
+        """Set by the caller to bound the bytes of the distinct blocks of the DAG met, stored or downloaded (a
+        remote pin's quota); TooLarge once over. fetch_dag adds the bound its target's size implies."""
+        return self.budget.max_dag_bytes
+
+    @max_dag_bytes.setter
+    def max_dag_bytes(self, value: int | None):
+        """Set the quota."""
+        self.budget.max_dag_bytes = value
+
+    @property
+    def dag_bytes(self) -> int:
+        """Bytes of the distinct blocks of the DAG counted against its limits so far (none while none applies)."""
+        return self.budget.used
 
     # Context
 
@@ -467,8 +602,8 @@ class Fetch:
                     event = self._events.get_nowait()
                 except queue.Empty:
                     break
-                if event[0] == "result":
-                    self._in_flight.pop(event[1], None)
+                if isinstance(event, ResultEvent):
+                    self._in_flight.pop(event.node_id, None)
             for node_id in list(self._in_flight):
                 try:
                     self.client.close(node_id)
@@ -553,7 +688,7 @@ class Fetch:
             size = self.size_of(target)
             self.check_size(size)
             # From here on the DAG's blocks are counted (the target's again) against what its size can hold
-            self._declared = (self._declared or 0) + size
+            self.budget.declare(size)
             if self.observer is not None:
                 self.observer.total(size)
             # The root's own DAG, already complete, was checked from the same expectation when it was memoised;
@@ -593,8 +728,7 @@ class Fetch:
         if max_entries is None:
             max_entries = self.config.max_output_entries
         with self._checking():
-            if self._declared is None:
-                self._declared = 0  # from here on its blocks are counted, the target's again
+            self.budget.declare(0)  # from here on its blocks are counted, the target's again
             frontier = [target]
             seen = {target}
             entries = 0
@@ -643,9 +777,9 @@ class Fetch:
                 return
             self.check_size(end - offset)
             self.check_disk(target, end - offset)
-            budget = _RangeBudget(range_bound(size, end - offset), end - offset)
+            budget = self.budget.for_range(range_bound(size, end - offset), end - offset)
             if not target.cid.is_raw:
-                budget.count(self.root, target.cid, len(self.get(target)))
+                budget.count(target.cid, len(self.get(target)))  # the fetch's own budget has counted it already
             small = walker.SmallLeaves(self.config.max_output_entries)
             window: list[tuple[Expect, int, int]] = []
             for leaf in self._range_leaves(target, offset, end - offset, budget):
@@ -674,10 +808,10 @@ class Fetch:
             yield block[child_offset:child_offset + child_length]
 
     def _range_leaves(self, target: Expect, offset: int, length: int,
-                      budget: _RangeBudget) -> Iterator[tuple[Expect, int, int]]:
+                      budget: _DagBudget) -> Iterator[tuple[Expect, int, int]]:
         """The raw chunks covering a range, in order, each with the range within it, depth-first; the DAG
-        nodes below each node are fetched together when it is reached, counted against budget (the stack
-        holds at most MAX_DEPTH × MAX_CHILDREN items)."""
+        nodes below each node are fetched together when it is reached, counted against budget, the read_range
+        call's (the stack holds at most MAX_DEPTH × MAX_CHILDREN items)."""
         stack: list[tuple[Expect, int, int]] = [(target, offset, length)]
         while stack:
             expect, child_offset, child_length = stack.pop()
@@ -685,25 +819,22 @@ class Fetch:
                 yield expect, child_offset, child_length
                 continue
             parts = walker.range_children(expect, self.get(expect), child_offset, child_length)
-            # Only while ensuring: another read_range of this fetch may run between this generator's steps
-            self._range = budget
-            try:
-                self.ensure([child for child, _, _ in parts if not child.cid.is_raw])
-            finally:
-                self._range = None
+            # Passed, not kept on the fetch: another read_range of this fetch may run between this generator's steps
+            self.ensure([child for child, _, _ in parts if not child.cid.is_raw], budget=budget)
             stack.extend(reversed(parts))
 
     # Getting blocks
 
-    def ensure(self, expects: list[Expect]) -> dict[Expect, list[Expect]]:
+    def ensure(self, expects: list[Expect], budget: _DagBudget | None = None) -> dict[Expect, list[Expect]]:
         """Make sure every block of expects is stored and passes its reader checks; their children's expects.
 
+        Their blocks are counted against budget (a read_range call's), by default the fetch's own.
         Raises InvalidDag, NotFound when no provider can supply a block, StorageFull, TooLarge.
         """
         with self._checking():
-            return self._ensure(expects)
+            return self._ensure(expects, self.budget if budget is None else budget)
 
-    def _ensure(self, expects: list[Expect]) -> dict[Expect, list[Expect]]:
+    def _ensure(self, expects: list[Expect], budget: _DagBudget) -> dict[Expect, list[Expect]]:
         """ensure(), untagged."""
         self._check_cancelled()
         children: dict[Expect, list[Expect]] = {}
@@ -711,7 +842,7 @@ class Fetch:
         for expect in dict.fromkeys(expects):
             self.fetcher.check_denied(expect.cid)  # before fetching or reading it, stored or not
             walker.check_cid(expect)  # before fetching a block that can't be right
-            checked = self._check_stored(expect)
+            checked = self._check_stored(expect, budget)
             if checked is None:
                 wanted.setdefault(expect.cid, []).append(expect)
             else:
@@ -719,12 +850,13 @@ class Fetch:
                 if self.observer is not None:
                     self.observer.block(expect.cid, self.storage.block_size(expect.cid) or 0, False)
         if wanted:
-            self._download(wanted, children)
+            self._download(wanted, children, budget)
             self.fetcher.after_store()
         return children
 
-    def _check_stored(self, expect: Expect) -> list[Expect] | None:
-        """Children of a stored block after checking it against expect, or None if it isn't stored.
+    def _check_stored(self, expect: Expect, budget: _DagBudget) -> list[Expect] | None:
+        """Children of a stored block after checking it against expect (counted against budget), or None if it
+        isn't stored.
 
         A stored block failing the checks is verified against its CID: if it no longer matches (damaged on
         disk), it is deleted and None returned, so it is fetched again rather than the root marked invalid.
@@ -735,7 +867,7 @@ class Fetch:
                 if length is None:
                     return None
                 walker.check_raw(expect, length)  # stored blocks were verified, so their length is enough
-                self._count_dag(expect.cid, length)
+                budget.count(expect.cid, length)
                 return []
             block = self.storage.get(expect.cid)
             if block is None:
@@ -746,82 +878,16 @@ class Fetch:
                 log(f"stored block {expect.cid} of {self.root} is damaged; fetching it again", LOG_WARNING)
                 return None
             raise
-        self._count_dag(expect.cid, len(block), result)
+        budget.count(expect.cid, len(block), result)
         return result
 
     def dag_limit(self) -> int | None:
-        """Bytes the distinct blocks of the DAG may hold: max_dag_bytes, and once fetch_dag (or fetch_listing)
-        runs, dag_bound of the size its target declares plus what the directory and index nodes counted bring
-        (node_credit), whichever is lower. None if neither applies."""
-        limits = [] if self.max_dag_bytes is None else [self.max_dag_bytes]
-        if self._declared is not None:
-            limits.append(dag_bound(self._declared) + self._credit)
-        return min(limits, default=None)
+        """Bytes the distinct blocks of the DAG may hold (_DagBudget.limit), None if no limit applies."""
+        return self.budget.limit()
 
-    def _count_dag(self, cid: Cid, length: int, children: list[Expect] = ()):
-        """Count a block of the DAG once against dag_limit(), if there is one, with what it brings to it
-        (node_credit), and a DAG node against the budget of the read_range call ensuring it, if any. Raises
-        TooLarge once over either."""
-        if self._range is not None and not cid.is_raw:
-            self._range.count(self.root, cid, length)
-        if (self.max_dag_bytes is None and self._declared is None) or cid in self._counted:
-            return
-        self._counted.add(cid)
-        self.dag_bytes += length
-        self._credit += node_credit(length, children)
-        limit = self.dag_limit()
-        if self.dag_bytes > limit:
-            if limit == self.max_dag_bytes:
-                raise TooLarge(f"{self.root} holds more than {limit} bytes of blocks")
-            content = f"its {plural(self._declared, 'byte')} of content and " if self._declared else ""
-            raise TooLarge(f"{self.root} holds more than {limit} bytes of blocks, more than {content}its "
-                           "directory entries can take: refusing it")
-
-    def _room(self, wanted: dict[Cid, list[Expect]]) -> tuple | None:
-        """What the limits leave for blocks not yet asked for, after the most the requests in flight can bring:
-        (bytes under the size-derived bound, bytes under max_dag_bytes, bytes under the budget of the
-        read_range call ensuring blocks), each None if that limit doesn't apply; None if none does."""
-        if self._declared is None and self.max_dag_bytes is None and self._range is None:
-            return None
-        bound = None if self._declared is None else dag_bound(self._declared) + self._credit - self.dag_bytes
-        quota = None if self.max_dag_bytes is None else self.max_dag_bytes - self.dag_bytes
-        budget = None if self._range is None else self._range.limit - self._range.used
-        room = (bound, quota, budget)
-        for cids, _ in self._in_flight.values():
-            for cid in cids:
-                room = self._reserve(cid, wanted, room)
-        return room
-
-    def _reserve(self, cid: Cid, wanted: dict[Cid, list[Expect]], room: tuple) -> tuple:
-        """room (as _room) after the most cid can add to the bytes counted: a raw chunk's declared size,
-        otherwise MAX_BLOCK_SIZE, and nothing for a raw chunk under a read_range budget.
-
-        Under the size-derived bound a directory or index node takes nothing: a directory node brings more
-        than it takes, and an index node takes at most INDEX_NODE_COST, so a request of MAX_BATCH of them
-        overshoots by at most 2 KiB. Holding them to INDEX_NODE_COST each would ask for a directory's
-        subdirectories a few at a time.
-        """
-        bound, quota, budget = room
-        if budget is not None and not cid.is_raw and cid not in self._range.counted:
-            budget -= MAX_BLOCK_SIZE
-        if cid in self._counted:
-            return bound, quota, budget
-        expects = wanted.get(cid)
-        worst = MAX_BLOCK_SIZE
-        if expects and cid.is_raw and expects[0].size is not None:
-            worst = expects[0].size
-        if bound is not None and not (expects and not cid.is_raw
-                                      and not any(walker.FILE_TYPE in expect.types for expect in expects)):
-            bound -= worst
-        return bound, None if quota is None else quota - worst, budget
-
-    @staticmethod
-    def _fits(room: tuple) -> bool:
-        """True if room (as _room) leaves nothing below zero."""
-        return all(left is None or left >= 0 for left in room)
-
-    def _accept(self, cid: Cid, block: bytes, wanted: dict[Cid, list[Expect]], children: dict):
-        """Check a verified block against every expectation of it and the limits, then store it.
+    def _accept(self, cid: Cid, block: bytes, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
+        """Check a verified block against every expectation of it and the limits (budget's among them), then
+        store it.
 
         Raises InvalidDag, TooLarge.
         """
@@ -832,7 +898,7 @@ class Fetch:
             if limit is not None and self.node_bytes + len(block) > limit:
                 raise TooLarge(f"{self.root}'s DAG nodes would exceed max_download_size ({limit})")
             self.node_bytes += len(block)
-        self._count_dag(cid, len(block), children[wanted[cid][0]])
+        budget.count(cid, len(block), children[wanted[cid][0]])
         self.session.put(cid, block)
         self._progress_at = self.fetcher.clock()
         self.downloaded_blocks += 1
@@ -844,8 +910,9 @@ class Fetch:
             if self._lookup is not None:
                 self._lookup.stop()  # it may now have enough providers to stop searching
 
-    def _download(self, wanted: dict[Cid, list[Expect]], children: dict):
-        """Fetch the wanted blocks from providers until all are stored. Raises NotFound if none can."""
+    def _download(self, wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
+        """Fetch the wanted blocks from providers until all are stored, counted against budget. Raises NotFound if
+        none can."""
         outstanding = set(wanted)
         pending = _Pending(wanted)
         in_flight = self._in_flight
@@ -854,9 +921,9 @@ class Fetch:
         while outstanding:
             self._check_cancelled()  # each pass waits at most POLL, so a cancel takes effect promptly
             # Requests and lookups have deadlines of their own; this catches whatever hangs regardless
-            if self.fetcher.clock() - self._progress_at > give_up:
+            if self.fetcher.clock() - max(self._progress_at, self._heard_at) > give_up:
                 raise NotFound(f"fetching {self.root} made no progress for {give_up:g}s")
-            self._assign(pending, in_flight, outstanding, wanted)
+            self._assign(pending, in_flight, outstanding, wanted, budget)
             if not in_flight and not self._lookup_running and not self._waiting_for_busy():
                 if not self._rerun_lookup():
                     raise NotFound(self._not_found_message(outstanding))
@@ -872,21 +939,21 @@ class Fetch:
                 except queue.Empty:
                     break
             for event in events:
-                self._handle_event(event, pending, in_flight, outstanding, wanted, children)
+                self._handle_event(event, pending, in_flight, outstanding, wanted, children, budget)
 
-    def _handle_event(self, event: tuple, pending: _Pending, in_flight: dict, outstanding: set[Cid],
-                      wanted: dict[Cid, list[Expect]], children: dict):
+    def _handle_event(self, event: ResultEvent | ProviderEvent | LookupDone, pending: _Pending, in_flight: dict,
+                      outstanding: set[Cid], wanted: dict[Cid, list[Expect]], children: dict, budget: _DagBudget):
         """Apply one event from a request thread or the lookup thread."""
-        kind = event[0]
-        if kind == "provider":
-            self._add_provider(event[1])
-        elif kind == "lookup_done":
+        if isinstance(event, ProviderEvent):
+            self._add_provider(event.node_id)
+        elif isinstance(event, LookupDone):
             self._lookup_running = False
-            self._lookup_found = event[1]
-        elif kind == "result":
-            _, provider, cids, result, sent_at, rate = event
-            _, probe = in_flight.pop(provider, (cids, False))
-            self._handle(provider, cids, result, probe, wanted, children, outstanding, sent_at, rate)
+            self._lookup_found = event.found
+        elif isinstance(event, ResultEvent):
+            cids = event.cids
+            _, probe = in_flight.pop(event.node_id, (cids, False))
+            self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
+                         event.sent_at, event.rate)
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending
                        and not any(cid in asked for asked, _ in in_flight.values())]
             pending.push_front(requeue)  # back at the front, keeping the walk's order
@@ -947,7 +1014,8 @@ class Fetch:
         waits = [p.busy_until - now for p in self._providers.values() if not p.failed and p.busy_until > now]
         return max(0.01, min([POLL, *waits]))
 
-    def _assign(self, pending: _Pending, in_flight: dict, outstanding: set[Cid], wanted: dict[Cid, list[Expect]]):
+    def _assign(self, pending: _Pending, in_flight: dict, outstanding: set[Cid], wanted: dict[Cid, list[Expect]],
+                budget: _DagBudget):
         """Send requests to idle providers, after finding providers if there are none."""
         now = self.fetcher.clock()
         usable = self._usable()
@@ -960,28 +1028,29 @@ class Fetch:
                 break
             if provider.node_id in in_flight or provider.busy_until > now:
                 continue
-            batch = self._take_batch(pending, provider.node_id, wanted)
+            batch = self._take_batch(pending, provider.node_id, wanted, budget)
             if batch:
                 in_flight[provider.node_id] = (batch, False)
                 self._send(provider.node_id, batch)
                 busy_providers += 1
 
-    def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]]) -> list[Cid]:
+    def _take_batch(self, pending: _Pending, node_id: bytes, wanted: dict[Cid, list[Expect]],
+                    budget: _DagBudget) -> list[Cid]:
         """The next CIDs to ask node_id for: what one response can carry and one request packet on its link can
         hold, at least one.
 
-        Under a DAG limit, only what the room it leaves can take for sure (_room), but at least one CID when no
-        request is in flight: so a fetch downloads at most about one block beyond the limit.
+        Under a DAG limit, only what the room budget leaves can take for sure (_DagBudget.room), but at least one
+        CID when no request is in flight: so a fetch downloads at most about one block beyond the limit.
         """
-        budget = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
+        max_bytes = rates.requester_max_bytes(self.client.rate_estimate(node_id), self.config)
         # However large max_bytes is, the responder's budget is at most this (server.blocks_budget, section 7)
-        carried = min(budget, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+        carried = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
         # The client sends what fits its link's packet and returns the rest: the open link's MDU, else (no link
         # open yet) the largest request any link allows. Whether a prefix fits only gets worse as it grows, so
         # one count covers every batch taken from the front of pending
         mdu = self.client.link_mdu(node_id) or MAX_REQUEST_SIZE
-        fit = max(1, protocol.blocks_batch_size(budget, list(islice(pending, MAX_BATCH)), mdu))
-        room = self._room(wanted)
+        fit = max(1, protocol.blocks_batch_size(max_bytes, list(islice(pending, MAX_BATCH)), mdu))
+        room = budget.room((cid for cids, _ in self._in_flight.values() for cid in cids), wanted)
         batch: list[Cid] = []
         total = 0
         while pending and len(batch) < fit:
@@ -991,8 +1060,8 @@ class Fetch:
             if batch and total + guess > carried:
                 break
             if room is not None:
-                room = self._reserve(cid, wanted, room)
-                if not self._fits(room) and (batch or self._in_flight):
+                room = budget.reserve(cid, wanted, room)
+                if not budget.fits(room) and (batch or self._in_flight):
                     break
             batch.append(pending.popleft())
             total += guess
@@ -1001,8 +1070,8 @@ class Fetch:
     def _send(self, node_id: bytes, cids: list[Cid]):
         """Ask node_id for cids on a request thread, which queues the result."""
         def progress(fraction: float):
-            """The response is arriving: the fetch isn't hung."""
-            self._progress_at = self.fetcher.clock()
+            """The response is arriving: the fetch isn't hung (on the request thread, so only _heard_at is written)."""
+            self._heard_at = self.fetcher.clock()
 
         def work():
             """Run the blocking request and queue its result, with when it was sent and the rate estimate
@@ -1020,7 +1089,7 @@ class Fetch:
             if result.elapsed is not None:
                 # When it actually went out: opening the link or waiting for its /blocks slot isn't its time
                 sent_at = max(sent_at, self.fetcher.clock() - result.elapsed)
-            self._events.put(("result", node_id, cids, result, sent_at, rate))
+            self._events.put(ResultEvent(node_id, cids, result, sent_at, rate))
 
         threading.Thread(target=work, name="rnfs-fetch", daemon=True).start()
 
@@ -1063,10 +1132,10 @@ class Fetch:
             """Search, reporting each provider as its reply arrives."""
             found = []
             try:
-                found = lookup.find_providers(lambda node_id: self._events.put(("provider", node_id)), should_stop)
+                found = lookup.find_providers(lambda node_id: self._events.put(ProviderEvent(node_id)), should_stop)
             except Exception as e:  # noqa: BLE001 - a failed lookup ends with the providers found so far
                 log(f"provider lookup for {self.root} failed: {e}", LOG_WARNING)
-            self._events.put(("lookup_done", len(found)))
+            self._events.put(LookupDone(len(found)))
 
         threading.Thread(target=work, name="rnfs-find-providers", daemon=True).start()
 
@@ -1109,8 +1178,9 @@ class Fetch:
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
     def _handle(self, node_id: bytes, cids: list[Cid], result, probe: bool, wanted: dict, children: dict,
-                outstanding: set[Cid], sent_at: float | None = None, rate: float | None = None):
-        """Store a response's blocks and apply the provider failure and pacing rules. Raises InvalidDag.
+                outstanding: set[Cid], budget: _DagBudget, sent_at: float | None = None, rate: float | None = None):
+        """Store a response's blocks (counted against budget) and apply the provider failure and pacing rules.
+        Raises InvalidDag.
 
         sent_at is when the request was sent and rate the link's rate estimate then (None: unknown).
         """
@@ -1126,7 +1196,7 @@ class Fetch:
         new = {cid: block for cid, block in result.blocks.items() if cid in outstanding}
         self._make_room(sum(len(block) for cid, block in new.items() if not self.storage.has(cid)))
         for cid, block in new.items():
-            self._accept(cid, block, wanted, children)
+            self._accept(cid, block, wanted, children, budget)
             outstanding.discard(cid)
         if probe:
             # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised

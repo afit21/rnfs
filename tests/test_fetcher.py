@@ -279,13 +279,23 @@ class PacingTest(FetcherTest):
         result = BlocksResult(status, reason=reason)
         if status == OK:
             result.blocks[cid] = self.network[cid]
-        self.fetch._handle(P1, [cid], result, False, {}, {}, set(), sent_at, rate)
+        self.fetch._handle(P1, [cid], result, False, {}, {}, set(), self.fetch.budget, sent_at, rate)
 
     def test_slow_link_waits_before_asking_again(self):
         self.result(OK, sent_at=self.now - 40, rate=50_000)  # 40 s for that request
         # At the default cap, half the rate estimate, the next response may start 2 × 40 s after the last one
         self.assertEqual(self.provider.busy_until, self.now + 40)
         self.assertGreaterEqual(self.fetch._progress_at, self.now + 40)  # waiting isn't counted as hanging
+
+    def test_response_progress_doesnt_cut_a_pacing_wait_short(self):
+        self.result(OK, sent_at=self.now - 40, rate=50_000)
+        paced = self.fetch._progress_at
+        self.now += 1
+        self.client.behaviour[P1] = lambda cids: self.client.on_progress(0.5)  # then served as usual
+        self.fetch._send(P1, [self.built.cid])
+        self.fetch._events.get(timeout=5)
+        # The request thread only notes when it heard progress; the deadline counts from the later of the two
+        self.assertEqual((self.fetch._progress_at, self.fetch._heard_at), (paced, self.now))
 
     def test_fast_link_isnt_paced(self):
         self.result(OK, sent_at=self.now - 40, rate=200_000)
@@ -331,8 +341,9 @@ class PacingTest(FetcherTest):
             return BlocksResult(OK, blocks={cid: self.network[cid]}, elapsed=elapsed)
         self.client.behaviour[P1] = answer
         self.fetch._send(P1, [cid])
-        _, node_id, cids, result, sent_at, rate = self.fetch._events.get(timeout=5)
-        self.fetch._handle(node_id, cids, result, False, {}, {}, set(), sent_at, rate)
+        event = self.fetch._events.get(timeout=5)
+        self.fetch._handle(event.node_id, event.cids, event.result, False, {}, {}, set(), self.fetch.budget,
+                           event.sent_at, event.rate)
 
     def test_pacing_counts_from_when_the_request_was_sent(self):
         self.sent(40)
@@ -352,7 +363,7 @@ def old_take_batch(fetch, pending, node_id, wanted, mdu):
     reserved that it has now: the reference the single count over pending must match."""
     budget = fetcher_module.rates.requester_max_bytes(fetch.client.rate_estimate(node_id), fetch.config)
     carried = min(budget, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
-    room = fetch._room(wanted)
+    room = fetch.budget.room((cid for cids, _ in fetch._in_flight.values() for cid in cids), wanted)
     batch, total = [], 0
     while pending and len(batch) < fetcher_module.MAX_BATCH:
         cid = pending[0]
@@ -363,8 +374,8 @@ def old_take_batch(fetch, pending, node_id, wanted, mdu):
         if batch and protocol.blocks_batch_size(budget, batch + [cid], mdu) <= len(batch):
             break
         if room is not None:
-            room = fetch._reserve(cid, wanted, room)
-            if not fetch._fits(room) and (batch or fetch._in_flight):
+            room = fetch.budget.reserve(cid, wanted, room)
+            if not fetch.budget.fits(room) and (batch or fetch._in_flight):
                 break
         batch.append(pending.popleft())
         total += guess
@@ -385,7 +396,7 @@ class BatchTest(FetcherTest):
 
     def take(self) -> list[Cid]:
         """The batch for P1 from every chunk."""
-        return self.fetch._take_batch(deque(self.wanted), P1, self.wanted)
+        return self.fetch._take_batch(deque(self.wanted), P1, self.wanted, self.fetch.budget)
 
     def test_capped_at_what_a_response_carries(self):
         # At 1 Gbit/s max_bytes asks for ~7.5 GB, but a response carries at most MAX_RESPONSE_SIZE less overhead
@@ -427,7 +438,7 @@ class BatchTest(FetcherTest):
             with self.subTest(trial=trial):
                 old, new = deque(wanted), deque(wanted)
                 expected = old_take_batch(self.fetch, old, P1, wanted, mdu or MAX_REQUEST_SIZE)
-                self.assertEqual(self.fetch._take_batch(new, P1, wanted), expected)
+                self.assertEqual(self.fetch._take_batch(new, P1, wanted, self.fetch.budget), expected)
                 self.assertEqual(list(new), list(old))
 
 
@@ -452,8 +463,8 @@ class RequeueTest(FetcherTest):
 
         def result(node_id: bytes, cids: list[Cid], outcome: BlocksResult):
             """Handle node_id's result for cids."""
-            fetch._handle_event(("result", node_id, cids, outcome, None, None), pending, in_flight, outstanding,
-                                wanted, {})
+            fetch._handle_event(fetcher_module.ResultEvent(node_id, cids, outcome, None, None), pending, in_flight,
+                                outstanding, wanted, {}, fetch.budget)
 
         # P2's budget cut its response after 10 blocks: the rest go back to the front
         result(P2, second, BlocksResult(OK, blocks={cid: blocks[cid] for cid in second[:10]}, unsent=second[10:]))
@@ -471,6 +482,47 @@ class RequeueTest(FetcherTest):
         drained = [pending.popleft() for _ in range(len(pending))]
         self.assertEqual(drained, walk[:32] + walk[42:])
         self.assertFalse(any(cid in pending for cid in walk))
+
+
+class DagBudgetTest(unittest.TestCase):
+    """_DagBudget, the pure bookkeeping of a fetch's DAG byte limits, and the budgets of its read_range calls."""
+
+    def setUp(self):
+        """A fetch's own budget, with no limit yet, a DAG node and a raw chunk."""
+        self.budget = fetcher_module._DagBudget(Cid.for_block(RAW, b"root"))
+        self.node = Cid.for_block(DAG, b"node")
+        self.chunk = Cid.for_block(RAW, b"chunk")
+
+    def test_nothing_is_counted_without_a_limit(self):
+        self.assertIsNone(self.budget.limit())
+        self.assertIsNone(self.budget.room([self.node], {}))
+        self.budget.count(self.node, 1000)
+        self.assertEqual(self.budget.used, 0)
+
+    def test_a_read_range_budget_counts_against_the_fetchs_too(self):
+        self.budget.max_dag_bytes = 10_000
+        first = self.budget.for_range(3000, 1)
+        first.count(self.node, 2000)
+        first.count(self.node, 2000)  # once per call
+        first.count(self.chunk, 5000)  # a raw chunk counts against the fetch's limits only
+        self.assertEqual((first.range_used, self.budget.used), (2000, 7000))
+        second = self.budget.for_range(3000, 1)
+        second.count(self.node, 2000)  # each call counts the nodes it meets; the fetch, each block once
+        self.assertEqual((second.range_used, self.budget.used), (2000, 7000))
+        with self.assertRaises(TooLarge):
+            second.count(Cid.for_block(DAG, b"other"), 1001)
+        with self.assertRaises(TooLarge):
+            self.budget.count(Cid.for_block(RAW, b"large"), 3001)
+
+    def test_room_reserves_what_is_in_flight(self):
+        self.budget.max_dag_bytes = 100 * MAX_BLOCK_SIZE
+        budget = self.budget.for_range(10 * MAX_BLOCK_SIZE, 1)
+        wanted = {self.chunk: [walker.Expect(self.chunk, 10, walker.FILE_TYPES, 2)]}
+        # A node not received may be MAX_BLOCK_SIZE; a raw chunk is its declared size, and nothing to the range
+        room = budget.room([self.node, self.chunk], wanted)
+        self.assertEqual(room, (None, 99 * MAX_BLOCK_SIZE - 10, 9 * MAX_BLOCK_SIZE))
+        self.assertTrue(budget.fits(room))
+        self.assertFalse(budget.fits((None, -1, 0)))
 
 
 class ValidityTest(FetcherTest):
