@@ -1041,7 +1041,9 @@ runs while a lock is held:
 change returns, "NORMAL" ones are batched saves a power loss may lose the last of:
 - storage: `pins` (one row per source; each pin and release FULL, after the blocks are synced) and `cache`
   (cached fetches, LRU order in `used`, at most 10 000; NORMAL every 30 s and at stop, changed records only);
-- `pin_names` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin list; FULL);
+- `pin_names` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin list; NORMAL,
+  each change written at once, after the pin it names was committed FULL: a power loss can lose a name, never the
+  pin, and an add costs one durable commit, not two);
 - node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
   pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
   `invalid` (invalid roots, oldest first; with the cache records);
