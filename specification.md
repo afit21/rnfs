@@ -1206,11 +1206,20 @@ gateway can never reach the API.
   to its owner only (on Windows: a protected access list allowing only the user and SYSTEM, which the files
   below it inherit; Administrators are tolerated where an older version left them). On Windows a new rnfs
   directory and its subdirectories MUST get that access list when they are created (not after), the daemon
-  MUST refuse a new one that already holds anything, and one that is a junction or symlink. The settings file
-  (`rnfs.toml`) and the identity MUST be checked before use, through the handle they are read from: one owned
-  by another user (account) is refused, one others may access is made private (with a warning), and one that
-  can't be made private stops rnfs. The identity MUST also be a regular file (not a symlink, FIFO or device);
-  anything else stops the daemon with an error.
+  MUST refuse a new one that already holds anything, and one that is a junction or symlink. Its existing
+  subdirectories (rnfs: `state`, `blocks`, `storage`, `names` and `lxmf`) MUST be real directories (not
+  symlinks or junctions) owned by the user, checked without following a link, and one others may access is
+  made owner-only (rnfs: 0700, with a notice; if others could write to it, entries in it owned by another
+  user are reported, as a warning). Anything else stops the daemon with an error before Reticulum starts.
+  The settings file (`rnfs.toml`), the identity, and Reticulum's `config` when `reticulum_dir` is the rnfs
+  directory MUST be checked before use, through the handle they are read from: one owned by another user
+  (account) is refused, one others may access is made private (rnfs: 0600 on POSIX; with a warning), and one
+  that can't be made private stops rnfs. Each MUST also be a regular file (not a symlink, FIFO or device),
+  opened without following a link or waiting on a FIFO; anything else is refused. A symlinked `rnfs.toml` is
+  refused too. rnfs reads at most 1 MiB of `rnfs.toml`. A start checks the rnfs directory, then reads the
+  settings, then checks the subdirectories, then takes the directory's lock, in the daemon and in an embedded
+  node alike; clients (the CLI, `rnfs.Client`) check `rnfs.toml` the same way when they read it, and show
+  what was changed (the CLI prints it, `rnfs.Client` raises a `RuntimeWarning`, an embedded node logs it).
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it sends the token, a client SHOULD check this proof with a `GET /api/status` on the connection

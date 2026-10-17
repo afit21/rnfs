@@ -4,7 +4,7 @@ import stat
 
 import RNS
 
-from rnfs import fsutil, winacl
+from rnfs import fsutil
 from rnfs.constants import APP_NAME, DHT_ASPECT, ID_LENGTH
 from rnfs.errors import RnfsError
 from rnfs.log import LOG_WARNING, log
@@ -116,28 +116,16 @@ def _load_identity(path: str) -> RNS.Identity:
 
 def _check_private(path: str, fd: int, info: os.stat_result):
     """Check that the identity file open as fd (whose fstat is info) is the user's own and private to them,
-    tightening its permissions if others may access it. Raises IdentityFileError, OSError."""
-    if fsutil.IS_WINDOWS:
-        try:
-            reason = winacl.tighten(path, fd=fd)
-        except OSError as e:
+    tightening its permissions (to IDENTITY_MODE on POSIX) if others may access it, with a warning. Raises
+    IdentityFileError."""
+    try:
+        warning = fsutil.check_owned_fd(path, fd, info, "the identity file")
+    except OSError as e:
+        if fsutil.IS_WINDOWS:
             raise IdentityFileError(f"the identity file {path} can't be made private to you: {e}") from None
-        if reason is not None:
-            log(f"identity file {path} was accessible to other users ({reason}); "
-                f"restricted it to you and SYSTEM", LOG_WARNING)
-        return
-    if info.st_uid != os.geteuid():
-        raise IdentityFileError(f"the identity file {path} belongs to another user (uid {info.st_uid}); "
-                                f"rnfs only uses a key file of your own")
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & 0o077:
-        try:
-            os.fchmod(fd, IDENTITY_MODE)
-        except OSError as e:
-            raise IdentityFileError(f"the identity file {path} is accessible to other users (mode {mode:o}) "
-                                    f"and can't be restricted: {e}") from None
-        log(f"identity file {path} was accessible to other users (mode {mode:o}); "
-            f"restricted it to {IDENTITY_MODE:o}", LOG_WARNING)
+        raise IdentityFileError(f"{e}; rnfs only uses a key file of your own, private to you") from None
+    if warning is not None:
+        log(warning, LOG_WARNING)
 
 
 def node_id_for_identity(identity: RNS.Identity) -> bytes:

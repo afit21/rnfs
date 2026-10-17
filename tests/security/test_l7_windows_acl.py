@@ -16,7 +16,6 @@ from unittest import mock
 import RNS
 
 from rnfs import cli, fsutil, node as node_module, winacl
-from rnfs.config import Config
 from rnfs.errors import RnfsError
 from rnfs.network import identity as identity_module
 from rnfs.winacl import ADMINISTRATORS, SYSTEM, Ace, Dacl
@@ -193,17 +192,18 @@ class RnfsDirTest(WindowsTestCase):
         return "\n".join(call.args[0] for call in self.log.call_args_list)
 
     def test_new_dir_gets_a_protected_dacl(self):
-        node_module._make_private_dirs(Config(rnfs_dir=self.root))
+        node_module._make_private_dirs(self.root)
         # Created with it (CreateDirectoryW's security attributes), never set afterwards
         self.assertEqual(self.acl.created, [self.root, *(os.path.join(self.root, name)
-                                                         for name in ("state", "blocks", "storage", "names"))])
+                                                         for name in ("state", "blocks", "storage", "names",
+                                                                      "lxmf"))])
         self.assertEqual(self.acl.set_calls, [])
         self.assertTrue(self.private(self.root))
         self.assertEqual(self.messages(), "")
 
     def test_existing_dir_others_can_read_is_tightened(self):
         os.mkdir(self.root)
-        node_module._make_private_dirs(Config(rnfs_dir=self.root))
+        node_module._make_private_dirs(self.root)
         self.assertEqual(self.acl.set_calls, [(self.root, True)])
         self.assertTrue(self.private(self.root))
         self.assertIn("made " + self.root + " private to you and SYSTEM (Users (S-1-5-32-545) may access it)",
@@ -213,7 +213,7 @@ class RnfsDirTest(WindowsTestCase):
         # The default ~/.rnfs, inheriting the profile's DACL: nothing changed, nothing logged at every start
         os.mkdir(self.root)
         self.acl.set(self.root, PROFILE)
-        node_module._make_private_dirs(Config(rnfs_dir=self.root))
+        node_module._make_private_dirs(self.root)
         self.assertEqual(self.acl.set_calls, [])
         self.assertEqual(self.messages(), "")
 
@@ -221,7 +221,7 @@ class RnfsDirTest(WindowsTestCase):
         os.mkdir(self.root)
         self.acl.set(self.root, Dacl(OTHER, [allow(OTHER), allow(USER)]))
         with self.assertRaisesRegex(RnfsError, f"couldn't make the rnfs dir .* private to you: .*belongs to {OTHER}"):
-            node_module._make_private_dirs(Config(rnfs_dir=self.root))
+            node_module._make_private_dirs(self.root)
         self.assertEqual(self.acl.set_calls, [])
         self.assertFalse(os.path.exists(os.path.join(self.root, "state")))
 
@@ -229,16 +229,16 @@ class RnfsDirTest(WindowsTestCase):
         os.mkdir(self.root)
         with mock.patch.object(self.acl, "set_private", side_effect=PermissionError(5, "Access is denied")):
             with self.assertRaisesRegex(RnfsError, "couldn't make the rnfs dir"):
-                node_module._make_private_dirs(Config(rnfs_dir=self.root))
+                node_module._make_private_dirs(self.root)
         # Nor one whose DACL doesn't take (e.g. a filesystem without ACLs)
         with mock.patch.object(self.acl, "set_private"):
             with self.assertRaisesRegex(RnfsError, "still not private"):
-                node_module._make_private_dirs(Config(rnfs_dir=self.root))
+                node_module._make_private_dirs(self.root)
 
     def test_dir_outside_the_profile_is_warned_about(self):
         with mock.patch.dict(os.environ, {"USERPROFILE": os.path.join(self.tmp.name, "profile")}):
-            node_module._make_private_dirs(Config(rnfs_dir=self.root))
-            node_module._make_private_dirs(Config(rnfs_dir=self.root))  # as a start does more than once
+            node_module._make_private_dirs(self.root)
+            node_module._make_private_dirs(self.root)  # as a start does more than once
         self.assertTrue(self.private(self.root))
         self.assertEqual(self.messages().count("is outside your user profile"), 1)
 
@@ -290,7 +290,7 @@ class PosixUnchangedTest(unittest.TestCase):
     def test_no_backend_calls(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(fsutil, "IS_WINDOWS", False), \
                 mock.patch.object(winacl, "backend", mock.Mock(side_effect=AssertionError)) as backend:
-            node_module._make_private_dirs(Config(rnfs_dir=os.path.join(directory, "rnfs")))
+            node_module._make_private_dirs(os.path.join(directory, "rnfs"))
             token = os.path.join(directory, "rnfs", cli.TOKEN_FILE)
             cli.write_token(token, "t")
             self.assertEqual(cli.read_token(token), "t")

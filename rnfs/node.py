@@ -19,6 +19,7 @@ The daemon owns its process, so its Resource guards cover every link and RNS's c
 (network/guards.py, PROCESS); an embedded node scopes both to its rnfs.dht links (DHT) and leaves the host
 program's Reticulum running when it stops. Neither ever stops Reticulum: the daemon calls RNS.exit() itself.
 """
+import errno
 import hashlib
 import os
 import random
@@ -109,20 +110,26 @@ def import_remote_pins(value: list, tx) -> int:
     return count
 
 
-def _make_private_dirs(config: Config):
-    """Create the rnfs dir and the node's subdirectories readable by the owner only (0700; on Windows, a
-    protected access list for the user and SYSTEM from the moment each is created, see winacl).
+# The node's subdirectories of the rnfs dir (Config.state_dir, blocks_dir, identity_path's, names_dir; LXMF's
+# ratchets), made private at each start. Not files/, the shared folder, whose contents the user chooses
+PRIVATE_SUBDIRS = ("state", "blocks", "storage", "names", "lxmf")
+_DIRECTORY_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | fsutil.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NONBLOCK", 0))
 
-    They hold the node's identity, name keys and the local API token, so other local users must not read
-    them; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if the
-    root belongs to another user or can't be made private: its owner could swap the identity or plant a
-    config there. On Windows also if the root is a junction or symlink, or new but not empty.
+
+def make_private_root(root: str):
+    """Create the rnfs dir root readable by the owner only (0700; on Windows, a protected access list for the
+    user and SYSTEM from the moment it is created, see winacl), or check and tighten an existing one.
+
+    The first step of a start, before the settings in it are read (then _make_private_dirs, then the lock). It
+    holds the node's identity, name keys, settings and the local API token, so other local users must not read
+    or change it; a root left group- or world-accessible by earlier versions is tightened. Raises RnfsError if it
+    belongs to another user or can't be made private: its owner could swap the identity or plant a config there.
+    On Windows also if it is a junction or symlink, or new but not empty.
     """
-    root = config.root
-    subdirs = (config.state_dir, config.blocks_dir, os.path.dirname(config.identity_path), config.names_dir)
     if fsutil.IS_WINDOWS:
         # No Unix permission bits there (st_mode always shows others allowed): an explicit access list
-        winacl.secure_rnfs_dir(root, subdirs)
+        winacl.secure_rnfs_dir(root)
         return
     os.makedirs(root, mode=0o700, exist_ok=True)
     info = os.stat(root)
@@ -135,8 +142,94 @@ def _make_private_dirs(config: Config):
         except OSError as e:
             raise RnfsError(f"couldn't make {root} private to its owner (mode {mode:o}): {e}") from None
         log(f"made {root} private to its owner (it had mode {mode:o})", LOG_NOTICE)
-    for directory in subdirs:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+
+def _make_private_dirs(root: str):
+    """Make the rnfs dir root private (make_private_root), then each of its PRIVATE_SUBDIRS: created 0700 if
+    missing (on Windows with the private access list), else checked and tightened (audit API-1).
+
+    Tightening the root later doesn't take back a subdirectory from a user who could once write in a loose rnfs
+    dir: they may own one they created, or hold a descriptor on it, and plant blocks (trusted by their length)
+    or name keys. So on POSIX each is opened without following a link and checked through that descriptor: a
+    symlink, anything but a directory or one of another user's stops the start; a loose one is made 0700 with a
+    notice, and if others could write to it, entries in it owned by another user are reported (a warning: they
+    may be planted). Raises RnfsError for any of those, or if the root can't be made private.
+    """
+    if fsutil.IS_WINDOWS:
+        winacl.secure_rnfs_dir(root, tuple(os.path.join(root, name) for name in PRIVATE_SUBDIRS))
+        return
+    make_private_root(root)
+    for name in PRIVATE_SUBDIRS:
+        _make_private_subdir(os.path.join(root, name))
+
+
+def _make_private_subdir(path: str):
+    """_make_private_dirs on POSIX for one subdirectory at path. Raises RnfsError."""
+    try:
+        fd = _open_subdir(path)
+    except OSError as e:
+        # O_NOFOLLOW's answer for a symlink is ELOOP (EMLINK on FreeBSD), or with O_DIRECTORY on Linux ENOTDIR
+        if e.errno not in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise RnfsError(f"can't use {path}: {e}") from None
+        try:
+            link = fsutil.is_link(os.lstat(path))
+        except OSError:
+            link = False
+        what = "a symlink" if link else "not a directory"
+        raise RnfsError(f"{path} is {what}; rnfs uses only a real directory of your own there. Move it away (rnfs "
+                        f"creates a new one)") from None
+    try:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        fsutil.check_owned_fd(path, fd, info, "the rnfs dir's subdirectory")
+    except OSError as e:
+        raise RnfsError(f"{e}. rnfs uses only directories of your own there: move it away, or as root give it to "
+                        f"yourself (chown -R {os.geteuid()} {path})") from None
+    finally:
+        os.close(fd)
+    if mode & 0o077:
+        log(f"made {path} private to its owner (it had mode {mode:o})", LOG_NOTICE)
+        if mode & 0o022:
+            _warn_foreign_entries(path)
+
+
+def _open_subdir(path: str) -> int:
+    """A descriptor of the directory at path, not following a link (created 0700 if missing). Raises OSError:
+    ELOOP, EMLINK or ENOTDIR for a symlink, ENOTDIR for anything else that isn't a directory."""
+    try:
+        fd = os.open(path, _DIRECTORY_FLAGS)
+    except FileNotFoundError:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass  # made meanwhile, by another start: checked like any other
+        fd = os.open(path, _DIRECTORY_FLAGS)
+    if not stat.S_ISDIR(os.fstat(fd).st_mode):  # where O_DIRECTORY is missing
+        os.close(fd)
+        raise NotADirectoryError(errno.ENOTDIR, "not a directory", path)
+    return fd
+
+
+def _warn_foreign_entries(directory: str):
+    """Warn about entries below directory, which others could write to until now, that another user owns: they
+    may have been planted (in blocks/, a raw block is trusted by its length). One lstat pass, links not followed;
+    nothing is removed."""
+    uid = os.geteuid()
+    count, first = 0, None
+    for parent, directories, files in os.walk(directory):
+        for name in directories + files:
+            entry = os.path.join(parent, name)
+            try:
+                if os.lstat(entry).st_uid == uid:
+                    continue
+            except OSError:
+                continue  # gone meanwhile
+            count += 1
+            first = first or entry
+    if count:
+        log(f"{directory} was writable by other users, and {count} entr{'y' if count == 1 else 'ies'} in it "
+            f"belong to another user (e.g. {first}): they may have been put there to mislead rnfs. Check them, or "
+            f"delete them (rnfs fetches blocks again)", LOG_WARNING)
 
 
 class DirInUse(RnfsError):
@@ -149,12 +242,13 @@ class DirInUse(RnfsError):
 
 
 def lock_rnfs_dir(config: Config) -> int:
-    """Make the rnfs dir private (as the node would) and lock <rnfs dir>/daemon.lock without waiting, before
-    anything else uses the dir: two nodes on one dir would load and save the same state and announce the same
+    """Make the rnfs dir and its subdirectories private (as the node would) and lock <rnfs dir>/daemon.lock
+    without waiting, before anything else uses the dir (the last steps of a start: make_private_root, then the
+    settings, come first): two nodes on one dir would load and save the same state and announce the same
     node ID. The open descriptor, whose lock lasts until it is closed or the process ends. Raises DirInUse if
     another process, or another node in this one, holds it; RnfsError or OSError if the dir can't be made
     private or the file locked. The daemon and rnfs.Node both lock through here."""
-    _make_private_dirs(config)
+    _make_private_dirs(config.root)
     path = os.path.join(config.root, LOCK_FILE)
     try:
         return fsutil.lock_exclusive(path)
@@ -330,7 +424,7 @@ class RnfsNode:
         program's running instance, or starts one if there is none; its guards cover only rnfs.dht links.
         """
         config.validate()
-        _make_private_dirs(config)  # before Reticulum and the identity, which write under it
+        _make_private_dirs(config.root)  # before Reticulum and the identity, which write under it
         self.embedded = embedded
         # Reject oversized, compressed and request Resource advertisements before RNS allocates for them; in the
         # daemon on every link, with RNS's compression off process-wide (section 3)
@@ -422,7 +516,7 @@ class RnfsNode:
                 self._bootstrap_nodes.append(parse_node_id(text))
             except ValueError as e:
                 log(f"ignoring bootstrap node: {e}", LOG_WARNING)
-        _make_private_dirs(config)
+        _make_private_dirs(config.root)
         # First, so the JSON state files of earlier versions are imported before any store loads its state
         self._db = statedb.connect(config.state_dir)
 

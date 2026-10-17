@@ -4,18 +4,21 @@ Each node may change these, in `<rnfs dir>/rnfs.toml` or on the command line. Ti
 sizes in bytes and rates in bits/s. A setting left as None takes a default that depends on whether
 the node (or link) is slow; use the `effective_*` helpers rather than reading those fields directly.
 """
+import errno
 import math
 import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass, field, fields
 
-from rnfs import winacl
-from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
+from rnfs import fsutil
+from rnfs.constants import DAY, GIB, HOUR, KIB, MIB, PROVIDER_TTL
 
 DEFAULT_API_PORT = 8788
 DEFAULT_GATEWAY_PORT = 8789
 SETTINGS_FILE = "rnfs.toml"
+MAX_SETTINGS_SIZE = 1 * MIB  # bytes of rnfs.toml read; a larger file is refused
 # In the rnfs dir, locked by the daemon or embedded node using it (node.lock_rnfs_dir), so a second can't start
 LOCK_FILE = "daemon.lock"
 
@@ -50,7 +53,13 @@ def _is_number(value) -> bool:
 
 @dataclass
 class Config:
-    """Settings for an RnfsNode."""
+    """Settings for an RnfsNode.
+
+    warnings: what Config.load changed to trust the settings, for the caller to show (a plain attribute, not a
+    field, so rnfs.toml can't set it).
+    """
+
+    warnings = ()  # unannotated, so not a dataclass field; Config.load sets a list
 
     rnfs_dir: str = "~/.rnfs/"  # identity, blocks, pins, names and shared folder live here
     # Reticulum config directory. None uses RNS's own default (/etc/reticulum, ~/.config/reticulum or
@@ -269,17 +278,30 @@ class Config:
     @classmethod
     def load(cls, rnfs_dir: str = "~/.rnfs/", defaults: dict | None = None, **overrides) -> "Config":
         """Settings from `<rnfs_dir>/rnfs.toml` if it exists, then overrides (None values ignored), validated.
-        defaults (an embedded node's) apply where neither sets a value."""
+        defaults (an embedded node's) apply where neither sets a value.
+
+        rnfs.toml, and RNS's `config` when reticulum_dir is the rnfs dir, must be regular files of this user's;
+        one others may access is made private (open_checked). What was changed is in the result's warnings, for
+        the caller to show: this module doesn't log, as rnfs.log imports RNS, which the CLI and rnfs.Client never
+        load. Raises PermissionError if either file can't be trusted, ValueError for settings that aren't valid
+        (also a settings file over MAX_SETTINGS_SIZE), OSError if the file can't be read.
+        """
         values: dict = dict(defaults or {})
-        path = os.path.join(os.path.expanduser(rnfs_dir), SETTINGS_FILE)
-        if os.path.isfile(path):
-            with open(path, "rb") as f:
-                # On Windows, owned by and private to this user: its settings pick programs rnfs runs
-                try:
-                    winacl.secure_settings(path, f.fileno())
-                except OSError as e:
-                    raise PermissionError(f"can't trust the settings file: {e}") from None
-                values.update(tomllib.load(f))
+        warnings: list[str] = []
+        root = os.path.expanduser(rnfs_dir)
+        path = os.path.join(root, SETTINGS_FILE)
+        # Its settings choose the Reticulum config, and with it programs rnfs starts, and the API port the CLI
+        # sends its token to: whoever could change it could choose them
+        opened = open_checked(path, "the settings file")
+        if opened is not None:
+            fd, warning = opened
+            if warning is not None:
+                warnings.append(f"{warning}. Check that its settings are yours")
+            with os.fdopen(fd, "rb") as f:
+                data = f.read(MAX_SETTINGS_SIZE + 1)
+            if len(data) > MAX_SETTINGS_SIZE:
+                raise ValueError(f"{path} is larger than {MAX_SETTINGS_SIZE // MIB} MiB")
+            values.update(tomllib.loads(data.decode("utf-8")))
         known = {f.name for f in fields(cls)}
         unknown = values.keys() - known
         if unknown:
@@ -291,4 +313,57 @@ class Config:
         values["rnfs_dir"] = rnfs_dir
         config = cls(**values)
         config.validate()
+        reticulum_root = config.reticulum_root
+        if reticulum_root is not None and os.path.realpath(reticulum_root) == os.path.realpath(root):
+            # Earlier versions' layout: RNS reads its config (interfaces, and their commands) from the rnfs dir
+            opened = open_checked(os.path.join(root, "config"), "the Reticulum config")
+            if opened is not None:
+                fd, warning = opened
+                os.close(fd)
+                if warning is not None:
+                    warnings.append(f"{warning}. Check that its interfaces are yours")
+        config.warnings = warnings
         return config
+
+
+def open_checked(path: str, what: str) -> tuple[int, str | None] | None:
+    """Open the file at path for reading, once checked through its descriptor: (the descriptor, a warning if it
+    was made private) or None if nothing is at path. what (e.g. "the settings file") names it in messages.
+
+    It must be a regular file (a FIFO would block the start, a device be read without end), not a symlink
+    (whoever can write to the directory could point it at a file of theirs), and the user's own; one others may
+    access is made private (fsutil.check_owned_fd). Opened with O_NOFOLLOW and O_NONBLOCK, so neither a symlink
+    nor a FIFO is followed or waited on. Raises PermissionError if it can't be trusted, OSError if it can't be
+    opened.
+    """
+    try:
+        # On Windows, which has no O_NOFOLLOW, a symlink or junction is found here (O_NOFOLLOW catches a swap)
+        listed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if fsutil.is_link(listed):
+        raise PermissionError(f"{what} {path} is a symlink; rnfs only reads a regular file there (put the file "
+                              f"itself there)")
+    try:
+        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | fsutil.O_BINARY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None  # removed since the lstat
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):  # O_NOFOLLOW's answer for a symlink (EMLINK on FreeBSD)
+            raise PermissionError(f"{what} {path} is a symlink; rnfs only reads a regular file there") from None
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError(f"{what} {path} is not a regular file; rnfs only reads a regular file there")
+        try:
+            warning = fsutil.check_owned_fd(path, fd, info, what)
+        except OSError as e:
+            if not fsutil.IS_WINDOWS:
+                raise  # its message says what and why
+            raise PermissionError(f"can't trust {what}: {e}") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, warning

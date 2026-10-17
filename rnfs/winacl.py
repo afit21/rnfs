@@ -10,12 +10,12 @@ the API token, the node's identity and the name keys. So on Windows:
   parent) that grants full control to the current user and SYSTEM only, inherited by everything created below
   it. The DACL is part of the CreateDirectoryW call, so there is no moment when the parent's DACL applies and
   another account could put a file in it; a dir that is new yet not empty is refused all the same. An existing
-  rnfs dir that lets anyone else in gets the same DACL (which Windows passes on to what is below it), and one
-  that is a junction or symlink is refused;
+  rnfs dir or subdirectory that lets anyone else in gets the same DACL (which Windows passes on to what is below
+  it), and one that is a junction or symlink is refused;
 - the API token, identity and name key files get that DACL explicitly when written (fsutil.write_atomic's
   private); an existing identity or settings file (rnfs.toml) is checked through the handle it is read from
-  before use: one owned by another account is refused, one that lets others in is tightened, and a DACL that
-  can't be read or tightened stops rnfs;
+  before use (fsutil.check_owned_fd): one owned by another account is refused, one that lets others in is
+  tightened, and a DACL that can't be read or tightened stops rnfs;
 - every CLI command checks the token file's DACL before trusting it, and the daemon the rnfs dir's at start;
 - a directory `get` writes out is created with that DACL too, so nobody else can rename inside it while it is
   written (audit CONT-2), and given back its folder's inherited access list (inherit_from_parent) once complete.
@@ -29,6 +29,7 @@ fsutil.IS_WINDOWS and `backend`. The ACL and SID formats are parsed and built he
 tested on any platform. No RNS dependency, so the CLI can use it.
 """
 import os
+import stat
 import struct
 from typing import NamedTuple
 
@@ -404,18 +405,6 @@ def tighten(path: str, directory: bool = False, fd: int | None = None) -> str | 
     return reason
 
 
-def secure_settings(path: str, fd: int):
-    """On Windows, check the settings file (rnfs.toml) open as fd before its settings are used: one that another
-    account owns is refused, one that lets others in is made private (with a warning, as they could have
-    changed it). Its settings choose the Reticulum config, and with it programs rnfs starts, and the API port
-    the CLI sends its token to. Raises PermissionError or OSError if it can't be trusted."""
-    reason = tighten(path, fd=fd)
-    if reason is not None:
-        from rnfs.log import LOG_WARNING, log
-        log(f"the settings file {path} was accessible to other users ({reason}); made it private to you and "
-            f"SYSTEM. Check that its settings are yours", LOG_WARNING)
-
-
 def outside_profile(path: str) -> bool:
     """On Windows, True if path is outside the user's profile (%USERPROFILE%), whose ACL keeps other users out."""
     if not fsutil.IS_WINDOWS:
@@ -437,10 +426,11 @@ def secure_rnfs_dir(root: str, subdirs: tuple[str, ...] = ()):
     A new root is created with the protected owner-only DACL in the same call (make_private_dir), and must
     then be empty: anything in it was put there by someone else. An existing one is made private if others
     may access it. A root that is a junction, symlink or other link-like reparse point is refused, as the
-    access list checked and set would be its target's. Missing subdirectories get the same DACL when created.
+    access list checked and set would be its target's. Missing subdirectories get the same DACL when created;
+    existing ones are checked and made private like the root (_make_private_below).
 
-    Raises RnfsError if root is a link, belongs to another account, can't be made private, or was found
-    non-empty when new.
+    Raises RnfsError if root or a subdirectory is a link, belongs to another account or can't be made private,
+    or if root was found non-empty when new.
     """
     if not fsutil.IS_WINDOWS:
         return
@@ -478,12 +468,26 @@ def secure_rnfs_dir(root: str, subdirs: tuple[str, ...] = ()):
 
 
 def _make_private_below(root: str, directory: str):
-    """Create directory (below root) and any missing directories between root and it with make_private_dir.
-    Raises OSError (FileExistsError if something other than a directory is in the way)."""
+    """Create directory (below root) and any missing directories between root and it with make_private_dir, or
+    make an existing one private if others may access it (audit API-1: an rnfs dir that was once open to them
+    may hold subdirectories they can still change). Raises RnfsError if one is a junction or symlink (the access
+    list checked and set would be its target's), OSError (FileExistsError if something other than a directory
+    is in the way, PermissionError if one belongs to another account)."""
+    from rnfs.errors import RnfsError
+    from rnfs.log import LOG_NOTICE, log
     path = root
     for part in os.path.relpath(directory, root).split(os.sep):
         if part == ".":
             continue
         path = os.path.join(path, part)
-        if not make_private_dir(path) and not os.path.isdir(path):
-            raise FileExistsError(f"{path} is in the way of a directory")
+        if make_private_dir(path):
+            continue
+        info = os.lstat(path)
+        if fsutil.is_link(info):
+            raise RnfsError(f"{path} is a junction or symlink; rnfs uses only a real directory there. Move it "
+                            f"away (rnfs creates a new one)")
+        if not stat.S_ISDIR(info.st_mode):
+            raise FileExistsError(f"{path} is not a directory, and is in the way of one")
+        reason = tighten(path, directory=True)
+        if reason is not None:
+            log(f"made {path} private to you and SYSTEM ({reason})", LOG_NOTICE)
