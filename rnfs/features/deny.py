@@ -161,7 +161,7 @@ class DenyFeature(Feature):
                 if previous == expect.cid and self.deny.in_use(source):
                     self._set_state(source, "in use")
                     return True
-                if walker.kind_of(expect, fetch.get(expect)) != "file":
+                if walker.kind_of(expect, fetch.get(expect)) != walker.FILE_TYPE:
                     raise ValueError("it is a directory, not a file")
                 if fetch.size_of(expect) > denylist.MAX_LIST_BYTES:
                     raise ValueError(f"it is over {denylist.MAX_LIST_BYTES // 1024} KiB")
