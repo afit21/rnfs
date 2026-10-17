@@ -117,24 +117,43 @@ def import_pins(value: dict, tx) -> int:
     return count
 
 
+CacheKey = tuple[Cid, tuple[str, ...]]  # a cached fetch's root and path names
+
+
+def _cache_names(names) -> tuple[str, ...]:
+    """A cache record's path names, checked: a list of valid names. Raises TypeError or ValueError."""
+    if not isinstance(names, list):
+        raise TypeError("names aren't a list")
+    for name in names:
+        dag.check_name(name)
+    return tuple(names)
+
+
+def _cache_row(key: CacheKey) -> tuple[bytes, str]:
+    """The cache table's key columns (root, path) for a record's key."""
+    root, names = key
+    return root.binary, statedb.dump(list(names))
+
+
+def _parse_cache_row(root: bytes, path: str) -> CacheKey:
+    """A record's key from the cache table's key columns, checked. Raises TypeError or ValueError."""
+    return Cid.from_bytes(root), _cache_names(statedb.load(path))
+
+
 def import_cache(value: dict, tx) -> int:
     """Import cache.json (statedb.migrate): its records, least recently used first, replace the cache table, each
     checked as rnfs 0.1.4 loaded it. Returns the number of records imported."""
     tx.execute("DELETE FROM cache")
-    records: OrderedDict[tuple[Cid, tuple[str, ...]], Cid] = OrderedDict()
+    records: OrderedDict[CacheKey, Cid] = OrderedDict()
     for record in value.get("fetches", []):
         try:
             root, names, target = record
-            if not isinstance(names, list):
-                raise TypeError("names aren't a list")
-            for name in names:
-                dag.check_name(name)
-            records[(Cid.parse(root), tuple(names))] = Cid.parse(target)  # a repeated key keeps its first place
+            names = _cache_names(names)
+            records[(Cid.parse(root), names)] = Cid.parse(target)  # a repeated key keeps its first place
         except (ValueError, TypeError):
             log(f"storage: ignoring invalid cache record {record!r}", LOG_ERROR)
     tx.executemany("INSERT INTO cache (root, path, target, used) VALUES (?, ?, ?, ?)",
-                   [(root.binary, statedb.dump(list(names)), target.binary, used)
-                    for used, ((root, names), target) in enumerate(records.items())])
+                   [(*_cache_row(key), target.binary, used) for used, (key, target) in enumerate(records.items())])
     return len(records)
 
 
@@ -256,7 +275,7 @@ class Storage:
         self._sizes: dict[Cid, int] = dict(self.blocks.scan())
         self._used = sum(self._sizes.values())
         self._pins: dict[Cid, set[str]] = {}
-        self._cache: OrderedDict[tuple[Cid, tuple[str, ...]], Cid] = OrderedDict()  # oldest first
+        self._cache: OrderedDict[CacheKey, Cid] = OrderedDict()  # oldest first
         self._sessions: list[Session] = []
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
         # Where a path step leads from a stored DAG node: node -> {name: _step_in's answer}; memoised like _links
@@ -266,7 +285,7 @@ class Storage:
         self._cache_generation = 0  # incremented whenever cache records are removed or retargeted
         self._changes = 0  # incremented with each block stored, pin, release and new cache record (changes())
         # Cache records changed (or removed) since the last save(); every one is among the most recently used
-        self._cache_dirty: set[tuple[Cid, tuple[str, ...]]] = set()
+        self._cache_dirty: set[CacheKey] = set()
         self._cache_used = 0  # the cache table's next used value: larger than every one saved
         # False only when nothing has happened since the last collection that could leave a block unreached,
         # so eviction over max_storage with nothing to evict needn't walk everything again
@@ -297,21 +316,14 @@ class Storage:
         bad_cache = []
         for root, path, target, used in self._db.query("SELECT root, path, target, used FROM cache ORDER BY used"):
             try:
-                names = statedb.load(path)
-                if not isinstance(names, list):
-                    raise TypeError("names aren't a list")
-                for name in names:
-                    dag.check_name(name)
-                key = (Cid.from_bytes(root), tuple(names))
-                self._cache[key] = Cid.from_bytes(target)
+                self._cache[_parse_cache_row(root, path)] = Cid.from_bytes(target)
             except (ValueError, TypeError):
                 log(f"storage: ignoring invalid cache record {root!r} {path!r}", LOG_ERROR)
                 bad_cache.append((root, path))
                 continue
             if isinstance(used, int):
                 self._cache_used = max(self._cache_used, used + 1)
-        capped = [(root.binary, statedb.dump(list(names))) for root, names in
-                  list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
+        capped = [_cache_row(key) for key in list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
         self._cap_cache()
         self._cache_dirty.clear()
         if bad_pins or bad_cache or capped:
@@ -338,11 +350,10 @@ class Storage:
                 # record to the end), so those still cached are the last ones, in order
                 kept = sum(1 for key in dirty if key in self._cache)
                 changed = list(itertools.islice(reversed(self._cache.items()), kept))[::-1]
-                rows = [(root.binary, statedb.dump(list(names)), target.binary, self._cache_used + n)
-                        for n, ((root, names), target) in enumerate(changed)]
+                rows = [(*_cache_row(key), target.binary, self._cache_used + n)
+                        for n, (key, target) in enumerate(changed)]
                 self._cache_used += len(rows)
-                gone = [(root.binary, statedb.dump(list(names))) for root, names in dirty if
-                        (root, names) not in self._cache]
+                gone = [_cache_row(key) for key in dirty if key not in self._cache]
             try:
                 self.blocks.sync()
                 with self._db.transaction() as tx:
@@ -516,31 +527,41 @@ class Storage:
 
         Returns the targets of records dropped to stay within MAX_CACHE_RECORDS, no longer cached.
         """
-        key = (root, tuple(names))
         with self._lock:
-            previous = self._cache.get(key)
-            if previous is None:
-                self._changes += 1
-            elif previous != target:
-                self._maybe_garbage = True
-                self._cache_generation += 1
-            self._cache[key] = target
-            self._cache.move_to_end(key)
-            self._cache_dirty.add(key)
+            self._set_record((root, tuple(names)), target)
             dropped = self._cap_cache()
             return dropped - set(self._cache.values())
 
-    def _cap_cache(self) -> set[Cid]:
-        """Drop the least recently used records past MAX_CACHE_RECORDS; their targets (lock held)."""
-        dropped = set()
-        while len(self._cache) > MAX_CACHE_RECORDS:
-            key, target = self._cache.popitem(last=False)
-            dropped.add(target)
-            self._cache_dirty.add(key)
-        if dropped:
+    def _set_record(self, key: CacheKey, target: Cid):
+        """Record key -> target as the most recently used, with the bookkeeping a new or retargeted record needs:
+        a retargeted one may leave its old target's blocks unreached (lock held)."""
+        previous = self._cache.get(key)
+        if previous is None:
+            self._changes += 1
+        elif previous != target:
             self._maybe_garbage = True
             self._cache_generation += 1
-        return dropped
+        self._cache[key] = target
+        self._cache.move_to_end(key)
+        self._cache_dirty.add(key)
+
+    def _drop_records(self, keys) -> list[Cid]:
+        """Remove the records of keys, with the bookkeeping every removal needs: the save deletes their rows
+        (_cache_dirty), _prune_fetched runs (_cache_generation), and the next collection looks for what they
+        left unreached (_maybe_garbage); their targets, in order, a target once per record (lock held)."""
+        targets = []
+        for key in keys:
+            targets.append(self._cache.pop(key))
+            self._cache_dirty.add(key)
+        if targets:
+            self._maybe_garbage = True
+            self._cache_generation += 1
+        return targets
+
+    def _cap_cache(self) -> set[Cid]:
+        """Drop the least recently used records past MAX_CACHE_RECORDS; their targets (lock held)."""
+        excess = max(0, len(self._cache) - MAX_CACHE_RECORDS)
+        return set(self._drop_records(list(itertools.islice(self._cache, excess))))
 
     def touch(self, root: Cid, names: list[str] | tuple[str, ...]) -> bool:
         """Mark a cached fetch as used now; False if there is no such record."""
@@ -831,10 +852,7 @@ class Storage:
         if self._held_back(damaged):
             return set(), 0, 0
         evicted = len(records) - keep
-        for _ in range(evicted):
-            self._cache_dirty.add(self._cache.popitem(last=False)[0])
-        if evicted:
-            self._cache_generation += 1
+        self._drop_records([key for key, _ in records[:evicted]])
         dead = {cid for cid in self._sizes if cid not in live}
         deleted, freed = self._delete(dead)
         self._maybe_garbage = deleted != dead  # anything deferred is collected on a later pass
@@ -911,25 +929,23 @@ class Storage:
             targets = self._targets()
         if not denied or not records:
             return {"uncached": set(), "removed_blocks": 0, "freed_bytes": 0, "incomplete": set()}
-        before = self._complete_sets(targets)
-        self._warm(set(records.values()) | {root for root, _ in records}, [key for key in records if key[1]])
-        with self._lock:
-            before = self._with_memoised(before)
-            dropped = [key for key, target in self._cache.items()
-                       if any(cid.binary in denied
-                              for cid in {key[0], target} | self._path_cids(*key) | self._reach([target]))]
-            uncached = set()
-            for key in dropped:
-                uncached.add(self._cache.pop(key))
-                self._cache_dirty.add(key)
-            uncached -= set(self._cache.values())
-            if dropped:
-                self._cache_generation += 1
-                self._maybe_garbage = True
-            deleted, freed = self._collect() if dropped else (set(), 0)
-            incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
-            return {"uncached": uncached, "removed_blocks": len(deleted), "freed_bytes": freed,
-                    "incomplete": incomplete}
+        stats = {}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Drop the records reaching a denied block and collect; the blocks deleted."""
+            self._warm(set(records.values()) | {root for root, _ in records}, [key for key in records if key[1]])
+            with self._lock:
+                self._add_memoised(before)
+                dropped = [key for key, target in self._cache.items()
+                           if any(cid.binary in denied
+                                  for cid in {key[0], target} | self._path_cids(*key) | self._reach([target]))]
+                uncached = set(self._drop_records(dropped)) - set(self._cache.values())
+                deleted, freed = self._collect() if dropped else (set(), 0)
+                stats.update(uncached=uncached, removed_blocks=len(deleted), freed_bytes=freed)
+                return deleted
+
+        stats["incomplete"] = self._newly_incomplete(targets, act)
+        return stats
 
     def is_complete(self, cid: Cid) -> bool:
         """True if every block of cid's DAG is stored and the DAG is valid."""
@@ -938,6 +954,18 @@ class Storage:
             return True
         except (NotFound, InvalidDag):
             return False
+
+    def _newly_incomplete(self, targets: set[Cid], act: Callable[[dict[Cid, frozenset[Cid]]], set[Cid]]) -> set[Cid]:
+        """Those of targets complete before act and not after: the one sequence for every operation that deletes
+        blocks a pin or cached fetch may need (eviction, gc, drop_denied, verify), so the node can withdraw them.
+
+        Which targets are complete is found first, without the lock (dag_blocks walks their DAGs, reading blocks);
+        then act(before) runs, deletes blocks and returns those it deleted. An act that deletes under one hold of
+        the lock adds the targets memoised as complete by then (_add_memoised(before)) just before deleting.
+        """
+        before = self._complete_sets(targets)
+        deleted = act(before)
+        return {cid for cid, blocks in before.items() if blocks & deleted}
 
     def _complete_sets(self, cids) -> dict[Cid, frozenset[Cid]]:
         """dag_blocks for those of cids that are complete."""
@@ -998,19 +1026,22 @@ class Storage:
             targets = self._targets()
             roots = self._roots() | set(self._cache.values())
             paths = [key for key in self._cache if key[1]]
-        # The long part, reading DAG nodes from disk, runs without the lock (_warm)
-        before = self._complete_sets(targets)
-        self._warm(roots, paths)
-        with self._lock:
-            if not wanted():
-                return set()  # another eviction did it meanwhile
-            before = self._with_memoised(before)
-            limit = self.max_storage - needed - self.max_storage // EVICT_MARGIN
-            deleted, freed, evicted = self._evict_to(max(0, limit))
-            if deleted:
-                log(f"storage: evicted {plural(evicted, 'cached fetch')}, freeing {size(freed)} "
-                    f"in {plural(len(deleted), 'block')}", LOG_VERBOSE)
-            return {cid for cid, blocks in before.items() if blocks & deleted}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Evict; the blocks deleted."""
+            self._warm(roots, paths)  # the long part, reading DAG nodes from disk, runs without the lock
+            with self._lock:
+                if not wanted():
+                    return set()  # another eviction did it meanwhile
+                self._add_memoised(before)
+                limit = self.max_storage - needed - self.max_storage // EVICT_MARGIN
+                deleted, freed, evicted = self._evict_to(max(0, limit))
+                if deleted:
+                    log(f"storage: evicted {plural(evicted, 'cached fetch')}, freeing {size(freed)} "
+                        f"in {plural(len(deleted), 'block')}", LOG_VERBOSE)
+                return deleted
+
+        return self._newly_incomplete(targets, act)
 
     def _roots(self) -> set[Cid]:
         """What pins and sessions hold (lock held)."""
@@ -1019,14 +1050,12 @@ class Storage:
             roots |= session.cids
         return roots
 
-    def _with_memoised(self, before: dict[Cid, frozenset[Cid]]) -> dict[Cid, frozenset[Cid]]:
-        """before (complete DAGs found without the lock) plus the targets memoised as complete now, which a
+    def _add_memoised(self, before: dict[Cid, frozenset[Cid]]):
+        """Add to before (complete DAGs found without the lock) the targets memoised as complete now, which a
         deletion about to happen may make incomplete (lock held)."""
-        result = dict(before)
         for cid in self._targets():
             if cid in self._complete:
-                result[cid] = self._complete[cid]
-        return result
+                before[cid] = self._complete[cid]
 
     def gc(self) -> dict:
         """Evict every cached fetch and delete every block no pin or session reaches.
@@ -1037,20 +1066,22 @@ class Storage:
         with self._lock:
             targets = self._targets()
             roots = self._roots()
-        # The long part without the lock, as in evict(); every cached fetch goes, so only pins and sessions count
-        before = self._complete_sets(targets)
-        self._warm(roots, [])
-        with self._lock:
-            before = self._with_memoised(before)
-            uncached = set(self._cache.values())
-            if self._cache:
-                self._cache_dirty.update(self._cache)
-                self._cache.clear()
-                self._cache_generation += 1
-            deleted, freed = self._collect()
-            incomplete = {cid for cid, blocks in before.items() if blocks & deleted}
-            return {"removed_blocks": len(deleted), "freed_bytes": freed, "incomplete": incomplete,
-                    "uncached": uncached}
+        stats = {}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Drop every record and collect; the blocks deleted."""
+            # The long part without the lock, as in evict(); every cached fetch goes, so only pins and sessions count
+            self._warm(roots, [])
+            with self._lock:
+                self._add_memoised(before)
+                stats["uncached"] = set(self._drop_records(list(self._cache)))
+                deleted, freed = self._collect()
+                stats.update(removed_blocks=len(deleted), freed_bytes=freed)
+                return deleted
+
+        incomplete = self._newly_incomplete(targets, act)
+        return {"removed_blocks": stats["removed_blocks"], "freed_bytes": stats["freed_bytes"],
+                "incomplete": incomplete, "uncached": stats["uncached"]}
 
     def verify(self) -> dict:
         """Re-check every stored block against its CID, deleting bad ones.
@@ -1060,21 +1091,24 @@ class Storage:
         with self._lock:
             cids = list(self._sizes)
             targets = self._targets()
-        before = self._complete_sets(targets)  # without the lock, as in evict(); dag_blocks checks for deletions
         bad = []
-        for cid in cids:
-            if self.blocks.verify(cid):
-                continue
-            with self._lock:
-                # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
-                if cid in self._sizes and not self.blocks.verify(cid):
-                    self._delete({cid})  # reported either way; one Windows defers stays until a later try
-                    bad.append(cid)
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Re-check every block, deleting bad ones, each under its own hold of the lock; the bad ones."""
+            for cid in cids:
+                if self.blocks.verify(cid):
+                    continue
+                with self._lock:
+                    # Checked again under the lock: it may have been deleted (or rewritten) meanwhile
+                    if cid in self._sizes and not self.blocks.verify(cid):
+                        self._delete({cid})  # reported either way; one Windows defers stays until a later try
+                        bad.append(cid)
+            return set(bad)
+
+        incomplete = self._newly_incomplete(targets, act)  # completeness without the lock, as in evict()
         if bad:
             log(f"storage: verify removed {plural(len(bad), 'damaged block')}", LOG_ERROR)
-        bad_set = set(bad)
-        return {"checked": len(cids), "bad": bad,
-                "incomplete": {cid for cid, blocks in before.items() if blocks & bad_set}}
+        return {"checked": len(cids), "bad": bad, "incomplete": incomplete}
 
     # Sizes, for stat and the remote-pin quota
 

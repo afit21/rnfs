@@ -694,6 +694,40 @@ class EvictionTest(StorageTest):
         self.assertEqual(set(stats["bad"]), damaged)
         self.assertEqual(stats["incomplete"], {pinned.cid})  # not partial: it was incomplete before
 
+    def test_every_record_removal_is_saved_counted_and_collected(self):
+        """The cap, eviction, drop_denied and gc each remove records with the same bookkeeping (_drop_records):
+        the cache generation moves, the next save deletes their rows, and their blocks are garbage."""
+        files = [self.add(b"%d" % i * 1000) for i in range(6)]
+        for built in files:
+            self.storage.record_fetch(built.cid, [], built.cid)
+
+        def removed(operation) -> set[Cid]:
+            """The targets operation removed from the records, checked against a reopened storage."""
+            before = self.storage.cached_targets()
+            generation = self.storage.cache_generation()
+            operation()
+            gone = before - self.storage.cached_targets()
+            self.assertGreater(self.storage.cache_generation(), generation)
+            self.storage.save()
+            self.assertEqual(self.open().cached_fetches(), self.storage.cached_fetches())
+            if any(self.storage.has(cid) for cid in gone):
+                self.assertTrue(self.storage._maybe_garbage)  # the next collection takes them
+                self.storage.collect()
+            self.assertFalse(any(self.storage.has(cid) for cid in gone))
+            return gone
+
+        with mock.patch.object(storage_module, "MAX_CACHE_RECORDS", 5):
+            # Touching files[0] leaves files[1] the oldest, past the cap
+            self.assertEqual(removed(lambda: self.storage.record_fetch(files[0].cid, [], files[0].cid)),
+                             {files[1].cid})
+        self.storage.max_storage = self.storage.used_bytes() - 500
+        self.assertEqual(removed(self.storage.evict), {files[2].cid})
+        stats = {}
+        self.assertEqual(removed(lambda: stats.update(self.storage.drop_denied(frozenset({files[3].cid.binary})))),
+                         {files[3].cid})
+        self.assertEqual((stats["uncached"], stats["incomplete"]), ({files[3].cid}, {files[3].cid}))
+        self.assertEqual(removed(self.storage.gc), {files[0].cid, files[4].cid, files[5].cid})
+
     def test_cache_generation(self):
         files = [self.add(b"%d" % i * 1000) for i in range(4)]
         generation = self.storage.cache_generation()
