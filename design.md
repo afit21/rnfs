@@ -240,6 +240,13 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.
 - `dag_blocks(cid) -> frozenset[Cid]` the blocks of a complete DAG (memoised), used for "what a node serves".
+  For an incomplete DAG it remembers the block it found missing (`_missing`, `MISSING_MEMO` 10 000, oldest
+  forgotten first): a CID's content never changes, so the DAG stays incomplete while that block isn't stored,
+  and `is_complete` is a lookup until it arrives. The walks under the lock take a DAG memoised as complete
+  whole (`_reach`: the memo's set, less what is already kept) rather than walking it, except one holding a path
+  node eviction kept without its other children, which is walked as before; `dag_bytes` of a complete DAG is
+  summed once (`_complete_bytes`). `_delete` forgets the complete memos a deleted block breaks, which is how
+  every deletion (eviction, gc, verify, `drop_denied`) keeps them exact.
 
 `denylist.py` — `parse_entry(text) -> (canonical, binary CID | None, digest | None)`, `parse_list(bytes) -> (binary
 CIDs, digests)` (ValueError naming the line; `MAX_LIST_BYTES` 4 MiB, `MAX_LIST_ENTRIES` 100 000).
