@@ -26,7 +26,8 @@ Records, first-seen times and departures are persisted in the state database (rn
 provider_records, provider_publishers, provider_departed and provider_evicted tables) by save(), which the node
 calls periodically and at shutdown, writing only the rows changed since the last save; they are read from it
 only at startup. Times are wall clock and persisted, so a time in the future (the clock ran ahead, then was
-corrected) is clamped to now on load and at each expire(); otherwise such records would outlive their TTL.
+corrected) is clamped to now on load and at the first expire() after the clock went backwards; otherwise such
+records would outlive their TTL.
 """
 import heapq
 import itertools
@@ -243,6 +244,9 @@ class ProviderStore:
         self._dirty_publishers: set[bytes] = set()
         self._dirty_gone: set[bytes] = set()
         self._last_expire = float("-inf")
+        # The latest clock reading any time held here came from: none is later, so expire() needs to clamp times
+        # only when the clock reads earlier than this (it was corrected backwards), not on every pass
+        self._latest = float("-inf")
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._db = None if state_dir is None else statedb.connect(state_dir)
@@ -272,7 +276,7 @@ class ProviderStore:
         check_id(key)
         check_id(publisher)
         with self._lock:
-            now = self.clock()
+            now = self._now()
             record = self._live_record(key, publisher, now)
             if record is not None:
                 record.last_stored = now
@@ -580,7 +584,7 @@ class ProviderStore:
         if not entry.keys:
             del self._publishers[publisher]
             self._touch_publisher(publisher)
-            self._depart(publisher, entry.first_seen, self.clock(), evicted)
+            self._depart(publisher, entry.first_seen, self._now(), evicted)
         return True
 
     def _depart(self, publisher: bytes, first_seen: float, now: float, evicted: bool = False):
@@ -651,12 +655,22 @@ class ProviderStore:
     def expire(self) -> int:
         """Remove every expired record. Returns how many were removed."""
         with self._lock:
-            return self._expire(self.clock())
+            return self._expire(self._now())
+
+    def _now(self) -> float:
+        """The clock's time, for a time about to be held: noted in _latest. Caller holds the lock."""
+        now = self.clock()
+        self._latest = max(self._latest, now)
+        return now
 
     def _expire(self, now: float) -> int:
-        """Remove records last stored ttl or more before now, clamping times in the future. Caller holds the lock."""
+        """Remove records last stored ttl or more before now, clamping times in the future if the clock went
+        backwards. Caller holds the lock."""
         self._last_expire = now
-        self._clamp(now)
+        if now < self._latest:
+            # A time may be in the future. Otherwise none is, and the clamping pass (half of an expiry pass,
+            # under the lock) would change nothing
+            self._clamp(now)
         expired = [(key, publisher) for key, records in self._records.items()
                    for publisher, record in records.items() if now - record.last_stored >= self.ttl]
         for key, publisher in expired:
@@ -671,7 +685,8 @@ class ProviderStore:
         return len(expired)
 
     def _clamp(self, now: float):
-        """Bring every time after now back to now (the clock was corrected backwards). Caller holds the lock."""
+        """Bring every time after now back to now (the clock was corrected backwards), so none is later than now
+        any more. Caller holds the lock."""
         stored_moved = False
         for key, records in self._records.items():
             for publisher, record in records.items():
@@ -695,6 +710,7 @@ class ProviderStore:
                     self._touch_gone(publisher)
         if moved:
             self._rebuild_newest()
+        self._latest = now
 
     # Queries
 
@@ -817,6 +833,13 @@ class ProviderStore:
             check(not set(self._departed) & set(self._evicted), "a publisher is both departed and evicted")
             check(len(self._departed) <= self._departed_size, "_departed over its size")
             check(len(self._evicted) <= self._evicted_size, "_evicted over its size")
+            # No time held is later than _latest, or expire() could skip clamping a time in the future
+            latest = max([time for records in self._records.values() for record in records.values()
+                          for time in (record.first_stored, record.last_stored)]
+                         + [entry.first_seen for entry in self._publishers.values()]
+                         + [time for memory in (self._departed, self._evicted) for times in memory.values()
+                            for time in times], default=float("-inf"))
+            check(latest <= self._latest, f"a time held ({latest}) is later than _latest ({self._latest})")
             if self._db is None:
                 check(not (self._dirty_records or self._dirty_publishers or self._dirty_gone),
                       "changes tracked with no state database")
@@ -890,7 +913,7 @@ class ProviderStore:
         record_rows = self._db.query("SELECT key, publisher, first_stored, last_stored, pooled FROM provider_records")
         departed_rows = self._db.query("SELECT publisher, first_seen, at FROM provider_departed")
         evicted_rows = self._db.query("SELECT publisher, first_seen, at FROM provider_evicted")
-        now = self.clock()
+        now = self._now()  # every time loaded is clamped to it
         malformed = 0
         # Times in the future (a clock that ran ahead, since corrected) count as now; NaN is dropped
         first_seen = {}

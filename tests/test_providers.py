@@ -70,6 +70,34 @@ class RecordTest(StoreTestCase):
         self.clock.now += PROVIDER_TTL
         self.assertEqual(self.store.expire(), 1)
 
+    def test_expiry_clamps_only_after_the_clock_went_back(self):
+        """The clamping pass runs only when the clock reads earlier than a time it gave before (S5)."""
+        with mock.patch.object(self.store, "_clamp", wraps=self.store._clamp) as clamp:
+            self.store.expire()
+            self.store.store(KEY, ident(1))
+            self.store.expire()
+            self.clock.now += 60
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 0)
+            self.clock.now -= 100  # corrected backwards: the record was stored in the future
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 1)
+            self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
+            self.store.expire()  # every time is now at most the clock's: nothing more to clamp
+            self.clock.now += 5
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 1)
+
+    def test_departure_in_the_future_clamped_at_expiry(self):
+        """A departure time, taken when the publisher's last record went, is clamped too (S5): the withdrawal's own
+        clock reading counts as one the store has seen."""
+        self.store.store(KEY, ident(1))
+        self.clock.now += DAY
+        self.store.withdraw(KEY, ident(1))  # departs a day ahead of the corrected clock
+        self.clock.now -= DAY
+        self.store.expire()
+        self.assertEqual(self.store._departed[ident(1)], (self.clock.now, self.clock.now))
+
     def test_expires_ttl_after_last_stored(self):
         self.store.store(KEY, ident(1))
         self.clock.now += PROVIDER_TTL - 1
