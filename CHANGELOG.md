@@ -10,10 +10,20 @@ Security fixes, maintainability work and performance work. No wire-format or CID
 Security:
 - The release workflow's Flatpak build no longer uses the GitHub Actions cache. Any workflow run on the default
   branch can write that cache, and a poisoned one would have gone into the attested `.flatpak` bundle.
+- `rnfs inbox get` no longer quietly fetches the CID a sender put in a name link when the name can't be
+  resolved. The sender chose that CID and nothing ties it to the name, so any sender could pose as a
+  well-known name. It now fails before writing anything, unless you pass `--use-sent-cid`; then the result
+  carries a warning. Auto-fetch (trusted senders only) keeps the fallback, and records it.
 
 Changed:
+- `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
+  `use_sent_cid` (before, it fetched the sender's CID).
+- `rnfs inbox` shows the CID each name link was sent as ("sent as `<cid>`"), and marks an auto-fetch that
+  pinned the sent CID because the name didn't resolve ("auto-fetch pinned (sent CID; name unresolved)";
+  `"sent_cid": true` in the inbox record).
 
 Added:
+- `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
 
 ## 0.1.5
 
