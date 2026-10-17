@@ -372,6 +372,33 @@ class WalkTest(unittest.TestCase):
             walker.count_entries(root_expect(cid), blocks.get, 1109)
         self.assertEqual(len(blocks.reads), 4)
 
+    def test_leaf_bytes(self):
+        """Each distinct raw chunk counted once, each distinct file node read once, no raw block read."""
+        blocks = Blocks()
+        a, b = blocks.raw(b"aaaa"), blocks.raw(b"bbbbbb")
+        lower = blocks.node(FileNode([Child(a, 4), Child(b, 6), Child(a, 4)]))
+        root = blocks.node(FileNode([Child(lower, 14)] * 3 + [Child(b, 6)]))
+        self.assertEqual(walker.leaf_bytes(root_expect(root), blocks.get), 10)
+        self.assertEqual(blocks.reads, {root: 1, lower: 1})
+        self.assertEqual(walker.leaf_bytes(root_expect(a), blocks.get), 4)  # a one-block file: its own length
+        # Stops once stop_at is met, before reading further nodes
+        blocks.reads.clear()
+        other = blocks.node(FileNode([Child(blocks.raw(b"c"), 1)]))
+        early = blocks.node(FileNode([Child(a, 4), Child(other, 1)]))
+        self.assertEqual(walker.leaf_bytes(root_expect(early), blocks.get, stop_at=4), 4)
+        self.assertNotIn(other, blocks.reads)
+        self.assertEqual(walker.leaf_bytes(root_expect(early), blocks.get, stop_at=100), 5)
+
+    def test_leaf_bytes_refuses_impossible_chunks_and_directories(self):
+        blocks = Blocks()
+        missing = Cid.for_block(RAW, b"never stored")  # not read, so only its claimed size counts
+        big = constants.MAX_BLOCK_SIZE + 1
+        with self.assertRaises(InvalidDag):
+            walker.leaf_bytes(root_expect(blocks.node(FileNode([Child(missing, big)]))), blocks.get)
+        directory = blocks.node(DirectoryNode([Entry("f", blocks.raw(b"x"), 1, 0)]))
+        with self.assertRaises(ValueError):
+            walker.leaf_bytes(root_expect(directory), blocks.get)
+
     def test_height(self):
         with small_tree():
             blocks = Blocks()

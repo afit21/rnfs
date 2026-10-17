@@ -8,7 +8,8 @@ Behaviour:
   segment is exactly one name.
 - Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. The
   user's own HEAD, or range not starting at byte 0, uses the first bytes only if they are stored (else the
-  name, or application/octet-stream), so it never fetches what it doesn't send. A web page's request (see
+  name, or application/octet-stream), so it never fetches what it doesn't send; the deny list applies to
+  them as to any read (451). A web page's request (see
   limited() below) always reads them, fetching them if need be, so what a page can observe of the type
   (e.g. through nosniff or opaque-response blocking) never depends on what is stored.
   Single byte ranges (206, 416, Accept-Ranges; If-Range honoured); several ranges get the whole file.

@@ -169,7 +169,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - Local operations over a blocking `get(expect) -> bytes` (raise `NotFound` when absent):
   `step_name(expect, name, get) -> Expect | None` (one name, stepping through index nodes),
   `resolve(root, names, get) -> Expect`, `iter_dag(expect, get)` (each `(expect, block)`, each CID once,
-  depth-first), `read_range(expect, get, offset, length) -> Iterator[bytes]`,
+  depth-first), `read_range(expect, get, offset, length) -> Iterator[bytes]`, `leaf_bytes(expect, get, stop_at)`
+  (the bytes of a file's distinct chunks, from its file nodes only: the deny list's hash bound),
   `list_directory(expect, get, max_entries=None) -> Iterator[Entry]` (`TooLarge` past
   `max_entries`), `write_out(expect, get, dest, max_entries) -> warnings`.
 
@@ -226,7 +227,8 @@ lookup), `denies(cid)`, `denies_hash(digest)`; the local list `entries()`, `add(
 accepted; `reload(read)` reads every one back from storage at start); `known_hash(cid)` / `remember_hash` (a file
 CID's content SHA-256, `MAX_KNOWN_HASHES` LRU, kept across restarts in `deny_hashes`: `save()`, called by the node's
 `_save_state`, writes the rows changed since the last one outside the lock, behind a save lock); `add_listener(fn)`,
-called after each change outside its lock. `walker.write_out(..., check)` and `walker.iter_files` and
+called after each change outside its lock; `DENY_HASH_RATIO` and `DENY_HASH_SLACK` bound what `_check_file` hashes.
+`walker.write_out(..., check)` and `walker.iter_files` and
 `builder.checking(check)` (a ContextVar: `build_file` hashes each file and passes the digest before the file's root
 node is stored) are its hooks in the content layer; `archive.import_archive(..., check)` runs on the complete roots
 before they are pinned.
@@ -335,7 +337,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
 | `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`; the sealed name is None unless `safe_default_name` accepts it) |
-| `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0) |
+| `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
 | `read(target, offset=0, length=None, for_gateway=False, from_node=None, raw=False)` | iterator of bytes of a file (range fetched only; sealed files decrypted unless `raw` or `for_gateway`) |
 | `read_file(target, offset=0, length=None, from_node=None, raw=False)` | `(info, chunks)`: `info()` and `read()` in one fetch, resolving the target once; `chunks` reads `[offset, offset + length)` cut to the info's size only once iterated (a directory's raises `ValueError`), and closing it ends the fetch (`GET /api/cat`, which used to call `info` and `read`: two fetches) |
 | `block(cid, for_gateway=False)` | the CID's own block, verified (`cat --block`, `?format=raw`: the gateway calls it only for the user's own GET) |
@@ -738,7 +740,10 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   the first chunk is fetched first even for a `cat --offset` deep in a file. The gateway does so only for a
   GET from byte 0 or a web page's request (`limited()`, so its type never depends on what is stored); the
   user's own HEAD, or range not at 0, uses the first bytes only if already stored (`stored_head`), else takes
-  the Content-Type from the name, or `application/octet-stream`.
+  the Content-Type from the name, or `application/octet-stream`. `stored_head` applies the deny list as a read
+  does (`node_content.denying` wraps its getter; with file hashes, `_check_file` over stored blocks once the file
+  is wholly stored), so such a HEAD of a denied file answers 451 like GET; `pin ls` (`_pin_sealed`) passes
+  `deny=False`.
 
 ## Mesh
 
@@ -1077,7 +1082,8 @@ Everything in the specification is implemented, with these simplifications and a
   nodes down to `MAX_DEPTH` took 751 KB; now a single-child index node costs 48 bytes, and those chains are
   refused after 24 KB.
 - **Byte-range reads** (`read_range`: `cat`, the gateway's file responses, `/api/cat`, a sealed file's
-  header and its decryption by `get`, `cat` and `info`, which never run `fetch_dag`) count the bytes of the
+  header and its decryption by `get`, `cat` and `info`, which run `fetch_dag` only to check a file against the deny
+  list's file hashes) count the bytes of the
   distinct file nodes each call meets, stored or downloaded, against `range_bound(size, length)` =
   `dag_bound(length)` + 2 × `file_levels(size)` × `FILE_NODE_MAX` (13,061 bytes: a header of 5 and 256
   children of 51). Nodes wholly inside the range cost no more than in a whole file of `length` bytes; on each
@@ -1210,9 +1216,17 @@ Everything in the specification is implemented, with these simplifications and a
   refreshes the publisher, `drop_denied`s the cache, releases `remote:` pins of `denied_roots` and collects, and
   warns about the other pins it keeps. File hashes: `_hash_check` (for `builder.checking`, in adds, the shared
   folder and imports, under `_refusing`, which collects what a refused add or import stored) and
-  `_check_file(expect, read)` (get's write-out check, a sealed get, `read` before its first byte,
-  `node_content.block` for a raw block and `export_stream` for every file before `start`; a raw file's digest is its
-  CID's, others are hashed once and remembered, across restarts: `deny_hashes`). A failed `_apply_deny` leaves
+  `_check_file(expect, get)` (get's write-out check, a sealed get, `read` before its first byte,
+  `node_content.block` for a raw block, `export_stream` for every file before `start` and `import_archive` for the
+  complete roots; a raw file's digest is its CID's, others are hashed once and remembered, across restarts:
+  `deny_hashes`). `get` serves the file's whole DAG, stored and checked: `_check_fetched` (a sealed get, `read`)
+  runs `fetch_dag` first unless the hash is known, which also brings `max_download_size` and `check_disk`. Before
+  hashing, a file declaring more than `DENY_HASH_RATIO` (16) × `walker.leaf_bytes` + `DENY_HASH_SLACK` (64 MiB) is
+  refused as `Denied`, so `_refusing` collects what a refused import stored: hashing reads every occurrence of
+  repeated content, and six blocks (one chunk, five nodes each listing the one below 256 times) declare 2^56 bytes.
+  `leaf_bytes(expect, get, stop_at)` reads each distinct file node once and adds each distinct raw child's size
+  once, never reading a raw block (a size over `MAX_BLOCK_SIZE` is `InvalidDag`), and stops at the bytes needed,
+  so the check costs the DAG's nodes at most and the hash at most 16 × the distinct chunks plus 64 MiB. A failed `_apply_deny` leaves
   `_deny_applied` as it was, so maintenance tries again after `DENY_RETRY` (60 s). `remote_pin` refuses a denied
   CID; jobs don't fall back to the DHT on `Denied`, and LXMF auto-fetch records it as refused.
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
