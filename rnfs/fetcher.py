@@ -427,7 +427,7 @@ class Fetch:
             for node_id in list(self._in_flight):
                 try:
                     self.client.close(node_id)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - closing is best effort; logged
                     log(f"could not close the link to {node_name(node_id)}: {e}", LOG_WARNING)
         # Only this fetch's own error: one from another fetch nested in the same `with` is about another root
         if isinstance(exc, InvalidDag) and getattr(exc, "root", None) == self.root:
@@ -880,7 +880,7 @@ class Fetch:
         """What RNS knows about the path to node_id (nothing if the lookup fails)."""
         try:
             return self.fetcher.path_info(node_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no path known if they fail
             return mesh.NO_PATH
 
     def _waiting_for_busy(self) -> bool:
@@ -960,7 +960,7 @@ class Fetch:
             try:
                 rate = self.client.rate_estimate(node_id)
                 result = self.client.blocks(node_id, cids, on_progress=progress)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - any client failure is a failed request, retried elsewhere
                 result = peer_client.BlocksResult(peer_client.FAILED, unsent=list(cids), reason=str(e))
             if result.elapsed is not None:
                 # When it actually went out: opening the link or waiting for its /blocks slot isn't its time
@@ -1007,7 +1007,7 @@ class Fetch:
             found = []
             try:
                 found = lookup.find_providers(lambda node_id: self._events.put(("provider", node_id)), should_stop)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - a failed lookup ends with the providers found so far
                 log(f"provider lookup for {self.root} failed: {e}", LOG_WARNING)
             self._events.put(("lookup_done", len(found)))
 

@@ -764,7 +764,7 @@ class Publisher:
             try:
                 if self.next_due() <= 0:
                     self.publish_due(stop_event.is_set)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the publisher thread keeps running; logged
                 log(f"publishing failed: {e!r}", LOG_ERROR)
             self._wake.wait(min(MAX_WAIT, max(0.5, self.next_due())))
             if stop_event.is_set():

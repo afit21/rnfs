@@ -9,7 +9,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from tests.security import _h1_real_helpers as h  # noqa: E402
+from tests.security import _h1_real_helpers as h
 
 
 def role_flood(configdir, node_id_hex, rate, seconds):

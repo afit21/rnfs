@@ -61,7 +61,7 @@ def path_description(node_id: bytes) -> str:
     try:
         hops = RNS.Transport.hops_to(node_id)
         interface = RNS.Transport.next_hop_interface(node_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS internals: no description if they fail
         return ""
     if hops >= RNS.Transport.PATHFINDER_M:
         return ""
@@ -95,7 +95,7 @@ class Exchange:
         """Record the response and the link's measured rate, which the next Resource would overwrite."""
         try:
             self.expected_rate = receipt.link.get_expected_rate()
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no rate if they fail
             self.expected_rate = None
         self.response_size = receipt.response_size
         self.response = receipt.get_response()
@@ -144,7 +144,7 @@ class PeerLink:
         """The link's packet MDU, which bounds request sizes."""
         try:
             return self.link.get_mdu()
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no MDU if they fail
             return None
 
     def acquire(self, blocks: bool, timeout: float | None = None) -> bool:
@@ -392,7 +392,7 @@ class LinkPool:
         for peer in peers:
             try:
                 quiet = peer.link.no_data_for()
-            except Exception:
+            except Exception:  # noqa: BLE001 - a link closing meanwhile is skipped
                 continue
             if not peer.busy() and quiet >= timeout:
                 idle.append(peer)
@@ -425,7 +425,7 @@ class LinkPool:
         while not self.stop_event.wait(interval):
             try:
                 self.sweep()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the sweeper thread keeps running; logged
                 log(f"error closing idle links: {e}", LOG_WARNING)
 
     # Queries
@@ -445,7 +445,7 @@ class LinkPool:
             """Seconds since data crossed the link."""
             try:
                 return peer.link.no_data_for()
-            except Exception:
+            except Exception:  # noqa: BLE001 - a link closing meanwhile sorts last
                 return float("inf")
 
         return [peer.node_id for peer in sorted(peers, key=quiet_for)]
@@ -484,7 +484,7 @@ class LinkPool:
                                             failed_callback=exchange.on_failed,
                                             progress_callback=exchange.on_progress,
                                             timeout=None, max_response_size=max_response_size)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - a failed send is a failed request; logged
                 log(f"could not send {path} to {node_name(peer.node_id)}: {e}", LOG_VERBOSE)
                 return exchange
             if not receipt:

@@ -332,7 +332,7 @@ def main():
             show(cid)
         except subprocess.TimeoutExpired:
             unavailable(cid, f"rnfs took longer than {TIMEOUT} s")
-        except Exception as error:  # rnfs not installed, a state file that can't be written, odd CLI output...
+        except Exception as error:  # noqa: BLE001 - rnfs missing, an unwritable state file, odd CLI output
             unavailable(cid, f"{type(error).__name__}: {error}")
 
 

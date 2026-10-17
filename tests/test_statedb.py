@@ -440,7 +440,7 @@ class MigrateTest(StateDbTest):
             """Connect, keeping the reference or the error."""
             try:
                 dbs.append(statedb.connect(self.state))
-            except BaseException as e:  # noqa: BLE001 - reported below
+            except BaseException as e:  # reported below
                 errors.append(e)
 
         with mock.patch.object(statedb, "LEGACY", TEST_LEGACY), \

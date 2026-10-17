@@ -15,7 +15,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # run from a source checkout
 
-import rnfs  # noqa: E402
+import rnfs
 
 
 def share(node: rnfs.Rnfs, path: str) -> str:

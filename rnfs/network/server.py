@@ -194,7 +194,7 @@ def fast_path(link) -> bool:
     KISS radio on it. A requester can lower its link's MTU, never raise it past what the path allows."""
     try:
         mtu = link.get_mtu()
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS internals: not a fast link if they fail
         return False
     return type(mtu) is int and mtu > rates.SLOW_MTU
 
@@ -751,7 +751,7 @@ class RequestServer:
         for link in links:
             try:
                 identity = link.get_remote_identity()
-            except Exception:
+            except Exception:  # noqa: BLE001 - RNS internals: no identity if they fail
                 identity = None
             if self._is_member(identity):
                 members.add(link.link_id)
@@ -812,7 +812,7 @@ class RequestServer:
                     log(f"refused {path} from a non-member", LOG_VERBOSE)
                     return False
                 return handler(path, data, request_id, link_id, remote_identity)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - runs on RNS's request thread: refuse and log
                 log(f"error answering {path}: {e}", LOG_ERROR)
                 return False
         return response_generator
@@ -1078,14 +1078,14 @@ class RequestServer:
             result = original(resource, *args, **kwargs)
             try:
                 self._registered(link, resource)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - runs inside RNS's Resource code; logged
                 log(f"error tracking a /blocks response: {e}", LOG_WARNING)
             return result
 
         register_outgoing_resource.rnfs_watch = True
         try:
             link.register_outgoing_resource = register_outgoing_resource
-        except Exception:
+        except Exception:  # noqa: BLE001 - a link that can't be watched isn't
             return
         self.watched.add(link.link_id)
 
@@ -1178,7 +1178,7 @@ class RequestServer:
             try:
                 sent = resource.get_progress() * (response.size or 0) if resource is not None else response.sent
                 final = min(response.cost, int(max(0.0, sent)))
-            except Exception:
+            except Exception:  # noqa: BLE001 - progress unknown: charged in full
                 pass  # progress unknown: it is charged in full
         with self.lock:
             response.charged = final
@@ -1234,7 +1234,7 @@ class RequestServer:
             return True
         try:
             return resource.get_progress() > 0
-        except Exception:
+        except Exception:  # noqa: BLE001 - progress unknown counts as progress
             return True
 
     def _cancel(self, response: Response, reason: str):
@@ -1267,7 +1267,7 @@ class RequestServer:
         """Link.get_expected_rate(), or None if unavailable."""
         try:
             return link.get_expected_rate()
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no rate if they fail
             return None
 
     def _hook(self, response: Response, link, resource):
@@ -1279,7 +1279,7 @@ class RequestServer:
 
             try:
                 resource.callback = concluded
-            except Exception:
+            except Exception:  # noqa: BLE001 - RNS internals: the deadline still applies
                 pass
         if getattr(resource, "status", 0) >= RNS.Resource.COMPLETE:
             # It concluded before the hook was in place
@@ -1322,7 +1322,7 @@ class RequestServer:
                     continue
                 try:
                     response.note_progress(resource.get_progress() * response.size, now)
-                except Exception:
+                except Exception:  # noqa: BLE001 - progress unknown: only the deadline applies
                     resource = None  # progress unknown: only the deadline applies
                 else:
                     self._charge_progress(response)
@@ -1358,7 +1358,7 @@ class RequestServer:
                 searching = self.check_responses()
                 # check_responses only looks at responses handed to RNS, and each handover sets wake
                 idle = not any(r.size is not None and not r.finished for r in self.pools.responses())
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the monitor thread keeps running; logged
                 log(f"error tracking /blocks responses: {e}", LOG_WARNING)
                 searching = idle = False
             self.wake.wait(None if idle else MONITOR_FAST_TICK if searching else MONITOR_TICK)

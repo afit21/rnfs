@@ -68,7 +68,7 @@ def link_is_slow(link, rate_estimate: float | None, config: Config) -> bool:
     """is_slow_link for an RNS link, reading its MTU with Link.get_mtu()."""
     try:
         mtu = link.get_mtu()
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS internals: MTU unknown if they fail
         mtu = None
     return is_slow_link(rate_estimate, mtu, config.slow_bitrate)
 
@@ -140,7 +140,7 @@ def is_slow_node(config: Config, reticulum=None) -> bool:
             import RNS
             reticulum = RNS.Reticulum.get_instance()
         stats = reticulum.get_interface_stats()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - not slow if the stats can't be read; logged
         log(f"could not read interface stats to decide whether this node is slow: {e}", LOG_WARNING)
         return False
     return slow_from_stats(stats, config.slow_bitrate)

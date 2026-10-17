@@ -148,7 +148,7 @@ def _fail_pending_request(packet, adv):
         if getattr(pending, "request_id", None) == request_id:
             try:
                 pending.response_rejected()
-            except Exception:
+            except Exception:  # noqa: BLE001 - RNS internals: best effort
                 pass
 
 
@@ -158,7 +158,7 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
     link = getattr(advertisement_packet, "link", None)
     try:
         adv = RNS.ResourceAdvertisement.unpack(advertisement_packet.plaintext)
-    except Exception:
+    except Exception:  # noqa: BLE001 - unreadable advertisements are left to RNS
         adv = None  # let RNS handle an advertisement it can't read, as it always has
     reason = refusal(adv, link) if adv is not None else None
     if reason is not None:
@@ -211,7 +211,7 @@ def _answer_as_malformed(link, request_id, size: int):
         return
     try:
         link.handle_response(request_id, None, size, size)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - runs inside RNS's packet handling; logged
         log(f"error failing a request whose response was refused: {e}", LOG_WARNING)
 
 
@@ -221,7 +221,7 @@ def _read_resource(resource) -> bytes | None:
     try:
         packed = data.read()
         data.seek(0)
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS's stream: unreadable means not checked here
         return None
     return packed if isinstance(packed, (bytes, bytearray)) else None
 
@@ -254,7 +254,7 @@ def guarded_receive(link, packet):
         if len(data) > PACKET_CHECK_SIZE:
             try:
                 packed = link.decrypt(data)
-            except Exception:
+            except Exception:  # noqa: BLE001 - undecryptable is left to RNS, as before
                 packed = None
             reason = protocol.response_refusal(packed) if packed is not None else None
             if reason is not None:
@@ -382,7 +382,7 @@ class HalfOpenLimit:
         handshake was cut short learns at once and can try again."""
         try:
             link.teardown()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - runs on the guard's timer thread; logged
             log(f"error closing a half-open link: {e}", LOG_WARNING)
             return
         self.closed += 1

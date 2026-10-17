@@ -96,7 +96,7 @@ class RnsPaths:
                 interface = RNS.Transport.next_hop_interface(node_id)
                 name, bitrate = interface_label(interface), _bitrate(getattr(interface, "bitrate", None))
             return PathInfo(hops, name, bitrate)
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no path known if they fail
             return NO_PATH
 
     def _shared_interface(self, reticulum, full_name) -> tuple[str | None, float | None]:

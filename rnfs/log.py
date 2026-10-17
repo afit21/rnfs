@@ -6,13 +6,13 @@ import threading
 
 import RNS
 
+# Re-exported so callers only need this module for logging
+from RNS import LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING  # noqa: F401
+
 from rnfs.fsutil import printable
 
 # Warnings a result keeps (a write-out skipping 50,000 entries mustn't make a 16 MB response or saved job)
 MAX_WARNINGS = 100
-
-# Re-exported so callers only need this module for logging
-from RNS import LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING  # noqa: F401
 
 # sink(level, text) given every message as well, at any level: the debug log's (set_debug_sink), or None
 _debug_sink = None

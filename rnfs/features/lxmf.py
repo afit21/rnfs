@@ -1346,7 +1346,7 @@ class LxmfFeature(features.Feature):
         for link, path, target in planned:
             try:
                 results.append(self._get_link(link, path, target))
-            except Exception as e:  # noqa: BLE001 - raised as is when nothing has started
+            except Exception as e:  # raised as is when nothing has started
                 if not results:
                     raise
                 # Something has started already: report it, and this failure with it

@@ -123,7 +123,7 @@ def is_sealed(pin):
     if cid not in _sealed:
         try:
             _sealed[cid] = rnfs("cat", cid, "--raw", "--length", str(len(SEALED_MAGIC))).startswith(SEALED_MAGIC)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - any failure counts as sealed, so it isn't listed
             log(f"checking whether {cid} is sealed failed: {type(error).__name__}: {error}")
             return True
         try:
@@ -202,7 +202,7 @@ def section(title, pins):
 
 try:
     pins = load_pins()
-except Exception as error:  # the daemon isn't running, rnfs isn't installed, ...
+except Exception as error:  # noqa: BLE001 - the daemon isn't running, rnfs isn't installed, ...
     log(f"listing pins failed: {type(error).__name__}: {error}")
     print("The file list isn't available right now; try again later.")
 else:
