@@ -1638,7 +1638,7 @@ class LxmfFeature(features.Feature):
         storage = self.node.storage
         with self.node.fetcher.open(root, names, from_node, pinned=True) as fetch:
             expect = fetch.resolve()
-            if source in storage.pins().get(expect.cid, set()):
+            if storage.has_pin(expect.cid, source):
                 return expect.cid if self._pin_recorded(entry_id, index, expect.cid, source, sent_cid) else None
             content = fetch.size_of(expect)
             used = storage.source_usage(source)

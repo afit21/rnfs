@@ -474,6 +474,12 @@ class Storage:
         with self._lock:
             return cid in self._pins
 
+    def has_pin(self, cid: Cid, source: str) -> bool:
+        """True if source pins cid (a lookup, where pins() would copy every pin)."""
+        with self._lock:
+            sources = self._pins.get(cid)
+            return sources is not None and source in sources
+
     def pin_count(self) -> int:
         """Number of pinned CIDs."""
         with self._lock:
