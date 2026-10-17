@@ -417,6 +417,140 @@ class KeeperStore:
             return len(self._reasons)
 
 
+# Keeper queries
+
+
+class _KeeperQuery:
+    """One keeper query of KeepersFeature.ask_keepers for a name: the search for its keepers, the candidates it
+    found, and the verifying records they answered with so far.
+
+    The search and the choice of batches run in the calling thread; ask runs on a thread per keeper asked, so the
+    answers are guarded by a lock.
+    """
+
+    def __init__(self, feature: "KeepersFeature", name: bytes):
+        """The query's starting state; nothing is sent until search() runs."""
+        node = self.node = feature.node
+        self.feature = feature
+        self.name = name
+        self.key = name_key(name)
+        self.alpha = node.config.effective_alpha(node.slow)
+        self.banned = node.routing.is_banned
+        # Taken before the lookup, whose answers add nodes to the routing table
+        self.before = node.routing.standings(node.config.provider_seniority)
+        self.local = [p for p in node.records.providers(self.key, exclude=self.banned) if p != node.node_id]
+        self.found = dict.fromkeys(self.local)  # every provider of the key found, in the order found
+        self.lookup = node._lookup(self.key)
+        self.wanted = KEEPER_CANDIDATES * self.alpha
+        # Records stored here count as a source only if an established publisher stored one, so identities
+        # nobody knows can't end the search by storing records for the key here first
+        self.local_source = any(self.established(p) for p in self.local)
+        self.candidates: list[bytes] = []  # not taken by a batch yet, in the order to ask them
+        self.vouched: dict[bytes, set[bytes]] = {}  # candidate -> the sources that listed it
+        self.floor: int | None = None  # the highest sequence known for the name when the search ended
+        self.asked = 0
+        self._lock = threading.Lock()
+        self._results: list[SignedRecord] = []
+        self._answered: set[bytes] = set()  # keepers that answered with a verifying record
+        # Unknown keepers given a path request: at most alpha, apart from the lookup's
+        self._unknown: set[bytes] = set()
+        self._used: set[bytes] = set()  # sources that listed a keeper already picked
+
+    def established(self, node_id: bytes) -> bool:
+        """Senior and healthy in the table before the search, and not failed or gone silent since."""
+        return self.feature._standing(node_id, self.before) == 0
+
+    def add(self, provider: bytes):
+        """Collect a provider the lookup reports."""
+        if provider != self.node.node_id and provider not in self.found and not self.banned(provider):
+            self.found[provider] = None
+
+    def enough(self) -> bool:
+        """Enough candidates, listed by more than one established source."""
+        if len(self.found) < self.wanted:
+            return False
+        sources = sum(1 for lister in self.lookup.listing_nodes() if self.established(lister))
+        return sources + (1 if self.local_source else 0) >= 2
+
+    def search(self) -> list[bytes]:
+        """Find providers of the name's key and rank them; the candidates, in the order to ask them.
+
+        Who vouches for each candidate: established nodes that listed it, and this node if it holds a record of
+        it; candidates nobody established vouches for count as one source between them.
+        """
+        self.lookup.find_providers(self.add, should_stop=self.enough)
+        self.candidates = self.feature.rank_keepers(list(self.found), self.before)
+        if not self.candidates:
+            return []
+        here = set(self.local)
+        self.vouched = {provider: ({lister for lister in self.lookup.listers(provider) if self.established(lister)}
+                                   | ({self.node.node_id} if provider in here else set())) or {_UNVOUCHED}
+                        for provider in self.candidates}
+        self.floor = self.feature._known_sequence(self.name)
+        return self.candidates
+
+    def may_ask(self, provider: bytes) -> bool:
+        """True if provider's identity is known, or the unknown-keeper budget has room."""
+        if self.node._is_known(provider) or provider in self._unknown:
+            return True
+        if len(self._unknown) >= self.alpha:
+            return False
+        self._unknown.add(provider)
+        return True
+
+    def next_batch(self) -> list[bytes]:
+        """Up to alpha candidates: first those listed by a source not used yet, then in rank order. Each candidate
+        considered leaves candidates, asked or not (an unknown one over the budget)."""
+        batch = []
+        for fresh in (True, False):
+            for provider in list(self.candidates):
+                if len(batch) >= self.alpha:
+                    break
+                if fresh and not self.vouched[provider] - self._used:
+                    continue
+                self.candidates.remove(provider)
+                if self.may_ask(provider):
+                    batch.append(provider)
+                    self._used.update(self.vouched[provider])
+        self.asked += len(batch)
+        return batch
+
+    def ask(self, provider: bytes):
+        """Ask one keeper; keep its record if it verifies. Runs on a thread of its own."""
+        try:
+            record = parse_response(self.name, self.feature.client.name_record(provider, self.name))
+        except Exception as e:  # noqa: BLE001 - a failed request is just no answer
+            _log(f"/name to {provider.hex()} failed: {e!r}")
+            return
+        if record is None:
+            return
+        with self._lock:
+            self._results.append(record)
+            self._answered.add(provider)
+
+    def settled(self) -> bool:
+        """True if the answers so far settle the name: one reaches the highest sequence known (any, if none is
+        known), and enough keepers answered to confirm it."""
+        with self._lock:
+            best = max((record.sequence for record in self._results), default=None)
+            responders = list(self._answered)
+        current = best is not None and (self.floor is None or best >= self.floor)
+        if self.floor is None:
+            # Nothing to check answers against: replayed old records from identities that answered the
+            # lookup must not settle it, so only established keepers confirm each other
+            confirmed = sum(1 for provider in responders if self.established(provider)) >= 2
+        else:
+            # A second keeper's answer is only worth its airtime on a slow node if there's nothing to check
+            # the first against
+            confirmed = len(responders) >= 2 or self.node.slow
+        return current and confirmed
+
+    def records(self) -> list[SignedRecord]:
+        """The verifying records answered so far."""
+        with self._lock:
+            return list(self._results)
+
+
 # The feature
 
 
@@ -719,124 +853,27 @@ class KeepersFeature(Feature):
         nothing is known to compare against). Each verifying record is returned; the caller keeps the highest
         sequence.
         """
-        node = self.node
-        key = name_key(name)
-        alpha = node.config.effective_alpha(node.slow)
-        banned = node.routing.is_banned
-        # Taken before the lookup, whose answers add nodes to the routing table
-        before = node.routing.standings(node.config.provider_seniority)
-        local = [p for p in node.records.providers(key, exclude=banned) if p != node.node_id]
-        found = dict.fromkeys(local)
-        lookup = node._lookup(key)
-        wanted = KEEPER_CANDIDATES * alpha
-
-        def established(node_id: bytes) -> bool:
-            """Senior and healthy in the table before the search, and not failed or gone silent since."""
-            return self._standing(node_id, before) == 0
-
-        # Records stored here count as a source only if an established publisher stored one, so identities
-        # nobody knows can't end the search by storing records for the key here first
-        local_source = any(established(p) for p in local)
-
-        def add(provider: bytes):
-            """Collect a provider the lookup reports."""
-            if provider != node.node_id and provider not in found and not banned(provider):
-                found[provider] = None
-
-        def enough() -> bool:
-            """Enough candidates, listed by more than one established source."""
-            if len(found) < wanted:
-                return False
-            sources = sum(1 for lister in lookup.listing_nodes() if established(lister))
-            return sources + (1 if local_source else 0) >= 2
-
-        lookup.find_providers(add, should_stop=enough)
-        candidates = self.rank_keepers(list(found), before)
-        if not candidates:
+        query = _KeeperQuery(self, name)
+        if not query.search():
             _log(f"no keepers found for name {name.hex()}")
             return []
-        # Who vouches for each candidate: established nodes that listed it, and this node if it holds a record of
-        # it; candidates nobody established vouches for count as one source between them
-        here = set(local)
-        vouched = {provider: ({lister for lister in lookup.listers(provider) if established(lister)}
-                              | ({node.node_id} if provider in here else set())) or {_UNVOUCHED}
-                   for provider in candidates}
-        floor = self._known_sequence(name)
-        results: list[SignedRecord] = []
-        answered: set[bytes] = set()
-        lock = threading.Lock()
-        unknown: set[bytes] = set()  # unknown keepers given a path request: at most alpha, apart from the lookup's
-
-        def may_ask(provider: bytes) -> bool:
-            """True if provider's identity is known, or the unknown-keeper budget has room."""
-            if node._is_known(provider) or provider in unknown:
-                return True
-            if len(unknown) >= alpha:
-                return False
-            unknown.add(provider)
-            return True
-
-        used: set[bytes] = set()  # sources that listed a keeper already picked
-
-        def next_batch() -> list[bytes]:
-            """Up to alpha candidates: first those listed by a source not used yet, then in rank order."""
-            batch = []
-            for fresh in (True, False):
-                for provider in list(candidates):
-                    if len(batch) >= alpha:
-                        break
-                    if fresh and not vouched[provider] - used:
-                        continue
-                    candidates.remove(provider)
-                    if may_ask(provider):
-                        batch.append(provider)
-                        used.update(vouched[provider])
-            return batch
-
-        def ask(provider: bytes):
-            """Ask one keeper; keep its record if it verifies."""
-            try:
-                record = parse_response(name, self.client.name_record(provider, name))
-            except Exception as e:  # noqa: BLE001 - a failed request is just no answer
-                _log(f"/name to {provider.hex()} failed: {e!r}")
-                return
-            if record is None:
-                return
-            with lock:
-                results.append(record)
-                answered.add(provider)
-
-        deadline = time.monotonic() + max(1.0, lookup.remaining())
-        asked = 0
+        deadline = time.monotonic() + max(1.0, query.lookup.remaining())
         for _ in range(self.keeper_rounds()):
-            batch = next_batch()
+            batch = query.next_batch()
             if not batch:
                 break
-            asked += len(batch)
-            threads = [threading.Thread(target=ask, args=(provider,), name="rnfs-keeper-query", daemon=True)
+            threads = [threading.Thread(target=query.ask, args=(provider,), name="rnfs-keeper-query", daemon=True)
                        for provider in batch]
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
-            with lock:
-                best = max((record.sequence for record in results), default=None)
-                responders = list(answered)
-            current = best is not None and (floor is None or best >= floor)
-            if floor is None:
-                # Nothing to check answers against: replayed old records from identities that answered the
-                # lookup must not settle it, so only established keepers confirm each other
-                confirmed = sum(1 for provider in responders if established(provider)) >= 2
-            else:
-                # A second keeper's answer is only worth its airtime on a slow node if there's nothing to check
-                # the first against
-                confirmed = len(responders) >= 2 or node.slow
-            if (current and confirmed) or time.monotonic() >= deadline:
+            if query.settled() or time.monotonic() >= deadline:
                 break
-        with lock:
-            _log(f"asked {asked} of {asked + len(candidates)} keepers of name {name.hex()}: "
-                 f"{len(results)} verifying records")
-            return list(results)
+        records = query.records()
+        _log(f"asked {query.asked} of {query.asked + len(query.candidates)} keepers of name {name.hex()}: "
+             f"{len(records)} verifying records")
+        return records
 
     def keeper_rounds(self) -> int:
         """How many batches of alpha keepers one query asks at most: KEEPER_ROUNDS, or 2 on a slow node, where
