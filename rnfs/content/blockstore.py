@@ -21,6 +21,11 @@ from rnfs.content.cid import Cid
 PARTIAL_PREFIX = fsutil.PARTIAL_PREFIX  # also the prefix of every other atomic write's temporary file
 
 
+def matches(cid: Cid, block: bytes) -> bool:
+    """True if block is a valid block for cid: at most MAX_BLOCK_SIZE bytes and hashing to cid's digest."""
+    return len(block) <= MAX_BLOCK_SIZE and cid.verify(block)  # the size first, so an oversized block isn't hashed
+
+
 class BlockStore:
     """A directory of blocks named by their CIDs."""
 
@@ -58,9 +63,9 @@ class BlockStore:
 
     def put(self, cid: Cid, block: bytes):
         """Store block under cid unless already stored. Raises ValueError, storing nothing, if it doesn't match."""
-        if len(block) > MAX_BLOCK_SIZE:
-            raise ValueError(f"block for {cid} exceeds MAX_BLOCK_SIZE")
-        if not cid.verify(block):
+        if not matches(cid, block):
+            if len(block) > MAX_BLOCK_SIZE:
+                raise ValueError(f"block for {cid} exceeds MAX_BLOCK_SIZE")
             raise ValueError(f"block does not match {cid}")
         path = self.path(cid)
         if os.path.isfile(path):
@@ -106,7 +111,7 @@ class BlockStore:
     def verify(self, cid: Cid) -> bool:
         """True if the stored block exists and matches its CID."""
         block = self.get(cid)
-        return block is not None and len(block) <= MAX_BLOCK_SIZE and cid.verify(block)
+        return block is not None and matches(cid, block)
 
     def scan(self) -> Iterator[tuple[Cid, int]]:
         """(CID, size) of every stored block. Files whose names aren't canonical CIDs are ignored."""
