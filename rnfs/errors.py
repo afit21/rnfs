@@ -1,6 +1,9 @@
 """Errors shared across rnfs, and raised by its public API (rnfs.Node, rnfs.Client), which exports each as
-rnfs.<name>. The API maps them to HTTP statuses (see design.md); rnfs.apiclient's errors for those statuses are
-subclasses of these, so one except clause catches either class's."""
+rnfs.<name>. The API maps them to HTTP statuses by STATUSES (see design.md); rnfs.apiclient's errors for those
+statuses are subclasses of these, so one except clause catches either class's.
+
+Standard library only: rnfs.apiclient, which never loads RNS, derives its table from STATUSES.
+"""
 
 
 class RnfsError(Exception):
@@ -41,3 +44,28 @@ class Cancelled(RnfsError):
 
 class Closed(RnfsError):
     """The rnfs.Node or rnfs.Client was closed."""
+
+
+class BlockMismatch(RnfsError, ValueError):
+    """A block handed to the block store doesn't match its CID (or is over MAX_BLOCK_SIZE).
+
+    The add and import paths only store blocks they built or checked, so there it is a bug, not a bad request:
+    the API logs it at WARNING. Still a ValueError (400), as before, so every `except ValueError` still holds.
+    """
+
+
+class SealError(RnfsError, ValueError):
+    """A sealed file is malformed or has been tampered with (rnfs.content.seal). A ValueError (400), as before."""
+
+
+class NotRecipient(ValueError):
+    """This node's identity isn't among a sealed file's recipients (rnfs.content.seal), or it has none. A
+    ValueError (400)."""
+
+
+# Error class -> the local API's HTTP status (design.md, "Node facade"), checked in order: an error gets the status
+# of the first class it is an instance of, and anything else 500. One class per status: rnfs.api maps errors by
+# it (BlockMismatch, SealError and NotRecipient are ValueErrors: 400), rnfs.apiclient each status back to its
+# error, and rnfs.gateway has a fixed message for each
+STATUSES = ((ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), (InvalidDag, 422), (Busy, 503),
+            (StorageFull, 507))
