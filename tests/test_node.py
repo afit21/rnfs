@@ -434,6 +434,94 @@ class SealedCheckTest(NodeTest):
         self.assertEqual(len(self.a._not_sealed), 0)
 
 
+class PinLsMemoTest(NodeTest):
+    """pin_ls remembers each complete pin's type, name from inside and sealed status, rather than reading its
+    blocks at every call; what it gives is what reading them gives."""
+
+    def setUp(self):
+        """Node A, with an identity, counting _pin_shape's calls (each reads the pin's root block)."""
+        super().setUp()
+        self.a.identity = RNS.Identity()
+        shape = mock.patch.object(self.a, "_pin_shape", wraps=self.a._pin_shape)
+        self.shape = shape.start()
+        self.addCleanup(shape.stop)
+
+    def fresh(self) -> list[dict]:
+        """pin_ls as it is without the memo."""
+        with mock.patch.object(node_module, "PIN_MEMO", 0):
+            saved, self.a._pin_memo = self.a._pin_memo, {}
+            try:
+                return self.a.pin_ls()
+            finally:
+                self.a._pin_memo = saved
+
+    def test_complete_pins_are_read_once(self):
+        """A second pin_ls reads no pin's blocks again and answers the same, for files, directories and sealed
+        files; pin_ls(cid) uses the memo too."""
+        cids = [self.a.add_stream(io.BytesIO(b"small"))["cid"],
+                self.a.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"],
+                self.a.add_stream(io.BytesIO(b"inside"), name="one.txt")["cid"],
+                self.a.add_stream(io.BytesIO(b"secret"), to_self=True)["cid"]]
+        first = self.a.pin_ls()
+        self.assertEqual(self.shape.call_count, 4)
+        self.assertEqual({entry["cid"]: (entry["type"], entry["sealed"]) for entry in first},
+                         {cids[0]: ("file", False), cids[1]: ("file", False), cids[2]: ("directory", False),
+                          cids[3]: ("file", True)})
+        self.assertEqual(self.a.pin_ls(), first)
+        self.assertEqual(self.a.pin_ls(cids[2]), [entry for entry in first if entry["cid"] == cids[2]])
+        self.assertEqual(self.shape.call_count, 4)
+        self.assertEqual(first, self.fresh())
+
+    def test_released_pins_are_forgotten(self):
+        """pin_ls forgets the pins released since the last."""
+        keep, drop = (self.a.add_stream(io.BytesIO(b"%d" % i))["cid"] for i in range(2))
+        self.a.pin_ls()
+        self.assertEqual({str(c) for c in self.a._pin_memo}, {keep, drop})
+        self.a.pin_rm(drop)
+        self.assertEqual([entry["cid"] for entry in self.a.pin_ls()], [keep])
+        self.assertEqual({str(c) for c in self.a._pin_memo}, {keep})
+
+    def test_incomplete_pins_are_read_each_time(self):
+        """A pin missing blocks isn't remembered: once they arrive it is seen complete, its sealed status known."""
+        data = os.urandom(2 * CHUNK_SIZE)
+        cid = Cid.parse(self.b.add_stream(io.BytesIO(data))["cid"])
+        self.a.storage.put(cid, self.b.storage.get(cid))
+        self.a.storage.pin(cid, "user")
+        for _ in range(2):
+            self.assertEqual([(e["complete"], e["type"], e["sealed"]) for e in self.a.pin_ls()], [(False, "file", None)])
+        self.assertEqual(self.a._pin_memo, {})
+        for child in dag.decode(self.b.storage.get(cid)).child_cids:
+            self.a.storage.put(child, self.b.storage.get(child))
+        self.assertEqual([(e["complete"], e["type"], e["sealed"]) for e in self.a.pin_ls()], [(True, "file", False)])
+        self.assertIn(cid, self.a._pin_memo)
+
+    def test_a_pin_that_loses_a_block_is_read_again(self):
+        """A remembered pin whose first chunk is found damaged (and deleted) is incomplete again: its sealed
+        status is unknown, as reading its blocks says."""
+        cid = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"])
+        self.assertEqual([(e["complete"], e["sealed"]) for e in self.a.pin_ls()], [(True, False)])
+        first = dag.decode(self.a.storage.get(cid)).child_cids[0]
+        path = self.a.storage.blocks.path(first)
+        os.chmod(path, 0o600)
+        with open(path, "r+b") as f:
+            f.write(b"damaged")
+        self.assertIsNone(self.a.storage.get(first, verify=True))  # deleted
+        self.assertEqual([(e["complete"], e["type"], e["sealed"]) for e in self.a.pin_ls()], [(False, "file", None)])
+        self.assertEqual(self.a.pin_ls(), self.fresh())
+
+    def test_the_memo_is_bounded(self):
+        """At most PIN_MEMO pins are remembered (the first met); the others are read each time, answering the
+        same."""
+        for i in range(3):
+            self.a.add_stream(io.BytesIO(b"%d" % i))
+        with mock.patch.object(node_module, "PIN_MEMO", 2):
+            first = self.a.pin_ls()
+            self.assertEqual(len(self.a._pin_memo), 2)
+            self.assertEqual(self.a.pin_ls(), first)
+            self.assertEqual(self.shape.call_count, 4)  # 3, then the one past the bound again
+        self.assertEqual(first, self.fresh())
+
+
 class BackendTest(NodeTest):
     """What the request server asks of the node."""
 

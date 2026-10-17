@@ -77,6 +77,9 @@ HASH_NOTICES = 1024  # files whose denied-hash NOTICE was logged, kept so it isn
 # Resolved targets found not to be sealed files, so reading one again needn't read its first bytes to tell (a CID's
 # content never changes); least recently used forgotten first, about 2 MB when full
 NOT_SEALED_MEMO = 4096
+# Complete pins whose pin_ls type, name from inside and sealed status are remembered (about 3 MB when full); pins
+# past it are read each time
+PIN_MEMO = 16384
 _UNOPENED = object()  # _read's opened when nothing has been opened yet
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
@@ -585,6 +588,9 @@ class RnfsNode:
         self._not_sealed: OrderedDict[walker.Expect, None] = OrderedDict()
         self._not_sealed_deny: frozenset[bytes] | None = None
         self._not_sealed_lock = threading.Lock()
+        # pin_ls's memo: pinned CID -> (type, name from inside, sealed), for complete pins only (_pin_details)
+        self._pin_memo: dict[Cid, tuple[str | None, str | None, bool | None]] = {}
+        self._pin_memo_lock = threading.Lock()
         # The shared folder is written through: nothing to save. Its per-file cache (what the files inside its entries
         # were built as) is saved with the batched stores; the shared folder's close releases it too
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
@@ -1533,17 +1539,43 @@ class RnfsNode:
         """
         pins = self.storage.pins()
         self.pin_names.prune(set(pins))
+        with self._pin_memo_lock:
+            for gone in [c for c in self._pin_memo if c not in pins]:
+                del self._pin_memo[gone]
         if cid is not None:
             wanted = Cid.parse(cid)
             pins = {wanted: pins[wanted]} if wanted in pins else {}
         folder_names = self.shared_folder.names()
         result = []
         for c, sources in sorted(pins.items(), key=lambda item: str(item[0])):
-            kind, inside = self._pin_shape(c)
+            complete = self.storage.is_complete(c)
+            kind, inside, sealed = self._pin_details(c, complete)
             name = self.pin_names.get(c) or (folder_names.get(c) if FOLDER in sources else None) or inside
-            result.append({"cid": str(c), "sources": sorted(sources), "complete": self.storage.is_complete(c),
-                           "type": kind, "sealed": self._pin_sealed(c, kind), "name": name})
+            result.append({"cid": str(c), "sources": sorted(sources), "complete": complete,
+                           "type": kind, "sealed": sealed, "name": name})
         return result
+
+    def _pin_details(self, cid: Cid, complete: bool) -> tuple[str | None, str | None, bool | None]:
+        """(type, name from inside, sealed) of a pin (_pin_shape, _pin_sealed), remembered while it is complete.
+
+        They are read from stored blocks, which a complete pin has all of and whose content never changes, so
+        they hold for as long as it stays complete; an incomplete pin's are read each time (a block may arrive,
+        or have gone). pin_ls forgets the pins released; at most PIN_MEMO are remembered, the first met kept:
+        pin_ls goes through them in the same order each time, so replacing older ones would remember none.
+        """
+        if complete:
+            with self._pin_memo_lock:
+                known = self._pin_memo.get(cid)
+            if known is not None:
+                return known
+        kind, inside = self._pin_shape(cid)
+        details = (kind, inside, self._pin_sealed(cid, kind))
+        # A complete DAG's blocks always tell both; None means a block went while they were read
+        if complete and kind is not None and details[2] is not None:
+            with self._pin_memo_lock:
+                if len(self._pin_memo) < PIN_MEMO:
+                    self._pin_memo[cid] = details
+        return details
 
     def _pin_sealed(self, cid: Cid, kind: str | None) -> bool | None:
         """True if a pinned file is sealed (its first bytes carry the sealed-file magic), False if it isn't or
