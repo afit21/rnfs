@@ -11,6 +11,7 @@ Repeated CIDs: every occurrence is checked against its own expectation, but iden
 (the same CID listed the same way at the same depth) are checked once, which is what keeps DAGs that
 repeat subtrees cheap to walk.
 """
+import bisect
 import errno
 import os
 import stat
@@ -94,12 +95,7 @@ def check_node(expect: Expect, node: dag.Node):
         raise InvalidDag(f"{expect.cid} is deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     if expect.size is not None and node.size != expect.size:
         raise InvalidDag(f"{expect.cid} holds {node.size} bytes, but its parent says {expect.size}")
-    if isinstance(node, DirectoryNode):
-        names = [entry.name for entry in node.entries]
-    elif isinstance(node, IndexNode):
-        names = [child.first_name for child in node.children]
-    else:
-        names = None
+    names = node.names
     if expect.first_name is not None:
         if not names or names[0] != expect.first_name:
             raise InvalidDag(f"{expect.cid}: first name below an index child isn't its first_name")
@@ -144,6 +140,14 @@ def is_index_step(expect: Expect) -> bool:
     return expect.first_name is not None
 
 
+def index_child(node: IndexNode, name: str) -> int | None:
+    """The position of the child of an index node that would hold name, if any is: the one with the greatest
+    first_name <= name (first names are strictly increasing in a decoded node); None if name sorts before them
+    all. The one rule for stepping through an index, here and in Storage."""
+    position = bisect.bisect_right(node.names, name) - 1
+    return None if position < 0 else position
+
+
 def step(expect: Expect, block: bytes, name: str) -> Expect | None:
     """One path step: the entry called name in a directory node, or for an index the child that would hold it.
 
@@ -159,14 +163,8 @@ def step(expect: Expect, block: bytes, name: str) -> Expect | None:
             if entry.name == name:
                 return child
         return None
-    # The name is in the child with the greatest first_name <= name, if anywhere
-    found = None
-    for index_child, child in zip(node.children, child_expects):
-        if index_child.first_name <= name:
-            found = child
-        else:
-            break
-    return found
+    position = index_child(node, name)
+    return None if position is None else child_expects[position]
 
 
 def range_children(expect: Expect, block: bytes, offset: int, length: int) -> list[tuple[Expect, int, int]]:

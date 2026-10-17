@@ -162,7 +162,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `dag.py`
 - `FILE, DIRECTORY, INDEX = 1, 2, 3`; `KIND_FILE, KIND_EXECUTABLE, KIND_DIRECTORY = 0, 1, 2`.
 - Frozen dataclasses `Child(cid, size)`, `Entry(name, cid, size, kind)`, `IndexChild(first_name, cid, size)`;
-  nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`.
+  nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`, each with `child_cids` (the CIDs it
+  lists, in order) and `names` (its entries' names or children's first names; none for a file node).
 - `encode(node) -> bytes`; `decode(block) -> node`, strict (types, shortest headers, re-encodes identically),
   raising `InvalidDag`. Nodes are immutable and decoding is a pure function of the bytes, so `decode` remembers
   the nodes of the blocks it decoded last (`MEMO_BLOCKS` 256, `MEMO_BYTES` 2 MiB of blocks, least recently used
@@ -178,7 +179,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - `expand(expect, block) -> list[Expect]` — check a verified block against its expectation (type, size, names,
   index bounds, depth) and return its children's expectations. Raises `InvalidDag`. Raw blocks have none.
 - `step(expect, block, name) -> Expect | None` — one path step in a directory or index node (for an index, the
-  child that would hold `name`; keep stepping until a directory entry is reached).
+  child that would hold `name`; keep stepping until a directory entry is reached). `index_child(node, name)` is
+  that index rule (the child with the greatest first name <= `name`), shared with `Storage`'s path walk.
 - `range_children(expect, block, offset, length) -> list[tuple[Expect, int, int]]` — children of a file node
   overlapping a byte range, with the range relative to each child.
 - `parse_target(text) -> tuple[Cid, list[str]]` for `<cid>[/name…]` (ValueError if malformed).
@@ -220,7 +222,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - `evict() -> set[Cid]` enforce `max_storage` (LRU cached fetches); `gc() -> stats` evicts every cached fetch;
   both delete unreachable blocks and report targets no longer complete, so the node can withdraw them. Both
   first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
-  memos; completeness via `dag_blocks`), then decide and delete under the lock from the pins, sessions and
+  memos, its path walk the one `_path_cids` makes under the lock, `_walk_path`; completeness via `dag_blocks`),
+  then decide and delete under the lock from the pins, sessions and
   records current then, so `get` (and `/blocks` serving) waits only for that in-memory walk and the deletions,
   and a block that became reachable meanwhile is kept. The size queries (`pinned_bytes`, `dag_bytes`,
   `source_usage`, `stat`) read their DAG nodes the same way first. `_links` memoises only stored DAG nodes: a

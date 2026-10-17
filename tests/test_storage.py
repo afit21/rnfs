@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest import mock
 
-from rnfs import fsutil, statedb
+from rnfs import constants, fsutil, statedb
 from rnfs.content import builder, dag, storage as storage_module, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
@@ -480,6 +480,49 @@ class EvictionTest(StorageTest):
         self.assertFalse(self.storage.has(orphan.cid))
         self.assertEqual(lost, set())  # a is still complete; b was never a target
         self.assertEqual(self.storage.cached_fetches(), [(root.cid, ("a",), a.cid)])
+
+    def test_warm_reads_what_the_path_walk_reaches(self):
+        """_warm and _path_cids share one path walk: warming reads exactly the stored nodes a record's path
+        reaches, through index nodes, missing names, files and nodes not stored, and the locked walk then reads
+        nothing."""
+        with mock.patch.multiple(constants, MAX_CHILDREN=3):
+            files = [self.add(b"%02d" % i * 20) for i in range(10)] + [self.add(b"G" * 70000)]  # raw blocks; a node
+            names = [f"f{i:02d}" for i in range(10)] + ["g"]
+            big = builder.build_directory([Entry(n, f.cid, f.size, 0) for n, f in zip(names, files)],
+                                          self.storage.put)  # index nodes over groups of 3 entries
+            inner = builder.wrap("big", big, self.storage.put)
+            root = builder.wrap("inner", inner, self.storage.put)
+        absent = builder.wrap("x", builder.build_bytes(b"absent", builder.NO_PUT), builder.NO_PUT)
+        missing = builder.wrap("absent", absent, self.storage.put)  # its one entry isn't stored
+        paths = [(root.cid, ("inner", "big", "f05")), (root.cid, ("inner", "big", "g")),
+                 (root.cid, ("inner", "big", "a")), (root.cid, ("inner", "big", "zz")),
+                 (root.cid, ("inner", "nothing")), (root.cid, ("inner", "big", "f00", "below a raw block")),
+                 (root.cid, ("inner", "big", "g", "below a file node")), (missing.cid, ("absent", "x")),
+                 (root.cid, ()), (files[0].cid, ("x",))]
+        for path in paths:
+            with self.subTest(path=path):
+                self.storage = self.open()  # nothing memoised
+                read = set()
+                real = Storage._read_node
+                with mock.patch.object(Storage, "_read_node", lambda s, cid: (read.add(cid), real(s, cid))[1]):
+                    self.storage._warm(set(), [path])
+                    stored = {cid for cid in read if self.storage.has(cid)}
+                    read.clear()
+                    with self.storage._lock:
+                        reached = self.storage._path_cids(*path)
+                self.assertEqual(reached, stored)
+                self.assertEqual(read, set())  # warmed: the walk under the lock read nothing
+        # What the walk reaches is what walker.step passes through
+        expected, expect = set(), walker.root_expect(root.cid)
+        for name in ("inner", "big", "f05"):
+            while True:
+                expected.add(expect.cid)
+                expect = walker.step(expect, self.storage.get(expect.cid), name)
+                if not walker.is_index_step(expect):
+                    break
+        self.assertGreater(len(expected), 4)  # through index nodes
+        with self.storage._lock:
+            self.assertEqual(self.storage._path_cids(root.cid, ("inner", "big", "f05")), expected)
 
     def test_lru_eviction(self):
         first = self.add(b"1" * 1000)

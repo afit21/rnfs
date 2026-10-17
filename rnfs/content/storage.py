@@ -56,6 +56,7 @@ WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB 
 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
+_NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 
 _IDENTITY_HASH = re.compile(r"[0-9a-f]{32}")
 
@@ -135,6 +136,29 @@ def import_cache(value: dict, tx) -> int:
                    [(root.binary, statedb.dump(list(names)), target.binary, used)
                     for used, ((root, names), target) in enumerate(records.items())])
     return len(records)
+
+
+def _walk_path(root: Cid, names: tuple[str, ...], step: Callable[[Cid, str], tuple[Cid, bool] | None]) \
+        -> Iterator[Cid]:
+    """The DAG nodes a walk along <root>/<names> passes through (not the target it reaches), in order: the walk
+    that keeps a cached fetch's path, written once for Storage._path_cids (under the lock) and Storage._warm
+    (without it), so warming covers exactly what the locked walk reads.
+
+    step(cid, name) is where name leads from the node cid (Storage._step_in's answer), or None if the walk ends
+    there: no such name, not a directory, or cid can't be read. The walk also ends at a raw block, unyielded.
+    """
+    current = root
+    for name in names:
+        while True:
+            if current.is_raw:
+                return
+            yield current
+            answer = step(current, name)
+            if answer is None:
+                return
+            current, through_directory = answer
+            if through_directory:
+                break  # the next name
 
 
 class Session:
@@ -599,22 +623,19 @@ class Storage:
     @staticmethod
     def _listed(node) -> tuple[Cid, ...]:
         """The CIDs a decoded DAG node lists; none for None (raw, missing or invalid)."""
-        if node is None:
-            return ()
-        if isinstance(node, DirectoryNode):
-            return tuple(entry.cid for entry in node.entries)
-        return tuple(child.cid for child in node.children)
+        return () if node is None else node.child_cids
 
     @staticmethod
     def _step_in(node, name: str) -> tuple[Cid, bool] | None:
         """Where the path step name leads from a decoded node: (entry, True) through a directory, (child, False)
-        to the index node child that may hold it, or None (no such entry, or not a directory)."""
+        to the index node child that may hold it (walker.index_child), or None (no such entry, or not a
+        directory)."""
         if isinstance(node, DirectoryNode):
             entry = next((e for e in node.entries if e.name == name), None)
             return None if entry is None else (entry.cid, True)
         if isinstance(node, IndexNode):
-            candidates = [c for c in node.children if c.first_name <= name]
-            return (candidates[-1].cid, False) if candidates else None
+            position = walker.index_child(node, name)
+            return None if position is None else (node.children[position].cid, False)
         return None
 
     def _children(self, cid: Cid) -> tuple[Cid, ...] | None:
@@ -653,27 +674,22 @@ class Storage:
     def _path_cids(self, root: Cid, names: tuple[str, ...], damaged: set[Cid] | None = None) -> set[Cid]:
         """The stored nodes along <root>/<names> (not their other children), as far as they're stored; damaged
         nodes met are added to damaged (lock held)."""
-        found: set[Cid] = set()
-        current = root
-        for name in names:
-            while True:
-                if current.is_raw or current not in self._sizes:
-                    return found
-                found.add(current)
-                step = self._steps.get(current, {}).get(name, MISSING)
-                if step is MISSING:
-                    node = self._node(current)
-                    if node is DAMAGED:
-                        if damaged is not None:
-                            damaged.add(current)
-                        return found  # not memoised, as in _children
-                    step = self._steps.setdefault(current, {})[name] = self._step_in(node, name)
-                if step is None:
-                    return found
-                current, through_directory = step
-                if through_directory:
-                    break  # the next name
-        return found
+
+        def step(cid: Cid, name: str) -> tuple[Cid, bool] | None:
+            """_step_in's answer at cid, memoised (_steps); None if cid isn't stored, or is damaged."""
+            if cid not in self._sizes:
+                return None
+            answer = self._steps.get(cid, {}).get(name, _NO_MEMO)
+            if answer is _NO_MEMO:
+                node = self._node(cid)
+                if node is DAMAGED:
+                    if damaged is not None:
+                        damaged.add(cid)
+                    return None  # not memoised, as in _children
+                answer = self._steps.setdefault(cid, {})[name] = self._step_in(node, name)
+            return answer
+
+        return {cid for cid in _walk_path(root, names, step) if cid in self._sizes}
 
     def _warm(self, roots: set[Cid], paths: list[tuple[Cid, tuple[str, ...]]]):
         """Read and decode, without the lock, the DAG nodes a collection will walk from roots and along paths,
@@ -705,29 +721,20 @@ class Storage:
                 listed = found_links[cid] = self._listed(node)
             stack.extend(child for child in listed if child not in seen and not child.is_raw)
 
-        def step(cid: Cid, name: str):
-            """_step_in's answer for cid, memoised or read; MISSING if cid can't be read."""
-            known = steps.get(cid, {}).get(name, found_steps.get((cid, name), MISSING))
-            if known is MISSING:
+        def step(cid: Cid, name: str) -> tuple[Cid, bool] | None:
+            """_step_in's answer at cid, memoised or read; None if cid can't be read (the walk under the lock
+            reads it)."""
+            known = steps.get(cid, {}).get(name, found_steps.get((cid, name), _NO_MEMO))
+            if known is _NO_MEMO:
                 node = self._read_node(cid)
                 if node is MISSING or node is DAMAGED:
-                    return MISSING
+                    return None
                 known = found_steps[(cid, name)] = self._step_in(node, name)
             return known
 
         for root, names in paths:
-            current, ended = root, False
-            for name in names:
-                while not ended:
-                    result = None if current.is_raw else step(current, name)
-                    if result is None or result is MISSING:
-                        ended = True  # the path ends here, or the walk under the lock reads it
-                    else:
-                        current, through_directory = result
-                        if through_directory:
-                            break  # the next name
-                if ended:
-                    break
+            for _ in _walk_path(root, names, step):
+                pass  # step memoises as the walk goes: the same walk _path_cids makes under the lock
         with self._lock:
             for cid, listed in found_links.items():
                 if cid in self._sizes:

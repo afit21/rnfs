@@ -336,6 +336,14 @@ class WalkTest(unittest.TestCase):
                         walker.resolve(root, [missing], blocks.get)
                     self.assertEqual(str(caught.exception), f"{root}/{missing} does not exist")
 
+    def test_index_child(self):
+        """The child with the greatest first_name <= name, or None before the first."""
+        index = IndexNode([IndexChild(n, Cid.for_block(DAG, n.encode()), 0) for n in ("b", "d", "f")])
+        for name, position in (("a", None), ("b", 0), ("c", 0), ("d", 1), ("e", 1), ("f", 2), ("zz", 2)):
+            with self.subTest(name=name):
+                self.assertEqual(walker.index_child(index, name), position)
+        self.assertIsNone(walker.index_child(IndexNode([]), "a"))
+
     def test_resolve_nested_and_into_file(self):
         """Nested names resolve, no names give the root, and a name below a file is NotFound, naming the path."""
         blocks = Blocks()
