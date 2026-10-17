@@ -1076,6 +1076,17 @@ class RequestServer:
         finally:
             self.incoming.stop_waiting(link_id)
 
+    @staticmethod
+    def _proof_wait(link) -> float:
+        """Seconds a new /blocks waits for the previous response's proof: 2 × the link's RTT + 1, at most
+        PROOF_GRACE. The only server-side use of link.rtt, and it must stay capped: on an incoming link it is
+        whatever the requester claims (RNS keeps the larger of what it measured and what the requester's RTT
+        packet says), so anything but a finite, non-negative int or float (a bool included) counts as none."""
+        rtt = getattr(link, "rtt", None)
+        if type(rtt) not in (int, float) or not 0 <= rtt < math.inf:  # NaN fails both comparisons
+            rtt = 0
+        return float(min(PROOF_GRACE, 2 * rtt + 1))
+
     def _previous_done(self, link, link_id: bytes) -> bool:
         """Whether the link's previous /blocks response, if any, has finished, so a new one may start.
 
@@ -1086,7 +1097,7 @@ class RequestServer:
         previous = [r for r in self.pools.responses() if r.link_id == link_id and not r.finished]
         if not previous:
             return True
-        deadline = time.monotonic() + min(PROOF_GRACE, 2 * (getattr(link, "rtt", None) or 0) + 1)
+        deadline = self.clock() + self._proof_wait(link)
         for response in previous:
             if response.untracked:
                 # Without RNS internals, the requester asking again is the only sign the response arrived
@@ -1096,7 +1107,7 @@ class RequestServer:
             resource = response.resource
             if resource is None or getattr(resource, "status", 0) < RNS.Resource.AWAITING_PROOF:
                 return False  # not yet sent, or still transferring
-            while not response.finished and time.monotonic() < deadline:
+            while not response.finished and self.clock() < deadline:
                 if getattr(resource, "status", 0) >= RNS.Resource.COMPLETE:
                     self._concluded(response, link, resource)
                     break

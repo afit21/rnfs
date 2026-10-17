@@ -802,7 +802,11 @@ and in total, never persisted.
   link closed, or RNS gave up) starts none, so a reader that gives up early must close its links and never
   call `Resource.cancel()` on a response, or it would cool itself down at its providers. `Cooldowns` is flat:
   every cooldown lasts `blocks_cooldown`, per link and per identity. The `Response` docstring records which
-  thread or lock owns each of its fields.
+  thread or lock owns each of its fields. A new `/blocks` arriving while the link's previous response has
+  sent all its parts waits, on `RequestServer.clock`, up to `_proof_wait(link)` (2 × RTT + 1 s, at most
+  `PROOF_GRACE`, 5 s) for its proof (`_previous_done`). That is the server's only use of `link.rtt`, which on an
+  incoming link is what the requester claims: anything but a finite, non-negative number counts as no RTT, and
+  any future use must go through it, capped.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends

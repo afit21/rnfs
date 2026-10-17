@@ -16,7 +16,7 @@ from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KI
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
-from tests.support import FakeClock
+from tests.support import FakeClock, wait_for
 
 KEY = bytes(range(ID_LENGTH))
 
@@ -570,9 +570,17 @@ class RequestServerTest(unittest.TestCase):
         self.assertIs(self.blocks(link, request_id=b"s" * 16), False)
         resource = self.send(link)
         self.assertIs(self.blocks(link, request_id=b"s" * 16), False)
-        # All parts sent, proof withheld: still refused (after a short grace), and the slots stay held
+        # All parts sent, proof withheld: still refused (after a short grace, on the server's clock), and the
+        # slots stay held
         resource.status = RNS.Resource.AWAITING_PROOF
-        self.assertIs(self.blocks(link, request_id=b"s" * 16), False)
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.blocks(link, request_id=b"s" * 16)))
+        thread.start()
+        time.sleep(0.05)
+        self.assertEqual(results, [])  # waiting out the grace
+        self.clock.now += server.PROOF_GRACE
+        thread.join(5)
+        self.assertEqual(results, [False])
         self.assertEqual(len(self.server.pools.responses()), 1)
         # The proof arriving while the next request waits: accepted
         threading.Timer(0.1, resource.complete).start()
@@ -583,22 +591,22 @@ class RequestServerTest(unittest.TestCase):
         self.blocks(link)
         self.send(link).status = RNS.Resource.AWAITING_PROOF  # all parts sent, proof withheld
         # A flood of /blocks on that link: one waits out the grace, the rest are refused at once
-        finished, results = [], []
+        results = []
 
         def ask(i):
-            """One /blocks request, noting when it was answered."""
+            """One /blocks request, noting its answer."""
             results.append(self.blocks(link, request_id=bytes([i]) * 16))
-            finished.append(time.monotonic())
 
-        start = time.monotonic()
         threads = [threading.Thread(target=ask, args=(i,)) for i in range(1, 9)]
         for thread in threads:
             thread.start()
+        wait_for(lambda: len(results) == 7, timeout=5, what="seven requests to be refused")
+        time.sleep(0.05)
+        self.assertEqual(len(results), 7)  # the grace (2 × RTT + 1 s, on the server's clock) hasn't passed
+        self.clock.now += server.PROOF_GRACE
         for thread in threads:
             thread.join(5)
         self.assertEqual(results, [False] * 8)
-        quick = sum(1 for t in finished if t - start < 0.5)  # the grace here is 2 × RTT + 1 s
-        self.assertEqual(quick, 7)
         self.assertEqual(len(self.server.pools.responses()), 1)
         self.assertEqual(self.server.incoming.in_progress(link.link_id), (1, 1))
         # The waiter's mark is cleared, so the next request may wait for the proof again
