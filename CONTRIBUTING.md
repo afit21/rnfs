@@ -50,6 +50,16 @@ variables:
 says how, including on a Raspberry Pi SD card). Performance changes record their before and after numbers in
 CHANGELOG.md.
 
+`tests/interop.py` is a manual cross-version check, not a test either: it runs this tree's daemons against daemons
+of older releases over local TCP, in both directions, and prints a PASS/FAIL table (providers, get and cat,
+transfers with and without `max_upload_rate` checked for refusals, names, keepers, LXMF). Run it before a release
+with each supported old release extracted by `git archive`:
+
+    mkdir -p /tmp/rnfs-0.1.5 && git archive v0.1.5 | tar -x -C /tmp/rnfs-0.1.5
+    python3 tests/interop.py --old /tmp/rnfs-0.1.5 --old /tmp/rnfs-0.1.4
+
+It takes about five minutes per release; logs are kept on failure or with `--keep`.
+
 Tests that guard compatibility, and must stay green:
 - `tests/test_wire.py`: wire known-answer vectors (`tests/fixtures/wire`).
 - `tests/test_upgrade_014.py`, `tests/test_upgrade_015.py`: the current code started on an `<rnfs dir>` exactly
