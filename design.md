@@ -337,7 +337,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
 | `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`; the sealed name is None unless `safe_default_name` accepts it) |
-| `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0) |
+| `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
 | `read(target, offset=0, length=None, for_gateway=False, from_node=None, raw=False)` | iterator of bytes of a file (range fetched only; sealed files decrypted unless `raw` or `for_gateway`) |
 | `read_file(target, offset=0, length=None, from_node=None, raw=False)` | `(info, chunks)`: `info()` and `read()` in one fetch, resolving the target once; `chunks` reads `[offset, offset + length)` cut to the info's size only once iterated (a directory's raises `ValueError`), and closing it ends the fetch (`GET /api/cat`, which used to call `info` and `read`: two fetches) |
 | `block(cid, for_gateway=False)` | the CID's own block, verified (`cat --block`, `?format=raw`: the gateway calls it only for the user's own GET) |
@@ -740,7 +740,10 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   the first chunk is fetched first even for a `cat --offset` deep in a file. The gateway does so only for a
   GET from byte 0 or a web page's request (`limited()`, so its type never depends on what is stored); the
   user's own HEAD, or range not at 0, uses the first bytes only if already stored (`stored_head`), else takes
-  the Content-Type from the name, or `application/octet-stream`.
+  the Content-Type from the name, or `application/octet-stream`. `stored_head` applies the deny list as a read
+  does (`node_content.denying` wraps its getter; with file hashes, `_check_file` over stored blocks once the file
+  is wholly stored), so such a HEAD of a denied file answers 451 like GET; `pin ls` (`_pin_sealed`) passes
+  `deny=False`.
 
 ## Mesh
 

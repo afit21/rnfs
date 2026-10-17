@@ -1191,6 +1191,9 @@ gateway can never reach the API.
     and never fetches them: its Content-Type then comes from the name, or is `application/octet-stream`. A
     request that isn't the user's own navigation (below) always reads them, fetching them if need be, so its
     Content-Type doesn't depend on what the node stores.
+  - The deny list (section 8) applies to those bytes as to any read: a `HEAD` of a stored file that is denied,
+    by a CID read or by its content hash, answers `451` like `GET`. While the deny list has file hashes, the
+    stored bytes are used only once the whole file is stored (its hash is checked first, never fetching).
 - **Trustless responses** (`/rnfs/` only; `/name/` answers `?format=` with 400):
   - `/rnfs/<cid>?format=raw` returns the CID's own block, re-verified, as `application/vnd.rnfs.raw`; a path
     is refused (400).

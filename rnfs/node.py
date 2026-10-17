@@ -1206,7 +1206,8 @@ class RnfsNode:
             return False
 
     def stored_head(self, target: str, length: int) -> bytes | None:
-        """A file's first length bytes if every block they need is stored, else None. Never fetches."""
+        """A file's first length bytes if every block they need is stored, else None. Never fetches. Raises
+        Denied as a read does (node_content.stored_head)."""
         return node_content.stored_head(self, target, length)
 
     def dir_set(self, target: str, name: str, child_cid: str, executable: bool = False) -> dict:
@@ -1289,7 +1290,8 @@ class RnfsNode:
             return False
         if kind is None:
             return None
-        head = node_content.stored_head(self, str(cid), len(seal.MAGIC))
+        # The user's own list of what is stored: whether a denied pin is sealed is no secret, and isn't worth a hash
+        head = node_content.stored_head(self, str(cid), len(seal.MAGIC), deny=False)
         return None if head is None else seal.is_sealed(head)
 
     def _pin_shape(self, cid: Cid) -> tuple[str | None, str | None]:

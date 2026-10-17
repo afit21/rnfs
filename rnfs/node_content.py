@@ -16,7 +16,7 @@ from typing import BinaryIO
 from rnfs.content import archive, builder, dag, seal, walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER
-from rnfs.errors import InvalidDag, NotFound
+from rnfs.errors import Denied, InvalidDag, NotFound
 
 
 def keep_added(node, cid: Cid, pin: bool):
@@ -171,16 +171,41 @@ def write_sealed(sealed: seal.SealedFile, output: str, blocks_dir: str | None = 
     return {"sealed": True, "name": name}
 
 
-def stored_head(node, target: str, length: int) -> bytes | None:
+def stored_head(node, target: str, length: int, deny: bool = True) -> bytes | None:
     """A file's first length bytes from stored blocks only (the gateway's sealed check and sniffing), or
-    None if one they need isn't stored (or the target is a directory or invalid). Never fetches."""
+    None if one they need isn't stored (or the target is a directory or invalid). Never fetches.
+
+    With deny, the deny list applies as to a read (a HEAD of a denied file answers 451, like GET): Denied for a
+    denied CID met, and while there are file hashes the file is checked first (node._check_file, bounded), which
+    takes it wholly stored (None otherwise: it can't be checked without fetching). `pin ls` passes deny=False.
+    """
     try:
         root, names = walker.parse_target(target)
         get = node.storage.getter()
+        if deny:
+            get = denying(node, get)
         expect = walker.resolve(root, names, get)
+        if deny and node.deny.hashes and walker.kind_of(expect, get(expect)) == "file":
+            if not expect.cid.is_raw and node.deny.known_hash(expect.cid) is None \
+                    and not node.storage.is_complete(expect.cid):
+                # leaf_bytes counts the chunks its file nodes list, so they must all be there to be counted
+                return None
+            node._check_file(expect, get)
         return b"".join(walker.read_range(expect, get, 0, length))
     except (ValueError, NotFound, InvalidDag):
         return None
+
+
+def denying(node, get: walker.Get) -> walker.Get:
+    """get, raising Denied for a CID on the node's deny list instead of reading it (as a fetch does)."""
+
+    def checked(expect: walker.Expect) -> bytes:
+        """The block for expect, unless its CID is denied."""
+        if node.deny.denies(expect.cid):
+            raise Denied(f"{expect.cid} is on this node's deny list")
+        return get(expect)
+
+    return checked
 
 
 def block(node, cid: str, for_gateway: bool = False) -> bytes:
