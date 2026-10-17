@@ -1077,7 +1077,7 @@ Everything in the specification is implemented, with these simplifications and a
   (64) per `DAG_GRANULE` (4 KiB, `SmallLeaves`' threshold) of the declared size + `DAG_SLACK` (1 KiB), plus
   what the counted directory and index nodes bring (`node_credit`): a directory node its own bytes and
   `DAG_ENTRY_OVERHEAD` (16) per entry, an index node its own bytes and 16 per child less `INDEX_NODE_COST`
-  (64), never below 0; and `max_dag_bytes` (a remote pin's or auto-fetch's quota) if lower. Over it is
+  (64), never below 0; and `max_dag_bytes` (a remote pin's, auto-fetch's or follow's quota) if lower. Over it is
   `TooLarge`, not `InvalidDag`. Every caller gets it, since it lives in `fetch_dag`: `get`, `pin_add`,
   `dir_set`/`dir_rm`, `export`, `export_stream`, follow, remote pins and LXMF auto-fetches. A target whose DAG
   is stored complete already isn't walked: it is checked whole against the deny list and, with
@@ -1273,7 +1273,9 @@ Everything in the specification is implemented, with these simplifications and a
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
-  (no path request).
+  (no path request). The fetch checks the resolved target's size against `follow_quota` and sets it as
+  `max_dag_bytes` (as remote pins do with their quota, but per name rather than per source: the old target's
+  pin isn't counted, so a swap peaks at twice the quota); 0 refuses before opening the fetch.
 - **Contacts.** Every `<name>` argument (`name resolve|keep|unkeep|follow|unfollow`) takes a name contact's
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.

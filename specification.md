@@ -986,7 +986,11 @@ resolves after its owner's announce has expired from the network.
 source `follow:<name>`. When the name moves, the new target is fetched completely in the background and
 pinned, and only then is the previous target's follow pin released, so a complete copy is always held. The
 fetch has the usual limits: `max_download_size`, the DAG byte bound of its new target's size (section 7) and
-the disk reserve (section 8). A
+the disk reserve (section 8). It also has `follow_quota` (section 12), since a pinned fetch never stops at
+`max_storage`: a new target whose verified size, or whose DAG's distinct blocks (stored or downloaded), would
+exceed it is refused (a failed fetch, so the old target stays pinned), and `follow_quota` = 0 fetches nothing.
+While one target replaces another both are held, so a followed name can use up to 2 × `follow_quota` for a
+time. A target pinned before the quota was lowered stays pinned. A
 followed name is checked when a newer record is heard and every `announce_interval`.
 - The periodic check uses the record held, unless nothing was heard for the name for
   2 × `announce_interval`; only then does it resolve through the network (a path request, then keepers).
@@ -1430,6 +1434,7 @@ setting.
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
 | `keep_max_names` | 100 | Names kept (keep and follow) for others; this node's own names don't count. A whole number |
 | `keeper_query` | `fallback` | `fallback`: ask keepers when a path request heard nothing; `always`: on every network resolve (about 10× the airtime) |
+| `follow_quota` | 1 GiB per followed name | Bytes a followed name's new target may hold, its size and its DAG's blocks; 0: followed names aren't fetched. A swap holds the old and new targets, so up to twice this (section 9) |
 | `max_jobs` | 2; 1 on slow nodes | Jobs running at once (a whole number ≥ 1). Foreground `get`, `pin add` and `export` run as jobs too, so they queue beyond this |
 | `max_finished_jobs` | 100 | Finished jobs kept (a whole number ≥ 1); each is kept at least 60 s regardless (section 11) |
 | `lxmf_enabled` | on if the LXMF package is installed | A boolean. `false` turns LXMF off; `true` without the package logs a warning and stays off |

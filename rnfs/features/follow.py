@@ -12,7 +12,11 @@
   held, without a path request.
 - One background thread does every check and fetch, one at a time, so following many names never runs more
   than one transfer. Fetches obey the usual limits (max_download_size, the DAG byte bound of the new
-  target's declared size, disk reserve); a followed target is a pin, so it is provided.
+  target's declared size, disk reserve) and follow_quota: a new target whose size, or the bytes of its DAG's
+  blocks, would exceed it is refused (TooLarge, shown as the check's state; the old target stays pinned), and 0
+  fetches nothing. A pinned fetch never stops at max_storage, so the quota is what keeps a name's owner from
+  filling the disk; while a target replaces another both are held, so up to twice the quota per name. A target
+  pinned before the quota was lowered stays. A followed target is a pin, so it is provided.
 - Followed names count against keep_max_names. State: the follow table of the state database (rnfs.statedb),
   each change committed durably as it is made (the rows of the names it changes), and a meta value saying it
   was saved whole ("clean"), which the reconcile at start needs.
@@ -24,7 +28,7 @@ import time
 
 from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
-from rnfs.errors import NotFound, RnfsError
+from rnfs.errors import NotFound, RnfsError, TooLarge
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, RETRY_INTERVAL, retry_delay
 from rnfs.features.keepers import FOLLOW, name_subcommands, parse_name_arg
@@ -296,9 +300,25 @@ class FollowFeature(Feature):
             return True
         self._set_state(name, f"fetching {target}")
         source = follow_source(name)
+        quota = self.node.config.follow_quota
         try:
+            if quota == 0:
+                raise TooLarge("follow fetches are off (follow_quota is 0)")
             with self.node.fetcher.open(target, pinned=True) as fetch:
-                fetch.fetch_dag(fetch.resolve())
+                # A pinned fetch never stops at max_storage, so without this the name's owner could fill the disk
+                expect = fetch.resolve()
+                content = fetch.size_of(expect)
+                if content > quota:
+                    raise TooLarge(f"{content} bytes would exceed follow_quota ({quota})")
+                # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks too
+                # (fetch_dag also bounds them by what the size can hold, whichever is lower)
+                fetch.max_dag_bytes = quota
+                try:
+                    fetch.fetch_dag(expect)
+                except TooLarge as e:
+                    if fetch.dag_bytes <= quota:
+                        raise  # the bound of its size, not the quota
+                    raise TooLarge(f"{e}, more than follow_quota") from e
                 with self._lock:
                     followed = name in self._pinned
                     if followed:
