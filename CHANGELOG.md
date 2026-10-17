@@ -187,6 +187,9 @@ Changed:
 - `rnfs jobs` (`--background`, `cancel`, `clear` and the progress line), `rnfs peers` and `rnfs stats` escape every
   field the daemon sends, as the other feature commands already did. Internally, features declare the features
   they use, and the node checks those and every feature's API routes and request paths when it loads them.
+- 16-byte IDs written as hex (node IDs, names, identity hashes, LXMF addresses) are parsed in one place with the
+  same rules everywhere; the only input refused that was accepted before is a `bootstrap_nodes` entry with
+  whitespace between its hex digits, now skipped with the warning other malformed entries get.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
