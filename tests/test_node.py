@@ -15,7 +15,9 @@ import RNS
 
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES, K
+from rnfs.content import dag, seal
 from rnfs.content.cid import RAW, Cid
+from rnfs.content.seal import SEGMENT_SIZE
 from rnfs.content.storage import remote_source
 from rnfs import fetcher
 from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
@@ -339,6 +341,97 @@ class NetworkFacadeTest(NodeTest):
         self.b.fetcher.mark_invalid(Cid.for_block(RAW, b"bad"))
         with self.assertRaises(InvalidDag):
             self.b.info(str(Cid.for_block(RAW, b"bad")))
+
+
+class SealedCheckTest(NodeTest):
+    """Whether a file is sealed is read from its first bytes once: plain files are remembered (_not_sealed), and
+    read_file passes what its info opened on to its read."""
+
+    def setUp(self):
+        """Node A, with an identity to seal for itself, counting seal.open_sealed's calls (each reads a file's
+        first bytes)."""
+        super().setUp()
+        self.a.identity = RNS.Identity()
+        opened = mock.patch.object(seal, "open_sealed", wraps=seal.open_sealed)
+        self.opened = opened.start()
+        self.addCleanup(opened.stop)
+
+    def test_plain_files_are_checked_once(self):
+        """A plain file's first bytes are read once, whatever reads it afterwards; each target separately."""
+        data = os.urandom(3 * CHUNK_SIZE)
+        cid = self.a.add_stream(io.BytesIO(data))["cid"]
+        self.assertEqual(b"".join(self.a.read(cid, CHUNK_SIZE, 10)), data[CHUNK_SIZE:CHUNK_SIZE + 10])
+        self.assertEqual(self.opened.call_count, 1)
+        info, chunks = self.a.read_file(cid, 5, 10)
+        self.assertEqual((info["size"], b"".join(chunks)), (len(data), data[5:15]))
+        self.assertNotIn("sealed", self.a.info(cid))
+        self.assertEqual(b"".join(self.a.read(cid)), data)
+        self.assertEqual(self.opened.call_count, 1)
+        # The same file under a directory is another target (its expectation differs): checked once too
+        root = self.a.add_stream(io.BytesIO(data), name="f.bin")["cid"]
+        for _ in range(2):
+            self.assertEqual(b"".join(self.a.read(f"{root}/f.bin", 0, 4)), data[:4])
+        self.assertEqual(self.opened.call_count, 2)
+
+    def test_sealed_files_are_opened_each_time_once_per_read_file(self):
+        """A sealed file isn't remembered; read_file opens it once (for its info), not again for its bytes."""
+        data = os.urandom(SEGMENT_SIZE + 5)
+        cid = self.a.add_stream(io.BytesIO(data), to_self=True)["cid"]
+        for _ in range(2):
+            self.assertEqual(b"".join(self.a.read(cid, 3, 4)), data[3:7])
+        self.assertEqual(self.opened.call_count, 2)
+        self.assertEqual(len(self.a._not_sealed), 0)
+        for count in (3, 4):
+            info, chunks = self.a.read_file(cid, SEGMENT_SIZE - 1, 3)
+            self.assertEqual((info["sealed"], info["recipient"], info["size"]), (True, True, len(data)))
+            self.assertEqual(b"".join(chunks), data[SEGMENT_SIZE - 1:SEGMENT_SIZE + 2])
+            self.assertEqual(self.opened.call_count, count)
+
+    def test_read_file_of_a_file_sealed_for_others(self):
+        """What info opened isn't unlocked for a non-recipient: the read raises NotRecipient, and for a denied
+        file Denied first, as when the read opened it itself."""
+        other = RNS.Identity()
+        data = b"for someone else" * 10
+        cid = self.a.add_stream(io.BytesIO(data), to=[other.get_public_key().hex()])["cid"]
+        info, chunks = self.a.read_file(cid)
+        self.assertEqual((info["sealed"], info["recipient"]), (True, False))
+        with self.assertRaises(seal.NotRecipient):
+            next(chunks)
+        self.a.identity = None
+        info, chunks = self.a.read_file(cid)
+        with self.assertRaisesRegex(seal.NotRecipient, "no identity"):
+            next(chunks)
+        stored = b"".join(self.a.read(cid, raw=True))
+        self.a.deny.add(["sha256:" + hashlib.sha256(stored).hexdigest()])
+        info, chunks = self.a.read_file(cid)
+        with self.assertRaises(Denied):
+            next(chunks)
+
+    def test_the_memo_is_bounded(self):
+        """At most NOT_SEALED_MEMO targets are remembered, the least recently used forgotten first."""
+        cids = [self.a.add_stream(io.BytesIO(b"file %d" % i))["cid"] for i in range(3)]
+        with mock.patch.object(node_module, "NOT_SEALED_MEMO", 2):
+            for cid in cids[:2]:
+                b"".join(self.a.read(cid))
+            b"".join(self.a.read(cids[0]))  # used again: now the most recent
+            b"".join(self.a.read(cids[2]))
+            self.assertEqual([str(expect.cid) for expect in self.a._not_sealed], [cids[0], cids[2]])
+            self.assertEqual(self.opened.call_count, 3)
+            b"".join(self.a.read(cids[1]))  # forgotten: read again
+            self.assertEqual(self.opened.call_count, 4)
+
+    def test_a_deny_list_change_empties_the_memo(self):
+        """Reading the first bytes checks the deny list: once their chunk is denied, a read of a remembered file
+        raises Denied as it did before the file was remembered, though the range read doesn't cover it."""
+        data = os.urandom(3 * CHUNK_SIZE)
+        cid = self.a.add_stream(io.BytesIO(data))["cid"]
+        self.assertEqual(b"".join(self.a.read(cid, 2 * CHUNK_SIZE, 4)), data[2 * CHUNK_SIZE:2 * CHUNK_SIZE + 4])
+        first = dag.decode(self.a.storage.get(Cid.parse(cid))).children[0].cid
+        self.a.deny.add([str(first)])
+        with self.assertRaises(Denied):
+            b"".join(self.a.read(cid, 2 * CHUNK_SIZE, 4))
+        self.assertEqual(self.opened.call_count, 2)
+        self.assertEqual(len(self.a._not_sealed), 0)
 
 
 class BackendTest(NodeTest):

@@ -30,6 +30,7 @@ import shutil
 import stat
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from functools import partial
 from typing import BinaryIO, Callable, Iterator, Protocol, TypeVar
@@ -73,6 +74,10 @@ MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 DENY_RETRY = 60.0  # seconds before maintenance applies a deny-list change again after applying it failed
 HASH_NOTICES = 1024  # files whose denied-hash NOTICE was logged, kept so it isn't repeated (then forgotten)
+# Resolved targets found not to be sealed files, so reading one again needn't read its first bytes to tell (a CID's
+# content never changes); least recently used forgotten first, about 2 MB when full
+NOT_SEALED_MEMO = 4096
+_UNOPENED = object()  # _read's opened when nothing has been opened yet
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
 
@@ -575,6 +580,11 @@ class RnfsNode:
         self.storage.deny = self.deny
         self.deny.reload(self._read_deny_list)
         self._hash_noticed: set[Cid] = set()  # files _check_file refused by hash and logged the NOTICE for
+        # _open_sealed's memo of targets that aren't sealed files (NOT_SEALED_MEMO), and the deny list's CIDs it
+        # was filled under: reading the first bytes also checks the deny list, so a change to it empties the memo
+        self._not_sealed: OrderedDict[walker.Expect, None] = OrderedDict()
+        self._not_sealed_deny: frozenset[bytes] | None = None
+        self._not_sealed_lock = threading.Lock()
         # The shared folder is written through: nothing to save. Its per-file cache (what the files inside its entries
         # were built as) is saved with the batched stores; the shared folder's close releases it too
         self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
@@ -1330,14 +1340,40 @@ class RnfsNode:
         """
         root, names = self._parse_target(target, for_gateway)
         with self._fetching(root, names, from_node, for_gateway) as fetch:
-            return self._info(fetch, fetch.resolve(), for_gateway or raw)
+            return self._info(fetch, fetch.resolve(), for_gateway or raw)[0]
 
-    def _info(self, fetch: Fetch, expect: walker.Expect, stored: bool) -> dict:
-        """info() of a resolved target; with stored, a sealed file's as stored (its ciphertext size)."""
+    def _info(self, fetch: Fetch, expect: walker.Expect, stored: bool) -> tuple[dict, seal.SealedFile | None]:
+        """(info() of a resolved target, the sealed file it opened); with stored, a sealed file's info as stored
+        (its ciphertext size) and None. The sealed file is unlocked when this node is a recipient."""
         block = fetch.get(expect)
         info = {"cid": str(expect.cid), "type": walker.kind_of(expect, block),
                 "size": walker.size_of(expect, block), "executable": expect.kind == dag.KIND_EXECUTABLE}
-        return info if stored else node_content.sealed_info(self, fetch, expect, info)
+        if stored or info["type"] != walker.FILE_TYPE:
+            return info, None
+        sealed = self._open_sealed(fetch, expect, unlock=False)
+        return node_content.sealed_info(self, info, sealed), sealed
+
+    def _open_sealed(self, fetch: Fetch, expect: walker.Expect, unlock: bool = True) -> seal.SealedFile | None:
+        """node_content.open_sealed, without reading the first bytes again of a target already found not to be
+        sealed under the same deny list (_not_sealed)."""
+        denied = self.deny.cids  # swapped whole when the list changes
+        with self._not_sealed_lock:
+            if self._not_sealed_deny is not denied:
+                # Reading the first bytes meets the deny list (Denied for a denied first chunk), so what was
+                # found under another list is found again
+                self._not_sealed.clear()
+                self._not_sealed_deny = denied
+            elif expect in self._not_sealed:
+                self._not_sealed.move_to_end(expect)
+                return None
+        sealed = node_content.open_sealed(self, fetch, expect, unlock)
+        if sealed is None:
+            with self._not_sealed_lock:
+                if self._not_sealed_deny is denied:
+                    self._not_sealed[expect] = None
+                    if len(self._not_sealed) > NOT_SEALED_MEMO:
+                        self._not_sealed.popitem(last=False)
+        return sealed
 
     def read(self, target: str, offset: int = 0, length: int | None = None, for_gateway: bool = False,
              from_node: bytes | None = None, raw: bool = False) -> Iterator[bytes]:
@@ -1370,7 +1406,7 @@ class RnfsNode:
             """The info, then the bytes; closed before reading them, the fetch ends as info()'s does."""
             with self._fetching(root, names, from_node) as fetch:
                 expect = fetch.resolve()
-                info = self._info(fetch, expect, raw)
+                info, sealed = self._info(fetch, expect, raw)
                 try:
                     yield info
                 except GeneratorExit:
@@ -1379,18 +1415,26 @@ class RnfsNode:
                     raise ValueError(f"{target} is a directory")
                 available = max(info["size"] - offset, 0)
                 yield from self._read(fetch, expect, offset, available if length is None else min(length, available),
-                                      False, raw)
+                                      False, raw, sealed)
 
         chunks = generate()
         return next(chunks), chunks
 
     def _read(self, fetch: Fetch, expect: walker.Expect, offset: int, length: int | None, for_gateway: bool,
-              raw: bool) -> Iterator[bytes]:
-        """read() of a resolved target, in fetch."""
+              raw: bool, opened: "seal.SealedFile | None | object" = _UNOPENED) -> Iterator[bytes]:
+        """read() of a resolved target, in fetch. opened: what _info opened in the same fetch (read_file), so the
+        file's first bytes aren't read again to tell whether it is sealed."""
         if self.deny.hashes and walker.kind_of(expect, fetch.get(expect)) == walker.FILE_TYPE:
             # The whole file is fetched and hashed (once: then remembered) before any of it is sent
             self._check_fetched(fetch, expect)
-        sealed = None if raw or for_gateway else node_content.open_sealed(self, fetch, expect)
+        if raw or for_gateway:
+            sealed = None
+        elif opened is _UNOPENED:
+            sealed = self._open_sealed(fetch, expect)
+        else:
+            sealed = opened
+            if sealed is not None and not node_content.is_recipient(self, sealed):
+                node_content.unlock_sealed(self, sealed)  # raises NotRecipient after the deny check, as opening did
         if sealed is not None:
             yield from sealed.read(offset, length)
             return

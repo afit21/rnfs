@@ -808,7 +808,11 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   creating the output, so nothing raised there leaves a file. `open_sealed` reports the stored (ciphertext)
   size as a job's total, which is what its done bytes count.
 - Cost: `get`, `cat` and `info` of a file read its first 12 bytes to detect sealing (`--raw` skips this), so
-  the first chunk is fetched first even for a `cat --offset` deep in a file. The gateway does so only for a
+  the first chunk is fetched first even for a `cat --offset` deep in a file. `info` and `read` (so `cat`) remember
+  the targets found not to be sealed (`RnfsNode._open_sealed`: by resolved expectation, `NOT_SEALED_MEMO` 4096,
+  least recently used forgotten first; emptied when the deny list's CIDs change, since that read meets them), so
+  reading one again doesn't read its first bytes; `read_file` (`GET /api/cat`) hands the `SealedFile` its info
+  opened to its read rather than opening it twice. The gateway does so only for a
   GET from byte 0 or a web page's request (`limited()`, so its type never depends on what is stored); the
   user's own HEAD, or range not at 0, uses the first bytes only if already stored (`stored_head`), else takes
   the Content-Type from the name, or `application/octet-stream`. `stored_head` applies the deny list as a read
