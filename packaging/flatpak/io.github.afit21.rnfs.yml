@@ -37,6 +37,8 @@ modules:
       - pip3 install --verbose --no-index --find-links="file://${PWD}" --prefix=${FLATPAK_DEST} --no-deps .
       - ${FLATPAK_DEST}/bin/rnfs --version
     sources:
+      # The checkout, without what isn't needed to build rnfs or is left by local builds, tests and lint (each
+      # .gitignore entry that isn't a pattern). Entries are paths from the top of the checkout, not patterns
       - type: dir
         path: ../..
         skip:
@@ -49,4 +51,11 @@ modules:
           - tests
           - packaging
           - __pycache__
+          - rnfs.egg-info
+          - .venv
+          - venv
+          - .ruff_cache
+          - .hypothesis
+          - .coverage
+          - htmlcov
       - build-sources.json

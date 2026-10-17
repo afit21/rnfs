@@ -10,7 +10,7 @@ Writes, next to this script:
 The requirements come from pyproject.toml (project.dependencies, plus the optional dependencies except
 development extras) at the exact versions in packaging/requirements.lock, and every wheel's sha256 must be
 one the lock lists, so the output only changes when the lock (or packaging/build-backend.lock, for
-build-sources.json) does. The release
+build-sources.json) does. The tests
 workflow re-runs this and fails if the result differs from what's committed. Needs pip >= 23 (for
 `--dry-run --report`) and network access.
 """

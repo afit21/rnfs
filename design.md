@@ -1417,7 +1417,8 @@ Everything in the specification is implemented, with these simplifications and a
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
   `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
   `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
-  a manual run only builds. The Windows exe isn't code-signed, and unpacks itself on each start.
+  a manual run only builds, as do the runs for a pull request touching `packaging/**`, `pyproject.toml` or
+  `.github/**` and the weekly scheduled run. The Windows exe isn't code-signed, and unpacks itself on each start.
   - `lxmf>=1.2.0,<1.3` is a regular dependency next to `rns>=1.5.6,<1.6` (`pyproject.toml`), so every
     install includes LXMF; the PyInstaller spec fails the build without it. The upper bounds keep unpinned
     installs off RNS and LXMF releases rnfs hasn't been tested with, since it relies on some of their internals.
@@ -1426,8 +1427,8 @@ Everything in the specification is implemented, with these simplifications and a
     `python3 -I packaging/update-lock.py [pkg==ver …]` regenerates it (no arguments: the newest versions
     `pyproject.toml` allows), then `packaging/flatpak/generate-sources.py` regenerates the Flatpak's
     `python3-deps.json` from it; both are committed. `install.sh`, `build-deb.sh`, the tests and the release's
-    Windows exe install from it with `pip --require-hashes --only-binary=:all:` (then `pip check`), and the
-    release's flatpak-sources step fails if regenerating changes the committed files. The sdist includes the
+    Windows exe install from it with `pip --require-hashes --only-binary=:all:` (then `pip check`), and
+    `tests.yml`'s flatpak-sources job fails if regenerating changes the committed files. The sdist includes the
     lock.
   - `update-lock.py --build pyinstaller==<ver>` writes `build-backend.lock` (setuptools, within
     `pyproject.toml`'s `<85` bound) and `build-tools.lock` (build, twine, PyInstaller, setuptools, ruff and
