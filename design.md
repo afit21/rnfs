@@ -325,8 +325,13 @@ every request needing the token first proves the daemon on its own connection (`
 which the daemon keeps open for that request only, so a client used for a long time sends nothing to a program
 that took the port after the daemon stopped; the token is read again when a proof with it fails (a restarted
 daemon's). The proof also reads the daemon's version for `check_daemon`, the one place a version
-check goes. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed`, `AuthFailed` (a failed proof,
-or 403) and the API's statuses (`STATUS_ERRORS`, `error_for`); `Stream` reads a body, raising
+check goes. `verify_daemon` checks `X-Rnfs-Proof` before anything else of the answer: without a valid proof a
+`503` is `Busy` and every other status `AuthFailed`, both in the client's own words, so a program on the port
+chooses neither the error nor its text; it reads at most `PROOF_READ_LIMIT` (64 KiB), and connecting and proving
+take at most `PROOF_TIMEOUT` (15 s, or the client's timeout if shorter), after which the request gets the client's
+own timeout. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
+failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
+`Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
 `ls`, `stat`, `pin_*`, `name_*` (with `name_watch`), `submit_job`, `job`, `jobs`, `cancel_job`, `clear_jobs`,
 `deny*`) send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
