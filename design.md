@@ -261,7 +261,9 @@ non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `provid
 that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
 swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
 from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
-one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool evicting by fair share: each
+one, never one of the `K/2` oldest records. The node's own record (`own_id`) isn't counted toward the 1000 and is
+never a victim, here or in the pool (`_most_pooled_by_others` steps past it when it alone holds the most), so
+Sybil stores can't push it out of its own store; its records may exceed the pool rather than evict each other. A tenth of the store is a newcomer pool evicting by fair share: each
 publisher's pooled keys sit in an ordered dict (oldest pooled first), and publishers in lists by how many they
 hold (`_holders`, with each one's index, and `_most_pooled`), so a full pool picks one of the biggest holders at
 random in O(1); one already holding the most is refused. The newest publisher with records outside the pool comes
@@ -368,7 +370,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name"}` |
 | `name_rm(alias)`, `name_export(alias)` | `None`, key bytes |
 | `name_list()` | `[{"alias", "name", "cid" or None, "sequence"}]` |
-| `name_publish(alias, target)` | `{"name", "cid", "sequence"}` |
+| `name_publish(alias, target)` | `{"name", "cid", "sequence"}`, plus `"warning"` in private mode (the name's announce reaches outsiders: `names.PRIVATE_NAME_WARNING`) |
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}` |
 | `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
@@ -1089,7 +1091,7 @@ Everything in the specification is implemented, with these simplifications and a
   (64) per `DAG_GRANULE` (4 KiB, `SmallLeaves`' threshold) of the declared size + `DAG_SLACK` (1 KiB), plus
   what the counted directory and index nodes bring (`node_credit`): a directory node its own bytes and
   `DAG_ENTRY_OVERHEAD` (16) per entry, an index node its own bytes and 16 per child less `INDEX_NODE_COST`
-  (64), never below 0; and `max_dag_bytes` (a remote pin's or auto-fetch's quota) if lower. Over it is
+  (64), never below 0; and `max_dag_bytes` (a remote pin's, auto-fetch's or follow's quota) if lower. Over it is
   `TooLarge`, not `InvalidDag`. Every caller gets it, since it lives in `fetch_dag`: `get`, `pin_add`,
   `dir_set`/`dir_rm`, `export`, `export_stream`, follow, remote pins and LXMF auto-fetches. A target whose DAG
   is stored complete already isn't walked: it is checked whole against the deny list and, with
@@ -1296,7 +1298,9 @@ Everything in the specification is implemented, with these simplifications and a
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
-  (no path request).
+  (no path request). The fetch checks the resolved target's size against `follow_quota` and sets it as
+  `max_dag_bytes` (as remote pins do with their quota, but per name rather than per source: the old target's
+  pin isn't counted, so a swap peaks at twice the quota); 0 refuses before opening the fetch.
 - **Contacts.** Every `<name>` argument (`name resolve|keep|unkeep|follow|unfollow`) takes a name contact's
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.

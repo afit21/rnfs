@@ -313,6 +313,11 @@ across shared interfaces and transport nodes, a node MAY run in private mode:
 - outgoing links go only to nodes whose identity is a member, so the node never identifies itself to an
   outsider (one listed as a provider anywhere, say).
 
+Private mode restricts rnfs's links, not RNS announces. A member's names are announced as anywhere else (section
+9), and RNS carries those announces to every node that hears them, so outsiders learn each name's
+`[sequence, CID]` record and can follow its changes; only the content stays member-only. `name publish` in
+private mode warns of this (rnfs: the result carries a `warning`, section 9).
+
 ## 4. Content identifiers
 
 A CID is 36 (raw) or 39 (rnfs-dag) bytes, written as `b` + lowercase unpadded base32 for people (CLI, API,
@@ -615,7 +620,10 @@ and repeat.
   as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
   always store something, a flood churns only the pool, and the pool is shared out evenly between
   publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
-  republished while the rest has room. The node's own records are always accepted.
+  republished while the rest has room. The node's own records are always accepted and never evicted to make
+  room for others' (rnfs: nor counted toward its local limit of 1000 publishers per key, a newcomer to a full
+  key evicting a random one of the others but the `K/2` oldest), so Sybil stores can't push a node's own record
+  out of its own store.
 - First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
   (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
   oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer
@@ -889,7 +897,9 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
    resolve, and persist it. If that fails, the publish fails and a pin step 2 added is released.
 4. Release that source from the previous target (only now, so a crash leaves the target the persisted record
    names pinned; any other pin of the source is released at the next start, section 8).
-5. Announce, and re-announce every `announce_interval`.
+5. Announce, and re-announce every `announce_interval`. In private mode the announce reaches outsiders all the
+   same (section 3), and the publish warns of it: rnfs adds a `warning` to the result (`POST /api/name/publish`
+   and `rnfs name publish`, which prints it to stderr).
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
@@ -997,7 +1007,11 @@ resolves after its owner's announce has expired from the network.
 source `follow:<name>`. When the name moves, the new target is fetched completely in the background and
 pinned, and only then is the previous target's follow pin released, so a complete copy is always held. The
 fetch has the usual limits: `max_download_size`, the DAG byte bound of its new target's size (section 7) and
-the disk reserve (section 8). A
+the disk reserve (section 8). It also has `follow_quota` (section 12), since a pinned fetch never stops at
+`max_storage`: a new target whose verified size, or whose DAG's distinct blocks (stored or downloaded), would
+exceed it is refused (a failed fetch, so the old target stays pinned), and `follow_quota` = 0 fetches nothing.
+While one target replaces another both are held, so a followed name can use up to 2 × `follow_quota` for a
+time. A target pinned before the quota was lowered stays pinned. A
 followed name is checked when a newer record is heard and every `announce_interval`.
 - The periodic check uses the record held, unless nothing was heard for the name for
   2 × `announce_interval`; only then does it resolve through the network (a path request, then keepers).
@@ -1083,7 +1097,11 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 **Limits.**
 - RNS identities are free to create. A determined attacker can surround one key with responsive nodes and
   make that key hard to find (a Sybil attack); it can't forge data. `get <cid> --from <node ID>` bypasses
-  the DHT when a provider is known.
+  the DHT when a provider is known. Grinding IDs near a key is cheap: one CPU core makes about 20,000-30,000
+  identities a second, each with its node ID (measured for rnfs 0.1.6), and getting `K` of them closer to a
+  key than the `K` closest of n honest nodes takes about n tries, so a fraction of a second against 10,000
+  nodes and under a minute against a million. Raising this cost means changing how node IDs are derived, a
+  protocol change left for a later version.
 - Patient attackers that keep identities alive for days defeat the preference for old records and long-known
   providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
   answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
@@ -1091,6 +1109,9 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
   newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
   while fewer than the bounded number of newcomers first seen before it were evicted too.
+- Private mode doesn't hide names: a member's names are announced over RNS like any other, so outsiders who
+  hear them learn each `[sequence, CID]` record and when it changes, though members won't serve them the content
+  (section 3). `name publish` in private mode warns of this.
 - Bans are evaded by switching identity; they only make an attacker pay for a new one.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
@@ -1451,6 +1472,7 @@ setting.
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
 | `keep_max_names` | 100 | Names kept (keep and follow) for others; this node's own names don't count. A whole number |
 | `keeper_query` | `fallback` | `fallback`: ask keepers when a path request heard nothing; `always`: on every network resolve (about 10× the airtime) |
+| `follow_quota` | 1 GiB per followed name | Bytes a followed name's new target may hold, its size and its DAG's blocks; 0: followed names aren't fetched. A swap holds the old and new targets, so up to twice this (section 9) |
 | `max_jobs` | 2; 1 on slow nodes | Jobs running at once (a whole number ≥ 1). Foreground `get`, `pin add` and `export` run as jobs too, so they queue beyond this |
 | `max_finished_jobs` | 100 | Finished jobs kept (a whole number ≥ 1); each is kept at least 60 s regardless (section 11) |
 | `lxmf_enabled` | on if the LXMF package is installed | A boolean. `false` turns LXMF off; `true` without the package logs a warning and stays off |

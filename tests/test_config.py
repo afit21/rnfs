@@ -34,6 +34,12 @@ class ValidateTest(unittest.TestCase):
             self.assert_invalid(**{name: value})
         Config(gateway_fetches=0, max_output_entries=0, max_storage=0, max_blocks_responses=2).validate()
 
+    def test_follow_quota(self):
+        """A whole number of bytes; 0 turns follow fetches off."""
+        for value in (-1, "1", 1.5, True, None):
+            self.assert_invalid(follow_quota=value)
+        Config(follow_quota=0).validate()
+
     def test_optional_whole_numbers(self):
         for name in ("alpha", "max_parallel_providers"):
             for value in (0, "3", True, 1.5):

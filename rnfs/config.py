@@ -127,6 +127,9 @@ class Config:
     # (at least every 3 days) and, if followed, a pin: 100 keeps a slow channel's republish airtime small
     keep_max_names: int = 100
     keeper_query: str = "fallback"  # "fallback": ask keepers when a path request heard nothing; "always"
+    # Bytes a followed name's new target may hold (its size and its DAG's blocks); 0: no follow fetches. A swap
+    # briefly holds the old target and the new one, so up to twice this per followed name
+    follow_quota: int = 1 * GIB
     # --- content (pin=false, sealing, chunker, gateway formats) ---
     # --- lxmf (rnfs/features/lxmf.py) ---
     lxmf_enabled: bool | None = None  # None: on if the LXMF package is installed
@@ -224,6 +227,8 @@ class Config:
             raise ValueError("keep_max_names must be a whole number, not negative")
         if self.keeper_query not in ("fallback", "always"):
             raise ValueError("keeper_query must be fallback or always")
+        if type(self.follow_quota) is not int or self.follow_quota < 0:
+            raise ValueError("follow_quota must be a whole number of bytes, not negative")
         # lxmf
         from rnfs.features import lxmf  # here, like mesh: only needed once settings are checked
         lxmf.validate_settings(self)

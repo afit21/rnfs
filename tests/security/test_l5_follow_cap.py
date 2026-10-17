@@ -4,8 +4,9 @@ name owner could point it at a DAG of any size.
 B follows A's name. A first publishes an honest file, then points the name at a root that declares 1 byte but holds
 about 2 MB of empty file nodes (the L3 bomb). The follow fetch now runs under the same DAG byte bound as every
 fetch_dag (rnfs.fetcher.dag_bound of the new target's declared size), so the check fails with "refusing it" after
-the root, the old target stays pinned and the bomb is not. Content size itself stays bounded by max_download_size
-(no default) and the disk reserve, as before: a per-follow size limit was not added.
+the root, the old target stays pinned and the bomb is not. Content size itself is bounded by follow_quota (1 GiB by
+default; added in 0.1.6 for DHT-3, tested in test_dht3_follow_quota.py) as well as max_download_size and the disk
+reserve; the bomb's size is far below the quota, so the DAG byte bound is what refuses it here.
 """
 import io
 import os

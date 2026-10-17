@@ -664,6 +664,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `name_table_size` | `10000` | Records remembered for names you haven't resolved yourself |
 | `keep_max_names` | `100` | Names kept or followed for others (your own don't count). Each is a DHT key your node republishes (every 3 days or more) and, if followed, a pin |
 | `keeper_query` | `"fallback"` | Ask keepers only when the network had no answer (`"fallback"`), or on every resolve (`"always"`). `always` costs about 10 times the airtime per resolve: keep `fallback` on slow links |
+| `follow_quota` | `1073741824` (1 GiB) | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned. While the target changes both are held, so up to twice this. `0` stops fetching followed names |
 
 **Content.** No settings: chunking, sealing and `--no-pin` are chosen per `rnfs add`.
 
@@ -823,7 +824,7 @@ $ rnfs jobs wait 3fa2b1c9
 
 A `NAME` is 32 hex characters or a name contact's nick. A followed name is checked every
 `announce_interval`; a failed check is retried after 5 minutes, then 10, 20 and so on up to
-`announce_interval`.
+`announce_interval`. A target larger than `follow_quota` (1 GiB) isn't fetched.
 
 **Contacts**
 
@@ -990,7 +991,9 @@ rnfs get <cid>              # recipients get the decrypted file under its origin
 ```
 
 For a fully closed group, run every node with `private = true` and the same `members` list (their identity
-hashes). Members then answer, store records for and serve only each other.
+hashes). Members then answer, store records for and serve only each other. Names are the exception: a name's
+announce still reaches everyone, so outsiders can see which CID it points at and when it changes (though not
+fetch it), and `rnfs name publish` warns of this in private mode.
 
 **Offline sneakernet.** Carry content where there's no link at all:
 
