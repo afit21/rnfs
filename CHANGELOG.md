@@ -48,6 +48,67 @@ Security:
   symlink, a non-directory or one another user owns stops the start before Reticulum starts; a loose one is made
   0700, with a notice; and if others could write to it, entries another user owns are reported. Before, a user
   who could once write in a loose rnfs dir kept their access to `blocks/` and `names/` after it was tightened.
+- The shared folder is no longer scanned when `files/` leads into the rnfs dir. Before, a symlinked `files/` that
+  led to `storage/` or `names/` (or that someone who could write to a directory above it retargeted there)
+  imported, pinned and provided the node's identity or the name keys, and one that led to the rnfs dir or a
+  directory above it shared everything in it. A folder that resolves, as opened, to the rnfs dir, a directory
+  holding it, or anything inside `storage/`, `names/`, `state/`, `blocks/` or `lxmf/` is now refused with a
+  warning and scanned as empty: nothing is imported, and every pin with source `folder` is released, so keys a
+  0.1.5 node already shared that way stop being provided at the first scan after the upgrade. On Linux and macOS,
+  a directory above the folder that other users can change gets a warning, once.
+- A node no longer reads request packets sent to it on `rnfs.dht` links it opened. That end of a link has no
+  request handlers, yet RNS decoded each request (up to the link's packet size) and started a thread for it
+  before finding nothing to run, for any node rnfs linked to. LXMF and host-program links are unchanged.
+- An explicit `max_upload_rate` now applies to every `/blocks` response, including one that fits in one packet.
+  Such responses never give the link a rate estimate, and the cap applied only once there was one, so on a
+  large-MTU path (RNS's TCP interfaces) a requester asking only for single-packet answers was never paced. Waits
+  of up to 5.6 s are held and longer ones refused as busy, as for larger responses. The default cap (half the
+  rate estimate, on slow links) is unchanged.
+- The wait for a previous `/blocks` response's proof uses the round-trip time the requester claims only if it is
+  a finite, non-negative number, and still at most 5 s. Before, a negative claim gave an honest proof no grace,
+  and a value that wasn't a number made the request handler fail.
+- `install.sh` ties a release install to the tag it asked for: where `gh` supports them, the provenance check
+  passes `--source-ref=refs/tags/<tag>` and `--deny-self-hosted-runners`, and only an `rnfs-<version>-*.whl` of
+  that tag's version is installed. Before, an older release's genuinely attested sdist, renamed to the new
+  release's file name, passed both checks.
+- `install.sh` stops when the GitHub CLI has `gh attestation` but isn't logged in (root installs usually hit
+  this), instead of quietly checking `SHA256SUMS` only. Log in with `gh auth login`, or set
+  `RNFS_REQUIRE_ATTESTATION=0` to install with the checksum only. Without `gh` it still warns, and the README now
+  says that `curl | sh` without `gh` trusts whoever can write the release's files.
+- The Flatpak's sandbox is narrowed to `~/.rnfs`, `~/.reticulum` and the Downloads folder, with no devices
+  (before: your whole home folder and every device, so a compromised daemon could write `~/.bashrc`). See the
+  upgrade note below.
+- `install.sh` warns when `RNFS_SOURCE` is, or names, a plain `http://` URL, and the `.deb`'s postinst
+  byte-compiles with `python3 -I`.
+- The file-index-node NomadNet page renders at most once a minute, one visit at a time, and serves its cached
+  page meanwhile (before, every visit ran `rnfs pin ls`).
+- `examples/rnfs_share.py` and `rnfs.Client`'s log escape names and daemon messages, so a name can't drive the
+  terminal.
+- `rnfs.Client` and the CLI check the daemon's proof before believing anything else the API port answers: while
+  the daemon is down, a program listening on its port can no longer make the client raise `Denied`, `NotFound`
+  or `StorageFull` with its own text. Without a valid proof a 503 is `Busy` and anything else `AuthFailed`, both
+  in the client's own words. Connecting and proving time out after 15 s (or the client's timeout, if shorter),
+  and at most 64 KiB of the proof response is read.
+- After the proof, the client sends the request on a new connection only to a daemon that proved a version below
+  0.1.5 (those close every connection); a newer daemon that closes the proved connection gets
+  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.1.7.
+- A followed name can no longer fill the follower's disk: its new target is fetched only if its size, and the
+  bytes of its DAG's blocks, fit in `follow_quota` (default 1 GiB); otherwise the check fails, the follow's state
+  says why, and the previous target stays pinned. While one target replaces another both are held, so a followed
+  name can use up to twice the quota for a time. Targets already pinned over the quota stay.
+- An auto-fetch sender can no longer push another auto-fetch sender's pinned messages out of the inbox.
+  Re-linking a CID it already pins costs no quota, so about 500 such messages filled the inbox with protected
+  records, and each further message dropped the oldest record of anyone, releasing its pin. Each of the n senders
+  in `lxmf_auto_fetch_from` now keeps at most 1/n of the inbox's messages and bytes, messages holding pins
+  included, and when every other message holds pins, a new one may push out only its own sender's.
+- Auto-fetches still queued for a sender removed from `lxmf_auto_fetch_from` are refused at the next start (with
+  LXMF off too) and when their turn comes. Before, up to 64 of them were fetched and pinned after a restart.
+- `rnfs inbox` shows each sender's address before its display name, marked `untrusted`, `trusted` or
+  `contact <nick>`; the display name, which the sender chooses, comes last, quoted and escaped. Before, a display
+  name like `alice <trusted address>` came first and pushed the real address off to the right.
+- A node's own provider records can no longer be evicted from its own store: about 1000 Sybil stores to a key it
+  provides pushed its record out, and a full newcomer pool could take it too. Its own records don't count toward
+  the publishers a key keeps and are never chosen for eviction.
 
 Changed:
 - `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
@@ -63,6 +124,33 @@ Changed:
 - The daemon and `rnfs.Node` check, in order, the rnfs dir, the settings, the subdirectories, then take the lock.
   The CLI prints settings warnings, and `rnfs.Client` raises them as `RuntimeWarning`. On Windows, a loose
   `rnfs.toml` no longer makes the CLI or `rnfs.Client` load RNS.
+- When a file is refused because its SHA-256 is on the deny list, the log suggests `rnfs deny add <file cid>`
+  (once per file): a `sha256:` entry doesn't stop the file's blocks being served one by one, and denying its CID
+  does.
+- **Upgrade note (Flatpak):** after updating, the Flatpak no longer sees the rest of your home folder or any
+  device. Grant what you used again: `flatpak override --user --device=all io.github.afit21.rnfs` for an RNode or
+  other serial interface, and `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` for other
+  folders, `~/.config/reticulum` included if your Reticulum config is there.
+- The README says plainly that pipx and plain `pip install` resolve dependencies unpinned, not at the versions in
+  `packaging/requirements.lock`.
+- The gateway treats a request without `Sec-Fetch-Site` as the user's own only if its `User-Agent` doesn't start
+  with `Mozilla/`. Browsers without Fetch Metadata (Safari before 16.4, Firefox before 90) are now treated like a
+  web page on every request: `?format=` downloads get 409, and their network fetches count against
+  `gateway_fetches`. curl, scripts and other tools keep the user's own access, and so does a browser's own
+  navigation (`Sec-Fetch-Site: none`).
+- `rnfs name publish` in private mode warns that the name's announce (its sequence and target CID) is visible
+  outside the private network; only the content is served to members only. `POST /api/name/publish` then carries
+  the warning as an optional `warning` key, and `rnfs.Node`/`rnfs.Client` raise it as a `RuntimeWarning`; outside
+  private mode nothing changes.
+- The specification documents that the API's proof keep-open lets one connection hold an API slot about twice as
+  long as one request, and the measured cost of grinding node IDs near a key (raising it needs a change to how
+  node IDs are derived, so it is deferred).
+- `rnfs inbox` prints each message as number, time, address, trust, method, then the quoted display name (the
+  text format isn't a stable interface; scripts should use the API). Display names are also escaped for
+  backslashes, blank filler characters (U+115F, U+1160, U+3164, U+FFA0, U+2800), stacked or leading combining
+  marks, and names of only spaces.
+- The specification documents that many LXMF identities can keep the strangers' bucket empty; contacts and other
+  trusted senders are unaffected.
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
@@ -74,6 +162,12 @@ Changed:
 
 Added:
 - `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
+- `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
+  `status` (messages from untrusted senders dropped by the rate limits since the start).
+- The `follow_quota` setting: bytes a followed name's target may take (default 1 GiB; `0` stops fetching
+  followed names).
+- `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and
+  `PrivateTmp=yes`, for systems with unprivileged user namespaces. The default unit sets neither, nor `UMask`.
 
 ## 0.1.5
 

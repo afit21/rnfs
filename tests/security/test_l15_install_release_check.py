@@ -1,6 +1,7 @@
 """L15 (fix): install.sh installed GitHub's auto-generated archive of the release tag, which neither SHA256SUMS nor the
 signed provenance covers and which a moved tag changes. Now it installs the release's sdist, checked against the
 release's SHA256SUMS and, where the GitHub CLI can, its signed provenance (gh attestation verify), failing closed.
+SUP-2 ties that provenance to the release's tag; SUP-3 stops the install when gh could check it but isn't logged in.
 
 install.sh's download, verify_release and fetch_release functions are run with sh against a fake release (file://
 URLs) and a fake gh on a PATH holding only the tools they need, so the real network and any real gh are never
@@ -24,14 +25,15 @@ die() { printf 'rnfs installer: %s\n' "$*" >&2; exit 1; }
 REPO=afit21/rnfs
 """
 # A gh that logs its arguments and answers as FAKE_GH says: "old" (no attestation command), "logged-out", "fail"
-# (verification fails) or "ok"
+# (verification fails) or "ok". Its verify --help lists FAKE_GH_HELP's options (by default only --signer-workflow,
+# as in gh 2.49)
 FAKE_GH = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_GH_LOG"
 case "$1 $2" in
     "auth status") [ "$FAKE_GH" != logged-out ] ;;
     "attestation verify")
         [ "$FAKE_GH" != old ] || { echo 'unknown command "attestation" for "gh"' >&2; exit 1; }
-        case " $* " in *" --help "*) echo "  --signer-workflow string"; exit 0 ;; esac
+        case " $* " in *" --help "*) printf '%s\n' "${FAKE_GH_HELP:-  --signer-workflow string}"; exit 0 ;; esac
         [ "$FAKE_GH" = ok ] || { echo "Error: no attestations found" >&2; exit 1; } ;;
     *) exit 2 ;;
 esac
@@ -82,7 +84,7 @@ class ReleaseCheckTest(unittest.TestCase):
         """Run fetch_release for v9.9.9 as do_install would; prints the SOURCE it leaves."""
         repo_url = "file://" + os.path.join(self.tmp.name, "repo")
         script = "\n".join([PRELUDE, shell_function("download"), shell_function("verify_release"),
-                            shell_function("gh_can_verify"), shell_function("fetch_release"),
+                            shell_function("gh_has_attestation"), shell_function("fetch_release"),
                             'fetch_release "$1"', 'printf "SOURCE=%s\\n" "$SOURCE"'])
         environment = {"PATH": self.bin, "PYTHON": sys.executable, "REPO_URL": repo_url, "RELEASE_TAG": "v9.9.9",
                        "SOURCE": repo_url + "/releases/download/v9.9.9/rnfs-9.9.9.tar.gz",
@@ -142,20 +144,50 @@ class ReleaseCheckTest(unittest.TestCase):
         self.assertIn(f"attestation verify {local} --repo afit21/rnfs "
                       f"--signer-workflow=afit21/rnfs/.github/workflows/release.yml", self.gh_calls())
 
+    def test_attestation_names_the_tag(self):
+        """SUP-2: where gh has the options, the check asks for a build of this release's tag on a GitHub-hosted
+        runner, so an older release's attested sdist renamed to this one's file name is refused."""
+        self.install_gh("ok")
+        result = self.fetch(FAKE_GH_HELP="  --signer-workflow string\n  --source-ref string\n"
+                                         "  --deny-self-hosted-runners")
+        self.assert_installs_checked_file(result)
+        local = os.path.join(self.work, "release", "rnfs-9.9.9.tar.gz")
+        self.assertIn(f"attestation verify {local} --repo afit21/rnfs "
+                      f"--signer-workflow=afit21/rnfs/.github/workflows/release.yml --source-ref=refs/tags/v9.9.9 "
+                      f"--deny-self-hosted-runners", self.gh_calls())
+        # gh is asked for its options once
+        self.assertEqual(len([call for call in self.gh_calls() if "--help" in call]), 1)
+
     def test_failed_attestation_is_refused(self):
         self.install_gh("fail")
         result = self.fetch()
         self.assert_refused(result, "no valid signed provenance")
         self.assertIn("no attestations found", result.stderr)  # gh's own explanation is shown
 
-    def test_gh_that_cant_verify_counts_as_absent(self):
-        # Ubuntu 24.04's gh 2.45 has no attestation command; a gh not logged in can't query attestations
-        for behaviour in ("old", "logged-out"):
-            with self.subTest(behaviour):
-                self.install_gh(behaviour)
-                self.assert_installs_checked_file(self.fetch())
-                self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
-                self.assert_refused(self.fetch(RNFS_REQUIRE_ATTESTATION="1"), "RNFS_REQUIRE_ATTESTATION=1")
+    def test_gh_without_attestation_counts_as_absent(self):
+        # Ubuntu 24.04's gh 2.45 has no attestation command
+        self.install_gh("old")
+        result = self.fetch()
+        self.assert_installs_checked_file(result)
+        self.assertIn("against the release's SHA256SUMS only", result.stderr)
+        self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
+        self.assert_refused(self.fetch(RNFS_REQUIRE_ATTESTATION="1"), "RNFS_REQUIRE_ATTESTATION=1")
+
+    def test_logged_out_gh_stops_the_install(self):
+        """SUP-3: a gh that could check the provenance but isn't logged in (a root install's, usually) stops the
+        install, and the error names the opt-out, RNFS_REQUIRE_ATTESTATION=0. (Until 0.1.6 it counted as absent.)"""
+        self.install_gh("logged-out")
+        for env in ({}, {"RNFS_REQUIRE_ATTESTATION": "1"}):
+            with self.subTest(env):
+                result = self.fetch(**env)
+                self.assert_refused(result, "the GitHub CLI (gh) is installed but not logged in")
+                self.assertIn("RNFS_REQUIRE_ATTESTATION=0", result.stderr)
+        self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
+        result = self.fetch(RNFS_REQUIRE_ATTESTATION="0")
+        self.assert_installs_checked_file(result)
+        self.assertIn("RNFS_REQUIRE_ATTESTATION=0: checked rnfs-9.9.9.tar.gz against the release's SHA256SUMS only",
+                      result.stderr)
+        self.assertFalse([call for call in self.gh_calls() if " --repo " in call])
 
 
 class DefaultSourceTest(unittest.TestCase):

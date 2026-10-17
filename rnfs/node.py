@@ -70,6 +70,7 @@ BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many 
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 DENY_RETRY = 60.0  # seconds before maintenance applies a deny-list change again after applying it failed
+HASH_NOTICES = 1024  # files whose denied-hash NOTICE was logged, kept so it isn't repeated (then forgotten)
 KIND_NAMES = {dag.KIND_FILE: "file", dag.KIND_EXECUTABLE: "executable", dag.KIND_DIRECTORY: "directory"}
 
 
@@ -533,7 +534,8 @@ class RnfsNode:
         self.deny = denylist.DenyList(config.state_dir)
         self.storage.deny = self.deny
         self.deny.reload(self._read_deny_list)
-        self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir)
+        self._hash_noticed: set[Cid] = set()  # files _check_file refused by hash and logged the NOTICE for
+        self.shared_folder = SharedFolder(config.files_dir, self.storage, config.state_dir, rnfs_dir=config.root)
         self.pin_names = PinNames(config.state_dir)  # where pins came from, for pin ls (local only)
         self.fetcher = Fetcher(self.storage, client, config, node_id, self.routing, self._lookup, slow,
                                config.state_dir, after_store=self._enforce_storage, make_room=self._make_room)
@@ -913,6 +915,8 @@ class RnfsNode:
         """Raise Denied if file expect's content hashes to a deny-list entry, before any of it is written out or
         sent. get serves its whole DAG, stored and checked (fetch_dag's, or a complete root's); its bytes are read
         only if the hash isn't known yet (a one-block file's CID is it; others are remembered by the deny list).
+        A denied hash is logged once per file (a NOTICE suggesting `rnfs deny add <cid>`, which also stops its
+        blocks being served).
 
         A file declaring more than DENY_HASH_RATIO × the bytes of its distinct chunks + DENY_HASH_SLACK is refused
         unread: hashing reads every occurrence of repeated content, so six small blocks can declare 2^56 bytes.
@@ -934,6 +938,14 @@ class RnfsNode:
             digest = hasher.digest()
             self.deny.remember_hash(expect.cid, digest)
         if self.deny.denies_hash(digest):
+            # A hash entry stops the file being assembled, not its blocks being served one by one (spec section 8)
+            if expect.cid not in self._hash_noticed:
+                if len(self._hash_noticed) >= HASH_NOTICES:
+                    self._hash_noticed.clear()
+                self._hash_noticed.add(expect.cid)
+                log(f"{expect.cid} is a file whose SHA-256 is denied: it isn't read or sent whole, but its blocks can "
+                    f"still be fetched, stored and served one by one. To stop that too, deny its CID: "
+                    f"rnfs deny add {expect.cid}", LOG_NOTICE)
             raise Denied(f"{expect.cid} is a file whose SHA-256 ({digest.hex()}) is on this node's deny list")
 
     def _check_fetched(self, fetch: Fetch, expect: walker.Expect):

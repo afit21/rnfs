@@ -39,6 +39,10 @@ rnfs.dht links two more RNS methods are wrapped, to check the packed response's 
   link that negotiated a larger one, up to hundreds of KiB) is decrypted and checked first, so such a link
   decrypts an honest one twice. An rnfs.dht server sends no requests, so a response packet arriving on an
   incoming link is dropped unread: RNS would otherwise decode it before finding no request it answers.
+Link.receive likewise drops, unread, a request packet arriving on an rnfs.dht link this node opened: the remote
+destination of such a link has no request handlers and no max_request_size, so RNS would decode any request up
+to the link's MDU and start a thread for it before finding nothing to run it. The node's server takes requests
+on incoming links only.
 A refused response answers its request with None, which every rnfs.dht parser refuses as malformed, so the
 requester fails it at once, as it would a malformed response.
 
@@ -203,6 +207,7 @@ class _ThrottledLog:
 
 _log_refused_response = _ThrottledLog()
 _log_unexpected_response = _ThrottledLog()
+_log_unexpected_request = _ThrottledLog()
 
 
 def _answer_as_malformed(link, request_id, size: int):
@@ -243,7 +248,14 @@ def guarded_response_resource_concluded(link, resource):
 
 
 def guarded_receive(link, packet):
-    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it."""
+    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it, and dropping a
+    request packet on a link this node opened."""
+    if getattr(packet, "context", None) == RNS.Packet.REQUEST and getattr(link, "initiator", False) is True \
+            and getattr(packet, "packet_type", None) == RNS.Packet.DATA and is_dht_link(link):
+        # The remote destination of a link this node opened has no max_request_size and no handlers, so RNS
+        # would decode the request (up to the link's MDU) and start a thread for it before finding nothing to run
+        _log_unexpected_request("dropped a request arriving on an outgoing link, which serves none", LOG_VERBOSE)
+        return None
     if getattr(packet, "context", None) == RNS.Packet.RESPONSE and is_dht_link(link) \
             and getattr(packet, "packet_type", None) == RNS.Packet.DATA:
         if not getattr(link, "initiator", False):

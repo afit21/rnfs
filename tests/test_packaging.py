@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 
@@ -105,15 +106,79 @@ class InstallScriptTest(unittest.TestCase):
         write = shell_function("write_unit")
         self.assertIn('$UNIT_MARK', write)
 
+    @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
+    def test_release_wheel_is_of_the_tag(self):
+        """A release install takes only a wheel of the tag's version: an older release's sdist renamed to this
+        release's file name builds an older one (SUP-2). Without a release (RNFS_SOURCE, --main) any rnfs wheel."""
+        def find(directory, tag):
+            script = shell_function("find_wheel") + '\nfind_wheel "$1"'
+            return subprocess.run(["sh", "-c", script, "sh", directory], capture_output=True, text=True, check=True,
+                                  env={**os.environ, "RELEASE_TAG": tag}).stdout
+        with tempfile.TemporaryDirectory() as wheels:
+            older = os.path.join(wheels, "rnfs-0.1.4-py3-none-any.whl")
+            open(older, "w").close()
+            self.assertEqual(find(wheels, "v0.1.6"), "")
+            self.assertEqual(find(wheels, ""), older + "\n")
+            wheel = os.path.join(wheels, "rnfs-0.1.6-py3-none-any.whl")
+            open(wheel, "w").close()
+            self.assertEqual(find(wheels, "v0.1.6"), wheel + "\n")
+        install = shell_function("do_install")
+        self.assertIn('wheel=$(find_wheel "$wheels")', install)
+        self.assertLess(install.index('build_wheel "$wheels"'), install.index('wheel=$(find_wheel "$wheels")'))
+
+    def test_provenance_names_the_tag(self):
+        """The provenance check asks for this tag's build on a GitHub-hosted runner, where gh can (SUP-2; the
+        check itself is run in tests/security/test_l15_install_release_check.py)."""
+        verify = shell_function("verify_release")
+        self.assertIn('*--source-ref*) options="$options --source-ref=refs/tags/$RELEASE_TAG"', verify)
+        self.assertIn('*--deny-self-hosted-runners*) options="$options --deny-self-hosted-runners"', verify)
+
     def test_unit_matches_contrib(self):
-        """install.sh's unit has the same [Unit] limits and [Service] settings as contrib/rnfs.service."""
+        """install.sh's unit has every [Unit] and [Service] line of contrib/rnfs.service, in order, except
+        ExecStart (the launcher's path) and comments (SUP-6)."""
         def settings(text):
-            return [line for line in text.splitlines()
-                    if re.match(r"(StartLimit|Restart|NoNewPrivileges|Restrict|LockPersonality|KillSignal)", line)]
+            section, lines = None, []
+            for line in text.splitlines():
+                line = line.strip()
+                if re.fullmatch(r"\[\w+\]", line):
+                    section = line
+                elif section in ("[Unit]", "[Service]") and line and not line.startswith(("#", "ExecStart=")):
+                    lines.append((section, line))
+            return lines
         contrib = settings(read(UNIT))
-        self.assertIn("StartLimitBurst=5", contrib)
-        self.assertIn("NoNewPrivileges=yes", contrib)
+        for setting in ("StartLimitBurst=5", "NoNewPrivileges=yes", "After=rnsd.service", "TimeoutStopSec=30",
+                        "SystemCallFilter=@system-service"):
+            self.assertIn(setting, [line for _, line in contrib])
         self.assertEqual(settings(shell_function("write_unit")), contrib)
+
+    def test_unit_hardening_is_an_opt_in_drop_in(self):
+        """ProtectSystem and PrivateTmp, which need unprivileged user namespaces in a user unit, are in a documented
+        drop-in only; no unit sets UMask, since what `get` writes takes the user's umask (SUP-6, Q16)."""
+        drop_in = read(os.path.join(REPO, "contrib", "rnfs.service.d", "hardening.conf"))
+        self.assertIn("\n[Service]\n", drop_in)
+        self.assertRegex(drop_in, r"(?m)^ProtectSystem=full$")
+        self.assertRegex(drop_in, r"(?m)^PrivateTmp=yes$")
+        for unit in (read(UNIT), shell_function("write_unit")):
+            self.assertNotRegex(unit, r"(?m)^(ProtectSystem|PrivateTmp|UMask)=")
+            self.assertIn("contrib/rnfs.service.d/hardening.conf", unit)
+        self.assertNotRegex(drop_in, r"(?m)^UMask=")
+
+    @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
+    def test_plain_http_source_warns(self):
+        """An RNFS_SOURCE fetched over plain http:// (a URL, or a requirement naming one) gets a warning (SUP-6)."""
+        script = "\n".join([re.search(r"(?m)^warn\(\) \{.*\}$", read(INSTALL_SH)).group(0),
+                            shell_function("warn_plain_http"), 'SOURCE="$1"', "warn_plain_http"])
+
+        def warning(source):
+            return subprocess.run(["sh", "-c", script, "sh", source], capture_output=True, text=True,
+                                  check=True).stderr
+        for source in ("http://example.org/rnfs.zip", "HTTP://example.org/rnfs.zip",
+                       "rnfs @ http://example.org/rnfs-0.1.6-py3-none-any.whl"):
+            self.assertIn("plain http://", warning(source), source)
+        for source in ("https://example.org/rnfs.zip", "/home/a/rnfs", "", "rnfs==0.1.6"):
+            self.assertEqual(warning(source), "", source)
+        install = shell_function("do_install")
+        self.assertLess(install.index("    choose_source\n"), install.index("    warn_plain_http\n"))
 
 
 class BuildScriptsTest(unittest.TestCase):
@@ -127,6 +192,14 @@ class BuildScriptsTest(unittest.TestCase):
         self.assertIn('_cffi_backend.cpython-"$nodot"-*.so', text)
         self.assertIn("--no-build-isolation", text)
         self.assertIn('python3 (<< $PYTHON_BELOW)', text)
+
+    def test_deb_postinst_python_is_isolated(self):
+        """The .deb's postinst, run as root, byte-compiles with python3 -I (SUP-6)."""
+        postinst = re.search(r"(?ms)^cat > \"\$ROOT/DEBIAN/postinst\" <<'EOF'\n(.*?)^EOF$", read(BUILD_DEB))
+        self.assertTrue(postinst)
+        calls = re.findall(r"python3( -\S+)", postinst.group(1))
+        self.assertTrue(calls)
+        self.assertEqual(set(calls), {" -I"})
 
     def test_workflow_pip_installs_are_hashed(self):
         """Every pip install in the workflows uses a hash lock or --no-deps (with no build isolation)."""
@@ -173,6 +246,19 @@ class BuildScriptsTest(unittest.TestCase):
                 steps += 1
                 self.assertRegex(step.group(2), r"(?m)^ +cache: false$", f"{name}: {step.group(0)}")
         self.assertTrue(steps)
+
+    def test_flatpak_sandbox_is_narrow(self):
+        """The Flatpak reaches only rnfs's and Reticulum's directories and Downloads, and no device (SUP-5)."""
+        manifest = read(os.path.join(REPO, "packaging", "flatpak", "io.github.afit21.rnfs.yml"))
+        block = re.search(r"(?m)^finish-args:\n((?: +.*\n)+)", manifest)
+        self.assertTrue(block)
+        args = re.findall(r"(?m)^ +- (--\S+)$", block.group(1))
+        self.assertEqual(args, ["--share=network", "--filesystem=~/.rnfs:create", "--filesystem=~/.reticulum:create",
+                                "--filesystem=xdg-download"])
+        # The opt-ins are documented in the manifest and the README
+        for text in (block.group(1), read(os.path.join(REPO, "README.md"))):
+            for override in ("--device=all", "--filesystem="):
+                self.assertIn(f"flatpak override --user {override}", text)
 
     def test_release_waits_for_the_tests(self):
         """The release job needs the whole tests workflow, called from release.yml."""

@@ -261,7 +261,9 @@ non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `provid
 that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
 swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
 from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
-one, never one of the `K/2` oldest records. A tenth of the store is a newcomer pool evicting by fair share: each
+one, never one of the `K/2` oldest records. The node's own record (`own_id`) isn't counted toward the 1000 and is
+never a victim, here or in the pool (`_most_pooled_by_others` steps past it when it alone holds the most), so
+Sybil stores can't push it out of its own store; its records may exceed the pool rather than evict each other. A tenth of the store is a newcomer pool evicting by fair share: each
 publisher's pooled keys sit in an ordered dict (oldest pooled first), and publishers in lists by how many they
 hold (`_holders`, with each one's index, and `_most_pooled`), so a full pool picks one of the biggest holders at
 random in O(1); one already holding the most is refused. The newest publisher with records outside the pool comes
@@ -325,8 +327,15 @@ every request needing the token first proves the daemon on its own connection (`
 which the daemon keeps open for that request only, so a client used for a long time sends nothing to a program
 that took the port after the daemon stopped; the token is read again when a proof with it fails (a restarted
 daemon's). The proof also reads the daemon's version for `check_daemon`, the one place a version
-check goes. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed`, `AuthFailed` (a failed proof,
-or 403) and the API's statuses (`STATUS_ERRORS`, `error_for`); `Stream` reads a body, raising
+check goes. `verify_daemon` checks `X-Rnfs-Proof` before anything else of the answer: without a valid proof a
+`503` is `Busy` and every other status `AuthFailed`, both in the client's own words, so a program on the port
+chooses neither the error nor its text; it reads at most `PROOF_READ_LIMIT` (64 KiB), and connecting and proving
+take at most `PROOF_TIMEOUT` (15 s, or the client's timeout if shorter), after which the request gets the client's
+own timeout. A daemon that closes the proved connection gets the request on a new one only if the version it proved
+is below 0.1.5 (`KEEPS_PROOF_OPEN_SINCE`; such daemons close every connection), else `ConnectionFailed`: a new
+connection could reach another listener. That fallback goes in 0.1.7. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
+failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
+`Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
 `ls`, `stat`, `pin_*`, `name_*` (with `name_watch`), `submit_job`, `job`, `jobs`, `cancel_job`, `clear_jobs`,
 `deny*`) send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
@@ -361,7 +370,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name"}` |
 | `name_rm(alias)`, `name_export(alias)` | `None`, key bytes |
 | `name_list()` | `[{"alias", "name", "cid" or None, "sequence"}]` |
-| `name_publish(alias, target)` | `{"name", "cid", "sequence"}` |
+| `name_publish(alias, target)` | `{"name", "cid", "sequence"}`, plus `"warning"` in private mode (the name's announce reaches outsiders: `names.PRIVATE_NAME_WARNING`) |
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}` |
 | `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
@@ -802,7 +811,11 @@ and in total, never persisted.
   link closed, or RNS gave up) starts none, so a reader that gives up early must close its links and never
   call `Resource.cancel()` on a response, or it would cool itself down at its providers. `Cooldowns` is flat:
   every cooldown lasts `blocks_cooldown`, per link and per identity. The `Response` docstring records which
-  thread or lock owns each of its fields.
+  thread or lock owns each of its fields. A new `/blocks` arriving while the link's previous response has
+  sent all its parts waits, on `RequestServer.clock`, up to `_proof_wait(link)` (2 × RTT + 1 s, at most
+  `PROOF_GRACE`, 5 s) for its proof (`_previous_done`). That is the server's only use of `link.rtt`, which on an
+  incoming link is what the requester claims: anything but a finite, non-negative number counts as no RTT, and
+  any future use must go through it, capped.
 - `IncomingLinks.take_token` keeps a per-link token bucket (`REQUEST_BURST`, `REQUEST_RATE`) and a smaller
   one of refusals (`OVER_RATE_REFUSALS`, one a second) in `_LinkState`. `RequestServer._guarded` asks it first
   for every path: over the limit it answers `False` while refusals are left, else `None`, which RNS sends
@@ -836,7 +849,8 @@ and in total, never persisted.
   `MAX_BLOCKS_CIDS` (26) entries of `bin` up to `MAX_BLOCK_SIZE` or `nil`, and nothing after it. A refused
   response is handed to `Link.handle_response` as `None`, which every parser refuses, so the request fails as
   malformed; refusals are logged at most once a minute. `guarded_receive` drops a response packet on an
-  incoming `rnfs.dht` link without decrypting it. Everything else goes to RNS's own methods unchanged.
+  incoming `rnfs.dht` link, and a request packet on one this node opened (`link.initiator`), without
+  decrypting it. Everything else goes to RNS's own methods unchanged.
 - `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
   instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
   RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in
@@ -886,7 +900,12 @@ retried first. A held message is dropped 30 s (`HOLD_PATH_WAIT`) after its sende
 arrival if later, with no identity known, and after 2 minutes in any case. A held message stays in the queue
 while it is retried, so it still counts as a duplicate and against the limit. The inbox (`MessageLog`) holds at
 most 500 records and 4 MiB as JSON, 50 per sender not in `lxmf_auto_fetch_from`, 16 KiB per record (links
-beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none;
+beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none,
+nor for another sender's (when all others hold pins, the new record's sender's own goes, or it is refused). An
+auto-fetch sender's record is added with `share=` 1/n of the record and byte limits (`_auto_share`, n senders in
+`lxmf_auto_fetch_from`, at least one record and 16 KiB), counting its protected records; past it, `_own_victim`
+drops its own unprotected records first, then those whose holdings (`holds=_held`: pinned CIDs, queued links)
+another of its records also holds, then the oldest;
 `add(reserved=)` keeps trusted senders' records from being evicted except for each other's (untrusted ones go
 first), so free identities can't push them out, and untrusted senders' new records come from a per-sender
 allowance (`SENDER_BURST` 4, then one per `SENDER_INTERVAL` 15 min; `_sender_tokens`, the last
@@ -922,6 +941,10 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 `TooLarge` or `StorageFull`, is retried once through the DHT). `POST /api/lxmf/send` and `/api/lxmf/sync` take
 `nearest`; `POST /api/lxmf/inbox/get` takes `use_sent_cid` (without it, an unresolvable name link is 404);
 `GET /api/lxmf/address` returns `propagation_node` (the configured one only) and `nearest_propagation_node`.
+`GET /api/lxmf/inbox` adds to each record, computed when listed, `trusted` (`LxmfFeature._trusted_hex`) and
+`contact` (`ContactsFeature.nick_of(address, "lxmf")`, the first nick naming it, or null); `rnfs inbox` prints the
+address, then `contact <nick>`, `trusted` or `untrusted` (`?` without the fields), the method, and last the
+display name quoted and escaped with `fsutil.printable_label`.
 Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 `chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`; `GET /api/cat`
 `raw=1`, `block=1`; `GET /api/info` `from`.
@@ -1077,7 +1100,7 @@ Everything in the specification is implemented, with these simplifications and a
   (64) per `DAG_GRANULE` (4 KiB, `SmallLeaves`' threshold) of the declared size + `DAG_SLACK` (1 KiB), plus
   what the counted directory and index nodes bring (`node_credit`): a directory node its own bytes and
   `DAG_ENTRY_OVERHEAD` (16) per entry, an index node its own bytes and 16 per child less `INDEX_NODE_COST`
-  (64), never below 0; and `max_dag_bytes` (a remote pin's or auto-fetch's quota) if lower. Over it is
+  (64), never below 0; and `max_dag_bytes` (a remote pin's, auto-fetch's or follow's quota) if lower. Over it is
   `TooLarge`, not `InvalidDag`. Every caller gets it, since it lives in `fetch_dag`: `get`, `pin_add`,
   `dir_set`/`dir_rm`, `export`, `export_stream`, follow, remote pins and LXMF auto-fetches. A target whose DAG
   is stored complete already isn't walked: it is checked whole against the deny list and, with
@@ -1175,6 +1198,16 @@ Everything in the specification is implemented, with these simplifications and a
   inode checks), so entries swapped for symlinks, FIFOs or devices mid-scan are skipped. The scan (not `add`)
   skips regular files whose opened descriptor has `st_nlink > 1` (`builder.hard_links`, `build_open`'s
   `skip_hard_links`); such a file's signature is marked, so it is imported once its other links are gone.
+- Each scan resolves the shared folder it opened (`shared_folder.opened_path`: `fsutil.final_path` of its
+  descriptor, the path walk's checked root, or else its real path with the same device and inode) and refuses one
+  that is the rnfs dir (`SharedFolder`'s `rnfs_dir`, `config.root` in the node), a directory holding it, or inside
+  one of `PRIVATE_SUBDIRS` (`storage`, `names`, `state`, `blocks`, `lxmf`, each resolved): a warning while it
+  stays refused, and the scan treats it as empty (`current = {}`): nothing imported, every `folder` pin released
+  and the shared_folder table emptied, so pins a 0.1.5 node made from such a folder go at the first scan after the
+  upgrade. The walk then reads that descriptor, so a link retargeted after
+  the check can't redirect it. On POSIX, the first directory above it owned by another user (not root) or writable
+  by group or others (unless sticky and what is below it is the user's or root's) is warned about once
+  (`loose_ancestor`).
 - The identity file (`network/identity.py`) is opened with `O_NOFOLLOW | O_NONBLOCK` after an lstat that must
   show a regular file, not a link; the descriptor must be that same regular file (device and inode), owned by
   the user, and is tightened through `fchmod` if loose. The key is read from it (`RNS.Identity.from_bytes`),
@@ -1260,7 +1293,8 @@ Everything in the specification is implemented, with these simplifications and a
   `_check_file(expect, get)` (get's write-out check, a sealed get, `read` before its first byte,
   `node_content.block` for a raw block, `export_stream` for every file before `start` and `import_archive` for the
   complete roots; a raw file's digest is its CID's, others are hashed once and remembered, across restarts:
-  `deny_hashes`). `get` serves the file's whole DAG, stored and checked: `_check_fetched` (a sealed get, `read`)
+  `deny_hashes`; a refusal by hash logs a NOTICE suggesting `rnfs deny add <cid>`, since the file's blocks are still
+  served, once per file CID in `_hash_noticed`, cleared at `HASH_NOTICES` (1024)). `get` serves the file's whole DAG, stored and checked: `_check_fetched` (a sealed get, `read`)
   runs `fetch_dag` first unless the hash is known, which also brings `max_download_size` and `check_disk`. Before
   hashing, a file declaring more than `DENY_HASH_RATIO` (16) × `walker.leaf_bytes` + `DENY_HASH_SLACK` (64 MiB) is
   refused as `Denied`, so `_refusing` collects what a refused import stored: hashing reads every occurrence of
@@ -1273,7 +1307,9 @@ Everything in the specification is implemented, with these simplifications and a
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
-  (no path request).
+  (no path request). The fetch checks the resolved target's size against `follow_quota` and sets it as
+  `max_dag_bytes` (as remote pins do with their quota, but per name rather than per source: the old target's
+  pin isn't counted, so a swap peaks at twice the quota); 0 refuses before opening the fetch.
 - **Contacts.** Every `<name>` argument (`name resolve|keep|unkeep|follow|unfollow`) takes a name contact's
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.
@@ -1318,9 +1354,13 @@ Everything in the specification is implemented, with these simplifications and a
     without build isolation, so nothing unpinned is fetched for a build; the Flatpak's `build-sources.json` comes from
     `build-backend.lock`. `build-deb.sh` fails if a supported Python has no cffi backend, caps `python3` below
     3.15, and writes a DEP-5 `copyright` and `md5sums`.
-  - `install.sh` installs the latest release's source archive (`archive/refs/tags/<tag>.zip`, the tag taken
-    from where `releases/latest` redirects, so no GitHub API), the main branch's with `--main`, or
-    `RNFS_SOURCE`. Since the script on `main` installs older release trees, it must keep working with every
+  - `install.sh` installs the latest release's sdist (`rnfs-X.Y.Z.tar.gz`, the tag taken from where
+    `releases/latest` redirects, so no GitHub API), the main branch's archive with `--main`, or `RNFS_SOURCE`
+    (with a warning for a plain `http://` URL). A release's sdist must match the release's `SHA256SUMS` and,
+    where the GitHub CLI (2.49 or newer) can check it, its signed build provenance for that tag
+    (`--source-ref=refs/tags/<tag>` and `--deny-self-hosted-runners` when this `gh` has them); a `gh` with the
+    attestation command that isn't logged in stops the install unless `RNFS_REQUIRE_ATTESTATION=0`, and without
+    `gh` it warns. Only a wheel of the tag's version is installed from it. Since the script on `main` installs older release trees, it must keep working with every
     release's layout from 0.1.1 on (`packaging/requirements.lock`, `packaging/build-backend.lock`).
     It unpacks an archive source itself (with Python, refusing absolute or `..` entries) to find its
     locks; a `.whl` or other requirement has none, so it warns and installs dependencies unpinned. It installs

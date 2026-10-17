@@ -603,6 +603,8 @@ def run_name_publish(args):
     """Point a name at a target."""
     result = client(args).name_publish(args.alias, args.target)
     print(printable(f"published {result['cid']} as {result['name']} (sequence {result['sequence']})"))
+    if result.get("warning"):  # private mode: the name's announce still reaches outsiders
+        warn(result["warning"])
 
 
 def run_name_resolve(args):

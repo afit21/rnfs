@@ -71,9 +71,9 @@ def index_page_namespace():
     """The file-index-node page's module-level defs (escape, display_name, entry, section)."""
     with open(INDEX_PAGE, encoding="utf-8") as f:
         source = f.read()
-    head = source.split('print("""#!c=0')[0]  # everything before the page body
-    namespace = {}
-    exec(compile(head, INDEX_PAGE, "exec"), namespace)
+    # The page renders only under __main__, so running its source here just defines them
+    namespace = {"__name__": "index_page"}
+    exec(compile(source, INDEX_PAGE, "exec"), namespace)
     return namespace
 
 

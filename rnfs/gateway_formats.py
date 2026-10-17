@@ -11,15 +11,16 @@ an ETag naming the target and the format ("<cid>.raw", "<cid>.archive") so they 
 plain response's "<cid>". Archives keep max_download_size and max_output_entries. /name/ paths don't take
 ?format= (the result must be named by the CID it is checked against).
 
-Every format is answered only to the user's own GET (handler.limited() false: no Sec-Fetch-Site, or "none"),
-which fetches what isn't stored (an archive's fetch is cancelled once the client disconnects). A web page's
-request or a HEAD always gets 409, stored or not, before the node is asked anything, so no format ever takes
-a gateway_fetches slot. Neither type is one a browser shows, so a format's 200 is a download, and an iframe
-of a download fires no load event while an error page does: answering a page 200 for stored content but a
-fetch (an error once nobody has it, or 503 once the page holds every gateway_fetches slot) for the rest
-would tell web pages what the node stores (L6). A bare-CID If-None-Match revalidation, which needs nothing
-stored, is answered 304 first. An archive also needs the target's whole DAG before its first byte (its
-length is in the headers), and a request whose body nobody reads shouldn't make the node fetch a whole DAG.
+Every format is answered only to the user's own GET (handler.limited() false: Sec-Fetch-Site "none", or none sent
+by a client whose User-Agent doesn't start with "Mozilla/"), which fetches what isn't stored (an archive's fetch is
+cancelled once the client disconnects). A web page's request or a HEAD always gets 409, stored or not, before the
+node is asked anything, so no format ever takes a gateway_fetches slot. Neither type is one a browser shows, so a
+format's 200 is a download, and an iframe of a download fires no load event while an error page does: answering a
+page 200 for stored content but a fetch (an error once nobody has it, or 503 once the page holds every
+gateway_fetches slot) for the rest would tell web pages what the node stores (L6). A bare-CID If-None-Match
+revalidation, which needs nothing stored, is answered 304 first. An archive also needs the target's whole DAG
+before its first byte (its length is in the headers), and a request whose body nobody reads shouldn't make the node
+fetch a whole DAG.
 """
 import select
 import socket

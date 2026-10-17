@@ -241,11 +241,15 @@ pass a `max_response_size` just above their largest honest answer.
   nothing after it. rnfs checks responses sent as a Resource, and those sent as one packet larger than RNS's
   default MTU (only links that negotiated a larger MTU carry them; smaller ones decode to little). A refused
   response fails its request as a malformed one does. A responder sends no requests, so a response packet on
-  an incoming `rnfs.dht` link is dropped unread.
-- `max_upload_rate` caps bytes sent for `/blocks` on a link once it has a rate estimate. RNS paces a Resource
-  by its receiver, so the cap is applied between responses: the response budget uses the lower of the rate
-  estimate and `max_upload_rate`, and the next response on that link starts no sooner than
-  `bytes × 8 / max_upload_rate` seconds after the previous one started.
+  an incoming `rnfs.dht` link is dropped unread. Likewise a node serves requests only on incoming links, so it
+  SHOULD drop, unread, a request packet on an `rnfs.dht` link it opened: the remote destination of such a link
+  has no request size limit or handlers, and RNS would decode the request and start a thread for it first.
+- `max_upload_rate` caps bytes sent for `/blocks` on a link. An explicit one applies to every `/blocks`
+  response, including one sent as a single packet (which never gives a rate estimate: on a link with a large
+  MTU every response may be one); the default, half the rate estimate on slow links, applies once the link has
+  one. RNS paces a Resource by its receiver, so the cap is applied between responses: the response budget uses
+  the lower of the rate estimate and `max_upload_rate`, and the next response on that link starts no sooner
+  than `bytes × 8 / max_upload_rate` seconds after the previous one started.
   - A responder holds an accepted request back for this at most 5.625 s (half of RNS's request timeout
     without RTT, 1.125 × `RNS.Resource.RESPONSE_MAX_GRACE_TIME` (10 s), so the requester doesn't give up
     meanwhile; not RTT-based, since the requester can inflate the RTT), and refuses it at once if it would
@@ -308,6 +312,11 @@ across shared interfaces and transport nodes, a node MAY run in private mode:
   removed from the list), and `/find` replies leave out any such record;
 - outgoing links go only to nodes whose identity is a member, so the node never identifies itself to an
   outsider (one listed as a provider anywhere, say).
+
+Private mode restricts rnfs's links, not RNS announces. A member's names are announced as anywhere else (section
+9), and RNS carries those announces to every node that hears them, so outsiders learn each name's
+`[sequence, CID]` record and can follow its changes; only the content stays member-only. `name publish` in
+private mode warns of this (rnfs: the result carries a `warning`, section 9).
 
 ## 4. Content identifiers
 
@@ -611,7 +620,10 @@ and repeat.
   as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
   always store something, a flood churns only the pool, and the pool is shared out evenly between
   publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
-  republished while the rest has room. The node's own records are always accepted.
+  republished while the rest has room. The node's own records are always accepted and never evicted to make
+  room for others' (rnfs: nor counted toward its local limit of 1000 publishers per key, a newcomer to a full
+  key evicting a random one of the others but the `K/2` oldest), so Sybil stores can't push a node's own record
+  out of its own store.
 - First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
   (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
   oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer
@@ -782,7 +794,12 @@ and repeat.
 `add` (copied into the block store) and pinned with source `folder`. A changed or removed file releases its
 old pin. Unlike `add`, a scan MUST skip (with a log line) a regular file that has other hard links, at the
 top level and inside shared directories: it is also a file elsewhere, which whoever may write to the folder
-could have linked in. It is imported at the next scan after its other links are gone.
+could have linked in. It is imported at the next scan after its other links are gone. `files/` may be a
+symlink, but a scan MUST NOT import from a folder that resolves, as opened, to the rnfs dir, to a directory
+holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, which hold the node's keys and state:
+rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin
+with source `folder` is released (including those an earlier version made from it). rnfs also warns, once, when
+a directory above the folder can be changed by other users, who could replace the folder with another.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
@@ -837,7 +854,9 @@ off their node. Nothing on the wire changes.
   (so a range fetches the whole file first; its hash is then remembered; the gateway's `?format=raw` and
   `?format=archive` too), and as `add`, the shared folder or `import` read it (the add or import fails). By then the file's blocks have been downloaded. A file-hash entry
   doesn't stop those blocks being fetched (by `pin add`, `export` to a file, a remote pin or a followed name), stored,
-  served or provided: deny the CID for that. A file of one block has its content's hash as its CID's digest,
+  served or provided (a file of several chunks is still served chunk by chunk, by `/blocks` and by the gateway's
+  `?format=raw` of each block's CID): deny the CID for that. The first time a node refuses a file by its hash it
+  logs a notice naming the command that does (`rnfs deny add <file cid>`). A file of one block has its content's hash as its CID's digest,
   so either entry stops it; a sealed file matches by its sealed bytes, as stored, not by what it decrypts to.
 - Hashing a file reads every occurrence of content its DAG repeats, so a few small blocks can declare a file of
   2^56 bytes. While there are file-hash entries, a file whose hash isn't known yet and whose declared size is
@@ -878,7 +897,9 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
    resolve, and persist it. If that fails, the publish fails and a pin step 2 added is released.
 4. Release that source from the previous target (only now, so a crash leaves the target the persisted record
    names pinned; any other pin of the source is released at the next start, section 8).
-5. Announce, and re-announce every `announce_interval`.
+5. Announce, and re-announce every `announce_interval`. In private mode the announce reaches outsiders all the
+   same (section 3), and the publish warns of it: rnfs adds a `warning` to the result (`POST /api/name/publish`
+   and `rnfs name publish`, which prints it to stderr).
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
@@ -986,7 +1007,11 @@ resolves after its owner's announce has expired from the network.
 source `follow:<name>`. When the name moves, the new target is fetched completely in the background and
 pinned, and only then is the previous target's follow pin released, so a complete copy is always held. The
 fetch has the usual limits: `max_download_size`, the DAG byte bound of its new target's size (section 7) and
-the disk reserve (section 8). A
+the disk reserve (section 8). It also has `follow_quota` (section 12), since a pinned fetch never stops at
+`max_storage`: a new target whose verified size, or whose DAG's distinct blocks (stored or downloaded), would
+exceed it is refused (a failed fetch, so the old target stays pinned), and `follow_quota` = 0 fetches nothing.
+While one target replaces another both are held, so a followed name can use up to 2 × `follow_quota` for a
+time. A target pinned before the quota was lowered stays pinned. A
 followed name is checked when a newer record is heard and every `announce_interval`.
 - The periodic check uses the record held, unless nothing was heard for the name for
   2 × `announce_interval`; only then does it resolve through the network (a path request, then keepers).
@@ -1033,7 +1058,7 @@ as is cheap. Rules live in the sections referenced.
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
-| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
+| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages, and each auto-fetch sender held to 1/n of the inbox; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
 | Unwanted content on a public gateway or provider node | Deny lists: denied CIDs never fetched, stored, served or provided, anywhere in a DAG; file hashes checked where content is assembled; lists size-capped and checked before use (8) |
 | Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
@@ -1072,7 +1097,11 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 **Limits.**
 - RNS identities are free to create. A determined attacker can surround one key with responsive nodes and
   make that key hard to find (a Sybil attack); it can't forge data. `get <cid> --from <node ID>` bypasses
-  the DHT when a provider is known.
+  the DHT when a provider is known. Grinding IDs near a key is cheap: one CPU core makes about 20,000-30,000
+  identities a second, each with its node ID (measured for rnfs 0.1.6), and getting `K` of them closer to a
+  key than the `K` closest of n honest nodes takes about n tries, so a fraction of a second against 10,000
+  nodes and under a minute against a million. Raising this cost means changing how node IDs are derived, a
+  protocol change left for a later version.
 - Patient attackers that keep identities alive for days defeat the preference for old records and long-known
   providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
   answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
@@ -1080,10 +1109,18 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
   newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
   while fewer than the bounded number of newcomers first seen before it were evicted too.
+- Private mode doesn't hide names: a member's names are announced over RNS like any other, so outsiders who
+  hear them learn each `[sequence, CID]` record and when it changes, though members won't serve them the content
+  (section 3). `name publish` in private mode warns of this.
 - Bans are evaded by switching identity; they only make an attacker pay for a new one.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
+- Many LXMF identities can keep the strangers' bucket empty (one message a minute, each from a new identity,
+  is enough), so no other untrusted sender's message is kept; contacts and other trusted senders are unaffected
+  (section 13). The node counts the messages dropped this way (`status`'s `untrusted_dropped`), so apps can
+  suggest adding the senders the user expects as contacts. LXMF stamps (proof of work) would make each message
+  cost the sender, but announcing a stamp cost changes the announce and refuses senders that haven't heard it.
 - RNS decrypts and decodes every request packet and starts a thread for it before rnfs sees it, so a link
   sending requests as fast as its interface carries them still costs the node that work (about 0.14 ms of CPU
   each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
@@ -1167,7 +1204,7 @@ are local conveniences, not part of the protocol.
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1227,7 +1264,11 @@ gateway can never reach the API.
   runs on the port while the daemon is down learns neither the token nor a name key being imported, nor can
   answer in the daemon's place. The API keeps a connection open after a status request carrying a valid
   challenge and `Connection: keep-alive` (and no body), answering it with `Connection: keep-alive`, for one
-  more request, which is its last; every other connection is closed after its request.
+  more request, which is its last; every other connection is closed after its request. Any caller can ask for
+  this (the proof needs no token), and the second request gets a new read deadline, so one connection can hold
+  a connection slot (below) about twice as long as a single request could (rnfs: about 2 × 15 s). This is
+  accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
+  exactly one more request.
 - The API never sends CORS headers.
 - Both servers SHOULD time-limit reading a request (rnfs: 15 s for the request line, headers and small
   bodies; 60 s between reads of an upload), but not the node's work, and SHOULD cap concurrent
@@ -1260,7 +1301,8 @@ gateway can never reach the API.
     its first byte, so the user's own `GET` fetches the whole DAG first, within `max_download_size` and
     `max_output_entries` (413 otherwise), and the fetch is cancelled if the client disconnects.
   - Every format is answered only to the user's own `GET`, which fetches what isn't stored. A request that
-    isn't the user's own navigation (`Sec-Fetch-Site` present and not `none`) and any `HEAD` get
+    isn't the user's own (`Sec-Fetch-Site` present and not `none`, or absent with a browser's `User-Agent`;
+    below) and any `HEAD` get
     `409 Conflict`, whether the target is stored or not, without the node fetching anything. A browser
     downloads both types, and a frame of a download fires no load event while an error page does, so an
     answer that depended on what is stored (a download for stored content, a fetch that fails or a `503` for
@@ -1289,7 +1331,12 @@ gateway can never reach the API.
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
   `gateway_fetches` network fetches or name resolutions at a time. Content already stored is served without
   limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
-  user started (address bar, bookmark); a request without it comes from a local tool the user runs.
+  user started (address bar, bookmark). A request without it is the user's own only if its `User-Agent`
+  doesn't start with `Mozilla/` (rnfs ignores case and leading spaces): then it comes from a local tool the
+  user runs, such as curl. Every browser's `User-Agent` starts with `Mozilla/`, and browsers without Fetch
+  Metadata (Safari before 16.4, Firefox before 90) send no `Sec-Fetch-Site` for a web page's requests either,
+  so all their requests are treated as a web page's: in them even the user's own navigation gets `409` for
+  `?format=` and is held to `gateway_fetches`.
 - Apart from timing, the `gateway_fetches` limit and content no provider has, a web page's request gets the
   same answer whether the node stores the content or has to fetch it. The limit is a known, accepted leak: while a
   page keeps every slot busy with fetches, stored content is still served and content that needs a fetch gets 503,
@@ -1403,7 +1450,7 @@ setting.
 | `max_incoming_links` | 128 | |
 | `max_blocks_responses` | 4 | `/blocks` responses in progress on slow links: half of this; the rest for other links, unless `fast_blocks_responses` is more. At least 2 |
 | `fast_blocks_responses` | 16 | `/blocks` responses in progress on links that aren't slow, if more than the rest of `max_blocks_responses` |
-| `max_upload_rate` | none; half the rate estimate on slow links that have one | |
+| `max_upload_rate` | none; half the rate estimate on slow links that have one | An explicit value applies to every `/blocks` response, with or without a rate estimate |
 | `max_records` | 100 000 | |
 | `ban_time` | 1 h | |
 | `max_storage` | 10 GiB | |
@@ -1430,6 +1477,7 @@ setting.
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
 | `keep_max_names` | 100 | Names kept (keep and follow) for others; this node's own names don't count. A whole number |
 | `keeper_query` | `fallback` | `fallback`: ask keepers when a path request heard nothing; `always`: on every network resolve (about 10× the airtime) |
+| `follow_quota` | 1 GiB per followed name | Bytes a followed name's new target may hold, its size and its DAG's blocks; 0: followed names aren't fetched. A swap holds the old and new targets, so up to twice this (section 9) |
 | `max_jobs` | 2; 1 on slow nodes | Jobs running at once (a whole number ≥ 1). Foreground `get`, `pin add` and `export` run as jobs too, so they queue beyond this |
 | `max_finished_jobs` | 100 | Finished jobs kept (a whole number ≥ 1); each is kept at least 60 s regardless (section 11) |
 | `lxmf_enabled` | on if the LXMF package is installed | A boolean. `false` turns LXMF off; `true` without the package logs a warning and stays off |
@@ -1547,22 +1595,34 @@ unreserved, pct-encoded: as in RFC 3986
   on a line of its own is read whole; elsewhere, trailing punctuation (`.,;:!?)]}'"`) is taken as the
   sentence's. At most 8 links, 4000 characters of text, 256 of title and 64 of display name are kept. Text
   from messages MUST be shown with control characters escaped.
+- A sender's display name is its own word, so it MUST NOT be shown where it could pass for the sender's address
+  or trust. `inbox` shows each message's sender address first, then `untrusted`, `trusted` or `contact <nick>`
+  (the API's computed `trusted` and `contact` fields; `?` from a daemon that doesn't give them), and the display
+  name last, quoted, with backslashes, quotes, blank fillers (U+115F, U+1160, U+3164, U+FFA0, U+2800), a
+  combining mark that follows nothing printed or is the third in a row, and a name of only spaces escaped too.
 - At most 500 messages and 4 MiB (as JSON) are kept, and at most 50 from one sender not in
   `lxmf_auto_fetch_from`. To make room, the oldest message holding no auto-fetched pins (none pinned or
   queued) is dropped; a message holding pins is not dropped for others' messages: if every kept message holds
-  pins, a new message without any is not kept (and one with pins pushes out the oldest). A trusted sender's
-  message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
+  pins, a new message without any is not kept, and one with pins pushes out its own sender's oldest message
+  (or, if that sender has none, is not kept). Each of the n senders in `lxmf_auto_fetch_from` keeps at most
+  1/n of the 500 messages and of the 4 MiB (at least one message and 16 KiB), messages holding pins included:
+  past its share, a new message from it drops its own messages, first those without pins, then those whose
+  pinned CIDs another of its messages also holds (dropping them releases nothing), then the oldest. A trusted
+  sender's message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
   message without pins is left; a new message from an untrusted sender that would need one dropped is not
   kept. New messages from untrusted senders are also rate limited: each sender has an allowance of 4 at once,
   then one per 15 minutes, and within it messages are taken from a node-wide bucket of 32 at once, then one
-  per minute; others are not kept. So one sender can't keep the node-wide bucket empty for everyone else. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
+  per minute; others are not kept, and counted (`untrusted_dropped` in `status`). So one sender can't keep the
+  node-wide bucket empty for everyone else (many can: section 10, Limits). Each message's record is at most 16
+  KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
   `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or
-  removing the message stops a fetch in progress. The fetch is refused if the target's verified size plus what
+  removing the message stops a fetch in progress. A waiting link whose sender is no longer in
+  `lxmf_auto_fetch_from` is refused, not fetched: at the next start (with LXMF off too) and when its turn comes. The fetch is refused if the target's verified size plus what
   that source already pins would exceed `lxmf_auto_fetch_quota`, or if the blocks of its DAG would (as for
   remote pins, section 8); `max_download_size` applies too. A `name/` link is resolved without persisting
   the name's sequence (only the capped table of section 9 holds it), so names arriving unasked don't grow

@@ -198,12 +198,19 @@ alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc to type j
 The app has these permissions:
 
 - network access;
-- your home folder, for the files you add or get, plus `~/.rnfs` and `~/.reticulum`;
-- all devices, for RNode and other serial interfaces. If you don't use serial interfaces, remove this
-  with `flatpak override --user --nodevice=all io.github.afit21.rnfs`.
+- `~/.rnfs` and `~/.reticulum` (created if missing), for rnfs's and Reticulum's files;
+- your Downloads folder, for the files you add or get.
 
-To reach files outside your home folder, run
-`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`.
+It can't see the rest of your home folder, or any device. Grant more with `flatpak override`:
+
+```sh
+flatpak override --user --device=all io.github.afit21.rnfs                    # RNode and other serial interfaces
+flatpak override --user --filesystem=~/Documents io.github.afit21.rnfs        # another folder to add from or get into
+flatpak override --user --filesystem=~/.config/reticulum io.github.afit21.rnfs   # a Reticulum config kept there
+```
+
+`flatpak override --user --reset io.github.afit21.rnfs` takes these back. Until 0.1.6 the Flatpak had your
+whole home folder and every device; after updating, grant the ones you used again.
 
 - **Update:** install the newer release's `.flatpak` the same way.
 - **Uninstall:** `flatpak uninstall --user io.github.afit21.rnfs`.
@@ -282,8 +289,11 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh
 This installs the latest rnfs release, with Reticulum and LXMF, into its own virtual environment at
 `~/.local/share/rnfs/venv`. It installs the release's source archive (`rnfs-X.Y.Z.tar.gz`) only if it matches
 the release's `SHA256SUMS` and, if the [GitHub CLI](https://cli.github.com/) (2.49 or newer) is installed and
-logged in, its signed build provenance (`gh attestation verify`). Without `gh` it warns that only the checksum
-was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it stop instead. Dependencies are installed at the
+logged in, its signed build provenance (`gh attestation verify`). If `gh` is installed but not logged in, it
+stops: log in with `gh auth login`, or set `RNFS_REQUIRE_ATTESTATION=0` to install with only the checksum
+checked. Without `gh` it warns that only the checksum was checked; set `RNFS_REQUIRE_ATTESTATION=1` to make it
+stop instead. So `curl | sh` without `gh` trusts whoever can write the release's files on GitHub, since
+`SHA256SUMS` comes from the same place as the archive. Dependencies are installed at the
 versions pinned in the source's `packaging/requirements.lock`, with their sha256 hashes checked. It links the `rnfs` command into
 `~/.local/bin` and tells you if that folder isn't on your PATH. Options go after `sh -s --`:
 
@@ -302,7 +312,9 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
   The branch has no checksums or provenance to check.
 - **Service:** `--service` installs `~/.config/systemd/user/rnfs.service` and starts it. To see its logs:
   `journalctl --user -u rnfs -f`. To keep it running while you're logged out:
-  `loginctl enable-linger $USER`.
+  `loginctl enable-linger $USER`. More sandboxing (`ProtectSystem`, `PrivateTmp`) needs unprivileged user
+  namespaces, so it is an optional drop-in, for this unit or the `.deb`'s:
+  [`contrib/rnfs.service.d/hardening.conf`](contrib/rnfs.service.d/hardening.conf) says how to add it.
 - **For all users:** run it as root with `--system`
   (`curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sudo sh -s -- --system`).
   This installs to `/opt/rnfs` and `/usr/local/bin/rnfs`.
@@ -310,7 +322,8 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
 - `--force` replaces an existing `~/.local/bin/rnfs`, for example one installed by pipx.
 - `RNFS_SOURCE=<dir, .zip, .tar.gz, .whl or URL>` installs something other than the latest release (it
   overrides `--main` too). A `.whl` or other pip requirement has no lock file, so its dependencies are
-  installed unpinned (newest), with a warning.
+  installed unpinned (newest), with a warning. Nothing checks what it downloads, so a plain `http://` URL
+  gets a warning too.
 
 ### pipx from GitHub
 
@@ -319,7 +332,10 @@ pipx install git+https://github.com/afit21/rnfs                                 
 pipx install https://github.com/afit21/rnfs/archive/refs/heads/main.zip          # Windows (no git needed)
 ```
 
-Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too.
+Update with `pipx upgrade rnfs`; uninstall with `pipx uninstall rnfs`. Plain `pip install` works too. Both
+resolve rnfs's dependencies (Reticulum, LXMF, cryptography, ...) unpinned, at the newest versions rnfs allows,
+not at the tested versions and hashes in `packaging/requirements.lock` that the other packages and the install
+script use.
 
 ### From source
 
@@ -648,6 +664,7 @@ lxmf_auto_fetch_from = ["<a friend's LXMF address>"]
 | `name_table_size` | `10000` | Records remembered for names you haven't resolved yourself |
 | `keep_max_names` | `100` | Names kept or followed for others (your own don't count). Each is a DHT key your node republishes (every 3 days or more) and, if followed, a pin |
 | `keeper_query` | `"fallback"` | Ask keepers only when the network had no answer (`"fallback"`), or on every resolve (`"always"`). `always` costs about 10 times the airtime per resolve: keep `fallback` on slow links |
+| `follow_quota` | `1073741824` (1 GiB) | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned. While the target changes both are held, so up to twice this. `0` stops fetching followed names |
 
 **Content.** No settings: chunking, sealing and `--no-pin` are chosen per `rnfs add`.
 
@@ -807,7 +824,7 @@ $ rnfs jobs wait 3fa2b1c9
 
 A `NAME` is 32 hex characters or a name contact's nick. A followed name is checked every
 `announce_interval`; a failed check is retried after 5 minutes, then 10, 20 and so on up to
-`announce_interval`.
+`announce_interval`. A target larger than `follow_quota` (1 GiB) isn't fetched.
 
 **Contacts**
 
@@ -825,7 +842,7 @@ Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
 |---|---|
 | `rnfs lxmf address` | Your LXMF address, to give to friends |
 | `rnfs send ADDRESS\|CONTACT TARGET [-m TEXT] [--propagate] [--nearest]` | Send an `rnfs:` link (and text). The target may also be `name/<name>[/path]` or an `rnfs:` URI. `--propagate` sends through `lxmf_propagation_node` for offline recipients. `--nearest`, without `lxmf_propagation_node`, uses the nearest propagation node heard (for `--propagate`, or if direct delivery fails) |
-| `rnfs inbox` | Received messages with rnfs links |
+| `rnfs inbox` | Received messages with rnfs links. Each starts with the sender's address and says `untrusted`, `trusted` or `contact NICK`; the display name, which the sender chose, comes last in quotes |
 | `rnfs inbox get N [--link K] [-o OUT]` | Fetch what message N links to (only its K-th link with `--link`; `-o` for one link only), asking the sender's node first, then the DHT. Default names follow the `get` rule above |
 | `rnfs inbox rm N` / `rnfs inbox rm --all` | Remove messages, releasing what they auto-fetched |
 | `rnfs outbox` | Sent messages and their delivery state |
@@ -931,8 +948,9 @@ released; your own pins are kept, but not served or read, and the log names each
 
 A file hash is only known once the file has been downloaded, so it stops `get`, `cat` and the gateway from
 handing the file out (they check before writing or sending anything, which makes them fetch the whole file
-first) and `add`, the shared folder or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served.
-Deny the CID to stop that. Lists larger than 4 MiB, with over 100 000 entries, not UTF-8 text, with a line that
+first) and `add`, the shared folder or `import` from adding it; it doesn't stop the blocks being downloaded, pinned or served
+(a file of several chunks can still be fetched from your node chunk by chunk). Deny the CID to stop that: the first
+time rnfs refuses a file by its hash, the log names the command (`rnfs deny add <cid>`). Lists larger than 4 MiB, with over 100 000 entries, not UTF-8 text, with a line that
 isn't an entry, or that are a directory are refused, and the previous version stays in use.
 
 # Example use cases
@@ -973,7 +991,9 @@ rnfs get <cid>              # recipients get the decrypted file under its origin
 ```
 
 For a fully closed group, run every node with `private = true` and the same `members` list (their identity
-hashes). Members then answer, store records for and serve only each other.
+hashes). Members then answer, store records for and serve only each other. Names are the exception: a name's
+announce still reaches everyone, so outsiders can see which CID it points at and when it changes (though not
+fetch it), and `rnfs name publish` warns of this in private mode.
 
 **Offline sneakernet.** Carry content where there's no link at all:
 

@@ -423,6 +423,18 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(loaded.first_seen(ident(1)), store.first_seen(ident(1)))
         self.assertEqual(loaded.first_seen(ident(2)), store.first_seen(ident(2)))
 
+    def test_own_record_beyond_a_full_key_survives_restart(self):
+        """The node's own record doesn't count toward max_per_key on load either (DHT-5)."""
+        own = ident(1)
+        store = self.open(1000, max_per_key=5, own_id=own)
+        for i in range(5):
+            store.store(KEY, ident(100 + i))
+        self.clock.now += 1
+        store.store(KEY, own)
+        store.save()
+        loaded = self.open(1000, max_per_key=5, own_id=own)
+        self.assertEqual(loaded.providers(KEY), [ident(100 + i) for i in range(5)] + [own])
+
     def test_first_seen_order_survives_restart(self):
         """A publisher seen first still evicts the newest one's records after a restart."""
         store = self.open(3)
