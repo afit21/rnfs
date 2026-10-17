@@ -147,6 +147,9 @@ class UpgradeTest(unittest.TestCase):
         self.start().stop()
         self.assertEqual(state_rows(self.state, "PRAGMA user_version"), [(len(statedb.SCHEMA),)])
         self.assertEqual(state_rows(self.state, "PRAGMA quick_check"), [("ok",)])
+        # 0.1.6's steps were applied: the shared folder's per-file cache (D1) has its table
+        self.assertEqual(state_rows(self.state, "SELECT name FROM sqlite_master WHERE name = 'shared_folder_files'"),
+                         [("shared_folder_files",)])
 
     def test_every_row_is_kept(self):
         """Every row 0.1.5 left is still there, unchanged, in every table."""

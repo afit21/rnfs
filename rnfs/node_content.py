@@ -81,9 +81,10 @@ def sealing_stream(stream: BinaryIO, size: int | None, recipients: list[bytes],
     return seal.SealingReader(stream, recipients, seal_name, size), None
 
 
-def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes],
-                    seal_name: bool) -> builder.Built:
-    """Seal the regular file at path and build it (wrapped under its visible name if wrap)."""
+def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes], seal_name: bool,
+                    options: builder.BuildOptions | None = None) -> builder.Built:
+    """Seal the regular file at path and build it (wrapped under its visible name if wrap), with options (the
+    chunker, and the deny check of the sealed bytes; builder.build_file)."""
     handle, st = builder.open_path(path)
     try:
         if not stat.S_ISREG(st.st_mode):
@@ -92,7 +93,7 @@ def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[by
         sealed_name = name if seal_name and dag.is_valid_name(name) else None
         with os.fdopen(handle, "rb", closefd=False) as f:
             return builder.add_stream(seal.SealingReader(f, recipients, sealed_name), put, None,
-                                      name if wrap else None)
+                                      name if wrap else None, options=options)
     finally:
         builder.close(handle)
 

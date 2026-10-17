@@ -4,7 +4,12 @@ Every top-level file and directory in it is imported as with `add` (copied into 
 pinned with source "folder"; a changed or removed entry releases its old pin. Entries are recognised as
 unchanged by a signature of path, size, modification time and execute bit (recursively for directories),
 remembered across restarts (the state database's shared_folder table, rnfs.statedb: after a scan that changed
-any, the entries changed are written durably), so unchanged entries aren't hashed again.
+any, the entries changed are written durably), so unchanged entries aren't hashed again. Inside an entry that
+changed, a regular file is not read again either if it was imported before and its device, inode, size,
+modification time and execute bit are as they were (FolderFiles, audit D1): its CID is reused while every block of
+it is still stored and none is denied, and its remembered content hash still goes through the deny list's check.
+What the files were built as is kept in the shared_folder_files table, saved with the node's periodic saves and at
+stop, not durably: a power loss costs at most reading some files again.
 
 An entry that fails to import because of its content (an invalid name, the deny list, too large) isn't tried
 again until it changes; one that fails for a reason that may pass (a full or failing disk, a pin that couldn't be
@@ -28,10 +33,10 @@ import time
 from collections.abc import Callable
 
 from rnfs import constants, fsutil, statedb
-from rnfs.content import builder
-from rnfs.content.builder import display_path
+from rnfs.content import builder, chunker, dag
+from rnfs.content.builder import Built, FileState, display_path
 from rnfs.content.cid import Cid
-from rnfs.content.storage import FOLDER, Storage
+from rnfs.content.storage import FOLDER, Session, Storage
 from rnfs.errors import RnfsError, StorageFull
 from rnfs.log import LOG_INFO, LOG_WARNING, log
 
@@ -157,6 +162,169 @@ def loose_ancestor(real: str) -> str | None:
     return None
 
 
+FILES_TABLE = "shared_folder_files"
+
+
+def _parse_state(value) -> FileState:
+    """A builder.file_state saved as a JSON list. Raises ValueError (or TypeError) if it isn't one."""
+    if not (isinstance(value, list) and len(value) == 5 and isinstance(value[4], bool)
+            and all(isinstance(n, int) and not isinstance(n, bool) for n in value[:4]) and value[2] >= 0):
+        raise ValueError(f"not a file state: {value!r}")
+    return value[0], value[1], value[2], value[3], value[4]
+
+
+def _record(built: Built | None) -> tuple | None:
+    """What a FolderFiles row holds of built (its size and kind come from the state), to tell a change."""
+    return None if built is None else (built.cid, built.height, built.digest)
+
+
+class FolderFiles:
+    """The shared folder's per-file cache (audit D1): what each regular file imported from the folder was built as,
+    by its builder.file_state, so the files of a changed entry that didn't change aren't read again.
+
+    Kept per top-level entry: an entry imported again keeps only the files it holds now, and an entry gone takes its
+    files with it. A file is found by its state whatever entry holds it, so one moved to another entry is reused
+    too. Kept in state_dir's state database (FILES_TABLE; only in memory without one), as a node.Store: save()
+    writes the rows changed since the last save (not durably), close() releases the database.
+    """
+
+    def __init__(self, state_dir: str | None = None):
+        """The cache saved in state_dir (empty without one); a row that doesn't parse is logged and deleted."""
+        self._lock = threading.Lock()  # held briefly, never during a build
+        self._entries: dict[str, dict[FileState, Built]] = {}  # entry name -> its files' states and what they built
+        self._index: dict[FileState, Built] = {}  # every entry's files, by state
+        self._stale = False  # _index may hold files no entry holds any more (retain rebuilds it)
+        self._rows: statedb.RowStore | None = None
+        self._db = statedb.open_store(os.path.expanduser(state_dir), self._load) if state_dir else None
+
+    def _load(self, db: statedb.StateDb):
+        """Read FILES_TABLE."""
+        # Saved with the node's batched saves and at stop, outside the lock, not durably: what a power loss takes
+        # is read again
+        self._rows = statedb.RowStore(db, FILES_TABLE, ("name", "state"), durable=False, mode=statedb.SNAPSHOT,
+                                      lock=self._lock, row=self._row, key_values=self._key_values)
+        bad = []
+        for name_text, state_text, binary, height, digest in db.query(
+                f"SELECT name, state, cid, height, digest FROM {FILES_TABLE}"):
+            try:
+                name, state = statedb.load(name_text), _parse_state(statedb.load(state_text))
+                if not isinstance(name, str):
+                    raise TypeError("not a string")
+                if not (isinstance(height, int) and 0 <= height <= constants.MAX_DEPTH):
+                    raise ValueError(f"height {height!r}")
+                if digest is not None and not (isinstance(digest, bytes) and len(digest) == 32):
+                    raise ValueError("not a SHA-256 digest")
+                kind = dag.KIND_EXECUTABLE if state[4] else dag.KIND_FILE
+                built = Built(Cid.from_bytes(binary), state[2], kind, height, digest)
+            except (ValueError, TypeError):
+                log(f"shared folder: ignoring invalid saved file {name_text!r} {state_text!r}", LOG_WARNING)
+                bad.append((name_text, state_text))
+                continue
+            self._entries.setdefault(name, {})[state] = built
+            self._index[state] = built
+        statedb.delete_rows(db, FILES_TABLE, ("name", "state"), bad)
+
+    @staticmethod
+    def _key_values(key: tuple[str, FileState]) -> tuple[str, str]:
+        """The name and state columns of a row's key (entry name, state)."""
+        name, state = key
+        return statedb.dump(name), statedb.dump(list(state))
+
+    def _row(self, key: tuple[str, FileState]) -> tuple | None:
+        """The row of key (entry name, state), or None if it is gone (lock held)."""
+        name, state = key
+        built = self._entries.get(name, {}).get(state)
+        if built is None:
+            return None
+        return (*self._key_values(key), built.cid.binary, built.height, built.digest)
+
+    def save(self):
+        """Write the files changed since the last save. Raises OSError (StateDbError) if the database fails; they
+        are written by the next save."""
+        if self._rows is not None:
+            self._rows.save()
+
+    def close(self):
+        """Release the state database (idempotent)."""
+        if self._db is not None:
+            self._db.close()
+
+    def get(self, state: FileState) -> Built | None:
+        """What the file in state was built as, if known."""
+        with self._lock:
+            return self._index.get(state)
+
+    def update(self, name: str, found: dict[FileState, Built], complete: bool):
+        """Record what an import of entry name found: every file it holds if complete (the import succeeded), else
+        those the import got to, added to what was known (it is tried again, and they are still what they were)."""
+        with self._lock:
+            old = self._entries.get(name, {})
+            self._set(name, dict(found) if complete else {**old, **found})
+            self._index.update(found)
+
+    def retain(self, names: set[str]):
+        """Forget the files of the entries not in names (gone from the folder, or a folder refused), at the end of a
+        scan."""
+        with self._lock:
+            for name in [name for name in self._entries if name not in names]:
+                self._set(name, {})
+            if self._stale:
+                self._index = {state: built for files in self._entries.values() for state, built in files.items()}
+                self._stale = False
+
+    def _set(self, name: str, files: dict[FileState, Built]):
+        """Make files entry name's (none: forget it), noting the rows that change. Lock held."""
+        old = self._entries.get(name, {})
+        if old.keys() - files.keys():
+            self._stale = True
+        if files:
+            self._entries[name] = files
+        else:
+            self._entries.pop(name, None)
+        if self._rows is not None:
+            self._rows.changed(*((name, state) for state in old.keys() | files.keys()
+                                 if _record(old.get(state)) != _record(files.get(state))))
+
+
+class _EntryFiles:
+    """One import's builder.FileCache, over the folder's FolderFiles.
+
+    A file known by its state stands for reading it only while every block of it is stored (protected first, in the
+    import's session, so a collection can't take them before the pin) and none is denied: such a file is read again,
+    and the deny list refuses its blocks' put, failing the import as before. found collects what the import's files
+    were built as, for FolderFiles.update.
+    """
+
+    def __init__(self, files: FolderFiles, storage: Storage, session: Session):
+        """A cache for one import storing through session."""
+        self.files = files
+        self.storage = storage
+        self.session = session
+        self.found: dict[FileState, Built] = {}
+
+    def lookup(self, st: os.stat_result, kind: int) -> Built | None:
+        """builder.FileCache.lookup."""
+        state = builder.file_state(st)
+        known = self.files.get(state)
+        if known is None or known.kind != kind:
+            return None
+        self.session.add(known.cid)
+        if not self.storage.is_complete(known.cid):
+            return None  # a block was evicted, collected or deleted as damaged: read again, which stores it
+        denied = self.storage.deny.cids
+        if denied and self.storage.denied_roots([known.cid], denied):
+            return None
+        self.found[state] = known
+        return known
+
+    def remember(self, st: os.stat_result, built: Built):
+        """builder.FileCache.remember (a file whose execute bit and kind disagree, changed between listing and
+        opening, isn't remembered)."""
+        state = builder.file_state(st)
+        if built.kind == (dag.KIND_EXECUTABLE if state[4] else dag.KIND_FILE):
+            self.found[state] = built
+
+
 class SharedFolder:
     """Keeps the shared folder's entries imported and pinned with source "folder"."""
 
@@ -178,6 +346,8 @@ class SharedFolder:
         self._failed: dict[str, tuple[str, float | None]] = {}
         self._warned: set[str] = set()  # skipped entries already warned about
         try:
+            # What the files inside entries were built as (D1): a store of its own, which the node saves
+            self.files = FolderFiles(state_dir)
             self._load()
         except BaseException:
             self.close()
@@ -221,12 +391,20 @@ class SharedFolder:
         self._saved = dict(self._known)
 
     def close(self):
-        """Release the state database (the node calls this once it has saved everything at shutdown)."""
+        """Release the state database, the per-file cache's too (the node calls this once it has saved everything
+        at shutdown; the cache's changes are saved by files.save(), not here)."""
+        files = getattr(self, "files", None)  # not made if __init__ failed first
+        if files is not None:
+            files.close()
         if self._db is not None:
             self._db.close()
 
-    def scan(self) -> set[Cid]:
-        """Import new and changed entries, release the pins of changed and removed ones; returns the folder's pins."""
+    def scan(self, options: builder.BuildOptions | None = None) -> set[Cid]:
+        """Import new and changed entries, release the pins of changed and removed ones; returns the folder's pins.
+
+        options: the chunker and the deny list's file-hash check every import is built with (builder.BuildOptions;
+        by default those of this context, builder.current_options)."""
+        options = options if options is not None else builder.current_options()
         with self._lock:
             os.makedirs(self.directory, exist_ok=True)
             current: dict[str, tuple[str, Cid]] = {}
@@ -239,18 +417,19 @@ class SharedFolder:
                 # led into the rnfs dir (as 0.1.5 allowed) stops providing what it imported from there
                 items = builder.list_directory(folder) if self._check_target(folder, st) else []
                 for item in items:
-                    result = self._scan_item(folder, item)
+                    result = self._scan_item(folder, item, options)
                     if result is not None:
                         current[item.name] = result
             finally:
                 builder.close(folder)
+            names = {item.name for item in items}
+            self.files.retain(names)
             pins = {cid for _, cid in current.values()}
             for cid in self.storage.pinned_by(FOLDER) - pins:
                 self.storage.unpin(cid, FOLDER)
             if current != self._known:
                 self._known = current
                 self._save()
-            names = {item.name for item in items}
             self._failed = {name: sig for name, sig in self._failed.items() if name in names}
             return pins
 
@@ -278,7 +457,8 @@ class SharedFolder:
             self._warned.add(key)
             log(f"shared folder: {message}", LOG_WARNING)
 
-    def _scan_item(self, folder: builder.Handle, item: os.DirEntry) -> tuple[str, Cid] | None:
+    def _scan_item(self, folder: builder.Handle, item: os.DirEntry,
+                   options: builder.BuildOptions) -> tuple[str, Cid] | None:
         """(signature, CID) of a top-level entry, importing and pinning it if new or changed; None if skipped."""
         path = os.path.join(self.directory, item.name)
         shown = display_path(path)
@@ -302,12 +482,13 @@ class SharedFolder:
             if links:
                 self._warn_once(f"hardlink:{item.name}", f"skipped {shown}: {builder.hard_link_reason(links)}")
                 return None
-            return self._import(item.name, handle, st, path)
+            return self._import(item.name, handle, st, path, options)
         finally:
             builder.close(handle)
 
-    def _import(self, name: str, handle: builder.Handle, st: os.stat_result, path: str) -> tuple[str, Cid] | None:
-        """_scan_item for an entry open as handle."""
+    def _import(self, name: str, handle: builder.Handle, st: os.stat_result, path: str,
+                options: builder.BuildOptions) -> tuple[str, Cid] | None:
+        """_scan_item for an entry open as handle, built with options."""
         shown = display_path(path)
         try:
             sig = open_signature(handle, st, path)
@@ -324,20 +505,33 @@ class SharedFolder:
         if failed is not None and failed[0] == sig and (failed[1] is None or self.clock() < failed[1]):
             return None
         warnings: list[str] = []
+        files: _EntryFiles | None = None
         try:
             with self.storage.protect() as session:
+                # What files were built as is reused only for the chunker it was built with (the folder's: fixed)
+                if options.chunker == chunker.FIXED:
+                    files = _EntryFiles(self.files, self.storage, session)
                 with session.writer() as put:
-                    built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True)
+                    built = builder.build_open(handle, st, path, put, warnings, skip_hard_links=True, options=options,
+                                               cache=files)
                 self.storage.pin(built.cid, FOLDER)
         except (OSError, StorageFull) as e:  # may pass (a full or failing disk, a pin not saved): tried again later
             self._failed[name] = (sig, self.clock() + RETRY_AFTER)
             log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
+            self._keep_files(name, files, complete=False)
             return None
         except (ValueError, RnfsError) as e:  # the content's: not until it changes
             self._failed[name] = (sig, None)
             log(f"shared folder: couldn't import {shown}: {e}", LOG_WARNING)
+            self._keep_files(name, files, complete=False)
             return None
+        self._keep_files(name, files, complete=True)
         for warning in warnings:
             log(f"shared folder: {warning}", LOG_WARNING)
         log(f"shared folder: imported {shown} as {built.cid}", LOG_INFO)
         return sig, built.cid
+
+    def _keep_files(self, name: str, files: _EntryFiles | None, complete: bool):
+        """Record in self.files what an import of entry name found its files built as (FolderFiles.update)."""
+        if files is not None:
+            self.files.update(name, files.found, complete)
