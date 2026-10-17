@@ -156,6 +156,11 @@ Changed:
   (the fetcher's `/blocks` worker, the lookup's routing-table callbacks, sending a request on a link, path
   lookups, the peers listing) are logged as warnings with their traceback in the debug log (the last two at most
   once a minute).
+- Stopping the node is exception-safe: every step (features, announcer, request server, names, saves, closing
+  the state database, releasing an embedded node's destination) runs even if an earlier one fails, so a failing
+  step no longer leaves the database open or the `rnfs.dht` destination registered in a host program. Stopping
+  waits at most 5 s in all for the features' threads and the node's own (LXMF and jobs no longer add 2 s each),
+  and remote-pin fetches stop with the node (their pins are fetched at the next start).
 - A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
   that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
   nodes they complete within 12 queries); peers see fewer `/find` requests.
