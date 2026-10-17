@@ -2,6 +2,7 @@
 seniority, hops and bitrate; the upload budget, interface rules and quiet hours on /blocks; traffic counters
 and `rnfs peers` on an offline node."""
 import os
+import sys
 import tempfile
 import threading
 import types
@@ -10,7 +11,7 @@ from unittest import mock
 
 import RNS
 
-from rnfs import mesh
+from rnfs import log, mesh
 from rnfs.config import Config
 from rnfs.constants import BLOCKS_PATH, FIND_PATH, KIB, MAX_RESPONSE_SIZE
 from rnfs.features import peers as peers_feature
@@ -24,6 +25,14 @@ from tests.test_names import FakeNetwork
 from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource, block_of
 
 P1, P2, P3, P4 = (bytes([i]) * 16 for i in (1, 2, 3, 4))
+
+
+def recorder(logged: list):
+    """A stand-in for rnfs.log.log appending (message, level, the type of the exception being handled) to logged."""
+    def record(message, level=log.LOG_INFO):
+        """Record the line and whether it was logged inside an except."""
+        logged.append((message, level, sys.exc_info()[0]))
+    return record
 
 _saved_loglevel = RNS.loglevel
 
@@ -200,6 +209,18 @@ class RnsPathsTest(unittest.TestCase):
         self.assertEqual(self.paths.info(P3), mesh.PathInfo(2, None, None))  # the instance has no path
         self.assertEqual(self.paths.info(P4), mesh.NO_PATH)
         self.assertEqual(self.instance.calls["next_hop"], 3)  # none for P4: no local path, no question
+
+    def test_rns_failure_logged_with_its_traceback(self):
+        """RNS failing to answer is a bug or an RNS change: logged at LOG_WARNING inside the except (so the debug
+        log has the traceback), at most once a minute; the path is unknown."""
+        self.paths._failure_log = log.ThrottledLog(60.0, self.clock)
+        logged = []
+        with mock.patch.object(RNS.Transport, "has_path", side_effect=TypeError("renamed")), \
+                mock.patch("rnfs.log.log", recorder(logged)):
+            self.assertEqual(self.paths.info(P1), mesh.NO_PATH)
+            self.assertEqual(self.paths.info(P2), mesh.NO_PATH)
+        self.assertEqual([(level, raised) for _, level, raised in logged], [(RNS.LOG_WARNING, TypeError)])
+        self.assertIn("renamed", logged[0][0])
 
     def test_interface_reused_for_at_most_path_cache(self):
         self.paths.info(P1)
@@ -636,6 +657,32 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertIsNone(listed[P1.hex()]["hops"])  # offline: no paths known
         lines = peers_feature.format_peers(list(listed.values()), 0)
         self.assertEqual(len(lines), 5)
+
+    def test_listing_failures_logged_with_their_traceback(self):
+        """What a listing can't read is left out and logged at LOG_WARNING inside the except (so the debug log has
+        the traceback), at most once a minute for the feature."""
+        clock = FakeClock()
+        self.feature._failure_log = log.ThrottledLog(60.0, clock)
+        logged = []
+
+        def broken(*args):
+            """A bug or an RNS change."""
+            raise TypeError("renamed")
+        self.node.client.open_links = broken
+        with mock.patch("rnfs.log.log", recorder(logged)):
+            self.assertEqual(self.feature.peers(), [])
+            self.feature.peers()  # within the minute: counted, not logged
+        self.assertEqual([(level, raised) for _, level, raised in logged], [(RNS.LOG_WARNING, TypeError)])
+        self.assertIn("open links", logged[0][0])
+        del self.node.client.open_links
+        self.node.client.rate_estimate = broken
+        clock.now += 60
+        with mock.patch("rnfs.log.log", recorder(logged)):
+            (listed,) = self.feature.peers()
+        self.assertIsNone(listed["rate"])
+        self.assertEqual([(level, raised) for _, level, raised in logged[1:]], [(RNS.LOG_WARNING, TypeError)])
+        self.assertIn("rate estimate", logged[1][0])
+        self.assertIn("(1 more since the last)", logged[1][0])
 
     def test_paths_from_one_lookup(self):
         asked = []

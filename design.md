@@ -23,14 +23,19 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
   `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set
-  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel.
+  (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel. `ThrottledLog(interval, clock)`
+  logs one line about a kind of event at most every interval (60 s), with a count of those left out; `due()` is
+  the check alone. The response guards, the request rate limit (`RequestServer._over_rate`), `RnsPaths` and the
+  peers listing use it. An unexpected exception caught by a broad `except` (a `# noqa: BLE001` reason says why
+  it's caught) is logged at `LOG_WARNING` inside the `except`, so the debug log gets its traceback: among them the
+  fetcher's `/blocks` worker, the lookup's routing-table callbacks and `LinkPool.request`.
 - `rnfs/debuglog.py` — the debug log file (`debug_log`, `daemon --debug-log`), `<rnfs dir>/debug.log` (0600),
   started by the daemon before the node: version first, then every rnfs message (warnings and errors logged in
   an `except` block with their traceback), RNS's own log lines at Info or more severe (`RNS_LEVEL`; copied from
   `RNS.logdest = LOG_CALLBACK`, which still prints all of them), threads that die (`threading.excepthook`), a status line every 5 minutes (`status_line`:
   the node's status, open links, each interface up or down), and gateway requests, numbered (`tag`). Each start
   and every 16 MiB moves the file to `debug.log.1`. Lookups report their queries through `Lookup(report=)` (dht
-  stays free of RNS), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
+  stays free of RNS at import), links their path, close reason and each request's outcome, all at `LOG_DEBUG`.
 - `rnfs/fsutil.py` — the one platform switch (`IS_WINDOWS`), `O_BINARY`, and `replace`/`remove` that retry for
   about a second on Windows while another handle holds the file; `rename_new` (rename onto a path that must not
   exist; atomic through `renameat2(RENAME_NOREPLACE)` on Linux or a hard link, else check then rename);

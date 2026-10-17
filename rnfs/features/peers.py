@@ -28,6 +28,9 @@ class PeersFeature(Feature):
         super().__init__(node)
         traffic = getattr(node.client, "traffic", None)
         self.traffic: mesh.Traffic = traffic if isinstance(traffic, mesh.Traffic) else mesh.Traffic()
+        from rnfs.log import ThrottledLog  # here, not at module level: it loads RNS, and the CLI imports features
+        # A listing that can't read something is a bug or an RNS change, met per peer: a line a minute
+        self._failure_log = ThrottledLog()
 
     def status(self) -> dict:
         """Traffic totals and airtime refusals for `rnfs status`."""
@@ -54,7 +57,8 @@ class PeersFeature(Feature):
         counters = self.traffic.peers()
         try:
             linked = set(node.client.open_links())
-        except Exception:  # noqa: BLE001 - a listing shows what it can
+        except Exception as e:  # noqa: BLE001 - a listing shows what it can; logged
+            self._failed(f"couldn't list the open links: {e!r}")
             linked = set()
         ids = [n for n in dict.fromkeys([*routing.nodes(), *linked, *reversed(list(counters))]) if n != node.node_id]
         ids = ids[:mesh.MAX_PEERS]
@@ -69,7 +73,8 @@ class PeersFeature(Feature):
             if node_id in linked:
                 try:
                     rate = node.client.rate_estimate(node_id)
-                except Exception:  # noqa: BLE001 - a listing shows what it can
+                except Exception as e:  # noqa: BLE001 - a listing shows what it can; logged
+                    self._failed(f"couldn't read the rate estimate of {node_id.hex()}: {e!r}")
                     rate = None
             peers.append({
                 "node_id": node_id.hex(),
@@ -107,7 +112,8 @@ class PeersFeature(Feature):
             if app_data is None:
                 return None
             return "server" if parse_mode(app_data) == MODE_SERVER else "client"
-        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
+        except Exception as e:  # noqa: BLE001 - RNS internals: unknown if they fail; logged
+            self._failed(f"couldn't read {node_id.hex()}'s last announce from RNS: {e!r}")
             return None
 
     def _recalled_heard(self, node_id: bytes) -> float | None:
@@ -118,8 +124,14 @@ class PeersFeature(Feature):
             import RNS
             entry = RNS.Identity.known_destinations.get(node_id)
             return float(entry[0]) if entry else None
-        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
+        except Exception as e:  # noqa: BLE001 - RNS internals: unknown if they fail; logged
+            self._failed(f"couldn't read when RNS last heard {node_id.hex()}: {e!r}")
             return None
+
+    def _failed(self, message: str):
+        """Log, at most once a minute, that a listing couldn't read something. Called inside the except, so the
+        debug log has the traceback."""
+        self._failure_log(f"peers: {message}", _common.LOG_WARNING)
 
     # API
 

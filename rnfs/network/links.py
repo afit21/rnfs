@@ -500,7 +500,8 @@ class LinkPool:
                                             progress_callback=exchange.on_progress,
                                             timeout=None, max_response_size=max_response_size)
             except Exception as e:  # noqa: BLE001 - a failed send is a failed request; logged
-                log(f"could not send {path} to {node_name(peer.node_id)}: {e}", LOG_VERBOSE)
+                # Link.request answers False when it can't send (a closed link too), so an exception is a bug
+                log(f"could not send {path} to {node_name(peer.node_id)}: {e!r}", LOG_WARNING)
                 return exchange
             if not receipt:
                 log(f"could not send {path} to {node_name(peer.node_id)}", LOG_VERBOSE)

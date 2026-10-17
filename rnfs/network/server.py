@@ -29,7 +29,7 @@ from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
                             MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
-from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
+from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
 from rnfs.network.identity import node_id_for_identity
 from rnfs.network.links import close_reason
@@ -728,8 +728,7 @@ class RequestServer:
         self.wake = threading.Event()
         self.pin_identities = {h.strip().strip("<>").lower() for h in config.remote_pin_identities}
         self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
-        self.over_rate_logged_at: float | None = None
-        self.over_rate_logged = 0
+        self.over_rate_log = ThrottledLog(OVER_RATE_LOG_INTERVAL, clock)
 
         # Reject request Resources, compressed ones and advertisements whose transfer outgrows their size: on
         # every link in the daemon, which also turns RNS's compression off process-wide, or on rnfs.dht links
@@ -866,12 +865,10 @@ class RequestServer:
         """Count a request over its link's rate limit, logging at most once a minute."""
         with self.lock:
             self.over_rate += 1
-            now = self.clock()
-            if self.over_rate_logged_at is not None and now - self.over_rate_logged_at < OVER_RATE_LOG_INTERVAL:
-                return
-            dropped, self.over_rate_logged, self.over_rate_logged_at = (self.over_rate - self.over_rate_logged,
-                                                                        self.over_rate, now)
-        log(f"refused or dropped {plural(dropped, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
+        skipped = self.over_rate_log.due()
+        if skipped is None:
+            return
+        log(f"refused or dropped {plural(skipped + 1, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
             f"once, {REQUEST_RATE:g} a second)", LOG_WARNING)
 
     def _is_member(self, remote_identity) -> bool:
