@@ -1084,6 +1084,11 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
+- Many LXMF identities can keep the strangers' bucket empty (one message a minute, each from a new identity,
+  is enough), so no other untrusted sender's message is kept; contacts and other trusted senders are unaffected
+  (section 13). The node counts the messages dropped this way (`status`'s `untrusted_dropped`), so apps can
+  suggest adding the senders the user expects as contacts. LXMF stamps (proof of work) would make each message
+  cost the sender, but announcing a stamp cost changes the announce and refuses senders that haven't heard it.
 - RNS decrypts and decodes every request packet and starts a thread for it before rnfs sees it, so a link
   sending requests as fast as its interface carries them still costs the node that work (about 0.14 ms of CPU
   each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
@@ -1167,7 +1172,7 @@ are local conveniences, not part of the protocol.
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1559,7 +1564,9 @@ unreserved, pct-encoded: as in RFC 3986
   message without pins is left; a new message from an untrusted sender that would need one dropped is not
   kept. New messages from untrusted senders are also rate limited: each sender has an allowance of 4 at once,
   then one per 15 minutes, and within it messages are taken from a node-wide bucket of 32 at once, then one
-  per minute; others are not kept. So one sender can't keep the node-wide bucket empty for everyone else. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
+  per minute; others are not kept, and counted (`untrusted_dropped` in `status`). So one sender can't keep the
+  node-wide bucket empty for everyone else (many can: section 10, Limits). Each message's record is at most 16
+  KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
   `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many

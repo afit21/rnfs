@@ -879,6 +879,7 @@ class LxmfFeature(features.Feature):
         self._untrusted_tokens = float(UNTRUSTED_BURST)
         self._untrusted_at: float | None = None
         self._untrusted_dry = False  # logged (notice) that the bucket ran dry; verbose until a token is taken
+        self._untrusted_dropped = 0  # untrusted senders' messages the rate limits dropped since the start
         self._sender_tokens: OrderedDict[bytes, tuple[float, float]] = OrderedDict()  # sender -> (tokens, when)
         self._auto_wanted = threading.Condition()
         self._stop = threading.Event()
@@ -1033,9 +1034,11 @@ class LxmfFeature(features.Feature):
         self.outbox.close()
 
     def status(self) -> dict:
-        """The LXMF address (None when off) and the number of inbox messages."""
+        """The LXMF address (None when off), the number of inbox messages, and how many messages from untrusted
+        senders the rate limits dropped since the start: many identities can keep the strangers' bucket empty, so
+        a rising count is a reason to add the senders the user expects as contacts."""
         return {"lxmf_address": self.network.address.hex() if self.network is not None else None,
-                "lxmf_inbox": len(self.inbox)}
+                "lxmf_inbox": len(self.inbox), "untrusted_dropped": self._untrusted_dropped}
 
     def _require_network(self):
         """The network, or ValueError explaining why LXMF is off."""
@@ -1243,7 +1246,9 @@ class LxmfFeature(features.Feature):
             _log(f"message {message_hash} from {sender} not kept: too many new messages from this sender, or from "
                  f"senders not in contacts, lxmf_accept_from or lxmf_auto_fetch_from",
                  LOG_VERBOSE if self._untrusted_dry else LOG_NOTICE)
-            self._untrusted_dry = True
+            with self._lock:
+                self._untrusted_dry = True
+                self._untrusted_dropped += 1
             return None
         with self._lock:
             # A sender not trusted with auto-fetch gets INBOX_PER_SENDER records, so one can't push out others',
