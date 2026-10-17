@@ -116,6 +116,9 @@ class Job:
                 self.downloaded_bytes += length
                 if not self._samples or now - self._samples[-1][0] >= SAMPLE_INTERVAL:
                     self._samples.append((now, self.downloaded_bytes))
+                    # Prune here too, not only in rate(): a job nobody polls would otherwise keep a sample a
+                    # second for as long as it runs (about 10 MB a day)
+                    self._prune(now)
             if cid in self._seen:
                 return
             self._seen.add(cid)
@@ -139,15 +142,19 @@ class Job:
             self._seen = set()
             self._samples = deque([(time.monotonic(), 0)])
 
+    def _prune(self, now: float):
+        """Drop samples older than RATE_WINDOW, keeping one at or before the window's start as the base to
+        measure from. Called with _lock held."""
+        while len(self._samples) > 1 and self._samples[1][0] <= now - RATE_WINDOW:
+            self._samples.popleft()
+
     def rate(self, now: float | None = None) -> float | None:
         """Bytes/s downloaded over the last RATE_WINDOW of a running job (it decays while nothing arrives)."""
         now = time.monotonic() if now is None else now
         with self._lock:
             if self.state != RUNNING or not self._samples:
                 return None
-            # Keep one sample at or before the window's start, as the base to measure from
-            while len(self._samples) > 1 and self._samples[1][0] <= now - RATE_WINDOW:
-                self._samples.popleft()
+            self._prune(now)
             since, base = self._samples[0]
             downloaded = self.downloaded_bytes
         elapsed = now - since
