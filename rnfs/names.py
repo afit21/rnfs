@@ -31,6 +31,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import RNS
@@ -273,7 +274,7 @@ def import_floor(value: dict, tx) -> int:
     first, replace the name_floor rows, each checked as rnfs 0.1.4 loaded it: one that doesn't parse is skipped
     (and counted in a warning), one without a valid resolve time counts as resolved long ago, and a name listed
     twice keeps the higher sequence, at its later place. Held names, future times and the floor's bound are left
-    to the load (_load_floor). Returns the number of entries imported."""
+    to the load (_NameFloor.load). Returns the number of entries imported."""
     floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
     skipped = 0
     for entry in value["floor"]:
@@ -382,6 +383,224 @@ class NameAnnounceHandler:
         self._on_announce(destination_hash, app_data, announce_packet_hash)
 
 
+# The floor
+
+
+class _NameFloor(Mapping):
+    """The highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), and when it was last
+    resolved (wall clock), least recently resolved first, persisted in the name_floor table. One value per name,
+    (sequence, resolved, used), used being its row's place in the table; read as a mapping of name -> (sequence,
+    resolved).
+
+    At most FLOOR_FACTOR × name_table_size names (size()), more (up to FLOOR_HARD_FACTOR times that) while those
+    resolved within FLOOR_KEEP_AGE need the room (trim). Saved, so such a resolve never goes back after table churn
+    or a restart: at once, or FLOOR_SAVE_INTERVAL after the last save (a timer), writing only the rows changed.
+
+    Changed only under the manager's lock, which every caller but save() holds; save() snapshots the rows under it
+    and writes without it.
+    """
+
+    def __init__(self, db, lock, clock, monotonic, size):
+        """An empty floor over the state database db (load() reads it); lock is the manager's, clock and monotonic
+        its clocks, and size() how many names the floor holds before trimming."""
+        self._db = db
+        self._lock = lock
+        self._clock = clock  # resolve times: persisted, so wall clock
+        self._monotonic = monotonic  # save pacing
+        self._size = size
+        self._entries: OrderedDict[bytes, tuple[int, float, int]] = OrderedDict()
+        self._next_used = 0  # above every used value given out
+        self._changed: set[bytes] = set()  # names whose row the next save writes (or deletes)
+        self._dirty = False  # a save is due
+        self._saved_at = float("-inf")  # monotonic time of the last save
+        self._timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
+        self._closed = False  # close() has run: no timer is started
+        # Saves write without the lock, one at a time, so an older snapshot never lands last. Taken before the
+        # manager's lock, never while holding it
+        self._save_lock = threading.Lock()
+
+    # Reading: name -> (sequence, resolved)
+
+    def __getitem__(self, name: bytes) -> tuple[int, float]:
+        """name's (sequence, resolve time); KeyError if it has no entry."""
+        sequence, resolved, _ = self._entries[name]
+        return sequence, resolved
+
+    def __iter__(self):
+        """The names, least recently resolved first."""
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        """How many names the floor holds."""
+        return len(self._entries)
+
+    def __contains__(self, name) -> bool:
+        """True if name has an entry."""
+        return name in self._entries
+
+    # Changes; callers hold the manager's lock
+
+    def raise_to(self, name: bytes, sequence: int):
+        """A higher record was accepted for name: raise its entry (if it has one) to sequence, keeping its place and
+        resolve time, and save it within FLOOR_SAVE_INTERVAL (by the timer, since callers hold the lock, some on
+        RNS's thread)."""
+        entry = self._entries.get(name)
+        if entry is not None and sequence > entry[0]:
+            self._entries[name] = (sequence, entry[1], entry[2])
+            self._changed.add(name)
+            self._dirty = True
+            self.save_soon(inline=False)
+
+    def drop(self, name: bytes):
+        """Forget name (held for the user now: its held record is its floor); the next save deletes its row."""
+        if self._entries.pop(name, None) is not None:
+            self._changed.add(name)
+            self._dirty = True
+
+    def resolved(self, name: bytes, sequence: int) -> bool:
+        """A resolve without persist returned name's record at sequence: it becomes the most recently resolved, and
+        its sequence the floor for later resolves (trim says which are forgotten). A floor raised (or a new one) is
+        saved at once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little. True if the
+        caller is to save it now (save()), once it has released the lock."""
+        now = self._clock()
+        previous = self._entries.pop(name, None)
+        # Last, with a new used value: the most recently resolved
+        self._entries[name] = (sequence if previous is None else max(previous[0], sequence), now, self._next_used)
+        self._next_used += 1
+        self._changed.add(name)  # written by the next save, even if this change doesn't call for one
+        trimmed = self.trim()
+        if previous is None or self._entries[name][0] != previous[0] or trimmed:
+            self._dirty = True
+            return self.save_soon()
+        if not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
+            self._dirty = True  # only its time renewed: saved with the next change or by announce_due
+        return False
+
+    def trim(self) -> bool:
+        """Forget the least recently resolved names over size(), but not those resolved within FLOOR_KEEP_AGE unless
+        the floor holds FLOOR_HARD_FACTOR times that. True if any went."""
+        size = self._size()
+        now = self._clock()
+        trimmed = False
+        while len(self._entries) > size:
+            _, at, _ = next(iter(self._entries.values()))
+            if len(self._entries) <= FLOOR_HARD_FACTOR * size and now - at < FLOOR_KEEP_AGE:
+                break
+            name, _ = self._entries.popitem(last=False)
+            self._changed.add(name)
+            trimmed = True
+        return trimmed
+
+    def save_soon(self, inline: bool = True) -> bool:
+        """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
+        has released the lock; else it is saved once it is (a timer). Without inline, a save due now is the
+        timer's too, started at once."""
+        wait = self._saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
+        if wait <= 0 and inline:
+            return True
+        if self._timer is None and not self._closed:
+            timer = threading.Timer(max(0.0, wait), self._save_later)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+        return False
+
+    def cancel_timer(self):
+        """Cancel a save waiting for its time (stop() saves at once instead)."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def close(self):
+        """Start no timer from now on, and cancel a waiting one."""
+        self._closed = True
+        self.cancel_timer()
+
+    # Loading and saving
+
+    def load(self, held):
+        """Read the name_floor rows, least recently resolved first. A row that doesn't parse is logged and deleted
+        (the floor only bounds rollback of gateway and auto-fetch resolves), as are those of names in held (resolved
+        for the user since: their held record is their floor) and those trim drops. A resolve time in the future
+        (the clock was corrected since) counts as now, and is written so by the next save that has a change to
+        write."""
+        now = self._clock()
+        dropped = []
+        for name, sequence, resolved, used in self._db.query(
+                "SELECT name, sequence, resolved, used FROM name_floor ORDER BY used"):
+            try:
+                _check_name(name)
+                sequence = _sequence(sequence)
+                if not 0 <= sequence <= MAX_SEQUENCE:
+                    raise ValueError(f"sequence {sequence} out of range")
+                if type(resolved) not in (int, float) or not math.isfinite(resolved):
+                    raise ValueError(f"invalid resolve time {resolved!r}")
+                if type(used) is not int or not 0 <= used < _MAX_USED:
+                    raise ValueError(f"invalid used value {used!r}")
+            except (TypeError, ValueError) as e:
+                log(f"dropping an invalid name floor entry {name!r}: {e}", LOG_WARNING)
+                dropped.append(name)
+                continue
+            if name in held:
+                dropped.append(name)
+                continue
+            self._entries[name] = (sequence, min(float(resolved), now), used)
+            self._next_used = max(self._next_used, used + 1)
+            if resolved > now:
+                self._changed.add(name)
+        self.trim()
+        trimmed = [name for name in self._changed if name not in self._entries]
+        self._changed.difference_update(trimmed)
+        if dropped or trimmed:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM name_floor WHERE name = ?", [(name,) for name in dropped + trimmed])
+
+    def _snapshot(self) -> tuple[set[bytes], list[tuple], list[tuple]]:
+        """(the names changed, the rows to write for them, the rows to delete), taken as saved. The lock held."""
+        changed, self._changed = self._changed, set()
+        rows = [(name, str(self._entries[name][0]), self._entries[name][1], self._entries[name][2])
+                for name in changed if name in self._entries]
+        gone = [(name,) for name in changed if name not in self._entries]
+        self._dirty = False
+        return changed, rows, gone
+
+    def save(self):
+        """Write the entries changed (or forgotten) since the last save, if a save is due, with synchronous=NORMAL.
+        Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds thousands of names),
+        the timer, announce_due (at least every minute while running) and stop().
+
+        Called without the lock: only the rows are made under it, so resolves and announces needn't wait for the
+        write. The save counts from when they were made; a failed one is retried by the next."""
+        with self._save_lock:
+            with self._lock:
+                if not self._dirty:
+                    return
+                changed, rows, gone = self._snapshot()
+                saved_at, self._saved_at = self._saved_at, self._monotonic()
+            saved = False
+            try:
+                try:
+                    with self._db.transaction() as tx:
+                        tx.executemany("DELETE FROM name_floor WHERE name = ?", gone)
+                        tx.executemany("INSERT OR REPLACE INTO name_floor (name, sequence, resolved, used) "
+                                       "VALUES (?, ?, ?, ?)", rows)
+                    saved = True
+                except OSError as e:
+                    log(f"could not save the name floor: {e}", LOG_WARNING)
+            finally:
+                if not saved:
+                    with self._lock:
+                        self._changed |= changed
+                        self._dirty = True
+                        self._saved_at = saved_at
+
+    def _save_later(self):
+        """The timer's save."""
+        with self._lock:
+            self._timer = None
+        self.save()
+
+
 # Names
 
 
@@ -419,21 +638,6 @@ class NameManager:
         # name this node isn't resolving and doesn't know may only take the place of one of these, so a flood of
         # new names can't push out the names it resolved
         self._heard_only: OrderedDict[bytes, None] = OrderedDict()
-        # Highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), and when it was last
-        # resolved (wall clock), least recently resolved first; at most FLOOR_FACTOR × name_table_size, more (up to
-        # FLOOR_HARD_FACTOR times that) while those resolved within FLOOR_KEEP_AGE need the room. Saved, so such a
-        # resolve never goes back after table churn or a restart
-        self._floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
-        self._floor_used: dict[bytes, int] = {}  # each floor name's used value, its place in the name_floor table
-        self._floor_next_used = 0  # above every used value given out
-        self._floor_changed: set[bytes] = set()  # floor names whose row the next save writes (or deletes)
-        self._floor_dirty = False  # a floor save is due
-        self._floor_saved_at = float("-inf")  # monotonic time of the last floor save
-        self._floor_timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
-        self._closed = False  # close() has run: no floor timer is started
-        # Floor saves write without self._lock, one at a time, so an older snapshot never lands last. Taken before
-        # self._lock, never while holding it
-        self._floor_save_lock = threading.Lock()
         self._held_dirty = False  # held records changed without a save (heard again, or a save that failed)
 
         self._destinations: dict[str, object] = {}
@@ -464,10 +668,12 @@ class NameManager:
 
         self._remove_old_temps()
         self._db = statedb.connect(config.state_dir)
+        # The highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), bounded and saved
+        self._floor = _NameFloor(self._db, self._lock, clock, monotonic, self._floor_size)
         try:
             self._load_keys()
             self._load_state()
-            self._load_floor()
+            self._floor.load(self._held)
         except BaseException:
             self._db.close()
             raise
@@ -640,10 +846,7 @@ class NameManager:
             # A freshly imported key: its previous home may have published sequences we've never heard, which
             # keepers may hold after its announces have expired (section 9: above the highest it can resolve)
             self._offer_kept(name)
-            self._refresh(name)
-            if self.keepers is not None:
-                for sequence, kept_cid, heard in self.keepers.query(name):
-                    self.offer(name, sequence, kept_cid, heard)
+            self._refresh_name(name, ask="always")
 
         with self._lock:
             if self.name(alias) != name:  # NotFound if removed while refreshing
@@ -717,19 +920,14 @@ class NameManager:
             for events in self._waiters.values():
                 for event in events:
                     event.set()
-            if self._floor_timer is not None:
-                self._floor_timer.cancel()
-                self._floor_timer = None
+            self._floor.cancel_timer()
             self._save()
-        self._save_floor()
+        self._floor.save()
 
     def close(self):
         """Release the state database, once stop() has saved everything (idempotent)."""
         with self._lock:
-            self._closed = True
-            if self._floor_timer is not None:
-                self._floor_timer.cancel()
-                self._floor_timer = None
+            self._floor.close()
         self._db.close()
 
     def announce_due(self) -> float:
@@ -745,7 +943,7 @@ class NameManager:
                 wait = self.config.announce_interval
             else:
                 wait = max(0.0, min(self._next_announce.values()) - now)
-        self._save_floor()
+        self._floor.save()
         return wait
 
     def run(self, stop_event: threading.Event):
@@ -820,16 +1018,7 @@ class NameManager:
             # This node's own names need no refresh, unless imported and not yet published here
             local = alias is not None and not self._published[alias].unsettled
         if not local and not fresh:
-            started = self._clock()
-            self._refresh(name)
-            if self.keepers is not None:
-                with self._lock:
-                    self._absorb_recalled(name)
-                    record = self._record(name, touch=False)
-                # Nothing heard during the refresh: the owner and the paths may be gone, so ask keepers
-                if record is None or record.heard < started or self.keepers.always_ask():
-                    for sequence, cid, heard in self.keepers.query(name):
-                        self.offer(name, sequence, cid, heard)
+            self._refresh_name(name, ask="if_unheard")
 
         # Again: the bounded table may have evicted it meanwhile, letting a replayed announce in
         self._offer_kept(name)
@@ -848,8 +1037,29 @@ class NameManager:
             result = {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
                       "age": max(0.0, self._clock() - record.heard)}
         if save_floor:
-            self._save_floor()
+            self._floor.save()
         return result
+
+    def _refresh_name(self, name: bytes, *, ask: str):
+        """Ask the network for name's newest record (_refresh), then keepers, offering what they answer. ask is
+        "always" (the first publish of an imported key: its previous home's sequences may be held by keepers alone)
+        or "if_unheard" (a resolve: only if nothing was heard during the refresh, or keeper_query is "always").
+        Called without the lock."""
+        if ask not in ("always", "if_unheard"):
+            raise ValueError(f"ask is 'always' or 'if_unheard', not {ask!r}")
+        started = self._clock()
+        self._refresh(name)
+        if self.keepers is None:
+            return
+        if ask == "if_unheard":
+            with self._lock:
+                self._absorb_recalled(name)
+                record = self._record(name, touch=False)
+            # Heard during the refresh: the owner (or a path to it) answered. If not, it and the paths may be gone
+            if record is not None and record.heard >= started and not self.keepers.always_ask():
+                return
+        for sequence, cid, heard in self.keepers.query(name):
+            self.offer(name, sequence, cid, heard)
 
     def _offer_kept(self, name: bytes):
         """Offer the signed record keepers hold for name, so it is a floor no replayed announce gets under.
@@ -1031,12 +1241,7 @@ class NameManager:
                 self._heard_only[name] = None
         self._table[name] = record
         self._touch(name)
-        floor = self._floor.get(name)
-        if floor is not None and record.sequence > floor[0]:
-            self._floor[name] = (record.sequence, floor[1])
-            self._floor_changed.add(name)
-            self._floor_dirty = True
-            self._save_floor_soon(inline=False)
+        self._floor.raise_to(name, record.sequence)
         if len(self._table) > limit:  # name_table_size 0: nothing is kept
             self._drop_from_table(name)
         return True
@@ -1056,66 +1261,14 @@ class NameManager:
         """name's record is held now: out of the table, and out of the floor (its held record is its floor), whose
         row the next floor save deletes."""
         self._drop_from_table(name)
-        if self._floor.pop(name, None) is not None:
-            del self._floor_used[name]
-            self._floor_changed.add(name)
-            self._floor_dirty = True
+        self._floor.drop(name)
 
     def _resolved(self, name: bytes, sequence: int) -> bool:
         """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
-        floor for later resolves (_trim_floor says which are forgotten). A floor raised (or a new one) is saved at
-        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little. True if the caller
-        is to save it now, once it has released the lock."""
+        floor for later resolves (_NameFloor.resolved). True if the caller is to save the floor now, once it has
+        released the lock."""
         self._heard_only.pop(name, None)
-        now = self._clock()
-        previous = self._floor.pop(name, None)
-        self._floor[name] = (sequence if previous is None else max(previous[0], sequence), now)
-        self._floor_used[name] = self._floor_next_used  # last: the most recently resolved
-        self._floor_next_used += 1
-        self._floor_changed.add(name)  # written by the next save, even if this change doesn't call for one
-        trimmed = self._trim_floor()
-        if previous is None or self._floor[name][0] != previous[0] or trimmed:
-            self._floor_dirty = True
-            return self._save_floor_soon()
-        if not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
-            self._floor_dirty = True  # only its time renewed: saved with the next change or by announce_due
-        return False
-
-    def _trim_floor(self) -> bool:
-        """Forget the least recently resolved names over FLOOR_FACTOR × name_table_size, but not those resolved
-        within FLOOR_KEEP_AGE unless the floor holds FLOOR_HARD_FACTOR times that. True if any went."""
-        size = self._floor_size()
-        now = self._clock()
-        trimmed = False
-        while len(self._floor) > size:
-            _, at = next(iter(self._floor.values()))
-            if len(self._floor) <= FLOOR_HARD_FACTOR * size and now - at < FLOOR_KEEP_AGE:
-                break
-            name, _ = self._floor.popitem(last=False)
-            del self._floor_used[name]
-            self._floor_changed.add(name)
-            trimmed = True
-        return trimmed
-
-    def _save_floor_soon(self, inline: bool = True) -> bool:
-        """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
-        has released the lock; else it is saved once it is (a timer). Without inline, a save due now is the
-        timer's too, started at once."""
-        wait = self._floor_saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
-        if wait <= 0 and inline:
-            return True
-        if self._floor_timer is None and not self._closed:
-            timer = threading.Timer(max(0.0, wait), self._save_floor_later)
-            timer.daemon = True
-            self._floor_timer = timer
-            timer.start()
-        return False
-
-    def _save_floor_later(self):
-        """The timer's save."""
-        with self._lock:
-            self._floor_timer = None
-        self._save_floor()
+        return self._floor.resolved(name, sequence)
 
     def _floor_size(self) -> int:
         """How many names the floor holds, past which only names resolved within FLOOR_KEEP_AGE are kept."""
@@ -1255,77 +1408,6 @@ class NameManager:
             # A key with no saved record (the state was lost, or the key copied in by hand) may have been
             # published elsewhere: treated as imported, so its first publish looks for its records first
             self._published.setdefault(alias, _Published(0, None, imported=True))
-
-    def _load_floor(self):
-        """Read the floor of names resolved without persist, least recently resolved first. A row that doesn't
-        parse is logged and deleted (the floor only bounds rollback of gateway and auto-fetch resolves), as are
-        those of names held for the user and those _trim_floor drops. A resolve time in the future (the clock was
-        corrected since) counts as now, and is written so by the next floor save that has a change to write."""
-        now = self._clock()
-        dropped = []
-        for name, sequence, resolved, used in self._db.query(
-                "SELECT name, sequence, resolved, used FROM name_floor ORDER BY used"):
-            try:
-                _check_name(name)
-                sequence = _sequence(sequence)
-                if not 0 <= sequence <= MAX_SEQUENCE:
-                    raise ValueError(f"sequence {sequence} out of range")
-                if type(resolved) not in (int, float) or not math.isfinite(resolved):
-                    raise ValueError(f"invalid resolve time {resolved!r}")
-                if type(used) is not int or not 0 <= used < _MAX_USED:
-                    raise ValueError(f"invalid used value {used!r}")
-            except (TypeError, ValueError) as e:
-                log(f"dropping an invalid name floor entry {name!r}: {e}", LOG_WARNING)
-                dropped.append(name)
-                continue
-            if name in self._held:
-                dropped.append(name)  # resolved for the user since: its held record is its floor
-                continue
-            self._floor[name] = (sequence, min(float(resolved), now))
-            self._floor_used[name] = used
-            self._floor_next_used = max(self._floor_next_used, used + 1)
-            if resolved > now:
-                self._floor_changed.add(name)
-        self._trim_floor()
-        trimmed = [name for name in self._floor_changed if name not in self._floor]
-        self._floor_changed.difference_update(trimmed)
-        if dropped or trimmed:
-            with self._db.transaction() as tx:
-                tx.executemany("DELETE FROM name_floor WHERE name = ?", [(name,) for name in dropped + trimmed])
-
-    def _save_floor(self):
-        """Write the floor entries changed (or forgotten) since the last save, if a save is due, with
-        synchronous=NORMAL. Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds
-        thousands of names), announce_due (at least every minute while running) and stop().
-
-        Called without the lock: only the rows are made under it, so resolves and announces needn't wait for
-        the write. The save counts from when they were made; a failed one is retried by the next."""
-        with self._floor_save_lock:
-            with self._lock:
-                if not self._floor_dirty:
-                    return
-                changed, self._floor_changed = self._floor_changed, set()
-                rows = [(name, str(self._floor[name][0]), self._floor[name][1], self._floor_used[name])
-                        for name in changed if name in self._floor]
-                gone = [(name,) for name in changed if name not in self._floor]
-                saved_at, self._floor_saved_at = self._floor_saved_at, self._monotonic()
-                self._floor_dirty = False
-            saved = False
-            try:
-                try:
-                    with self._db.transaction() as tx:
-                        tx.executemany("DELETE FROM name_floor WHERE name = ?", gone)
-                        tx.executemany("INSERT OR REPLACE INTO name_floor (name, sequence, resolved, used) "
-                                       "VALUES (?, ?, ?, ?)", rows)
-                    saved = True
-                except OSError as e:
-                    log(f"could not save the name floor: {e}", LOG_WARNING)
-            finally:
-                if not saved:
-                    with self._lock:
-                        self._floor_changed |= changed
-                        self._floor_dirty = True
-                        self._floor_saved_at = saved_at
 
     def _save(self):
         """Write the published and held records changed since the last save, durably (on disk when it returns:

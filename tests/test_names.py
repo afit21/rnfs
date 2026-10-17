@@ -983,6 +983,30 @@ class FloorSaveTest(NamesTestCase):
         self.assertEqual([(name, sequence) for name, (sequence, _) in restarted._floor.items()],
                          [(other_name(2), 9), (other_name(3), 1), (other_name(1), 2)])
 
+    def test_round_trip(self):
+        """A restart loads the floor as it was saved, each name with its (sequence, resolved, used) value in the
+        same order, after resolves, raises, a name held for the user and the highest sequence; a resolve after it
+        goes last."""
+        for i in (1, 2, 3, 4):
+            self.clock.now += 1
+            self.resolve_for_gateway(i, sequence=i)
+        self.resolve_for_gateway(2, sequence=5)  # resolved again: last, raised
+        self.network.announce(other_name(3), encode_record(9, CID_B), self.clock.now)  # raised in place
+        self.manager.offer(other_name(1), names.MAX_SEQUENCE, CID_B, self.clock.now)  # a keeper's answer
+        self.manager.resolve(other_name(4), persist=True, max_age=60)  # held: leaves the floor
+        self.manager.stop()
+        saved = list(self.manager._floor._entries.items())
+        self.assertEqual([(name, sequence) for name, (sequence, _, _) in saved],
+                         [(other_name(1), names.MAX_SEQUENCE), (other_name(3), 9), (other_name(2), 5)])
+        restarted = self.make_manager()
+        self.assertEqual(list(restarted._floor._entries.items()), saved)
+        self.assertEqual(dict(restarted._floor), {name: (sequence, at) for name, (sequence, at, _) in saved})
+        self.network.announce(other_name(5), encode_record(1, CID_A), self.clock.now)
+        restarted.resolve(other_name(5), persist=False, max_age=60)
+        self.assertEqual(list(restarted._floor), [other_name(1), other_name(3), other_name(2), other_name(5)])
+        restarted.stop()
+        self.assertEqual(list(self.make_manager()._floor), [other_name(1), other_name(3), other_name(2), other_name(5)])
+
     def test_save_writes_only_changed_rows(self):
         """A resolve adding a name to the floor writes its row alone, as a save after an announce raised one does."""
         for i in range(1, 6):
@@ -1030,7 +1054,7 @@ class FloorSaveTest(NamesTestCase):
             self.resolve_for_gateway(1)
             self.network.announce(other_name(1), encode_record(4, CID_B), self.clock.now)
             self.assertEqual(self.saved_sequence(1), [("1",)])
-            self.assertIsNotNone(self.manager._floor_timer)
+            self.assertIsNotNone(self.manager._floor._timer)
             wait_for(lambda: self.saved_sequence(1) == [("4",)], timeout=5, what="the timer's save")
 
     def test_no_timer_after_close(self):
@@ -1040,7 +1064,7 @@ class FloorSaveTest(NamesTestCase):
         self.manager.close()
         self.clock.now += names.FLOOR_SAVE_INTERVAL
         self.manager.offer(other_name(1), 5, CID_B, self.clock.now)
-        self.assertIsNone(self.manager._floor_timer)
+        self.assertIsNone(self.manager._floor._timer)
 
     def test_written_without_the_lock(self):
         """The floor's commit runs without the manager's lock: resolves and announces needn't wait for it."""
@@ -1098,7 +1122,7 @@ class FloorSaveTest(NamesTestCase):
         self.assertEqual(self.saved(), [other_name(1), other_name(2)])
         self.manager.resolve(other_name(1), persist=True, max_age=60)
         self.assertNotIn(other_name(1), self.manager._floor)
-        self.assertNotIn(other_name(1), self.manager._floor_used)
+        self.assertNotIn(other_name(1), self.manager._floor._entries)
         self.manager.announce_due()
         self.assertEqual(self.saved(), [other_name(2)])
 

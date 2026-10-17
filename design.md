@@ -1355,13 +1355,14 @@ Everything in the specification is implemented, with these simplifications and a
   (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with no waiting resolve, of a name
   neither kept nor watched, may only evict one of those (`watch()` takes a name out of `_heard_only`). A name
   resolved for the user, or published here, leaves the table and the floor (`_hold`). A resolve with `persist=False`
-  (gateway, LXMF auto-fetch) raises the name's floor (`_floor`: name -> (sequence, wall time last resolved), in
-  resolve order), which `_offer` checks. A raise (or a new name) saves the floor at once if the last save was
-  `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`; a raise by a record heard for a name in
-  the table (`_store`: an announce, a keeper's record, or one a resolve's refresh heard) is always the timer's,
-  started at once when a save is due, since its callers hold the lock; renewing only the time marks it for the next
-  save after an hour. `_trim_floor` drops the least recently resolved past `FLOOR_FACTOR` × `name_table_size`, but
-  stops at one resolved within `FLOOR_KEEP_AGE` (7 days) until the floor holds `FLOOR_HARD_FACTOR` (2) times that.
+  (gateway, LXMF auto-fetch) raises the name's floor (`_floor`, a `_NameFloor`: name -> (sequence, wall time last
+  resolved, used), in resolve order, `used` being its row's place; it owns its trim, load, save snapshot and timer, and
+  reads as name -> (sequence, resolved)), which `_offer` checks. A raise (or a new name) saves the floor at once if the
+  last save was `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`; a raise by a record heard for a
+  name in the table (`_store`: an announce, a keeper's record, or one a resolve's refresh heard) is always the timer's,
+  started at once when a save is due, since its callers hold the lock; renewing only the time marks it for the next save
+  after an hour. `_NameFloor.trim` drops the least recently resolved past `FLOOR_FACTOR` × `name_table_size`, but stops
+  at one resolved within `FLOOR_KEEP_AGE` (7 days) until the floor holds `FLOOR_HARD_FACTOR` (2) times that.
 - **Deny lists.** `RnfsNode._setup` makes the `DenyList` right after storage, gives it to storage (`storage.deny`),
   and `reload`s the accepted lists from their pinned blocks (`_read_deny_list`), so the publisher's first refresh
   already leaves out denied content. Fetches check every expectation in `_ensure` and the root in `Fetcher.open`,
