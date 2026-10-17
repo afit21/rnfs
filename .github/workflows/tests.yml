@@ -37,12 +37,16 @@ jobs:
           python -m pip check
       - name: Unit tests
         run: python -m unittest discover tests
-      # On Windows the daemons are started in their own process groups and stopped with CTRL_BREAK_EVENT
+      # On Windows the daemons are started in their own process groups and stopped with CTRL_BREAK_EVENT. Every
+      # module gated on RNFS_E2E is listed here (test_packaging checks it): the embedded node and the security
+      # regressions that need real RNS included
       - name: End-to-end tests (real daemons over local TCP)
         env:
           RNFS_E2E: "1"
-        run: python -m unittest tests.test_e2e tests.test_client
-        timeout-minutes: 10
+        run: >-
+          python -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns
+          tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins
+        timeout-minutes: 20
       - name: Command works
         run: rnfs --version
 
