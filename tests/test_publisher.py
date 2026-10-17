@@ -480,6 +480,25 @@ class PublisherTest(unittest.TestCase):
         restarted.save()
         self.assertEqual(self.saved()["earlier"], {})
 
+    def test_provided_again_cancels_only_its_queued_withdrawals(self):
+        """A CID provided (again) cancels the withdrawals queued for its key at every node, whose nodes join its
+        earlier ones; the other keys' stay queued, and a CID with none queued cancels nothing."""
+        a, b = self.pinned(b"a"), self.pinned(b"b")
+        other = bytes([7]) * 16
+        with self.publisher._lock:  # as if queued earlier, and saved
+            self.publisher._withdrawals = {N1: {a.key, other}, N2: {a.key}, N3: {other}}
+            for node in (N1, N2, N3):
+                self.publisher._touch_node(node)
+        self.publisher.save()
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {a, b})
+        self.assertEqual(self.publisher._withdrawals, {N1: {other}, N3: {other}})
+        self.assertEqual(set(self.publisher._earlier[a]), {N1, N2})
+        self.assertNotIn(b, self.publisher._earlier)
+        self.assertEqual(self.saved()["withdraw"], {N1: {other}, N3: {other}})
+        self.assertEqual(self.records.providers(a.key), [OWN])
+        self.assertEqual(self.records.providers(b.key), [OWN])  # recorded locally, nothing to cancel
+
     def test_served_blocks_are_the_provided_dags(self):
         cid = self.pinned(os.urandom(200_000))
         self.publisher.refresh()
@@ -697,8 +716,8 @@ class PublisherTest(unittest.TestCase):
     # Refreshes that change nothing
 
     def counting(self) -> dict[str, int]:
-        """Count the calls of storage.pins and dag_blocks from now until the test ends: {name: calls}."""
-        counts = {"pins": 0, "dag_blocks": 0}
+        """Count the calls of storage.pinned_cids and dag_blocks from now until the test ends: {name: calls}."""
+        counts = {"pinned_cids": 0, "dag_blocks": 0}
         for name in counts:
             original = getattr(self.storage, name)
 
@@ -724,16 +743,16 @@ class PublisherTest(unittest.TestCase):
         counts = self.counting()
         for _ in range(3):
             self.publisher.refresh()
-        self.assertEqual(counts, {"pins": 0, "dag_blocks": 0})
+        self.assertEqual(counts, {"pinned_cids": 0, "dag_blocks": 0})
         self.assertIs(self.publisher._provided, provided)
         self.assertIs(self.publisher._served, served)
         self.assertEqual(self.publisher.provided(), {cid})
         self.assertEqual(self.publisher.provided_keys(), keys)
         publisher = self.make_publisher()
         publisher.refresh()
-        counts["pins"] = 0
+        counts["pinned_cids"] = 0
         publisher.refresh()
-        self.assertEqual(counts["pins"], 1)
+        self.assertEqual(counts["pinned_cids"], 1)
 
     def test_refresh_computes_after_each_kind_of_change(self):
         """With a generation, each change a refresh is computed from makes the next refresh compute, and what
@@ -751,9 +770,9 @@ class PublisherTest(unittest.TestCase):
         def refresh(provided: set, withdrawn: Cid | bytes | None = None):
             """Refresh: it computes, provides provided (CIDs and keys) and has queued, at once, the withdrawal
             of withdrawn (a CID or key published to N1 and N2). Then publish, and a refresh computes nothing."""
-            counts["pins"] = 0
+            counts["pinned_cids"] = 0
             self.publisher.refresh()
-            self.assertEqual(counts["pins"], 1)
+            self.assertEqual(counts["pinned_cids"], 1)
             self.assertEqual(self.publisher.provided() | self.publisher.provided_keys(), provided)
             if withdrawn is not None:
                 key = withdrawn if isinstance(withdrawn, bytes) else withdrawn.key
@@ -761,9 +780,9 @@ class PublisherTest(unittest.TestCase):
                 self.assertEqual(self.held(self.publisher)["withdraw"], {N1: {key}, N2: {key}})
             self.publisher.publish_due()  # also published, so a later withdrawal has nodes to go to
             self.assertEqual(self.held(self.publisher)["withdraw"], {})
-            counts["pins"] = 0
+            counts["pinned_cids"] = 0
             self.publisher.refresh()
-            self.assertEqual(counts["pins"], 0)
+            self.assertEqual(counts["pinned_cids"], 0)
 
         with self.subTest("pin"):
             a = self.pinned(b"a")
@@ -829,16 +848,16 @@ class PublisherTest(unittest.TestCase):
         self.publisher = self.make_publisher(generation=True)
         a = self.pinned(b"a")
         built = builder.build_bytes(b"pinned meanwhile", self.storage.put)
-        pins = self.storage.pins
+        pinned_cids = self.storage.pinned_cids
 
         def pins_then_pin():
-            """The pins as they were, then (once) another pin."""
-            result = pins()
+            """The pinned CIDs as they were, then (once) another pin."""
+            result = pinned_cids()
             if not self.storage.is_pinned(built.cid):
                 self.storage.pin(built.cid, USER)
             return result
 
-        with mock.patch.object(self.storage, "pins", pins_then_pin):
+        with mock.patch.object(self.storage, "pinned_cids", pins_then_pin):
             self.publisher.refresh()
         self.assertEqual(self.publisher.provided(), {a})
         self.publisher.refresh()

@@ -205,7 +205,9 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
   cache records, so they never refer to block names a power loss could undo.
 - pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
-  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]`, `pin_count()`, `is_complete(cid)`.
+  `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]` (a copy), `pinned_cids() -> frozenset[Cid]` (the
+  same set until pins change: the publisher's refresh reads it after every add), `has_pin(cid, source)`,
+  `pin_count()`, `is_complete(cid)`.
 - cache: `record_fetch(root, names, target)` (keeps the path's nodes and the target's DAG), LRU touched on use.
   `cache_generation()` grows whenever records are removed or retargeted, so the node prunes its fetched
   targets only then. `changes()` grows with every block stored or deleted, pin or release, and record added,
@@ -302,7 +304,13 @@ from a heap of (first seen, arrival) with stale entries dropped lazily. First-se
 (seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order; those of younger
 publishers whose last record the pool evicted (`_evicted`) for a TTL too, at most `pool_size` // 10 (at least
 10), forgetting the one first seen most recently when full (an O(n) scan, only on such evictions). Times later than now
-(a clock corrected backwards) are clamped to now at load and at each `expire()`.
+(a clock corrected backwards) are clamped to now at load and at the first `expire()` after the clock went backwards:
+the store notes the latest clock reading any time it holds came from (`_latest`, via `_now()`), and an `expire()`
+with the clock not behind it skips the clamping pass, which would change nothing (about half of a pass at 100 000
+records, held under the lock). Records are added only through
+`_insert`, by `store` and by the load alike, so the indexes beside `_records` (each publisher's keys and count
+outside the pool, the counts, `_pooled`, `_holders`, `_newest`) are kept in step in one place;
+`_check_consistency()` recomputes them from `_records`, and test_providers runs it after every test.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
@@ -393,7 +401,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user` |
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
-| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. Callers that show pins to others must skip `sealed` entries' names and content |
+| `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
@@ -808,7 +816,11 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   creating the output, so nothing raised there leaves a file. `open_sealed` reports the stored (ciphertext)
   size as a job's total, which is what its done bytes count.
 - Cost: `get`, `cat` and `info` of a file read its first 12 bytes to detect sealing (`--raw` skips this), so
-  the first chunk is fetched first even for a `cat --offset` deep in a file. The gateway does so only for a
+  the first chunk is fetched first even for a `cat --offset` deep in a file. `info` and `read` (so `cat`) remember
+  the targets found not to be sealed (`RnfsNode._open_sealed`: by resolved expectation, `NOT_SEALED_MEMO` 4096,
+  least recently used forgotten first; emptied when the deny list's CIDs change, since that read meets them), so
+  reading one again doesn't read its first bytes; `read_file` (`GET /api/cat`) hands the `SealedFile` its info
+  opened to its read rather than opening it twice. The gateway does so only for a
   GET from byte 0 or a web page's request (`limited()`, so its type never depends on what is stored); the
   user's own HEAD, or range not at 0, uses the first bytes only if already stored (`stored_head`), else takes
   the Content-Type from the name, or `application/octet-stream`. `stored_head` applies the deny list as a read
@@ -1044,7 +1056,10 @@ runs while a lock is held:
   deny list's CID set, the key sources' keys or the strategy. A refresh that changed none of them returns at once
   (about 1 µs, from 7 ms at 10 000 pins); the generation is read before computing, so a change made meanwhile
   makes the next refresh compute. When it does compute, it builds the set of blocks served again only when a
-  provided CID went or its DAG's blocks changed (CIDs only added are unioned in).
+  provided CID went or its DAG's blocks changed (CIDs only added are unioned in). It takes the pins as
+  `Storage.pinned_cids()`, not a copy of every pin's sources, and gathers the keys withdrawals are queued for once,
+  so an item newly provided searches the queues only when its key is among them (a mass re-pin, or the first
+  refresh after a start with withdrawals pending).
 - `Storage.evict` and `gc` decide what to delete, and delete it, under the storage lock (after reading the DAG
   nodes outside it); `verify` checks completeness and re-reads the blocks outside it.
 - Every pin and unpin commits its row durably (`synchronous=FULL`, after the blocks are synced) under the
@@ -1355,13 +1370,19 @@ Everything in the specification is implemented, with these simplifications and a
   (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with no waiting resolve, of a name
   neither kept nor watched, may only evict one of those (`watch()` takes a name out of `_heard_only`). A name
   resolved for the user, or published here, leaves the table and the floor (`_hold`). A resolve with `persist=False`
-  (gateway, LXMF auto-fetch) raises the name's floor (`_floor`: name -> (sequence, wall time last resolved), in
-  resolve order), which `_offer` checks. A raise (or a new name) saves the floor at once if the last save was
-  `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`; a raise by a record heard for a name in
-  the table (`_store`: an announce, a keeper's record, or one a resolve's refresh heard) is always the timer's,
-  started at once when a save is due, since its callers hold the lock; renewing only the time marks it for the next
-  save after an hour. `_trim_floor` drops the least recently resolved past `FLOOR_FACTOR` × `name_table_size`, but
-  stops at one resolved within `FLOOR_KEEP_AGE` (7 days) until the floor holds `FLOOR_HARD_FACTOR` (2) times that.
+  (gateway, LXMF auto-fetch) raises the name's floor (`_floor`, a `_NameFloor`: name -> (sequence, wall time last
+  resolved, used), in resolve order, `used` being its row's place; it owns its trim, load, save snapshot and timer, and
+  reads as name -> (sequence, resolved)), which `_offer` checks. A raise (or a new name) saves the floor at once if the
+  last save was `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`; a raise by a record heard for a
+  name in the table (`_store`: an announce, a keeper's record, or one a resolve's refresh heard) is always the timer's,
+  started at once when a save is due, since its callers hold the lock; renewing only the time marks it for the next save
+  after an hour. `_NameFloor.trim` drops the least recently resolved past `FLOOR_FACTOR` × `name_table_size`, but stops
+  at one resolved within `FLOOR_KEEP_AGE` (7 days) until the floor holds `FLOOR_HARD_FACTOR` (2) times that. A resolve's
+  network refresh (`_shared_refresh` around `_refresh_name`) is remembered per name (`_refreshed`: when it ended,
+  monotonic, and whether it left a record; at most `REFRESHED_SIZE`, least recent dropped), so a resolve within its
+  `max_age` skips it unless that record has left the table or the refresh left a suspected replay (`_absorb_recalled`);
+  resolves of a name being refreshed wait on the leader's `Event` in `_refreshing`, then each runs only the local step
+  (persist, floor).
 - **Deny lists.** `RnfsNode._setup` makes the `DenyList` right after storage, gives it to storage (`storage.deny`),
   and `reload`s the accepted lists from their pinned blocks (`_read_deny_list`), so the publisher's first refresh
   already leaves out denied content. Fetches check every expectation in `_ensure` and the root in `Fetcher.open`,

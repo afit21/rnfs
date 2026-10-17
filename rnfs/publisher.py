@@ -424,7 +424,7 @@ class Publisher:
         (most refreshes): the same complete CIDs with the same dag_blocks objects, and the same keys. CIDs only
         added since add their blocks to it; only one gone or changed builds it again.
         """
-        candidates = set(self.storage.pins())
+        candidates = self.storage.pinned_cids()  # the same frozenset until pins change: not copied
         if self.config.provide_strategy == "roots":
             candidates |= self.storage.cached_targets() & set(self.cached_eligible())
         dags: dict[Cid, frozenset[Cid]] = {}
@@ -492,7 +492,9 @@ class Publisher:
                 for node_id in set(record[1] if record else []) | set(earlier):
                     self._withdrawals.setdefault(node_id, set()).add(cid.key)
                     self._touch_node(node_id)
-            cancelled = [cid for cid in added if self._provide_again(cid)]
+            # The keys withdrawals are queued for, gathered once: most added items have none to cancel
+            pending = {key for keys in self._withdrawals.values() for key in keys} if added else set()
+            cancelled = [cid for cid in added if self._provide_again(cid, pending)]
             self._inputs = inputs  # only once everything above is done: an exception computes again next time
             if removed:
                 log(f"no longer providing {plural(len(removed), 'CID')}", LOG_VERBOSE)
@@ -501,9 +503,10 @@ class Publisher:
         if removed or any(self._is_due(cid, self.clock()) for cid in added):
             self.wake()
 
-    def _provide_again(self, cid: ProvidedItem) -> bool:
+    def _provide_again(self, cid: ProvidedItem, pending: set[bytes]) -> bool:
         """cid is provided (again): record ourselves locally and cancel withdrawals of its key still queued;
-        True if any were. Lock held.
+        True if any were. pending holds every key a withdrawal is queued for (it may hold more: those already
+        cancelled), so the queues are searched only for those. Lock held.
 
         A withdrawal queued when it stopped being provided would otherwise reach a node after a round stored it
         there again, deleting the fresh record (section 6). Those nodes may still hold a record of it, so they
@@ -511,6 +514,8 @@ class Publisher:
         """
         key = cid.key
         self.providers.store(key, self.own_id)  # refresh() withdrew it when it stopped being provided
+        if key not in pending:
+            return False
         now = self.clock()
         cancelled = False
         for node_id in [node_id for node_id, keys in self._withdrawals.items() if key in keys]:
