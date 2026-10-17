@@ -1227,7 +1227,11 @@ gateway can never reach the API.
   runs on the port while the daemon is down learns neither the token nor a name key being imported, nor can
   answer in the daemon's place. The API keeps a connection open after a status request carrying a valid
   challenge and `Connection: keep-alive` (and no body), answering it with `Connection: keep-alive`, for one
-  more request, which is its last; every other connection is closed after its request.
+  more request, which is its last; every other connection is closed after its request. Any caller can ask for
+  this (the proof needs no token), and the second request gets a new read deadline, so one connection can hold
+  a connection slot (below) about twice as long as a single request could (rnfs: about 2 × 15 s). This is
+  accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
+  exactly one more request.
 - The API never sends CORS headers.
 - Both servers SHOULD time-limit reading a request (rnfs: 15 s for the request line, headers and small
   bodies; 60 s between reads of an upload), but not the node's work, and SHOULD cap concurrent
