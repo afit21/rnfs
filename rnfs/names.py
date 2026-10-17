@@ -5,7 +5,9 @@ A name is the hash of an `rnfs.name` destination whose RNS identity is the name'
 any validly signed announce, including a replayed old one, so the highest sequence seen is persisted for every
 name this node publishes or resolves for the user, and lower sequences are never accepted from any source. RNS
 also remembers a replayed announce as just heard, so an announce shows its record current only up to
-ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers.
+ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers. One
+older than the announce RNS took the path from, or carrying another record, is a suspected replay, as old as it is
+(RnsNetwork.recalled_emission), and resolves ask keepers at once.
 Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
 names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
 within seconds of a resolve or an announce raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten
@@ -72,6 +74,7 @@ _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path
 # it was heard: RNS remembers a replayed announce as just heard (_announce_heard)
 ANNOUNCE_VALIDITY = 2
 _PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds its announces' random blobs
+_PATH_PACKET = 6  # RNS's IDX_PT_PACKET: where a path table entry holds the packet hash of the path's announce
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up
 
 
@@ -347,6 +350,56 @@ class RnsNetwork:
             return float(emitted) if type(emitted) is int and emitted > 0 else None
         except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
+
+    def recalled_emission(self, name: bytes, app_data: bytes) -> tuple[float | None, bool]:
+        """(emitted, takes_path) for the announce RNS last stored for name, whose app_data (recall_app_data) is
+        app_data: when that announce was emitted (its owner's clock, signed), or None if RNS no longer has it; and
+        False if RNS shows it isn't the record of the announce RNS took name's path from (a replay, usually of an
+        older announce, which RNS stores all the same).
+
+        RNS internals (Identity.known_destinations[hash][1], the packet hash Identity.remember stores;
+        Transport.path_table[hash][IDX_PT_PACKET], the packet hash of the path's announce; Transport's announce
+        cache, written only for an announce that takes the path, read with Transport.get_cached_packet). The path's
+        announce is read first: if it carries app_data, so does the path (an announce heard again, or repeated in
+        a path response, which RNS hashes with its context, gets another packet hash and is never cached). Else
+        the stored one is read for its own emission time. Without a path, or with neither announce cached (a
+        shared instance's client whose cache isn't rnsd's), nothing shows a replay: (None, True), or the path's
+        emission time if the stored announce is the path's. If an internal changes in another RNS version this
+        returns (None, True) and callers go by emitted_time alone.
+        """
+        try:
+            known = RNS.Identity.known_destinations.get(name)
+            path = RNS.Transport.path_table.get(name)
+            # known[3] is another record if RNS stored a newer announce since app_data was read: judge that one later
+            if not known or not path or known[3] != app_data:
+                return None, True
+            stored, path_packet = known[1], path[_PATH_PACKET]
+            in_path = self._cached_announce(name, path_packet)
+            if in_path is not None and in_path[1] == app_data:
+                return in_path[0], True
+            own = in_path if stored == path_packet else self._cached_announce(name, stored)
+            emitted = own[0] if own is not None and own[1] == app_data else None
+            if in_path is not None:
+                return emitted, False  # the path's announce carries another record
+            if stored == path_packet:
+                return self.emitted_time(name), True
+            return emitted, True
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
+            return None, True
+
+    @staticmethod
+    def _cached_announce(name: bytes, packet_hash) -> tuple[float, bytes] | None:
+        """(emission time, app_data) of name's announce with packet_hash in RNS's announce cache, or None if it
+        isn't there (or isn't an announce of name). Not verified again: RNS caches only announces it validated."""
+        packet = RNS.Transport.get_cached_packet(packet_hash, packet_type="announce")
+        if packet is None or packet.unpack() is False or packet.packet_type != RNS.Packet.ANNOUNCE \
+                or packet.destination_hash != name:
+            return None
+        data = bytes(packet.data)
+        blob = RNS.Identity.KEYSIZE // 8 + RNS.Identity.NAME_HASH_LENGTH // 8  # the random blob: emission time
+        ratchet = RNS.Identity.RATCHETSIZE // 8 if packet.context_flag == RNS.Packet.FLAG_SET else 0
+        app_data = data[blob + 10 + ratchet + RNS.Identity.SIGLENGTH // 8:]
+        return float(RNS.Transport.timebase_from_random_blob(data[blob:blob + 10])), app_data
 
     def heard_time(self, name: bytes) -> float | None:
         """When RNS last stored a validly signed announce for name (wall clock), or None.
@@ -1049,26 +1102,38 @@ class NameManager:
             self._floor.save()
         return result
 
-    def _refresh_name(self, name: bytes, *, ask: str):
+    def _refresh_name(self, name: bytes, *, ask: str) -> bool:
         """Ask the network for name's newest record (_refresh), then keepers, offering what they answer. ask is
         "always" (the first publish of an imported key: its previous home's sequences may be held by keepers alone)
-        or "if_unheard" (a resolve: only if nothing was heard during the refresh, or keeper_query is "always").
-        Called without the lock."""
+        or "if_unheard" (a resolve: only if nothing was heard during the refresh, the record RNS stored is a
+        suspected replay, or keeper_query is "always"). True if the record held after it is a suspected replay
+        (DHT-2; asked only with "if_unheard"). Called without the lock."""
         if ask not in ("always", "if_unheard"):
             raise ValueError(f"ask is 'always' or 'if_unheard', not {ask!r}")
         started = self._clock()
         self._refresh(name)
-        if self.keepers is None:
-            return
+        suspect = None
         if ask == "if_unheard":
             with self._lock:
-                self._absorb_recalled(name)
+                suspect = self._absorb_recalled(name)
                 record = self._record(name, touch=False)
-            # Heard during the refresh: the owner (or a path to it) answered. If not, it and the paths may be gone
-            if record is not None and record.heard >= started and not self.keepers.always_ask():
-                return
-        for sequence, cid, heard in self.keepers.query(name):
-            self.offer(name, sequence, cid, heard)
+            # Heard during the refresh, and no replay suspected: the owner (or a path to it) answered. If not, the
+            # owner and the paths may be gone, or a neighbour repeats an old announce
+            heard = suspect is None and record is not None and record.heard >= started
+            if self.keepers is None or (heard and not self.keepers.always_ask()):
+                return self._held_is(name, suspect)
+        if self.keepers is not None:
+            for sequence, cid, kept_heard in self.keepers.query(name):
+                self.offer(name, sequence, cid, kept_heard)
+        return self._held_is(name, suspect)
+
+    def _held_is(self, name: bytes, record: tuple[int, Cid] | None) -> bool:
+        """True if the record held for name is record, a (sequence, CID)."""
+        if record is None:
+            return False
+        with self._lock:
+            held = self._record(name, touch=False)
+            return held is not None and (held.sequence, held.cid) == record
 
     def _offer_kept(self, name: bytes):
         """Offer the signed record keepers hold for name, so it is a floor no replayed announce gets under.
@@ -1112,16 +1177,17 @@ class NameManager:
                 if not events:
                     self._waiters.pop(name, None)
 
-    def _absorb_recalled(self, name: bytes):
-        """Offer the record RNS last stored for name (which may be a replay) to the sequence rules."""
+    def _absorb_recalled(self, name: bytes) -> tuple[int, Cid] | None:
+        """Offer the record RNS last stored for name (which may be a replay) to the sequence rules. Its (sequence,
+        CID) if it is a suspected replay (_announce_heard), which a resolve takes as a reason to ask keepers."""
         try:
             app_data = self._network.recall_app_data(name)
         except Exception as e:  # noqa: BLE001 - the resolve goes on with what is held; logged
             log(f"could not recall name {name.hex()}: {e}", LOG_WARNING)
-            return
+            return None
         parsed = parse_record(app_data)
         if parsed is None:
-            return
+            return None
         sequence, cid = parsed
         heard = self._network.heard_time(name)
         if heard is None:
@@ -1129,19 +1195,30 @@ class NameManager:
             held = self._record(name, touch=False)
             same = held is not None and held.sequence == sequence and held.cid == cid
             heard = held.heard if same else self._clock()
-        self._offer(name, sequence, cid, self._announce_heard(name, heard))
+        heard, suspect = self._announce_heard(name, bytes(app_data), heard)
+        self._offer(name, sequence, cid, heard)
+        return parsed if suspect else None
 
-    def _announce_heard(self, name: bytes, heard: float) -> float:
-        """The heard time of name's record from an announce RNS heard at heard: no later than ANNOUNCE_VALIDITY
-        announce_intervals after RNS's newest announce of name was emitted. Anyone may repeat an old announce, and
-        RNS remembers it as just heard, so by its time alone a record its owner has since replaced would look
-        current, and resolves would never ask keepers for the newer one. The owner announces every
-        announce_interval, so an announce older than ANNOUNCE_VALIDITY of them no longer shows its record current.
+    def _announce_heard(self, name: bytes, app_data: bytes, heard: float) -> tuple[float, bool]:
+        """(heard time, suspected replay) of name's record from the announce RNS last stored, carrying app_data and
+        heard at heard.
+
+        Anyone may repeat an old announce, and RNS stores it as just heard, so by its time alone a record its
+        owner has since replaced would look current, and resolves would never ask keepers for the newer one:
+        - The record is heard no later than ANNOUNCE_VALIDITY announce_intervals after RNS's newest announce of
+          name was emitted (the path's: emitted_time), since the owner announces every announce_interval.
+        - An announce emitted before the path's newest, or carrying another record than the path's announce
+          (RnsNetwork.recalled_emission), is a suspected replay (DHT-2): it is heard no later than its own
+          emission time, or the path's if its own is unknown. Without a path nothing is compared.
         """
-        emitted = self._network.emitted_time(name)
-        if emitted is None:
-            return heard
-        return min(heard, emitted + ANNOUNCE_VALIDITY * self.config.announce_interval)
+        path_emitted = self._network.emitted_time(name)
+        if path_emitted is None:
+            return heard, False
+        emitted, takes_path = self._network.recalled_emission(name, app_data)
+        suspect = not takes_path or (emitted is not None and emitted < path_emitted)
+        if suspect:
+            heard = min(heard, emitted if emitted is not None else path_emitted)
+        return min(heard, path_emitted + ANNOUNCE_VALIDITY * self.config.announce_interval), suspect
 
     def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
@@ -1149,11 +1226,13 @@ class NameManager:
         parsed = parse_record(app_data)
         # A name kept here may take a table place like a resolved one (asked outside our lock, as always)
         kept = parsed is not None and self.keepers is not None and self.keepers.local_record(name) is not None
+        # Read before taking the lock: it may read RNS's announce cache on disk
+        heard = self._announce_heard(name, bytes(app_data), self._clock())[0] if parsed is not None else None
         with self._lock:
             if parsed is not None:
                 # Unasked: not being resolved (a path response would have a waiter), kept nor watched
                 unasked = not kept and name not in self._waiters and name not in self._watched
-                self._offer(name, parsed[0], parsed[1], self._announce_heard(name, self._clock()), unasked=unasked)
+                self._offer(name, parsed[0], parsed[1], heard, unasked=unasked)
             else:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):

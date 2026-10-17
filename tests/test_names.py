@@ -84,6 +84,7 @@ class FakeNetwork:
         self.app_data: dict[bytes, bytes] = {}
         self.heard: dict[bytes, float] = {}
         self.emitted: dict[bytes, float] = {}
+        self.stored_emitted: dict[bytes, float] = {}  # when the announce RNS 'stored' last was emitted, if known
         self.path_requests = []
         self.on_request_path = None
 
@@ -126,12 +127,19 @@ class FakeNetwork:
         """When the newest announce RNS 'took a path from' was emitted (None: tests not setting emitted)."""
         return self.emitted.get(name)
 
+    def recalled_emission(self, name, app_data):
+        """When the announce RNS 'stored' last was emitted (None if the test didn't say), and that nothing shows it
+        isn't the path's record: an older one is a suspected replay all the same (DHT-2)."""
+        return self.stored_emitted.get(name), True
+
     def store(self, name, app_data, heard, emitted=None):
         """Make RNS 'remember' an announce, as validate_announce does, without calling handlers. An announce
         emitted at emitted joins the path's, which keeps the newest emission: repeating an old one changes nothing."""
         self.app_data[name] = app_data
         self.heard[name] = heard
+        self.stored_emitted.pop(name, None)
         if emitted is not None:
+            self.stored_emitted[name] = emitted
             self.emitted[name] = max(emitted, self.emitted.get(name, emitted))
 
     def announce(self, name, app_data, heard, emitted=None):
