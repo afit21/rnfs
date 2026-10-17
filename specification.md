@@ -4,6 +4,11 @@ rnfs is content-addressed file sharing over [Reticulum](https://reticulum.networ
 features of IPFS: content IDs, chunked files, directories, a provider DHT, verified multi-source transfer,
 pinning, mutable names and a gateway — built on what RNS already provides.
 
+**Version.** This document describes rnfs 0.1.6. The wire format (request paths and messages, CIDs and DAG
+bytes, chunk boundaries, provider and name records, announce app_data and the LXMF field) is byte-identical
+since rnfs 0.1.3, so nodes of 0.1.3 and later work together. `tests/test_wire.py` checks the current code
+against vectors that 0.1.3's and 0.1.4's own code produced (`tests/fixtures/wire`).
+
 **Principles**
 - No compatibility with IPFS or libp2p is required. Follow IPFS where its design helps; drop what exists only
   because of IP networks or legacy.

@@ -452,6 +452,14 @@ class ChangelogTest(unittest.TestCase):
             self.assertEqual(first.group(1), __version__)
         self.assertEqual(len(headings), len(set(headings)), "a version has two sections")
 
+    def test_specification_names_the_version(self):
+        """specification.md's version note names the version CHANGELOG.md's first section is for (TS11)."""
+        first = re.search(r"(?m)^## (\d+\.\d+\.\d+)", read(os.path.join(REPO, "CHANGELOG.md")))
+        note = re.search(r"(?m)^\*\*Version\.\*\* This document describes rnfs (\d+\.\d+\.\d+)\.",
+                         read(os.path.join(REPO, "specification.md")))
+        self.assertTrue(first and note)
+        self.assertEqual(note.group(1), first.group(1))
+
     def test_release_notes_are_the_changelog_section(self):
         """The release is created with --notes-file, from the notes the version job extracted, not
         --generate-notes."""

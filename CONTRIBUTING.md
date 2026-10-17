@@ -163,14 +163,14 @@ The same builds run, without publishing, on pull requests that touch `packaging/
 Steps:
 1. Go through the checklist below.
 2. Set `__version__` in `rnfs/__init__.py` to X.Y.Z, change CHANGELOG.md's first heading from
-   `## X.Y.Z (unreleased)` to `## X.Y.Z`, and update README's release links and file names (`tests/test_packaging.py`
-   checks all three agree) and the version at the top of specification.md.
+   `## X.Y.Z (unreleased)` to `## X.Y.Z`, and update README's release links and file names
+   (`tests/test_packaging.py` checks the three agree).
 3. Commit, let CI pass on `main`, then push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow
    refuses a tag that isn't `v` + `__version__`, and a CHANGELOG whose section for it is still marked
    unreleased.
 4. If the `release` environment requires a reviewer, approve its deployment once the builds pass.
 5. Open the next version's section: `## X.Y.(Z+1) (unreleased)` at the top of CHANGELOG.md (`__version__` stays
-   X.Y.Z until that release).
+   X.Y.Z until that release), and name that version in the note at the top of specification.md (checked too).
 
 ### Release checklist
 
