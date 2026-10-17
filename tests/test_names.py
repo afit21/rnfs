@@ -84,6 +84,7 @@ class FakeNetwork:
         self.app_data: dict[bytes, bytes] = {}
         self.heard: dict[bytes, float] = {}
         self.emitted: dict[bytes, float] = {}
+        self.stored_emitted: dict[bytes, float] = {}  # when the announce RNS 'stored' last was emitted, if known
         self.path_requests = []
         self.on_request_path = None
 
@@ -126,12 +127,19 @@ class FakeNetwork:
         """When the newest announce RNS 'took a path from' was emitted (None: tests not setting emitted)."""
         return self.emitted.get(name)
 
+    def recalled_emission(self, name, app_data):
+        """When the announce RNS 'stored' last was emitted (None if the test didn't say), and that nothing shows it
+        isn't the path's record: an older one is a suspected replay all the same (DHT-2)."""
+        return self.stored_emitted.get(name), True
+
     def store(self, name, app_data, heard, emitted=None):
         """Make RNS 'remember' an announce, as validate_announce does, without calling handlers. An announce
         emitted at emitted joins the path's, which keeps the newest emission: repeating an old one changes nothing."""
         self.app_data[name] = app_data
         self.heard[name] = heard
+        self.stored_emitted.pop(name, None)
         if emitted is not None:
+            self.stored_emitted[name] = emitted
             self.emitted[name] = max(emitted, self.emitted.get(name, emitted))
 
     def announce(self, name, app_data, heard, emitted=None):
@@ -190,8 +198,10 @@ class NamesTestCase(unittest.TestCase):
         self.manager = self.make_manager()
 
     def make_manager(self) -> NameManager:
-        """A manager over the same directory (as after a restart), sharing the fakes; closed after the test."""
-        manager = NameManager(self.config, self.pins, network=self.network, clock=self.clock, monotonic=self.clock)
+        """A manager over the same directory (as after a restart), sharing the fakes; closed after the test. Its
+        refreshes wait in virtual time: path_timeout passes at once unless an answer has already arrived."""
+        manager = NameManager(self.config, self.pins, network=self.network, clock=self.clock, monotonic=self.clock,
+                              wait=lambda event, timeout: event.is_set())
         self.addCleanup(manager.close)
         return manager
 
@@ -780,6 +790,7 @@ class ResolveTest(NamesTestCase):
         name = other_name(1)
         self.network.announce(name, encode_record(1, CID_A), self.clock.now)
         self.manager.resolve(name, persist=True)
+        self.clock.now += 60  # past the first resolve's refresh, which a resolve reuses for max_age (E1)
         with self.manager._lock:  # as loaded from a record saved while the clock ran ahead
             self.manager._held[name] = names.Record(1, CID_A, self.clock.now + 10**6)
         self.network.path_requests.clear()
@@ -799,6 +810,115 @@ class ResolveTest(NamesTestCase):
         """Names must be 16 bytes."""
         with self.assertRaises(ValueError):
             self.manager.resolve(b"short", persist=False)
+
+
+class RefreshCacheTest(NamesTestCase):
+    """A resolve's network refresh is reused for max_age and shared by the resolves running alongside it (E1): a
+    name whose owner is offline, with keepers answering."""
+
+    AGE = 60.0  # the gateway's max_age (node.GATEWAY_NAME_AGE)
+
+    def setUp(self):
+        """A started manager with keepers holding sequence 4; RNS remembers the owner's last announce, of 3,
+        emitted two days ago (it never shows current)."""
+        super().setUp()
+        self.manager.start()
+        self.name = other_name(1)
+        emitted = self.clock.now - 2 * 24 * 3600
+        self.network.store(self.name, encode_record(3, CID_A), emitted, emitted=emitted)
+        self.keepers = self.manager.keepers = FakeKeepers()
+        self.keepers.answers[self.name] = [(4, CID_B, emitted + 10)]
+
+    def gateway(self) -> dict | None:
+        """A gateway resolve."""
+        return self.manager.resolve(self.name, persist=False, max_age=self.AGE)
+
+    def work(self) -> tuple[int, int]:
+        """(path requests, keeper queries) so far."""
+        return len(self.network.path_requests), len(self.keepers.queried)
+
+    def test_gateway_resolves_reuse_a_refresh_for_max_age(self):
+        """Gateway resolves within max_age of a refresh go to neither the network nor keepers; after it they do."""
+        for _ in range(5):
+            self.assertEqual(self.gateway()["sequence"], 4)
+            self.clock.now += self.AGE / 5 - 1
+        self.assertEqual(self.work(), (1, 1))
+        self.clock.now += 5
+        self.assertEqual(self.gateway()["sequence"], 4)
+        self.assertEqual(self.work(), (2, 2))
+
+    def test_cli_resolves_always_refresh(self):
+        """A resolve with max_age 0 (the CLI's) never reuses a refresh, nor does it leave one the gateway can't."""
+        for _ in range(3):
+            self.assertEqual(self.manager.resolve(self.name, persist=True)["sequence"], 4)
+        self.assertEqual(self.work(), (3, 3))
+        self.assertEqual(self.gateway()["sequence"], 4)
+        self.assertEqual(self.work(), (3, 3))
+
+    def test_nothing_found_is_reused_too(self):
+        """A name nothing answers for resolves to None, and again to None without the network for max_age."""
+        self.keepers.answers.clear()
+        self.network.app_data.clear()
+        self.assertIsNone(self.gateway())
+        self.assertIsNone(self.gateway())
+        self.assertEqual(self.work(), (1, 1))
+
+    def test_a_record_evicted_since_is_looked_for_again(self):
+        """A refresh that found a record isn't reused once the bounded table has dropped it."""
+        self.assertEqual(self.gateway()["sequence"], 4)
+        for i in range(2, 2 + self.config.name_table_size):
+            self.manager.offer(other_name(i), 1, CID_A, self.clock.now)
+        self.assertIsNone(self.manager.record(self.name))
+        self.assertEqual(self.gateway()["sequence"], 4)
+        self.assertEqual(self.work(), (2, 2))
+
+    def test_a_suspected_replay_is_not_reused(self):
+        """A refresh leaving a record that is a suspected replay (DHT-2: older than the path's announce) isn't
+        reused, so each resolve asks keepers again."""
+        self.keepers.answers.clear()
+        self.network.store(self.name, encode_record(3, CID_A), self.clock.now, emitted=self.clock.now - 3600)
+        self.network.emitted[self.name] = self.clock.now - 60  # the path holds a newer announce
+        for _ in range(3):
+            self.assertEqual(self.gateway()["sequence"], 3)
+        self.assertEqual(self.work(), (3, 3))
+
+    def test_simultaneous_resolves_share_one_refresh(self):
+        """Resolves of a name being refreshed, the CLI's included, wait for that refresh and take its record: one
+        path request and one keeper query for all of them. Each persists as it asked."""
+        gate = threading.Lock()
+        gate.acquire()
+        keepers = self.keepers
+        real_query = keepers.query
+
+        def query(name):
+            """The keepers' answer, once the test opens the gate."""
+            with gate:
+                return real_query(name)
+
+        keepers.query = query
+        joined, real_wait = [], threading.Event.wait
+
+        def wait(event, timeout=None):
+            """Event.wait, noting a resolve waiting for a refresh running."""
+            if event in self.manager._refreshing.values():
+                joined.append(event)
+            return real_wait(event, timeout)
+
+        results = {}
+        persist = {i: i == 0 for i in range(8)}  # resolve 0 is the CLI's; the rest the gateway's
+        threads = [threading.Thread(target=lambda i=i: results.__setitem__(i, self.manager.resolve(
+            self.name, persist=persist[i], max_age=0.0 if persist[i] else self.AGE))) for i in range(8)]
+        with mock.patch.object(threading.Event, "wait", wait):
+            for thread in threads:
+                thread.start()
+            wait_for(lambda: len(joined) == 7, what="seven resolves waiting for the eighth's refresh")
+            gate.release()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(self.work(), (1, 1))
+        self.assertEqual({i: result["sequence"] for i, result in results.items()}, {i: 4 for i in range(8)})
+        self.assertEqual(self.manager._held[self.name].sequence, 4)  # the CLI's resolve persisted it
+        self.assertEqual(self.manager._refreshing, {})
 
 
 class StateTest(NamesTestCase):
@@ -983,6 +1103,30 @@ class FloorSaveTest(NamesTestCase):
         self.assertEqual([(name, sequence) for name, (sequence, _) in restarted._floor.items()],
                          [(other_name(2), 9), (other_name(3), 1), (other_name(1), 2)])
 
+    def test_round_trip(self):
+        """A restart loads the floor as it was saved, each name with its (sequence, resolved, used) value in the
+        same order, after resolves, raises, a name held for the user and the highest sequence; a resolve after it
+        goes last."""
+        for i in (1, 2, 3, 4):
+            self.clock.now += 1
+            self.resolve_for_gateway(i, sequence=i)
+        self.resolve_for_gateway(2, sequence=5)  # resolved again: last, raised
+        self.network.announce(other_name(3), encode_record(9, CID_B), self.clock.now)  # raised in place
+        self.manager.offer(other_name(1), names.MAX_SEQUENCE, CID_B, self.clock.now)  # a keeper's answer
+        self.manager.resolve(other_name(4), persist=True, max_age=60)  # held: leaves the floor
+        self.manager.stop()
+        saved = list(self.manager._floor._entries.items())
+        self.assertEqual([(name, sequence) for name, (sequence, _, _) in saved],
+                         [(other_name(1), names.MAX_SEQUENCE), (other_name(3), 9), (other_name(2), 5)])
+        restarted = self.make_manager()
+        self.assertEqual(list(restarted._floor._entries.items()), saved)
+        self.assertEqual(dict(restarted._floor), {name: (sequence, at) for name, (sequence, at, _) in saved})
+        self.network.announce(other_name(5), encode_record(1, CID_A), self.clock.now)
+        restarted.resolve(other_name(5), persist=False, max_age=60)
+        self.assertEqual(list(restarted._floor), [other_name(1), other_name(3), other_name(2), other_name(5)])
+        restarted.stop()
+        self.assertEqual(list(self.make_manager()._floor), [other_name(1), other_name(3), other_name(2), other_name(5)])
+
     def test_save_writes_only_changed_rows(self):
         """A resolve adding a name to the floor writes its row alone, as a save after an announce raised one does."""
         for i in range(1, 6):
@@ -1030,7 +1174,7 @@ class FloorSaveTest(NamesTestCase):
             self.resolve_for_gateway(1)
             self.network.announce(other_name(1), encode_record(4, CID_B), self.clock.now)
             self.assertEqual(self.saved_sequence(1), [("1",)])
-            self.assertIsNotNone(self.manager._floor_timer)
+            self.assertIsNotNone(self.manager._floor._timer)
             wait_for(lambda: self.saved_sequence(1) == [("4",)], timeout=5, what="the timer's save")
 
     def test_no_timer_after_close(self):
@@ -1040,7 +1184,7 @@ class FloorSaveTest(NamesTestCase):
         self.manager.close()
         self.clock.now += names.FLOOR_SAVE_INTERVAL
         self.manager.offer(other_name(1), 5, CID_B, self.clock.now)
-        self.assertIsNone(self.manager._floor_timer)
+        self.assertIsNone(self.manager._floor._timer)
 
     def test_written_without_the_lock(self):
         """The floor's commit runs without the manager's lock: resolves and announces needn't wait for it."""
@@ -1098,7 +1242,7 @@ class FloorSaveTest(NamesTestCase):
         self.assertEqual(self.saved(), [other_name(1), other_name(2)])
         self.manager.resolve(other_name(1), persist=True, max_age=60)
         self.assertNotIn(other_name(1), self.manager._floor)
-        self.assertNotIn(other_name(1), self.manager._floor_used)
+        self.assertNotIn(other_name(1), self.manager._floor._entries)
         self.manager.announce_due()
         self.assertEqual(self.saved(), [other_name(2)])
 
