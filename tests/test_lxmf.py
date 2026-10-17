@@ -1060,7 +1060,7 @@ class AuditFixesTest(FeatureTestCase):
         for number in range(20):
             feature.received(self.link_message(number=number, source=bytes([number]) * 16,
                                                text=("é" * 3000).encode()))
-        sizes = [lxmf._json_bytes(e) for e in feature.inbox_list()]
+        sizes = [lxmf._json_bytes(e) for e in feature.inbox.entries()]
         self.assertLessEqual(sum(sizes), 20_000)
         self.assertEqual(feature.inbox_list()[-1]["id"], 20)
         feature.save()
@@ -1270,6 +1270,30 @@ class RestartAndCancelTest(FeatureTestCase):
                 self.assertRaises(OSError):
             lxmf.LxmfFeature(self.b)
         self.assertEqual(database.references, before)
+
+    def test_constructor_sets_every_attribute_before_its_start_up_steps(self):
+        """FT1: building the feature over an inbox that isn't clean records an unrecorded lxmf: pin in a new
+        message (_release_unrecorded -> _record_kept, which takes the lock and adds to the inbox); every attribute
+        the finished feature has is already set when that runs."""
+        self.feature_node()
+        target = Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"])
+        self.b.storage.pin(target, f"lxmf:{SENDER.hex()}")  # the inbox was never saved, so it isn't clean
+        seen = []
+        original = lxmf.LxmfFeature._release_unrecorded
+
+        def release_unrecorded(feature):
+            """Note the attributes set so far, then run the real start-up step."""
+            seen.append(set(vars(feature)))
+            original(feature)
+
+        with mock.patch.object(lxmf.LxmfFeature, "_release_unrecorded", release_unrecorded):
+            again = self.reloaded()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(vars(again)) - seen[0], set(), "attributes set only after the start-up steps")
+        records = again.inbox_list()
+        self.assertEqual([(e["from"], e["auto"]) for e in records],
+                         [(SENDER.hex(), [{"state": "pinned", "cid": str(target)}])])
+        self.assertEqual(self.b.storage.pins()[target], {f"lxmf:{SENDER.hex()}"})
 
 
 class MessageLogBoundsTest(unittest.TestCase):

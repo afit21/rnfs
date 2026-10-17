@@ -9,8 +9,8 @@
 - A target may start with a name contact's nick: `rnfs get alice/docs/report.pdf` resolves alice's name to
   its CID first (RnfsNode._parse_target calls expand_target; never for the gateway, so web pages can't use
   or probe the address book). Wherever the CLI takes a node ID (`get --from`, `ping`, `pin remote`), a node
-  contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf"), and trusts
-  senders that has(address, "lxmf") finds.
+  contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf"), trusts
+  senders that has(address, "lxmf") finds, and names them in the inbox listing with nick_of(address, "lxmf").
 - Stored in the state database's contacts table (rnfs.statedb), each change written at once, durably; at most
   MAX_CONTACTS entries.
 
@@ -102,7 +102,7 @@ class ContactsFeature(Feature):
         super().__init__(node)
         self._lock = threading.Lock()
         self._contacts: dict[str, tuple[str, bytes]] = {}  # nick -> (kind, hash)
-        self._nicks: dict[tuple[str, bytes], int] = {}  # (kind, hash) -> how many nicks name it, for has()
+        self._nicks: dict[tuple[str, bytes], set[str]] = {}  # (kind, hash) -> the nicks naming it, for has()
         self._dirty: set[str] = set()  # nicks changed (or deleted) whose save failed, written with the next change
         # name -> (CID, monotonic time of the resolve that found it), reused for EXPAND_AGE
         self._expanded: dict[bytes, tuple[str, float]] = {}
@@ -138,12 +138,12 @@ class ContactsFeature(Feature):
         """Set or (None) delete a contact, keeping _nicks in step (lock held, or loading)."""
         old = self._contacts.pop(nick, None)
         if old is not None:
-            self._nicks[old] -= 1
+            self._nicks[old].discard(nick)
             if not self._nicks[old]:
                 del self._nicks[old]
         if value is not None:
             self._contacts[nick] = value
-            self._nicks[value] = self._nicks.get(value, 0) + 1
+            self._nicks.setdefault(value, set()).add(nick)
 
     def _save(self, nick: str):
         """Write nick's row, and those of earlier changes whose save failed, durably (lock held). If it fails they
@@ -214,6 +214,13 @@ class ContactsFeature(Feature):
         """Whether some contact of that kind has hash ident (for other features: LXMF trusts its contacts)."""
         with self._lock:
             return (kind, bytes(ident)) in self._nicks
+
+    def nick_of(self, ident: bytes, kind: str) -> str | None:
+        """The nick of the contact of that kind with hash ident (the first by nick if several name it), or None
+        (for other features: the LXMF inbox listing names its senders' contacts)."""
+        with self._lock:
+            nicks = self._nicks.get((kind, bytes(ident)))
+            return min(nicks) if nicks else None
 
     def get(self, nick: str) -> dict:
         """One contact. NotFound if there is none; ValueError for an invalid nick."""

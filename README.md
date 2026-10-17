@@ -842,7 +842,7 @@ Nicks are 1–32 characters of `a-z 0-9 - _ .`, starting with a letter or digit.
 |---|---|
 | `rnfs lxmf address` | Your LXMF address, to give to friends |
 | `rnfs send ADDRESS\|CONTACT TARGET [-m TEXT] [--propagate] [--nearest]` | Send an `rnfs:` link (and text). The target may also be `name/<name>[/path]` or an `rnfs:` URI. `--propagate` sends through `lxmf_propagation_node` for offline recipients. `--nearest`, without `lxmf_propagation_node`, uses the nearest propagation node heard (for `--propagate`, or if direct delivery fails) |
-| `rnfs inbox` | Received messages with rnfs links |
+| `rnfs inbox` | Received messages with rnfs links. Each starts with the sender's address and says `untrusted`, `trusted` or `contact NICK`; the display name, which the sender chose, comes last in quotes |
 | `rnfs inbox get N [--link K] [-o OUT]` | Fetch what message N links to (only its K-th link with `--link`; `-o` for one link only), asking the sender's node first, then the DHT. Default names follow the `get` rule above |
 | `rnfs inbox rm N` / `rnfs inbox rm --all` | Remove messages, releasing what they auto-fetched |
 | `rnfs outbox` | Sent messages and their delivery state |

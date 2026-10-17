@@ -1058,7 +1058,7 @@ as is cheap. Rules live in the sections referenced.
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
-| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
+| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages, and each auto-fetch sender held to 1/n of the inbox; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
 | Unwanted content on a public gateway or provider node | Deny lists: denied CIDs never fetched, stored, served or provided, anywhere in a DAG; file hashes checked where content is assembled; lists size-capped and checked before use (8) |
 | Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
@@ -1116,6 +1116,11 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - A provider can lower its own measured rate, and so slow a fetch from it; on slow nodes, which use one
   provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
+- Many LXMF identities can keep the strangers' bucket empty (one message a minute, each from a new identity,
+  is enough), so no other untrusted sender's message is kept; contacts and other trusted senders are unaffected
+  (section 13). The node counts the messages dropped this way (`status`'s `untrusted_dropped`), so apps can
+  suggest adding the senders the user expects as contacts. LXMF stamps (proof of work) would make each message
+  cost the sender, but announcing a stamp cost changes the announce and refuses senders that haven't heard it.
 - RNS decrypts and decodes every request packet and starts a thread for it before rnfs sees it, so a link
   sending requests as fast as its interface carries them still costs the node that work (about 0.14 ms of CPU
   each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
@@ -1199,7 +1204,7 @@ are local conveniences, not part of the protocol.
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1590,22 +1595,34 @@ unreserved, pct-encoded: as in RFC 3986
   on a line of its own is read whole; elsewhere, trailing punctuation (`.,;:!?)]}'"`) is taken as the
   sentence's. At most 8 links, 4000 characters of text, 256 of title and 64 of display name are kept. Text
   from messages MUST be shown with control characters escaped.
+- A sender's display name is its own word, so it MUST NOT be shown where it could pass for the sender's address
+  or trust. `inbox` shows each message's sender address first, then `untrusted`, `trusted` or `contact <nick>`
+  (the API's computed `trusted` and `contact` fields; `?` from a daemon that doesn't give them), and the display
+  name last, quoted, with backslashes, quotes, blank fillers (U+115F, U+1160, U+3164, U+FFA0, U+2800), a
+  combining mark that follows nothing printed or is the third in a row, and a name of only spaces escaped too.
 - At most 500 messages and 4 MiB (as JSON) are kept, and at most 50 from one sender not in
   `lxmf_auto_fetch_from`. To make room, the oldest message holding no auto-fetched pins (none pinned or
   queued) is dropped; a message holding pins is not dropped for others' messages: if every kept message holds
-  pins, a new message without any is not kept (and one with pins pushes out the oldest). A trusted sender's
-  message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
+  pins, a new message without any is not kept, and one with pins pushes out its own sender's oldest message
+  (or, if that sender has none, is not kept). Each of the n senders in `lxmf_auto_fetch_from` keeps at most
+  1/n of the 500 messages and of the 4 MiB (at least one message and 16 KiB), messages holding pins included:
+  past its share, a new message from it drops its own messages, first those without pins, then those whose
+  pinned CIDs another of its messages also holds (dropping them releases nothing), then the oldest. A trusted
+  sender's message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
   message without pins is left; a new message from an untrusted sender that would need one dropped is not
   kept. New messages from untrusted senders are also rate limited: each sender has an allowance of 4 at once,
   then one per 15 minutes, and within it messages are taken from a node-wide bucket of 32 at once, then one
-  per minute; others are not kept. So one sender can't keep the node-wide bucket empty for everyone else. Each message's record is at most 16 KiB as JSON: links beyond that are dropped (the
+  per minute; others are not kept, and counted (`untrusted_dropped` in `status`). So one sender can't keep the
+  node-wide bucket empty for everyone else (many can: section 10, Limits). Each message's record is at most 16
+  KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
   `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or
-  removing the message stops a fetch in progress. The fetch is refused if the target's verified size plus what
+  removing the message stops a fetch in progress. A waiting link whose sender is no longer in
+  `lxmf_auto_fetch_from` is refused, not fetched: at the next start (with LXMF off too) and when its turn comes. The fetch is refused if the target's verified size plus what
   that source already pins would exceed `lxmf_auto_fetch_quota`, or if the blocks of its DAG would (as for
   remote pins, section 8); `max_download_size` applies too. A `name/` link is resolved without persisting
   the name's sequence (only the capped table of section 9 holds it), so names arriving unasked don't grow

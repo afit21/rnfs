@@ -900,7 +900,12 @@ retried first. A held message is dropped 30 s (`HOLD_PATH_WAIT`) after its sende
 arrival if later, with no identity known, and after 2 minutes in any case. A held message stays in the queue
 while it is retried, so it still counts as a duplicate and against the limit. The inbox (`MessageLog`) holds at
 most 500 records and 4 MiB as JSON, 50 per sender not in `lxmf_auto_fetch_from`, 16 KiB per record (links
-beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none;
+beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none,
+nor for another sender's (when all others hold pins, the new record's sender's own goes, or it is refused). An
+auto-fetch sender's record is added with `share=` 1/n of the record and byte limits (`_auto_share`, n senders in
+`lxmf_auto_fetch_from`, at least one record and 16 KiB), counting its protected records; past it, `_own_victim`
+drops its own unprotected records first, then those whose holdings (`holds=_held`: pinned CIDs, queued links)
+another of its records also holds, then the oldest;
 `add(reserved=)` keeps trusted senders' records from being evicted except for each other's (untrusted ones go
 first), so free identities can't push them out, and untrusted senders' new records come from a per-sender
 allowance (`SENDER_BURST` 4, then one per `SENDER_INTERVAL` 15 min; `_sender_tokens`, the last
@@ -936,6 +941,10 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 `TooLarge` or `StorageFull`, is retried once through the DHT). `POST /api/lxmf/send` and `/api/lxmf/sync` take
 `nearest`; `POST /api/lxmf/inbox/get` takes `use_sent_cid` (without it, an unresolvable name link is 404);
 `GET /api/lxmf/address` returns `propagation_node` (the configured one only) and `nearest_propagation_node`.
+`GET /api/lxmf/inbox` adds to each record, computed when listed, `trusted` (`LxmfFeature._trusted_hex`) and
+`contact` (`ContactsFeature.nick_of(address, "lxmf")`, the first nick naming it, or null); `rnfs inbox` prints the
+address, then `contact <nick>`, `trusted` or `untrusted` (`?` without the fields), the method, and last the
+display name quoted and escaped with `fsutil.printable_label`.
 Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 `chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`; `GET /api/cat`
 `raw=1`, `block=1`; `GET /api/info` `from`.
