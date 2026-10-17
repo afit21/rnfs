@@ -204,7 +204,7 @@ class DependencyLockTest(unittest.TestCase):
         """The build locks are hashed, agree with each other and with requirements.lock, and fit pyproject.toml."""
         backend, tools, runtime = read_lock(BACKEND_LOCK), read_lock(TOOLS_LOCK), read_lock()
         self.assertEqual(list(backend), ["setuptools"])
-        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib", "ruff"):
+        for name in ("setuptools", "build", "twine", "pyinstaller", "pyinstaller-hooks-contrib", "ruff", "coverage"):
             self.assertIn(name, tools)
         self.assertEqual(backend["setuptools"], tools["setuptools"])
         for name, (version, hashes) in [*backend.items(), *tools.items()]:
