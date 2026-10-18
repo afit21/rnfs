@@ -2,7 +2,7 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## 0.1.6 (unreleased)
+## 0.1.6
 
 Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,
 0.1.4 and 0.1.3 nodes work together. The upgrade of an `<rnfs dir>` is automatic and one-way.

@@ -24,7 +24,7 @@
 * Name changes: `names.watch` in the library, `GET /api/name/watch` in the local API
 * Job progress and completion: job callbacks in the library
 
-# 0.1.6 (in progress)
+# 0.1.6
 
 Security fixes, maintainability work and performance work, with no wire-format or CID changes (see
 CHANGELOG.md).
