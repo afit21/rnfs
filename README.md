@@ -17,7 +17,7 @@ Access any file on RNFS by it's **'CID'**.
 
 <hr>
 
-### Publish any file to a string & fetch it over Reticulum
+### Publish files that anyone can fetch over Reticulum by it's hash
 
 
 <img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
