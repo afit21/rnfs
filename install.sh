@@ -279,7 +279,7 @@ SystemCallArchitectures=native
 # ProtectSystem and PrivateTmp are left out: in a user unit they need unprivileged user namespaces, which some
 # systems turn off. Where that works, add them with the drop-in in contrib/rnfs.service.d/hardening.conf
 # (https://github.com/afit21/rnfs/blob/main/contrib/rnfs.service.d/hardening.conf). UMask is left out too: what
-# `rnfs get` writes gets its permissions from your umask.
+# rnfs get writes gets its permissions from your umask.
 
 [Install]
 WantedBy=default.target

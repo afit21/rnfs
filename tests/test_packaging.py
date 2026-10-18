@@ -136,6 +136,15 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn('*--source-ref*) options="$options --source-ref=refs/tags/$RELEASE_TAG"', verify)
         self.assertIn('*--deny-self-hosted-runners*) options="$options --deny-self-hosted-runners"', verify)
 
+    def test_unit_heredoc_runs_nothing(self):
+        """write_unit's heredoc is unquoted (it fills in the launcher's path), so the shell would run anything in
+        backticks or $(...) there: only the systemd_quote of the launcher may be."""
+        body = shell_function("write_unit")
+        heredoc = body[body.index("<<EOF\n") + len("<<EOF\n"):body.index("\nEOF\n")]
+        self.assertNotIn("`", heredoc)
+        self.assertEqual(re.findall(r"\$\(", heredoc), ["$("])
+        self.assertIn('$(systemd_quote "$LAUNCHER")', heredoc)
+
     def test_unit_matches_contrib(self):
         """install.sh's unit has every [Unit] and [Service] line of contrib/rnfs.service, in order, except
         ExecStart (the launcher's path) and comments (SUP-6)."""
