@@ -17,7 +17,6 @@ on any platform through the fake winacl backend of test_l7_windows_acl, with a s
 the real advapi32 calls aren't exercised here.
 """
 import os
-import resource
 import stat
 import sys
 import tempfile
@@ -154,6 +153,7 @@ class PosixSwapTest(SwapTestCase):
         empty = [Entry(f"d{i:05}", EMPTY_DIRECTORY, 0, dag.KIND_DIRECTORY) for i in range(count)]
         middle = builder.build_directory(empty, self.blocks.put)
         top = builder.build_directory([Entry("m", middle.cid, 0, dag.KIND_DIRECTORY)], self.blocks.put)
+        import resource  # POSIX only, as this class is: imported here so the module loads on Windows
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         fd_dir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
         highest = max(int(name) for name in os.listdir(fd_dir))

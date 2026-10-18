@@ -117,11 +117,12 @@ class InstallScriptTest(unittest.TestCase):
             return subprocess.run(["sh", "-c", script, "sh", directory], capture_output=True, text=True, check=True,
                                   env={**os.environ, "RELEASE_TAG": tag}).stdout
         with tempfile.TemporaryDirectory() as wheels:
-            older = os.path.join(wheels, "rnfs-0.1.4-py3-none-any.whl")
+            # The script joins with "/" whatever the platform (sh on Windows is Git Bash), so the expected paths do too
+            older = wheels + "/rnfs-0.1.4-py3-none-any.whl"
             open(older, "w").close()
             self.assertEqual(find(wheels, "v0.1.6"), "")
             self.assertEqual(find(wheels, ""), older + "\n")
-            wheel = os.path.join(wheels, "rnfs-0.1.6-py3-none-any.whl")
+            wheel = wheels + "/rnfs-0.1.6-py3-none-any.whl"
             open(wheel, "w").close()
             self.assertEqual(find(wheels, "v0.1.6"), wheel + "\n")
         install = shell_function("do_install")

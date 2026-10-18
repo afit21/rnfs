@@ -130,7 +130,13 @@ class BlockStoreTest(unittest.TestCase):
         alphabet = "abcdefghijklmnopqrstuvwxyz234567"
         spare_bits_set = str(raw)[:-1] + alphabet[alphabet.index(str(raw)[-1]) + 1]  # parse() refuses it
         dag_pb = "b" + base64.b32encode(bytes([1, 0x70, 0x12, 0x20]) + bytes(32)).decode().lower().rstrip("=")
-        for name in (spare_bits_set, dag_pb, str(raw) + "=", "b" + str(node)[1:].upper()):
+        names = [spare_bits_set, dag_pb, str(raw) + "="]
+        upper = "b" + str(node)[1:].upper()
+        # On a case-insensitive filesystem (macOS, Windows) the upper-case name is the node's own file: writing it
+        # would empty the block, and it can't be a second file there anyway
+        if not os.path.exists(os.path.join(self.tmp.name, upper)):
+            names.append(upper)
+        for name in names:
             open(os.path.join(self.tmp.name, name), "wb").close()
         scanned = sorted(BlockStore(self.tmp.name).scan())
         self.assertEqual(scanned, sorted([(raw, 4), (node, 4)]))
