@@ -21,6 +21,13 @@ class NotFound(RnfsError):
     """Content, a path inside a DAG, a name or an alias doesn't exist, or no provider could supply it."""
 
 
+class Unsupported(NotFound):
+    """This node can't do what was asked at all (a daemon started without a way to stop it from the API, say), as
+    opposed to there being no such content. A NotFound (404) whose code is "unsupported"."""
+
+    code = "unsupported"
+
+
 class TooLarge(RnfsError):
     """A fetch or read would exceed a bound: max_download_size, max_output_entries, the DAG byte or byte-range
     bound (section 7), a remote pin's or auto-fetch's quota, or the free space an output needs."""
@@ -69,3 +76,21 @@ class NotRecipient(ValueError):
 # error, and rnfs.gateway has a fixed message for each
 STATUSES = ((ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), (InvalidDag, 422), (Busy, 503),
             (StorageFull, 507))
+
+# The machine-readable code an API error carries ({"error", "code"}; design.md, "Error codes"), so a client needn't
+# read the message: the node's errors by STATUSES' classes, then the API's own refusals. An error with a code
+# attribute of its own (one of CODES) gives that instead. A code is never renamed once released
+STATUS_CODES = {400: "bad_request", 404: "not_found", 413: "too_large", 451: "denied", 422: "invalid_dag",
+                503: "busy", 507: "storage_full", 500: "internal"}
+API_CODES = ("bad_host", "unauthorized", "no_such_endpoint", "method_not_allowed", "timeout", "length_required",
+             "body_too_large", "unsupported", "too_many_connections")
+CODES = (*STATUS_CODES.values(), *API_CODES)
+
+
+def error_code(error: Exception, status: int) -> str:
+    """The code for error, answered with status: its own code attribute if it has one of CODES, else the
+    status's ("internal" for any status without one)."""
+    own = getattr(error, "code", None)
+    if isinstance(own, str) and own in CODES:
+        return own
+    return STATUS_CODES.get(status, "internal")

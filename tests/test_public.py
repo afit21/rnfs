@@ -5,12 +5,15 @@ of an ApiServer serving one, so both classes are shown to behave alike. Node A, 
 """
 import array
 import contextlib
+import dataclasses
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -22,12 +25,15 @@ import RNS
 
 import rnfs
 from rnfs import api, cli, embedded, fsutil, interface, objects, remote
+from rnfs import events as events_module
 from rnfs.api import ApiHandler, ApiServer, NameWatches
 from rnfs.config import Config
 from rnfs.content.cid import RAW, Cid
+from rnfs.features.lxmf import Link, encode_field
 from rnfs.names import encode_record
 from rnfs.node import DirInUse, RnfsNode, lock_rnfs_dir
 from tests.support import wait_for
+from tests.test_lxmf import RECIPIENT, SENDER, FakeLxmf, message
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -457,6 +463,277 @@ class PublicTests:
         with self.assertRaises(ValueError):
             self.rnfs.deny.add(["not an entry"])
 
+    # The features: peers, contacts, keep and follow, LXMF
+
+    def test_peers_and_stats(self):
+        """peers() lists the nodes the feature does, as Peers; stats() its traffic report, as Stats."""
+        peers = self.rnfs.peers()
+        listed = [rnfs.Peer.from_dict(peer) for peer in self.b.feature("peers").peers()]
+        timeless = {"seniority": None, "first_heard": None}  # times measured at each call
+        self.assertEqual([dataclasses.replace(peer, **timeless) for peer in peers],
+                         [dataclasses.replace(peer, **timeless) for peer in listed])
+        self.assertEqual([(str(peer), peer.node_id, peer.in_table) for peer in peers], [(A_ID.hex(), A_ID, True)])
+        stats = self.rnfs.stats()
+        self.assertIsInstance(stats, rnfs.Stats)
+        self.assertEqual(stats.totals, self.b.feature("peers").stats()["totals"])
+        self.assertEqual(stats.upload_budget, self.b.config.upload_budget)
+
+    def test_contacts(self):
+        """add (the kind told by the node, or given), get, list and remove; and what they refuse."""
+        alice = self.rnfs.contacts.add("alice", A_ID)
+        self.assertEqual((alice, str(alice)), (rnfs.Contact("alice", "node", A_ID), "alice"))
+        self.assertEqual(self.rnfs.contacts.add("other", OTHER.hex(), kind="name").kind, "name")
+        self.assertEqual(self.rnfs.contacts.get("other"), rnfs.Contact("other", "name", OTHER))
+        self.assertEqual([contact.nick for contact in self.rnfs.contacts.list()], ["alice", "other"])
+        self.rnfs.contacts.remove("alice")
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.contacts.remove("alice")
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.contacts.get("alice")
+        for nick, ident, kind in (("Not A Nick", A_ID, None), ("bob", A_ID, "friend"), ("bob", b"short", None),
+                                  ("bob", bytes([7] * 16), None)):  # the last: a kind the node can't tell
+            with self.subTest(nick=nick, kind=kind), self.assertRaises(ValueError):
+                self.rnfs.contacts.add(nick, ident, kind)
+        with self.assertRaises(ValueError):
+            self.rnfs.contacts.get("Not A Nick")
+
+    def test_keep_and_follow(self):
+        """names.keep/unkeep/kept and follow/unfollow/following, a name given as bytes, hex, a Name or a nick."""
+        name = self.rnfs.names.create("site")
+        name.publish(self.rnfs.add(b"site").cid)
+        kept = self.rnfs.names.keep(OTHER)
+        self.assertEqual((kept, str(kept)), (rnfs.Kept(OTHER, ("user",)), OTHER.hex()))
+        self.assertEqual(self.rnfs.names.keep(name).name, name.name)
+        self.assertEqual({entry.name for entry in self.rnfs.names.kept()}, {OTHER, name.name})
+        self.rnfs.names.unkeep(name.hex)
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.names.unkeep(name)
+        self.rnfs.contacts.add("other", OTHER, kind="name")
+        followed = self.rnfs.names.follow("other")
+        self.assertEqual((followed.name, followed.pinned, followed.state), (OTHER, None, "waiting"))
+        self.assertEqual(self.rnfs.names.following(), [followed])
+        self.assertIn(rnfs.Kept(OTHER, ("follow", "user")), self.rnfs.names.kept())
+        self.rnfs.names.unfollow(OTHER.hex())
+        self.assertEqual(self.rnfs.names.following(), [])
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.names.unfollow(OTHER)
+        for bad in ("nobody", b"short", 5):  # an unknown nick, not a name, not a name at all
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.rnfs.names.keep(bad)
+
+    def test_a_missing_feature_is_not_found(self):
+        """Each feature's methods raise NotFound, with its API route's message, when the node hasn't loaded it."""
+        calls = {"peers": (self.rnfs.peers, "no peers feature"),
+                 "contacts": (self.rnfs.contacts.list, "no address book"),
+                 "keepers": (self.rnfs.names.kept, "doesn't keep names"),
+                 "follow": (lambda: self.rnfs.names.follow(OTHER), "can't follow names"),
+                 "lxmf": (self.rnfs.lxmf.inbox, "no lxmf feature")}
+        for feature, (call, words) in calls.items():
+            with self.subTest(feature=feature), mock.patch.dict(self.b.features):
+                del self.b.features[feature]
+                with self.assertRaisesRegex(rnfs.NotFound, words):
+                    call()
+
+    def test_lxmf_off(self):
+        """With LXMF off (a Node's default), address, send and sync raise ValueError saying why; the boxes list."""
+        for call in (self.rnfs.lxmf.address, lambda: self.rnfs.lxmf.send(SENDER, self.rnfs.add(b"x").cid),
+                     self.rnfs.lxmf.sync):
+            with self.assertRaisesRegex(ValueError, "LXMF has not been started"):
+                call()
+        self.assertEqual((self.rnfs.lxmf.inbox(), self.rnfs.lxmf.outbox()), ([], []))
+
+    def test_lxmf(self):
+        """address, send and the outbox, sync, the inbox (with its sender's contact), get as a job, remove."""
+        feature = self.b.feature("lxmf")
+        feature.attach(FakeLxmf())
+        address = self.rnfs.lxmf.address()
+        self.assertEqual((address.address, str(address), address.propagation_node), (RECIPIENT, RECIPIENT.hex(), None))
+        data = os.urandom(5000)
+        cid = self.share(data, "f.bin")
+        sent = self.rnfs.lxmf.send(SENDER, f"{cid}/f.bin", "for you")
+        self.assertEqual((sent.to, sent.method), (SENDER, "direct"))
+        outgoing, = self.rnfs.lxmf.outbox()
+        self.assertEqual((outgoing.id, outgoing.hash, outgoing.text, outgoing.state), (sent.id, sent.hash, "for you",
+                                                                                      "outbound"))
+        self.assertEqual((outgoing.links[0].cid, outgoing.links[0].path), (cid, ("f.bin",)))
+        with self.assertRaises(ValueError):
+            self.rnfs.lxmf.send(SENDER, cid, propagate=True)  # no propagation node
+        self.assertEqual(self.rnfs.lxmf.sync(), rnfs.Synced(None, False))
+        # A message from a contact, linking to the file on A
+        self.rnfs.contacts.add("sender", SENDER, kind="lxmf")
+        link = Link(cid, path=("f.bin",), from_node=A_ID)
+        entry_id = feature.received(message(content=b"have a look", fields=encode_field([link])))
+        received, = self.rnfs.lxmf.inbox()
+        self.assertEqual((received.id, received.sender, received.text, received.trusted, received.contact),
+                         (entry_id, SENDER, "have a look", True, "sender"))
+        self.assertEqual((str(received.links[0]), received.links[0].from_node), (link.uri(), A_ID))
+        fetched, = self.rnfs.lxmf.get(entry_id, output=self.out("lxmf"))
+        self.assertEqual((fetched.target, fetched.output), (f"{cid}/f.bin", self.out("lxmf")))
+        self.assertEqual(fetched.job.wait(10).state, "done")
+        with open(self.out("lxmf"), "rb") as f:
+            self.assertEqual(f.read(), data)
+        for bad_id, error in ((0, ValueError), (99, rnfs.NotFound)):
+            with self.subTest(bad_id=bad_id), self.assertRaises(error):
+                self.rnfs.lxmf.get(bad_id, directory=self.tmp)
+        self.assertEqual(self.rnfs.lxmf.remove(entry_id), 1)
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.lxmf.remove(entry_id)
+        feature.received(message(content=b"again", fields=encode_field([link]), number=2))
+        self.assertEqual(self.rnfs.lxmf.remove_all(), 1)
+        self.assertEqual(self.rnfs.lxmf.inbox(), [])
+
+    def test_timeout_is_checked(self):
+        """timeout() takes None or a positive number, on either class, and nests."""
+        with self.rnfs.timeout(30), self.rnfs.timeout(None):
+            self.assertEqual(self.rnfs.status().node_id, B_ID)
+        for bad in (0, -1, True, "5", float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                with self.rnfs.timeout(bad):
+                    pass
+
+    # 0.1.7: pin details and labels, the cache, capabilities, events, the daemon, settings, streams
+
+    def test_pin_details_and_label(self):
+        """pins() gives 0.1.7's details; label_pin labels a pin, None clears it, and an unpinned CID is NotFound."""
+        data = os.urandom(5000)
+        cid = self.rnfs.add(data).cid
+        pin, = self.rnfs.pins(cid)
+        self.assertEqual((pin.size, pin.label, pin.entries), (len(data), None, None))
+        self.assertIsInstance(pin.added, float)
+        labelled = self.rnfs.label_pin(cid, "holiday")
+        self.assertEqual((labelled.cid, labelled.label), (cid, "holiday"))
+        self.assertEqual(self.rnfs.pins(cid)[0].label, "holiday")
+        self.assertIsNone(self.rnfs.label_pin(cid, None).label)
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.label_pin(Cid.for_block(RAW, b"not pinned"), "x")
+
+    def test_cache(self):
+        """A fetch not pinned is listed by cache(); uncache() evicts it, then is NotFound."""
+        data = os.urandom(5000)
+        cid = self.share(data, "f.bin")
+        self.rnfs.get(f"{cid}/f.bin", self.out("got"))
+        cached = self.rnfs.cache()
+        self.assertEqual([(entry.root, entry.path, entry.size, entry.pinned) for entry in cached],
+                         [(cid, ("f.bin",), len(data), False)])
+        self.assertIsInstance(cached[0], rnfs.Cached)
+        removed = self.rnfs.uncache(cached[0].cid)
+        self.assertEqual((removed.removed_records, removed.freed_bytes > 0), (1, True))
+        self.assertEqual(self.rnfs.cache(), [])
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.uncache(cached[0].cid)
+
+    def test_capabilities(self):
+        """capabilities(): the version, what the node offers, its routes, features and event kinds."""
+        capabilities = self.rnfs.capabilities()
+        self.assertEqual(capabilities.version, rnfs.__version__)
+        self.assertTrue(capabilities.has("events") and capabilities.has("config"))
+        self.assertIn(("GET", "/api/events"), capabilities.routes)
+        self.assertIn("lxmf", capabilities.features)
+        self.assertIn("pin", capabilities.event_kinds)
+        self.assertIn("not_found", capabilities.error_codes)
+        self.assertEqual(capabilities.has("shutdown"), self.daemon)
+
+    def test_shutdown_and_daemon_info(self):
+        """shutdown() is Unsupported (a Node; a daemon started without a way to stop it); daemon_info() None
+        where there is no daemon.json."""
+        with self.assertRaises(rnfs.Unsupported):
+            self.rnfs.shutdown()
+        self.assertIsNone(self.rnfs.daemon_info())
+
+    def test_events_since(self):
+        """since(): the baseline, then the events after it (of kinds), lost for another run, and its checks."""
+        baseline = self.rnfs.events.since()
+        self.assertEqual((baseline.events, baseline.lost), ((), False))
+        cid = self.rnfs.add(b"an event").cid
+        batch = self.rnfs.events.since(baseline.next, kinds="pin", epoch=baseline.epoch)
+        self.assertEqual([(event.kind, event.fields["change"]) for event in batch.events], [("pin", "added")])
+        self.assertIn(str(cid), batch.events[0].fields["cids"])
+        self.assertGreater(batch.events[0].seq, baseline.next)
+        self.assertEqual(self.rnfs.events.since(batch.next, epoch=batch.epoch, wait=1).events, ())
+        self.assertTrue(self.rnfs.events.since(baseline.next, epoch="another run").lost)
+        self.assertFalse(self.rnfs.events.since(baseline.next, epoch="").lost)  # "" is no epoch, on both
+        for bad in ({"kinds": ["nope"]}, {"after": -1}, {"after": 0, "wait": 1.5}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.rnfs.events.since(**bad)
+
+    def test_events_watch(self):
+        """watch() calls back on the event thread for each event of its kinds published after it, in order,
+        until cancelled."""
+        heard = []
+        watch = self.rnfs.events.watch(lambda event: heard.append((threading.current_thread().name, event)),
+                                       kinds=["pin"])
+        first, second = self.rnfs.add(b"one").cid, self.rnfs.add(b"two").cid
+        wait_for(lambda: len(heard) >= 2, what="two pin events")
+        self.assertEqual({thread for thread, _ in heard}, {self.rnfs.events_thread})
+        self.assertEqual([event.fields["cids"] for _, event in heard], [[str(first)], [str(second)]])
+        watch.cancel()
+        self.rnfs.add(b"three")
+        time.sleep(0.3)
+        self.assertEqual(len(heard), 2)
+        with self.assertRaises(ValueError):
+            self.rnfs.events.watch(print, kinds="nope")
+
+    def test_config(self):
+        """config() lists the settings; config_set() changes rnfs.toml, applying a live one (a list too), and
+        refuses what it can't set."""
+        settings = self.rnfs.config()
+        self.assertEqual(settings.path, os.path.join(self.b.config.rnfs_dir, "rnfs.toml"))
+        self.assertEqual((settings["max_jobs"].value, settings["max_jobs"].live), (2, True))
+        change = self.rnfs.config_set({"max_jobs": 3, "lxmf_accept_from": (SENDER.hex(),)})
+        self.assertEqual((change.applied, change.restart_required), (("max_jobs", "lxmf_accept_from"), ()))
+        self.assertEqual(self.b.config.max_jobs, 3)
+        settings = self.rnfs.config()
+        self.assertEqual((settings["max_jobs"].file, settings["lxmf_accept_from"].file), (3, (SENDER.hex(),)))
+        self.assertEqual(rnfs.Settings.from_dict(settings.to_dict()), settings)
+        for bad in ({"no_such_setting": 1}, {}, {"max_jobs": "many"}, "max_jobs"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.rnfs.config_set(bad)
+
+    def test_add_flags_and_recipients(self):
+        """jobs.add and add take truthy flags as booleans and refuse recipients that aren't strings with
+        ValueError, alike on both classes (the audit's parity: wrap=1, to=[b"x"])."""
+        path = self.out("flags")
+        os.makedirs(path)
+        with open(os.path.join(path, "x.txt"), "wb") as f:
+            f.write(b"x")
+        job = self.rnfs.jobs.add(path, wrap=1, only_hash=1)
+        self.assertEqual(job.wait(10).state, "done")
+        self.assertEqual(self.rnfs.add(path, wrap=1, only_hash=1).cid, rnfs.Cid.parse(job.wait(10).result["cid"]))
+        for to in ([b"x"], "alice", [5]):
+            with self.subTest(to=to), self.assertRaisesRegex(ValueError, "to must be a list of recipients"):
+                self.rnfs.jobs.add(path, to=to)
+            with self.subTest(to=to), self.assertRaisesRegex(ValueError, "to must be a list of recipients"):
+                self.rnfs.add(b"data", to=to)
+
+    def test_streams(self):
+        """add_tar, get_tar, export_stream and import_stream: a tar and an archive through the program."""
+        source = self.out("tree")
+        os.makedirs(os.path.join(source, "sub"))
+        with open(os.path.join(source, "sub", "x.txt"), "wb") as f:
+            f.write(b"hello")
+        tar = io.BytesIO()
+        with tarfile.open(fileobj=tar, mode="w") as archive:
+            archive.add(os.path.join(source, "sub"), arcname="sub")
+        added = self.rnfs.add_tar(tar.getvalue(), name="tree")
+        self.assertEqual([entry.name for entry in self.rnfs.ls(added.cid)], ["tree"])
+        self.assertEqual(b"".join(self.rnfs.cat(f"{added.cid}/tree/sub/x.txt")), b"hello")
+        self.assertEqual(self.rnfs.add_tar(io.BytesIO(tar.getvalue()), name="tree", only_hash=True).cid, added.cid)
+        with tarfile.open(fileobj=io.BytesIO(b"".join(self.rnfs.get_tar(f"{added.cid}/tree")))) as back:
+            member, = [name for name in back.getnames() if name.endswith("sub/x.txt")]
+            self.assertEqual(back.extractfile(member).read(), b"hello")
+        exported = self.rnfs.export(added.cid, self.out("a.rnfs"))
+        streamed = b"".join(self.rnfs.export_stream(added.cid))
+        with open(self.out("a.rnfs"), "rb") as f:
+            self.assertEqual(streamed, f.read())
+        self.rnfs.unpin(added.cid)
+        self.assertEqual(self.rnfs.import_stream(memoryview(streamed)).roots, exported.roots)
+        self.assertEqual(self.rnfs.pins(added.cid)[0].sources, ("user",))
+        with self.assertRaises(rnfs.NotFound):
+            next(self.rnfs.get_tar(f"{added.cid}/no such entry"))
+        with self.assertRaises(ValueError):
+            self.rnfs.add_tar(b"not a tar" * 100)
+        self.rnfs.get_tar(added.cid).close()  # never iterated: nothing sent, nothing fetched
+
     # The example app (examples/rnfs_share.py), with whichever class
 
     def test_example_app(self):
@@ -499,6 +776,8 @@ class PublicTests:
 class EmbeddedNodeTest(PublicTests, unittest.TestCase):
     """The interface on rnfs.Node."""
 
+    daemon = False  # it can't be stopped through an API
+
     def make(self, node: RnfsNode):
         """rnfs.Node over node."""
         return OfflineNode(node)
@@ -514,6 +793,8 @@ class EmbeddedNodeTest(PublicTests, unittest.TestCase):
 
 class ClientTest(PublicTests, unittest.TestCase):
     """The interface on rnfs.Client, through a live ApiServer serving node B."""
+
+    daemon = True
 
     def make(self, node: RnfsNode):
         """A Client of an ApiServer serving node."""
@@ -581,6 +862,153 @@ class ClientTest(PublicTests, unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 job.wait(4)
             job.cancel()
+
+    def test_timeout_bounds_this_threads_requests(self):
+        """timeout() bounds the requests this thread makes inside it: a slow one raises ConnectionFailed, while
+        another thread's, and this thread's after the block, wait for the answer."""
+        peers = self.b.feature("peers")
+        original = peers.peers
+
+        def slow():
+            """The listing, a second late."""
+            time.sleep(1)
+            return original()
+        with mock.patch.object(peers, "peers", slow), mock.patch("rnfs.api.log"):  # answering too late fails
+            other = []
+            thread = threading.Thread(target=lambda: other.append(self.rnfs.peers()))
+            with self.rnfs.timeout(0.3):
+                thread.start()
+                with self.assertRaisesRegex(rnfs.ConnectionFailed, "didn't answer within its timeout"):
+                    self.rnfs.peers()
+            self.assertEqual(self.rnfs.peers()[0].node_id, A_ID)
+            thread.join(10)
+            self.assertEqual(other[0][0].node_id, A_ID)
+
+    def test_timeout_fits_long_polls(self):
+        """Inside timeout(), Job.wait's long polls ask to wait within it, so it times out as asked, not the socket;
+        outside, they wait the API's cap."""
+        waits = []
+        job_call = self.rnfs.api.job
+
+        def spy(job_id, wait=0):
+            """ApiConnection.job, recording each wait asked."""
+            waits.append(wait)
+            return job_call(job_id, wait)
+        with mock.patch.object(self.b.feature("jobs"), "_schedule", return_value=False), \
+                mock.patch.object(self.rnfs.api, "job", spy):  # the job stays queued
+            job = self.rnfs.jobs.pin(self.share(b"pinned"))
+            with self.rnfs.timeout(3), self.assertRaises(TimeoutError):
+                job.wait(4)
+            self.assertTrue(waits and max(waits) == 1, waits)
+            self.assertEqual(remote.long_poll_wait(None), remote.MAX_WATCH_WAIT)
+            job.cancel()
+
+    def test_event_watch_hears_a_restart_as_lost(self):
+        """A daemon whose run changed (a new event log, as at a restart): the watch gets a "lost" Event, then the
+        new run's events."""
+        heard = []
+        self.rnfs.events.watch(heard.append)
+        old = self.b.events
+        self.b.events = events_module.EventLog()  # the next poll asks it with the old run's epoch
+        old.publish("peer", node_id=A_ID.hex(), change="new", online=True)  # ends the poll waiting on the old log
+        wait_for(lambda: any(event.lost for event in heard), what="the lost marker")
+        lost = next(event for event in heard if event.lost)
+        self.assertEqual(lost.fields["epoch"], self.b.events.epoch)
+        cid = self.rnfs.add(b"after the restart").cid
+        wait_for(lambda: heard[-1].kind == "pin" and heard[-1].fields["cids"] == [str(cid)], what="the new event")
+
+    def test_a_watch_begun_in_a_new_run_leaves_older_watches_hearing(self):
+        """A daemon restarting while the poller waits to retry, and a new watch begun in the new run: the older
+        watch still gets "lost", then the new run's events, as the new watch does (the audit's ev_restart)."""
+        older, newer = [], []
+        self.rnfs.events.watch(older.append)
+        real, failed = self.rnfs.api.events, threading.Event()
+
+        def events(after=None, kinds=None, wait=0, epoch=None):
+            """The daemon dropping the poll in flight once, as a restart does."""
+            if after is not None and not failed.is_set():
+                failed.set()
+                raise rnfs.ConnectionFailed("the daemon dropped the connection")
+            return real(after, kinds, wait, epoch)
+        with mock.patch.object(self.rnfs.api, "events", events), mock.patch.object(remote, "RETRY_DELAY", 1.0), \
+                mock.patch.object(self.rnfs, "_report"):
+            old, self.b.events = self.b.events, events_module.EventLog()
+            old.publish("peer", node_id=A_ID.hex(), change="new", online=True)  # ends the poll on the old run
+            wait_for(failed.is_set, what="the failed poll")
+            self.rnfs.events.watch(newer.append)  # while the poller waits to retry
+            wait_for(lambda: any(event.lost for event in older), what="the older watch's lost marker")
+            self.b.events.publish("peer", node_id=A_ID.hex(), change="online", online=True)
+            for heard in (older, newer):
+                wait_for(lambda heard=heard: heard and heard[-1].fields.get("change") == "online",
+                         what="the new run's event")
+        self.assertFalse(any(event.lost for event in newer))
+
+    def test_two_first_watches_miss_nothing(self):
+        """Two first watches at once: the one with the older baseline still gets the events between the two (the
+        poller starts at the first baseline taken; the audit's ev_two_watch)."""
+        real, gate = self.rnfs.api.events, threading.Event()
+
+        def events(after=None, kinds=None, wait=0, epoch=None):
+            """The first watch's baseline, held up after its answer."""
+            result = real(after, kinds, wait, epoch)
+            if after is None and threading.current_thread().name == "first":
+                gate.wait(5)
+            return result
+        first, second = [], []
+        with mock.patch.object(self.rnfs.api, "events", events):
+            one = threading.Thread(name="first", target=lambda: self.rnfs.events.watch(first.append))
+            one.start()
+            time.sleep(0.3)
+            log = self.b.events
+            log.publish("peer", node_id=A_ID.hex(), change="new", online=True)
+            two = threading.Thread(target=lambda: self.rnfs.events.watch(second.append))
+            two.start()
+            time.sleep(0.3)
+            gate.set()
+            one.join(5)
+            two.join(5)
+            log.publish("peer", node_id=A_ID.hex(), change="online", online=True)
+            wait_for(lambda: len(first) == 2 and second, what="the events")
+        self.assertEqual([event.fields["change"] for event in first], ["new", "online"])
+        self.assertEqual([event.fields["change"] for event in second], ["online"])
+
+    def test_since_pauses_when_the_timeout_leaves_no_wait(self):
+        """events.since(wait=) inside a timeout too short for a long poll pauses up to a second on an empty answer,
+        as Job.wait does, rather than returning at once for the caller to spin."""
+        batch = self.rnfs.events.since()
+        with self.rnfs.timeout(2):
+            started = time.monotonic()
+            self.assertEqual(self.rnfs.events.since(batch.next, wait=5, epoch=batch.epoch).events, ())
+            self.assertGreaterEqual(time.monotonic() - started, remote.SHORT_POLL * 0.9)
+
+    def test_old_daemon_has_no_events_or_capabilities(self):
+        """A daemon without the 0.1.7 endpoints: empty capabilities, and NoSuchEndpoint (a NotFound) from
+        events.since and events.watch."""
+        new = {"/api/events", "/api/capabilities"}
+        without = {route: name for route, name in ApiHandler.ROUTES.items() if route[1] not in new}
+        with mock.patch.object(ApiHandler, "ROUTES", without):
+            capabilities = self.rnfs.capabilities()
+            self.assertEqual((capabilities, capabilities.has("events")), (rnfs.Capabilities(), False))
+            for call in (self.rnfs.events.since, lambda: self.rnfs.events.watch(print)):
+                with self.assertRaises(rnfs.NoSuchEndpoint):
+                    call()
+        self.assertEqual(self.rnfs._event_watch_count(), 0)  # the failed watch was forgotten
+
+    def test_shutdown_and_daemon_json(self):
+        """shutdown() stops a daemon that can be stopped through its API; daemon_info() reads its daemon.json."""
+        stopped = threading.Event()
+        server = ApiServer(self.b, 0, shutdown=stopped.set)
+        server.start()
+        self.addCleanup(server.stop)
+        client = rnfs.Client(self.b.config.rnfs_dir, port=server.port)
+        self.addCleanup(client.close)
+        cli.write_token(os.path.join(self.b.config.root, "api_token"), server.token)
+        self.assertTrue(client.shutdown())
+        self.assertTrue(stopped.wait(5))
+        info = {"pid": os.getpid(), "api_port": server.port, "version": rnfs.__version__}
+        fsutil.write_atomic(os.path.join(self.b.config.rnfs_dir, "daemon.json"), json.dumps(info).encode(),
+                            mode=0o600, private=True)
+        self.assertEqual(client.daemon_info(), info)
 
     def test_api_is_the_connection(self):
         """Client.api reaches any endpoint."""
@@ -838,6 +1266,59 @@ class NameWatchEndpointTest(unittest.TestCase):
         self.assertNotIn(OTHER, self.node.names._watched)
 
 
+class EventWatchTest(unittest.TestCase):
+    """_EventWatch's position: what it delivers before and after its baseline, across runs and losses."""
+
+    @staticmethod
+    def event(seq: int, kind: str = "pin") -> dict:
+        """An event of kind numbered seq."""
+        return {"seq": seq, "kind": kind, "time": 1.0}
+
+    def test_events_heard_before_the_baseline_wait_for_it(self):
+        """Events offered before begin() wait; begin delivers only those after the baseline, of its run."""
+        delivered = []
+        watch = interface._EventWatch(frozenset({"pin"}), print)
+        for epoch, event in (("run", self.event(4)), ("run", self.event(6)), ("run", self.event(7, "job")),
+                             ("other", self.event(8))):
+            self.assertFalse(watch.offer(epoch, event, delivered.append))
+        self.assertEqual(delivered, [])
+        self.assertEqual(watch.begin(5, "run", delivered.append), [self.event(6)])
+        self.assertTrue(watch.offer("run", self.event(9), delivered.append))
+        self.assertFalse(watch.offer("run", self.event(9), delivered.append))  # never twice
+        self.assertFalse(watch.offer("run", self.event(10, "job"), delivered.append))  # not its kind
+        self.assertEqual(delivered, [self.event(6), self.event(9)])
+
+    def test_lost(self):
+        """A lost marker after the watch's position is delivered and moves it to the new run; one the watch began
+        after is not."""
+        delivered = []
+        watch = interface._EventWatch(None, print)
+        watch.begin(5, "run", delivered.append)
+        lost = {"seq": 3, "kind": "lost", "time": None, "epoch": "run"}
+        self.assertFalse(watch.offer("run", lost, delivered.append))  # began after what was missed
+        self.assertTrue(watch.offer("new", {**lost, "seq": 2, "epoch": "new"}, delivered.append))
+        self.assertTrue(watch.offer("new", self.event(3), delivered.append))
+        self.assertFalse(watch.offer("run", self.event(20), delivered.append))  # the old run's
+        self.assertEqual([event["kind"] for event in delivered], ["lost", "pin"])
+
+    def test_events_heard_while_beginning_come_after_the_pending(self):
+        """An event another thread hears while begin() delivers the pending ones is delivered after them: deliveries
+        are queued under the watch's lock (the audit's ev_begin_order)."""
+        delivered = []
+        watch = interface._EventWatch(None, print)
+        watch.offer("run", self.event(6), delivered.append)
+        other = threading.Thread(target=watch.offer, args=("run", self.event(7), delivered.append))
+
+        def deliver(event):
+            """Deliver the pending event, once the other thread is trying to deliver a later one."""
+            other.start()
+            time.sleep(0.2)
+            delivered.append(event)
+        watch.begin(5, "run", deliver)
+        other.join(5)
+        self.assertEqual([event["seq"] for event in delivered], [6, 7])
+
+
 class ObjectsTest(unittest.TestCase):
     """The typed objects: from_dict(to_dict()) gives the object back, and to_dict is the API's form."""
 
@@ -849,9 +1330,36 @@ class ObjectsTest(unittest.TestCase):
                       objects.Stat(cid, 1, 2, 3, 4), objects.Pin(cid, ("user",), True, "file", False, None),
                       objects.Record(OTHER, cid, 2, 1.5), objects.Collected(1, 2), objects.Verified(3, (cid,)),
                       objects.Exported((cid,), 1), objects.Imported((cid,), (), 1), objects.DenyState(("a",), ()),
-                      objects.Status("0.1.4", B_ID, None, "client", features={"jobs_running": 0})):
+                      objects.Status("0.1.4", B_ID, None, "client", features={"jobs_running": 0}),
+                      objects.Peer(A_ID, "server", True, 12.5, False, 2, "TCP", 1e6, True, 800.0, 1.7e9, None,
+                                   False, 1, 2, 3, 4, 5, 6, 7, 1.6e9, 0.25, 1.7e9, True),
+                      objects.Stats(1.7e9, {"sent": 1}, {"budget": 2}, {"TCP": {"sent": 1, "received": 0}}, 10, 5),
+                      objects.Contact("alice", "node", A_ID), objects.Kept(OTHER, ("user",), 3, cid, 1.7e9),
+                      objects.Followed(OTHER, cid, cid, 3, "current"),
+                      objects.LxmfAddress(A_ID, "me", None, B_ID),
+                      objects.Message(1, bytes(32), A_ID, "a", 1.7e9, 1.7e9, "t", "x", "direct",
+                                      (objects.MessageLink("rnfs:x", cid, None, ("a",), 3, B_ID),), ({"state": "x"},),
+                                      True, "alice"),
+                      objects.Outgoing(2, bytes(32), A_ID, 1.7e9, (), "x", "propagated", "sent", 1.0, None,
+                                       bytes(32), True),
+                      objects.Sent(3, bytes(32), A_ID, "direct"), objects.Synced(B_ID, True),
+                      interface.Fetched("t", "/o", interface.Job("j", "get", "t"), None, ("w",), None),
+                      objects.Pin(cid, ("user",), True, "file", False, "n", "label", "/o", 3, None, 1.7e9),
+                      objects.Cached(cid, cid, ("a",), False, True, "file", 3, True), objects.Uncached(1, 2, 3),
+                      objects.Event(3, "pin", 1.7e9, {"change": "added", "cids": [str(cid)]}),
+                      objects.EventBatch((objects.Event(1, "job", 1.0, {"id": "x"}),), 1, False, "e"),
+                      objects.Capabilities("0.1.7", frozenset({"events"}), (("GET", "/api/events"),), ("lxmf",),
+                                           ("pin",), ("not_found",)),
+                      objects.Settings("/r/rnfs.toml", (objects.Setting("lxmf_accept_from", "lxmf", "list[string]",
+                                                                        None, False, (), None, value=("a",)),),
+                                       None, ("w",)),
+                      objects.SettingsChange("/r/rnfs.toml", ("max_jobs",), (), (), ())):
             with self.subTest(value=type(value).__name__):
                 self.assertEqual(type(value).from_dict(value.to_dict()), value)
+        link = objects.MessageLink("rnfs:x", from_node=B_ID).to_dict()
+        self.assertEqual((link["from"], "from_node" in link), (B_ID.hex(), False))  # the API's key
+        self.assertEqual(objects.Message.from_dict({"id": 1, "hash": "00" * 32, "from": A_ID.hex(),
+                                                    "new_field": 1}).sender, A_ID)  # a newer daemon's keys ignored
         self.assertEqual(objects.Entry("n", "file", 1, cid).to_dict(), {"name": "n", "kind": "file", "size": 1,
                                                                         "cid": str(cid)})
         self.assertEqual(objects.Record(OTHER, cid, 2, None).to_dict()["name"], OTHER.hex())
@@ -868,7 +1376,8 @@ class ImportTest(unittest.TestCase):
     def test_client_loads_no_rns(self):
         """rnfs.Client, the objects and errors load no RNS."""
         code = ("import sys, rnfs; rnfs.Client(port=1); rnfs.Cid, rnfs.Record, rnfs.NotFound, rnfs.ApiError, "
-                "rnfs.Job, rnfs.File, rnfs.SealError, rnfs.NotRecipient, rnfs.BlockMismatch; "
+                "rnfs.Job, rnfs.File, rnfs.SealError, rnfs.NotRecipient, rnfs.BlockMismatch, rnfs.Peer, "
+                "rnfs.Message, rnfs.Lxmf, rnfs.Fetched; "
                 "print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
         self.assertEqual(self.run_python(code), "False")
 

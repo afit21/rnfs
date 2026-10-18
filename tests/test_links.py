@@ -250,6 +250,28 @@ class LinkPoolTest(unittest.TestCase):
         self.assertIsNotNone(run(self, lambda: self.pool.get(NODE)))
         self.assertEqual(calls, [False, True, True, True, False])
 
+    def test_round_trip_reported_for_every_link_opened(self):
+        # rnfs peers' rtt: the shared link, a one-shot (ping's) and an identified one each report theirs
+        reported = []
+        self.pool.on_rtt = lambda node_id, rtt: reported.append((node_id, rtt))
+        run(self, lambda: self.pool.get(NODE))
+        run(self, lambda: self.pool.get(NODE))  # reused: not established again
+        self.pool.close_link(run(self, lambda: self.pool.open_identified(OTHER)))
+        self.assertEqual(reported, [(NODE, 0.01), (OTHER, 0.01)])
+        for rtt in (None, float("nan"), float("inf"), -1.0, True, "0.1"):  # not a usable measurement: not reported
+            self.pool._report_rtt(NODE, rtt)
+        self.assertEqual(len(reported), 2)
+
+    def test_ping_records_the_round_trip(self):
+        from rnfs.network.client import PeerClient
+        client = PeerClient(self.pool, Config())
+        self.assertEqual(run(self, lambda: client.ping(OTHER)), 0.01)
+        peer = client.traffic.peer(OTHER)
+        self.assertEqual(peer["rtt"], 0.01)
+        self.assertIsNotNone(peer["rtt_at"])
+        self.assertIsNotNone(peer["last_seen"])  # a link established: it is up
+        self.assertFalse(self.pool.has_link(OTHER))  # ping's link is closed again
+
     def test_path_described_only_for_a_kept_debug_message(self):
         # The description costs RNS lookups: built only when a LOG_DEBUG message goes somewhere (C2)
         with mock.patch.object(links, "path_description", return_value="") as describe:

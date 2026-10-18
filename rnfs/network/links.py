@@ -240,6 +240,9 @@ class LinkPool:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sweeper: threading.Thread | None = None
+        # Called with (node ID, seconds) for the round trip RNS measured on each link established, shared, one-shot
+        # (ping's) or identified, on the thread that opened it; PeerClient sets its traffic counters' (`rnfs peers`)
+        self.on_rtt: Callable[[bytes, float], None] | None = None
         # Reject response advertisements whose transfer outgrows their size (in the scope the node set)
         guards.install()
 
@@ -358,7 +361,17 @@ class LinkPool:
             link.identify(self.identity)
         rtt = getattr(link, "rtt", None)
         log(f"connected to {name}" + (f" (round trip {rtt * 1000:.0f} ms)" if rtt else ""), LOG_VERBOSE)
+        self._report_rtt(node_id, rtt)
         return True
+
+    def _report_rtt(self, node_id: bytes, rtt):
+        """Hand on_rtt the round trip of a link just established to node_id, if it is a finite, non-negative number
+        (RNS measures it on a link this node opens: the time from its request to the other node's proof)."""
+        listener = self.on_rtt
+        if listener is None or not isinstance(rtt, (int, float)) or isinstance(rtt, bool):
+            return
+        if 0 <= rtt < float("inf"):
+            listener(node_id, float(rtt))
 
     def _recall(self, node_id: bytes):
         """The node's identity from RNS, asking for a path again (whose response carries it) if needed.

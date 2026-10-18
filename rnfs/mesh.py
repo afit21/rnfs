@@ -7,7 +7,8 @@ interface rules and quiet hours; design.md, "Mesh").
 - Airtime controls for /blocks (AirtimePolicy): a node-wide upload budget (a token bucket), interface rules
   and quiet hours. /find, /provide and /pin are tiny and never refused by them.
 - Traffic: bounded, thread-safe counters of bytes and requests per peer and per interface, for `rnfs peers`,
-  `rnfs stats` and `rnfs status`.
+  `rnfs stats` and `rnfs status`, with each peer's last link round-trip time and the last sign it was up, from
+  which online() tells whether it is online.
 
 Pure policy with injected clocks; nothing here imports RNS (or rnfs.log, which does) at module level, since
 the CLI imports the peers feature, which uses this module.
@@ -30,6 +31,14 @@ STATS_CACHE = 30.0  # seconds a shared instance's interface stats are reused for
 PATH_CACHE = 15.0
 MAX_CACHED_PATHS = 1024
 PATHFINDER_M = 128  # RNS.Transport.PATHFINDER_M: what hops_to returns for an unknown path
+# Seconds a peer stays online after the last sign it was up (online()). Three link_idle_timeouts (300 s by
+# default): a peer just talked to doesn't turn offline the moment its idle link closes, nor between a fetch's
+# requests or a republish's. Far below announce_interval (6 h by default), so one announce doesn't keep a node
+# shown online for hours after it went away; a node that only announces is shown online for this long after each
+ONLINE_WINDOW = 900.0
+# Seconds an announce's emission time (its sender's clock) may be off from ours and still count as now
+# (Traffic.announced): nodes on a mesh without NTP drift by minutes
+EMISSION_SKEW = 300.0
 
 # Why a /blocks request was refused by an airtime control (Traffic.refused keys)
 REFUSED_BUDGET = "budget"
@@ -418,19 +427,37 @@ def shared_instance_warning(config, reticulum) -> str | None:
 
 # Traffic counters
 
+def online(link: bool, last_seen: float | None, now: float) -> bool:
+    """Whether a peer counts as online (`rnfs peers`, "peer" events): an rnfs link to it is open, or the last sign
+    it was up (Traffic: last_seen, monotonic like now) is at most ONLINE_WINDOW old; a negative age (a clock that
+    went back) counts as offline. A guess from what the node already knows, without network I/O: a node up but
+    silent shows offline (ping tells for sure), and one that went away shows online until the window passes or
+    its link closes."""
+    return link or (last_seen is not None and 0 <= now - last_seen <= ONLINE_WINDOW)
+
+
 class _Peer:
-    """Counters for one node."""
+    """Counters for one node. Times shown to users are wall time; those decisions are made from (last_seen,
+    first_counted) are Traffic.monotonic's, so a step of the wall clock can't turn peers online, offline or new."""
 
     __slots__ = ("sent", "received", "requests", "answered", "refused", "failed", "bad", "mode", "last_heard",
-                 "last_active")
+                 "last_active", "first_heard", "first_counted", "last_seen", "last_emitted", "rtt", "rtt_at")
 
-    def __init__(self):
-        """Nothing counted yet."""
+    def __init__(self, now: float, monotonic: float):
+        """Nothing counted yet; first counted at now (wall time), monotonic (Traffic.monotonic)."""
         self.sent = self.received = 0
         self.requests = self.answered = self.refused = self.failed = self.bad = 0
         self.mode: str | None = None  # "server" or "client", from its announces
-        self.last_heard: float | None = None  # wall time of its last announce
+        self.last_heard: float | None = None  # wall time of its last announce (or path response)
         self.last_active: float | None = None  # wall time of the last traffic with it
+        self.first_heard = now  # wall time it was first counted (this run, or since it was last forgotten)
+        self.first_counted = monotonic  # the same, monotonic: what "new" peer events are decided from
+        # Monotonic time of the last sign it was up: an announce emitted recently (Traffic.announced), an answer to a
+        # request (a refusal too), a request of its own served, or a link established
+        self.last_seen: float | None = None
+        self.last_emitted: float | None = None  # emission time (its clock) of the newest announce counted
+        self.rtt: float | None = None  # seconds: the round trip RNS measured on the last link established to it
+        self.rtt_at: float | None = None  # wall time it was measured
 
     def as_dict(self) -> dict:
         """JSON-ready counters."""
@@ -441,15 +468,17 @@ class Traffic:
     """Bytes and requests per peer, per interface and in total since start. Thread-safe, bounded.
 
     Peers and interfaces are kept in LRU order and capped (MAX_PEERS, MAX_INTERFACES), so a flood of
-    identities or spawned interfaces costs a fixed amount of memory. clock is wall time (for display).
+    identities or spawned interfaces costs a fixed amount of memory. clock is wall time (for display, and for
+    announces' emission times); monotonic is what online() and "new" peers are decided from.
     """
 
     def __init__(self, max_peers: int = MAX_PEERS, max_interfaces: int = MAX_INTERFACES,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         """Empty counters."""
         self.max_peers = max_peers
         self.max_interfaces = max_interfaces
         self.clock = clock
+        self.monotonic = monotonic
         self.started = clock()
         self._peers: OrderedDict[bytes, _Peer] = OrderedDict()
         self._interfaces: OrderedDict[str, dict[str, int]] = OrderedDict()
@@ -462,7 +491,7 @@ class Traffic:
         """node_id's counters, made most recent (created, evicting the oldest, if new). Caller holds the lock."""
         peer = self._peers.get(node_id)
         if peer is None:
-            peer = self._peers[node_id] = _Peer()
+            peer = self._peers[node_id] = _Peer(self.clock(), self.monotonic())
             while len(self._peers) > self.max_peers:
                 self._peers.popitem(last=False)
         else:
@@ -492,6 +521,7 @@ class Traffic:
                 peer = self._peer(node_id)
                 peer.sent += nbytes
                 peer.last_active = self.clock()
+                peer.last_seen = self.monotonic()  # it just asked
 
     def request(self, node_id: bytes, outcome: str, received: int = 0, interface: str | None = None,
                 bad: int = 0):
@@ -508,13 +538,44 @@ class Traffic:
             peer.received += received
             peer.bad += bad
             peer.last_active = self.clock()
+            if outcome != FAILED:  # it answered, if only to refuse
+                peer.last_seen = self.monotonic()
 
     def heard(self, node_id: bytes, mode: str):
-        """node_id announced itself in DHT mode ("server" or "client")."""
+        """node_id announced itself in DHT mode ("server" or "client"), or a path response for it arrived."""
         with self._lock:
             peer = self._peer(node_id)
             peer.mode = mode
             peer.last_heard = self.clock()
+
+    def announced(self, node_id: bytes, emitted: float | None) -> bool:
+        """An announce of node_id's own arrived, emitted at emitted (Unix time on its clock, signed; None if
+        unknown). True if it counts as a sign node_id was up: emitted later than the newest counted before (a replay
+        doesn't count twice) and at most ONLINE_WINDOW ago, allowing EMISSION_SKEW of clock difference. An announce
+        delivered late (held in an announce queue, or a path answer a shared instance passes on as an announce) says
+        nothing of now. It is seen when it was emitted (less the skew, never later than now), not when it arrived."""
+        if not isinstance(emitted, (int, float)) or isinstance(emitted, bool) or not math.isfinite(emitted):
+            return False
+        with self._lock:
+            peer = self._peer(node_id)
+            if peer.last_emitted is not None and emitted <= peer.last_emitted:
+                return False
+            peer.last_emitted = float(emitted)
+            age = max(0.0, self.clock() - emitted - EMISSION_SKEW)
+            if age > ONLINE_WINDOW:
+                return False
+            seen = self.monotonic() - age
+            if peer.last_seen is None or seen > peer.last_seen:
+                peer.last_seen = seen
+            return True
+
+    def measured(self, node_id: bytes, rtt: float):
+        """A link to node_id was established, RNS measuring a round trip of rtt seconds."""
+        with self._lock:
+            peer = self._peer(node_id)
+            peer.rtt = float(rtt)
+            peer.rtt_at = self.clock()
+            peer.last_seen = self.monotonic()
 
     def refused(self, reason: str):
         """A /blocks request was refused by an airtime control (one of REFUSALS)."""

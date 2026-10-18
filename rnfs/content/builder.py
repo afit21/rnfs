@@ -128,11 +128,15 @@ class BuildOptions:
     chunker: the name of the chunker cutting files (chunker.FIXED, the default, or FASTCDC); it decides their CIDs.
     check: called with each file's content SHA-256 once it is read, before the file's root node is stored; it may
     raise to stop the build (the deny list's file hashes). None checks nothing, and hashes nothing for it.
+    progress: called with the length of each read from a file of the tree being built (build_open: a path's files,
+    not a stream's), and with 0 for each directory entry met, so a walk over empty files reports too; it may raise
+    to stop the build (an add job's cancel). None reports nothing.
     Raises ValueError for an unknown chunker.
     """
 
     chunker: str = chunker.FIXED
     check: Callable[[bytes], None] | None = None
+    progress: Callable[[int], None] | None = None
 
     def __post_init__(self):
         """Check the chunker's name (None is the default)."""
@@ -532,7 +536,27 @@ def build_open(handle: Handle, st: os.stat_result, path: str, put: Put, warnings
         return _build_cached(handle, put, kind, options, cache)
     # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
     with os.fdopen(handle, "rb", closefd=False) as f:
-        return build_file(f, put, kind=kind, options=options)
+        return build_file(counted(f, options.progress), put, kind=kind, options=options)
+
+
+class _Counted:
+    """A binary reader passing the length of each read on to progress (BuildOptions.progress)."""
+
+    def __init__(self, stream: BinaryIO, progress: Callable[[int], None]):
+        """Read from stream, reporting to progress."""
+        self.stream = stream
+        self.progress = progress
+
+    def read(self, size: int = -1) -> bytes:
+        """Up to size bytes of the stream, reported once read (progress may raise to stop the build)."""
+        data = self.stream.read(size)
+        self.progress(len(data))
+        return data
+
+
+def counted(stream: BinaryIO, progress: Callable[[int], None] | None) -> BinaryIO:
+    """stream, reporting the length of each read to progress if it is given (BuildOptions.progress)."""
+    return stream if progress is None else _Counted(stream, progress)
 
 
 def _build_cached(handle: Handle, put: Put, kind: int, options: BuildOptions, cache: FileCache) -> Built:
@@ -565,6 +589,8 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
     child_height = 0
     children = list_directory(directory)
     for item in children:
+        if options.progress is not None:
+            options.progress(0)  # a cancel check even where no file is read (a tree of empty directories)
         child_path = os.path.join(path, item.name)
         shown = display_path(child_path)
         if not dag.is_valid_name(item.name):
@@ -596,6 +622,46 @@ def _build_tree(directory: Handle, path: str, put: Put, warnings: list[str], dep
         entries.append(Entry(item.name, child.cid, child.size, child.kind))
         child_height = max(child_height, child.height)
     return build_directory(entries, put, child_height)
+
+
+def tree_size(path: str, check: Callable[[], None] | None = None) -> int:
+    """The bytes add_path would read at path: a regular file's size (path followed if a symlink, as the add follows
+    it), or the sizes of the regular files below a directory that _build_tree reads, which skips symlinks, other
+    types and invalid names. An add job's total_bytes, measured before it reads anything: files changing meanwhile
+    make it an estimate. Unreadable directories count nothing (the add reports them); check(), if given, is called
+    for each entry and may raise (a job's cancel)."""
+    st = os.stat(path)
+    if stat.S_ISREG(st.st_mode):
+        return st.st_size
+    if not stat.S_ISDIR(st.st_mode):
+        return 0
+    total = 0
+    stack = [(path, 1)]
+    while stack:
+        directory, depth = stack.pop()
+        if depth > constants.MAX_DEPTH:
+            continue  # the add refuses it (TooLarge) when it gets there
+        try:
+            listing = os.scandir(directory)
+        except OSError:
+            continue
+        with listing:
+            for item in listing:
+                if check is not None:
+                    check()
+                if not dag.is_valid_name(item.name):
+                    continue
+                try:
+                    st = item.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_link(st):
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    total += st.st_size
+                elif stat.S_ISDIR(st.st_mode):
+                    stack.append((item.path, depth + 1))
+    return total
 
 
 def hard_link_reason(links: int) -> str:

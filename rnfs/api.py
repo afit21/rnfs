@@ -2,7 +2,7 @@
 
 Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; node IDs and names are
 32 hex characters; paths are absolute paths on the daemon's machine. Successful responses are JSON
-(except cat and name export, which send bytes); errors are `{"error": message}`.
+(except cat and name export, which send bytes); errors are `{"error": message, "code": code}` (below).
 
 | Method | Path | Parameters | Response / facade call |
 |---|---|---|---|
@@ -11,20 +11,26 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/cat | `target`, `offset`, `length`, `raw`, `block`, `from` | the bytes of a file (`read`; sealed files decrypted unless `raw`; fetched from node `from` if given), Content-Length set; `block=1`: the CID's own block |
 | GET  | /api/ls | `target` | `{"entries": ls(target)}` |
 | GET  | /api/stat | `target` | `stat(target)` |
-| GET  | /api/pin/ls | `cid` (optional) | `{"pins": pin_ls(cid)}` |
+| GET  | /api/pin/ls | `cid` (optional) | `{"pins": pin_ls(cid)}`: `cid`, `sources`, `complete`, `type`, `sealed`, `name`, and since 0.1.7 `label`, `origin`, `size`, `entries`, `added` |
 | GET  | /api/providers | `cid` | `{"providers": [node ID]}` |
 | GET  | /api/ping | `node` | `{"rtt": seconds or null}` |
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
 | GET  | /api/name/watch | `names` (comma-separated), `after` (a sequence or `-` per name), `wait` (≤ 30 s) | `{"records": [{"name", "cid", "sequence", "age"}]}`: the records held whose sequence is above `after`, as soon as there is one or after `wait` (below) |
 | POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker` | `add_path(...)` |
-| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`; body is the data | `add_stream(...)` |
+| POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`, `format`; body is the data | `add_stream(...)`; `format=tar`: the body is a tar stream, `add_tar(stream, name, ...)` builds the directory it holds (no `to`, `to_self` or `seal_name`) |
+| GET  | /api/get/stream | `target`, `format` (`tar`) | the target as a tar stream (`get_tar`), fetched first, Content-Length set |
+| GET  | /api/export/stream | `target` | the target's archive (`export_chunks`), byte-identical to `export`, Content-Length set |
+| POST | /api/import/stream | body is an archive | `import_stream(body)`, as `/api/import` answers |
 | POST | /api/get | JSON `target`, `output`, `from`, `raw` | `get(...)` |
 | POST | /api/dir/set | JSON `target`, `name`, `cid`, `executable` | `dir_set(...)` |
 | POST | /api/dir/rm | JSON `target` | `dir_rm(target)` |
 | POST | /api/pin/add | JSON `target` | `pin_add(target)` |
 | POST | /api/pin/rm | JSON `cid` | `{}` after `pin_rm(cid)` |
 | POST | /api/pin/remote | JSON `node`, `cid`, `pin` | `{"accepted": bool}` |
+| POST | /api/pin/label | JSON `cid`, `label` (null or "" clears it) | `pin_label(cid, label)`: the pin's `pin_ls` entry |
+| GET  | /api/cache/ls | | `{"cache": cache_ls()}`: the cached fetches, most recently used first |
+| POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes"}` |
 | POST | /api/gc, /api/verify | | `gc()`, `verify()` |
 | POST | /api/name/create | JSON `alias` | `name_create(alias)` |
 | POST | /api/name/rm | JSON `alias` | `{}` after `name_rm(alias)` |
@@ -33,6 +39,9 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | POST | /api/name/publish | JSON `alias`, `target` | `name_publish(alias, target)` |
 | POST | /api/export | JSON `target`, `output` | `export(target, output)` |
 | POST | /api/import | JSON `path` | `import_archive(path)` |
+| GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...]}` (below) |
+| GET  | /api/events | `after` (a sequence; absent: none, only `next`), `kinds` (comma-separated), `epoch`, `wait` (≤ 30 s) | `{"events": [event], "next", "lost", "epoch"}` (rnfs.events): the events after `after`, as soon as there is one or after `wait` |
+| POST | /api/shutdown | | `{"stopping": true}`, then the daemon stops as on SIGTERM (`unsupported` 404 where nothing can stop it) |
 
 The features (rnfs.features, each's `api_routes()`) add these; `name` is a name or a name contact's nick:
 
@@ -65,8 +74,18 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | GET  | /api/deny | | `{"entries": [local entry], "lists": [{"source", "cid", "entries", "state"}]}` |
 | POST | /api/deny/add | JSON `entries` | `{"added": [entries new to the local list]}` |
 | POST | /api/deny/rm | JSON `entries` | `{"removed": [...]}` (404 if one isn't on the local list) |
+| GET  | /api/config | | `{"path", "settings": [schema entry + "value", "file", "overridden", "pending"], "file_error", "warnings"}` (rnfs.features.settings) |
+| POST | /api/config/set | JSON `settings` ({name: value, or null to remove it from rnfs.toml}) | `{"path", "applied", "restart_required", "overridden", "warnings"}`; nothing written unless the whole result is valid (400) |
 
 Both tables are checked against ApiHandler.ROUTES and the features' routes (tests/test_api.py).
+
+Errors are `{"error": message, "code": code}`: code is machine-readable (rnfs.errors.CODES, design.md "Error
+codes"), so a client tells "no such endpoint" (`no_such_endpoint`, an older daemon) from "no such content"
+(`not_found`), both 404, without reading the message. `GET /api/capabilities` lists what this daemon offers
+(CAPABILITIES, every route and feature), so a client checks once instead of trying each endpoint.
+
+Events (rnfs.events, `GET /api/events`): a long poll like the name watch below, at most MAX_EVENT_WAITERS waiting
+at once (503 beyond); `after` absent answers at once with the `next` to start from.
 
 GET parameters are in the query string. Request bodies may use Content-Length or chunked encoding.
 
@@ -116,12 +135,12 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from rnfs import __version__, fsutil, ids
+from rnfs import __version__, events, fsutil, ids
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
-from rnfs.errors import STATUSES, BlockMismatch, Busy
-from rnfs.log import LOG_ERROR, LOG_WARNING, log
+from rnfs.errors import CODES, STATUSES, BlockMismatch, Busy, Unsupported, error_code
+from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_WARNING, log
 
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
@@ -133,6 +152,11 @@ MAX_WATCH_WAITERS = 4  # GET /api/name/watch calls waiting at once
 MAX_WATCH_WAIT = 30  # seconds one may wait, as GET /api/jobs/get's wait=
 WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it ends
 MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
+MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
+# What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
+CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
+                "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
+                "import_stream")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -148,6 +172,17 @@ def feature_routes() -> dict:
         from rnfs import features
         _feature_routes = features.api_routes()
     return _feature_routes
+
+
+def capabilities(node, without=()) -> dict:
+    """GET /api/capabilities' answer for node: {"version", "capabilities" (CAPABILITIES but those in without),
+    "routes" (every core and feature route, by path), "features" (those node loaded), "event_kinds",
+    "error_codes"}. rnfs.Node's capabilities() too, without what an embedded node can't do."""
+    loaded = getattr(node, "features", None) or {}
+    routes = sorted({*ApiHandler.ROUTES, *feature_routes()}, key=lambda route: (route[1], route[0]))
+    return {"version": __version__, "capabilities": sorted(set(CAPABILITIES) - set(without)),
+            "routes": [list(route) for route in routes], "features": sorted(loaded),
+            "event_kinds": list(events.EVENT_KINDS), "error_codes": list(CODES)}
 
 
 def error_status(error: Exception) -> int:
@@ -613,21 +648,26 @@ class ApiServer(LocalServer):
 
     max_connections = 32  # the CLI makes one connection per command; this is plenty for scripts too
 
-    def __init__(self, node, port: int, token: str | None = None):
-        """Bind to 127.0.0.1:port, requiring token (a new random one if None); serves once start() is called."""
+    def __init__(self, node, port: int, token: str | None = None, shutdown=None):
+        """Bind to 127.0.0.1:port, requiring token (a new random one if None); serves once start() is called.
+        shutdown, if given, is called (with no arguments) once POST /api/shutdown has been answered: the daemon
+        passes what its signal handlers do. Without it that route answers 404 unsupported."""
         self.token = token if token is not None else secrets.token_urlsafe(32)
         if not self.token:
             raise ValueError("the API token must not be empty")
-        super().__init__(ApiHandler, port, node=node, token=self.token, watches=NameWatches(node))
+        super().__init__(ApiHandler, port, node=node, token=self.token, watches=NameWatches(node),
+                         event_waiters=threading.BoundedSemaphore(MAX_EVENT_WAITERS),
+                         shutdown_callback=None if shutdown is None else staticmethod(shutdown))
 
 
 class ApiRequestError(Exception):
-    """A request the API refuses before reaching the node: status and message."""
+    """A request the API refuses before reaching the node: status, message and code (rnfs.errors.CODES)."""
 
-    def __init__(self, status: int, message: str):
-        """A refusal with status and message."""
+    def __init__(self, status: int, message: str, code: str):
+        """A refusal with status, message and code."""
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class ApiHandler(TimedHandler):
@@ -636,6 +676,8 @@ class ApiHandler(TimedHandler):
     node = None
     token: str | None = None
     watches: NameWatches | None = None
+    event_waiters: threading.BoundedSemaphore | None = None
+    shutdown_callback = None  # what POST /api/shutdown calls once answered (ApiServer's shutdown)
     server_version = "rnfs"
     sys_version = ""
 
@@ -655,6 +697,9 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/name/watch"): "api_name_watch",
         ("POST", "/api/add"): "api_add",
         ("POST", "/api/add/stream"): "api_add_stream",
+        ("GET", "/api/get/stream"): "api_get_stream",
+        ("GET", "/api/export/stream"): "api_export_stream",
+        ("POST", "/api/import/stream"): "api_import_stream",
         ("POST", "/api/get"): "api_get",
         ("POST", "/api/dir/set"): "api_dir_set",
         ("POST", "/api/dir/rm"): "api_dir_rm",
@@ -670,6 +715,12 @@ class ApiHandler(TimedHandler):
         ("POST", "/api/name/publish"): "api_name_publish",
         ("POST", "/api/export"): "api_export",
         ("POST", "/api/import"): "api_import",
+        ("POST", "/api/pin/label"): "api_pin_label",
+        ("GET", "/api/cache/ls"): "api_cache_ls",
+        ("POST", "/api/cache/rm"): "api_cache_rm",
+        ("GET", "/api/capabilities"): "api_capabilities",
+        ("GET", "/api/events"): "api_events",
+        ("POST", "/api/shutdown"): "api_shutdown",
     }
     OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
     PROOF_ROUTE = ("GET", "/api/status")
@@ -682,7 +733,8 @@ class ApiHandler(TimedHandler):
     @classmethod
     def busy_response(cls) -> bytes:
         """503 for a connection over max_connections."""
-        body = json.dumps({"error": "too many API connections; try again shortly"}).encode()
+        body = json.dumps({"error": "too many API connections; try again shortly",
+                           "code": "too_many_connections"}).encode()
         return raw_response("503 Service Unavailable", {"Content-Type": "application/json", "Retry-After": "10",
                                                         "Cache-Control": "no-store",
                                                         "X-Content-Type-Options": "nosniff"}, body)
@@ -715,9 +767,9 @@ class ApiHandler(TimedHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_error_json(self, status: int, message: str, headers: dict | None = None):
-        """Send {"error": message} with the given status."""
-        data = json.dumps({"error": message}).encode()
+    def send_error_json(self, status: int, message: str, code: str, headers: dict | None = None):
+        """Send {"error": message, "code": code} with the given status."""
+        data = json.dumps({"error": message, "code": code}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -769,18 +821,19 @@ class ApiHandler(TimedHandler):
         self.headers_sent = False
         try:
             if not host_allowed(self.headers.get("Host"), self.server.server_address[1]):
-                raise ApiRequestError(403, "Host header must be 127.0.0.1:<port> or localhost:<port>")
+                raise ApiRequestError(403, "Host header must be 127.0.0.1:<port> or localhost:<port>", "bad_host")
             route = (self.command, url.path)
             name = self.ROUTES.get(route)
             feature_route = None if name is not None else feature_routes().get(route)
             if name is None and feature_route is None:
                 allowed = sorted(method for method, path in (*self.ROUTES, *feature_routes()) if path == url.path)
                 if allowed:
-                    return self.send_error_json(405, f"use {' or '.join(allowed)}", {"Allow": ", ".join(allowed)})
-                raise ApiRequestError(404, f"no such API endpoint: {url.path}")
+                    return self.send_error_json(405, f"use {' or '.join(allowed)}", "method_not_allowed",
+                                                {"Allow": ", ".join(allowed)})
+                raise ApiRequestError(404, f"no such API endpoint: {url.path}", "no_such_endpoint")
             if route not in self.OPEN_ROUTES and not self.token_valid():
                 raise ApiRequestError(403, f"API requests must carry the header {API_HEADER}: <token>, with the "
-                                           f"token the daemon wrote to <rnfs dir>/api_token")
+                                           f"token the daemon wrote to <rnfs dir>/api_token", "unauthorized")
             if self.command != "POST":
                 self.request_read()  # no body; POST endpoints call it once they have read theirs
             self.keep_open = (route == self.PROOF_ROUTE and not self.proved
@@ -798,9 +851,9 @@ class ApiHandler(TimedHandler):
                 self.deadline = time.monotonic() + self.request_timeout
                 self.phase = "request"
         except ApiRequestError as e:
-            self.respond_error(e.status, str(e))
+            self.respond_error(e.status, str(e), e.code)
         except RequestTimeout as e:
-            self.respond_error(408, str(e))
+            self.respond_error(408, str(e), "timeout")
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             if status == 500:
@@ -809,14 +862,15 @@ class ApiHandler(TimedHandler):
                 # Answered 400 as a ValueError, as before, but the node's own fault: logged, with its traceback
                 log(f"API {self.command} {loggable(url.path)} failed: {e!r}", LOG_WARNING)
             message = str(e) or type(e).__name__
-            self.respond_error(status, message, {"Retry-After": "10"} if status == 503 else None)
+            self.respond_error(status, message, error_code(e, status),
+                               {"Retry-After": "10"} if status == 503 else None)
 
-    def respond_error(self, status: int, message: str, headers: dict | None = None):
+    def respond_error(self, status: int, message: str, code: str, headers: dict | None = None):
         """Send an error response, unless a response is already under way (then just drop the connection)."""
         if self.headers_sent:
             return
         try:
-            self.send_error_json(status, message, headers)
+            self.send_error_json(status, message, code, headers)
         except OSError:
             pass  # the client has gone away
 
@@ -846,13 +900,13 @@ class ApiHandler(TimedHandler):
             return BodyReader(self.rfile, 0, chunked=True)
         length = self.headers.get("Content-Length")
         if length is None:
-            raise ApiRequestError(411, "Content-Length or chunked encoding required")
+            raise ApiRequestError(411, "Content-Length or chunked encoding required", "length_required")
         try:
             size = int(length)
         except ValueError:
-            raise ApiRequestError(411, "invalid Content-Length") from None
+            raise ApiRequestError(411, "invalid Content-Length", "length_required") from None
         if size < 0:
-            raise ApiRequestError(400, "invalid Content-Length")
+            raise ApiRequestError(400, "invalid Content-Length", "bad_request")
         return BodyReader(self.rfile, size, chunked=False)
 
     def stream_reader(self) -> BodyReader:
@@ -871,7 +925,7 @@ class ApiHandler(TimedHandler):
             return b""
         data = self.body_reader().read(limit + 1)
         if len(data) > limit:
-            raise ApiRequestError(413, "request body too large")
+            raise ApiRequestError(413, "request body too large", "body_too_large")
         self.request_read()
         return data
 
@@ -944,6 +998,52 @@ class ApiHandler(TimedHandler):
             if close:
                 close()  # stop a generator's fetch if the client went away
 
+    def api_get_stream(self):
+        """GET /api/get/stream?target=&format=tar: the target as a tar (RnfsNode.get_tar), its whole DAG fetched
+        first so the response has an exact Content-Length."""
+        target = parse_target(self.param("target"))
+        if self.param("format") != "tar":
+            raise ValueError("format must be tar")
+        self.send_chunks("get/stream", target, "application/x-tar", lambda: self.node.get_tar(target))
+
+    def api_export_stream(self):
+        """GET /api/export/stream?target=: the target's archive (RnfsNode.export_chunks), as `export` writes it."""
+        target = parse_target(self.param("target"))
+        self.send_chunks("export/stream", target, "application/vnd.rnfs.archive",
+                         lambda: self.node.export_chunks(target))
+
+    def send_chunks(self, what: str, target: str, content_type: str, open_chunks):
+        """Answer with what open_chunks() gives, (info with "length", chunks), sent with that exact Content-Length.
+
+        open_chunks fetches the whole DAG first, while a client that disconnects cancels it (as the gateway's
+        ?format=archive); an error before the first byte gets its status, one after it cuts the body short, which
+        the Content-Length tells the client."""
+        from rnfs.errors import Cancelled
+        from rnfs.fetcher import observing
+        from rnfs.gateway_formats import ClientWatch
+        try:
+            with observing(ClientWatch(self.connection)):
+                info, chunks = open_chunks()
+        except Cancelled:
+            self.close_connection = True  # nobody to answer
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(info["length"]))
+            self.send_common_headers()
+            self.end_headers()
+            for chunk in chunks:
+                self.wfile.write(chunk)
+        except Exception as e:
+            if not self.headers_sent:
+                raise
+            if not isinstance(e, OSError):  # an OSError is the client gone
+                log(f"API {what} {loggable(target)} failed mid-stream: {e!r}", LOG_ERROR)
+            self.close_connection = True
+        finally:
+            chunks.close()  # ends the fetch
+
     def api_ls(self):
         """GET /api/ls?target=: directory entries."""
         self.send_json(200, {"entries": list(self.node.ls(parse_target(self.param("target"))))})
@@ -1012,7 +1112,16 @@ class ApiHandler(TimedHandler):
         name = self.param("name", False) or None
         only_hash = parse_bool(self.param("only_hash", False) or "")
         options = node_content.add_options(lambda key: self.param(key, False), stream=True)  # pin, to, seal_name…
-        self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
+        stream_format = self.param("format", False)
+        if stream_format is None:
+            self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
+            return
+        if stream_format != "tar":
+            raise ValueError("format must be tar")
+        if {"to", "to_self", "seal_name"} & options.keys():
+            raise ValueError("a tar stream can't be sealed: sealing is for single files")
+        # add_tar reads the body to its end, checking that only zeros follow the tar's (its padding)
+        self.send_json(200, self.node.add_tar(reader, name=name, only_hash=only_hash, **options))
 
     def api_get(self):
         """POST /api/get: fetch and write out to a path on this machine (parameters: the module docstring's table)."""
@@ -1043,6 +1152,19 @@ class ApiHandler(TimedHandler):
         """POST /api/pin/rm {"cid"}: remove the user source."""
         self.node.pin_rm(parse_cid(self.json_body().get("cid")))
         self.send_json(200, {})
+
+    def api_pin_label(self):
+        """POST /api/pin/label {"cid", "label"}: label a pin (null or "" clears it); its pin ls entry."""
+        body = self.json_body()
+        self.send_json(200, self.node.pin_label(parse_cid(body.get("cid")), body.get("label")))
+
+    def api_cache_ls(self):
+        """GET /api/cache/ls: the cached fetches (downloads not pinned), most recently used first."""
+        self.send_json(200, {"cache": self.node.cache_ls()})
+
+    def api_cache_rm(self):
+        """POST /api/cache/rm {"cid"}: evict the cached fetches leading to cid now."""
+        self.send_json(200, self.node.cache_rm(parse_cid(self.json_body().get("cid"))))
 
     def api_pin_remote(self):
         """POST /api/pin/remote {"node", "cid", "pin"}: ask a node to pin (or release) a CID."""
@@ -1096,3 +1218,49 @@ class ApiHandler(TimedHandler):
     def api_import(self):
         """POST /api/import {"path"}: import an archive from a path on this machine."""
         self.send_json(200, self.node.import_archive(parse_path(self.json_body().get("path"))))
+
+    def api_import_stream(self):
+        """POST /api/import/stream: import the archive the request body holds, read to its end."""
+        self.send_json(200, self.node.import_stream(self.stream_reader()))
+
+    # Capabilities, events, shutdown
+
+    def api_capabilities(self):
+        """GET /api/capabilities: what this daemon offers (the module docstring)."""
+        self.send_json(200, capabilities(self.node))
+
+    def api_events(self):
+        """GET /api/events?after=&kinds=&epoch=&wait=: the node's events after a sequence (rnfs.events)."""
+        event_log = getattr(self.node, "events", None)
+        if event_log is None:
+            raise Unsupported("this node keeps no event log")
+        after = parse_int(self.param("after", False), "after", None)
+        kinds_text = self.param("kinds", False)
+        kinds = [kind for kind in kinds_text.split(",") if kind] if kinds_text else None
+        if kinds_text and not kinds:
+            raise ValueError("kinds lists no event kind")
+        for kind in kinds or ():
+            if kind not in events.EVENT_KINDS:
+                raise ValueError(f"unknown event kind {kind!r}; known: {', '.join(events.EVENT_KINDS)}")
+        epoch = self.param("epoch", False) or None
+        wait = min(parse_int(self.param("wait", False), "wait", 0), MAX_WATCH_WAIT) if after is not None else 0
+        if wait > 0:
+            if not self.event_waiters.acquire(blocking=False):
+                raise Busy(f"{MAX_EVENT_WAITERS} event polls are waiting already")
+            try:
+                result = event_log.since(after, kinds, wait, epoch)
+            finally:
+                self.event_waiters.release()
+        else:
+            result = event_log.since(after, kinds, 0, epoch)
+        self.send_json(200, result)
+
+    def api_shutdown(self):
+        """POST /api/shutdown: answer, then stop the daemon as SIGTERM does (ApiServer's shutdown)."""
+        self.json_body()
+        if self.shutdown_callback is None:
+            raise Unsupported("this daemon can't be stopped through its API")
+        log("stopping: asked through the API", LOG_NOTICE)
+        self.send_json(200, {"stopping": True})
+        self.wfile.flush()
+        self.shutdown_callback()

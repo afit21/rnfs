@@ -172,9 +172,13 @@ class LocalFacadeTest(NodeTest):
                          self.big[70000:71000])
         self.assertTrue(self.a.is_local(cid))
         self.assertFalse(self.a.is_local(str(Cid.for_block(RAW, b"elsewhere"))))
-        self.assertEqual(self.a.pin_ls(), [{"cid": cid, "sources": ["user"], "complete": True, "type": "directory",
-                                            "sealed": False,
-                                            "name": os.path.abspath(os.path.join(self.tmp.name, "tree"))}])
+        # The fields of 0.1.7 too: no label yet, the origin as the name, the size and entries from the root block
+        listed = self.a.pin_ls()
+        self.assertLessEqual(abs(listed[0].pop("added") - time.time()), 60)
+        origin = os.path.abspath(os.path.join(self.tmp.name, "tree"))
+        self.assertEqual(listed, [{"cid": cid, "sources": ["user"], "complete": True, "type": "directory",
+                                   "sealed": False, "name": origin, "label": None, "origin": origin,
+                                   "size": added["size"], "entries": 2}])
         self.assertEqual(self.a.stat(cid)["blocks"], self.a.stat(cid)["local_blocks"])
         self.assertIn(Cid.parse(cid), self.a.publisher.provided())
         self.assertEqual(self.a.status()["pins"], 1)

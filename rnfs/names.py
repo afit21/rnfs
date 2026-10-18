@@ -715,6 +715,9 @@ class NameManager:
         # each newer record accepted for a watched name; swapped whole, so they are read without the lock
         self._watched: dict[bytes, int] = {}
         self._record_listeners: tuple = ()
+        # Called as held_listener(name, record), with the lock held, for each newer record accepted for a name held
+        # (persisted: this node's own, kept, followed, resolved) or watched: the node's "name" events. Must only queue
+        self.held_listener = None
         # Pins of names whose key file was deleted by hand, released by release_gone() once the node is set up
         self._gone: list[tuple[str, Cid]] = []
         # Aliases whose key file is there but couldn't be read (permissions, damage): not names this node can
@@ -1051,7 +1054,13 @@ class NameManager:
             self._record_listeners = tuple(item for item in self._record_listeners if item != listener)
 
     def _accepted(self, name: bytes, record: Record):
-        """A newer record was accepted for name: tell the record listeners if it is watched. Lock held."""
+        """A newer record was accepted for name: tell the record listeners if it is watched, and held_listener if it
+        is held or watched. Lock held."""
+        if self.held_listener is not None and (name in self._held or name in self._watched):
+            try:
+                self.held_listener(name, record)
+            except Exception as e:  # noqa: BLE001 - as below
+                log(f"record listener failed: {e!r}", LOG_ERROR)
         if name not in self._watched:
             return
         for listener in self._record_listeners:

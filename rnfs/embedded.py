@@ -18,7 +18,9 @@ It is an RnfsNode (rnfs/node.py) started embedded, in its own rnfs dir, behind r
 Name records are heard through NameManager's record listener, which only queues them for the event thread; jobs
 are the jobs feature's, polled for progress.
 """
+import contextlib
 import io
+import json
 import os
 import threading
 import time
@@ -27,8 +29,9 @@ from dataclasses import fields
 import RNS
 
 from rnfs import fetcher, fsutil, interface
+from rnfs.apiclient import check_timeout
 from rnfs.config import Config
-from rnfs.errors import RnfsError
+from rnfs.errors import RnfsError, Unsupported
 from rnfs.log import LOG_ERROR, LOG_WARNING, log
 from rnfs.node import RnfsNode, lock_rnfs_dir, make_private_root
 from rnfs.objects import Record
@@ -36,6 +39,8 @@ from rnfs.objects import Record
 # An embedded node's settings where neither rnfs.toml nor the program's settings give them: an app's node is
 # often short-lived, and short-lived nodes should be DHT clients (section 6); the program has its own LXMF
 EMBEDDED_DEFAULTS = {"dht_mode": "client", "lxmf_enabled": False}
+# The capabilities (api.CAPABILITIES) a Node lacks: it serves no API to be stopped through, and writes no daemon.json
+NODE_LACKS = ("shutdown", "daemon_json")
 
 _process_lock = threading.Lock()
 _running: "Node | None" = None  # the Node running in this process: one at a time, as RNS.Reticulum is one
@@ -103,6 +108,7 @@ class Node(interface.Rnfs):
         global _running
         node = self._node
         node.names.remove_record_listener(self._heard)
+        node.events.remove_listener(self._published)  # if events.watch added it
         try:
             node.stop()
         finally:
@@ -134,13 +140,41 @@ class Node(interface.Rnfs):
         record = self._node.names.record(name)
         return record.sequence if record is not None else None
 
+    # Event watches
+
+    def _published(self, event: dict):
+        """The event log's listener (any thread, perhaps under the names or storage lock): queue the event for the
+        event watches. A Node hears every event of its own run, so it never reports any lost."""
+        self._events_heard(self._node.events.epoch, [event])
+
+    def _event_baseline(self) -> tuple[int, str]:
+        """Listen to the node's event log (from the first watch on), then its last sequence and epoch: an event
+        published in between reaches the watch, which skips it as at or before its baseline."""
+        event_log = self._node.events
+        with self._watch_lock:
+            if not getattr(self, "_listening", False):  # (getattr: tests build a Node without __init__)
+                event_log.add_listener(self._published)
+                self._listening = True
+        return event_log.last, event_log.epoch
+
 
 class _Backend:
-    """rnfs.interface's backend for an RnfsNode: its facade, taking and returning the API's forms."""
+    """rnfs.interface's backend for an RnfsNode: its facade, taking and returning the API's forms.
+
+    A feature's methods are called as its API route calls them, so a Node gives a Client's results and errors: the
+    feature looked up through the route's own lookup (each feature module's _feature, or _common.feature), which
+    takes anything with the handler's node attribute, as this has, and raises the route's NotFound when the
+    feature isn't loaded; then the route's checks of its arguments, in its order."""
 
     def __init__(self, node: RnfsNode):
         """The backend of node."""
         self.node = node
+
+    def timeout(self, seconds: float | None):
+        """Nothing to bound (no request is made): a context manager doing nothing, once seconds is checked as a
+        Client checks it."""
+        check_timeout(seconds)
+        return contextlib.nullcontext()
 
     def status(self) -> dict:
         """The node's status."""
@@ -264,8 +298,8 @@ class _Backend:
         from rnfs.features.keepers import parse_name_arg
         return self.node.name_resolve(parse_name_arg(self.node, name).hex())
 
-    def submit_job(self, kind: str, target: str, output: str | None, from_node: str | None, **flags) -> dict:
-        """JobsFeature.submit."""
+    def submit_job(self, kind: str, target: str | None, output: str | None, from_node: str | None, **flags) -> dict:
+        """JobsFeature.submit (flags: get's sealed_name and fallback_dht, or an add's or import's path and options)."""
         return self.node.feature("jobs").submit(kind, target, output, from_node, **flags)
 
     def job(self, job_id: str, wait: float) -> dict:
@@ -298,3 +332,190 @@ class _Backend:
     def deny_rm(self, entries: list[str]) -> list[str]:
         """DenyList.remove."""
         return self.node.deny.remove(entries)
+
+    # Features (see the class)
+
+    def peers(self) -> list[dict]:
+        """PeersFeature.peers, as GET /api/peers."""
+        from rnfs.features import _common, peers
+        return _common.feature(self, peers.NAME).peers()
+
+    def stats(self) -> dict:
+        """PeersFeature.stats, as GET /api/stats."""
+        from rnfs.features import _common, peers
+        return _common.feature(self, peers.NAME).stats()
+
+    def contacts(self) -> list[dict]:
+        """ContactsFeature.list, as GET /api/contacts."""
+        from rnfs.features import contacts
+        return contacts._feature(self).list()
+
+    def contact_get(self, nick: str) -> dict:
+        """ContactsFeature.get, as GET /api/contacts/get."""
+        from rnfs.features import contacts
+        return contacts._feature(self).get(nick)
+
+    def contact_add(self, nick: str, ident: str, kind: str | None) -> dict:
+        """ContactsFeature.add, as POST /api/contacts/add (kind checked after the feature is found)."""
+        from rnfs.features import contacts
+        return contacts._feature(self).add(nick, ident, None if kind is None else contacts.check_kind(kind))
+
+    def contact_rm(self, nick: str):
+        """ContactsFeature.remove, as POST /api/contacts/rm."""
+        from rnfs.features import contacts
+        contacts._feature(self).remove(nick)
+
+    def name_keep(self, name: str) -> dict:
+        """KeepersFeature.keep of a name or a name contact's nick, as POST /api/name/keep."""
+        from rnfs.features import keepers
+        feature = keepers._feature(self)
+        return feature.keep(keepers.parse_name_arg(self.node, name))
+
+    def name_unkeep(self, name: str):
+        """KeepersFeature.unkeep, as POST /api/name/unkeep."""
+        from rnfs.features import keepers
+        feature = keepers._feature(self)
+        feature.unkeep(keepers.parse_name_arg(self.node, name))
+
+    def name_kept(self) -> list[dict]:
+        """KeepersFeature.kept, as GET /api/name/kept."""
+        from rnfs.features import keepers
+        return keepers._feature(self).kept()
+
+    def name_follow(self, name: str) -> dict:
+        """FollowFeature.follow of a name or a name contact's nick, as POST /api/name/follow."""
+        from rnfs.features import follow, keepers
+        feature = follow._feature(self)
+        return feature.follow(keepers.parse_name_arg(self.node, name))
+
+    def name_unfollow(self, name: str):
+        """FollowFeature.unfollow, as POST /api/name/unfollow."""
+        from rnfs.features import follow, keepers
+        feature = follow._feature(self)
+        feature.unfollow(keepers.parse_name_arg(self.node, name))
+
+    def name_following(self) -> list[dict]:
+        """FollowFeature.following, as GET /api/name/following."""
+        from rnfs.features import follow
+        return follow._feature(self).following()
+
+    def lxmf_address(self) -> dict:
+        """LxmfFeature.address, as GET /api/lxmf/address."""
+        from rnfs.features import lxmf
+        return lxmf._feature(self).address()
+
+    def lxmf_send(self, to: str, target: str, message: str | None, propagate: bool, nearest: bool) -> dict:
+        """LxmfFeature.send, as POST /api/lxmf/send."""
+        from rnfs.features import lxmf
+        return lxmf._feature(self).send(to, target, message, propagate, nearest)
+
+    def lxmf_inbox(self) -> list[dict]:
+        """LxmfFeature.inbox_list, as GET /api/lxmf/inbox."""
+        from rnfs.features import lxmf
+        return lxmf._feature(self).inbox_list()
+
+    def lxmf_inbox_get(self, entry_id, link, output: str | None, directory: str | None,
+                       use_sent_cid: bool) -> list[dict]:
+        """LxmfFeature.inbox_get, as POST /api/lxmf/inbox/get: id and link checked as it checks them."""
+        from rnfs.features import lxmf
+        return lxmf._feature(self).inbox_get(lxmf._int(entry_id, "id"), lxmf._int(link, "link", False), output,
+                                             directory, use_sent_cid)
+
+    def lxmf_inbox_rm(self, entry_id, every: bool) -> int:
+        """LxmfFeature.inbox_rm of entry_id (checked as POST /api/lxmf/inbox/rm checks it), or every message."""
+        from rnfs.features import lxmf
+        if every:
+            return lxmf._feature(self).inbox_rm(None)
+        return lxmf._feature(self).inbox_rm(lxmf._int(entry_id, "id"))
+
+    def lxmf_outbox(self) -> list[dict]:
+        """LxmfFeature.outbox_list, as GET /api/lxmf/outbox."""
+        from rnfs.features import lxmf
+        return lxmf._feature(self).outbox_list()
+
+    def lxmf_sync(self, nearest: bool) -> dict:
+        """LxmfFeature.sync, as POST /api/lxmf/sync."""
+        from rnfs.features import lxmf
+        return lxmf._feature(self).sync(nearest)
+
+    # Streams (rnfs 0.1.7)
+
+    def add_tar(self, data, name: str | None, pin: bool, only_hash: bool, chunker: str | None) -> dict:
+        """RnfsNode.add_tar of bytes or a binary file."""
+        stream = io.BytesIO(data) if isinstance(data, bytes) else data
+        return self.node.add_tar(stream, name=name, only_hash=only_hash, pin=pin, chunker=chunker)
+
+    def get_tar(self, target: str):
+        """RnfsNode.get_tar's chunks: a generator, fetching (and raising) once iterated, as a Client's."""
+        def chunks():
+            """The tar's bytes, the fetch ended when done or closed."""
+            _, inner = self.node.get_tar(target)
+            try:
+                yield from inner
+            finally:
+                inner.close()
+        return chunks()
+
+    def export_stream(self, target: str):
+        """RnfsNode.export_chunks' chunks: a generator, fetching (and raising) once iterated, as a Client's."""
+        def chunks():
+            """The archive's bytes, the fetch ended when done or closed."""
+            _, inner = self.node.export_chunks(target)
+            try:
+                yield from inner
+            finally:
+                inner.close()
+        return chunks()
+
+    def import_stream(self, data) -> dict:
+        """RnfsNode.import_stream of bytes or a binary file."""
+        return self.node.import_stream(io.BytesIO(data) if isinstance(data, bytes) else data)
+
+    # Pins, the cache, the node (rnfs 0.1.7)
+
+    def pin_label(self, cid: str, label: str | None) -> dict:
+        """RnfsNode.pin_label."""
+        return self.node.pin_label(cid, label)
+
+    def cache_ls(self) -> list[dict]:
+        """RnfsNode.cache_ls."""
+        return self.node.cache_ls()
+
+    def cache_rm(self, cid: str) -> dict:
+        """RnfsNode.cache_rm."""
+        return self.node.cache_rm(cid)
+
+    def capabilities(self) -> dict:
+        """GET /api/capabilities' answer for this node (api.capabilities), but what an embedded node can't do: be
+        stopped through an API, or describe itself in daemon.json."""
+        from rnfs import api
+        return api.capabilities(self.node, without=NODE_LACKS)
+
+    def shutdown(self, wait: float | None) -> bool:
+        """Refused: a Node is the program's; close() stops it."""
+        raise Unsupported("an rnfs.Node runs inside this program: close() it to stop it")
+
+    def daemon_info(self) -> dict | None:
+        """None: a Node is no daemon, and its rnfs dir has no daemon.json."""
+        return None
+
+    def config(self) -> dict:
+        """SettingsFeature.describe, as GET /api/config answers it (through JSON, so the values have the forms a
+        Client's have)."""
+        from rnfs.features import _common, settings
+        return json.loads(json.dumps(_common.feature(self, settings.NAME).describe()))
+
+    def config_set(self, changes: dict) -> dict:
+        """SettingsFeature.set of changes as POST /api/config/set's JSON body carries them (tuples as lists: the
+        feature checks rnfs.toml reads back as exactly what it was given)."""
+        from rnfs.features import _common, settings
+        feature = _common.feature(self, settings.NAME)
+        return feature.set(json.loads(json.dumps(changes)))
+
+    def events_since(self, after: int | None, kinds: list[str] | None, wait: int, epoch: str | None) -> dict:
+        """EventLog.since, as GET /api/events calls it: wait capped as it caps it, and none without after."""
+        from rnfs import api
+        event_log = getattr(self.node, "events", None)
+        if event_log is None:
+            raise Unsupported("this node keeps no event log")
+        return event_log.since(after, kinds, min(wait, api.MAX_WATCH_WAIT) if after is not None else 0, epoch)

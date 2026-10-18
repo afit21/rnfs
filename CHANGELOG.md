@@ -2,6 +2,97 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.7 (unreleased)
+
+The local API and the library for companion apps. No wire-format or CID changes: these nodes, 0.1.6, 0.1.5, 0.1.4
+and 0.1.3 nodes work together. The local API stays compatible: every route, field and status of 0.1.6 is
+unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
+
+Upgrade notes:
+- **State:** the state database gains two tables (`pin_times`, `pin_labels`); an older rnfs can't open it
+  afterwards. Pins made before the upgrade have no `added` time.
+- **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.1.7 on read the API port from
+  it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
+- **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
+  assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
+  non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
+
+Added, for apps:
+- **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
+  daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
+  attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,
+  a file others could have written, or one whose process has ended.
+- **Stopping:** `POST /api/shutdown` stops the daemon as SIGTERM does, after answering; `rnfs stop [--wait S]`
+  uses it and waits until the API stops answering. Windows has no other clean way to stop a background daemon.
+- **Error codes:** every API error is `{"error", "code"}`, the code machine-readable (`rnfs.errors.CODES`): the
+  node's errors by status (`bad_request`, `not_found`, `too_large`, `denied`, `invalid_dag`, `busy`,
+  `storage_full`, `internal`) and the API's own refusals (`no_such_endpoint`, `method_not_allowed`,
+  `unauthorized`, `bad_host`, `timeout`, `length_required`, `body_too_large`, `too_many_connections`,
+  `unsupported`). So a 404 for an endpoint a daemon lacks (`no_such_endpoint`) is told from one for missing
+  content (`not_found`). `ApiError.code`, and `NoSuchEndpoint` and `Unsupported` (both `NotFound`s) in the
+  library, which also recognises an older daemon's unknown-endpoint 404 by its message.
+- **Capabilities:** `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
+  capabilities (`events`, `pin_details`, `cache`, `config`, `jobs_add`, `add_tar`, ...).
+- **Events:** `GET /api/events?after=&kinds=&epoch=&wait=`, a long poll on the node's events (`rnfs/events.py`),
+  replacing an app's polling of each list: `job` (every state change, and a running job's progress at most once
+  a second), `pin` (added, removed, labelled), `cache` (added, removed), `inbox` (messages received, removed and
+  auto-fetched; outbox messages queued and their delivery state), `name` (a newer record of a name the node holds
+  or watches) and `peer` (a peer first heard, coming online, going offline). Events are numbered within a run;
+  the last 1024 are kept, and a client that falls behind, or asks of an earlier run (`epoch`), is told `lost`
+  and reloads. At most 8 polls wait at once.
+- **Pins:** `pin ls --json` and `GET /api/pin/ls` give each pin's `label`, `origin` (where it was added from,
+  kept apart from the label), `size`, `entries` (a directory's entry count, as a number) and `added` (when first
+  pinned). `rnfs pin label <cid> [label]` / `POST /api/pin/label` give a pin a label, which becomes its listed
+  name. `name` is otherwise unchanged.
+- **The cache:** `rnfs cache ls [--json]` / `GET /api/cache/ls` list the cached fetches (downloads not pinned),
+  most recently used first, with size, completeness and whether the same content is pinned or provided;
+  `rnfs cache rm <cid>…` / `POST /api/cache/rm` evict those leading to a CID now. Apps no longer need to look in
+  `blocks/`.
+- **Settings:** `GET /api/config` gives every setting with its schema (type, choices, default, unit, range,
+  description, group, whether it applies without a restart), the running value, the value in `rnfs.toml`, and
+  whether the command line overrides it or a restart is pending; `POST /api/config/set` changes `rnfs.toml`
+  (validated as a start would, nothing written otherwise; `null` removes a setting), keeping its comments and
+  other lines, and applies at once what can be. `rnfs config [list|get|set|unset]`. `rnfs.config.settings_schema()`
+  needs no daemon. Settings that now apply without a restart: `max_storage` (enforced at once),
+  `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`, `follow_quota`,
+  `lxmf_auto_fetch_quota`, `max_jobs` (queued jobs start if the new limit allows), `max_finished_jobs`,
+  `serve_interfaces`, `no_serve_interfaces`, `quiet_hours`, `keep_max_names`, `keeper_query`,
+  `lxmf_accept_from`, `lxmf_auto_fetch_from`, `lxmf_send_from_hint` and `scan_interval`.
+- **Add and import as jobs:** `POST /api/jobs` takes `kind` `add` (`path` and `POST /api/add`'s options) and
+  `import` (`path`), with progress (`total_bytes` to read, `done_bytes` read, `rate`, `eta`), cancellation at
+  the next read, and the result `POST /api/add` / `/api/import` would give; persisted, and run again from the
+  start if interrupted. `rnfs add --background`, `rnfs import --background`.
+- **Streaming, so a daemon that can't see the app's files (Flatpak) works fully:** `POST /api/add/stream?format=tar`
+  (a tar stream becomes a directory; links, devices, absolute or `..` paths and invalid names are skipped with
+  warnings; bounded by `max_output_entries` and the DAG depth limit; extended headers over 64 KiB, global headers
+  over 4 KiB in all, data after the tar's end, and compressed or malformed tars refused),
+  `GET /api/get/stream?format=tar` (a target as a tar, fetched first, every limit checked before the response
+  starts, with an exact length; files as stored; entries whose names hold `\`, `＼` or `／`, or start as a Windows
+  drive does, `C:`, are skipped and counted),
+  `GET /api/export/stream` (an archive, byte-identical to `rnfs export`) and `POST /api/import/stream`.
+- **Peers:** `GET /api/peers` and `rnfs peers` gain `first_heard`, `rtt` and `rtt_at` (the round trip RNS measured
+  on the last link to the peer, `ping` included) and `online`, worked out by the daemon: an rnfs link is open, or
+  within 15 minutes of its last sign of life — an answer, a request served, a link, or an announce emitted within
+  that time (a path answer, or an announce relayed late, doesn't count). Decided on the monotonic clock, so a
+  wall-clock step changes nothing.
+  `rnfs peers` gains RTT and ONLINE columns.
+- **rnfs.Client and rnfs.Node:** typed methods for what was only reachable through `Client.api`: `peers()`,
+  `stats()`, `contacts.*`, `names.keep/unkeep/kept`, `names.follow/unfollow/following` and `lxmf.*` (address,
+  send, inbox, get, remove, outbox, sync), with objects (`Peer`, `Stats`, `Contact`, `Kept`, `Followed`,
+  `Message`, ...); `jobs.add` and `jobs.import_archive`; and the additions above (events, capabilities, pin
+  labels, the cache, settings, streams). A Node raises what a Client gets back.
+- **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
+  fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
+
+Changed:
+- `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
+  than sending the request on a second connection as it did for them until now (the fallback planned to go in
+  0.1.7): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.
+- `POST /api/import` (and `rnfs import`) refuse anything but a regular file, without waiting on a FIFO.
+- `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
+- A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
+- `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+
 ## 0.1.6
 
 Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,

@@ -81,8 +81,13 @@ class DhtAnnounceHandler:
     """RNS announce handler for rnfs.dht, including path responses, reporting each node's DHT mode."""
 
     def __init__(self, on_server: Callable[[bytes], None], on_client: Callable[[bytes], None],
-                 is_banned: Callable[[bytes], bool] = lambda node_id: False, own_id: bytes | None = None):
-        """Handler calling on_server(node_id) or on_client(node_id) for each announce not from a banned node."""
+                 is_banned: Callable[[bytes], bool] = lambda node_id: False, own_id: bytes | None = None,
+                 on_announced: Callable[[bytes], None] | None = None):
+        """Handler calling on_server(node_id) or on_client(node_id) for each announce or path response not from a
+        banned node, then on_announced(node_id), if given, for an announce only: a transport node may answer a
+        path request from its path table long after the node went away. Not enough on its own: a shared instance
+        passes path answers on as announces, and announces can arrive late, so on_announced (RnfsNode._announced)
+        goes by the announce's emission time."""
         # RNS only calls us for announces whose destination hash matches this full name
         self.aspect_filter = f"{APP_NAME}.{DHT_ASPECT}"
         self.receive_path_responses = True
@@ -90,9 +95,12 @@ class DhtAnnounceHandler:
         self.on_client = on_client
         self.is_banned = is_banned
         self.own_id = own_id
+        self.on_announced = on_announced
 
-    def received_announce(self, destination_hash, announced_identity, app_data):
-        """RNS calls this (on a thread of its own) for each rnfs.dht announce or path response."""
+    def received_announce(self, destination_hash, announced_identity, app_data, announce_packet_hash=None,
+                          is_path_response=False):
+        """RNS calls this (on a thread of its own) for each rnfs.dht announce or path response; with five
+        parameters, it says which (is_path_response)."""
         node_id = bytes(destination_hash)
         if node_id == self.own_id or self.is_banned(node_id):
             return
@@ -101,6 +109,8 @@ class DhtAnnounceHandler:
                 self.on_server(node_id)
             else:
                 self.on_client(node_id)
+            if not is_path_response and self.on_announced is not None:
+                self.on_announced(node_id)
         except Exception as e:  # noqa: BLE001 - runs on RNS's announce thread; logged
             log(f"error handling the announce of {node_name(node_id)}: {e}", LOG_WARNING)
 

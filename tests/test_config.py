@@ -56,6 +56,9 @@ class ValidateTest(unittest.TestCase):
             Config(**{name: 65535}).validate()
         self.assert_invalid(api_port=0)  # the CLI must know the API's port
         Config(gateway_port=0).validate()  # any free port, printed at start
+        # One port for both: the daemon's start would fail binding the second
+        self.assert_invalid(api_port=9000, gateway_port=9000)
+        Config(api_port=9000, gateway_port=9001).validate()
 
     def test_rates_and_durations(self):
         for name in ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate"):

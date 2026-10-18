@@ -4,7 +4,7 @@ rnfs is content-addressed file sharing over [Reticulum](https://reticulum.networ
 features of IPFS: content IDs, chunked files, directories, a provider DHT, verified multi-source transfer,
 pinning, mutable names and a gateway — built on what RNS already provides.
 
-**Version.** This document describes rnfs 0.1.6. The wire format (request paths and messages, CIDs and DAG
+**Version.** This document describes rnfs 0.1.7. The wire format (request paths and messages, CIDs and DAG
 bytes, chunk boundaries, provider and name records, announce app_data and the LXMF field) is byte-identical
 since rnfs 0.1.3, so nodes of 0.1.3 and later work together. `tests/test_wire.py` checks the current code
 against vectors that 0.1.3's and 0.1.4's own code produced (`tests/fixtures/wire`).
@@ -787,7 +787,7 @@ and repeat.
 - Each cached fetch is recorded as the `<root>/<path>` it fetched, which keeps the path's nodes as well as the
   target's DAG.
 - When storage exceeds `max_storage`, cached fetches are evicted least recently used first; `gc` evicts them
-  all.
+  all, and `cache rm <cid>` those leading to one CID (a pin of the same content keeps its blocks).
 - `add --no-pin` stores what it adds as a cached fetch of its CID instead of pinning it: evicted least recently
   used like any other, removed by `gc`, never provided under `pinned`, and under `roots` provided while it is
   cached (it counts as a target the user fetched).
@@ -1221,13 +1221,14 @@ are local conveniences, not part of the protocol.
 
 | Command | Does |
 |---|---|
-| `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files); `--chunker fastcdc` uses content-defined chunks (section 5) |
+| `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
 | `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; `--raw` writes the stored bytes |
 | `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
 | `stat <cid>[/path]` | Size, block count, and how much is held locally |
 | `dir set <cid>[/path] <name> <cid> [--exec]`, `dir rm <cid>/<path>` | Make a new directory with an entry added, replaced or removed, and pin it with source `user` (fetching the complete directory, file contents included) |
-| `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: where each was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds |
+| `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]`, `pin label <cid> [<label>]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: the pin's label if it has one, else where it was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds. `--json` also gives each pin's `label`, `origin` (where it was added from, kept apart from the label), `size` (as its root block states it), `entries` (a directory's entry count) and `added` (when first pinned, by any source; null for pins made before rnfs 0.1.7). `label` sets a pin's label (local only, lasting while the CID is pinned); without a label it clears it |
+| `cache ls [--json]`, `cache rm <cid>…` | The cached fetches (downloads not pinned, section 8), most recently used first, with their size, completeness and whether the same content is pinned; `rm` evicts those leading to a CID now, deleting the blocks nothing else needs, as `gc` does for all of them |
 | `pin remote add\|rm <node ID> <cid>` | Remote pinning |
 | `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
 | `providers <cid>` | Find nodes providing a CID |
@@ -1236,12 +1237,14 @@ are local conveniences, not part of the protocol.
 | `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
-| `export <cid>[/path] -o file [--background]`, `import file` | Archives |
+| `export <cid>[/path] -o file [--background]`, `import file [--background]` | Archives; `import --background` runs as an `import` job |
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
-| `peers [--json]`, `stats [--json]` | Known nodes with hops, interface and traffic; traffic since start, refusals by cause, per interface |
+| `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
+| `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
+| `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
 | `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
@@ -1308,6 +1311,23 @@ gateway can never reach the API.
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
   exactly one more request.
 - The API never sends CORS headers.
+- **For apps** (rnfs 0.1.7). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
+  atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
+  gateway ports, version, start time, rnfs directory, Reticulum config directory, whether it attached to a shared
+  instance, and node ID. Clients read the port there first (refusing a symlink, a file other users could have
+  written, or one whose process has ended), so a client finds the daemon even when it can't read a newer
+  daemon's `rnfs.toml`; nothing else in it is trusted, and the proof above still comes first. Errors are
+  `{"error": message, "code": code}`, the code machine-readable and never renamed once released, so a client
+  tells "no such endpoint" (`no_such_endpoint`, a daemon that predates it) from "no such content" (`not_found`),
+  both `404`; `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
+  capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does, after answering (Windows has no other
+  clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
+  node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds and peers — numbered within a run:
+  answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
+  level-triggered like the name watch below, so a client asking again with what it was given loses nothing. A
+  node keeps a bounded number of events (rnfs: 1024) and says `lost` when the client asks for some it no longer
+  holds, or of another run (`epoch`): the client then reloads its lists. It SHOULD cap the calls waiting at once
+  (rnfs: 8; more get `503`).
 - Both servers SHOULD time-limit reading a request (rnfs: 15 s for the request line, headers and small
   bodies; 60 s between reads of an upload), but not the node's work, and SHOULD cap concurrent
   connections (rnfs: 32 for the API, 64 for the gateway), answering others `503` at once, so held-open
@@ -1385,10 +1405,12 @@ gateway can never reach the API.
 
 **Background jobs.** A node MAY run long transfers as *jobs* it owns, so a transfer doesn't depend on one API
 request or terminal staying open. A job has a kind — `get` (fetch a target and write it to an output path,
-optionally from one node), `pin` (fetch a target completely and pin it with source `user`) or `export`
-(write an archive of a target to an output path) — and a state: `queued`, `running`, `done`, `failed` or
-`cancelled`. Its result, when done, MUST be what the equivalent API call returns (`POST /api/get`,
-`/api/pin/add`, `/api/export`), and its error, when failed, the message that call would have reported.
+optionally from one node), `pin` (fetch a target completely and pin it with source `user`), `export`
+(write an archive of a target to an output path), `add` (add a file or directory at a path on the node's
+machine, with `POST /api/add`'s options) or `import` (import an archive at such a path) — and a state: `queued`,
+`running`, `done`, `failed` or `cancelled`. Its result, when done, MUST be what the equivalent API call returns
+(`POST /api/get`, `/api/pin/add`, `/api/export`, `/api/add`, `/api/import`), and its error, when failed, the
+message that call would have reported.
 - At most `max_jobs` jobs run at once; queued jobs MUST be started oldest first.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
   queued or running MUST be queued again. A resumed job MUST NOT fetch again blocks that are still stored.
@@ -1398,7 +1420,13 @@ optionally from one node), `pin` (fetch a target completely and pin it with sour
   whatever was evicted meanwhile.
 - Cancelling a queued job MUST end it at once; cancelling a running one MUST stop its fetch at the fetch's next
   step (within 0.5 s), not at the end of a request in flight, whose link is then closed (section 7). Writing
-  out (`get`) or the archive (`export`) after the fetch is local and is not interrupted.
+  out (`get`) or the archive (`export`) after the fetch is local and is not interrupted. A running `add` or
+  `import` MUST stop at its next read of the file or archive; what it stored by then is unreferenced, for the
+  next collection.
+- `add` and `import` jobs fetch nothing and hold no blocks while queued: one interrupted (or queued at a
+  restart) runs again from the start, which is safe because adding and importing are idempotent (the same
+  content gives the same CIDs; a sealed add seals afresh, so its CID is the finishing run's). Their path MUST
+  exist when queued (404 otherwise); they have no target or output, so the output rules don't apply.
 - Stopping the node MUST NOT wait for jobs beyond a short bound (rnfs: the node's stop budget, 5 s for every
   thread it ends); a job interrupted by the shutdown is saved as queued and resumes at the next start.
 - At most `max_finished_jobs` (at least 1) finished jobs are kept, the oldest finished forgotten first, but
@@ -1419,7 +1447,37 @@ optionally from one node), `pin` (fetch a target completely and pin it with sour
   already stored), `blocks` (distinct blocks met by this run), `blocks_total` (blocks of its DAG, once
   complete), `downloaded_bytes` (bytes downloaded by this run, DAG nodes included), `rate` (bytes/s
   downloaded over the last 300 s of the run, falling while nothing arrives) and `eta`
-  (`(total_bytes - done_bytes) / rate`).
+  (`(total_bytes - done_bytes) / rate`). For `add` and `import`: `total_bytes` is what they will read (the
+  sizes of the regular files an add reads, measured before reading, or the archive's size), `done_bytes` what
+  they have read, and `rate` bytes/s read.
+- A node with an event log (rnfs: `GET /api/events`) publishes a `job` event at every change of a job's state,
+  when it is forgotten (`removed`: true), and at most once a second for a running job's progress, with its `id`,
+  `job_kind`, `state`, `error` and progress fields but not its result.
+
+**Streams.** For a client that can't share files with the node (a sandboxed app), the API also carries content
+in its requests and responses (rnfs: these routes):
+- `POST /api/add/stream?format=tar`: the body is a plain tar, read once in order and never held whole. Its
+  regular files and directories become a directory (wrapped as `name` if given) under the rules of adding a
+  directory: members that are symlinks, hard links, devices or FIFOs, whose path is absolute or has a `..`
+  component, or whose names break the entry-name rules are skipped with a warning; directories a path implies
+  are made; a later file replaces an earlier one of the same path, and a member conflicting with what is
+  there as the other type is skipped with a warning. A file is executable if its mode has the owner's execute
+  bit. Sealing is refused (400). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
+  `max_output_entries` files and directories or nesting deeper than `MAX_DEPTH`, refuses (400) extended headers
+  over 64 KiB, more than 8 in a row, global headers of more than 4 KiB in all, and sparse files, and keeps 100
+  warnings (counting the rest), each naming at most 300 characters of the member. A malformed header anywhere,
+  anything but zeros after the tar's end (as a zeroed header in its middle leaves), or a body ending inside the
+  tar, is an error (400), never a shorter directory. The result is `/api/add`'s, the root pinned `user` (or cached with `pin=0`).
+- `GET /api/get/stream?target=&format=tar`: the target as a tar, its DAG fetched first within
+  `max_download_size` and `max_output_entries` (413) and checked against the deny list (451) like `get`, then
+  sent with an exact Content-Length, so a client can tell a transfer cut short. A directory's entries are the
+  tar's top level, each directory before its contents; a file is one member named by the target's last path
+  name (its CID for a bare CID). Member paths are relative and never hold `..` (DAG names hold no `/`); an entry
+  whose name holds a character some extractors read as a separator (rnfs: `\`, and the fullwidth `＼` and
+  `／`), or starts as a Windows drive does (`C:`), is skipped (with what is below it), counted and logged (rnfs: the first 10 by
+  name). Every limit, small chunks included, is checked before the response starts. Files are their stored bytes (a sealed file stays sealed, as in a directory's `get`).
+- `GET /api/export/stream?target=`: the target's archive, byte-identical to `export`, with the same limits and
+  an exact Content-Length; `POST /api/import/stream`: the body is an archive, imported as `/api/import` does.
 
 **Watching names.** A node MAY let local clients wait for newer records of names (rnfs: `GET /api/name/watch`,
 which rnfs.Client's `names.watch` uses). It answers from the records the node holds, under the sequence rules
@@ -1429,6 +1487,24 @@ name's announces count as asked for (section 9: a full table makes room for them
 while after it (rnfs: 60 s); watching sends nothing to the network. A node SHOULD cap the names per call
 (rnfs: 64), the calls waiting at once (rnfs: 4, so watchers can't take the API's connections; more get `503`)
 and the names watched (rnfs: 1024). `GET /api/cat` takes `from`, a node to fetch from, as `GET /api/info` does.
+
+**Peers.** `GET /api/peers` lists the nodes this one knows (in its routing table, with an open link, or met since
+it started) with what it already knows of each, gathered without network I/O. Besides the path and traffic fields,
+each has `first_heard` (when this node first heard of it, as far as it knows: rnfs keeps nothing of its peers
+across a restart, so it is since the start unless the routing table or Reticulum's own announce cache knows an
+earlier time; null if nothing does), `rtt` and `rtt_at` (the round trip measured on the last link this node
+established to it, a ping's included, in seconds, and when; null if none) and `online`, decided by the node so
+every client applies the same rule: online while a link to it is open, or within a window (rnfs: 15 minutes) of
+the last sign it was up — an answer to a request (a refusal too), a request of its own served, a link established,
+or an announce of its own emitted within the window (by the emission time signed in it, allowing some clock
+difference, rnfs: 5 minutes, and later than the last one counted). A path response doesn't count, nor an announce
+delivered late (a transport node may answer a path request long after the node went away, an announce queue may
+hold an announce for hours, and a shared instance passes path answers on to its clients as announces). The window
+is measured on a monotonic clock, so a step of the wall clock changes nothing. A node up but silent therefore shows
+offline (`ping` tells for sure). A node SHOULD publish `peer` events (`{"node_id", "change", "online"}`) when a
+peer is first heard or contacted (`new`) and when its online state changes (`online`, `offline`, checked
+periodically: rnfs every 30 s, over the peers it met this run or has a link to); rnfs publishes none for the peers
+it knows when it starts, so a client lists them once and then follows the events, taking `new` as add-or-update.
 
 **Contacts.** A node MAY keep a local address book of nicks for names, node IDs and LXMF addresses. A nick is
 1–32 characters of `a-z`, `0-9`, `-`, `_` and `.`, starting with a letter or digit, and not 32 hex digits, so
@@ -1462,6 +1538,17 @@ sizes and counts at least 0; rates above 0; times above 0, except `startup_annou
 `provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
 `remote_pin_identities` are lists of identity hashes (32 hex digits). A node MUST NOT start with an invalid
 setting.
+
+A node MAY let local clients change its settings while it runs (rnfs: `rnfs config`, `POST /api/config/set`,
+with each setting's type, range, unit, default and description from `GET /api/config`). A change MUST be refused,
+leaving the settings file as it was, unless the whole resulting file is valid by itself and with the node's
+command-line options, under the same checks as at start (ownership, no symlink, size). Options given on the
+command line keep winning over the file. rnfs applies these at once, the rest at the next start: `max_storage`
+(enforced at once), `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`,
+`scan_interval`, `max_jobs`, `max_finished_jobs`, `serve_interfaces`, `no_serve_interfaces`, `quiet_hours`,
+`keep_max_names` (names kept beyond a lower cap stay, as at a start), `keeper_query`, `follow_quota`,
+`lxmf_accept_from`, `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota` and `lxmf_send_from_hint`. Settings of
+identity, ports, Reticulum, the DHT mode and private mode never apply before a restart.
 
 | Name | Default | Notes |
 |---|---|---|

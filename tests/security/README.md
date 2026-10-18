@@ -100,7 +100,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | none (headers) | `test_response_headers.py` | `rnfs/gateway.py` (`?filename=`), `rnfs/api.py` (`no-store`, `nosniff`) | `bfe9bc7` (test; pins existing behaviour) |
 | API-2 | `test_api2_proof_first.py` | `rnfs/apiclient.py` (`verify_daemon`, `PROOF_TIMEOUT`) | `dda4603` |
 | API-3 | none: documented only (the proof keep-open, specification section 11) | none | `feba0f0` (docs) |
-| API-4 | `test_api4_old_daemon_fallback.py`; also `tests/test_apiclient.py` | `rnfs/apiclient.py` (the pre-0.1.5 reconnect) | `b565ee8` |
+| API-4 | `test_api4_old_daemon_fallback.py`; also `tests/test_apiclient.py` | `rnfs/apiclient.py` (the pre-0.1.5 reconnect, dropped in 0.1.7: such daemons are refused in `check_daemon`) | `b565ee8` |
 | API-5 | `test_api5_head_deny.py` | `rnfs/node_content.py` (`stored_head`), `rnfs/gateway.py`, `rnfs/node.py` | `cb5c93f` |
 | API-7 | `test_api7_missing_fetch_metadata.py` | `rnfs/gateway.py` (`limited`, the User-Agent rule) | `0d010b1` |
 

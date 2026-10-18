@@ -1618,5 +1618,62 @@ class NetworkBoundsTest(unittest.TestCase):
         Config(lxmf_enabled=False, lxmf_send_from_hint=False).validate()
 
 
+class InboxEventsTest(FeatureTestCase):
+    """"inbox" events (rnfs.events) for the inbox and the outbox."""
+
+    def events(self) -> list[dict]:
+        """B's "inbox" events so far, without seq and time."""
+        return [{key: value for key, value in event.items() if key not in ("seq", "time", "kind")}
+                for event in self.b.events.since(0, kinds=["inbox"])["events"]]
+
+    def test_received_and_removed(self):
+        feature = self.feature_node()
+        ids = [feature.received(self.link_message(number=number)) for number in range(3)]
+        feature.received(self.link_message(number=0))  # a duplicate: nothing
+        feature.received(message(content=b"no links", number=9))  # not kept: nothing
+        self.assertEqual(self.events(), [{"box": "inbox", "change": "received", "id": entry_id, "from": SENDER.hex()}
+                                         for entry_id in ids])
+        feature.inbox_rm(ids[1])
+        feature.inbox_rm(None)  # --all: one event
+        self.assertEqual(self.events()[3:], [{"box": "inbox", "change": "removed", "ids": [ids[1]]},
+                                             {"box": "inbox", "change": "removed", "ids": [ids[0], ids[2]]}])
+        with self.assertRaises(NotFound):
+            feature.inbox_rm(ids[0])
+        feature.inbox_rm(None)  # nothing left: nothing removed, no event
+        self.assertEqual(len(self.events()), 5)
+
+    def test_dropped_to_make_room(self):
+        feature = self.feature_node()
+        feature.inbox.limit = 2
+        feature.clock = FakeClock()
+        for number in range(3):
+            feature.clock.now += lxmf.SENDER_INTERVAL  # within the limits on senders not trusted
+            feature.received(self.link_message(number=number))
+        self.assertEqual([(event["change"], event.get("id"), event.get("ids")) for event in self.events()],
+                         [("received", 1, None), ("received", 2, None), ("removed", None, [1]),
+                          ("received", 3, None)])
+
+    def test_auto_fetch_results(self):
+        feature = self.feature_node(lxmf_auto_fetch_from=[SENDER.hex()])
+        entry_id = feature.received(self.link_message())
+        feature.process_auto_fetches()
+        self.assertEqual(self.events()[1:], [{"box": "inbox", "change": "auto", "id": entry_id, "index": 0,
+                                              "state": "pinned"}])
+
+    def test_outbox_states(self):
+        feature = self.feature_node(FakeLxmf(propagation_node=OTHER))
+        result = feature.send(SENDER.hex(), str(self.cid))
+        first = bytes.fromhex(result["hash"])
+        feature.outbound_changed(first, "sending", 0.2)
+        feature.outbound_changed(first, "sending", 0.6)  # progress alone: nothing
+        feature.outbound_changed(first, "failed", 0.0)  # falls back to propagation
+        feature.outbound_changed(bytes.fromhex(feature.outbox_list()[0]["hash"]), "sent", 1.0)
+        entry_id = result["id"]
+        self.assertEqual(self.events(), [{"box": "outbox", "change": "queued", "id": entry_id},
+                                         {"box": "outbox", "change": "state", "id": entry_id, "state": "sending"},
+                                         {"box": "outbox", "change": "state", "id": entry_id, "state": "outbound"},
+                                         {"box": "outbox", "change": "state", "id": entry_id, "state": "sent"}])
+
+
 if __name__ == "__main__":
     unittest.main()

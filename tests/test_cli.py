@@ -2,6 +2,7 @@
 import contextlib
 import http.server
 import io
+import json
 import os
 import stat
 import subprocess
@@ -224,6 +225,34 @@ class ContentCommandTest(CliTestCase):
 
 
 class OtherCommandTest(CliTestCase):
+
+    def test_pin_label_and_cache(self):
+        """pin label sets and clears a label; cache ls lists downloads (names escaped), cache rm evicts them."""
+        cid = self.node.put_file(b"abc")
+        self.ok("pin", "add", cid)
+        self.assertEqual(self.ok("pin", "label", cid, "my file"), f"{cid}  my file\n")
+        self.assertEqual(self.ok("pin", "label", cid), f"{cid}: label cleared\n")
+        self.assertEqual([args for args, _ in self.node.called("pin_label")], [(cid, "my file"), (cid, None)])
+        self.node.cached.add(cid)
+        self.assertEqual(self.ok("cache", "ls"), f"{cid} 1 B\n")
+        self.assertEqual(json.loads(self.ok("cache", "ls", "--json"))[0]["cid"], cid)
+        self.assertEqual(self.ok("cache", "rm", cid), f"{cid}: removed 1 blocks, freed 1 bytes\n")
+        code, _, err = self.run_cli("cache", "rm", cid)
+        self.assertEqual((code, err.strip()), (1, f"rnfs: {cid} is not in the cache"))
+
+    def test_stop(self):
+        """stop asks the daemon to stop and waits until its API no longer answers; a daemon that can't be
+        stopped through its API is reported."""
+        code, _, err = self.run_cli("stop", "--wait", "1")
+        self.assertEqual(code, 1)
+        self.assertIn("can't be stopped through its API", err)
+        stopping = threading.Event()
+        server = ApiServer(self.node, 0, token=self.server.token, shutdown=stopping.set)
+        server.start()
+        self.addCleanup(server.stop)
+        threading.Thread(target=lambda: stopping.wait(10) and server.stop(), daemon=True).start()
+        with mock.patch("rnfs.api.log"):  # the daemon's own log line, which goes to stdout here
+            self.assertEqual(self.ok("stop", port=server.port), "rnfs: the daemon stopped\n")
 
     def test_pins(self):
         cid = self.node.put_file(b"abc")

@@ -22,6 +22,9 @@ from tests.support import POSIX_MODES, failing_commits, state_execute, state_row
 # reach it. Never change this digest: append a step instead.
 RELEASED_0_1_5 = "50bd4ec20bbf10e408a9313cb168d35915af0f9d2afcf850d812dd1a7b7fb72b"
 RELEASED_0_1_5_STEPS = 16
+# And the steps 0.1.6 released (the first 17: 0.1.5's and shared_folder_files)
+RELEASED_0_1_6 = "32a8242dd4ac7b5974e98208b6c00c31b95ef00c7fc7756b77bf8bb58c42447f"
+RELEASED_0_1_6_STEPS = 17
 
 _saved_loglevel = RNS.loglevel
 
@@ -117,6 +120,9 @@ class OpenTest(StateDbTest):
         self.assertTrue(all(isinstance(step, str) for _, steps in released for step in steps))
         digest = hashlib.sha256(json.dumps([[label, list(steps)] for label, steps in released]).encode()).hexdigest()
         self.assertEqual(digest, RELEASED_0_1_5)
+        released = statedb.SCHEMA[:RELEASED_0_1_6_STEPS]
+        digest = hashlib.sha256(json.dumps([[label, list(steps)] for label, steps in released]).encode()).hexdigest()
+        self.assertEqual(digest, RELEASED_0_1_6)
 
     def test_callable_step_runs_in_the_upgrade_transaction(self):
         """A step's callable gets the upgrade's transaction: its writes commit with the step, and a raise rolls the

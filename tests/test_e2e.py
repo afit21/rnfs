@@ -362,6 +362,10 @@ class NetworkTest(unittest.TestCase):
         self.assertIn(a.node_id, peers)
         self.assertGreater(peers[a.node_id]["received"], 0)
         self.assertIsNotNone(peers[a.node_id]["hops"])
+        # b fetched from a over a link it opened: RNS measured its round trip, and a answered within the window
+        self.assertGreaterEqual(peers[a.node_id]["rtt"], 0)
+        self.assertTrue(peers[a.node_id]["online"])
+        self.assertLessEqual(peers[a.node_id]["first_heard"], peers[a.node_id]["rtt_at"])
         self.assertIn(a.node_id, b.out("peers"))
         self.assertGreater(b.status()["bytes_received"], 0)
         self.assertGreater(a.status()["bytes_sent"], 0)

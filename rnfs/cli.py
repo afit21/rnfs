@@ -1,8 +1,9 @@
 """rnfs command line (specification section 11).
 
 `daemon` runs a node with its API and gateway, holding a lock on <rnfs dir>/daemon.lock from before it touches
-anything there, so a second daemon on the same rnfs dir stops at once; every other command is one request to a
-running daemon's local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
+anything there, so a second daemon on the same rnfs dir stops at once, and describes itself in
+<rnfs dir>/daemon.json (its PID, ports, version, start time and Reticulum config) while it runs, so clients find
+it whatever rnfs.toml holds; every other command is one request to a running daemon's local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
 are resolved to absolute paths here, since the daemon reads and writes them itself.
 
 Client commands talk to the daemon through rnfs.apiclient, the library companion apps use too: it reads the token
@@ -22,6 +23,7 @@ import time
 
 from rnfs import __version__, apiclient, fsutil
 from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
+from rnfs.apiclient import daemon_info_path
 from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
 
 DEFAULT_DIR = apiclient.DEFAULT_DIR
@@ -60,6 +62,24 @@ def remove_token(path: str, token: str):
         fsutil.remove(path)  # on Windows, one a client still holds open is left, and replaced at the next start
     except OSError:
         pass  # already gone, or unreadable: nothing of ours to clean up
+
+
+def write_daemon_info(path: str, info: dict):
+    """Write the running daemon's description (apiclient.DAEMON_FILE) to path atomically, owner-only like the
+    token beside it."""
+    fsutil.write_atomic(path, (json.dumps(info, indent=2) + "\n").encode("utf-8"), mode=0o600, private=True)
+
+
+def remove_daemon_info(path: str, pid: int):
+    """Delete the daemon description at path if it is still this process's (pid): another daemon may have
+    replaced it."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            if json.load(f).get("pid") != pid:
+                return
+        fsutil.remove(path)
+    except (OSError, ValueError, AttributeError):
+        pass  # already gone, or not ours to clean up
 
 
 def read_token(path: str) -> str:
@@ -131,9 +151,13 @@ def copy_response(stream: apiclient.Stream, out, progress=None):
 
 
 def client(args) -> ApiClient:
-    """An ApiClient for --api-port, or the api_port in <dir>/rnfs.toml, or the default port; token from <dir>."""
+    """An ApiClient for --api-port, or the port in the running daemon's <dir>/daemon.json, or the api_port in
+    <dir>/rnfs.toml, or the default port; token from <dir>."""
     port = args.api_port
     if port is None:
+        running = apiclient.read_daemon_info(args.dir)
+        if running is not None:
+            return ApiClient(running["api_port"], token_path(args.dir))
         try:
             config = apiclient.load_settings(args.dir)
         except apiclient.ApiError as e:
@@ -153,6 +177,17 @@ def port_number(text: str, minimum: int = 1) -> int:
     if not minimum <= port <= 65535:
         raise argparse.ArgumentTypeError(f"invalid port {text!r}: must be {minimum}-65535")
     return port
+
+
+def positive_seconds(text: str) -> float:
+    """A number of seconds above 0 from the command line (argparse type)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid number of seconds {text!r}") from None
+    if not 0 < value < float("inf"):
+        raise argparse.ArgumentTypeError(f"invalid number of seconds {text!r}: must be above 0")
+    return value
 
 
 def absolute(path: str) -> str:
@@ -255,6 +290,8 @@ def run_daemon(args):
         print(f"rnfs: {printable(str(e))}", file=sys.stderr, flush=True)
         RNS.exit(1)  # Reticulum has started: ends with os._exit, so its threads don't keep the process
     servers = []
+    # Set by a signal (below) or POST /api/shutdown (Windows has no clean way to stop a background daemon otherwise)
+    stopping = threading.Event()
 
     def abort(message: str):
         """Shut down what has started and exit with status 1 and message."""
@@ -267,7 +304,7 @@ def run_daemon(args):
         RNS.exit(1)  # ends with os._exit, so the message is printed first
 
     try:
-        servers.append(ApiServer(node, config.api_port))
+        servers.append(ApiServer(node, config.api_port, shutdown=stopping.set))
         servers.append(GatewayServer(node, config, config.gateway_port))
     except (OSError, OverflowError) as e:  # OverflowError: a port over 65535, which validate() should have refused
         abort(f"can't listen on 127.0.0.1: {e}. Is another daemon running? (--api-port, --gateway-port)")
@@ -280,6 +317,15 @@ def run_daemon(args):
         abort(f"can't write the API token {token_file}: {e}")
     for server in servers:
         server.start()
+    # After the token and the servers: a client finding it finds a daemon to talk to
+    info_file = daemon_info_path(config.root)
+    try:
+        write_daemon_info(info_file, {
+            "pid": os.getpid(), "api_port": api.port, "gateway_port": gateway.port, "version": __version__,
+            "started": time.time(), "rnfs_dir": config.root, "reticulum_config": RNS.Reticulum.configdir,
+            "shared_instance": bool(node.reticulum.is_connected_to_shared_instance), "node_id": node.node_id.hex()})
+    except OSError as e:
+        abort(f"can't write {info_file}: {e}")
     print(f"rnfs node {node.node_id.hex()}, API on http://127.0.0.1:{api.port}, "
           f"gateway on http://127.0.0.1:{gateway.port}", flush=True)
     debug = debuglog.current()
@@ -293,7 +339,6 @@ def run_daemon(args):
     # Replace RNS's handlers, which exit immediately, so the node shuts down first. On Windows, Ctrl+C is
     # SIGINT and Ctrl+Break (or CTRL_BREAK_EVENT sent to the daemon's process group) is SIGBREAK, whose
     # default would end the process at once; SIGTERM never comes from another process there
-    stopping = threading.Event()
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), lambda *_: stopping.set())
@@ -309,6 +354,7 @@ def run_daemon(args):
 
     for server in servers:
         server.stop()
+    remove_daemon_info(info_file, os.getpid())
     remove_token(token_file, api.token)
     node.stop()
     if debug is not None:
@@ -363,8 +409,38 @@ def sealed_output(args, output: str) -> str:
     return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
 
 
+def print_added(result: dict):
+    """Print an add's warnings (on stderr) and CID, as `rnfs add` does (an add job's too)."""
+    print_warnings(result)
+    print(printable(result["cid"]))
+
+
+def print_imported(result: dict):
+    """Print an import's roots, and warn of those it didn't pin, as `rnfs import` does (an import job's too)."""
+    for root in result["roots"]:
+        print(printable(root))
+    for root in result.get("incomplete") or []:
+        warn(f"{root} is incomplete in the archive, so it wasn't pinned")
+
+
 def run_add(args):
-    """Add a file, directory or stdin and print its CID."""
+    """Add a file, directory or stdin and print its CID; with --background, start an add job and print its ID.
+
+    In the foreground an add stays one request, not a job: a job would wait behind max_jobs transfers (one on slow
+    nodes), and a local add mustn't queue behind an hour-long LoRa download."""
+    if getattr(args, "background", False):
+        if args.path == "-":
+            fail("--background adds a path; stdin is added in the foreground")
+        if args.name:
+            fail("--name is only for stdin (add -)")
+        path = absolute(args.path)
+        if not os.path.lexists(path):
+            fail(f"no such file or directory: {args.path}")
+        from rnfs.features import jobs
+        fields = {"kind": "add", "path": path, **{name: True for name in ("wrap", "only_hash") if getattr(args, name)},
+                  **add_options(args)}
+        jobs.run_transfer(args, fields, None)  # prints the job's ID (and fails on a daemon without jobs)
+        return
     api = client(args)
     if args.path == "-":
         if args.wrap and not args.name:
@@ -387,8 +463,7 @@ def run_add(args):
         if not os.path.lexists(path):
             fail(f"no such file or directory: {args.path}")
         result = api.post("/api/add", path=path, wrap=args.wrap, only_hash=args.only_hash, **add_options(args))
-    print_warnings(result)
-    print(printable(result["cid"]))
+    print_added(result)
 
 
 def default_output(target: str) -> str:
@@ -514,6 +589,39 @@ def run_pin_ls(args):
         state = ("" if pin["complete"] else " (incomplete)") + (" (sealed)" if pin.get("sealed") else "")
         name = f"  {display_name(pin['name'])}" if pin.get("name") else ""
         print(f"{printable(pin['cid'])} {','.join(printable(s) for s in pin['sources'])}{state}{name}")
+
+
+def run_pin_label(args):
+    """Label a pin, or clear its label (no label given)."""
+    pin = client(args).pin_label(args.cid, args.label)
+    if pin.get("label"):
+        print(printable(f"{pin['cid']}  {pin['label']}"))
+    else:
+        print(printable(f"{pin['cid']}: label cleared"))
+
+
+def run_cache_ls(args):
+    """List the cached fetches: downloads kept until evicted, not pinned."""
+    from rnfs.features.peers import human_size  # no RNS there
+    cache = client(args).cache_ls()
+    if args.json:
+        print(json.dumps(cache, indent=2))
+        return
+    for entry in cache:
+        target = "/".join([entry["root"], *entry["path"]])
+        state = ("" if entry["complete"] else " (incomplete)") + (" (pinned)" if entry["pinned"] else "")
+        line = f"{printable(entry['cid'])} {human_size(entry.get('size'))}{state}"
+        if target != entry["cid"]:
+            line += f"  {printable(target)}"  # names from other people's DAGs: escaped
+        print(line)
+
+
+def run_cache_rm(args):
+    """Evict cached fetches now, by CID."""
+    api = client(args)
+    for cid in args.cids:
+        result = api.cache_rm(cid)
+        print(printable(f"{cid}: removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes"))
 
 
 def run_pin_remote(args):
@@ -644,15 +752,33 @@ def run_export(args):
 
 
 def run_import(args):
-    """Import an archive, pinning its complete roots."""
+    """Import an archive, pinning its complete roots; with --background, as an import job (one request otherwise,
+    as run_add explains)."""
     path = absolute(args.file)
     if not os.path.isfile(path):
         fail(f"no such file: {args.file}")
-    result = client(args).post("/api/import", path=path)
-    for root in result["roots"]:
-        print(printable(root))
-    for root in result.get("incomplete") or []:
-        warn(f"{root} is incomplete in the archive, so it wasn't pinned")
+    if getattr(args, "background", False):
+        from rnfs.features import jobs
+        jobs.run_transfer(args, {"kind": "import", "path": path}, None)  # prints the job's ID
+        return
+    print_imported(client(args).post("/api/import", path=path))
+
+
+def run_stop(args):
+    """Ask the daemon to stop, and wait (up to --wait seconds) until it has."""
+    found = client(args)
+    # The library's own connection: the CLI's would exit on the error that means the daemon has stopped
+    api = apiclient.ApiConnection(args.dir, port=found.port, token_file=found.token_file)
+    try:
+        stopped = api.shutdown(wait=args.wait)
+    except apiclient.NoSuchEndpoint:
+        fail(f"the daemon (rnfs {api.daemon_version or '?'}) can't be stopped through its API; stop its process "
+             f"instead")
+    except apiclient.ApiError as e:
+        fail(str(e))
+    if not stopped:
+        fail(f"the daemon hasn't stopped after {args.wait:g} s; it may still be saving its state")
+    print("rnfs: the daemon stopped")
 
 
 def run_status(args):
@@ -711,6 +837,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--wrap", action="store_true", help="put it in a directory")
     add.add_argument("--only-hash", action="store_true", help="just print the CID; store nothing")
     add.add_argument("--name", help="with stdin: wrap it in a directory as this entry")
+    add.add_argument("--background", action="store_true",
+                     help="start an add job (a path only), print its ID and return (rnfs jobs)")
     # --- content: unpinned adds, sealed files, chunkers ---
     add.add_argument("--no-pin", action="store_true", help="keep it as evictable cache instead of pinning it")
     add.add_argument("--to", nargs="+", action="extend", metavar="RECIPIENT",
@@ -761,6 +889,9 @@ def build_parser() -> argparse.ArgumentParser:
     pin_ls = command(pin, "ls", run_pin_ls, "list pins, their sources and where each came from")
     pin_ls.add_argument("cid", nargs="?")
     pin_ls.add_argument("--json", action="store_true", help="print the full listing as JSON")
+    pin_label = command(pin, "label", run_pin_label, "give a pin a label (none given: clear it)")
+    pin_label.add_argument("cid")
+    pin_label.add_argument("label", nargs="?", default=None)
     remote = pin.add_parser("remote", help="remote pinning").add_subparsers(dest="action", required=True,
                                                                             metavar="command")
     for action in ("add", "rm"):
@@ -769,6 +900,12 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("cid")
 
     command(commands, "gc", run_gc, "evict all cached fetches")
+    cache = commands.add_parser("cache", help="cached fetches (downloads not pinned)").add_subparsers(
+        dest="cache_command", required=True, metavar="command")
+    cache_ls = command(cache, "ls", run_cache_ls, "list cached fetches, most recently used first")
+    cache_ls.add_argument("--json", action="store_true", help="print the full listing as JSON")
+    cache_rm = command(cache, "rm", run_cache_rm, "evict cached fetches now")
+    cache_rm.add_argument("cids", nargs="+", metavar="CID")
     command(commands, "verify", run_verify, "re-check every stored block against its CID")
 
     providers = command(commands, "providers", run_providers, "find nodes providing a CID")
@@ -800,8 +937,13 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
     import_ = command(commands, "import", run_import, "import an archive, pinning its roots")
     import_.add_argument("file")
+    import_.add_argument("--background", action="store_true",
+                         help="start an import job, print its ID and return (rnfs jobs)")
 
     command(commands, "status", run_status, "node ID, known nodes, records held, storage use")
+    stop = command(commands, "stop", run_stop, "stop the daemon (as Ctrl+C or SIGTERM would) and wait until it has")
+    stop.add_argument("--wait", type=positive_seconds, default=30.0, metavar="SECONDS",
+                      help="how long to wait for it to stop (default 30)")
 
     from rnfs import features
     for feature in features.feature_classes():

@@ -118,6 +118,10 @@ INTERNALS = [
              "and link_id (set_link_id); Link.ACTIVE, CLOSED, TRAFFIC_TIMEOUT_FACTOR",
              lambda: (_assigns(RNS.Link.__init__, "status", "rtt", "traffic_timeout_factor", "attached_interface"),
                       _has(RNS.Link, "ACTIVE", "CLOSED", "TRAFFIC_TIMEOUT_FACTOR", "set_link_id"))),
+    Internal("network/links.py", "Link.rtt measured on a link this node opens, from its request to the proof, "
+             "before the established callback runs (LinkPool.on_rtt reads it once established, for `rnfs peers`)",
+             lambda: _source(RNS.Link.validate_proof, "self.rtt = time.time() - self.request_time",
+                             "self.callbacks.link_established")),
 
     # Requests
     Internal("network/links.py, network/server.py", "Link.request's own timeout, rtt × traffic_timeout_factor + "
@@ -146,8 +150,11 @@ INTERNALS = [
     # Identities and announces RNS remembers
     Internal("node.py, names.py, features/peers.py", "Identity.known_destinations entries: [time heard, packet "
              "hash, public key, app_data, ...]", lambda: _known_destinations()),
-    Internal("names.py", "Transport.path_table entries holding, at IDX_PT_RANDBLOBS, the random blobs of the "
-             "announces the path was taken from, a blob added only for an announce not heard before; "
+    Internal("node.py", "announce handlers called only for an announce that takes the path (should_add), and only "
+             "after its path table entry is written, so the path's newest emission is that announce's",
+             lambda: _handlers_after_path()),
+    Internal("names.py, node.py", "Transport.path_table entries holding, at IDX_PT_RANDBLOBS, the random blobs of "
+             "the announces the path was taken from, a blob added only for an announce not heard before; "
              "Transport.timebase_from_random_blobs, their newest emission time",
              lambda: (_true(sys.modules["RNS.Transport"].IDX_PT_RANDBLOBS == names._PATH_RANDOM_BLOBS,
                             "IDX_PT_RANDBLOBS moved"),
@@ -175,7 +182,8 @@ INTERNALS = [
     Internal("features/keepers.py, names.py", "Transport.get_cached_packet(packet_hash, packet_type=\"announce\") and the "
              "signed announce in it: public key, name hash, random hash (emission time in its last 5 bytes), "
              "ratchet, signature, app_data", lambda: _cached_announce()),
-    Internal("names.py", "announce handlers with five parameters get announce_packet_hash and is_path_response",
+    Internal("names.py, network/announces.py", "announce handlers with five parameters get announce_packet_hash and "
+             "is_path_response",
              lambda: _source(RNS.Transport, "len(inspect.signature(handler.received_announce).parameters) == 5",
                              "announce_packet_hash=packet.packet_hash",
                              "is_path_response=packet.context == RNS.Packet.PATH_RESPONSE")),
@@ -485,6 +493,19 @@ def _recall():
                     pass
                 else:
                     raise AssertionError("recall without _no_use and without Reticulum didn't raise AttributeError")
+
+
+def _handlers_after_path():
+    """Transport._inbound writes an announce's path table entry, inside `if should_add:`, before it calls the
+    announce handlers, which are inside that block too."""
+    written, handlers = (_normal("Transport.path_table[packet.destination_hash] = path_table_entry"),
+                         _normal("for handler in Transport.announce_handlers:"))
+    for node in ast.walk(_tree(RNS.Transport._inbound)):
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "should_add":
+            code = _normal(ast.unparse(node))
+            if -1 < code.find(written) < code.find(handlers):
+                return
+    raise AssertionError("announce handlers no longer run inside `if should_add:`, after the path is written")
 
 
 def _cached_announce():

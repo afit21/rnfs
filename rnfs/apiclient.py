@@ -14,29 +14,44 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   Connecting and proving take at most PROOF_TIMEOUT seconds, reading at most PROOF_READ_LIMIT bytes. The proof
   is made on the connection that then carries the request (the daemon keeps it open for that one request), for
   every request, so a client used for a long time sends nothing to a program listening on the port after the
-  daemon stopped. Only a daemon proved older than 0.1.5, which closes every connection, gets the request on a
-  new one (KEEPS_PROOF_OPEN_SINCE, until 0.1.7).
+  daemon stopped. A daemon that closes that connection gets nothing more (ConnectionFailed).
+- The port: a running daemon (0.1.7 on) writes `<rnfs dir>/daemon.json` (read_daemon_info: its PID, ports,
+  version, start time and Reticulum config), which is read first, so a client finds the daemon whatever its
+  rnfs.toml holds (an older client can't read a newer one's settings); without it (or with a stale one), the
+  api_port in rnfs.toml. Nothing is trusted from it but the port, and the proof below still comes first.
 - That proof request is also where the daemon's version is read (Client.daemon_version), and check_daemon is the
-  one place to refuse a daemon by it; every version is accepted for now.
+  one place to refuse a daemon by it: one before 0.1.5 (OLDEST_DAEMON), which closes the connection it proved
+  itself on so the request could only go on a new one, is refused before the token is sent (until 0.1.7 the
+  client did send it on a new connection).
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
   (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
   refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS, from
   rnfs.errors.STATUSES: 400 BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507
   StorageFull, other 5xx ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a
   subclass of the node's own (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except
-  clause catches what rnfs.Node and rnfs.Client raise alike.
-- Each request opens its own connection (its proof, then the request), with no timeout for the request unless
-  one is given (fetches can take hours), so an ApiConnection may be used from several threads. Paths are on the
+  clause catches what rnfs.Node and rnfs.Client raise alike. Every ApiError has the daemon's machine-readable
+  code (rnfs.errors.CODES; None from a daemon before 0.1.7): a 404 for an endpoint the daemon doesn't have is
+  NoSuchEndpoint (also told from an older daemon's message), one for something it can't do Unsupported, both
+  NotFound subclasses.
+- Each request opens its own connection (its proof, then the request), so an ApiConnection may be used from
+  several threads. A request has no timeout unless one is given (fetches can take hours): the connection's
+  (timeout=), replaced for every request one thread makes inside using_timeout(seconds), or for one call by
+  request/call/get/post's own timeout= (None: none, even if the connection has one). Connecting and proving take
+  at most the smaller of it and PROOF_TIMEOUT. A request outlasting it raises ConnectionFailed. Paths are on the
   daemon's machine, which is this one: they are made absolute here.
 """
+import contextlib
 import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 import re
 import secrets
 import stat
+import threading
+import time
 import warnings
 from urllib.parse import urlencode
 
@@ -45,6 +60,8 @@ from rnfs.config import DEFAULT_API_PORT, Config
 
 DEFAULT_DIR = Config.rnfs_dir
 TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every client
+DAEMON_FILE = "daemon.json"  # in the rnfs directory: the running daemon's PID, ports, version (read_daemon_info)
+MAX_DAEMON_FILE = 64 * 1024  # bytes of daemon.json read at most (the daemon's is a few hundred)
 API_HEADER = "X-Rnfs-Api"
 # Before sending the token, a client makes whatever listens on the API port prove it knows it (api_proof)
 CHALLENGE_HEADER = "X-Rnfs-Challenge"
@@ -52,18 +69,20 @@ PROOF_HEADER = "X-Rnfs-Proof"
 PROOF_TIMEOUT = 15  # seconds to connect and prove (at most the client's timeout): a listener mustn't hang a client
 PROOF_READ_LIMIT = 64 * 1024  # the most read of a proof's response (the daemon's is a few dozen bytes)
 COPY_SIZE = 64 * 1024  # what a Stream reads at a time when iterated
-# A daemon before 0.1.5 closes the connection it proved itself on; only one proved that old gets the request on a
-# new connection (the fallback is to be dropped in 0.1.7)
-KEEPS_PROOF_OPEN_SINCE = (0, 1, 5)
+# The oldest daemon a client talks to: one before 0.1.5 closes the connection it proved itself on, so the request
+# could only go on a new connection, which another listener could take (clients before 0.1.7 sent it there)
+OLDEST_DAEMON = (0, 1, 5)
 
 
 class ApiError(errors.RnfsError):
-    """An API call failed; str() says why. status is the HTTP status, or None if the daemon never answered."""
+    """An API call failed; str() says why. status is the HTTP status, or None if the daemon never answered; code
+    the daemon's machine-readable code (rnfs.errors.CODES), or None (no response, or a daemon before 0.1.7)."""
 
-    def __init__(self, message: str, status: int | None = None):
-        """An error with message, from a response with status (None: no response)."""
+    def __init__(self, message: str, status: int | None = None, code: str | None = None):
+        """An error with message, from a response with status (None: no response) and code."""
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class DaemonNotRunning(ApiError):
@@ -93,6 +112,14 @@ class BadRequest(ApiError, ValueError):
 
 class NotFound(ApiError, errors.NotFound):
     """404: no such content, name, pin, job or endpoint."""
+
+
+class NoSuchEndpoint(NotFound):
+    """404 no_such_endpoint: the daemon has no such endpoint (it predates it), not that some content is missing."""
+
+
+class Unsupported(NotFound, errors.Unsupported):
+    """404 unsupported: the daemon can't do this at all (a daemon that can't be stopped through its API, say)."""
 
 
 class TooLarge(ApiError, errors.TooLarge):
@@ -137,10 +164,18 @@ def _status_errors() -> dict[int, type[ApiError]]:
 STATUS_ERRORS = _status_errors()
 
 
-def error_for(status: int, message: str) -> ApiError:
-    """The ApiError subclass for an error response's status, with its message."""
+# A daemon before 0.1.7 sends no code; its 404 for an unknown endpoint says this
+_NO_ENDPOINT_MESSAGE = "no such API endpoint"
+
+
+def error_for(status: int, message: str, code: str | None = None) -> ApiError:
+    """The ApiError subclass for an error response's status (and code), with its message."""
+    if status == 404 and (code == "no_such_endpoint" or (code is None and message.startswith(_NO_ENDPOINT_MESSAGE))):
+        return NoSuchEndpoint(message, status, code or "no_such_endpoint")
+    if status == 404 and code == "unsupported":
+        return Unsupported(message, status, code)
     error_class = STATUS_ERRORS.get(status) or (ServerError if status >= 500 else ApiError)
-    return error_class(message, status)
+    return error_class(message, status, code)
 
 
 def version_numbers(version) -> tuple[int, ...] | None:
@@ -163,10 +198,89 @@ def load_settings(rnfs_dir: str = DEFAULT_DIR) -> Config:
         raise SettingsError(f"can't read the settings in {rnfs_dir}: {e}") from None
 
 
+def daemon_info_path(rnfs_dir: str = DEFAULT_DIR) -> str:
+    """Where the daemon using rnfs_dir describes itself (DAEMON_FILE)."""
+    return os.path.join(os.path.expanduser(rnfs_dir), DAEMON_FILE)
+
+
+def _process_alive(pid: int) -> bool:
+    """False only if no process pid runs; True when it does, or when that can't be told."""
+    if fsutil.IS_WINDOWS:
+        return _windows_process_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: it runs, as another user
+        return True
+    return True
+
+
+def _windows_process_alive(pid: int) -> bool:
+    """Windows: False only if OpenProcess says no process pid exists, or it has exited (GetExitCodeProcess);
+    True otherwise, also when that can't be told (another user's process can't be opened: it runs)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError, ValueError):
+        return True
+
+
+def read_daemon_info(rnfs_dir: str = DEFAULT_DIR) -> dict | None:
+    """What the daemon using rnfs_dir wrote about itself at its start (DAEMON_FILE): {"pid", "api_port",
+    "gateway_port", "version", "started", "rnfs_dir", "reticulum_config", "shared_instance", "node_id"}, or None
+    if there is none, it can't be trusted (a symlink, not a regular file, writable by other users), it doesn't
+    parse, or its process no longer runs (a daemon that crashed). Never raises for a bad file: a client then uses
+    rnfs.toml, as before daemons wrote one."""
+    path = daemon_info_path(rnfs_dir)
+    try:
+        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | fsutil.O_BINARY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            if not fsutil.IS_WINDOWS and (info.st_mode & 0o022 or info.st_uid != os.getuid()):
+                return None
+            raw = f.read(MAX_DAEMON_FILE + 1)
+        if len(raw) > MAX_DAEMON_FILE:
+            return None
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pid, port = data.get("pid"), data.get("api_port")
+    if type(pid) is not int or type(port) is not int or not 1 <= port <= 65535 or not _process_alive(pid):
+        return None
+    return data
+
+
 def api_port(rnfs_dir: str = DEFAULT_DIR) -> int:
-    """The port the daemon using rnfs_dir listens on: api_port in its rnfs.toml, else DEFAULT_API_PORT. A
-    settings file made private on the way (others could access it) is reported as a RuntimeWarning. Raises
-    SettingsError if rnfs.toml can't be read."""
+    """The port the daemon using rnfs_dir listens on: the one in its daemon.json (read_daemon_info), else api_port
+    in its rnfs.toml, else DEFAULT_API_PORT. A settings file made private on the way (others could access it) is
+    reported as a RuntimeWarning. Raises SettingsError if there is no usable daemon.json and rnfs.toml can't be
+    read."""
+    running = read_daemon_info(rnfs_dir)
+    if running is not None:
+        return running["api_port"]
     config = load_settings(rnfs_dir)
     for message in config.warnings:
         warnings.warn(message, RuntimeWarning, stacklevel=2)
@@ -217,6 +331,10 @@ def read_all(response: http.client.HTTPResponse) -> bytes:
         return response.read()
     except http.client.IncompleteRead:
         raise ConnectionFailed("the response was cut short; see the daemon's log") from None
+    except TimeoutError:
+        raise ConnectionFailed("the daemon didn't finish its answer within the timeout") from None
+    except OSError as e:  # a reset
+        raise ConnectionFailed(f"the response failed ({e!r}); see the daemon's log") from None
 
 
 class Stream:
@@ -241,6 +359,12 @@ class Stream:
             chunk = self.response.read(size)
         except http.client.IncompleteRead:
             chunk = b""
+        except TimeoutError:
+            raise ConnectionFailed(f"the daemon stopped sending within the timeout, after {self.received} bytes") \
+                from None
+        except OSError as e:  # a reset
+            raise ConnectionFailed(f"the transfer failed after {self.received} bytes ({e!r}); see the daemon's "
+                                   f"log") from None
         self.received += len(chunk)
         if not chunk and size and self.length is not None and self.received != self.length:
             raise ConnectionFailed(f"the transfer stopped after {self.received} of {self.length} bytes; "
@@ -269,13 +393,38 @@ def _flag(value: bool) -> int | None:
     return 1 if value else None
 
 
+class _Default:
+    """The type of DEFAULT."""
+
+    def __repr__(self) -> str:
+        """Its name, for signatures in help()."""
+        return "DEFAULT"
+
+
+# A request's timeout when none is given for it: this thread's (using_timeout), else the connection's. Not None,
+# which is a timeout of its own: none at all
+DEFAULT = _Default()
+
+
+def check_timeout(timeout) -> float | None:
+    """timeout if it is None or a positive number of seconds; ValueError otherwise (0 would make the socket
+    non-blocking, and a bool is a mistake)."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout < math.inf:
+        raise ValueError(f"a timeout is None or a positive number of seconds, not {timeout!r}")
+    return timeout
+
+
 class ApiConnection:
     """The local API of the daemon using rnfs_dir (default ~/.rnfs/), on 127.0.0.1:port (default: the api_port in
     its rnfs.toml). token_file defaults to <rnfs_dir>/api_token and is read on the first request needing it.
 
     request() and call() are the whole protocol; get() and post() call any endpoint (features' too); the other
-    methods are every core route (api.ApiHandler.ROUTES), jobs and the deny list, returning what the API answers
-    (design.md, "Node facade"). Every failure raises an ApiError subclass.
+    methods are every core route (api.ApiHandler.ROUTES), jobs, the deny list and the features' routes rnfs.Client
+    uses (peers, contacts, keep, follow, LXMF), returning what the API answers (design.md, "Node facade"). Every
+    failure raises an ApiError subclass. timeout bounds each request (None: no bound; see the module docstring for
+    using_timeout and a call's own).
     """
 
     def __init__(self, rnfs_dir: str | None = None, port: int | None = None, token_file: str | None = None,
@@ -283,23 +432,51 @@ class ApiConnection:
         """A client; nothing is sent until the first request. Raises SettingsError if port isn't given and
         rnfs.toml can't be read."""
         rnfs_dir = DEFAULT_DIR if rnfs_dir is None else rnfs_dir
+        self.rnfs_dir = rnfs_dir
         self.port = api_port(rnfs_dir) if port is None else port
         self.token_file = token_path(rnfs_dir) if token_file is None else token_file
-        self.timeout = timeout
+        self.timeout = timeout  # each request's, unless the thread or the call gives another
+        self._local = threading.local()  # .timeout: this thread's, inside using_timeout()
         self.token: str | None = None  # the token read last, once a daemon has proved it knows it
         self.daemon_version: str | None = None  # what the daemon said in the last proof request
+
+    # Timeouts
+
+    def effective_timeout(self, timeout=DEFAULT) -> float | None:
+        """The timeout a request made now by this thread gets: timeout unless DEFAULT, else the one this thread's
+        using_timeout() set, else the connection's. ValueError for a timeout given that isn't one."""
+        if timeout is not DEFAULT:
+            return check_timeout(timeout)
+        timeout = getattr(self._local, "timeout", DEFAULT)
+        return self.timeout if timeout is DEFAULT else timeout
+
+    @contextlib.contextmanager
+    def using_timeout(self, timeout: float | None):
+        """A context manager: requests this thread makes inside it get timeout (None: none) instead of the
+        connection's, unless a call gives its own. Thread-local, so other threads (and their requests) keep
+        theirs; nests, restoring the outer one on exit. ValueError unless None or a positive number."""
+        check_timeout(timeout)
+        previous = getattr(self._local, "timeout", DEFAULT)
+        self._local.timeout = timeout
+        try:
+            yield self
+        finally:
+            self._local.timeout = previous
 
     # The protocol
 
     def request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
                 body=None, length: int | None = None, extra_headers: dict | None = None,
-                authenticated: bool = True) -> http.client.HTTPResponse:
+                authenticated: bool = True, timeout=DEFAULT) -> http.client.HTTPResponse:
         """Send a request and return the successful response, whose body the caller reads (read_all, Stream).
 
         params go in the query string (None values left out); json_body is sent as JSON; body may be bytes or a
         binary file, sent chunked without length. Unless authenticated is False (version(), and the proof
         request itself), the token is sent, on a connection whose other end has just proved it knows it.
+        timeout bounds this request (None: no bound; DEFAULT: effective_timeout()), connecting and proving within
+        at most PROOF_TIMEOUT of it; it stays the response's, for reading its body.
         """
+        timeout = self.effective_timeout(timeout)
         url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
         # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
         headers = {"Host": f"127.0.0.1:{self.port}", **(extra_headers or {})}
@@ -311,13 +488,13 @@ class ApiConnection:
             if length is not None:
                 headers["Content-Length"] = str(length)
         if authenticated:
-            connection, headers[API_HEADER] = self._prove(self._connect(self._proof_timeout()))
-            # Proved: the request itself may take as long as the client allows
-            connection.timeout = self.timeout
+            connection, headers[API_HEADER] = self._prove(self._connect(self._proof_timeout(timeout)), timeout)
+            # Proved: the request itself may take as long as its timeout allows
+            connection.timeout = timeout
             if connection.sock is not None:
-                connection.sock.settimeout(self.timeout)
+                connection.sock.settimeout(timeout)
         else:
-            connection = self._connect()
+            connection = self._connect(timeout)
         response = self._exchange(connection, method, url, body, headers)
         try:
             return self._raise_for(response)
@@ -325,18 +502,20 @@ class ApiConnection:
             connection.close()
             raise
 
-    def _connect(self, timeout: float | None = None) -> http.client.HTTPConnection:
-        """A new connection to the API port (opened by its first request), with timeout (default: the client's)."""
-        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout if timeout is None else timeout)
+    def _connect(self, timeout: float | None) -> http.client.HTTPConnection:
+        """A new connection to the API port (opened by its first request), with timeout (None: none)."""
+        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
 
-    def _proof_timeout(self) -> float:
-        """The timeout for connecting and proving: PROOF_TIMEOUT, or the client's own if shorter."""
-        return PROOF_TIMEOUT if self.timeout is None else min(self.timeout, PROOF_TIMEOUT)
+    @staticmethod
+    def _proof_timeout(timeout: float | None) -> float:
+        """The timeout for connecting and proving before a request with timeout: PROOF_TIMEOUT, or timeout if
+        shorter (a listener mustn't hold a request longer than the caller allows it in all)."""
+        return PROOF_TIMEOUT if timeout is None else min(timeout, PROOF_TIMEOUT)
 
     def _exchange(self, connection: http.client.HTTPConnection, method: str, url: str, body,
                   headers: dict) -> http.client.HTTPResponse:
         """Send one request on connection and return its response, whatever its status; a connection that fails
-        raises DaemonNotRunning or ConnectionFailed."""
+        raises DaemonNotRunning or ConnectionFailed (also when the answer doesn't come within its timeout)."""
         try:
             connection.request(method, url, body=body, headers=headers)
             return connection.getresponse()
@@ -345,6 +524,9 @@ class ApiConnection:
             if isinstance(e, ConnectionRefusedError):
                 raise DaemonNotRunning(f"no daemon is running on API port {self.port}. Start one with: rnfs daemon") \
                     from None
+            if isinstance(e, TimeoutError) and connection.timeout is not None:  # else the system's (ETIMEDOUT)
+                raise ConnectionFailed(f"the daemon on API port {self.port} didn't answer within its timeout "
+                                       f"({connection.timeout:g} seconds)") from None
             if isinstance(e, (http.client.HTTPException, ConnectionError)):
                 raise ConnectionFailed(f"the daemon dropped the connection ({e!r}); see its log") from None
             raise ConnectionFailed(f"can't reach the daemon on API port {self.port}: {e}") from None
@@ -357,41 +539,39 @@ class ApiConnection:
         if data is None:
             data = read_all(response)
         try:
-            message = json.loads(data)["error"]
+            body = json.loads(data)
+            message = body["error"]
         except (ValueError, KeyError, TypeError):
-            message = f"HTTP {response.status} {response.reason}"
-        raise error_for(response.status, str(message))
+            body, message = None, f"HTTP {response.status} {response.reason}"
+        code = body.get("code") if isinstance(body, dict) else None
+        raise error_for(response.status, str(message), code if isinstance(code, str) else None)
 
-    def _prove(self, connection: http.client.HTTPConnection) -> tuple[http.client.HTTPConnection, str]:
+    def _prove(self, connection: http.client.HTTPConnection,
+               timeout: float | None) -> tuple[http.client.HTTPConnection, str]:
         """Make what listens on the API port prove, on connection, that it knows the token, and return the
-        connection to send the request on and the token. The daemon keeps a connection it proved itself on
-        open for one more request, so the token and the request's body can only reach it: a proof made once,
+        connection to send a request with timeout on, and the token. The daemon keeps a connection it proved itself
+        on open for one more request, so the token and the request's body can only reach it: a proof made once,
         on another connection, would hold no longer than the daemon, and any local user can listen on its port
         once it stops. The token read is kept, and read again if the proof fails (a daemon restarted since
-        wrote a new one). A daemon that closes the connection anyway gets the request on a new one only if it
-        proved a version before 0.1.5 (whose daemons close every connection); for any other, ConnectionFailed."""
+        wrote a new one). A daemon that closes the connection anyway gets nothing more: ConnectionFailed (one
+        before 0.1.5, which always does, was refused by check_daemon already)."""
         token = self.token or read_token(self.token_file)
         try:
-            version = self.verify_daemon(token, connection)
+            self.verify_daemon(token, connection)
         except AuthFailed:
             fresh = read_token(self.token_file)
             if fresh == token:
                 raise
             connection.close()
-            connection = self._connect(self._proof_timeout())
-            version = self.verify_daemon(fresh, connection)
+            connection = self._connect(self._proof_timeout(timeout))
+            self.verify_daemon(fresh, connection)
             token = fresh
         self.token = token
         if connection.sock is None:
-            # A new connection could reach another listener (the daemon may stop in between), so only a daemon too
-            # old to keep it open gets the request on one, as its clients sent it
-            numbers = version_numbers(version)
-            if numbers is None or numbers >= KEEPS_PROOF_OPEN_SINCE:
-                raise ConnectionFailed(f"the daemon on API port {self.port} closed the connection it proved itself "
-                                       f"on, so the request wasn't sent; see its log")
-            connection = self._connect()
-        else:
-            connection.auto_open = 0  # never reconnect: a new connection could reach another listener
+            # A new connection could reach another listener (the daemon may stop in between): nothing more is sent
+            raise ConnectionFailed(f"the daemon on API port {self.port} closed the connection it proved itself on, "
+                                   f"so the request wasn't sent; see its log")
+        connection.auto_open = 0  # never reconnect: a new connection could reach another listener
         return connection, token
 
     def verify_daemon(self, token: str, connection: http.client.HTTPConnection | None = None) -> str | None:
@@ -404,7 +584,7 @@ class ApiConnection:
         request; every other status AuthFailed) nor its text. A proved daemon's error status raises its ApiError."""
         challenge = secrets.token_hex(16)
         headers = {"Host": f"127.0.0.1:{self.port}", CHALLENGE_HEADER: challenge, "Connection": "keep-alive"}
-        connection = connection or self._connect(self._proof_timeout())
+        connection = connection or self._connect(self._proof_timeout(self.effective_timeout()))
         response = self._exchange(connection, "GET", "/api/status", None, headers)
         proof = (response.getheader(PROOF_HEADER) or "").strip().encode("ascii", "replace")
         if not hmac.compare_digest(proof, api_proof(token, self.port, challenge).encode()):
@@ -446,24 +626,34 @@ class ApiConnection:
 
     def check_daemon(self, version: str | None):
         """The one place to refuse a daemon by its version (None if it didn't say), before the token is sent;
-        raise an ApiError to refuse. Every version is accepted for now."""
+        raise an ApiError to refuse. A daemon proved older than OLDEST_DAEMON is refused (one that says no version,
+        or one that doesn't parse, is a newer one's business: a daemon that closes the connection is refused after
+        anyway)."""
+        numbers = version_numbers(version)
+        if numbers is not None and numbers < OLDEST_DAEMON:
+            raise ApiError(f"the daemon on API port {self.port} is rnfs {version}, too old for this client (it needs "
+                           f"{'.'.join(map(str, OLDEST_DAEMON))} or later); upgrade it, or use rnfs {version}'s own "
+                           f"command line")
 
     def call(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
-             body=None, length: int | None = None, authenticated: bool = True):
-        """Send a request and return its decoded JSON response."""
-        response = self.request(method, path, params, json_body, body, length, authenticated=authenticated)
+             body=None, length: int | None = None, authenticated: bool = True, timeout=DEFAULT):
+        """Send a request and return its decoded JSON response (timeout as request's)."""
+        response = self.request(method, path, params, json_body, body, length, authenticated=authenticated,
+                                timeout=timeout)
         try:
             return json.loads(read_all(response))
         except ValueError:
             raise ConnectionFailed("the daemon sent an invalid response") from None
 
-    def get(self, path: str, /, **params):
-        """GET path with query parameters; JSON response."""
-        return self.call("GET", path, params=params)
+    def get(self, path: str, /, *, timeout=DEFAULT, **params):
+        """GET path with query parameters; JSON response (timeout as request's: no endpoint takes a parameter
+        called timeout)."""
+        return self.call("GET", path, params=params, timeout=timeout)
 
-    def post(self, path: str, /, **fields):
-        """POST path with a JSON body; JSON response."""
-        return self.call("POST", path, json_body=fields)
+    def post(self, path: str, /, *, timeout=DEFAULT, **fields):
+        """POST path with a JSON body; JSON response (timeout as request's: no endpoint takes a field called
+        timeout)."""
+        return self.call("POST", path, json_body=fields, timeout=timeout)
 
     def _post(self, path: str, /, **fields):
         """POST path with the fields that aren't None."""
@@ -478,6 +668,61 @@ class ApiConnection:
     def status(self) -> dict:
         """The node's status: node ID, DHT mode, counts, storage and every feature's fields."""
         return self.get("/api/status")
+
+    def capabilities(self) -> dict:
+        """What the daemon offers: {"version", "capabilities", "routes", "features", "event_kinds", "error_codes"};
+        from a daemon before 0.1.7, which has no such endpoint, {} (so every capability is absent)."""
+        try:
+            return self.get("/api/capabilities")
+        except NoSuchEndpoint:
+            return {}
+
+    def events(self, after: int | None = None, kinds: list[str] | None = None, wait: int = 0,
+               epoch: str | None = None) -> dict:
+        """The daemon's events after sequence after (of kinds, if given), as soon as there is one or after wait
+        seconds (the API caps it): {"events", "next", "lost", "epoch"}. after None answers at once with the
+        "next" to start from; pass the epoch given, so a restarted daemon answers "lost". NoSuchEndpoint from a
+        daemon before 0.1.7."""
+        return self.get("/api/events", after=after, kinds=",".join(kinds) if kinds else None, wait=wait or None,
+                        epoch=epoch)
+
+    def shutdown(self, wait: float | None = None) -> bool:
+        """Ask the daemon to stop (as SIGTERM does). With wait, poll up to that many seconds (at least once) until
+        it has stopped: its API no longer answers and, when its daemon.json in this client's rnfs dir names this
+        port, its process has ended (it saves its state and releases the rnfs dir's lock after its API stops, so
+        a daemon started next can take it); True once it has, False if not within wait. Without wait, True once it
+        agreed. Unsupported from a daemon that can't be stopped this way, NoSuchEndpoint from one before 0.1.7."""
+        running = self.daemon_info()
+        pid = running["pid"] if running is not None and running["api_port"] == self.port else None
+        self.post("/api/shutdown")
+        if wait is None:
+            return True
+        deadline = time.monotonic() + wait
+        while True:
+            remaining = deadline - time.monotonic()
+            if self._stopped(pid, max(0.1, remaining)):
+                return True
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.2, remaining))
+
+    def _stopped(self, pid: int | None, timeout: float) -> bool:
+        """True if the daemon's API no longer answers (within timeout: whatever holds the port then mustn't hold
+        the caller) and its process pid, if known, has ended."""
+        try:
+            self.call("GET", "/api/status", authenticated=False, timeout=timeout)
+            return False
+        except DaemonNotRunning:
+            pass
+        except ConnectionFailed:
+            pass  # dropped, or a listener that doesn't answer: not the daemon's API either way
+        except ApiError:
+            return False  # something answered
+        return pid is None or not _process_alive(pid)
+
+    def daemon_info(self) -> dict | None:
+        """What the daemon wrote about itself (read_daemon_info) in this client's rnfs dir, or None."""
+        return read_daemon_info(self.rnfs_dir)
 
     # Content
 
@@ -501,6 +746,33 @@ class ApiConnection:
                   "to": ",".join(to) if to else None, "to_self": _flag(to_self), "seal_name": seal_name,
                   "chunker": chunker}
         return self.call("POST", "/api/add/stream", params=params, body=data, length=length)
+
+    def add_tar(self, data, name: str | None = None, length: int | None = None, only_hash: bool = False,
+                pin: bool = True, chunker: str | None = None) -> dict:
+        """Add the directory a tar holds (bytes, or a binary file read to its end, sent chunked unless length is
+        given): regular files and directories, the rest skipped with a warning; name wraps it in a directory as that
+        entry. {"cid", "size", "warnings"} (+ "warnings_total"). For a program whose files the daemon can't open."""
+        if isinstance(data, (bytes, bytearray, memoryview)) and length is None:
+            length = len(data)
+        params = {"format": "tar", "name": name, "only_hash": _flag(only_hash), "pin": None if pin else 0,
+                  "chunker": chunker}
+        return self.call("POST", "/api/add/stream", params=params, body=data, length=length)
+
+    def get_tar(self, target: str) -> Stream:
+        """A target (file or directory) as a tar, read as it arrives: the daemon fetches all of it first and sends its
+        exact length, so a transfer cut short raises ConnectionFailed. Files are as stored (a sealed file sealed)."""
+        return Stream(self.request("GET", "/api/get/stream", params={"target": target, "format": "tar"}))
+
+    def export_stream(self, target: str) -> Stream:
+        """A target's archive, as export writes it, read as it arrives (fetched first, with its exact length)."""
+        return Stream(self.request("GET", "/api/export/stream", params={"target": target}))
+
+    def import_stream(self, data, length: int | None = None) -> dict:
+        """Import an archive sent as bytes or a binary file read to its end (chunked unless length is given): as
+        import_archive, {"roots", "incomplete", ...}."""
+        if isinstance(data, (bytes, bytearray, memoryview)) and length is None:
+            length = len(data)
+        return self.call("POST", "/api/import/stream", body=data, length=length)
 
     def fetch(self, target: str, output: str, from_node: str | None = None, raw: bool = False) -> dict:
         """Fetch a file or directory and have the daemon write it to output (a path on this machine, which must
@@ -565,8 +837,25 @@ class ApiConnection:
         self.post("/api/pin/rm", cid=cid)
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
-        """Every pin (or cid's): [{"cid", "sources", "complete", "type", "sealed", "name"}]."""
+        """Every pin (or cid's): [{"cid", "sources", "complete", "type", "sealed", "name", and from a daemon since
+        0.1.7 "label", "origin", "size", "entries", "added"}]."""
         return self.get("/api/pin/ls", cid=cid)["pins"]
+
+    def pin_label(self, cid: str, label: str | None) -> dict:
+        """Label a pin (None or "" clears its label): its pin_ls entry. NotFound if cid isn't pinned."""
+        return self.post("/api/pin/label", cid=cid, label=label)
+
+    # The cache
+
+    def cache_ls(self) -> list[dict]:
+        """The cached fetches (downloads not pinned), most recently used first: [{"cid", "root", "path", "pinned",
+        "complete", "type", "size", "provided"}]."""
+        return self.get("/api/cache/ls")["cache"]
+
+    def cache_rm(self, cid: str) -> dict:
+        """Evict the cached fetches leading to cid now: {"removed_records", "removed_blocks", "freed_bytes"}.
+        NotFound if none does."""
+        return self.post("/api/cache/rm", cid=cid)
 
     def pin_remote(self, node: str, cid: str, pin: bool = True) -> bool:
         """Ask node (hex) to pin cid for this node, or (pin=False) to release that pin; True if it accepted."""
@@ -637,14 +926,34 @@ class ApiConnection:
         """Remove entries from the local deny list (NotFound, removing none, if one isn't on it)."""
         return self.post("/api/deny/rm", entries=list(entries))["removed"]
 
+    # Settings (rnfs.toml; the schema alone is rnfs.config.settings_schema(), without a daemon)
+
+    def config(self) -> dict:
+        """The daemon's settings: {"path" (its rnfs.toml), "settings": [each setting's schema entry with "value"
+        (running), "file" (rnfs.toml's, None if it doesn't set it), "overridden" (by the daemon's command line,
+        which wins), "pending" (a restart would change it)], "file_error" (why a restart would refuse rnfs.toml,
+        or None), "warnings"}. NoSuchEndpoint from a daemon before 0.1.7."""
+        return self.get("/api/config")
+
+    def config_set(self, settings: dict) -> dict:
+        """Set settings ({name: value, or None to remove it from rnfs.toml}) in the daemon's rnfs.toml, applying at
+        once those that can be: {"path", "applied", "restart_required", "overridden", "warnings"}. BadRequest,
+        writing nothing, unless the whole result is valid."""
+        return self.post("/api/config/set", settings=dict(settings))
+
     # Jobs (background transfers, with progress)
 
-    def submit_job(self, kind: str, target: str, output: str | None = None, from_node: str | None = None,
-                   **options) -> dict:
-        """Start a job: kind "get" (output needed), "pin" or "export" (output needed). Its record, with its
-        "id". options: get's sealed_name and fallback_dht."""
+    def submit_job(self, kind: str, target: str | None = None, output: str | None = None,
+                   from_node: str | None = None, path: str | None = None, options: dict | None = None,
+                   **flags) -> dict:
+        """Start a job: kind "get" (output needed), "pin" or "export" (output needed) of a target, or "add" or
+        "import" of a path on this machine. Its record, with its "id". flags: get's sealed_name and fallback_dht;
+        options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to, to_self, seal_name,
+        chunker; only those set)."""
         output = os.path.abspath(os.path.expanduser(output)) if output is not None else None
-        return self._post("/api/jobs", kind=kind, target=target, output=output, **{"from": from_node}, **options)
+        path = os.path.abspath(os.path.expanduser(path)) if path is not None else None
+        return self._post("/api/jobs", kind=kind, target=target, output=output, path=path, **{"from": from_node},
+                          **(options or {}), **flags)
 
     def job(self, job_id: str, wait: int = 0) -> dict:
         """A job's record; waits up to wait seconds (the API caps it) for it to finish."""
@@ -661,3 +970,96 @@ class ApiConnection:
     def clear_jobs(self, job_id: str | None = None) -> int:
         """Forget finished jobs (or that one); how many."""
         return self._post("/api/jobs/clear", id=job_id)["removed"]
+
+    # The features' routes rnfs.Client uses (rnfs/features/: NotFound from a daemon without the feature). A name
+    # is 32 hex characters or a name contact's nick; an LXMF recipient an address (hex) or an LXMF contact's nick
+
+    def peers(self) -> list[dict]:
+        """Every node the daemon knows, nearest first: [{"node_id", "mode", "in_table", "seniority", "senior",
+        "hops", "interface", "bitrate", "link", "rate", "last_heard", "last_active", "banned", "sent",
+        "received", "requests", "answered", "refused", "failed", "bad", ...}] (peers feature)."""
+        return self.get("/api/peers")["peers"]
+
+    def stats(self) -> dict:
+        """Traffic since the daemon started: {"since", "totals", "refused", "interfaces", "upload_budget",
+        "upload_budget_left"} (peers feature)."""
+        return self.get("/api/stats")
+
+    def contacts(self) -> list[dict]:
+        """Every contact, by nick: [{"nick", "kind", "id"}]."""
+        return self.get("/api/contacts")["contacts"]
+
+    def contact_get(self, nick: str) -> dict:
+        """One contact: {"nick", "kind", "id"}; NotFound if there is none."""
+        return self.get("/api/contacts/get", nick=nick)
+
+    def contact_add(self, nick: str, ident: str, kind: str | None = None) -> dict:
+        """Add or replace a contact for ident (32 hex characters): kind "name", "node" or "lxmf", or None to have
+        the daemon tell (ValueError if it can't). The contact."""
+        return self._post("/api/contacts/add", nick=nick, id=ident, kind=kind)
+
+    def contact_rm(self, nick: str):
+        """Delete a contact (NotFound if there is none)."""
+        self.post("/api/contacts/rm", nick=nick)
+
+    def name_keep(self, name: str) -> dict:
+        """Keep a name's signed record: {"name", "reasons", "sequence", "cid", "emitted"} (keepers feature)."""
+        return self.post("/api/name/keep", name=name)
+
+    def name_unkeep(self, name: str):
+        """Stop keeping a name (NotFound if it isn't kept by the user)."""
+        self.post("/api/name/unkeep", name=name)
+
+    def name_kept(self) -> list[dict]:
+        """Every kept name: [{"name", "reasons", "sequence", "cid", "emitted"}]."""
+        return self.get("/api/name/kept")["kept"]
+
+    def name_follow(self, name: str) -> dict:
+        """Follow a name, pinning its latest target: {"name", "pinned", "latest", "sequence", "state"} (follow
+        feature)."""
+        return self.post("/api/name/follow", name=name)
+
+    def name_unfollow(self, name: str):
+        """Stop following a name, releasing its pin (NotFound if it isn't followed)."""
+        self.post("/api/name/unfollow", name=name)
+
+    def name_following(self) -> list[dict]:
+        """Every followed name: [{"name", "pinned", "latest", "sequence", "state"}]."""
+        return self.get("/api/name/following")["following"]
+
+    def lxmf_address(self) -> dict:
+        """{"address", "display_name", "propagation_node", "nearest_propagation_node"}; BadRequest if LXMF is off."""
+        return self.get("/api/lxmf/address")
+
+    def lxmf_send(self, to: str, target: str, message: str | None = None, propagate: bool = False,
+                  nearest: bool = False) -> dict:
+        """Send a link to target (and message) over LXMF, queued: {"id", "hash", "to", "method"}."""
+        return self._post("/api/lxmf/send", to=to, target=target, message=message, propagate=propagate or None,
+                          nearest=nearest or None)
+
+    def lxmf_inbox(self) -> list[dict]:
+        """The inbox, oldest first: [{"id", "hash", "from", "display_name", "sent", "received", "title", "text",
+        "method", "links", "auto", "trusted", "contact"}]."""
+        return self.get("/api/lxmf/inbox")["messages"]
+
+    def lxmf_inbox_get(self, entry_id: int, link: int | None = None, output: str | None = None,
+                       directory: str | None = None, use_sent_cid: bool = False) -> list[dict]:
+        """Fetch inbox message entry_id's links (or link, 1-based) to output or into directory (paths on this
+        machine): [{"target", "output", "job" | "cid", "warnings"?, "error"?}]."""
+        output = os.path.abspath(os.path.expanduser(output)) if output is not None else None
+        directory = os.path.abspath(os.path.expanduser(directory)) if directory is not None else None
+        return self._post("/api/lxmf/inbox/get", id=entry_id, link=link, output=output, directory=directory,
+                          use_sent_cid=use_sent_cid or None)["results"]
+
+    def lxmf_inbox_rm(self, entry_id: int | None = None, every: bool = False) -> int:
+        """Remove inbox message entry_id, or every one (every); how many (NotFound for an id there isn't)."""
+        return self.post("/api/lxmf/inbox/rm", **({"all": True} if every else {"id": entry_id}))["removed"]
+
+    def lxmf_outbox(self) -> list[dict]:
+        """The messages sent, oldest first: [{"id", "hash", "to", "time", "links", "text", "method", "state",
+        "progress", ...}]."""
+        return self.get("/api/lxmf/outbox")["messages"]
+
+    def lxmf_sync(self, nearest: bool = False) -> dict:
+        """Start downloading waiting messages from the propagation node: {"propagation_node", "started"}."""
+        return self._post("/api/lxmf/sync", nearest=nearest or None)

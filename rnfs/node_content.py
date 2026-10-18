@@ -4,13 +4,14 @@
 - Sealed files (rnfs/content/seal.py): resolving recipients to public keys, sealing a file being added,
   and opening a sealed target with the node's identity for get, cat and info.
 - Gateway formats: a CID's own block (?format=raw) and a target's archive streamed with its exact length
-  (?format=archive).
+  (?format=archive, and GET /api/export/stream); a target as a tar streamed the same way (GET /api/get/stream).
 
 Functions take the RnfsNode first. RNS is imported inside functions: the daemon has loaded it already.
 """
 import os
 import stat
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from typing import BinaryIO
 
 from rnfs.content import archive, builder, dag, seal, walker
@@ -84,7 +85,7 @@ def sealing_stream(stream: BinaryIO, size: int | None, recipients: list[bytes],
 def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes], seal_name: bool,
                     options: builder.BuildOptions | None = None) -> builder.Built:
     """Seal the regular file at path and build it (wrapped under its visible name if wrap), with options (the
-    chunker, and the deny check of the sealed bytes; builder.build_file)."""
+    chunker, the deny check of the sealed bytes, builder.build_file; and progress, given the plaintext read)."""
     handle, st = builder.open_path(path)
     try:
         if not stat.S_ISREG(st.st_mode):
@@ -92,7 +93,8 @@ def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[by
         name = os.path.basename(os.path.normpath(os.path.abspath(path)))
         sealed_name = name if seal_name and dag.is_valid_name(name) else None
         with os.fdopen(handle, "rb", closefd=False) as f:
-            return builder.add_stream(seal.SealingReader(f, recipients, sealed_name), put, None,
+            plain = builder.counted(f, options.progress if options is not None else None)
+            return builder.add_stream(seal.SealingReader(plain, recipients, sealed_name), put, None,
                                       name if wrap else None, options=options)
     finally:
         builder.close(handle)
@@ -234,24 +236,73 @@ def block(node, cid: str, for_gateway: bool = False) -> bytes:
 
 def export_stream(node, target: str, start: Callable[[int], BinaryIO | None], for_gateway: bool = False) -> dict:
     """Fetch the target's DAG, then write its archive to start(exact archive length): the stream to write to,
-    or None to write nothing. Limits as for export: max_download_size, max_output_entries, and the DAG
-    byte bound of fetch_dag. Every file is checked against the deny list's file hashes before anything is sent,
-    as the gateway checks what it sends."""
-    root, names = walker.parse_target(target)
+    or None to write nothing. {"roots", "blocks", "length"}; limits and checks as export_chunks."""
+    chunks = export_chunks(node, target, for_gateway)
+    try:
+        info = next(chunks)
+        out = start(info["length"])
+        if out is not None:
+            for data in chunks:
+                out.write(data)
+        return info
+    finally:
+        chunks.close()  # ends the fetch, as leaving its block would
+
+
+def _fetched_dag(node, fetch, expect: walker.Expect):
+    """Fetch the whole DAG of a resolved target to send it (an archive or a tar): limits as for export
+    (max_download_size, max_output_entries counting every occurrence, the DAG byte bound of fetch_dag), and every
+    file checked against the deny list's file hashes before anything is sent, as the gateway checks what it
+    sends."""
+    fetch.fetch_dag(expect, node.config.max_output_entries)
+    walker.count_entries(expect, fetch.get, node.config.max_output_entries)
+    if node.deny.hashes:
+        for file in walker.iter_files(expect, fetch.get):
+            node._check_file(file, fetch.get)
+
+
+def export_chunks(node, target: str, for_gateway: bool = False) -> Iterator:
+    """The target's archive as a generator: first {"roots", "blocks", "length"} once its DAG is fetched and
+    checked (_fetched_dag), then its bytes, byte-identical to `rnfs export` (?format=archive, GET
+    /api/export/stream). The fetch stays open until the generator ends or is closed. A leading contact nick is
+    expanded unless for_gateway."""
+    root, names = node._parse_target(target, for_gateway)
     with node._fetching(root, names, None, for_gateway) as fetch:
         expect = fetch.resolve()
-        fetch.fetch_dag(expect, node.config.max_output_entries)
-        walker.count_entries(expect, fetch.get, node.config.max_output_entries)
-        if node.deny.hashes:
-            for file in walker.iter_files(expect, fetch.get):
-                node._check_file(file, fetch.get)
+        _fetched_dag(node, fetch, expect)
         blocks = node.storage.dag_blocks(expect.cid)
         length = archive.archive_size([expect.cid], ((cid, node.storage.block_size(cid) or 0) for cid in blocks))
-        out = start(length)
-        if out is None:
-            return {"roots": [str(expect.cid)], "blocks": len(blocks), "length": length}
-        stats = archive.export_archive([expect], fetch.get, out)
-    return {"roots": [str(cid) for cid in stats["roots"]], "blocks": stats["blocks"], "length": length}
+        yield {"roots": [str(expect.cid)], "blocks": len(blocks), "length": length}
+        yield from archive.archive_chunks([expect], fetch.get)
+
+
+SKIPS_LOGGED = 10  # entries a tar of a target skips that are logged by name (the rest only counted)
+
+
+def tar_chunks(node, target: str) -> Iterator:
+    """The target as a tar (rnfs/content/tarstream.py), as a generator: first {"cid", "length", "skipped"} once its
+    DAG is fetched and checked (_fetched_dag), then the tar's bytes (GET /api/get/stream?format=tar). A file is
+    one member named by the target's last path name (or its CID for a bare CID, or one unsafe in a tar); entries
+    whose names are unsafe in a tar are skipped (counted in "skipped", the first SKIPS_LOGGED logged). The fetch
+    stays open until the generator ends or is closed."""
+    from rnfs.content import tarstream
+    from rnfs.log import LOG_WARNING, log
+
+    root, names = node._parse_target(target)
+    max_entries = node.config.max_output_entries
+    with node._fetching(root, names) as fetch:
+        expect = fetch.resolve()
+        _fetched_dag(node, fetch, expect)
+        name = names[-1] if names and tarstream.safe_name(names[-1]) else str(expect.cid)
+        skipped = tarstream.Warnings(SKIPS_LOGGED)
+        members = tarstream.plan(expect, fetch.get, name, max_entries, skipped)
+        for path in skipped.kept:
+            log(f"tar of {target}: skipped {path!r}: a character in its name could be read as a path", LOG_WARNING)
+        if skipped.total > len(skipped.kept):
+            log(f"tar of {target}: skipped {skipped.total - len(skipped.kept)} more such entries", LOG_WARNING)
+        mtime = int(time.time())
+        yield {"cid": str(expect.cid), "length": tarstream.length(members, mtime), "skipped": skipped.total}
+        yield from tarstream.chunks(members, fetch.get, mtime, max_entries)
 
 
 # API parameters

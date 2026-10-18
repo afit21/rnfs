@@ -404,6 +404,12 @@ def _directory_entries(expect: Expect, get: Get, memo: dict | None = None) -> It
             stack.extend(reversed(children(current, node)))
 
 
+def directory_entries(expect: Expect, get: Get, memo: dict | None = None) -> Iterator[tuple[Entry, Expect]]:
+    """Every entry of a directory in name order with the entry's expectation (memo: directory and index nodes
+    already decoded, kept for repeated subtrees). Raises ValueError for a file. Unbounded: the caller counts."""
+    return _directory_entries(expect, get, memo)
+
+
 def list_directory(expect: Expect, get: Get, max_entries: int | None = None) -> Iterator[Entry]:
     """The entries of a directory in name order. Raises ValueError for a file, TooLarge past max_entries."""
     for count, (entry, _) in enumerate(_directory_entries(expect, get), 1):

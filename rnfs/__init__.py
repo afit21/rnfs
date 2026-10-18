@@ -28,13 +28,19 @@ _EXPORTS = {
     "Node": "rnfs.embedded",
     "Client": "rnfs.remote",
     **{name: "rnfs.objects" for name in ("Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record",
-                                         "Status", "Collected", "Verified", "Exported", "Imported", "DenyState")},
-    **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File")},
+                                         "Status", "Collected", "Verified", "Exported", "Imported", "DenyState",
+                                         "Peer", "Stats", "Contact", "Kept", "Followed", "LxmfAddress",
+                                         "MessageLink", "Message", "Outgoing", "Sent", "Synced", "Cached",
+                                         "Uncached", "Event", "EventBatch", "Capabilities", "Setting", "Settings",
+                                         "SettingsChange")},
+    **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File",
+                                           "Contacts", "Lxmf", "Fetched", "Events")},
     **{name: "rnfs.errors" for name in ("RnfsError", "NotFound", "TooLarge", "InvalidDag", "StorageFull", "Busy",
                                         "Denied", "Cancelled", "Closed", "BlockMismatch", "SealError",
-                                        "NotRecipient")},
+                                        "NotRecipient", "Unsupported")},
     **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "ConnectionFailed", "TokenError",
-                                           "AuthFailed", "SettingsError", "BadRequest", "ServerError")},
+                                           "AuthFailed", "SettingsError", "BadRequest", "ServerError",
+                                           "NoSuchEndpoint")},
 }
 __all__ = ["API_STATUS", "__version__", *_EXPORTS]
 

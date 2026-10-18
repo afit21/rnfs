@@ -31,6 +31,31 @@ CHANGELOG.md).
 
 # 0.1.7
 
+## Local API and library for companion apps (done)
+
+What companion apps need from the daemon, most impactful first.
+
+* Discovery file: the daemon writes `<rnfs dir>/daemon.json` at start with its PID, API ports, version, start time
+  and the Reticulum config it uses, so a client finds the daemon without parsing `rnfs.toml` (an older client
+  can't find the port today if `rnfs.toml` has a newer setting)
+* `POST /api/shutdown`: a background daemon can't be stopped cleanly on Windows without it (the app ships a second
+  console program to send Ctrl+Break through a hidden console)
+* Capability list and machine-readable error codes: apps string-match error messages today, and a 404 can mean
+  either "no such endpoint" or "content not found"
+* Push endpoint (`GET /api/events`) for jobs, pins, the LXMF inbox, names and peers, replacing the apps' polling
+* Richer `pin ls`: size, time added, folder entry counts as fields (not "(directory: 28 entries)" strings), and a
+  renamable label kept separate from the added-from path (nothing can set a file's local name today)
+* `cache ls` and `cache rm`: nothing lists downloads that aren't pinned, short of reading `blocks/` on disk
+* Config API that carries its own schema (so apps don't keep a copy of the setting metadata), with some settings
+  applied without a restart (every setting needs one today)
+* Add and import as jobs with progress, and directory streaming for upload and export, so a sandboxed (Flatpak)
+  daemon works fully
+* Peers: `first_heard`, the last link RTT the node already measured, and an online state worked out by the daemon
+* `rnfs.Client`: typed methods for peers, stats, contacts, follow, keep and LXMF, and timeouts per call instead
+  of per connection
+
+# 0.1.8
+
 ## Faster block writes on SD cards (plan item B, then A2)
 Sync blocks to disk at the durability point (before a pin or cache save) instead of once per block, with one
 `syncfs()` on Linux; keep the per-block fsync on other platforms and on stacked filesystems (ecryptfs, overlayfs),

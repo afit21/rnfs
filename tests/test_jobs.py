@@ -744,7 +744,7 @@ class ParsingAndFormattingTest(unittest.TestCase):
         self.assertIsNone(job.rate())
         job.begin_run()
         start = job._samples[0][0]
-        job.downloaded_bytes = 10_000
+        job._moved = job.downloaded_bytes = 10_000  # _moved: what the rate counts (bytes downloaded, for a get)
         job._samples.append((start + 10, 10_000))
         self.assertAlmostEqual(job.rate(start + 10), 1000.0)
         self.assertAlmostEqual(job.rate(start + 20), 500.0)  # nothing arrived since: the rate falls
@@ -789,6 +789,252 @@ class ParsingAndFormattingTest(unittest.TestCase):
         self.assertNotIn("\x1b", stdout.getvalue() + stderr.getvalue())
         self.assertNotIn("\x07", stdout.getvalue())
         self.assertIn("\\x1b]0;t\\x07", stdout.getvalue())
+
+
+class LocalJobsTest(JobsBase):
+    """Add and import jobs on B: what they read is on B's machine."""
+
+    def tree(self, name: str = "tree") -> str:
+        """A directory of three files (one executable, one in a subdirectory) and a symlink; its path."""
+        top = self.out(name)
+        os.makedirs(os.path.join(top, "sub"))
+        for relative, data in (("a.txt", b"hello"), ("sub/big", os.urandom(3 * CHUNK_SIZE + 7)), ("run.sh", b"#!")):
+            with open(os.path.join(top, relative), "wb") as f:
+                f.write(data)
+        os.chmod(os.path.join(top, "run.sh"), 0o755)
+        if hasattr(os, "symlink") and os.name != "nt":
+            os.symlink("a.txt", os.path.join(top, "link"))
+        return top
+
+    def held_add(self):
+        """Patch B's add_path so the add holds at its first read until the returned gate is set; (reading, gate)."""
+        reading, gate = threading.Event(), threading.Event()
+        real_add = self.b.add_path
+
+        def add_path(path, progress=None, **options):
+            """The real add, its progress held at the first read."""
+            def held(length):
+                reading.set()
+                gate.wait(10)
+                progress(length)
+            return real_add(path, progress=held, **options)
+
+        patcher = mock.patch.object(self.b, "add_path", add_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(gate.set)
+        return reading, gate
+
+    def test_add_job_result_is_add_paths(self):
+        top = self.tree()
+        job = self.finished(self.jobs.submit("add", path=top, options={"wrap": True})["id"])
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(job["result"], self.b.add_path(top, wrap=True))
+        self.assertEqual((job["target"], job["path"], job["options"]), (None, top, {"wrap": True}))
+        size = 5 + 3 * CHUNK_SIZE + 7 + 2
+        self.assertEqual((job["total_bytes"], job["done_bytes"]), (size, size))
+        self.assertIn(USER, self.b.storage.pins()[Cid.parse(job["result"]["cid"])])
+        job = self.finished(self.jobs.submit("add", path=top, options={"only_hash": True, "pin": False})["id"])
+        self.assertEqual(job["result"]["cid"], self.b.add_path(top, only_hash=True)["cid"])
+
+    def test_import_job_result_is_import_archives(self):
+        cid = self.b.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"]
+        self.b.export(cid, self.out("archive"))
+        self.b.pin_rm(cid)
+        self.b.gc()
+        job = self.finished(self.jobs.submit("import", path=self.out("archive"))["id"])
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(job["result"], {"roots": [cid], "incomplete": [], "blocks": 3})
+        size = os.path.getsize(self.out("archive"))
+        self.assertEqual((job["total_bytes"], job["done_bytes"]), (size, size))
+        self.assertIn(USER, self.b.storage.pins()[Cid.parse(cid)])
+        self.assertEqual(job["result"], self.b.import_archive(self.out("archive")))  # idempotent
+
+    def test_failed_add_and_import_report_the_calls_errors(self):
+        with open(self.out("not-an-archive"), "wb") as f:
+            f.write(b"junk")
+        job = self.finished(self.jobs.submit("import", path=self.out("not-an-archive"))["id"])
+        self.assertEqual(job["state"], "failed")
+        with self.assertRaises(ValueError) as raised:
+            self.b.import_archive(self.out("not-an-archive"))
+        self.assertEqual(job["error"], str(raised.exception))
+        top = self.tree()
+        job = self.finished(self.jobs.submit("add", path=top, options={"to_self": True})["id"])
+        self.assertEqual(job["state"], "failed")  # directories can't be sealed, as add says
+        with self.assertRaises(ValueError) as raised:
+            self.b.add_path(top, to_self=True)
+        self.assertEqual(job["error"], str(raised.exception))
+
+    def test_bad_add_and_import_submissions(self):
+        top = self.tree()
+        cid = self.share(b"x")
+        for args, kwargs in ((("add", cid), {"path": top}), (("add", None, self.out("o")), {"path": top}),
+                             (("add",), {"path": "relative"}), (("add",), {}),
+                             (("import",), {"path": top, "options": {"wrap": True}}),
+                             (("get", cid, self.out("o")), {"path": top}),
+                             (("add",), {"path": top, "options": {"recursive": True}}),
+                             (("add",), {"path": top, "options": {"wrap": "yes"}}),
+                             (("add",), {"path": top, "options": {"to": "abc"}}),
+                             (("add",), {"path": top, "options": {"chunker": "nope"}}),
+                             (("add",), {"path": top, "options": {"to": ["x"] * 300}})):
+            with self.assertRaises(ValueError, msg=(args, kwargs)):
+                self.jobs.submit(*args, **kwargs)
+        from rnfs.errors import NotFound
+        with self.assertRaises(NotFound):
+            self.jobs.submit("add", path=self.out("missing"))
+        with self.assertRaises(NotFound):
+            self.jobs.submit("import", path=self.out("missing"))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs FIFOs")
+    def test_import_of_a_fifo_is_refused_without_waiting(self):
+        """A FIFO would hold the import (and a job slot) until something writes to it, uncancellable."""
+        os.mkfifo(self.out("fifo"))
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            self.jobs.submit("import", path=self.out("fifo"))
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            self.b.import_archive(self.out("fifo"))
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            self.b.import_archive(self.tmp.name)  # a directory
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_progress_while_reading_and_cancel(self):
+        top = self.tree()
+        reading, gate = self.held_add()
+        job_id = self.jobs.submit("add", path=top)["id"]
+        self.assertTrue(reading.wait(10))
+        running = self.jobs.get(job_id)
+        self.assertEqual(running["state"], "running")
+        self.assertEqual(running["total_bytes"], 5 + 3 * CHUNK_SIZE + 7 + 2)  # measured before reading
+        self.assertIn("reading", jobs.format_progress({**running, "total_bytes": None}))
+        self.assertEqual(self.jobs.cancel(job_id)["state"], "running")
+        started = time.monotonic()
+        gate.set()  # its next read sees the cancel
+        job = self.finished(job_id, timeout=5)
+        self.assertEqual(job["state"], "cancelled", job)
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_interrupted_add_runs_again_after_restart(self):
+        top = self.tree()
+        reading, gate = self.held_add()
+        job_id = self.jobs.submit("add", path=top, options={"chunker": "fastcdc"})["id"]
+        self.assertTrue(reading.wait(10))
+        stopping = threading.Thread(target=self.b.stop)
+        stopping.start()
+        self.assertTrue(wait_for(lambda: self.jobs._stop_event.is_set()))
+        gate.set()
+        stopping.join(10)
+        self.assertEqual([(r["id"], r["state"], r["path"]) for r in self.saved()], [(job_id, "queued", top)])
+        b2 = self.make_node("b", B_ID)
+        manager = b2.feature("jobs")
+        manager.start()
+        self.assertTrue(wait_for(lambda: manager.get(job_id)["state"] in jobs.FINISHED))
+        job = manager.get(job_id)
+        self.assertEqual((job["state"], job["runs"], job["options"]), ("done", 2, {"chunker": "fastcdc"}), job)
+        self.assertEqual(job["result"], b2.add_path(top, chunker="fastcdc"))
+
+    def test_events_follow_every_job(self):
+        """Every state change of every kind is a "job" event with the job's kind as job_kind, without its result;
+        clearing it is one with removed."""
+        first = self.b.events.last
+        cid = self.b.add_stream(io.BytesIO(b"pin me"))["cid"]
+        pin_id = self.finished(self.jobs.submit("pin", cid)["id"])["id"]
+        add_id = self.finished(self.jobs.submit("add", path=self.tree())["id"])["id"]
+        self.jobs.clear(pin_id)
+
+        def job_events():
+            """The job events since the test began."""
+            return [e for e in self.b.events.since(first, ["job"])["events"]]
+
+        self.assertTrue(wait_for(lambda: len(job_events()) >= 7))
+        by_job: dict = {}
+        for event in job_events():
+            self.assertNotIn("result", event)
+            self.assertEqual(event["kind"], "job")
+            by_job.setdefault(event["id"], []).append(event)
+        for job_id, kind in ((pin_id, "pin"), (add_id, "add")):
+            states = [e["state"] for e in by_job[job_id] if not e.get("removed")]
+            self.assertEqual((states[0], states[-1]), ("queued", "done"), states)
+            self.assertIn("running", states)
+            self.assertTrue(all(e["job_kind"] == kind for e in by_job[job_id]))
+        self.assertTrue(by_job[pin_id][-1]["removed"])
+        done = [e for e in by_job[add_id] if e["state"] == "done"][-1]
+        self.assertEqual(done["done_bytes"], done["total_bytes"])
+
+    def test_progress_events_at_most_once_a_second(self):
+        job = jobs.Job("0123abcd", "add", None, path="/x")
+        told = []
+        job.on_progress = told.append
+        clock = [100.0]
+        with mock.patch.object(jobs.time, "monotonic", lambda: clock[0]):
+            job.begin_run()
+            for _ in range(10):
+                clock[0] += 0.25
+                job.read(1000)
+        self.assertEqual(len(told), 2)  # at 101.0 and 102.0 (begin_run counts as the running event)
+        self.assertEqual(job.event()["done_bytes"], 10_000)
+        self.assertEqual(job.event()["job_kind"], "add")
+
+
+class LocalJobsApiTest(ApiBase):
+    """Add and import jobs through the API, rnfs.Client and the CLI."""
+
+    run_cli = CliTest.run_cli
+
+    def setUp(self):
+        """B's API, with its token where the CLI and rnfs.Client look for it."""
+        super().setUp()
+        self.cli_dir = os.path.join(self.tmp.name, "cli")
+        os.makedirs(self.cli_dir)
+        cli.write_token(cli.token_path(self.cli_dir), self.server.token)
+
+    def test_add_job_through_the_api_equals_post_add(self):
+        top = LocalJobsTest.tree(self)
+        body = {"path": top, "wrap": True, "pin": False, "chunker": "fastcdc"}
+        status, job = self.call("POST", "/api/jobs", {"kind": "add", **body})
+        self.assertEqual(status, 200, job)
+        self.assertEqual(job["options"], {"wrap": True, "pin": False, "chunker": "fastcdc"})
+        job = self.finished(job["id"])
+        status, added = self.call("POST", "/api/add", body)
+        self.assertEqual((status, job["result"]), (200, added))
+        for bad in ({"kind": "add", "path": "relative"}, {"kind": "add", "path": top, "seal_name": "x"},
+                    {"kind": "add", "path": top, "chunker": "x"}, {"kind": "add", "path": top, "target": "x"},
+                    {"kind": "import", "path": top, "output": self.out("o")}):
+            self.assertEqual(self.call("POST", "/api/jobs", bad)[0], 400, bad)
+        self.assertEqual(self.call("POST", "/api/jobs", {"kind": "import", "path": self.out("missing")})[0], 404)
+
+    def test_client_jobs_add_and_import(self):
+        from rnfs.remote import Client
+        top = LocalJobsTest.tree(self)
+        with Client(self.cli_dir, port=self.server.port) as client:
+            job = client.jobs.add(top, pin=False).wait(10)
+            self.assertEqual((job.state, job.kind, job.path, job.options), ("done", "add", top, {"pin": False}))
+            self.assertEqual(job.result["cid"], self.b.add_path(top, only_hash=True)["cid"])
+            self.b.export(job.result["cid"], self.out("archive"))
+            job = client.jobs.import_archive(self.out("archive")).wait(10)
+            self.assertEqual((job.state, job.result["roots"]), ("done", [job.result["roots"][0]]))
+            self.assertIsNone(job.target)
+
+    def test_cli_background_add_and_import(self):
+        top = LocalJobsTest.tree(self)
+        code, out, err = self.run_cli("add", top, "--background", "--wrap")
+        self.assertEqual(code, 0, err)
+        job_id = out.strip()
+        code, out, err = self.run_cli("jobs", "wait", job_id)
+        self.assertEqual((code, out.strip()), (0, self.b.add_path(top, wrap=True)["cid"]), err)
+        self.assertIn("path: " + top, self.run_cli("jobs", "show", job_id)[1])
+        self.assertIn('options: {"wrap": true}', self.run_cli("jobs", "show", job_id)[1])
+        self.b.export(out.strip(), self.out("archive"))
+        code, out, err = self.run_cli("import", self.out("archive"), "--background")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("jobs", "wait", out.strip())
+        self.assertEqual((code, out.strip()), (0, self.b.add_path(top, wrap=True)["cid"]), err)
+        self.assertEqual(self.run_cli("add", "-", "--background")[0], 1)
+        # In the foreground, add and import stay one request each: no job
+        before = len(self.jobs.list())
+        self.assertEqual(self.run_cli("add", top)[0], 0)
+        self.assertEqual(self.run_cli("import", self.out("archive"))[0], 0)
+        self.assertEqual(len(self.jobs.list()), before)
 
 
 if __name__ == "__main__":

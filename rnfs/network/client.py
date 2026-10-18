@@ -44,6 +44,8 @@ class PeerClient:
         self.links = links
         self.config = config
         self.traffic = mesh.Traffic()  # requests and bytes per peer (mesh); the node shares it with the server
+        # Every link opened (shared, ping's, identified) records its round trip, and that the node is up, there
+        links.on_rtt = self.traffic.measured
 
     # Links
 
@@ -160,7 +162,8 @@ class PeerClient:
     # ping
 
     def ping(self, node_id: bytes) -> float | None:
-        """Open a new link to node_id and return its round-trip time in seconds, or None if unreachable."""
+        """Open a new link to node_id and return its round-trip time in seconds, or None if unreachable. The pool
+        records it in traffic as it does for every link (LinkPool.on_rtt)."""
         peer = self.links.open_oneshot(node_id, identify=False)
         if peer is None:
             return None

@@ -33,11 +33,11 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import partial
-from typing import BinaryIO, Callable, Iterator, Literal, Protocol, TypeVar, overload
+from typing import BinaryIO, Callable, Iterator, Literal, NamedTuple, Protocol, TypeVar, overload
 
 import RNS
 
-from rnfs import __version__, denylist, features, fsutil, statedb, winacl
+from rnfs import __version__, denylist, events, features, fsutil, statedb, winacl
 from rnfs.config import LOCK_FILE, Config
 from rnfs.constants import (APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MISSED_ANNOUNCES, MODE_SERVER,
                             PARTIAL_SUFFIX)
@@ -53,7 +53,7 @@ from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, TooL
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
-from rnfs.names import NameManager, parse_name
+from rnfs.names import NameManager, RnsNetwork, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, rates
 from rnfs.network.announces import DhtAnnounceHandler, DhtAnnouncer, parse_mode
@@ -375,6 +375,16 @@ class _StoreParts:
         self.close = close
 
 
+class _PinDetails(NamedTuple):
+    """What pin_ls reads from a pin's stored blocks (RnfsNode._pin_details): None for what they can't tell."""
+
+    kind: str | None  # "file" or "directory"
+    inside: str | None  # a directory's one entry's name, or "(directory: N entries)"
+    sealed: bool | None  # a sealed file
+    entries: int | None  # a directory's entry count
+    size: int | None  # content bytes, as the root block states them
+
+
 class _NamePins:
     """The pins NameManager uses: storage pins that also update what the node provides."""
 
@@ -509,7 +519,7 @@ class RnfsNode:
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
         self.announcer = DhtAnnouncer(self.destination, config)
         self.announce_handler = DhtAnnounceHandler(self._heard_server, self._heard_client, self.routing.is_banned,
-                                                   self.node_id)
+                                                   self.node_id, on_announced=self._announced)
         self.announce_handler.register()
         self.names.start()
         log(f"node {node_name(self.node_id)} running as a DHT {config.dht_mode}"
@@ -546,6 +556,8 @@ class RnfsNode:
         self.config = config
         self.node_id = node_id
         self.client = client
+        # What changed, for local clients (GET /api/events, rnfs.events); first, so every part may publish
+        self.events = events.EventLog()
         self.slow = slow
         self._is_known = is_known
         self.members = config.member_set
@@ -578,6 +590,8 @@ class RnfsNode:
             if removed:
                 log(f"private mode: dropped {plural(removed, 'provider record')} of non-members", LOG_NOTICE)
         self.storage = self._add_store(Storage(config.blocks_dir, config.state_dir, config.max_storage))
+        self.storage.pin_listener = self._pin_event
+        self.storage.cache_listener = self._cache_event
         # Before anything is fetched or provided: the fetcher and the publisher check it through storage.deny
         self.deny = self._add_store(denylist.DenyList(config.state_dir))
         self.storage.deny = self.deny
@@ -588,8 +602,8 @@ class RnfsNode:
         self._not_sealed: OrderedDict[walker.Expect, None] = OrderedDict()
         self._not_sealed_deny: frozenset[bytes] | None = None
         self._not_sealed_lock = threading.Lock()
-        # pin_ls's memo: pinned CID -> (type, name from inside, sealed), for complete pins only (_pin_details)
-        self._pin_memo: dict[Cid, tuple[str | None, str | None, bool | None]] = {}
+        # pin_ls's memo: pinned CID -> its _PinDetails, for complete pins only (_pin_details)
+        self._pin_memo: dict[Cid, _PinDetails] = {}
         self._pin_memo_lock = threading.Lock()
         # The shared folder is written through: nothing to save. Its per-file cache (what the files inside its entries
         # were built as) is saved with the batched stores; the shared folder's close releases it too
@@ -599,6 +613,7 @@ class RnfsNode:
         # Where pins came from, for pin ls (local only). Written through, not durably: a power loss can lose a
         # name, never the pin it names, which is committed durably first; its save writes a name whose write failed
         self.pin_names = self._add_store(PinNames(config.state_dir), batched=False)
+        self.pin_names.prune_labels(self.storage.pinned_cids())
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
                                                make_room=self._make_room))
@@ -608,6 +623,7 @@ class RnfsNode:
                                                    generation=self._provide_generation), batched=False)
         # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
+        self.names.held_listener = self._name_event
         self._add_store(_StoreParts(close=self.names.close), batched=False)
         self.backend = NodeBackend(self)
 
@@ -815,6 +831,25 @@ class RnfsNode:
         if self.routing.answered(node_id):
             self.publisher.wake()  # a CID that found no nodes may now be publishable
 
+    def _pin_event(self, change: str, cids: list[Cid], source: str):
+        """Storage's pin_listener (storage lock held): pins of source added or removed, as a "pin" event; a CID
+        no source pins any more loses its label (pin_names' lock is taken under storage's, never the other way)."""
+        pin_names = getattr(self, "pin_names", None)  # made after storage; prune_labels covers the gap
+        if change == "removed" and pin_names is not None:
+            for cid in cids:
+                if not self.storage.is_pinned(cid):
+                    pin_names.forget_label(cid)
+        self.events.publish("pin", change=change, source=source, **events.cid_fields(cids))
+
+    def _cache_event(self, change: str, cids: list[Cid]):
+        """Storage's cache_listener (storage lock held): cached fetches added or removed, as a "cache" event."""
+        self.events.publish("cache", change=change, **events.cid_fields(cids))
+
+    def _name_event(self, name: bytes, record):
+        """NameManager's held_listener (names lock held): a newer record of a name this node holds (its own, kept,
+        followed or resolved) or watches, as a "name" event."""
+        self.events.publish("name", name=name.hex(), cid=str(record.cid), sequence=record.sequence)
+
     def _heard_server(self, node_id: bytes):
         """A server-mode announce (or path response) from node_id."""
         self._count_heard(node_id, "server")
@@ -834,6 +869,23 @@ class RnfsNode:
         traffic = getattr(self.client, "traffic", None)
         if traffic is not None:
             traffic.heard(node_id, mode)
+
+    def _announced(self, node_id: bytes):
+        """node_id's own announce (not one RNS marks as a path response) arrived: Traffic.announced counts it as a
+        sign it is up, which `rnfs peers` reads its online state from (mesh.online), if it was emitted recently.
+        Attached to a shared instance, path answers come as announces too, and an announce queue can hold one for
+        hours, so only its emission time tells.
+
+        That is the newest emission in node_id's path (RnsNetwork.emitted_time: RNS internal, None if it can't be
+        read, and then the announce doesn't count), which is this announce's: RNS calls announce handlers only for
+        an announce that takes the path, which needs one emitted later than the path's newest (or an expired path:
+        then the newest may be an earlier announce's, which counts only if no later one was). An in-memory read: no
+        disk, unlike the
+        announce cache, which a shared instance's client doesn't write and whose packet hash a path answer passed on
+        as an announce doesn't match."""
+        traffic = getattr(self.client, "traffic", None)
+        if traffic is not None:
+            traffic.announced(node_id, RnsNetwork().emitted_time(node_id))
 
     def _is_member_node(self, node_id: bytes) -> bool:
         """Private mode's routing table admission: node_id's identity is a member."""
@@ -1232,20 +1284,22 @@ class RnfsNode:
 
     def add_path(self, path: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
                  to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
-                 chunker: str | None = None) -> dict:
+                 chunker: str | None = None, progress: Callable[[int], None] | None = None) -> dict:
         """Import a file or directory on this machine, pinned "user" (cache if not pin) unless only_hash.
 
         With to/to_self the file is sealed for those recipients first (seal.py; directories are refused),
-        its name sealed inside unless not seal_name; chunker is "fixed" (default) or "fastcdc".
+        its name sealed inside unless not seal_name; chunker is "fixed" (default) or "fastcdc". progress, if
+        given, is told the bytes read as they are (builder.BuildOptions.progress: an add job's), and may raise to
+        stop the add; blocks stored by then are unreferenced, for the next collection.
         """
         if not os.path.lexists(path):
             raise NotFound(f"no such file or directory: {path}")
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
-        options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
+        options = builder.BuildOptions(chunker, progress=progress)  # ValueError for an unknown chunker, at once
         if only_hash:
             built, warnings = builder.add_path(path, builder.NO_PUT, wrap, options)
         else:
-            options = builder.BuildOptions(options.chunker, self._hash_check())
+            options = builder.BuildOptions(options.chunker, self._hash_check(), progress)
             with self._refusing(), self.storage.protect() as session:
                 with session.writer() as put:
                     if recipients:
@@ -1280,6 +1334,31 @@ class RnfsNode:
             self._added(built)
         return {"cid": str(built.cid), "size": built.size, "warnings": [], **({"sealed": True} if recipients else {})}
 
+    def add_tar(self, stream: BinaryIO, name: str | None = None, only_hash: bool = False, pin: bool = True,
+                chunker: str | None = None) -> dict:
+        """Import the directory a tar stream holds (POST /api/add/stream?format=tar; rnfs/content/tarstream.py's
+        rules and limits, max_output_entries files and directories at most), wrapped as the entry name if given,
+        pinned "user" (cache if not pin) unless only_hash; chunker as for add_path. {"cid", "size", "warnings"}
+        (+ "warnings_total" past MAX_WARNINGS, as get caps them). Reads the stream to its end, where only zeros
+        may follow the tar's own."""
+        from rnfs.content import tarstream
+
+        options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
+        warnings = tarstream.Warnings()
+        max_entries = self.config.max_output_entries
+        if only_hash:
+            built = tarstream.build_tar(stream, builder.NO_PUT, warnings, max_entries, options, name)
+        else:
+            options = builder.BuildOptions(options.chunker, self._hash_check())
+            with self._refusing(), self.storage.protect() as session:
+                with session.writer() as put:
+                    built = tarstream.build_tar(stream, put, warnings, max_entries, options, name)
+                node_content.keep_added(self, built.cid, pin)
+            if pin:
+                self.pin_names.record(built.cid, name or "(tar upload)")
+            self._added(built)
+        return {"cid": str(built.cid), "size": built.size, **warnings.result()}
+
     def block(self, cid: str, for_gateway: bool = False) -> bytes:
         """A CID's own block, fetched if needed and re-verified (the gateway's ?format=raw)."""
         return node_content.block(self, cid, for_gateway)
@@ -1288,6 +1367,20 @@ class RnfsNode:
         """Fetch the target's DAG, then write its archive to start(exact length), the stream to write to (None
         writes nothing: HEAD). The gateway's ?format=archive (rnfs/node_content.py)."""
         return node_content.export_stream(self, target, start, for_gateway)
+
+    def export_chunks(self, target: str, for_gateway: bool = False) -> tuple[dict, Iterator[bytes]]:
+        """(info, chunks): the target's DAG fetched and checked, its archive's {"roots", "blocks", "length"}, and an
+        iterator of the archive's bytes, byte-identical to `rnfs export` (GET /api/export/stream). Close chunks when
+        done, read or not: that ends the fetch."""
+        chunks = node_content.export_chunks(self, target, for_gateway)
+        return next(chunks), chunks
+
+    def get_tar(self, target: str) -> tuple[dict, Iterator[bytes]]:
+        """(info, chunks): the target's DAG fetched and checked, its tar's {"cid", "length", "skipped"}, and an
+        iterator of the tar's bytes (GET /api/get/stream?format=tar; node_content.tar_chunks). Close chunks when
+        done, read or not: that ends the fetch."""
+        chunks = node_content.tar_chunks(self, target)
+        return next(chunks), chunks
 
     @contextmanager
     def _refusing(self) -> Iterator[None]:
@@ -1549,14 +1642,18 @@ class RnfsNode:
         self.publisher.refresh()
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
-        """Pins with their sources, whether they're complete, their type, whether they're sealed files and a
-        local name when one is known.
+        """Pins with their sources, whether they're complete, their type, whether they're sealed files, a local
+        name when one is known, and (rnfs 0.1.7) their label, origin, size, entry count and when added.
 
-        The name is where the pin was added from on this machine (pin_names), the shared-folder entry it
-        came from, or for a stored directory its single entry's name (add --wrap) or its entry count. For a
-        sealed file it is still the local path or the name given to add (this node's own record, for its user):
-        `sealed` tells callers that show pins to others not to show the name or the content. `sealed` is None
-        when it can't be told without fetching (the root or the file's first chunk isn't stored).
+        origin is where the pin was added from on this machine (pin_names) or the shared-folder entry it came
+        from; label the name its user gave it (pin_label), kept apart from origin. name, as before 0.1.7, is the
+        label, else the origin, else for a stored directory its single entry's name (add --wrap) or its entry
+        count as text. For a sealed file origin is still the local path or the name given to add (this node's own
+        record, for its user): `sealed` tells callers that show pins to others not to show the name or the content.
+        `sealed` is None when it can't be told without fetching (the root or the file's first chunk isn't stored).
+        size is the content size the root block states (None until it is stored), entries a directory's entry
+        count (None for a file, or while a large directory's index isn't all stored), added when it was first
+        pinned (None for a pin made before rnfs 0.1.7).
         """
         pins = self.storage.pins()
         self.pin_names.prune(set(pins))
@@ -1570,14 +1667,32 @@ class RnfsNode:
         result = []
         for c, sources in sorted(pins.items(), key=lambda item: str(item[0])):
             complete = self.storage.is_complete(c)
-            kind, inside, sealed = self._pin_details(c, complete)
-            name = self.pin_names.get(c) or (folder_names.get(c) if FOLDER in sources else None) or inside
+            details = self._pin_details(c, complete)
+            origin = self.pin_names.get(c) or (folder_names.get(c) if FOLDER in sources else None)
+            label = self.pin_names.label(c)
             result.append({"cid": str(c), "sources": sorted(sources), "complete": complete,
-                           "type": kind, "sealed": sealed, "name": name})
+                           "type": details.kind, "sealed": details.sealed,
+                           "name": label or origin or details.inside, "label": label, "origin": origin,
+                           "size": details.size, "entries": details.entries, "added": self.storage.pin_added(c)})
         return result
 
-    def _pin_details(self, cid: Cid, complete: bool) -> tuple[str | None, str | None, bool | None]:
-        """(type, name from inside, sealed) of a pin (_pin_shape, _pin_sealed), remembered while it is complete.
+    def pin_label(self, cid: str, label: str | None) -> dict:
+        """Give a pin a label (None or "" clears it), kept apart from where it was added from: its pin_ls entry.
+        NotFound if cid isn't pinned; ValueError for a label pin_names.check_label refuses. A label lasts while
+        the CID stays pinned (by any source)."""
+        parsed = Cid.parse(cid)
+        if not self.storage.is_pinned(parsed):
+            raise NotFound(f"{cid} is not pinned")
+        if self.pin_names.set_label(parsed, label):
+            events.publish(self, "pin", change="label", source=None, label=self.pin_names.label(parsed),
+                           **events.cid_fields([parsed]))
+        listed = self.pin_ls(str(parsed))
+        if not listed:  # released meanwhile
+            raise NotFound(f"{cid} is not pinned")
+        return listed[0]
+
+    def _pin_details(self, cid: Cid, complete: bool) -> "_PinDetails":
+        """A pin's _PinDetails (_pin_shape, _pin_sealed), remembered while it is complete.
 
         They are read from stored blocks, which a complete pin has all of and whose content never changes, so
         they hold for as long as it stays complete; an incomplete pin's are read each time (a block may arrive,
@@ -1589,10 +1704,11 @@ class RnfsNode:
                 known = self._pin_memo.get(cid)
             if known is not None:
                 return known
-        kind, inside = self._pin_shape(cid)
-        details = (kind, inside, self._pin_sealed(cid, kind))
-        # A complete DAG's blocks always tell both; None means a block went while they were read
-        if complete and kind is not None and details[2] is not None:
+        shape = self._pin_shape(cid)
+        details = shape._replace(sealed=self._pin_sealed(cid, shape.kind))
+        # A complete DAG's blocks always tell them all; None means a block went while they were read
+        if complete and details.kind is not None and details.sealed is not None \
+                and (details.kind == "file" or details.entries is not None):
             with self._pin_memo_lock:
                 if len(self._pin_memo) < PIN_MEMO:
                     self._pin_memo[cid] = details
@@ -1609,25 +1725,59 @@ class RnfsNode:
         head = node_content.stored_head(self, str(cid), len(seal.MAGIC), deny=False)
         return None if head is None else seal.is_sealed(head)
 
-    def _pin_shape(self, cid: Cid) -> tuple[str | None, str | None]:
-        """(type, name from inside) of a pin whose root block is stored: "file" or "directory", and for a
-        directory its one entry's name or "(directory: N entries)". (None, None) if the root isn't stored."""
+    def _pin_shape(self, cid: Cid, count: bool = True) -> "_PinDetails":
+        """The _PinDetails of a pin whose root block is stored, but sealed (None): its type ("file" or
+        "directory"), for a directory its one entry's name or "(directory: N entries)" (inside; a large
+        directory's index root, "(directory)" as before 0.1.7) and, if count, its entry count, and its content
+        size. All None if the root isn't stored (or isn't a valid DAG node)."""
+        unknown = _PinDetails(None, None, None, None, None)
+        if cid.is_raw:  # a raw block is its own content: its size is known without reading it
+            size = self.storage.block_size(cid)
+            return unknown if size is None else _PinDetails("file", None, None, None, size)
         block = self.storage.get(cid)
         if block is None:
-            return None, None
-        if cid.is_raw:
-            return "file", None
+            return unknown
         try:
             node = dag.decode(block)
         except InvalidDag:
-            return None, None
+            return unknown
         if isinstance(node, dag.FileNode):
-            return "file", None
+            return _PinDetails("file", None, None, None, node.size)
         if isinstance(node, dag.DirectoryNode):
-            if len(node.entries) == 1:
-                return "directory", node.entries[0].name
-            return "directory", f"(directory: {len(node.entries)} entries)"
-        return "directory", "(directory)"
+            inside = node.entries[0].name if len(node.entries) == 1 else f"(directory: {len(node.entries)} entries)"
+            return _PinDetails("directory", inside, None, len(node.entries), node.size)
+        return _PinDetails("directory", "(directory)", None, self._index_entries(node) if count else None, node.size)
+
+    def _index_entries(self, index: dag.IndexNode) -> int | None:
+        """The entries below a large directory's index node, counted from its stored groups; None if one of its
+        index or group nodes isn't stored (or isn't valid), or if the count would pass max_output_entries. Never
+        fetches. A node the index lists twice is invalid (a valid index never repeats a child), which also stops
+        a few crafted blocks from making the walk grow exponentially; at most max_output_entries nodes are read."""
+        count = 0
+        seen: set[Cid] = set()
+        stack = list(index.child_cids)
+        limit = self.config.max_output_entries
+        while stack:
+            cid = stack.pop()
+            if cid in seen or len(seen) >= limit:
+                return None
+            seen.add(cid)
+            block = self.storage.get(cid)
+            if block is None:
+                return None
+            try:
+                node = dag.decode(block)
+            except InvalidDag:
+                return None
+            if isinstance(node, dag.DirectoryNode):
+                count += len(node.entries)
+                if count > limit:
+                    return None
+            elif isinstance(node, dag.IndexNode):
+                stack.extend(node.child_cids)
+            else:
+                return None
+        return count
 
     def pin_remote(self, node_id: bytes, cid: str, pin: bool) -> bool:
         """Ask node_id to pin (or release our pin of) cid over an identified link; True if accepted."""
@@ -1851,6 +2001,38 @@ class RnfsNode:
         log(f"gc removed {plural(stats['removed_blocks'], 'block')} ({size(stats['freed_bytes'])})", LOG_NOTICE)
         return {"removed_blocks": stats["removed_blocks"], "freed_bytes": stats["freed_bytes"]}
 
+    def cache_ls(self) -> list[dict]:
+        """The cached fetches (downloads not pinned, kept until evicted; section 8), most recently used first:
+        {"cid" (the target), "root", "path" (the names from root to it, [] for a bare CID), "pinned" (the same
+        content is also pinned), "complete", "size" (as its root block states it, None until stored), "type",
+        "provided" (offered to the network: the roots strategy, a complete download for the user)}. One target
+        reached through several paths is listed once per path. Never fetches."""
+        provided = self.publisher.provided()
+        pinned = self.storage.pinned_cids()
+        result = []
+        for root, names, target in reversed(self.storage.cached_fetches()):
+            shape = self._pin_shape(target, count=False)  # the type and size only: no walk of a large directory
+            result.append({"cid": str(target), "root": str(root), "path": list(names), "pinned": target in pinned,
+                           "complete": self.storage.is_complete(target), "type": shape.kind, "size": shape.size,
+                           "provided": target in provided})
+        return result
+
+    def cache_rm(self, cid: str) -> dict:
+        """Evict the cached fetches leading to cid now (as gc does for all of them), deleting the blocks nothing
+        else needs: {"removed_records", "removed_blocks", "freed_bytes"}. A pin of the same content keeps its
+        blocks. NotFound if no cached fetch leads to cid."""
+        parsed = Cid.parse(cid)
+        stats = self.storage.uncache({parsed})
+        if not stats["removed_records"]:
+            raise NotFound(f"{cid} is not in the cache")
+        self.publisher.refresh()
+        self._prune_fetched()
+        self._save_state()
+        log(f"cache rm {parsed} removed {plural(stats['removed_blocks'], 'block')} ({size(stats['freed_bytes'])})",
+            LOG_NOTICE)
+        return {"removed_records": stats["removed_records"], "removed_blocks": stats["removed_blocks"],
+                "freed_bytes": stats["freed_bytes"]}
+
     def verify(self) -> dict:
         """Re-check every stored block against its CID, deleting bad ones."""
         stats = self.storage.verify()
@@ -1942,12 +2124,34 @@ class RnfsNode:
                 raise
         return {"roots": [str(cid) for cid in stats["roots"]], "blocks": stats["blocks"]}
 
-    def import_archive(self, path: str) -> dict:
-        """Import an archive, pinning its complete roots with source "user"."""
+    def import_archive(self, path: str, progress: Callable[[int], None] | None = None) -> dict:
+        """Import an archive on this machine, pinning its complete roots with source "user" (import_stream; progress
+        as there: an import job's). Raises ValueError for anything but a regular file: opened without blocking, so a
+        FIFO can't hold the call (or an import job's slot) waiting for a writer."""
         try:
-            stream = open(path, "rb")
+            fd = os.open(path, os.O_RDONLY | fsutil.O_BINARY | getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError:
             raise NotFound(f"no such file: {path}") from None
+        except IsADirectoryError:
+            raise ValueError(f"{path} is not a regular file") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError(f"{path} is not a regular file")
+            stream = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
+            return self.import_stream(stream, f"archive {os.path.abspath(path)}", progress)
+
+    def import_stream(self, stream: BinaryIO, label: str = "(archive upload)",
+                      progress: Callable[[int], None] | None = None) -> dict:
+        """Import an archive read from stream to its end (POST /api/import/stream), pinning its complete roots with
+        source "user", each recorded in pin_names as label unless it has a name there. progress, if given, is told
+        the bytes read as they are (an import job's) and may raise to stop the import: blocks stored by then stay as
+        unpinned blocks, for the next collection. {"roots", "incomplete", "blocks"}."""
+        stream = builder.counted(stream, progress)
+
         def check(roots: list[Cid]):
             """Refuse the import if a file the roots hold has a denied content hash."""
             if self.deny.hashes:
@@ -1956,10 +2160,10 @@ class RnfsNode:
                     for file in walker.iter_files(walker.root_expect(root), get):
                         self._check_file(file, get)  # a complete root: every block is stored and checked
 
-        with stream, self._refusing():
+        with self._refusing():
             stats = archive.import_archive(stream, self.storage, check=check)
         for root in stats.get("complete", []):
-            self.pin_names.record_if_unknown(root, f"archive {os.path.abspath(path)}")
+            self.pin_names.record_if_unknown(root, label)
         self.publisher.refresh()
         self._enforce_storage()
         return {"roots": [str(cid) for cid in stats["roots"]], "incomplete": [str(cid) for cid in stats["incomplete"]],

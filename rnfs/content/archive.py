@@ -5,7 +5,7 @@ An archive is a msgpack stream: ["rnfs-archive", 1, [root CID, ...]], then [cid,
 every root's DAG, depth-first from each root, each block once. CIDs are binary.
 """
 import struct
-from typing import BinaryIO, Callable
+from typing import BinaryIO, Callable, Iterator
 
 from RNS.vendor import umsgpack
 
@@ -32,12 +32,19 @@ def export_archive(roots: list, get: walker.Get, out: BinaryIO, max_entries: int
     if max_entries is not None:
         for expect in expects:
             walker.count_entries(expect, get, max_entries)
-    out.write(umsgpack.packb([ARCHIVE_MAGIC, ARCHIVE_VERSION, [expect.cid.binary for expect in expects]]))
-    written = 0
-    for block_expect, block in walker.iter_dags(expects, get):  # each block once over every root
-        out.write(umsgpack.packb([block_expect.cid.binary, block]))
+    written = -1  # the header isn't a block
+    for data in archive_chunks(expects, get):
+        out.write(data)
         written += 1
     return {"roots": [expect.cid for expect in expects], "blocks": written}
+
+
+def archive_chunks(expects: list[walker.Expect], get: walker.Get) -> Iterator[bytes]:
+    """The bytes of the archive of expects (at most MAX_ROOTS, checked by the caller) as export_archive writes them:
+    the header, then one record per block, each block once over every root (GET /api/export/stream)."""
+    yield umsgpack.packb([ARCHIVE_MAGIC, ARCHIVE_VERSION, [expect.cid.binary for expect in expects]])
+    for block_expect, block in walker.iter_dags(expects, get):  # each block once over every root
+        yield umsgpack.packb([block_expect.cid.binary, block])
 
 
 def archive_size(roots: list[Cid], blocks) -> int:

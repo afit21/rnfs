@@ -7,7 +7,13 @@ two classes can't drift apart; only lifecycle, how name records are heard, and t
 
 A target is a Cid, `<cid>[/name…]` (whose first part may be a name contact's nick), or an rnfs: URI (section 13):
 a name URI's name is resolved first (persisted, as names.resolve does), and its from= is the from_node of the
-methods taking one. Node IDs are 16 bytes or 32 hex characters; names 16 bytes, 32 hex characters or a Name.
+methods taking one. Node IDs are 16 bytes or 32 hex characters; names 16 bytes, 32 hex characters or a Name, and a
+name contact's nick where the API takes one (resolve, keep, follow); an LXMF recipient 16 bytes, 32 hex characters
+or an LXMF contact's nick.
+
+The features' methods (peers, stats, contacts, names.keep and follow, lxmf) call the feature as its API route does,
+so a Node raises what a Client gets back: NotFound when the feature isn't loaded, ValueError for what it refuses.
+timeout() bounds a Client's requests per thread; a Node, which makes none, only checks its argument.
 
 Callbacks (names.watch, a job's on_progress or watch) run on the instance's event thread, one at a time, in the
 order their events arrived, with no rnfs lock held: whatever hears an event only queues it, coalesced per watch
@@ -15,22 +21,28 @@ order their events arrived, with no rnfs lock held: whatever hears an event only
 delays every other callback of the instance; close() from one doesn't wait for the thread. An exception in a
 callback is logged and dropped. Watched jobs are polled by a thread of their own, which queues a call when a
 job changes (at most every job_poll seconds) and once more when it finishes. Both threads start on first use.
+events.watch's callbacks are the exception to coalescing: each event is one call, in order (an event says what
+changed, not a state), so a callback slower than the events lets them queue up.
 """
 import io
+import itertools
 import os
 import threading
 import time
 import warnings
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from rnfs import ids
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
+from rnfs.events import EVENT_KINDS
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
 from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
-from rnfs.objects import (Added, Collected, DenyState, Entry, Exported, Imported, Info, Pin, Record, Stat, Status,
-                          Verified, Written)
+from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
+                          Exported, Followed, Imported, Info, Kept, LxmfAddress, Message, Outgoing, Peer, Pin, Record,
+                          Sent, Settings, SettingsChange, Stat, Stats, Status, Synced, Uncached, Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
@@ -55,6 +67,46 @@ def name_bytes(name) -> bytes:
     if isinstance(name, Name):
         return name.name
     return bytes.fromhex(node_hex(name))
+
+
+def name_arg(name) -> str:
+    """A name as the API takes it: a string that isn't 32 hex characters as it is (a name contact's nick, which
+    the node checks), anything else (16 bytes, hex, a Name) as 32 hex characters. ValueError for anything else."""
+    if isinstance(name, str) and not ids.HEX16.fullmatch(name):
+        return name
+    return node_hex(name_bytes(name))
+
+
+def hash_arg(value) -> str:
+    """A hash (a node ID, name or LXMF address) as the API takes it: 16 bytes or a Name as hex, a string as it is
+    (32 hex characters, or a contact's nick where one is taken), for the node to check. ValueError otherwise."""
+    if isinstance(value, Name):
+        return value.hex
+    if isinstance(value, (bytes, bytearray)):
+        return node_hex(value)
+    if isinstance(value, str):
+        return value
+    raise ValueError(f"a hash is 16 bytes or 32 hex characters, not {type(value).__name__}")
+
+
+def recipients(to) -> list[str] | None:
+    """Sealing recipients as a list of strings (node IDs, identity hashes or contact nicks, for the node to
+    check), None for none. ValueError for anything but a list or tuple of strings, as the API refuses it."""
+    if not to:
+        return None
+    if isinstance(to, str) or not isinstance(to, (list, tuple)) or not all(isinstance(item, str) for item in to):
+        raise ValueError("to must be a list of recipients")
+    return list(to)
+
+
+def _body(source, method: str):
+    """What a stream method sends: bytes-like data as bytes (a memoryview's len() counts its items, not its
+    bytes), a binary file as it is. ValueError for anything else."""
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        return bytes(source)
+    if hasattr(source, "read"):
+        return source
+    raise ValueError(f"{method}() takes bytes or a binary file, not {type(source).__name__}")
 
 
 def _abspath(path) -> str:
@@ -177,6 +229,73 @@ class _NameWatch:
         self.callback(record)
 
 
+class _EventWatch:
+    """One events.watch: its kinds (None: all), its callback, and its position: the node's run (epoch) and the
+    last sequence delivered or skipped. Events heard before the baseline is known wait in pending, then only those
+    after it are delivered; a "lost" marker (kind "lost", seq the sequence the source resumes after) moves the
+    position there and is delivered unless the watch began after it."""
+
+    def __init__(self, kinds: frozenset | None, callback):
+        """A watch calling callback, not ready until begin()."""
+        self.kinds = kinds
+        self.callback = callback
+        # Held while a delivery is queued (deliver: _Events.post, whose condition is innermost), so deliveries are
+        # queued in the order the position passes them, whichever thread hears them; never held calling out else
+        self.lock = threading.Lock()
+        self.ready = False
+        self.epoch: str | None = None
+        self.after = 0
+        self.pending: list[tuple[str, dict]] = []
+        self.handle: Watch | None = None
+
+    def begin(self, after: int, epoch: str, deliver) -> list[dict]:
+        """Set the position the watch begins at and deliver(event) the events heard meanwhile that are after it,
+        in order, before any heard later; those delivered."""
+        with self.lock:
+            self.ready, self.after, self.epoch = True, after, epoch
+            pending, self.pending = self.pending, []
+            delivered = [event for run, event in pending if self._take(run, event)]
+            for event in delivered:
+                deliver(event)
+            return delivered
+
+    def offer(self, epoch: str, event: dict, deliver) -> bool:
+        """deliver(event) of run epoch if the watch wants it (kept for begin() while the baseline isn't known);
+        whether it did."""
+        with self.lock:
+            if not self.ready:
+                self.pending.append((epoch, event))
+                return False
+            if not self._take(epoch, event):
+                return False
+            deliver(event)
+            return True
+
+    def _take(self, epoch: str, event: dict) -> bool:
+        """Whether to deliver event, moving the position past it (lock held, ready)."""
+        if event["kind"] == "lost":
+            if epoch == self.epoch and event["seq"] <= self.after:
+                return False  # the watch began after what was missed
+            self.epoch, self.after = epoch, event["seq"]
+            return True
+        if epoch != self.epoch or event["seq"] <= self.after:
+            return False
+        self.after = event["seq"]
+        return self.kinds is None or event["kind"] in self.kinds
+
+
+def event_kinds(kinds) -> list[str] | None:
+    """kinds (a kind, an iterable of them, or None) as a list, None for every kind (also for none given).
+    ValueError for a kind the node doesn't publish (rnfs.events.EVENT_KINDS), as GET /api/events words it."""
+    if kinds is None:
+        return None
+    kinds = [kinds] if isinstance(kinds, str) else list(kinds)
+    for kind in kinds:
+        if kind not in EVENT_KINDS:
+            raise ValueError(f"unknown event kind {kind!r}; known: {', '.join(EVENT_KINDS)}")
+    return kinds or None
+
+
 class _JobPoller:
     """The thread polling watched jobs, queueing each watch's callback when its job changes and when it ends."""
 
@@ -290,10 +409,15 @@ class Rnfs:
         self._jobs = _JobPoller(self, self.jobs_thread, self.job_poll)
         self._watch_lock = threading.Lock()  # taken after the names lock (records are heard under it), never before
         self._name_watches: dict[bytes, list[_NameWatch]] = {}
+        self._event_watches: dict[int, _EventWatch] = {}  # under _watch_lock
+        self._event_keys = itertools.count()  # each event watch's key, and each delivery's (never coalesced)
         self._node_id: bytes | None = None
         self.names = Names(self)
         self.jobs = Jobs(self)
         self.deny = Deny(self)
+        self.contacts = Contacts(self)
+        self.lxmf = Lxmf(self)
+        self.events = Events(self)
 
     # Lifecycle
 
@@ -313,9 +437,13 @@ class Rnfs:
         with self._watch_lock:
             watches = [watch for each in self._name_watches.values() for watch in each]
             self._name_watches.clear()
+            event_watches = list(self._event_watches.values())
+            self._event_watches.clear()
         for watch in watches:
             watch.handle.active = False
             self._unwatch_name(watch.name)
+        for watch in event_watches:
+            watch.handle.active = False
         self._close()
 
     def _close(self):
@@ -341,6 +469,60 @@ class Rnfs:
         """Wait until the node's first join of the DHT has finished; True if it has (a daemon's has)."""
         self._check()
         return self._backend.wait_joined(timeout)
+
+    def timeout(self, seconds: float | None):
+        """A context manager bounding each request a Client makes for this thread inside it to seconds (None: no
+        bound), instead of the timeout the Client was made with: `with client.timeout(5): client.peers()`.
+
+        Thread-local: other threads, and the event, job-watch and name-watch threads, keep the Client's. A long
+        poll in it (Job.wait) waits within it, as within the Client's; a request outlasting it raises
+        ConnectionFailed. Nests, the outer one back on exit. A Node makes no requests, so it only checks seconds:
+        code using it runs unchanged on either class. ValueError unless None or a positive number."""
+        return self._backend.timeout(seconds)
+
+    # The node: what it offers, the daemon, settings
+
+    def capabilities(self) -> Capabilities:
+        """What the node offers: its version, capabilities (has("events"), ...), API routes, features loaded,
+        event kinds and error codes. A daemon before 0.1.7 can't say: an empty Capabilities, every has() False. A
+        Node's are a daemon's but "shutdown" and "daemon_json", which it can't do; its routes are the API's, whose
+        operations it offers through its methods."""
+        self._check()
+        return Capabilities.from_dict(self._backend.capabilities())
+
+    def shutdown(self, wait: float | None = None) -> bool:
+        """Stop the daemon (a Client), as SIGTERM does; this Client stays usable once a daemon runs again. With
+        wait, True once its API stops answering within wait seconds (False: still answering); without, True once
+        it agreed. Raises Unsupported: from a Node (close() stops it), or a daemon that can't be stopped this way;
+        NoSuchEndpoint (a NotFound) from a daemon before 0.1.7."""
+        self._check()
+        return self._backend.shutdown(wait)
+
+    def daemon_info(self) -> dict | None:
+        """What the running daemon wrote about itself in its rnfs dir (daemon.json: "pid", "api_port",
+        "gateway_port", "version", "started", "rnfs_dir", "reticulum_config", "shared_instance", "node_id"), or None:
+        none there (a daemon before 0.1.7), it can't be trusted or its process has ended; always None for a Node,
+        which is no daemon. Read from the file, not asked of the daemon."""
+        self._check()
+        return self._backend.daemon_info()
+
+    def config(self) -> Settings:
+        """The node's settings: each with its schema, running value, rnfs.toml's, and whether the command line (a
+        Node's settings) overrides it or a restart would change it; rnfs.toml's path and why a restart would refuse
+        it, if it would. Raises NotFound without the settings feature (a daemon before 0.1.7: NoSuchEndpoint)."""
+        self._check()
+        return Settings.from_dict(self._backend.config())
+
+    def config_set(self, settings: Mapping) -> SettingsChange:
+        """Set settings ({name: value, None: removed from rnfs.toml, so back to the default}) in the node's
+        rnfs.toml, applying at once those that apply live and that the command line doesn't override. Nothing is
+        written unless the whole result is valid. Raises ValueError (unknown, refused or malformed settings), Busy
+        (rnfs.toml changed meanwhile: try again), NotFound without the settings feature; a Node OSError, a Client
+        ServerError, if rnfs.toml can't be written."""
+        self._check()
+        if not isinstance(settings, Mapping):
+            raise ValueError("settings must be a dict of setting names and values (None: back to the default)")
+        return SettingsChange.from_dict(self._backend.config_set(dict(settings)))
 
     # Targets
 
@@ -393,9 +575,10 @@ class Rnfs:
         ValueError, NotFound (no such path), Denied (a file's hash is denied), StorageFull, OSError.
         """
         self._check()
+        to, wrap, pin, only_hash, to_self, seal_name = (recipients(to), bool(wrap), bool(pin), bool(only_hash),
+                                                       bool(to_self), bool(seal_name))
         sealing = bool(to or to_self)
-        options = {"only_hash": only_hash, "pin": pin, "to": list(to) if to else None, "to_self": to_self,
-                   "chunker": chunker}
+        options = {"only_hash": only_hash, "pin": pin, "to": to, "to_self": to_self, "chunker": chunker}
         if isinstance(source, (str, os.PathLike)):
             if name is not None:
                 raise ValueError("name is for adding data; a path is added under its own name")
@@ -496,6 +679,12 @@ class Rnfs:
         self._check()
         return [Pin.from_dict(pin) for pin in self._backend.pin_ls(str(cid) if cid is not None else None)]
 
+    def label_pin(self, cid, label: str | None) -> Pin:
+        """Give cid's pin a label (None or "" clears it), kept apart from where it was added from and lasting while
+        it stays pinned; the pin. Raises NotFound (not pinned), ValueError (a label refused)."""
+        self._check()
+        return Pin.from_dict(self._backend.pin_label(str(cid), label))
+
     def pin_remote(self, node_id, cid, pin: bool = True) -> bool:
         """Ask node_id to pin (or release this node's pin of) cid; True if it accepted."""
         self._check()
@@ -511,6 +700,18 @@ class Rnfs:
         self._check()
         return Verified.from_dict(self._backend.verify())
 
+    def cache(self) -> list[Cached]:
+        """The cached fetches (downloads not pinned, kept until evicted), most recently used first. Never
+        fetches."""
+        self._check()
+        return [Cached.from_dict(entry) for entry in self._backend.cache_ls()]
+
+    def uncache(self, cid) -> Uncached:
+        """Evict the cached fetches leading to cid now, deleting the blocks nothing else needs (a pin of the same
+        content keeps its own). Raises NotFound (no cached fetch leads to cid), ValueError."""
+        self._check()
+        return Uncached.from_dict(self._backend.cache_rm(str(cid)))
+
     # Network
 
     def providers(self, cid) -> list[bytes]:
@@ -522,6 +723,19 @@ class Rnfs:
         """Round-trip seconds of a new link to node_id, or None if it can't be reached."""
         self._check()
         return self._backend.ping(node_hex(node_id))
+
+    def peers(self) -> list[Peer]:
+        """Every node this one knows (in its routing table, with a link open, or counted in its traffic), nearest
+        first, with its path, link and traffic since the node started. Raises NotFound without the peers
+        feature."""
+        self._check()
+        return [Peer.from_dict(peer) for peer in self._backend.peers()]
+
+    def stats(self) -> Stats:
+        """The node's traffic since it started: totals, refusals, per interface, the upload budget left. Raises
+        NotFound without the peers feature."""
+        self._check()
+        return Stats.from_dict(self._backend.stats())
 
     # Archives
 
@@ -536,6 +750,38 @@ class Rnfs:
         StorageFull, ValueError, OSError."""
         self._check()
         return Imported.from_dict(self._backend.import_archive(_abspath(path)))
+
+    # Streams: tars and archives through the program, for files the daemon can't open (or a Node's app has
+    # in memory). A stream out is sent once iterated, as cat's, its target's whole DAG fetched first
+
+    def add_tar(self, source, *, name: str | None = None, pin: bool = True, only_hash: bool = False,
+                chunker: str | None = None) -> Added:
+        """Add the directory a tar holds (bytes, or a binary file read up to the tar's end): its regular files
+        and directories, the rest skipped with a warning; wrapped as the entry name if given, pinned "user" unless
+        pin is False (evictable cache) or only_hash (nothing stored); chunker as add's. Raises ValueError (a
+        malformed tar, an unknown chunker), Denied (a file's hash), TooLarge (max_output_entries), StorageFull."""
+        self._check()
+        return Added.from_dict(self._backend.add_tar(_body(source, "add_tar"), name or None, pin, only_hash, chunker))
+
+    def get_tar(self, target):
+        """An iterator of target (a file or directory) as a tar, files as stored (a sealed file sealed); entries
+        whose names are unsafe in a tar are left out. The whole DAG is fetched first (max_download_size,
+        max_output_entries), once iterated; close() it to stop early. Raises the fetch errors, ValueError,
+        possibly only once iterated."""
+        self._check()
+        return self._backend.get_tar(self._target(target)[0])
+
+    def export_stream(self, target):
+        """An iterator of target's archive, byte for byte what export() writes, its whole DAG fetched first once
+        iterated; close() it to stop early. Raises the fetch errors, ValueError, possibly only once iterated."""
+        self._check()
+        return self._backend.export_stream(self._target(target)[0])
+
+    def import_stream(self, source) -> Imported:
+        """Import an archive (bytes, or a binary file read to its end), as import_archive: its complete roots
+        pinned "user". Raises InvalidDag, Denied, StorageFull, ValueError."""
+        self._check()
+        return Imported.from_dict(self._backend.import_stream(_body(source, "import_stream")))
 
     # Name watches (Names.watch)
 
@@ -602,6 +848,65 @@ class Rnfs:
     def _baseline(self, name: bytes) -> int | None:
         """The sequence of name's record held now, or None (subclasses)."""
         return None
+
+    # Event watches (Events.watch)
+
+    def _watch_events(self, kinds: frozenset | None, callback) -> Watch:
+        """Call callback(event) for each event of kinds (None: every kind) published from now on. The watch is
+        registered before its baseline is asked for, so whatever is heard meanwhile waits in it, not lost."""
+        self._check()
+        key = next(self._event_keys)
+        watch = _EventWatch(kinds, callback)
+        watch.handle = Watch(lambda: self._end_event_watch(key))
+        self._events.start()
+        with self._watch_lock:
+            self._event_watches[key] = watch
+        try:
+            after, epoch = self._event_baseline()
+        except BaseException:
+            watch.handle.cancel()
+            raise
+        watch.begin(after, epoch, lambda event: self._deliver_event(watch, event))
+        return watch.handle
+
+    def _end_event_watch(self, key: int):
+        """Forget a cancelled event watch."""
+        with self._watch_lock:
+            self._event_watches.pop(key, None)
+
+    def _event_watch_count(self) -> int:
+        """How many event watches there are (begun or not)."""
+        with self._watch_lock:
+            return len(self._event_watches)
+
+    def _events_heard(self, epoch: str, events: list[dict]):
+        """Events of the node's run epoch were heard, in order: queue each for every watch wanting it (any
+        thread; never blocks)."""
+        with self._watch_lock:
+            watches = list(self._event_watches.values())
+        for watch in watches:
+            for event in events:
+                watch.offer(epoch, event, lambda event, watch=watch: self._deliver_event(watch, event))
+
+    def _events_lost(self, next_seq: int, epoch: str):
+        """Events up to next_seq were missed (the watcher fell behind, or the node's run is now epoch): queue the
+        "lost" marker for every watch whose position is before it."""
+        self._events_heard(epoch, [{"seq": next_seq, "kind": "lost", "time": None, "epoch": epoch}])
+
+    def _deliver_event(self, watch: "_EventWatch", event: dict):
+        """Queue watch's callback with event, under a key of its own: events are never coalesced."""
+        value = Event.from_dict(event)
+
+        def call():
+            """The app's callback, unless cancelled since."""
+            if watch.handle.active:
+                watch.callback(value)
+        self._events.post(("event", next(self._event_keys)), call)
+
+    def _event_baseline(self) -> tuple[int, str]:
+        """(the sequence of the last event published, the run's epoch) now, the event source started if needed
+        (subclasses)."""
+        raise NotImplementedError
 
 
 class _FileReader(io.RawIOBase):
@@ -829,8 +1134,7 @@ class Names:
         """The newest record of name (16 bytes, 32 hex characters, a Name or a name contact's nick), after
         asking the network; persisted, so it never goes back. Raises NotFound (unresolved), ValueError."""
         self._owner._check()
-        text = name if isinstance(name, str) and not ids.HEX16.fullmatch(name) else node_hex(name_bytes(name))
-        return Record.from_dict(self._owner._backend.name_resolve(text))
+        return Record.from_dict(self._owner._backend.name_resolve(name_arg(name)))
 
     def watch(self, name, callback) -> Watch:
         """Call callback(record) on the event thread for each record of name (16 bytes, 32 hex characters or a
@@ -839,20 +1143,62 @@ class Names:
         daemon that can't watch names."""
         return self._owner._watch_name(name_bytes(name), callback)
 
+    # Keepers and follow (rnfs/features/keepers.py, follow.py). After list(), so their annotations name the
+    # builtin through strings
+
+    def keep(self, name) -> Kept:
+        """Keep name (16 bytes, 32 hex characters, a Name or a name contact's nick): hold and serve its signed
+        record so it stays resolvable while its owner is offline (section 9), asking keepers for it in the
+        background if none is held. Raises ValueError (a malformed name or unknown nick, keep_max_names reached),
+        NotFound without the keepers feature."""
+        self._owner._check()
+        return Kept.from_dict(self._owner._backend.name_keep(name_arg(name)))
+
+    def unkeep(self, name):
+        """Stop keeping name for the user (a name followed stays kept for that). Raises NotFound (not kept by the
+        user, or no keepers feature), ValueError."""
+        self._owner._check()
+        self._owner._backend.name_unkeep(name_arg(name))
+
+    def kept(self) -> "list[Kept]":
+        """Every name kept, whatever for, with the record held."""
+        self._owner._check()
+        return [Kept.from_dict(entry) for entry in self._owner._backend.name_kept()]
+
+    def follow(self, name) -> Followed:
+        """Follow name (as keep takes it): keep it and keep its latest target pinned, fetched in the background as
+        the name moves (within follow_quota). Raises ValueError (as keep), NotFound without the follow feature."""
+        self._owner._check()
+        return Followed.from_dict(self._owner._backend.name_follow(name_arg(name)))
+
+    def unfollow(self, name):
+        """Stop following name, releasing its pin. Raises NotFound (not followed, or no follow feature),
+        ValueError."""
+        self._owner._check()
+        self._owner._backend.name_unfollow(name_arg(name))
+
+    def following(self) -> "list[Followed]":
+        """Every name followed, with the target pinned for it and what its last check did."""
+        self._owner._check()
+        return [Followed.from_dict(entry) for entry in self._owner._backend.name_following()]
+
 
 @dataclass(frozen=True)
 class Job:
-    """A background transfer (get, pin or export) the node runs, persists and resumes after a restart: its
-    record as of the last refresh(), wait() or callback. done is True once it has finished (state "done",
-    "failed" or "cancelled"); result is what the matching call returns, error why it failed."""
+    """A background transfer (get, pin, export, add or import) the node runs, persists and resumes after a restart:
+    its record as of the last refresh(), wait() or callback. done is True once it has finished (state "done",
+    "failed" or "cancelled"); result is what the matching call returns, error why it failed. An add or import job
+    has a path (and an add its options) instead of a target."""
 
     id: str
     kind: str
-    target: str
+    target: str | None
     output: str | None = None
     from_node: bytes | None = None
     sealed_name: bool = False
     fallback_dht: bool = False
+    path: str | None = None
+    options: dict | None = None
     state: str = "queued"
     created: float | None = None
     started: float | None = None
@@ -869,7 +1215,8 @@ class Job:
     eta: float | None = None
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
-    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "state", "created", "started",
+    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "state", "created",
+              "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
               "downloaded_bytes", "rate", "eta")
 
@@ -941,10 +1288,31 @@ class Jobs:
         """Write an archive of target to output (which must not exist), as a job."""
         return self._submit("export", target, _abspath(output), None, on_progress)
 
+    def add(self, path, *, wrap: bool = False, pin: bool = True, only_hash: bool = False,
+            to: list[str] | None = None, to_self: bool = False, seal_name: bool = True, chunker: str | None = None,
+            on_progress=None) -> Job:
+        """Add a file or directory on the node's machine as a job: add()'s options for a path, its result add()'s
+        Added as a dict; progress counts the bytes read of the size measured first. An interrupted add runs again
+        from the start (adding is idempotent). Raises NotFound (no such path), ValueError (an option), Busy."""
+        # Flags as bools and recipients checked here, so both classes refuse alike (a Client's JSON would carry
+        # wrap=1 as 1, which the daemon takes, while a Node's job refuses it)
+        options = {"wrap": True if wrap else None, "pin": None if pin else False,
+                   "only_hash": True if only_hash else None, "to": recipients(to),
+                   "to_self": True if to_self else None, "seal_name": None if seal_name else False,
+                   "chunker": chunker}
+        return self._submit("add", None, None, None, on_progress, path=_abspath(path),
+                            options={name: value for name, value in options.items() if value is not None} or None)
+
+    def import_archive(self, path, *, on_progress=None) -> Job:
+        """Import an archive on the node's machine as a job (import_archive()'s result as a dict); progress counts
+        the archive's bytes read. Raises NotFound (no such file), Busy."""
+        return self._submit("import", None, None, None, on_progress, path=_abspath(path))
+
     def _submit(self, kind: str, target, output: str | None, from_node, on_progress, **flags) -> Job:
-        """Queue a job; with on_progress, watched from the start."""
+        """Queue a job (target None for add and import, which take path= instead); with on_progress, watched from
+        the start."""
         self._owner._check()
-        text, hint = self._owner._target(target)
+        text, hint = self._owner._target(target) if target is not None else (None, None)
         from_node = self._owner._from(from_node, hint) if kind == "get" else None
         job = Job.from_dict(self._owner._backend.submit_job(kind, text, output, from_node, **flags), self._owner)
         if on_progress is not None:
@@ -995,3 +1363,182 @@ class Deny:
         """The local entries, and each deny_lists source with its state."""
         self._owner._check()
         return DenyState.from_dict(self._owner._backend.deny())
+
+
+class Contacts:
+    """A node's address book (Rnfs.contacts; rnfs/features/contacts.py): nicks for names, nodes and LXMF
+    addresses, taken wherever the node takes one of those (a name contact's nick also starts a target). A nick is
+    1-32 lowercase letters, digits, '-', '_' or '.', starting with a letter or digit. Every method raises NotFound
+    without the contacts feature."""
+
+    def __init__(self, owner: Rnfs):
+        """The address book of owner."""
+        self._owner = owner
+
+    def get(self, nick: str) -> Contact:
+        """The contact called nick. Raises NotFound (none), ValueError (not a nick)."""
+        self._owner._check()
+        return Contact.from_dict(self._owner._backend.contact_get(nick))
+
+    def add(self, nick: str, id, kind: str | None = None) -> Contact:
+        """Add or replace the contact nick for id (16 bytes, 32 hex characters or a Name) of kind "name", "node"
+        or "lxmf"; None has the node tell what id is (one of its names or a name it knows, a node it knows, an
+        RNS destination it has heard). Raises ValueError (nick, id or kind invalid, a kind it can't tell, the
+        address book full)."""
+        self._owner._check()
+        return Contact.from_dict(self._owner._backend.contact_add(nick, hash_arg(id), kind))
+
+    def remove(self, nick: str):
+        """Delete the contact nick. Raises NotFound (none), ValueError (not a nick)."""
+        self._owner._check()
+        self._owner._backend.contact_rm(nick)
+
+    # After the methods above, whose annotations name the builtin list
+    def list(self) -> list[Contact]:
+        """Every contact, by nick."""
+        self._owner._check()
+        return [Contact.from_dict(contact) for contact in self._owner._backend.contacts()]
+
+
+@dataclass(frozen=True)
+class Fetched:
+    """One link fetched by Lxmf.get: its target (`<cid>[/path]`, a name link's name resolved) and output path;
+    the Job fetching it (a Node's and a daemon's jobs feature runs the fetch as a job) or, fetched in the call, its
+    CID; warnings (a name link fetched by the CID it was sent with), and error if it failed after an earlier link
+    had started (the first link's failure is raised instead)."""
+
+    target: str
+    output: str
+    job: Job | None = None
+    cid: Cid | None = None
+    warnings: tuple[str, ...] = ()
+    error: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict, owner: Rnfs | None = None) -> "Fetched":
+        """From the API's form: {"target", "output", "job" | "cid", "warnings"?, "error"?}."""
+        job, cid = data.get("job"), data.get("cid")
+        return cls(data["target"], data["output"], Job.from_dict(job, owner) if job else None,
+                   Cid.parse(cid) if cid else None, tuple(data.get("warnings") or ()), data.get("error"))
+
+    def to_dict(self) -> dict:
+        """The API's form, every key present (None where the node leaves one out)."""
+        return {"target": self.target, "output": self.output, "job": self.job.to_dict() if self.job else None,
+                "cid": str(self.cid) if self.cid else None, "warnings": list(self.warnings), "error": self.error}
+
+
+class Lxmf:
+    """A node's LXMF messaging (Rnfs.lxmf; rnfs/features/lxmf.py): rnfs links sent to and received from LXMF
+    addresses (Sideband, NomadNet, MeshChat, other rnfs nodes). A Node runs it only with settings
+    {"lxmf_enabled": True}; while it is off, address, send and sync raise ValueError saying why (inbox and outbox
+    list what is stored). Every method raises NotFound without the lxmf feature."""
+
+    def __init__(self, owner: Rnfs):
+        """The LXMF messaging of owner."""
+        self._owner = owner
+
+    def address(self) -> LxmfAddress:
+        """This node's LXMF address and display name, the propagation node set and the nearest one heard."""
+        self._owner._check()
+        return LxmfAddress.from_dict(self._owner._backend.lxmf_address())
+
+    def send(self, to, target, message: str | None = None, *, propagate: bool = False,
+             nearest: bool = False) -> Sent:
+        """Send a link to target (a Cid, `<cid>[/path]`, a name contact's nick path or an rnfs: URI, a name URI
+        sent as a name link that follows the name), with message as its text, to to (an LXMF address: 16 bytes
+        or 32 hex characters; or an LXMF contact's nick). Direct unless propagate (through the propagation node;
+        nearest: without lxmf_propagation_node set, the nearest heard); a direct message that fails is sent again
+        through the propagation node, if one is set. Returns once queued: outbox() says how it went. Raises
+        ValueError (LXMF off, recipient or target invalid, no propagation node), NotFound (no announce heard
+        from the recipient yet: a path request was sent, try again shortly)."""
+        self._owner._check()
+        if isinstance(target, Cid):
+            target = str(target)
+        elif not isinstance(target, str):
+            raise ValueError(f"a target is a Cid, <cid>[/path] or an rnfs: URI, not {type(target).__name__}")
+        return Sent.from_dict(self._owner._backend.lxmf_send(hash_arg(to), target, message, bool(propagate),
+                                                             bool(nearest)))
+
+    def inbox(self) -> list[Message]:
+        """The messages received with rnfs links, oldest first."""
+        self._owner._check()
+        return [Message.from_dict(entry) for entry in self._owner._backend.lxmf_inbox()]
+
+    def get(self, id: int, *, link: int | None = None, output=None, directory=None,
+            use_sent_cid: bool = False) -> list[Fetched]:
+        """Fetch the links of inbox message id (only link, 1-based, if given) and write each to output (one
+        link; must not exist) or into directory under its last path name (the root CID if that name is unsafe:
+        the sender chose it), asking the sender's node first, then the DHT. Each fetch is a job (Fetched.job).
+        A name link whose name can't be resolved raises NotFound before anything starts, unless use_sent_cid:
+        then the CID it was sent with is fetched (nothing ties it to the name), with a warning. Raises NotFound (no
+        such message), ValueError (id or link invalid, neither or a clashing output)."""
+        self._owner._check()
+        results = self._owner._backend.lxmf_inbox_get(
+            id, link, _abspath(output) if output is not None else None,
+            _abspath(directory) if directory is not None else None, bool(use_sent_cid))
+        return [Fetched.from_dict(result, self._owner) for result in results]
+
+    def remove(self, id: int) -> int:
+        """Remove inbox message id, releasing the pins its links were auto-fetched under; 1. Raises NotFound (no
+        such message), ValueError."""
+        self._owner._check()
+        return self._owner._backend.lxmf_inbox_rm(id, False)
+
+    def remove_all(self) -> int:
+        """Remove every inbox message, releasing their auto-fetched pins; how many."""
+        self._owner._check()
+        return self._owner._backend.lxmf_inbox_rm(None, True)
+
+    def outbox(self) -> list[Outgoing]:
+        """The messages sent, oldest first, with their delivery state."""
+        self._owner._check()
+        return [Outgoing.from_dict(entry) for entry in self._owner._backend.lxmf_outbox()]
+
+    def sync(self, nearest: bool = False) -> Synced:
+        """Start downloading the messages waiting at the propagation node (nearest: without lxmf_propagation_node
+        set, the nearest heard). Raises ValueError (LXMF off)."""
+        self._owner._check()
+        return Synced.from_dict(self._owner._backend.lxmf_sync(bool(nearest)))
+
+
+def _whole(value, name: str, none: bool = False) -> int | None:
+    """value if it is a whole number of at least 0 (or None, if none); ValueError otherwise, as the API's
+    parse_int refuses it."""
+    if value is None and none:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+class Events:
+    """What changes on a node (Rnfs.events; rnfs/events.py; design.md, "Events"): jobs, pins, the cache, the LXMF
+    boxes, names and peers, each an Event, so an app follows them instead of polling every list. A Node hears its
+    own as they are published; a Client long-polls GET /api/events. A daemon before 0.1.7 has no events:
+    NoSuchEndpoint (a NotFound)."""
+
+    def __init__(self, owner: Rnfs):
+        """The events of owner."""
+        self._owner = owner
+
+    def watch(self, callback, kinds=None) -> Watch:
+        """Call callback(event) on the event thread for each event of kinds (a kind or several; None: all)
+        published from now on, in order, one call each. If events were missed (a Client fell more than the node's
+        1024 kept events behind, or the daemon restarted), callback gets an Event of kind "lost" (event.lost) in
+        their place: read again what the app shows. A Client polls on a thread of its own
+        (rnfs-client-event-watch), within its timeout as the name poller does. Raises ValueError (an unknown
+        kind); a Client NoSuchEndpoint from a daemon without events."""
+        return self._owner._watch_events(frozenset(kinds) if (kinds := event_kinds(kinds)) else None, callback)
+
+    def since(self, after: int | None = None, kinds=None, wait: int = 0, epoch: str | None = None) -> EventBatch:
+        """The events after sequence after (of kinds, if given) as soon as there is one, or none after wait whole
+        seconds (at most 30; a Client's within its timeout, as Job.wait's). after None answers at once with only
+        the next to ask after. Pass back the batch's next and epoch: lost then says events were missed (the
+        node's run changed, or they are no longer held), and events holds every one held. Raises ValueError; a
+        Client NoSuchEndpoint from a daemon without events, Busy while 8 other polls wait."""
+        self._owner._check()
+        kinds = event_kinds(kinds)
+        # epoch "" is no epoch, as the API reads an empty parameter (a Node's log would call it another run)
+        data = self._owner._backend.events_since(_whole(after, "after", none=True), kinds, _whole(wait, "wait"),
+                                                 epoch or None)
+        return EventBatch.from_dict(data)

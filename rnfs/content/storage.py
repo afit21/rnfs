@@ -23,9 +23,11 @@ eviction, gc and the size queries read the DAG nodes they will walk beforehand (
 (or counting) under the lock, where a DAG memoised as complete is taken whole rather than walked again.
 """
 import itertools
+import math
 import os
 import shutil
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -277,7 +279,16 @@ class Storage:
         self._sizes: dict[Cid, int] = dict(self.blocks.scan())
         self._used = sum(self._sizes.values())
         self._pins: dict[Cid, set[str]] = {}
+        # When each pinned CID was first pinned by any source (Unix time; pin_times); one pinned before rnfs 0.1.7
+        # has none
+        self._added: dict[Cid, float] = {}
         self._pinned: frozenset[Cid] | None = None  # pinned_cids(), built when asked; None again once pins change
+        # Called as pin_listener(change, cids, source) once pins of source were added ("added") or released
+        # ("removed") and saved, and as cache_listener(change, cids) with the targets of cache records added
+        # ("added"), dropped ("removed") or retargeted (both), each with the lock held: the node's "pin" and "cache"
+        # events. Must only queue (rnfs.events)
+        self.pin_listener = None
+        self.cache_listener = None
         self._cache: OrderedDict[CacheKey, Cid] = OrderedDict()  # oldest first
         self._sessions: list[Session] = []
         self._links: dict[Cid, tuple[Cid, ...]] = {}  # children of stored DAG nodes; CIDs never change content
@@ -320,6 +331,18 @@ class Storage:
                 bad_pins.append((binary, source))
                 continue
             self._pins.setdefault(cid, set()).add(source)
+        stale_times = []
+        for binary, added in self._db.query("SELECT cid, added FROM pin_times"):
+            try:
+                cid = Cid.from_bytes(binary)
+            except (ValueError, TypeError):
+                cid = None
+            # A time without its pin is deleted: they are written in one transaction, so only a pin row refused
+            # above (or a database edited by hand) leaves one
+            if cid in self._pins and isinstance(added, (int, float)) and math.isfinite(added):
+                self._added[cid] = float(added)
+            else:
+                stale_times.append((binary,))
         bad_cache = []
         for root, path, target, used in self._db.query("SELECT root, path, target, used FROM cache ORDER BY used"):
             try:
@@ -333,17 +356,22 @@ class Storage:
         capped = [_cache_row(key) for key in list(self._cache)[:max(0, len(self._cache) - MAX_CACHE_RECORDS)]]
         self._cap_cache()
         self._cache_dirty.clear()
-        if bad_pins or bad_cache or capped:
+        if bad_pins or bad_cache or capped or stale_times:
             with self._db.transaction() as tx:
                 tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?", bad_pins)
                 tx.executemany("DELETE FROM cache WHERE root = ? AND path = ?", bad_cache + capped)
+                tx.executemany("DELETE FROM pin_times WHERE cid = ?", stale_times)
 
-    def _save_pins(self, source: str, added=(), removed=()):
-        """Persist source's new pins of added and releases of removed, durably (called with the lock held)."""
+    def _save_pins(self, source: str, added=(), removed=(), first=(), at: float = 0.0, gone=()):
+        """Persist source's new pins of added and releases of removed, durably, with the CIDs first pinned at
+        all now (first, at time at) and no longer pinned at all (gone) (called with the lock held)."""
         self.blocks.sync()  # so pins saved never outlast the blocks they keep
         with self._db.transaction(durable=True) as tx:
             tx.executemany("INSERT OR IGNORE INTO pins (cid, source) VALUES (?, ?)",
                            [(cid.binary, source) for cid in added])
+            tx.executemany("INSERT OR IGNORE INTO pin_times (cid, added) VALUES (?, ?)",
+                           [(cid.binary, at) for cid in first])
+            tx.executemany("DELETE FROM pin_times WHERE cid = ?", [(cid.binary,) for cid in gone])
             tx.executemany("DELETE FROM pins WHERE cid = ? AND source = ?", [(cid.binary, source) for cid in removed])
 
     def save(self):
@@ -473,8 +501,10 @@ class Storage:
                 return
             self._changes += 1
             self._pinned = None
+            now = time.time()
+            first = [cid for cid in added if self._pins[cid] == {source}]  # pinned by nothing else before
             try:
-                self._save_pins(source, added=added)
+                self._save_pins(source, added=added, first=first, at=now)
             except BaseException:
                 # Not saved (a full or failing disk): not pinned, so memory says what the database does
                 for cid in added:
@@ -484,6 +514,9 @@ class Storage:
                         del self._pins[cid]
                 self._pinned = None
                 raise
+            for cid in first:  # a pin another source held already keeps its first time (or its lack of one)
+                self._added[cid] = now
+            self._tell(self.pin_listener, "added", added, source)
 
     def unpin(self, cid: Cid, source: str) -> bool:
         """Release source's hold on cid; True if it held it. Blocks go at the next evict() or gc()."""
@@ -497,13 +530,32 @@ class Storage:
                 del self._pins[cid]
                 self._maybe_garbage = True
                 self._pinned = None
+            gone = [cid] if cid not in self._pins else []
             try:
-                self._save_pins(source, removed=[cid])
+                self._save_pins(source, removed=[cid], gone=gone)
             except BaseException:
                 self._pins.setdefault(cid, set()).add(source)  # still pinned, as the database says
                 self._pinned = None
                 raise
+            if gone:
+                self._added.pop(cid, None)
+            self._tell(self.pin_listener, "removed", [cid], source)
             return True
+
+    def _tell(self, listener, *args):
+        """Call a pin or cache listener, if set (lock held); one that fails is logged, never raised: the change
+        it reports is made and saved already."""
+        if listener is None:
+            return
+        try:
+            listener(*args)
+        except Exception as e:  # noqa: BLE001 - see above
+            log(f"storage: a change listener failed: {e!r}", LOG_ERROR)
+
+    def pin_added(self, cid: Cid) -> float | None:
+        """When cid was first pinned (Unix time; None if not pinned, or pinned before rnfs 0.1.7 recorded it)."""
+        with self._lock:
+            return self._added.get(cid) if cid in self._pins else None
 
     def pins(self) -> dict[Cid, set[str]]:
         """Every pin and its sources (a copy)."""
@@ -563,6 +615,10 @@ class Storage:
         self._cache[key] = target
         self._cache.move_to_end(key)
         self._cache_dirty.add(key)
+        if previous != target:
+            if previous is not None:  # a retargeted record (rare: a path whose name now leads elsewhere)
+                self._tell(self.cache_listener, "removed", [previous])
+            self._tell(self.cache_listener, "added", [target])
 
     def _drop_records(self, keys) -> list[Cid]:
         """Remove the records of keys, with the bookkeeping every removal needs: the save deletes their rows
@@ -575,6 +631,9 @@ class Storage:
         if targets:
             self._maybe_garbage = True
             self._cache_generation += 1
+            # One per target of the records dropped, as cache_ls lists records: another record may still lead to
+            # the same target, which a client reloading the list then sees
+            self._tell(self.cache_listener, "removed", list(dict.fromkeys(targets)))
         return targets
 
     def _cap_cache(self) -> set[Cid]:
@@ -997,6 +1056,41 @@ class Storage:
                 uncached = set(self._drop_records(dropped)) - set(self._cache.values())
                 deleted, freed = self._collect() if dropped else (set(), 0)
                 stats.update(uncached=uncached, removed_blocks=len(deleted), freed_bytes=freed)
+                return deleted
+
+        stats["incomplete"] = self._newly_incomplete(targets, act)
+        return stats
+
+    def uncache(self, cids: set[Cid]) -> dict:
+        """Drop every cached fetch leading to one of cids (cache rm), then delete every block nothing reaches, as
+        gc() does for every fetch. A pin of the same content keeps its blocks.
+
+        Returns {"uncached": set[Cid] targets no longer cached, "removed_records", "removed_blocks",
+        "freed_bytes", "incomplete": set[Cid] no longer complete}.
+        """
+        with self._lock:
+            records = {key: target for key, target in self._cache.items() if target in cids}
+            targets = self._targets()
+        if not records:
+            return {"uncached": set(), "removed_records": 0, "removed_blocks": 0, "freed_bytes": 0,
+                    "incomplete": set()}
+        stats = {}
+
+        def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
+            """Drop the records still leading to one of cids and collect; the blocks deleted."""
+            with self._lock:
+                rest = dict(self._cache)
+                roots = self._roots()
+            # What stays is walked without the lock first, as in gc(), so the collection under it reads little
+            self._warm(roots | {target for target in rest.values() if target not in cids},
+                       [key for key, target in rest.items() if key[1] and target not in cids])
+            with self._lock:
+                self._add_memoised(before)
+                dropped = [key for key, target in self._cache.items() if target in cids]
+                uncached = set(self._drop_records(dropped)) - set(self._cache.values())
+                deleted, freed = self._collect() if dropped else (set(), 0)
+                stats.update(uncached=uncached, removed_records=len(dropped), removed_blocks=len(deleted),
+                             freed_bytes=freed)
                 return deleted
 
         stats["incomplete"] = self._newly_incomplete(targets, act)

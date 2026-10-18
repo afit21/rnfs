@@ -440,6 +440,16 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `debug_log` | `false` | Write `~/.rnfs/debug.log` (readable by you only) for diagnosing problems (`daemon --debug-log`) |
 | `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |
 
+**Changing settings while the daemon runs.** `rnfs config` lists every setting with the value the daemon runs
+with (`*` set in `rnfs.toml`, `!` changed there but waiting for a restart, `^` set on the daemon's command line,
+which wins); `rnfs config get <name>` describes one. `rnfs config set <name> <value>` (a TOML value: `true`,
+`10`, `"text"`, `["a", "b"]`; a bare word is text) and `rnfs config unset <name>` edit `rnfs.toml` in place,
+keeping your comments, after checking the whole file as a start would. Some apply at once: `max_storage` (enforced
+then), `max_download_size`, `max_jobs`, `quiet_hours`, the serve interfaces, the quotas, the LXMF sender lists
+and a few more (`config get` says which); the rest at the next start. Apps do
+the same through `GET /api/config` and `POST /api/config/set`, which carry each setting's type, range, unit,
+default and description.
+
 <a id="privacy"></a>**Private mode.** `private = true` with a `members` list (identity hashes, from each
 node's `rnfs status`) makes the node link to, serve and keep records for members only. A name's announce still
 reaches everyone, so outsiders can see which CID it points at and when it changes (not fetch it), and
@@ -458,7 +468,7 @@ Every command except `daemon` talks to the running daemon, so run them as the da
 | Command | Description |
 |---|---|
 | `rnfs daemon` | Run a node with its API and gateway (`--bootstrap`, `--rnsconfig`, `--private`, `--debug-log`, `-v`…) |
-| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address / known nodes / traffic |
+| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address / known nodes, their round-trip time and whether each is online / traffic |
 | `rnfs ping NODE_ID` / `providers CID` | Round-trip time to a node / nodes providing a CID |
 | `rnfs add PATH\|-` | Add a file, directory or stdin, pin it and print its CID (options below) |
 | `rnfs get TARGET [-o OUT] [--from NODE_ID] [--background]` | Fetch and write out a file or directory |
@@ -525,6 +535,17 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
   never stops your Reticulum. Never point it at the daemon's `~/.rnfs/`: a directory is used by one node at a
   time.
 - Callbacks run on one event thread; keep them short.
+- Beyond content, pins, names and jobs: `peers()` and `stats()`, the address book (`contacts.add/get/list/remove`),
+  keeping and following names (`names.keep/unkeep/kept`, `names.follow/unfollow/following`), and LXMF
+  (`lxmf.address/send/inbox/get/remove/remove_all/outbox/sync`; off in an embedded node unless
+  `settings={"lxmf_enabled": True}`).
+- To follow what changes instead of polling lists: `events.watch(callback, kinds=...)` (jobs, pins, the cache, the
+  inbox, names, peers; an event with `event.lost` means "read everything again"), or `events.since(...)`. Also
+  `capabilities()`, pin labels (`label_pin`), the cache (`cache()`, `uncache(cid)`), settings (`config()`,
+  `config_set({...})`), tars and archives as streams (`add_tar`, `get_tar`, `export_stream`, `import_stream`), and
+  for a `Client` `shutdown()` and `daemon_info()`.
+- A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
+  just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the
   reference. Other languages can use the local API's JSON endpoints (listed in `rnfs/api.py`).
 

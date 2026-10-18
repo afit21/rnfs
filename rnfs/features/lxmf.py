@@ -21,6 +21,12 @@ startup_announce_delay and every announce_interval. LXMF keeps its router state 
   batches, each save writing the records changed since the last; outbox messages still unfinished at a start
   are marked failed (LXMF doesn't persist its outbound queue).
 - Messages waiting at lxmf_propagation_node are downloaded every lxmf_sync_interval.
+- Changes are published as "inbox" events (rnfs.events), each with "box" ("inbox" or "outbox") and "change":
+  inbox "received" ({"id", "from"}), "removed" ({"ids"}: by inbox rm, one event for --all, or dropped to make room)
+  and "auto" ({"id", "index", "state"}: an auto-fetch result recorded); outbox "queued" ({"id"}, by send), "state"
+  ({"id", "state"}: its delivery state changed, or it fell back to propagation) and "removed" ({"ids"}: dropped to
+  make room). Progress alone publishes nothing. The inbox records a start restores (_record_kept) publish nothing:
+  a client reloads at a start anyway (the events' epoch changes).
 
 Everything received is untrusted: fields are parsed strictly and capped, text is capped and escaped when
 printed. A message is only accepted once LXMF has validated its signature against the sender's identity; one
@@ -44,7 +50,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
 
-from rnfs import features, fsutil, ids
+from rnfs import events, features, fsutil, ids
 from rnfs.features import _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
@@ -976,6 +982,16 @@ class LxmfFeature(features.Feature):
         """A propagated message is done once the propagation node has it."""
         return entry.get("method") == "propagated" and entry.get("state") == "sent"
 
+    def _event(self, box: str, change: str, **fields):
+        """Publish an "inbox" event about box (INBOX or OUTBOX); see the module docstring. Safe with the lock held:
+        publishing only appends to the node's event log."""
+        events.publish(self.node, "inbox", box=box, change=change, **fields)
+
+    def _removed_event(self, box: str, removed: list[dict]):
+        """Publish one "removed" event for the records of box removed or dropped together, if any."""
+        if removed:
+            self._event(box, "removed", ids=[entry["id"] for entry in removed])
+
     # Lifecycle
 
     def start(self):
@@ -1178,7 +1194,10 @@ class LxmfFeature(features.Feature):
         method = "propagated" if propagate else "direct"
         entry = {"hash": message_hash.hex(), "to": address.hex(), "time": time.time(), "links": [link.to_json()],
                  "text": text or "", "method": method, "state": "outbound", "progress": 0.0}
-        entry_id, _ = self.outbox.add(entry)
+        entry_id, dropped = self.outbox.add(entry)
+        self._removed_event(OUTBOX, dropped)
+        if entry_id is not None:
+            self._event(OUTBOX, "queued", id=entry_id)
         if not propagate:
             with self._lock:
                 self._resend[message_hash.hex()] = (address, content, fields, nearest)
@@ -1202,17 +1221,19 @@ class LxmfFeature(features.Feature):
             elif network is not None:
                 try:
                     new_hash = network.send(resend[0], resend[1], resend[2], True, nearest)
-                    if entry is not None:
-                        self.outbox.update(entry["id"], hash=new_hash.hex(), method="propagated",
-                                           state="outbound", progress=0.0, direct_hash=message_hash.hex(),
-                                           fallback=True)
+                    if entry is not None and self.outbox.update(entry["id"], hash=new_hash.hex(),
+                                                                method="propagated", state="outbound",
+                                                                progress=0.0, direct_hash=message_hash.hex(),
+                                                                fallback=True):
+                        self._event(OUTBOX, "state", id=entry["id"], state="outbound")
                     _log(f"direct delivery of {message_hash.hex()} failed; sending it through the propagation "
                          f"node as {new_hash.hex()}", LOG_NOTICE)
                     return
                 except Exception as e:  # noqa: BLE001
                     values["error"] = f"propagation fallback failed: {fsutil.printable(e)}"
-        if entry is not None:
-            self.outbox.update(entry["id"], **values)
+        # Progress alone (polled each second while sending) publishes nothing
+        if entry is not None and self.outbox.update(entry["id"], **values) and entry.get("state") != state:
+            self._event(OUTBOX, "state", id=entry["id"], state=state)
 
     # Receiving
 
@@ -1269,6 +1290,10 @@ class LxmfFeature(features.Feature):
                                                reserved=lambda record: self._trusted_hex(record.get("from")),
                                                share=self._auto_share() if auto else None)
             self._release(dropped)
+            self._removed_event(INBOX, dropped)
+            if entry_id is not None:
+                # Under the lock, so an inbox rm of it can't publish "removed" first
+                self._event(INBOX, "received", id=entry_id, **{"from": sender})
         if entry_id is None:
             _log(f"message {message_hash} from {sender} not kept: the inbox is full of messages from trusted "
                  f"senders or holding auto-fetched pins (rnfs inbox rm)", LOG_NOTICE)
@@ -1359,6 +1384,7 @@ class LxmfFeature(features.Feature):
         with self._lock:
             removed = self.inbox.remove(entry_id)
             self._release(removed)
+            self._removed_event(INBOX, removed)  # one event, whatever their number
         if entry_id is not None and not removed:
             from rnfs.errors import NotFound
             raise NotFound(f"no inbox message #{entry_id}")
@@ -1567,7 +1593,8 @@ class LxmfFeature(features.Feature):
         auto = list(entry.get("auto") or [])
         if 0 <= index < len(auto):
             auto[index] = result
-            self.inbox.update(entry_id, auto=auto)
+            if self.inbox.update(entry_id, auto=auto):
+                self._event(INBOX, "auto", id=entry_id, index=index, state=result.get("state"))
 
     def auto_fetch(self, entry_id: int, index: int):
         """Fetch one link of an inbox message and pin it with source lxmf:<sender>, within the sender's quota.

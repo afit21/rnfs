@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 from rnfs import api, cli, features, fsutil
+from rnfs import events as rnfs_events
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
 from rnfs.content import edit
 from rnfs.content.cid import DAG, RAW, Cid
@@ -48,6 +49,8 @@ class FakeNode:
         self.records: dict[str, dict] = {}  # name → {"cid", "sequence"}
         self.provider_map: dict[str, list[bytes]] = {}
         self.piece = 7  # read() yields pieces this big, to exercise streaming
+        self.cached: set[str] = set()  # cache_ls's targets
+        self.events = rnfs_events.EventLog()  # GET /api/events
 
     def record(self, method, *args, **kwargs):
         """Remember a facade call."""
@@ -155,7 +158,7 @@ class FakeNode:
     # Facade
 
     def add_path(self, path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True,
-                 chunker=None):
+                 chunker=None, progress=None):
         self.record("add_path", path, wrap=wrap, only_hash=only_hash,
                     **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
         if not os.path.isabs(path):
@@ -315,6 +318,26 @@ class FakeNode:
         self.record("pin_remote", node_id, cid, pin)
         return node_id != b"\xff" * 16
 
+    def pin_label(self, cid, label):
+        self.record("pin_label", cid, label)
+        if cid not in self.pins:
+            raise NotFound(f"{cid} is not pinned")
+        if label is not None and not isinstance(label, str):
+            raise ValueError("a label must be a string")
+        return {"cid": cid, "sources": sorted(self.pins[cid]), "label": label or None}
+
+    def cache_ls(self):
+        self.record("cache_ls")
+        return [{"cid": cid, "root": cid, "path": [], "pinned": False, "complete": True, "type": "file",
+                 "size": 1, "provided": False} for cid in sorted(self.cached)]
+
+    def cache_rm(self, cid):
+        self.record("cache_rm", cid)
+        if cid not in self.cached:
+            raise NotFound(f"{cid} is not in the cache")
+        self.cached.discard(cid)
+        return {"removed_records": 1, "removed_blocks": 1, "freed_bytes": 1}
+
     def gc(self):
         self.record("gc")
         return {"removed_blocks": 3, "freed_bytes": 300}
@@ -391,7 +414,7 @@ class FakeNode:
             f.write(b"archive")
         return {"roots": [cid], "blocks": len(self._dag(cid))}
 
-    def import_archive(self, path):
+    def import_archive(self, path, progress=None):
         self.record("import_archive", path)
         if not os.path.isfile(path):
             raise NotFound(f"no such file: {path}")
@@ -739,7 +762,8 @@ class EndpointTest(ApiTestCase):
             with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log"):
                 code, headers, data = self.call("GET", f"/api/stat?target={file_cid}")
             self.assertEqual(code, status, error)
-            self.assertEqual(json.loads(data), {"error": str(error)})
+            # The message, and since 0.1.7 the machine-readable code of its status
+            self.assertEqual(json.loads(data), {"error": str(error), "code": errors.STATUS_CODES[status]})
             self.assertEqual(headers["Content-Type"], "application/json")
             if status == 503:
                 self.assertIn("Retry-After", headers)
@@ -956,6 +980,111 @@ class ConnectionTest(ApiTestCase):
         self.assertIn(f"{cid}/\\x1b[2J\\n", message)
         self.assertNotIn("\x1b", message)
         self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class AppSupportTest(ApiTestCase):
+    """What 0.1.7 added for apps: error codes, the capability list, events, shutdown, pin labels and the cache."""
+
+    def error(self, method, path, body=None, **kwargs) -> tuple[int, dict]:
+        """(status, JSON body) of a request that must fail."""
+        status, _, data = self.call(method, path, body, **kwargs)
+        self.assertGreaterEqual(status, 400, data)
+        return status, json.loads(data)
+
+    def test_error_codes_tell_endpoints_from_content(self):
+        """A 404 for an unknown endpoint and one for missing content carry different codes; the API's own
+        refusals have theirs; every code is one rnfs.errors lists."""
+        file_cid = self.node.put_file(b"abc")
+        cases = [(("GET", "/api/nope"), 404, "no_such_endpoint"),
+                 (("GET", f"/api/stat?target={str(Cid.for_block(RAW, b'gone'))}"), 404, "not_found"),
+                 (("PUT", "/api/ls"), 405, "method_not_allowed"),
+                 (("GET", f"/api/ls?target={file_cid}"), 400, "bad_request")]
+        for (method, path), status, code in cases:
+            with self.subTest(path=path):
+                self.assertEqual(self.error(method, path), (status, {"error": mock.ANY, "code": code}))
+        self.assertEqual(self.error("GET", "/api/ls", api=False)[1]["code"], "unauthorized")
+        self.assertEqual(self.error("GET", "/api/status", host="evil.example:80")[1]["code"], "bad_host")
+        self.assertEqual(json.loads(ApiHandler.busy_response().split(b"\r\n\r\n", 1)[1])["code"],
+                         "too_many_connections")
+        self.assertLessEqual(set(errors.STATUS_CODES.values()) | set(errors.API_CODES), set(errors.CODES))
+        self.assertEqual(errors.error_code(errors.Unsupported("x"), 404), "unsupported")
+
+    def test_capabilities(self):
+        """The capability list names every route (core and features'), the event kinds and the error codes."""
+        result = self.ok("GET", "/api/capabilities")
+        self.assertEqual({tuple(route) for route in result["routes"]},
+                         set(ApiHandler.ROUTES) | set(features.api_routes()))
+        self.assertEqual(result["capabilities"], sorted(api.CAPABILITIES))
+        self.assertEqual(result["event_kinds"], list(rnfs_events.EVENT_KINDS))
+        self.assertEqual(result["error_codes"], list(errors.CODES))
+        self.assertIn("events", result["capabilities"])
+
+    def test_events_long_poll(self):
+        """No after: the next sequence at once; then events after it, as they come; kinds filter them; a wait
+        ends with none; an unknown kind is refused; a client behind the log, or of another epoch, is told it lost
+        some."""
+        start = self.ok("GET", "/api/events")
+        self.assertEqual((start["events"], start["lost"]), ([], False))
+        log = self.node.events
+        log.publish("pin", change="added", cids=["x"], count=1)
+        log.publish("job", id="j", state="done")
+        both = self.ok("GET", f"/api/events?after={start['next']}")
+        self.assertEqual([event["kind"] for event in both["events"]], ["pin", "job"])
+        only = self.ok("GET", f"/api/events?after={start['next']}&kinds=job")
+        self.assertEqual([event["kind"] for event in only["events"]], ["job"])
+        timer = threading.Timer(0.3, lambda: log.publish("peer", node_id="ab", change="new"))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        began = time.monotonic()
+        later = self.ok("GET", f"/api/events?after={both['next']}&wait=5")
+        self.assertEqual([event["kind"] for event in later["events"]], ["peer"])
+        self.assertLess(time.monotonic() - began, 4)
+        self.assertEqual(self.ok("GET", f"/api/events?after={later['next']}&wait=1")["events"], [])
+        self.assertEqual(self.error("GET", "/api/events?after=0&kinds=nope")[0], 400)
+        other = self.ok("GET", f"/api/events?after={later['next']}&epoch=elsewhere")
+        self.assertTrue(other["lost"])
+        self.assertEqual(len(other["events"]), 3)
+
+    def test_events_waiters_are_capped(self):
+        """At most MAX_EVENT_WAITERS polls wait at once; the next gets 503 busy; a wait=0 poll still answers."""
+        with mock.patch.object(api, "MAX_EVENT_WAITERS", 1):
+            server = ApiServer(self.node, 0)
+        server.start()
+        self.addCleanup(server.stop)
+        self.server, self.port = server, server.port
+        waiting = threading.Thread(target=self.call, args=("GET", "/api/events?after=0&wait=2"))
+        waiting.start()
+        self.addCleanup(waiting.join)
+        wait_for(lambda: server.server.RequestHandlerClass.event_waiters._value == 0)
+        status, body = self.error("GET", "/api/events?after=0&wait=2")
+        self.assertEqual((status, body["code"]), (503, "busy"))
+        self.assertEqual(self.ok("GET", "/api/events?after=0")["events"], [])
+
+    def test_shutdown(self):
+        """POST /api/shutdown answers, then calls the server's shutdown; a server without one answers 404
+        unsupported."""
+        status, body = self.error("POST", "/api/shutdown")
+        self.assertEqual((status, body["code"]), (404, "unsupported"))
+        stopped = threading.Event()
+        server = ApiServer(self.node, 0, shutdown=stopped.set)
+        server.start()
+        self.addCleanup(server.stop)
+        self.server, self.port = server, server.port
+        self.assertEqual(self.ok("POST", "/api/shutdown"), {"stopping": True})
+        self.assertTrue(stopped.wait(5))
+
+    def test_pin_label_and_cache_routes(self):
+        """POST /api/pin/label, GET /api/cache/ls and POST /api/cache/rm reach the facade, CIDs checked first."""
+        cid = self.node.put_file(b"label me")
+        self.node.pins[cid] = {"user"}
+        self.assertEqual(self.ok("POST", "/api/pin/label", {"cid": cid, "label": "mine"})["label"], "mine")
+        self.assertIsNone(self.ok("POST", "/api/pin/label", {"cid": cid, "label": None})["label"])
+        self.assertEqual(self.error("POST", "/api/pin/label", {"cid": "nope", "label": "x"})[0], 400)
+        self.node.cached.add(cid)
+        self.assertEqual([entry["cid"] for entry in self.ok("GET", "/api/cache/ls")["cache"]], [cid])
+        self.assertEqual(self.ok("POST", "/api/cache/rm", {"cid": cid})["removed_records"], 1)
+        self.assertEqual(self.error("POST", "/api/cache/rm", {"cid": cid}), (404, {"error": mock.ANY,
+                                                                                   "code": "not_found"}))
 
 
 class RouteTableTest(unittest.TestCase):

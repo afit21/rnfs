@@ -1,13 +1,27 @@
-"""Background jobs for long transfers (feature "jobs"): get, pin and export run by the daemon, with progress.
+"""Background jobs for long transfers (feature "jobs"): get, pin, export, add and import run by the daemon, with
+progress.
 
 On LoRa a 1 MB file can take an hour, so a transfer runs as a job the daemon owns instead of inside one API
 request. `rnfs get`, `pin add` and `export` start a job and follow it with a progress line on stderr (or
-return at once with --background); `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
+return at once with --background); `rnfs add <path> --background` and `rnfs import --background` start an add
+or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
 
-- A job runs one node facade call (get, pin_add, export) on a thread of its own, inside
+- A job runs one node facade call (get, pin_add, export, add_path, import_archive) on a thread of its own, inside
   fetcher.observing(): the fetch reports the verified size of what it fetches and each block it meets, and
   raises Cancelled at its next step (within fetcher.POLL) once the job is cancelled or the node stops.
   At most max_jobs run at once (2; 1 on slow nodes); queued jobs start oldest first.
+- Add and import jobs read a file, directory or archive on this machine (path) instead of fetching a target:
+  their total_bytes is measured before reading (builder.tree_size, or the archive's size), each read is counted
+  as done (Job.read, the facade's progress callback), which raises Cancelled at once when the job is cancelled
+  or the node stops, and their rate is of bytes read. They hold no protection session: an interrupted one runs
+  again from the start, which is safe because adding is idempotent (the same content gives the same CIDs, and
+  blocks stored already are kept), and what a cancelled one stored is unreferenced until the next collection.
+  An add job's options are POST /api/add's (ADD_OPTIONS); a sealed add run again seals afresh, so only the run
+  that finishes gives the job its CID.
+- Every change of a job's state (queued, running, done, failed, cancelled, and forgotten: "removed") and, at
+  most once a second (EVENT_INTERVAL), a running job's progress is published as a "job" event (rnfs.events) with
+  the job's state and progress fields (Job.event; the job's kind as "job_kind", an event's "kind" being "job"),
+  not its result: a client fetches the job for that.
 - Jobs are saved in the state database's jobs table (rnfs.statedb), durably, at every state change and with
   the node's periodic saves (keeping a running job's progress recent); each save writes only the jobs changed
   since the last. At startup, jobs that were queued or running are queued again and resume where they
@@ -41,6 +55,7 @@ import threading
 import time
 from collections import deque
 from contextlib import ExitStack
+from typing import Callable
 
 from rnfs import ids
 from rnfs.constants import PARTIAL_SUFFIX
@@ -49,7 +64,12 @@ from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 from rnfs.fsutil import printable
 
 NAME = "jobs"
-KINDS = ("get", "pin", "export")
+KINDS = ("get", "pin", "export", "add", "import")
+LOCAL_KINDS = frozenset({"add", "import"})  # read a path on this machine rather than fetch a target
+# An add job's options: POST /api/add's, each with its JSON type (absent: add_path's default)
+ADD_OPTIONS = {"wrap": bool, "only_hash": bool, "pin": bool, "to": list, "to_self": bool, "seal_name": bool,
+               "chunker": str}
+MAX_RECIPIENT_TEXT = 256  # characters of one of an add job's to= recipients (a key is 128 hex digits)
 QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
 STATES = (QUEUED, RUNNING, DONE, FAILED, CANCELLED)
 ACTIVE = frozenset({QUEUED, RUNNING})
@@ -61,6 +81,11 @@ MAX_WAIT = 30  # longest wait= a GET /api/jobs/get may ask for, in seconds
 POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
 FINISHED_GRACE = 60.0  # seconds a finished job is kept whatever max_finished_jobs says
+EVENT_INTERVAL = 1.0  # seconds between a running job's progress events, at least
+# A "job" event's fields (rnfs.events): what changes, not the result (clients fetch the job for that); "kind" is
+# sent as "job_kind", since an event's own "kind" is "job"
+EVENT_FIELDS = ("id", "kind", "state", "error", "total_bytes", "done_bytes", "blocks", "blocks_total",
+                "downloaded_bytes", "rate", "eta")
 _JOB_ID = re.compile(r"[0-9a-f]{8}")
 _NODE_ID = ids.HEX16_LOWER  # a saved job's from_node, as bytes.hex() writes it (a row that fails is deleted)
 
@@ -73,10 +98,11 @@ def _log(message: str, level: int = LOG_INFO):
 class Job:
     """One transfer: what it is, its state and its progress. Also the fetch Observer of its runs."""
 
-    def __init__(self, job_id: str, kind: str, target: str, output: str | None = None,
+    def __init__(self, job_id: str, kind: str, target: str | None, output: str | None = None,
                  from_node: str | None = None, created: float | None = None, sealed_name: bool = False,
-                 fallback_dht: bool = False):
-        """A queued job; from_node is a node ID in hex. sealed_name and fallback_dht are for get jobs."""
+                 fallback_dht: bool = False, path: str | None = None, options: dict | None = None):
+        """A queued job; from_node is a node ID in hex. sealed_name and fallback_dht are for get jobs; path (and
+        for add, options: ADD_OPTIONS) for add and import jobs, which have no target."""
         self.id = job_id
         self.kind = kind
         self.target = target
@@ -84,6 +110,8 @@ class Job:
         self.from_node = from_node
         self.sealed_name = sealed_name  # write a sealed file under its sealed name, beside output
         self.fallback_dht = fallback_dht  # if from_node fails, try again with ordinary DHT discovery
+        self.path = path  # what an add or import job reads, on this machine
+        self.options = options  # an add job's add_path options (only those set)
         self.state = QUEUED
         self.created = time.time() if created is None else created
         self.started: float | None = None  # when the latest run started
@@ -101,14 +129,23 @@ class Job:
         self.stop_event: threading.Event | None = None  # the feature's, set when the node stops
         self.protection: ExitStack | None = None  # the session keeping its blocks while queued or running
         self.position: int | None = None  # its row's place in the jobs table (creation order), once queued or loaded
-        self._lock = threading.Lock()  # guards _samples and _seen
-        self._samples: deque[tuple[float, int]] = deque()  # (monotonic time, downloaded_bytes)
+        # Called with the job at most every EVENT_INTERVAL while it progresses (the feature's progress event)
+        self.on_progress: Callable[["Job"], None] | None = None
+        self._lock = threading.Lock()  # guards _samples, _moved and _seen
+        self._moved = 0  # what the rate counts: bytes downloaded (transfers) or read (add, import) this run
+        self._samples: deque[tuple[float, int]] = deque()  # (monotonic time, _moved)
         self._seen: set = set()  # CIDs met this run, so each counts once
+        self._last_event = float("-inf")  # monotonic time of the last progress event
+
+    @property
+    def subject(self) -> str:
+        """What the job works on, for messages: its target, or an add's or import's path."""
+        return self.target if self.target is not None else str(self.path)
 
     # Observer (rnfs.fetcher.Observer), called on the job's thread
 
     def total(self, size: int):
-        """The fetch knows the verified size of what it fetches."""
+        """The fetch knows the verified size of what it fetches (or an add or import measured what it reads)."""
         self.total_bytes = size
 
     def block(self, cid, length: int, downloaded: bool):
@@ -117,17 +154,46 @@ class Job:
         with self._lock:
             if downloaded:
                 self.downloaded_bytes += length
-                if not self._samples or now - self._samples[-1][0] >= SAMPLE_INTERVAL:
-                    self._samples.append((now, self.downloaded_bytes))
-                    # Prune here too, not only in rate(): a job nobody polls would otherwise keep a sample a
-                    # second for as long as it runs (about 10 MB a day)
-                    self._prune(now)
-            if cid in self._seen:
-                return
-            self._seen.add(cid)
-            self.blocks += 1
-            if cid.is_raw:
-                self.done_bytes += length
+                self._sample(now, length)
+            if cid not in self._seen:
+                self._seen.add(cid)
+                self.blocks += 1
+                if cid.is_raw:
+                    self.done_bytes += length
+        self._progressed(now)
+
+    def read(self, length: int):
+        """An add or import read length bytes of its path (the facade's progress callback, on the job's thread):
+        counted as done. Raises Cancelled once the job is cancelled or the node stops, which stops the read at
+        once."""
+        from rnfs.errors import Cancelled
+        if self.cancelled():
+            raise Cancelled(f"job {self.id} was cancelled")
+        now = time.monotonic()
+        with self._lock:
+            self.done_bytes += length
+            self._sample(now, length)
+        self._progressed(now)
+
+    def check_cancelled(self):
+        """Raise Cancelled once the job is cancelled or the node stops (an add's measuring, between entries)."""
+        self.read(0)
+
+    def _sample(self, now: float, length: int):
+        """Count length bytes moved for the rate, sampling at most every SAMPLE_INTERVAL. Called with _lock held."""
+        self._moved += length
+        if not self._samples or now - self._samples[-1][0] >= SAMPLE_INTERVAL:
+            self._samples.append((now, self._moved))
+            # Prune here too, not only in rate(): a job nobody polls would otherwise keep a sample a second for
+            # as long as it runs (about 10 MB a day)
+            self._prune(now)
+
+    def _progressed(self, now: float):
+        """Tell on_progress, if EVENT_INTERVAL has passed since it was last told (on the job's thread, no lock)."""
+        if self.on_progress is None or now - self._last_event < EVENT_INTERVAL:
+            return
+        self._last_event = now
+        self.on_progress(self)
 
     def cancelled(self) -> bool:
         """True once the job is cancelled or the node stops."""
@@ -141,9 +207,10 @@ class Job:
             self.state = RUNNING
             self.started = time.time()
             self.runs += 1
-            self.done_bytes = self.blocks = self.downloaded_bytes = 0
+            self.done_bytes = self.blocks = self.downloaded_bytes = self._moved = 0
             self._seen = set()
             self._samples = deque([(time.monotonic(), 0)])
+            self._last_event = time.monotonic()  # the "running" event has just been published
 
     def _prune(self, now: float):
         """Drop samples older than RATE_WINDOW, keeping one at or before the window's start as the base to
@@ -152,18 +219,19 @@ class Job:
             self._samples.popleft()
 
     def rate(self, now: float | None = None) -> float | None:
-        """Bytes/s downloaded over the last RATE_WINDOW of a running job (it decays while nothing arrives)."""
+        """Bytes/s downloaded (read, for add and import) over the last RATE_WINDOW of a running job (it decays
+        while nothing arrives)."""
         now = time.monotonic() if now is None else now
         with self._lock:
             if self.state != RUNNING or not self._samples:
                 return None
             self._prune(now)
             since, base = self._samples[0]
-            downloaded = self.downloaded_bytes
+            moved = self._moved
         elapsed = now - since
         if elapsed < SAMPLE_INTERVAL:
             return None
-        return max(0.0, (downloaded - base) / elapsed)
+        return max(0.0, (moved - base) / elapsed)
 
     def to_dict(self) -> dict:
         """The job as the API shows it, with its current rate and ETA."""
@@ -173,14 +241,24 @@ class Job:
             eta = max(0.0, (self.total_bytes - self.done_bytes) / rate)
         return {**self.to_record(), "state": self.state, "rate": rate, "eta": eta}
 
+    def event(self) -> dict:
+        """The job's "job" event fields (EVENT_FIELDS): its state and progress, not its result. Its kind is
+        "job_kind": an event's "kind" is the event's own ("job")."""
+        job = self.to_dict()
+        return {("job_kind" if name == "kind" else name): job[name] for name in EVENT_FIELDS}
+
     def to_record(self) -> dict:
-        """The job as saved (a running job is saved as such, and queued again when loaded)."""
-        return {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
-                "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht,
-                "state": self.state, "created": self.created, "started": self.started,
-                "finished": self.finished, "error": self.error, "result": self.result, "runs": self.runs,
-                "total_bytes": self.total_bytes, "done_bytes": self.done_bytes, "blocks": self.blocks,
-                "blocks_total": self.blocks_total, "downloaded_bytes": self.downloaded_bytes}
+        """The job as saved (a running job is saved as such, and queued again when loaded). path and options
+        only for the kinds that have them (add, import), so the record of every other job is as 0.1.6 saved it."""
+        record = {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
+                  "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht}
+        if self.path is not None or self.options is not None:
+            record.update(path=self.path, options=self.options)
+        record.update({"state": self.state, "created": self.created, "started": self.started,
+                       "finished": self.finished, "error": self.error, "result": self.result, "runs": self.runs,
+                       "total_bytes": self.total_bytes, "done_bytes": self.done_bytes, "blocks": self.blocks,
+                       "blocks_total": self.blocks_total, "downloaded_bytes": self.downloaded_bytes})
+        return record
 
     @classmethod
     def from_record(cls, record) -> "Job":
@@ -194,9 +272,10 @@ class Job:
         if kind not in KINDS or state not in STATES:
             raise ValueError("bad kind or state")
         sealed_name, fallback_dht = record.get("sealed_name", False), record.get("fallback_dht", False)
-        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht)
+        path, options = record.get("path"), record.get("options")
+        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options)
         job = cls(job_id, kind, target, output, from_node, _number(record.get("created"), time.time()),
-                  sealed_name, fallback_dht)
+                  sealed_name, fallback_dht, path, options)
         job.state = state
         job.started = _number(record.get("started"), None)
         job.finished = _number(record.get("finished"), None)
@@ -237,17 +316,31 @@ def _capped(result: dict) -> dict:
     return result
 
 
-def check_job_params(kind: str, target, output, from_node, sealed_name=False, fallback_dht=False):
-    """Raise ValueError unless these fit a job of kind: a well-formed target, an absolute output path for
-    get and export (none for pin), and from (a node ID in hex), sealed_name and fallback_dht (booleans)
-    only for get."""
+def check_job_params(kind: str, target, output, from_node, sealed_name=False, fallback_dht=False, path=None,
+                     options=None):
+    """Raise ValueError unless these fit a job of kind: for get, pin and export a well-formed target, an absolute
+    output path for get and export (none for pin), and from (a node ID in hex), sealed_name and fallback_dht
+    (booleans) only for get; for add and import an absolute path and neither target nor output, and options
+    (check_add_options) only for add."""
     from rnfs.content import walker  # validates the root CID and every path name
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
-    walker.parse_target(target)
-    if kind == "pin":
+    if kind in LOCAL_KINDS:
+        if target is not None or output is not None:
+            raise ValueError(f"an {kind} job reads a path: it takes no target or output")
+        if not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path:
+            raise ValueError(f"path must be an absolute path: {path!r}")
+        if options is not None:
+            if kind != "add":
+                raise ValueError("only add jobs take options")
+            check_add_options(options)
+    elif path is not None or options is not None:
+        raise ValueError(f"a {kind} job takes a target, not a path")
+    else:
+        walker.parse_target(target)
+    if kind == "pin" or kind in LOCAL_KINDS:
         if output is not None:
-            raise ValueError("a pin job has no output")
+            raise ValueError(f"a {kind} job has no output")
     elif not isinstance(output, str) or not os.path.isabs(output) or "\x00" in output:
         raise ValueError(f"output must be an absolute path: {output!r}")
     if from_node is not None:
@@ -260,6 +353,37 @@ def check_job_params(kind: str, target, output, from_node, sealed_name=False, fa
             raise ValueError(f"{name} must be true or false")
         if value and kind != "get":
             raise ValueError(f"only get jobs take {name}")
+
+
+def check_add_options(options):
+    """Raise ValueError unless options are an add job's: a JSON object of ADD_OPTIONS, each of its type, to a list of
+    at most MAX_RECIPIENTS recipient strings, chunker a known chunker's name. What the node checks only when the
+    add runs (recipients it knows, only_hash with to) fails the job then, with the add's own message."""
+    from rnfs.content import chunker, seal
+    if not isinstance(options, dict):
+        raise ValueError("an add job's options must be an object")
+    for name, value in options.items():
+        expected = ADD_OPTIONS.get(name)
+        if expected is None:
+            raise ValueError(f"unknown add option {name!r}")
+        if type(value) is not expected:
+            raise ValueError(f"add option {name} must be a {expected.__name__}")
+    recipients = options.get("to", [])
+    if len(recipients) > seal.MAX_RECIPIENTS or not all(
+            isinstance(text, str) and 0 < len(text) <= MAX_RECIPIENT_TEXT for text in recipients):
+        raise ValueError(f"to must list at most {seal.MAX_RECIPIENTS} recipients")
+    if "chunker" in options:
+        chunker.check(options["chunker"])
+
+
+def add_job_options(value) -> dict | None:
+    """An add job's options from a JSON body's value(name) (None when absent), as POST /api/add takes them: wrap
+    and only_hash (flags), and node_content.add_options' (pin, to, to_self, seal_name, chunker); only those set, or
+    None for none. Raises ValueError as POST /api/add does."""
+    from rnfs import api, node_content
+    options = {name: True for name in ("wrap", "only_hash") if api.parse_bool(value(name))}
+    options.update(node_content.add_options(value))
+    return options or None
 
 
 def import_jobs(value: dict, tx) -> int:
@@ -337,6 +461,7 @@ class JobsFeature(Feature):
                 bad.append((job_id,))
                 continue
             job.position = position
+            job.on_progress = self._publish
             if job.state in ACTIVE:
                 if job.state == RUNNING:
                     self._store.changed(job.id)  # saved as queued by the next save
@@ -392,12 +517,29 @@ class JobsFeature(Feature):
             if (job.finished or job.created) < recent:
                 del self._jobs[job.id]
                 self._store.changed(job.id)
+                self._removed(job)
+
+    # Events
+
+    def _publish(self, job: Job):
+        """Publish a "job" event of job's state and progress (Job.event; rnfs.events never raises). Also each job's
+        on_progress, called on its thread with no lock held."""
+        from rnfs import events
+        events.publish(self.node, "job", **job.event())
+
+    def _removed(self, job: Job):
+        """Publish that job was forgotten (cleared, or past max_finished_jobs): its last state, and "removed"."""
+        from rnfs import events
+        events.publish(self.node, "job", id=job.id, job_kind=job.kind, state=job.state, removed=True)
 
     # Protection
 
     def _protect(self, job: Job):
-        """Keep everything stored below the job's root while it is queued or running."""
+        """Keep everything stored below the job's root while it is queued or running; an add or import job has none
+        (it runs again from the start: the module docstring)."""
         from rnfs.content import walker
+        if job.target is None:
+            return
         root, _ = walker.parse_target(job.target)
         stack = ExitStack()
         session = stack.enter_context(self.node.storage.protect())
@@ -454,9 +596,11 @@ class JobsFeature(Feature):
                 self._store.changed(job.id)
                 thread = threading.Thread(target=self._run, args=(job,), name=f"rnfs-job-{job.id}", daemon=True)
                 self._threads[job.id] = thread
-                starting.append(thread)
+                starting.append((job, thread))
                 running += 1
-        for thread in starting:
+        for job, _ in starting:
+            self._publish(job)  # before its thread runs, so its first progress event comes after
+        for _, thread in starting:
             thread.start()
         if starting:
             self._save_quietly()
@@ -478,7 +622,7 @@ class JobsFeature(Feature):
             error = str(e) or type(e).__name__
         except Exception as e:  # noqa: BLE001 - a job's failure mustn't take its thread's bookkeeping with it
             error = str(e) or type(e).__name__
-            _log(f"job {job.id} ({job.kind} {job.target}) failed: {e!r}", LOG_ERROR)
+            _log(f"job {job.id} ({job.kind} {job.subject}) failed: {e!r}", LOG_ERROR)
         self._finish(job, state, error, result)
 
     def _execute(self, job: Job) -> dict:
@@ -488,10 +632,31 @@ class JobsFeature(Feature):
             result = self._get(job)
         elif job.kind == "pin":
             result = node.pin_add(job.target)
-        else:
+        elif job.kind == "export":
             result = node.export(job.target, job.output)
+        elif job.kind == "add":
+            result = self._add(job)
+        else:
+            result = self._import(job)
         job.blocks_total = self._dag_block_count(result)
         return result
+
+    def _add(self, job: Job) -> dict:
+        """An add job: measure what it will read, then node.add_path with its options, as POST /api/add calls it."""
+        from rnfs.content import builder
+        try:
+            job.total(builder.tree_size(job.path, job.check_cancelled))
+        except OSError:
+            pass  # add_path reports it, in its own words
+        return self.node.add_path(job.path, progress=job.read, **(job.options or {}))
+
+    def _import(self, job: Job) -> dict:
+        """An import job: node.import_archive, as POST /api/import calls it; its size is what it will read."""
+        try:
+            job.total(os.path.getsize(job.path))
+        except OSError:
+            pass  # import_archive reports it, in its own words
+        return self.node.import_archive(job.path, progress=job.read)
 
     def _get(self, job: Job) -> dict:
         """A get job: write to its partial path, then rename that to the output (or the sealed name)."""
@@ -561,29 +726,38 @@ class JobsFeature(Feature):
             self._threads.pop(job.id, None)
             self._store.changed(job.id)
             self._cap_finished()
+        self._publish(job)
         if state in FINISHED:
             job.ended.set()
-            _log(f"job {job.id} ({job.kind} {job.target}) {state}" + (f": {error}" if error else ""))
+            _log(f"job {job.id} ({job.kind} {job.subject}) {state}" + (f": {error}" if error else ""))
         if not self._schedule():  # starting the next saves this outcome with it
             self._save_quietly()
 
     # Operations (API)
 
-    def submit(self, kind: str, target: str, output: str | None = None, from_node: str | None = None,
-               sealed_name: bool = False, fallback_dht: bool = False) -> dict:
-        """Queue a job; its dict. Raises ValueError for bad parameters or an output in use, Busy when full.
+    def submit(self, kind: str, target: str | None = None, output: str | None = None, from_node: str | None = None,
+               sealed_name: bool = False, fallback_dht: bool = False, path: str | None = None,
+               options: dict | None = None) -> dict:
+        """Queue a job; its dict. Raises ValueError for bad parameters or an output in use, NotFound for an add's
+        or import's path that doesn't exist, Busy when full.
 
         For get: sealed_name writes a sealed file under its sealed name beside output; fallback_dht retries
-        by DHT discovery if from_node fails.
+        by DHT discovery if from_node fails. For add and import: path, and for add options (ADD_OPTIONS).
         """
-        from rnfs.errors import Busy
+        from rnfs.errors import Busy, NotFound
         contacts = self.dependency("contacts")
-        if contacts is not None:
+        if contacts is not None and target is not None:
             # `alice/docs`: a name contact's nick becomes the CID its name points at now (rnfs.features.contacts)
             target = contacts.expand_target(target)
-        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht)
+        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options)
         if output is not None and os.path.lexists(output):
             raise ValueError(f"{output} already exists")
+        if path is not None and not os.path.lexists(path):
+            # As add_path and import_archive say it, but before queueing: the CLI and apps learn it at once
+            raise NotFound(f"no such file or directory: {path}" if kind == "add" else f"no such file: {path}")
+        if kind == "import" and not os.path.isfile(path):
+            # A FIFO or device would hold a job slot until something writes to it (import_archive refuses it too)
+            raise ValueError(f"{path} is not a regular file")
         with self._lock:
             active = [job for job in self._jobs.values() if job.state in ACTIVE]
             if len(active) >= MAX_ACTIVE:
@@ -594,14 +768,17 @@ class JobsFeature(Feature):
             job_id = secrets.token_hex(4)
             while job_id in self._jobs:
                 job_id = secrets.token_hex(4)
-            job = Job(job_id, kind, target, output, from_node, sealed_name=sealed_name, fallback_dht=fallback_dht)
+            job = Job(job_id, kind, target, output, from_node, sealed_name=sealed_name, fallback_dht=fallback_dht,
+                      path=path, options=options)
             job.stop_event = self._stop_event
+            job.on_progress = self._publish
             job.position = self._position
             self._position += 1
             self._protect(job)
             self._jobs[job_id] = job
             self._store.changed(job_id)
-        _log(f"job {job_id} queued: {kind} {target}" + (f" to {output}" if output else ""))
+        _log(f"job {job_id} queued: {kind} {job.subject}" + (f" to {output}" if output else ""))
+        self._publish(job)  # queued, before _schedule may start it
         if not self._schedule():  # else saved as it started
             self._save_quietly()
         return job.to_dict()
@@ -629,7 +806,8 @@ class JobsFeature(Feature):
         return [job.to_dict() for job in jobs]
 
     def cancel(self, job_id: str) -> dict:
-        """Cancel a job: a queued one at once, a running one at its fetch's next step. Finished ones stay."""
+        """Cancel a job: a queued one at once, a running one at its fetch's next step (an add's or import's next
+        read). Finished ones stay."""
         job = self._job(job_id)
         ended = False
         with self._lock:
@@ -643,6 +821,7 @@ class JobsFeature(Feature):
         if ended:
             self._release(job)
             job.ended.set()
+            self._publish(job)
             with self._lock:
                 self._cap_finished()
             self._save_quietly()
@@ -656,7 +835,7 @@ class JobsFeature(Feature):
             removed = [jid for jid, job in self._jobs.items()
                        if job.state in FINISHED and (job_id is None or jid == job_id)]
             for jid in removed:
-                del self._jobs[jid]
+                self._removed(self._jobs.pop(jid))
             self._store.changed(*removed)
         if removed:
             self._save_quietly()
@@ -713,12 +892,20 @@ def _feature(handler) -> JobsFeature:
 
 
 def api_start(handler):
-    """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht"}: queue a job; the job."""
+    """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht"} for get, pin and export;
+    {"kind": "add", "path", and POST /api/add's options} or {"kind": "import", "path"}: queue a job; the job."""
     from rnfs import api
     body = handler.json_body()
     kind = body.get("kind")
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+    if kind in LOCAL_KINDS:
+        path = api.parse_path(body.get("path"))
+        options = add_job_options(body.get) if kind == "add" else None
+        # A target or output given is refused by submit's check, as for the other kinds
+        handler.send_json(200, _feature(handler).submit(kind, body.get("target"), body.get("output"), path=path,
+                                                        options=options))
+        return
     target = api.parse_target(body.get("target"))
     output = api.parse_path(body.get("output")) if kind != "pin" else body.get("output")
     from_node = api.parse_hex_id(body["from"]).hex() if body.get("from") else None
@@ -799,6 +986,8 @@ def format_progress(job: dict, width: int = 20) -> str:
     if state == RUNNING:
         rate = job.get("rate")
         speed = f"{human_size(rate)}/s" if rate is not None else "-/s"
+        if total is None and job.get("kind") in LOCAL_KINDS:
+            return f"reading: {human_size(done)}, {speed}"  # its size is being measured
         if total is None:
             blocks = job.get("blocks") or 0
             return f"finding the target: {blocks} block{'' if blocks == 1 else 's'}, {speed}"
@@ -813,17 +1002,20 @@ def format_progress(job: dict, width: int = 20) -> str:
 
 
 def format_job(job: dict) -> str:
-    """One `rnfs jobs` line: ID, state, kind, progress, target (and output)."""
+    """One `rnfs jobs` line: ID, state, kind, progress, target (and output), or an add's or import's path."""
     where = f" -> {job['output']}" if job.get("output") else ""
-    return printable(f"{job['id']}  {job['state']:<9} {job['kind']:<6} {format_progress(job)}  {job['target']}{where}")
+    subject = job.get("target") or job.get("path")
+    return printable(f"{job['id']}  {job['state']:<9} {job['kind']:<6} {format_progress(job)}  {subject}{where}")
 
 
 def job_fields(job: dict) -> dict:
     """A job's fields for `rnfs jobs show`, readable."""
-    fields = {"id": job["id"], "kind": job["kind"], "state": job["state"], "target": job["target"]}
-    for name in ("output", "from", "sealed_name", "fallback_dht"):
+    fields = {"id": job["id"], "kind": job["kind"], "state": job["state"]}
+    for name in ("target", "path", "output", "from", "sealed_name", "fallback_dht"):
         if job.get(name):
             fields[name] = job[name]
+    if job.get("options"):
+        fields["options"] = json.dumps(job["options"])
     fields["progress"] = format_progress(job)
     total = job.get("total_bytes")
     fields["bytes"] = f"{job.get('done_bytes') or 0} of {total if total is not None else '?'}"
@@ -942,7 +1134,9 @@ def has_jobs(api) -> bool:
 def run_transfer(args, fields: dict, fallback) -> dict | None:
     """Run a transfer as a job and follow it; its result, or None with --background (its ID is printed).
 
-    fallback(api) does the transfer in one request instead, for a daemon without the job manager.
+    fallback(api) does the transfer in one request instead, for a daemon without the job manager (None: only with
+    --background, which fails then). A daemon whose job manager predates the kind refuses it (400, kind must be one
+    of ...).
     """
     from rnfs import cli
     api = cli.client(args)
@@ -974,6 +1168,10 @@ def print_result(job: dict):
         print(cli.printable(result.get("output") or job["output"]))
     elif job["kind"] == "pin":
         print(cli.printable(result.get("cid")))
+    elif job["kind"] == "add":
+        cli.print_added(result)
+    elif job["kind"] == "import":
+        cli.print_imported(result)
     else:
         print(cli.printable(f"exported {result.get('blocks')} blocks of {', '.join(result.get('roots') or [])} "
                             f"to {job['output']}"))

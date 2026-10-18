@@ -1,10 +1,12 @@
 """Tests for the mesh feature (rnfs/mesh.py, rnfs/features/peers.py and their hooks): provider ranking by
 seniority, hops and bitrate; the upload budget, interface rules and quiet hours on /blocks; traffic counters
 and `rnfs peers` on an offline node."""
+import inspect
 import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -19,7 +21,7 @@ from rnfs.network import protocol, server
 from rnfs.network.announces import DhtAnnounceHandler, encode_mode
 from rnfs.network.client import BUSY, FAILED, OK, BlocksResult, PeerClient
 from rnfs.node import RnfsNode
-from tests.support import FakeClock
+from tests.support import FakeClock, wait_for
 from tests.test_fetcher import OWN, FakeClient, FetcherTest
 from tests.test_names import FakeNetwork
 from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource, block_of
@@ -604,6 +606,73 @@ class TrafficTest(unittest.TestCase):
             traffic.heard(i.to_bytes(16, "big"), "server")
         self.assertEqual(len(traffic.peers()), mesh.MAX_PEERS)
 
+    def test_first_heard_last_seen_and_rtt(self):
+        wall, mono = FakeClock(5000.0), FakeClock(100.0)  # shown times are wall time; decisions monotonic
+        traffic = mesh.Traffic(clock=wall, monotonic=mono)
+        traffic.heard(P1, "server")  # an announce or a path response: heard, not seen
+        wall.now, mono.now = 5010.0, 110.0
+        traffic.request(P1, mesh.FAILED)  # no answer: not seen
+        peer = traffic.peer(P1)
+        self.assertEqual((peer["first_heard"], peer["first_counted"], peer["last_heard"], peer["last_seen"],
+                          peer["rtt"], peer["rtt_at"]), (5000.0, 100.0, 5000.0, None, None, None))
+        for at, record in ((120.0, lambda: traffic.request(P1, mesh.REFUSED)),  # it answered, if only False
+                           (130.0, lambda: traffic.request(P1, mesh.ANSWERED)),
+                           (140.0, lambda: traffic.sent(P1, None, 100))):  # it asked
+            mono.now = at
+            record()
+            self.assertEqual(traffic.peer(P1)["last_seen"], at)
+        wall.now, mono.now = 5060.0, 160.0
+        traffic.measured(P1, 0.25)
+        peer = traffic.peer(P1)
+        self.assertEqual((peer["rtt"], peer["rtt_at"], peer["last_seen"], peer["first_heard"]),
+                         (0.25, 5060.0, 160.0, 5000.0))
+        wall.now = 5070.0
+        traffic.measured(P2, 1)  # a new peer, first counted by its link
+        self.assertEqual((traffic.peer(P2)["first_heard"], traffic.peer(P2)["rtt"]), (5070.0, 1.0))
+
+    def test_announce_counts_by_its_emission_time(self):
+        wall, mono = FakeClock(50000.0), FakeClock(100.0)
+        traffic = mesh.Traffic(clock=wall, monotonic=mono)
+        self.assertTrue(traffic.announced(P1, 50000.0))
+        self.assertEqual(traffic.peer(P1)["last_seen"], 100.0)
+        mono.now += 10
+        self.assertFalse(traffic.announced(P1, 50000.0))  # the same announce again (a replay)
+        self.assertFalse(traffic.announced(P1, 49000.0))  # an older one
+        self.assertEqual(traffic.peer(P1)["last_seen"], 100.0)
+        # Held in an announce queue, or a path answer a shared instance passes on as an announce: 3 h old
+        self.assertFalse(traffic.announced(P2, wall.now - 3 * 3600))
+        self.assertIsNone(traffic.peer(P2)["last_seen"])
+        # Seen when emitted, less the skew allowed: at the window's edge
+        self.assertTrue(traffic.announced(P3, wall.now - mesh.EMISSION_SKEW - mesh.ONLINE_WINDOW))
+        self.assertEqual(traffic.peer(P3)["last_seen"], mono.now - mesh.ONLINE_WINDOW)
+        self.assertTrue(mesh.online(False, traffic.peer(P3)["last_seen"], mono.now))
+        self.assertFalse(traffic.announced(P4, wall.now - mesh.EMISSION_SKEW - mesh.ONLINE_WINDOW - 1))
+        # A sender's clock ahead of ours: seen now, never later
+        self.assertTrue(traffic.announced(P4, wall.now + 3600))
+        self.assertEqual(traffic.peer(P4)["last_seen"], mono.now)
+        for emitted in (None, float("nan"), float("inf"), True, "50000"):  # unknown: doesn't count
+            self.assertFalse(traffic.announced(bytes([9]) * 16, emitted))
+
+    def test_wall_clock_steps_dont_decide(self):
+        wall, mono = FakeClock(50000.0), FakeClock(100.0)
+        traffic = mesh.Traffic(clock=wall, monotonic=mono)
+        traffic.request(P1, mesh.ANSWERED)
+        wall.now -= 86400  # the wall clock goes back a day (or forward): online is decided by monotonic time
+        self.assertTrue(mesh.online(False, traffic.peer(P1)["last_seen"], mono.now))
+        wall.now += 2 * 86400
+        self.assertTrue(mesh.online(False, traffic.peer(P1)["last_seen"], mono.now))
+        self.assertFalse(mesh.online(False, mono.now + 10, mono.now))  # a negative age is offline
+
+    def test_online_rule(self):
+        now = 10000.0
+        self.assertTrue(mesh.online(True, None, now))  # an open link
+        self.assertFalse(mesh.online(False, None, now))  # never seen
+        self.assertTrue(mesh.online(False, now - mesh.ONLINE_WINDOW, now))
+        self.assertFalse(mesh.online(False, now - mesh.ONLINE_WINDOW - 1, now))
+        # One announce mustn't keep a node online until the next (announce_interval)
+        self.assertLess(mesh.ONLINE_WINDOW, Config().announce_interval / 10)
+        self.assertGreaterEqual(mesh.ONLINE_WINDOW, Config().link_idle_timeout)
+
 
 class PeerClientCountingTest(unittest.TestCase):
     """PeerClient.blocks counts outcomes and verified bytes per provider."""
@@ -722,6 +791,131 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertEqual((listed[P2.hex()]["mode"], listed[P2.hex()]["in_table"]), ("client", False))
         self.assertIsNotNone(listed[P2.hex()]["last_heard"])
 
+    def clocks(self) -> tuple[FakeClock, FakeClock]:
+        """Fake wall and monotonic clocks for the feature's Traffic, set apart so neither stands in for the other."""
+        wall, mono = FakeClock(50000.0), FakeClock(100.0)
+        self.feature.traffic.clock, self.feature.traffic.monotonic = wall, mono
+        return wall, mono
+
+    def advance(self, wall: FakeClock, mono: FakeClock, seconds: float):
+        """Move both clocks on."""
+        wall.now += seconds
+        mono.now += seconds
+
+    def test_announce_not_path_response_shows_it_up(self):
+        # A transport node may answer a path request from its path table long after the node went away
+        wall, mono = self.clocks()
+        handler = DhtAnnounceHandler(self.node._heard_server, self.node._heard_client, self.node.routing.is_banned,
+                                     self.node.node_id, on_announced=self.node._announced)  # as _start_network
+        emitted = {P1: wall.now, P2: wall.now, P4: wall.now - 3 * 3600}
+        with mock.patch("rnfs.node.RnsNetwork.emitted_time", side_effect=lambda node_id: emitted.get(node_id)):
+            handler.received_announce(P1, None, encode_mode(True), b"h" * 32, True)
+            self.assertEqual(self.feature.traffic.peer(P1)["mode"], "server")
+            self.assertIsNone(self.feature.traffic.peer(P1)["last_seen"])
+            handler.received_announce(P2, None, encode_mode(False), b"h" * 32, False)
+            self.assertEqual(self.feature.traffic.peer(P2)["last_seen"], mono.now)
+            # Attached to a shared instance, a path answer comes as an announce (RNS 1.5.6 passes it on with no
+            # context), and an announce queue may deliver one hours late: its emission time tells
+            handler.received_announce(P4, None, encode_mode(True), b"h" * 32, False)
+            self.assertIsNone(self.feature.traffic.peer(P4)["last_seen"])
+            handler.received_announce(P3, None, encode_mode(True), b"h" * 32, False)  # emission unreadable
+            self.assertIsNone(self.feature.traffic.peer(P3)["last_seen"])
+        # RNS passes both only to a handler with five parameters
+        self.assertEqual(len(inspect.signature(handler.received_announce).parameters), 5)
+
+    def test_first_heard_rtt_and_online(self):
+        wall, mono = self.clocks()
+        traffic = self.feature.traffic
+        self.node.routing.heard(P1)  # in the table, never counted
+        traffic.heard(P2, "client")
+        traffic.announced(P2, wall.now)
+        traffic.measured(P4, 0.4)
+        self.advance(wall, mono, mesh.ONLINE_WINDOW + 1)
+        traffic.request(P2, mesh.ANSWERED)
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        p1, p2, p3, p4 = (listed[node_id.hex()] for node_id in (P1, P2, P3, P4))
+        self.assertEqual(p1["first_heard"], wall.now - p1["seniority"])  # entered the table then
+        self.assertEqual((p1["rtt"], p1["rtt_at"], p1["online"]), (None, None, False))
+        self.assertEqual((p2["first_heard"], p2["online"]), (50000.0, True))  # answered just now
+        self.assertEqual((p3["first_heard"], p3["online"]), (None, True))  # an open link, nothing counted
+        self.assertEqual((p4["first_heard"], p4["rtt"], p4["rtt_at"], p4["online"]),
+                         (50000.0, 0.4, 50000.0, False))  # its link closed longer than ONLINE_WINDOW ago
+        # Every field before 0.1.7 is still there
+        self.assertEqual(set(p1), {"node_id", "mode", "in_table", "seniority", "senior", "hops", "interface",
+                                   "bitrate", "link", "rate", "last_heard", "last_active", "banned", "sent",
+                                   "received", "requests", "answered", "refused", "failed", "bad",
+                                   "first_heard", "rtt", "rtt_at", "online"})
+
+    def test_first_heard_from_rns_cache(self):
+        # RNS's announce cache heard it by then, before this run counted it: the earlier time
+        self.node.reticulum = object()
+        self.addCleanup(setattr, self.node, "reticulum", None)
+        self.clocks()
+        self.feature.traffic.heard(P2, "client")
+        with mock.patch.dict(RNS.Identity.known_destinations, {P2: [40000.0, b"", b"", None]}), \
+                mock.patch.object(RNS.Identity, "recall_app_data", return_value=None):
+            listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        self.assertEqual(listed[P2.hex()]["first_heard"], 40000.0)
+
+    def peer_events(self) -> list[tuple[str, str, bool]]:
+        """The node's "peer" events since the last call, as (node ID, change, online), sorted."""
+        found = self.node.events.since(getattr(self, "_seen", 0), kinds=["peer"])
+        self._seen = found["next"]
+        return sorted((event["node_id"], event["change"], event["online"]) for event in found["events"])
+
+    def test_peer_events(self):
+        wall, mono = self.clocks()
+        traffic = self.feature.traffic
+        P5, P6 = bytes([5]) * 16, bytes([6]) * 16
+        self.node.routing.heard(P1)
+        traffic.announced(P2, wall.now)
+        self.feature.check()  # the first records the states: no flood at start
+        self.assertEqual(self.peer_events(), [])
+        self.advance(wall, mono, 1)
+        self.node.routing.heard(P5)  # as seeded from RNS's announce cache: not heard this run, so no event
+        traffic.announced(P4, wall.now)
+        traffic.heard(P6, "client")  # a path response only: new, but not shown up
+        self.feature.check()
+        self.assertEqual(self.peer_events(), [(P4.hex(), "new", True), (P6.hex(), "new", False)])
+        wall.now -= 86400  # a wall clock step back decides nothing
+        self.feature.check()  # nothing changed
+        self.assertEqual(self.peer_events(), [])
+        wall.now += 86400
+        self.advance(wall, mono, mesh.ONLINE_WINDOW - 0.5)  # P2's window has passed, P4's not yet
+        self.feature.check()
+        self.assertEqual(self.peer_events(), [(P2.hex(), "offline", False)])
+        self.advance(wall, mono, 1)
+        traffic.request(P2, mesh.REFUSED)  # it answered
+        self.node.client.links = []  # P3's link closed
+        self.feature.check()
+        self.assertEqual(self.peer_events(), [(P2.hex(), "online", True), (P3.hex(), "offline", False),
+                                              (P4.hex(), "offline", False)])
+
+    def test_events_dont_follow_the_listings_cut(self):
+        # A routing table beyond MAX_PEERS cuts the listing; an online peer cut from it isn't offline
+        wall, mono = self.clocks()
+        self.node.client.links = []
+        self.feature.traffic.request(P2, mesh.ANSWERED)
+        self.feature.check()
+        with mock.patch.object(mesh, "MAX_PEERS", 3):
+            for i in range(10, 15):
+                self.node.routing.heard(bytes([i]) * 16)
+            self.assertNotIn(P2.hex(), {peer["node_id"] for peer in self.feature.peers()})
+            self.feature.check()
+            self.assertEqual(self.peer_events(), [])
+            self.advance(wall, mono, mesh.ONLINE_WINDOW + 1)
+            self.feature.check()
+        self.assertEqual(self.peer_events(), [(P2.hex(), "offline", False)])
+
+    def test_events_thread_runs_and_stops(self):
+        with mock.patch.object(peers_feature, "CHECK_INTERVAL", 0.05):
+            self.feature.start()
+            wait_for(lambda: self.feature._states is not None, what="the first check")
+            self.feature.traffic.request(P4, mesh.ANSWERED)
+            wait_for(lambda: self.peer_events(), what="the new peer's event")
+        self.feature.stop(time.monotonic() + 5)
+        self.assertTrue(self.feature._join(time.monotonic()))
+
     def test_recalled_mode_doesnt_mark_used(self):
         # A listing is a check, not a contact (C2)
         self.node.reticulum = object()
@@ -744,6 +938,20 @@ class PeersFeatureTest(unittest.TestCase):
         from rnfs import cli
         self.assertTrue(cli.build_parser().parse_args(["peers", "--json"]).json)
         self.assertFalse(cli.build_parser().parse_args(["stats"]).json)
+
+    def test_table_rtt_and_online_columns(self):
+        self.feature.traffic.measured(P2, 0.085)
+        listed = {peer["node_id"]: peer for peer in self.feature.peers()}
+        header, *lines = peers_feature.format_peers(sorted(listed.values(), key=lambda p: p["node_id"]), 0)
+        # The older columns keep their places; RTT and ONLINE come last
+        self.assertTrue(header.startswith("NODE"))
+        self.assertTrue(header.endswith("FAIL     RTT ONLINE"), header)
+        self.assertEqual([line.split()[-2:] for line in lines], [["85ms", "yes"], ["-", "yes"]])
+        # A daemon before 0.1.7 sends neither field
+        old = {key: value for key, value in listed[P3.hex()].items() if key not in ("rtt", "rtt_at", "online")}
+        self.assertEqual(peers_feature.format_peers([old], 0)[1].split()[-2:], ["-", "-"])
+        self.assertEqual(peers_feature.human_rtt(2.43), "2.4s")
+        self.assertEqual(peers_feature.human_rtt(float("nan")), "-")
 
     def test_human_formats(self):
         self.assertEqual(peers_feature.human_size(None), "-")
