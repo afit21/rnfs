@@ -307,6 +307,8 @@ E2E = unittest.skipUnless(os.environ.get("RNFS_E2E") == "1", "set RNFS_E2E=1 to 
 
 
 @E2E
+@unittest.skipIf(os.name == "nt", "drives the page through a /bin/sh shim of the rnfs command: on Windows the "
+                 "page's subprocess finds the installed rnfs.exe instead (the page's logic runs above on Windows)")
 class DisplayPageDaemonTest(unittest.TestCase):
     """Run the actual page script against a real victim daemon served by a real provider."""
 
