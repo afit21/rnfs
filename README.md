@@ -9,7 +9,7 @@ Share files over LoRa radio, Wi-Fi, local networks or the internet without relyi
 
 Access any file on RNFS by it's **'CID'**.
 
-***Example:*** The Moby Dick Book .txt file: ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
+***Example:*** Moby Dick book .txt file: ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
@@ -40,7 +40,7 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 
 ### Key Features
 
-***📃 Share File With A Single Line (CID) -*** To fetch a file, all someone needs it's a 'CID'. For example: The communist Manifesto PDF - ```bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya```
+***📃 Share File With A Single Line (CID) -*** To fetch a file, all someone needs it's a 'CID'. For example: Moby Dick book .txt file - ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
 
 <p align="center">
 <img width="500" alt="rnfs-cid" src="https://github.com/user-attachments/assets/01a4b717-9647-4df1-a924-254f92031141" />
