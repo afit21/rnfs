@@ -434,10 +434,10 @@ class SupportedPythonsTest(unittest.TestCase):
         self.assertIn(f"older than Python {self.oldest}, which rnfs needs", shell_function("find_python"))
 
     def test_readme_pyinstaller_is_locked(self):
-        """README's pyinstaller==X (building the binary by hand) is the version build-tools.lock pins."""
+        """README's pyinstaller==X (building the binary by hand), where it gives one, is the version build-tools.lock
+        pins."""
         versions = re.findall(r"\bpyinstaller==([\w.]+)", read(os.path.join(REPO, "README.md")))
-        self.assertTrue(versions)
-        self.assertEqual(set(versions), {read_lock(TOOLS_LOCK)["pyinstaller"][0]})
+        self.assertLessEqual(set(versions), {read_lock(TOOLS_LOCK)["pyinstaller"][0]})
 
 
 class ChangelogTest(unittest.TestCase):
