@@ -29,6 +29,15 @@
 Security fixes, maintainability work and performance work, with no wire-format or CID changes (see
 CHANGELOG.md).
 
+# 0.1.7
+
+## Faster block writes on SD cards (plan item B, then A2)
+Sync blocks to disk at the durability point (before a pin or cache save) instead of once per block, with one
+`syncfs()` on Linux; keep the per-block fsync on other platforms and on stacked filesystems (ecryptfs, overlayfs),
+where `syncfs()` may write nothing back. A block left damaged by a power loss is found and deleted at the next
+start (a `blocks/.dirty` marker). Measure on a Pi SD card first (`tests/bench_block_writes.py`); then move block
+writes off the fetch thread (A2). Deferred from 0.1.6: see 0.1.6-plan.md, item B.
+
 # Later
 
 ## Alternate Pin Sources
