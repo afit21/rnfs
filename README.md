@@ -19,6 +19,7 @@ Access any file on RNFS by it's **'CID'**.
 
 ### Publish files that anyone can fetch over Reticulum by it's hash
 
+No centralized servers
 
 <img width="700" alt="rnfs demo" src="https://raw.githubusercontent.com/afit21/rnfs/refs/heads/main/rnfsgifcompressed.gif" />
 
@@ -55,29 +56,11 @@ RNFS provides a number of benefits compared to other 'torrenting for RNS' or fil
 
 # Ways To Use RNFS
 
-Things made using RNFS & applications wrapping RNFS
-
-### Standard Install (Command line + HTML gateway)
-
-See the quickstart section bellow to install this project and get started with RNFS.
-
-See documentation for more in depth information.
-
-### GUI Application (Planned)
-
-Comming soon, stay tuned
-
-### Project Gutenberg Nomadnet Mirror
-
-Visit `78d812594409fc12489f3d392974bec9:/page/index.mu` on NomadNet.
-
-This is essentially a site that indexes a mirror of Project Gutenberg (libary of over 70k public domain books). It serves files through a gateway rather than RNFS but also provides CIDs.
-
-### Public RNFS NomadNet Gateway 
-
-Access file on RNFS via the nomadnet gateway at `14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu`
-
-A use case is that you can host files on rnfs and share them via `14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu'cid=<CID>|o=<File Name>`
+* ***GUI Application (Planned)*** - User friendly interface for rnfs coming soon
+* ***Standard Install (Command line + HTML gateway)*** - See the [Quick Start](#quick-start) or [Getting started](#getting-started) sections to install this project and get started with RNFS.
+* ***Host a NomadNet Gateway*** - See [RNFS NomadNet Gateway Project](https://github.com/afit21/rnfs-nomadnet-gateway)
+* ***Project Gutenberg NomadNet Mirror*** - Visit `78d812594409fc12489f3d392974bec9:/page/index.mu` on NomadNet. This is essentially a site that indexes a mirror of Project Gutenberg (libary of over 70k public domain books). It serves files through a gateway rather than RNFS but also provides CIDs.
+* ***Public RNFS NomadNet Gateway*** - Access file on RNFS via the nomadnet gateway at `14c5fc21e231343073ff9e64a26d6f5d:/page/index.mu`
 
 # Quick start
 
