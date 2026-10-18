@@ -297,6 +297,8 @@ rather than linking them. rnfs refuses an identity or `rnfs.toml` owned by anoth
 Some files & folders that I host as examples for everyone to download. Fetch them with a running daemon that is
 connected to a network ([Getting started](#getting-started)):
 
+*Moby Dick book .txt file* - bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q
+
 *The Communist Manifesto* - bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya (PDF, 715 KB)
 
 *Original Doge Photo* - bafkreigqte4wbglswc74766w445b67scla7kd2wvrqtp6t7a2ofw32znny
