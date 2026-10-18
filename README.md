@@ -9,7 +9,7 @@ Share files over LoRa radio, Wi-Fi, local networks or the internet without relyi
 
 Access any file on RNFS by it's **'CID'**.
 
-***Example:*** The Communist Manifesto PDF: ```bagaibqabciqkq6rth6jhr2vkh7c2ip7p6bsmdxmslbia47rjbmwpcz6wwu6veya```
+***Example:*** The Moby Dick Book .txt file: ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
