@@ -206,7 +206,14 @@ class NodeGetSwapTest(unittest.TestCase):
 
         with mock.patch.object(walker, "_write_file", write_and_swap), self.assertRaisesRegex(ValueError, CHANGED):
             self.node.get(self.cid, self.out)
-        self.assertEqual(os.listdir(self.attacker), [])
+        if fsutil.IS_WINDOWS:
+            # Writing by path, Windows creates the file where the link leads before its final path can be checked:
+            # it is refused unwritten, and left there empty, as removing it by path could be redirected too
+            # (walker._PathOutput). Other users are kept out of the partial output by its private access list
+            self.assertEqual({name: os.path.getsize(os.path.join(self.attacker, name))
+                              for name in os.listdir(self.attacker)}, {"evil.desktop": 0})
+        else:
+            self.assertEqual(os.listdir(self.attacker), [])
         self.assertFalse(os.path.lexists(self.out))
         self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".rnfs-get-")], [])
 
