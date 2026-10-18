@@ -9,8 +9,9 @@
 - A target may start with a name contact's nick: `rnfs get alice/docs/report.pdf` resolves alice's name to
   its CID first (RnfsNode._parse_target calls expand_target; never for the gateway, so web pages can't use
   or probe the address book). Wherever the CLI takes a node ID (`get --from`, `ping`, `pin remote`), a node
-  contact's nick works too (node_arg). The LXMF feature looks nicks up with lookup(nick, "lxmf"), and trusts
-  senders that has(address, "lxmf") finds.
+  contact's nick works too (node_arg). The LXMF feature resolves a recipient's nick with resolve_id(nick, "lxmf"),
+  trusts senders that has(address, "lxmf") finds, and names them in the inbox listing with nick_of(address,
+  "lxmf"). What other features may call is rnfs.features.ContactsApi (tests/test_contacts.py checks it).
 - Stored in the state database's contacts table (rnfs.statedb), each change written at once, durably; at most
   MAX_CONTACTS entries.
 
@@ -20,6 +21,7 @@ import re
 import threading
 import time
 
+from rnfs import ids
 from rnfs.content.cid import is_valid as is_valid_cid
 from rnfs.errors import NotFound
 from rnfs.features import Feature, _common
@@ -31,14 +33,20 @@ KINDS = ("name", "node", "lxmf")
 MAX_CONTACTS = 10_000  # an address book is typed in by hand; this only bounds the saved state
 EXPAND_AGE = 60.0  # seconds a nick's resolved CID is reused when a target starts with a contact's nick
 _NICK = re.compile(r"[a-z0-9][a-z0-9._-]{0,31}")
-_HEX_ID = re.compile(r"[0-9a-f]{32}")
 # RNS destination aspects a hash is checked against to tell its kind
 _KIND_ASPECTS = {"name": ("rnfs", "name"), "node": ("rnfs", "dht"), "lxmf": ("lxmf", "delivery")}
+# Each kind in resolve_id's errors: (article, noun, the word before "contact")
+_KIND_WORDS = {"name": ("a", "name", "name"), "node": ("a", "node", "node"), "lxmf": ("an", "LXMF address", "LXMF")}
+
+
+def _log(message: str, level: int = LOG_INFO):
+    """Log with this feature's prefix."""
+    _common.log(f"contacts: {message}", level)
 
 
 def check_nick(nick) -> str:
     """nick if it is a valid contact nick; ValueError otherwise."""
-    if not isinstance(nick, str) or not _NICK.fullmatch(nick) or _HEX_ID.fullmatch(nick) or is_valid_cid(nick):
+    if not isinstance(nick, str) or not _NICK.fullmatch(nick) or ids.HEX16_LOWER.fullmatch(nick) or is_valid_cid(nick):
         raise ValueError(f"invalid nick {nick!r}: use 1-32 lowercase letters, digits, '-', '_' or '.', starting "
                          "with a letter or digit (and not 32 hex digits)")
     return nick
@@ -55,11 +63,7 @@ def is_nick(text) -> bool:
 
 def parse_hex(text) -> bytes:
     """A 16-byte destination hash from 32 hex characters (RNS's <angle brackets> allowed). ValueError."""
-    if isinstance(text, str):
-        text = text.strip().strip("<>").lower()
-        if _HEX_ID.fullmatch(text):
-            return bytes.fromhex(text)
-    raise ValueError(f"invalid hash {text!r}: must be 32 hex characters")
+    return ids.parse_hex16(text, "hash", brackets=True)
 
 
 def check_kind(kind) -> str:
@@ -85,7 +89,7 @@ def import_contacts(value, tx) -> int:
                        (nick, check_kind(entry["kind"]), parse_hex(entry["id"])))
             count += 1
         except (KeyError, TypeError, ValueError):
-            ContactsFeature._log(f"ignoring malformed contact {nick!r} in contacts.json", LOG_WARNING)
+            _log(f"ignoring malformed contact {nick!r} in contacts.json", LOG_WARNING)
         if count >= MAX_CONTACTS:
             break
     return count
@@ -95,6 +99,7 @@ class ContactsFeature(Feature):
     """The address book. Thread-safe."""
 
     name = NAME
+    optional = ("keepers",)  # a name it keeps is a name (detect_kind)
 
     def __init__(self, node):
         """Load the address book from the state database."""
@@ -102,23 +107,21 @@ class ContactsFeature(Feature):
         super().__init__(node)
         self._lock = threading.Lock()
         self._contacts: dict[str, tuple[str, bytes]] = {}  # nick -> (kind, hash)
-        self._nicks: dict[tuple[str, bytes], int] = {}  # (kind, hash) -> how many nicks name it, for has()
-        self._dirty: set[str] = set()  # nicks changed (or deleted) whose save failed, written with the next change
+        self._nicks: dict[tuple[str, bytes], set[str]] = {}  # (kind, hash) -> the nicks naming it, for has()
         # name -> (CID, monotonic time of the resolve that found it), reused for EXPAND_AGE
         self._expanded: dict[bytes, tuple[str, float]] = {}
-        self._db = statedb.connect(node.config.state_dir)
-        try:
-            self._load()
-        except BaseException:
-            self.close()
-            raise
+        self._db = statedb.open_store(node.config.state_dir, self._load)
 
     # State
 
-    def _load(self):
+    def _load(self, db):
         """Read the contacts table, by nick; malformed rows are logged and deleted, as are any past MAX_CONTACTS."""
+        from rnfs import statedb
+        # Written through, durably: a change is on disk when it returns; one whose write failed is written with the
+        # next change, or by save()
+        self._store = statedb.RowStore(db, "contacts", ("nick",), durable=True, lock=self._lock, row=self._row)
         bad = []
-        for nick, kind, ident in self._db.query("SELECT nick, kind, id FROM contacts ORDER BY nick"):
+        for nick, kind, ident in db.query("SELECT nick, kind, id FROM contacts ORDER BY nick"):
             if len(self._contacts) >= MAX_CONTACTS:
                 bad.append((nick,))  # never added (the address book is full): dropped, as from contacts.json
                 continue
@@ -128,42 +131,38 @@ class ContactsFeature(Feature):
                     raise ValueError("not a 16-byte hash")
                 self._set(nick, (check_kind(kind), ident))
             except (TypeError, ValueError):
-                self._log(f"ignoring malformed contact {nick!r}", LOG_WARNING)
+                _log(f"ignoring malformed contact {nick!r}", LOG_WARNING)
                 bad.append((nick,))
-        if bad:
-            with self._db.transaction() as tx:
-                tx.executemany("DELETE FROM contacts WHERE nick = ?", bad)
+        statedb.delete_rows(db, "contacts", ("nick",), bad)
+
+    def _row(self, nick: str) -> tuple | None:
+        """nick's contacts row, or None if there is no such contact (lock held)."""
+        entry = self._contacts.get(nick)
+        return None if entry is None else (nick, *entry)
 
     def _set(self, nick: str, value: tuple[str, bytes] | None):
         """Set or (None) delete a contact, keeping _nicks in step (lock held, or loading)."""
         old = self._contacts.pop(nick, None)
         if old is not None:
-            self._nicks[old] -= 1
+            self._nicks[old].discard(nick)
             if not self._nicks[old]:
                 del self._nicks[old]
         if value is not None:
             self._contacts[nick] = value
-            self._nicks[value] = self._nicks.get(value, 0) + 1
+            self._nicks.setdefault(value, set()).add(nick)
 
     def _save(self, nick: str):
-        """Write nick's row, and those of earlier changes whose save failed, durably (lock held). If it fails they
-        are written with the next change."""
-        self._dirty.add(nick)
-        rows = [(other, *self._contacts[other]) for other in self._dirty if other in self._contacts]
-        gone = [(other,) for other in self._dirty if other not in self._contacts]
-        with self._db.transaction(durable=True) as tx:
-            tx.executemany("DELETE FROM contacts WHERE nick = ?", gone)
-            tx.executemany("INSERT OR REPLACE INTO contacts (nick, kind, id) VALUES (?, ?, ?)", rows)
-        self._dirty.clear()
+        """Write nick's row, and those of earlier changes whose save failed, durably (lock held). Raises OSError if
+        it fails (the change stays in memory); they are then written with the next change, or by save()."""
+        self._store.changed(nick)
+
+    def save(self):
+        """Write the contacts whose write failed, if any (each change is written as it is made)."""
+        self._store.save()
 
     def close(self):
         """Release the state database (the node calls this once it has saved everything at shutdown)."""
         self._db.close()
-
-    @staticmethod
-    def _log(message: str, level: int = LOG_INFO):
-        """Log with this feature's prefix."""
-        _common.log(f"contacts: {message}", level)
 
     # The address book
 
@@ -182,7 +181,7 @@ class ContactsFeature(Feature):
                 raise ValueError(f"the address book is full ({MAX_CONTACTS} contacts)")
             self._set(nick, (kind, ident))
             self._save(nick)
-        self._log(f"added {nick}: {kind} {ident.hex()}")
+        _log(f"added {nick}: {kind} {ident.hex()}")
         return {"nick": nick, "kind": kind, "id": ident.hex()}
 
     def remove(self, nick: str):
@@ -215,6 +214,13 @@ class ContactsFeature(Feature):
         with self._lock:
             return (kind, bytes(ident)) in self._nicks
 
+    def nick_of(self, ident: bytes, kind: str) -> str | None:
+        """The nick of the contact of that kind with hash ident (the first by nick if several name it), or None
+        (for other features: the LXMF inbox listing names its senders' contacts)."""
+        with self._lock:
+            nicks = self._nicks.get((kind, bytes(ident)))
+            return min(nicks) if nicks else None
+
     def get(self, nick: str) -> dict:
         """One contact. NotFound if there is none; ValueError for an invalid nick."""
         check_nick(nick)
@@ -225,20 +231,24 @@ class ContactsFeature(Feature):
         return {"nick": nick, "kind": entry[0], "id": entry[1].hex()}
 
     def resolve_id(self, text: str, kind: str) -> bytes:
-        """32 hex characters as bytes, or the hash of a contact of kind with that nick. ValueError otherwise."""
+        """32 hex characters as bytes, or the hash of a contact of kind with that nick. ValueError otherwise.
+
+        Other features call it too (keepers' and follow's names, LXMF's recipients), so they all word it alike.
+        """
         try:
             return parse_hex(text)
         except ValueError:
             pass
+        article, noun, word = _KIND_WORDS.get(kind, ("a", kind, kind))
         if is_nick(text):
             ident = self.lookup(text, kind)
             if ident is not None:
                 return ident
             known = self.lookup(text)
             if known is not None:
-                raise ValueError(f"contact {text} is not a {kind}")
-            raise ValueError(f"no {kind} contact {text}")
-        raise ValueError(f"invalid {kind} {text!r}: give 32 hex characters or a contact's nick")
+                raise ValueError(f"contact {text} is not {article} {noun}")
+            raise ValueError(f"no {word} contact {text}")
+        raise ValueError(f"invalid {noun} {text!r}: give 32 hex characters or a contact's nick")
 
     # Kinds
 
@@ -248,7 +258,7 @@ class ContactsFeature(Feature):
         names = node.names
         if any(entry["name"] == ident.hex() for entry in names.list()) or names.record(ident) is not None:
             return "name"
-        keepers = node.features.get("keepers")
+        keepers = self.dependency("keepers")
         if keepers is not None and keepers.is_kept(ident):
             return "name"
         if ident == node.node_id or node.routing.contains(ident):
@@ -398,7 +408,7 @@ def node_arg(args, text: str | None) -> str | None:
 
     For the CLI's --from, ping and pin remote. Fails the command for an unknown nick.
     """
-    if text is None or _HEX_ID.fullmatch(text.strip().strip("<>").lower()) or not is_nick(text):
+    if text is None or ids.is_hex16(text, brackets=True) or not is_nick(text):
         return text  # hex, or something the API will reject with its own message
     import rnfs.cli
     contact = rnfs.cli.client(args).get("/api/contacts/get", nick=text)  # exits with "no contact <nick>"

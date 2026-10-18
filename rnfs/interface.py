@@ -20,10 +20,11 @@ import io
 import os
 import threading
 import time
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from rnfs.config import _HEX_ID
+from rnfs import ids
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
@@ -32,6 +33,9 @@ from rnfs.objects import (Added, Collected, DenyState, Entry, Exported, Imported
                           Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
+# The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
+# to it, so the per-request cost is spread over more bytes; a seek starts again at FILE_BUFFER
+READ_AHEAD = 4 * 1024 * 1024
 STOP_WAIT = 5.0  # seconds close() waits for the event and job threads to end
 
 
@@ -41,7 +45,7 @@ def node_hex(node_id) -> str | None:
         return None
     if isinstance(node_id, (bytes, bytearray)) and len(node_id) == 16:
         return bytes(node_id).hex()
-    if isinstance(node_id, str) and _HEX_ID.fullmatch(node_id):
+    if isinstance(node_id, str) and ids.HEX16.fullmatch(node_id):
         return node_id.lower()
     raise ValueError(f"invalid node ID or name {node_id!r}: 16 bytes or 32 hex characters")
 
@@ -422,8 +426,9 @@ class Rnfs:
         return Written.from_dict({**result, "output": output})
 
     def open(self, target, *, from_node=None, raw: bool = False) -> "File":
-        """A file to read and seek in, each read fetching only the chunks it covers (sealed files read as
-        plaintext unless raw). Raises the fetch errors, ValueError (a directory); reads raise the fetch errors."""
+        """A file to read and seek in, each read after a seek fetching only the chunks it covers, sequential reads
+        reading ahead (sealed files read as plaintext unless raw). Raises the fetch errors, ValueError (a
+        directory); reads raise the fetch errors."""
         self._check()
         text, hint = self._target(target)
         from_node = self._from(from_node, hint)
@@ -600,7 +605,8 @@ class Rnfs:
 
 
 class _FileReader(io.RawIOBase):
-    """File's raw stream: each readinto is one read of [position, position + its length) of the target opened.
+    """File's raw stream: each refill is one read of the target opened from the position, of what readinto asks
+    for, or (read sequentially) of up to READ_AHEAD bytes ahead, kept for the next readintos.
 
     By the target (root and path), not the file's own CID: providers announce roots (provide_strategy), so the
     file's CID may have none."""
@@ -614,6 +620,9 @@ class _FileReader(io.RawIOBase):
         self.from_node = from_node
         self.raw = raw
         self.position = 0
+        self._ahead = memoryview(b"")  # bytes read from the position on but not handed out yet
+        self._fetched_to: int | None = None  # where the last read ended, while no seek has moved the position
+        self._window = FILE_BUFFER  # the last refill's read-ahead size, doubled while reads are sequential
 
     def readable(self) -> bool:
         """True."""
@@ -624,12 +633,43 @@ class _FileReader(io.RawIOBase):
         return True
 
     def readinto(self, buffer) -> int:
-        """Fill buffer from the position, fetching only what it covers; 0 at the end."""
+        """Fill buffer from the position, from what was read ahead or else one read; 0 at the end."""
         wanted = min(len(buffer), self.info.size - self.position)
         if wanted <= 0:
             return 0
+        if not self._ahead:
+            self._ahead = memoryview(self._read(self._refill_size(wanted)))
+        count = min(wanted, len(self._ahead))
+        buffer[:count] = self._ahead[:count]
+        self._ahead = self._ahead[count:]
+        self.position += count
+        return count
+
+    def readall(self) -> bytes:
+        """The rest of the file in one read (RawIOBase's would make one per 8 KiB), after what was read ahead."""
+        chunks = [bytes(self._ahead)]
+        self.position += len(self._ahead)
+        self._ahead = memoryview(b"")
+        while self.position < self.info.size:
+            data = self._read(self.info.size - self.position)
+            chunks.append(data)
+            self.position += len(data)
+        return b"".join(chunks)
+
+    def _refill_size(self, wanted: int) -> int:
+        """How much a refill of wanted bytes reads: just those, unless it continues where the last read ended.
+        Then the read-ahead doubles (up to READ_AHEAD), so a sequential reader makes few requests, and no more
+        than about what it has already read is fetched beyond what it reads."""
+        if self._fetched_to != self.position:
+            return wanted
+        self._window = min(2 * self._window, READ_AHEAD)
+        return min(max(wanted, self._window), self.info.size - self.position)
+
+    def _read(self, length: int) -> bytes:
+        """One read of [position, position + length), fetching only what it covers. Raises RnfsError if the
+        file ends before it."""
         self.owner._check()
-        chunks = self.owner._backend.read(self.name, self.position, wanted, self.raw, self.from_node)
+        chunks = self.owner._backend.read(self.name, self.position, length, self.raw, self.from_node)
         try:
             data = b"".join(chunks)
         finally:
@@ -638,25 +678,21 @@ class _FileReader(io.RawIOBase):
                 close()
         if not data:
             raise RnfsError(f"{self.name} ended at {self.position} of its {self.info.size} bytes")
-        buffer[:len(data)] = data
-        self.position += len(data)
-        return len(data)
-
-    def readall(self) -> bytes:
-        """The rest of the file in one read (RawIOBase's would make one per 8 KiB)."""
-        chunks = []
-        while self.position < self.info.size:
-            buffer = bytearray(self.info.size - self.position)
-            chunks.append(bytes(buffer[:self.readinto(buffer)]))
-        return b"".join(chunks)
+        self._fetched_to = self.position + len(data)
+        return data
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        """Move the position (past the end is allowed: reads there return nothing)."""
+        """Move the position (past the end is allowed: reads there return nothing). A move drops what was read
+        ahead, and the next refill reads only what it covers."""
         base = {io.SEEK_SET: 0, io.SEEK_CUR: self.position, io.SEEK_END: self.info.size}.get(whence)
         if base is None:
             raise ValueError(f"invalid whence {whence!r}")
         if base + offset < 0:
             raise ValueError("negative seek position")
+        if base + offset != self.position:
+            self._ahead = memoryview(b"")
+            self._fetched_to = None
+            self._window = FILE_BUFFER
         self.position = base + offset
         return self.position
 
@@ -664,10 +700,16 @@ class _FileReader(io.RawIOBase):
         """The position."""
         return self.position
 
+    def close(self):
+        """Close the stream, dropping what was read ahead."""
+        self._ahead = memoryview(b"")
+        super().close()
+
 
 class File(io.BufferedReader):
     """A file in rnfs, from open(): read, readinto, readline, iteration, seek and tell, buffered by FILE_BUFFER
-    bytes, each refill fetching only the chunks it covers. Reads go by the target opened (an rnfs: name URI
+    bytes. A refill after open or a seek fetches only the chunks it covers; each refill continuing the last reads
+    ahead twice as far, up to READ_AHEAD. Reads go by the target opened (an rnfs: name URI
     resolved once, at open; a contact nick is expanded by the node, which reuses its CID for 60 s). cid is the
     file's own CID, size its size, info its Info, as open() found them. Not thread-safe, like any file object."""
 
@@ -725,9 +767,13 @@ class Name:
 
     def publish(self, target) -> Record:
         """Point the name at target (a path in it resolved locally) and announce it; the new record. Raises
-        NotFound (a path not stored here), ValueError, RnfsError (the highest sequence reached)."""
+        NotFound (a path not stored here), ValueError, RnfsError (the highest sequence reached). In private mode
+        the node's warning that the announce is visible outside the private network is raised as a
+        RuntimeWarning (warnings.warn), as the CLI prints it."""
         self._owner._check()
         result = self._owner._backend.name_publish(self.alias, self._owner._target(target)[0])
+        if result.get("warning"):
+            warnings.warn(result["warning"], RuntimeWarning, stacklevel=2)
         return Record.from_dict({**result, "age": 0.0})
 
     def export_key(self) -> bytes:
@@ -783,7 +829,7 @@ class Names:
         """The newest record of name (16 bytes, 32 hex characters, a Name or a name contact's nick), after
         asking the network; persisted, so it never goes back. Raises NotFound (unresolved), ValueError."""
         self._owner._check()
-        text = name if isinstance(name, str) and not _HEX_ID.fullmatch(name) else node_hex(name_bytes(name))
+        text = name if isinstance(name, str) and not ids.HEX16.fullmatch(name) else node_hex(name_bytes(name))
         return Record.from_dict(self._owner._backend.name_resolve(text))
 
     def watch(self, name, callback) -> Watch:

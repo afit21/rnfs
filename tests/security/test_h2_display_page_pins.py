@@ -1,6 +1,6 @@
 """H2: one anonymous view of the display-mu-file page made the node permanently pin (source "user") and
 provide content the visitor chose. The CID comes from var_cid; the page ran stat, ls, `pin add` and cat on it
-with no allowlist and no per-visitor limit. `pin add` pins USER (node.py:821-833), which the node then
+with no allowlist and no per-visitor limit. `pin add` pins USER (RnfsNode.pin_add), which the node then
 provides; and with the default provide_strategy="roots", stat/cat alone already make a cached complete fetch
 be provided, so dropping only the pin would not stop the seeding. That part is documented behaviour of
 "roots" (kept as the default by the user's decision; "pinned" avoids it), tested as such below.
@@ -307,6 +307,8 @@ E2E = unittest.skipUnless(os.environ.get("RNFS_E2E") == "1", "set RNFS_E2E=1 to 
 
 
 @E2E
+@unittest.skipIf(os.name == "nt", "drives the page through a /bin/sh shim of the rnfs command: on Windows the "
+                 "page's subprocess finds the installed rnfs.exe instead (the page's logic runs above on Windows)")
 class DisplayPageDaemonTest(unittest.TestCase):
     """Run the actual page script against a real victim daemon served by a real provider."""
 

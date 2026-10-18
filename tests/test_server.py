@@ -11,12 +11,12 @@ import RNS
 from RNS.vendor import umsgpack
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE,
-                            PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUEST_SIZE,
+                            MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
-from tests.support import FakeClock
+from tests.support import FakeClock, wait_for
 
 KEY = bytes(range(ID_LENGTH))
 
@@ -362,6 +362,10 @@ class FakeBackend:
         """The served block for cid, if any."""
         return self.blocks.get(cid)
 
+    def served_block_size(self, cid):
+        """Not known: the server reads each block to size it."""
+        return None
+
     def remote_pin(self, identity_hash, cid, pin):
         """Accept or refuse a remote pin."""
         self.pins.append((identity_hash, cid, pin))
@@ -370,6 +374,10 @@ class FakeBackend:
     def is_member(self, identity_hash):
         """Whether the identity is a member."""
         return identity_hash in self.members
+
+    def feature_requests(self):
+        """No feature request paths."""
+        return {}
 
 
 class RequestServerTest(unittest.TestCase):
@@ -456,6 +464,70 @@ class RequestServerTest(unittest.TestCase):
         self.assertIs(self.ask(PIN_PATH, [cid.binary, True], link, RNS.Identity()), False)
         self.assertIs(self.ask(PIN_PATH, [cid.binary, True], link, self.identity), True)
         self.assertEqual(self.backend.pins, [(self.identity.hash, cid, True)])
+
+    def test_handler_that_raises_frees_its_slot(self):
+        """A handler whose work raises is answered False and frees its request slot, so the link isn't refused
+        from then on (MAX_REQUESTS_PER_LINK + 1 failures in a row would otherwise leave it with none)."""
+        def broken(*args):
+            """A backend or feature bug."""
+            raise RuntimeError("bug")
+        self.backend.find = self.backend.provide = self.backend.remote_pin = broken
+        self.backend.feature_requests = lambda: {"/feature": broken}
+        self.make_server(self.config)
+        link = self.connect(b"a")
+        cid = self.big[0][0]
+        for path, data in ((FIND_PATH, KEY), (PROVIDE_PATH, [[KEY], []]), (PIN_PATH, [cid.binary, True]),
+                           ("/feature", b"")):
+            with self.subTest(path=path):
+                for _ in range(MAX_REQUESTS_PER_LINK + 1):
+                    self.assertIs(self.ask(path, data, link, self.identity), False)
+                self.assertEqual(self.server.incoming.in_progress(link.link_id), (0, 0))
+        del self.backend.find, self.backend.provide, self.backend.remote_pin
+        self.assertEqual(len(self.ask(FIND_PATH, KEY, link)[0]), K)
+        self.assertIs(self.ask(PROVIDE_PATH, [[KEY], []], link, self.identity), True)
+        self.assertIs(self.ask(PIN_PATH, [cid.binary, True], link, self.identity), True)
+
+    def test_feature_responses_requesters_refuse_are_answered_false(self):
+        """A feature's response is checked with protocol.body_refusal, as every requester since 0.1.4 checks it:
+        one of a shape they'd refuse is answered False (and logged as the bug it is) instead."""
+        answers = {}
+        self.backend.feature_requests = lambda: {"/feature": lambda data, identity: answers[data]}
+        self.make_server(self.config)
+        link = self.connect(b"a")
+        too_many = [None] * (protocol.MAX_BLOCKS_CIDS + 1)
+        for response in ({"a": 1}, "text", 7, too_many, [bytes(protocol.MAX_BLOCK_SIZE + 1)], [[KEY], [KEY], [KEY]]):
+            with self.subTest(response=repr(response)[:40]):
+                answers[b"x"] = response
+                with mock.patch.object(server, "log") as log:
+                    self.assertIs(self.ask("/feature", b"x", link), False)
+                log.assert_called_once_with(mock.ANY, server.LOG_ERROR)
+                self.assertIn("/feature", log.call_args.args[0])
+        for response in (True, False, [], [b"a", None], [[KEY], [KEY]]):
+            with self.subTest(response=response):
+                answers[b"x"] = response
+                self.assertEqual(self.ask("/feature", b"x", link), response)
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (0, 0))
+
+    def test_busy_link_refused_after_the_checks(self):
+        """With both of a link's request slots taken, a request is refused without running its work, and a
+        refusal by a handler's own checks takes no slot."""
+        calls = []
+        self.backend.feature_requests = lambda: {"/feature": lambda data, identity: calls.append(data) or True}
+        self.make_server(self.config)
+        link = self.connect(b"a")
+        for _ in range(MAX_REQUESTS_PER_LINK):
+            self.assertTrue(self.server.incoming.start_request(link.link_id, blocks=False))
+        with mock.patch.object(self.backend, "find") as find:
+            self.assertIs(self.ask(FIND_PATH, KEY, link), False)
+        find.assert_not_called()
+        self.assertIs(self.ask("/feature", b"x", link), False)
+        self.assertEqual(calls, [])
+        self.assertIs(self.ask(PIN_PATH, [b"x", True], link, self.identity), False)  # malformed: refused anyway
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (MAX_REQUESTS_PER_LINK, 0))
+        self.server.incoming.finish_request(link.link_id, blocks=False)
+        self.assertIs(self.ask("/feature", b"x", link), True)
+        self.assertEqual(calls, [b"x"])
+        self.assertEqual(self.server.incoming.in_progress(link.link_id), (MAX_REQUESTS_PER_LINK - 1, 0))
 
     def test_private_mode_refuses_non_members(self):
         self.backend.members = {self.identity.hash}
@@ -570,9 +642,17 @@ class RequestServerTest(unittest.TestCase):
         self.assertIs(self.blocks(link, request_id=b"s" * 16), False)
         resource = self.send(link)
         self.assertIs(self.blocks(link, request_id=b"s" * 16), False)
-        # All parts sent, proof withheld: still refused (after a short grace), and the slots stay held
+        # All parts sent, proof withheld: still refused (after a short grace, on the server's clock), and the
+        # slots stay held
         resource.status = RNS.Resource.AWAITING_PROOF
-        self.assertIs(self.blocks(link, request_id=b"s" * 16), False)
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.blocks(link, request_id=b"s" * 16)))
+        thread.start()
+        time.sleep(0.05)
+        self.assertEqual(results, [])  # waiting out the grace
+        self.clock.now += server.PROOF_GRACE
+        thread.join(5)
+        self.assertEqual(results, [False])
         self.assertEqual(len(self.server.pools.responses()), 1)
         # The proof arriving while the next request waits: accepted
         threading.Timer(0.1, resource.complete).start()
@@ -583,22 +663,22 @@ class RequestServerTest(unittest.TestCase):
         self.blocks(link)
         self.send(link).status = RNS.Resource.AWAITING_PROOF  # all parts sent, proof withheld
         # A flood of /blocks on that link: one waits out the grace, the rest are refused at once
-        finished, results = [], []
+        results = []
 
         def ask(i):
-            """One /blocks request, noting when it was answered."""
+            """One /blocks request, noting its answer."""
             results.append(self.blocks(link, request_id=bytes([i]) * 16))
-            finished.append(time.monotonic())
 
-        start = time.monotonic()
         threads = [threading.Thread(target=ask, args=(i,)) for i in range(1, 9)]
         for thread in threads:
             thread.start()
+        wait_for(lambda: len(results) == 7, timeout=5, what="seven requests to be refused")
+        time.sleep(0.05)
+        self.assertEqual(len(results), 7)  # the grace (2 × RTT + 1 s, on the server's clock) hasn't passed
+        self.clock.now += server.PROOF_GRACE
         for thread in threads:
             thread.join(5)
         self.assertEqual(results, [False] * 8)
-        quick = sum(1 for t in finished if t - start < 0.5)  # the grace here is 2 × RTT + 1 s
-        self.assertEqual(quick, 7)
         self.assertEqual(len(self.server.pools.responses()), 1)
         self.assertEqual(self.server.incoming.in_progress(link.link_id), (1, 1))
         # The waiter's mark is cleared, so the next request may wait for the proof again
@@ -667,8 +747,11 @@ class RequestServerTest(unittest.TestCase):
         bound = server.MAX_PACING_WAIT
         sleeps = []
         with mock.patch.object(self.server, "_pace", lambda response, wait: sleeps.append(wait)):
-            self.blocks(link)  # no rate estimate yet: no cap, no pacing
+            self.blocks(link)  # no rate estimate yet: the explicit cap applies all the same (NET-2)
             self.send(link).complete()
+            self.assertGreater(self.server.pacer.wait_time(link.link_id), bound)
+            self.assertIs(self.blocks(link, request_id=b"q" * 16), False)
+            self.clock.now += 11
             self.assertEqual(self.server.pacer.wait_time(link.link_id), 0)
             self.server.rates.record(link.link_id, 64 * KIB, 1_000_000)
             self.assertNotEqual(self.blocks(link, request_id=b"s" * 16), False)

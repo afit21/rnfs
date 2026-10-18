@@ -7,6 +7,7 @@ import http.client
 import inspect
 import json
 import os
+import re
 import select
 import socket
 import tempfile
@@ -15,9 +16,11 @@ import time
 import unittest
 from unittest import mock
 
-from rnfs import cli, fsutil
+from rnfs import api, cli, features, fsutil
 from rnfs.api import ApiHandler, ApiServer, BodyReader, LocalServer, loggable
+from rnfs.content import edit
 from rnfs.content.cid import DAG, RAW, Cid
+from rnfs import errors
 from rnfs.errors import Busy, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from tests.support import wait_for
 
@@ -280,6 +283,7 @@ class FakeNode:
 
     def dir_rm(self, target):
         self.record("dir_rm", target)
+        edit.check_entry_target(target)  # as RnfsNode.dir_rm, before anything is fetched
         parent, name = target.rsplit("/", 1)
         obj = self._object(self._resolve(parent))
         if name not in obj[1]:
@@ -729,7 +733,9 @@ class EndpointTest(ApiTestCase):
         file_cid = self.node.put_file(b"abc")
         for error, status in ((ValueError("v"), 400), (NotFound("n"), 404), (TooLarge("t"), 413),
                               (Denied("d"), 451), (InvalidDag("i"), 422), (Busy("b"), 503), (StorageFull("s"), 507),
-                              (RnfsError("r"), 500), (RuntimeError("boom"), 500)):
+                              (RnfsError("r"), 500), (RuntimeError("boom"), 500),
+                              (errors.BlockMismatch("m"), 400), (errors.SealError("s"), 400),
+                              (errors.NotRecipient("n"), 400)):
             with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log"):
                 code, headers, data = self.call("GET", f"/api/stat?target={file_cid}")
             self.assertEqual(code, status, error)
@@ -737,6 +743,39 @@ class EndpointTest(ApiTestCase):
             self.assertEqual(headers["Content-Type"], "application/json")
             if status == 503:
                 self.assertIn("Retry-After", headers)
+
+    def test_every_error_class_keeps_its_status(self):
+        """The status of every error class rnfs raises, pinned (XC4): one table, rnfs.errors.STATUSES, decides them,
+        and the classes that became RnfsErrors (BlockMismatch, SealError) stay 400 as the ValueErrors they were."""
+        from rnfs import apiclient
+        pinned = {ValueError: 400, errors.BlockMismatch: 400, errors.SealError: 400, errors.NotRecipient: 400,
+                  apiclient.BadRequest: 400, NotFound: 404, TooLarge: 413, Denied: 451, InvalidDag: 422, Busy: 503,
+                  StorageFull: 507, RnfsError: 500, errors.Cancelled: 500, errors.Closed: 500, OSError: 500,
+                  RuntimeError: 500, KeyError: 500}
+        for error_class, status in pinned.items():
+            with self.subTest(error_class.__name__):
+                self.assertEqual(api.error_status(error_class("x")), status)
+        self.assertIs(api.ERROR_STATUSES, errors.STATUSES)
+        self.assertEqual({status for _, status in errors.STATUSES}, {400, 404, 413, 422, 451, 503, 507})
+        # The classes whose base changed are still caught as ValueErrors, and the content.seal names are the same
+        from rnfs.content import seal
+        self.assertIs(seal.SealError, errors.SealError)
+        self.assertIs(seal.NotRecipient, errors.NotRecipient)
+        for error_class in (errors.BlockMismatch, errors.SealError):
+            self.assertTrue(issubclass(error_class, RnfsError) and issubclass(error_class, ValueError))
+
+    def test_block_mismatch_is_logged(self):
+        """A BlockMismatch is a 400, as the ValueError it was, but a bug, so the API logs it at WARNING; another
+        ValueError (the caller's) isn't logged."""
+        file_cid = self.node.put_file(b"abc")
+        for error, logged in ((errors.BlockMismatch(f"block does not match {file_cid}"), True),
+                              (ValueError("bad"), False)):
+            with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log") as log:
+                self.assertEqual(self.call("GET", f"/api/stat?target={file_cid}")[0], 400)
+            warnings = [c for c in log.call_args_list if c.args[1:] == (api.LOG_WARNING,)]
+            self.assertEqual(len(warnings), 1 if logged else 0, error)
+            if logged:
+                self.assertIn("BlockMismatch", warnings[0].args[0])
 
     def test_state_changing_endpoints(self):
         file_cid = self.node.put_file(b"abc")
@@ -917,6 +956,33 @@ class ConnectionTest(ApiTestCase):
         self.assertIn(f"{cid}/\\x1b[2J\\n", message)
         self.assertNotIn("\x1b", message)
         self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class RouteTableTest(unittest.TestCase):
+    """ApiHandler.ROUTES, the features' routes and the module docstring's tables agree (ND4)."""
+
+    def test_every_route_names_a_handler_method(self):
+        """ROUTES dispatches by name through getattr, so a typo would only show when that route is requested."""
+        for route, name in ApiHandler.ROUTES.items():
+            with self.subTest(route=route):
+                self.assertTrue(name.startswith("api_"), name)
+                self.assertTrue(callable(getattr(ApiHandler, name, None)), name)
+        self.assertLessEqual(ApiHandler.OPEN_ROUTES | {ApiHandler.PROOF_ROUTE}, set(ApiHandler.ROUTES))
+        for route, handler in features.api_routes().items():
+            with self.subTest(route=route):
+                self.assertTrue(callable(handler))
+                self.assertNotIn(route, ApiHandler.ROUTES)
+
+    def test_docstring_tables_list_every_route(self):
+        """Each (method, path) the docstring's tables list is a route, once, and every route is listed."""
+        documented = []
+        for line in api.__doc__.splitlines():
+            row = re.match(r"\| (GET|POST) +\| (/api/[^|]*?) +\|", line)
+            if row is not None:
+                documented += [(row[1], path) for path in row[2].split(", ")]
+        self.assertEqual(len(documented), len(set(documented)), "a route is listed twice")
+        routes = set(ApiHandler.ROUTES) | set(features.api_routes())
+        self.assertEqual(sorted(documented), sorted(routes))
 
 
 class BindTest(unittest.TestCase):

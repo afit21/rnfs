@@ -17,7 +17,10 @@
   transaction recorded in the migrated table, then renames it to <name>.migrated. A crash between the commit and
   the rename leaves the record, so the next start only renames the file: nothing is imported twice or by half.
 
-Stores keep their state in memory and read the database only when they load. Text that may hold lone
+Stores keep their state in memory and read the database only when they load (open_store), and write what changed
+through a RowStore: it keeps the keys changed and not yet written, writes them at once (WRITE_THROUGH) or at the
+store's saves (SNAPSHOT, outside the store's lock, one save at a time), and keeps them for the next write when one
+fails. reconcile_pins makes a feature's pins match its saved state at start. Text that may hold lone
 surrogates (file names, remote strings) is stored through dump() and load(); sequences, which may not fit
 SQLite's signed 64-bit integers, as decimal text.
 """
@@ -42,7 +45,11 @@ MIGRATED_SUFFIX = ".migrated"
 
 # Each step brings PRAGMA user_version from its index to its index + 1, in one transaction. Steps are only ever
 # appended: a store whose layout changes gets a new step (ALTER TABLE, or a new table and an INSERT ... SELECT).
-SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
+# The steps released in 0.1.5 (the first 16) are pinned by a digest in tests/test_statedb.py: a database 0.1.5
+# wrote has them already, so an edit there would never reach it. A step's item is an SQL statement, or a callable
+# taking the transaction's connection, for a migration SQL alone can't express.
+Step = str | Callable[[object], None]
+SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
     ("statedb", (
         # JSON state files imported, so each is imported once (migrate)
         "CREATE TABLE migrated (file TEXT PRIMARY KEY, records INTEGER NOT NULL, at REAL NOT NULL)",
@@ -128,6 +135,13 @@ SCHEMA: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("denylist_hashes", (
         # Files' content SHA-256 (digest) by binary CID; used orders them (least recently used lowest)
         "CREATE TABLE deny_hashes (cid BLOB PRIMARY KEY, digest BLOB NOT NULL, used INTEGER NOT NULL) WITHOUT ROWID",
+    )),
+    ("shared_folder_files", (
+        # What each file in the shared folder was built as (rnfs 0.1.6). name: the dump()ed top-level entry holding
+        # it; state: the dump()ed [device, inode, size, mtime_ns, execute bit] (text: an inode may not fit SQLite's
+        # integers); digest: its content SHA-256, NULL if it was built without one
+        "CREATE TABLE shared_folder_files (name TEXT NOT NULL, state TEXT NOT NULL, cid BLOB NOT NULL,"
+        " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
     )),
 )
 
@@ -232,8 +246,11 @@ class _Database:
                             "one (rnfs never moves state back to an older format)")
         for number in range(version, len(SCHEMA)):
             with self.transaction(durable=True) as tx:
-                for statement in SCHEMA[number][1]:
-                    tx.execute(statement)
+                for step in SCHEMA[number][1]:
+                    if callable(step):
+                        step(tx)
+                    else:
+                        tx.execute(step)
                 tx.execute(f"PRAGMA user_version = {number + 1}")
 
     @contextmanager
@@ -417,6 +434,186 @@ def open_databases() -> list[str]:
     """Paths of the state databases this process has open (tests check none is left open)."""
     with _open_lock:
         return [database.path for database in _open.values()]
+
+
+# Stores: what every store does the same way
+
+
+WRITE_THROUGH = "write_through"
+SNAPSHOT = "snapshot"
+_UNKNOWN = object()  # RowStore's last-written memo has no entry for a key
+
+
+def open_store(state_dir: str, load: Callable[[StateDb], object]) -> StateDb:
+    """A reference to the state database in state_dir (connect) once load(db) has read a store's rows from it
+    (making the store's RowStore first, so the load can mark rows it changed). If load raises, the reference is
+    released and the exception raised."""
+    db = connect(state_dir)
+    try:
+        load(db)
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+def delete_rows(db: StateDb, table: str, key_cols: tuple[str, ...], keys: list[tuple]):
+    """Delete the rows of table whose key_cols hold each of keys (tuples of their values), in one transaction: the
+    rows a store's load found malformed. Not durable: a row a power loss brings back is only dropped again."""
+    if keys:
+        with db.transaction() as tx:
+            tx.executemany(f"DELETE FROM {table} WHERE {_where(key_cols)}", keys)
+
+
+def _where(key_cols: tuple[str, ...]) -> str:
+    """The WHERE clause matching one row's key_cols."""
+    return " AND ".join(f"{column} = ?" for column in key_cols)
+
+
+class RowStore:
+    """Writes a store's changed rows: one table whose key_cols are its primary key, one row per key.
+
+    The store keeps its state in memory under its own lock, and tells changed(key) of each key it changes (lock
+    held). row(key) gives the row key has now, a tuple of the table's columns in the table's order, or None once
+    it is gone (lock held); key_values(key) gives its key_cols' values (by default (key,)). A write deletes the
+    rows of the keys gone and inserts or replaces the others, in one transaction, durable as given.
+
+    This owns what each store used to do by hand: the set of keys changed and not yet written, writing them in
+    order, and keeping them for the next write when one fails (the change itself stays in memory):
+    - WRITE_THROUGH: changed() writes at once, under the store's lock (each change is on disk, as durable says,
+      when it returns); it raises OSError (StateDbError) if the write fails, and the keys are written with the
+      next change or save().
+    - SNAPSHOT: changed() only notes the keys; save() takes them and their rows under the lock and writes them
+      outside it, so a slow disk never holds the store up. One save at a time, so an older snapshot never lands
+      last; if the write fails the keys are noted again and save() raises.
+
+    skip_unchanged: remember each row as last written, and leave out a key whose row is as it was (for a store that
+    marks keys that may not have changed, as jobs mark the running ones at each save). A store whose rows span
+    several tables (the publisher) subclasses this, overriding snapshot() and write_rows().
+    """
+
+    def __init__(self, db: StateDb, table: str, key_cols: tuple[str, ...], *, durable: bool,
+                 mode: str = WRITE_THROUGH, lock, row: Callable[[object], tuple | None] | None = None,
+                 key_values: Callable[[object], tuple] = lambda key: (key,), skip_unchanged: bool = False):
+        """Rows of table for a store whose state lock guards; see the class. Raises ValueError for an unknown
+        mode."""
+        if mode not in (WRITE_THROUGH, SNAPSHOT):
+            raise ValueError(f"unknown RowStore mode {mode!r}")
+        self.db = db
+        self.table = table
+        self.durable = durable
+        self.mode = mode
+        self.lock = lock
+        self._row = row
+        self._key_values = key_values
+        self._dirty: set = set()  # keys changed and not yet written (under lock)
+        self._save_lock = threading.Lock()  # SNAPSHOT: one save at a time, so an older snapshot never lands last
+        # skip_unchanged: key -> its row as last committed (under _save_lock in SNAPSHOT mode, lock otherwise)
+        self._written: dict | None = {} if skip_unchanged else None
+        self._delete = f"DELETE FROM {table} WHERE {_where(key_cols)}"
+        columns = [info[1] for info in db.query(f"PRAGMA table_info({table})")]
+        self._insert = (f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                        f"VALUES ({', '.join('?' * len(columns))})")
+
+    @property
+    def pending(self) -> frozenset:
+        """The keys changed and not yet written."""
+        with self.lock:
+            return frozenset(self._dirty)
+
+    def changed(self, *keys):
+        """Note that keys changed (lock held); in WRITE_THROUGH mode, write them, and any a failed write left, at
+        once. Raises OSError (StateDbError) if that write fails; the keys are then written by the next one."""
+        self._dirty.update(keys)
+        if self.mode == WRITE_THROUGH:
+            self._write_dirty()
+
+    def save(self):
+        """Write the keys changed and not yet written, if any: in SNAPSHOT mode the store's changes since the last
+        save, in WRITE_THROUGH mode those a failed write left. Raises OSError (StateDbError) if the write fails;
+        they are then written by the next save."""
+        if self.mode == WRITE_THROUGH:
+            with self.lock:
+                if self._dirty:
+                    self._write_dirty()
+            return
+        with self._save_lock:
+            with self.lock:
+                keys, self._dirty = self._dirty, set()
+                if not keys:
+                    return
+                snapshot = self.snapshot(keys)
+            try:
+                self._commit(snapshot)
+            except BaseException:
+                with self.lock:  # written by the next save
+                    self._dirty |= keys
+                raise
+
+    def _write_dirty(self):
+        """WRITE_THROUGH: write every key not yet written (lock held), then forget them; kept if it fails."""
+        self._commit(self.snapshot(self._dirty))
+        self._dirty.clear()
+
+    def _commit(self, snapshot):
+        """Write snapshot in one transaction, if it holds anything, then remember what was written."""
+        if snapshot:
+            with self.db.transaction(self.durable) as tx:
+                self.write_rows(tx, snapshot)
+            self.written(snapshot)
+
+    def snapshot(self, keys) -> list:
+        """What a write of keys writes, taken under the lock: [(key, row or None)], leaving out (skip_unchanged)
+        keys whose row is as last written. Empty (false) when there is nothing to write."""
+        rows = [(key, self._row(key)) for key in keys]
+        if self._written is not None:
+            rows = [(key, row) for key, row in rows if self._written.get(key, _UNKNOWN) != row]
+        return rows
+
+    def write_rows(self, tx, snapshot):
+        """Write snapshot inside transaction tx: delete the keys gone, insert or replace the others' rows."""
+        tx.executemany(self._delete, [self._key_values(key) for key, row in snapshot if row is None])
+        tx.executemany(self._insert, [row for _, row in snapshot if row is not None])
+
+    def written(self, snapshot):
+        """snapshot was committed (skip_unchanged: remember its rows; a key gone is forgotten)."""
+        if self._written is None:
+            return
+        for key, row in snapshot:
+            if row is None:
+                self._written.pop(key, None)
+            else:
+                self._written[key] = row
+
+
+def reconcile_pins(pins: dict, prefix: str, recorded: Callable[[str, object], bool], clean: bool,
+                   adopt: Callable[[dict[str, list]], None], release: Callable[[str, object], None]):
+    """At start, make a feature's pins match its saved state. Its pins are those whose source is prefix and an
+    owner ("lxmf:<sender>", "follow:<name>"); pins is storage.pins() (CID -> sources). A pin recorded(owner, cid)
+    says the state doesn't record was left by a crash between the pin and the save, or by state that was lost.
+
+    If the state is clean (saved whole, and every row of it read), release(owner, cid) releases each such pin:
+    nothing else would (`pin rm` releases only the user's pins). An OSError it raises (a read-only state
+    directory) is logged; the pin is tried again at the next start. Otherwise such a pin may be all that is left
+    of the state that was lost: adopt({owner: [cid, ...]}) records them again (owners and CIDs in order), so they
+    are kept, and the feature can release them later."""
+    unrecorded: dict[str, list] = {}
+    for cid, sources in pins.items():
+        for source in sources:
+            if source.startswith(prefix) and not recorded(source[len(prefix):], cid):
+                unrecorded.setdefault(source[len(prefix):], []).append(cid)
+    if not unrecorded:
+        return
+    if not clean:
+        adopt({owner: sorted(unrecorded[owner], key=str) for owner in sorted(unrecorded)})
+        return
+    for owner, cids in unrecorded.items():
+        for cid in cids:
+            try:
+                release(owner, cid)
+            except OSError as e:
+                log(f"state: could not release {cid}, pinned for {prefix}{owner} ({e}); trying again at the next "
+                    "start", LOG_ERROR)
 
 
 # Migration of the JSON state files of rnfs 0.1.4 and earlier

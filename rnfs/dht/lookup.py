@@ -1,5 +1,6 @@
 """Iterative DHT lookups (specification section 6). No RNS dependency: network access, identity knowledge
-and time are injected, so lookups run over in-memory networks in tests.
+and time are injected, so lookups run over in-memory networks in tests. (Only a callback raising, a bug, is
+logged through rnfs.log, which loads RNS, imported then.)
 
 A lookup keeps up to `alpha` /find queries in flight, always to the closest known nodes not yet queried,
 and merges the nodes each reply returns. It is complete once the `beta` closest nodes it knows of have all
@@ -7,17 +8,23 @@ answered, or once every known node has been queried without finding new ones; it
 `lookup_timeout` budget. Queries are blocking calls run on worker threads, so a slow or hung node never
 holds the caller past the deadline.
 
+Nodes near the key can keep answering with ever closer IDs (made up, or ground for the key), so the beta closest
+never all answer. A run therefore also ends, incomplete, once it has sent `max_queries` queries and their answers
+are in, or after STALL_WINDOWS × max(alpha, beta) answers in a row that leave the bit length of the beta-th
+closest known distance unchanged. Over a simulated network of 2000 honest nodes, lookups complete within both.
+
 Nodes whose recent queries all failed (the routing table's `unreliable`) rank after every other node, so a
 lookup asks and waits for them only when it has too few others. One whose retry is due (`may_retry`) is asked
 again on top of the `alpha` queries if it would otherwise rank among the closest, and nothing waits for that
 answer: a node that never establishes a link costs a lookup no time, yet one that comes back is found.
 """
+import heapq
 import queue
 import threading
 import time
 from collections.abc import Callable, Iterable
 
-from rnfs.constants import K
+from rnfs.constants import ID_LENGTH, K
 from rnfs.dht.routing import distance, is_id
 
 # query(node_id, key) -> (provider IDs, node IDs), or None if the node didn't answer, refused, or replied
@@ -26,6 +33,9 @@ FindQuery = Callable[[bytes, bytes], tuple[list[bytes], list[bytes]] | None]
 NodeCallback = Callable[[bytes], object]  # return value ignored
 
 _POLL_INTERVAL = 0.5  # seconds between should_stop() checks while waiting for replies
+MAX_QUERIES = 8 * K  # queries a run sends at most (section 6)
+STALL_WINDOWS = 3  # a run ends after this many query windows of answers in a row that bring the key no nearer
+_FAR = ID_LENGTH * 8 + 1  # _reach with fewer than beta nodes known: farther than any distance
 _STOP = object()  # queued by stop() to wake the waiting caller
 
 
@@ -67,6 +77,7 @@ class Lookup:
       LOG_DEBUG, for the debug log); called from the running thread and the query threads.
     - `unreliable(id)`: nodes to avoid, checked when a run learns of them; `may_retry(id)`: True if an
       unreliable node is due to be asked again, claiming that retry (both the routing table's).
+    - `max_queries`: queries one run sends at most, retries included.
 
     A Lookup may be run again (find_providers after every provider failed): each run re-queries the nodes,
     so /find replies give a fresh random half of providers, within the same deadline and unknown-ID budget.
@@ -79,7 +90,7 @@ class Lookup:
                  on_failure: NodeCallback = _ignore, exclude: Callable[[bytes], bool] = _never,
                  clock: Callable[[], float] = time.monotonic, poll_interval: float = _POLL_INTERVAL,
                  report: Callable[[str], None] = _quiet, unreliable: Callable[[bytes], bool] = _never,
-                 may_retry: Callable[[bytes], bool] = _never):
+                 may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -97,6 +108,7 @@ class Lookup:
         self.report = report
         self.unreliable = unreliable
         self.may_retry = may_retry
+        self.max_queries = max(1, max_queries)
         self.deadline: float | None = None
         self._failed: set[bytes] = set()  # didn't answer: dropped for the rest of the lookup
         self._answered: set[bytes] = set()  # answered in any run
@@ -190,6 +202,13 @@ class Lookup:
         """node_id's distance to the key."""
         return distance(node_id, self.key)
 
+    def _reach(self, known: dict[bytes, int]) -> int:
+        """The bit length of the beta-th closest known node's distance to the key (_FAR if fewer are known):
+        what an answer must shorten to count as progress."""
+        if len(known) < self.beta:
+            return _FAR
+        return heapq.nsmallest(self.beta, known.values())[-1].bit_length()
+
     def _usable(self, node_id) -> bool:
         """True if node_id may be queried in this lookup."""
         return (is_id(node_id) and node_id != self.own_id and node_id not in self._failed
@@ -226,7 +245,11 @@ class Lookup:
         found: list[bytes] = []
         in_flight = 0
         retried = 0
+        sent = 0  # queries sent by this run, retries included: at most max_queries
         window = max(self.alpha, self.beta)
+        # Answers in a row that didn't bring the beta-th closest known node a bit nearer the key
+        reach = self._reach(known)
+        stalled = 0
         self._last_known = known  # live: find_closest reads them once the run ends
         self._last_queried = queried
         self._last_doubtful = doubtful
@@ -249,6 +272,9 @@ class Lookup:
             if ranked and all(node_id in answered for node_id in ranked[:self.beta]):
                 why = "complete"
                 break  # the beta closest known nodes have all answered: complete
+            if stalled >= STALL_WINDOWS * window:
+                why = "no progress"
+                break  # nodes keep answering, but the closest known come no nearer
             for node_id in ranked[:window]:
                 if node_id in retrying:  # a retry the lookup now needs: waited for like any query
                     retrying.discard(node_id)
@@ -257,7 +283,7 @@ class Lookup:
             # Keep up to alpha queries in flight, to the closest nodes not yet queried. Only nodes ranked
             # within the closest max(alpha, beta) known can affect completion, so farther ones aren't
             # queried while nearer queries are pending: on slow networks every query costs airtime.
-            while in_flight < self.alpha:
+            while in_flight < self.alpha and sent < self.max_queries:
                 ranked = sorted(known, key=rank)[:window]
                 node_id = next((n for n in ranked if n not in queried), None)
                 if node_id is None:
@@ -267,20 +293,25 @@ class Lookup:
                     del known[node_id]  # over the unknown-ID budget: dropped, but not a failure
                     continue
                 self._send(node_id, results)
+                sent += 1
                 in_flight += 1
             # An unreliable node that distance alone would rank among them is asked again once its retry is
             # due: only an answer shows it is back. On top of alpha, since nothing waits for it
             for node_id in sorted(known, key=known.__getitem__)[:window]:
-                if node_id not in doubtful or node_id in queried or node_id in passed:
+                if node_id not in doubtful or node_id in queried or node_id in passed or sent >= self.max_queries:
                     continue
                 if self.is_known(node_id) and self.may_retry(node_id):
                     queried.add(node_id)
                     retrying.add(node_id)
                     retried += 1
+                    sent += 1
                     self._send(node_id, results)
                 else:
                     passed.add(node_id)
             if in_flight == 0:
+                if sent >= self.max_queries:
+                    why = "query cap"
+                    break  # sent all it may, and every answer waited for is in
                 why = "no node left to ask"
                 break  # every known node was queried and nothing new turned up
 
@@ -320,6 +351,11 @@ class Lookup:
                     known[new_id] = self._distance(new_id)
                     if self.unreliable(new_id):
                         doubtful.add(new_id)
+            nearer = self._reach(known)
+            if nearer < reach:
+                reach, stalled = nearer, 0
+            else:
+                stalled += 1
             if on_provider is not None:
                 for provider in providers:
                     if provider in self._reported or provider == self.own_id or self.exclude(provider):
@@ -341,7 +377,7 @@ class Lookup:
             started = self.clock()
             try:
                 reply = self._clean(self.query(node_id, self.key))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - one broken node must not abort the lookup
                 reply = None  # one broken node must not abort the lookup
                 self.report(f"lookup for {self.key.hex()}: asking {_name(node_id)} raised {e!r}")
             else:
@@ -351,12 +387,16 @@ class Lookup:
                     else f"answered in {took:.1f}s: {len(reply[0])} providers, {len(reply[1])} nodes"))
             try:
                 (self.on_failure if reply is None else self.on_answer)(node_id)
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged
+                # A bug in the routing table (private mode's admit, say): logged inside the except, so the debug
+                # log has its traceback. rnfs.log loads RNS, which this module doesn't at import
+                from rnfs.log import LOG_WARNING, log
+                log(f"lookup for {self.key.hex()}: the callback for {_name(node_id)} raised {e!r}", LOG_WARNING)
             results.put((node_id, reply))
 
         # Daemon threads rather than a ThreadPoolExecutor: a query hung past the deadline is abandoned
-        # and must not delay process exit. At most alpha run at a time per run.
+        # and must not delay process exit. A run waits for at most alpha at a time; retries of unreliable nodes
+        # run on top of those (each node once per run, every query within max_queries).
         threading.Thread(target=work, name="rnfs-lookup", daemon=True).start()
 
     def _clean(self, reply) -> tuple[list[bytes], list[bytes]] | None:

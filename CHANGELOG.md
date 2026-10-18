@@ -2,6 +2,304 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
+## 0.1.6
+
+Security fixes, maintainability work and performance work. No wire-format or CID changes: these nodes, 0.1.5,
+0.1.4 and 0.1.3 nodes work together. The upgrade of an `<rnfs dir>` is automatic and one-way.
+
+Upgrade notes (each is described in full below):
+- **Settings and the rnfs dir:** a symlinked `rnfs.toml`, or one or a subdirectory owned by another user, stops the
+  start; a loose one (such as a 0664 `rnfs.toml` or 0775 `blocks/`) is made owner-only, with a warning.
+- **The shared folder:** one that leads into the rnfs dir (or a directory holding it) is refused, and its
+  pins with source `folder` are released.
+- **Following names:** a followed name's target may take at most `follow_quota` (new, default 1 GiB).
+- **Deny lists:** while the deny list has `sha256:` entries, a file repeating its content more than 16 times
+  (beyond 64 MiB) can't be read or imported (451).
+- **Local API:** `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the
+  request sets `use_sent_cid`.
+- **Gateway:** browsers that send no `Sec-Fetch-Site` (Safari before 16.4, Firefox before 90) are treated as web
+  pages, so `?format=` downloads give them 409.
+- **`rnfs inbox`:** its message line is reordered (address and trust first, the display name last, quoted).
+- **install.sh:** it stops when the GitHub CLI can check provenance but isn't logged in; log in with
+  `gh auth login`, or set `RNFS_REQUIRE_ATTESTATION=0`.
+- **Flatpak:** after updating, the Flatpak no longer sees the rest of your home folder or any device. Grant what
+  you used again: `flatpak override --user --device=all io.github.afit21.rnfs` for an RNode or other serial
+  interface, and `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` for other folders,
+  `~/.config/reticulum` included if your Reticulum config is there.
+- **State:** the state database gains a table (the shared folder's file cache); an older rnfs can't open it
+  afterwards.
+
+Security:
+- The release workflow's Flatpak build no longer uses the GitHub Actions cache. Any workflow run on the default
+  branch can write that cache, and a poisoned one would have gone into the attested `.flatpak` bundle.
+- `rnfs inbox get` no longer quietly fetches the CID a sender put in a name link when the name can't be
+  resolved. The sender chose that CID and nothing ties it to the name, so any sender could pose as a
+  well-known name. It now fails before writing anything, unless you pass `--use-sent-cid`; then the result
+  carries a warning. Auto-fetch (trusted senders only) keeps the fallback, and records it.
+- A `/blocks` requester that rejects or cancels a response before a quarter of it was sent now cools down for
+  `blocks_cooldown`, per link and per identity, as one that rejected it unsent already did. Before, a requester
+  could take the first window of each response, cancel it and ask again at once, so the node built a whole
+  response per window. Closing the link still starts no cooldown, so an honest reader that gives up early isn't
+  held back.
+- While the deny list has file hashes (`sha256:` entries), a file that declares more than 16 times the bytes of
+  its distinct chunks, plus 64 MiB, is refused (451) before it is hashed. Hashing reads every repeat of
+  repeated content, so six blocks (128 KB) declaring 2^56 bytes made a one-byte `cat`, a gateway range request,
+  `?format=archive` or an `import` hash for about a year, holding a gateway slot. `cat` and the gateway now fetch
+  a file's whole DAG before checking it (unless its hash is already known), so `max_download_size` and the disk
+  reserve apply as they do for `get`.
+- A gateway HEAD (or a range not starting at byte 0) of a stored file the deny list blocks answers 451, like
+  GET. Before, it took its Content-Type from a denied stored chunk, and a HEAD of a file with a denied hash
+  answered 200.
+- A name whose owner is offline can still be resolved through its keepers when Sybil nodes near its keeper key
+  stall the DHT lookup. They could answer `/find` slowly with ever closer IDs, so the search used all of
+  `lookup_timeout` and the keepers then had one second to answer. Each batch of `/name` queries now has its own
+  budget (87.5 s at the defaults); the search for keepers stops once some are known and `lookup_timeout` / 5 has
+  passed, and resumes if their answers don't settle the name.
+- A neighbour replaying an older, validly signed name announce no longer makes its record look current: rnfs
+  reads the replayed announce's own emission time from RNS's announce cache, treats one older than the path's
+  (or carrying another record) as a suspected replay, gives its real age and asks keepers.
+- A provider can no longer hold a fetch for hours by dripping a `/blocks` response: once nothing is left to
+  request and a provider is idle, a batch in flight longer than `deadline_slack` is asked of it too, the first
+  verified copy wins, and the slow request's link is closed (left to finish if another fetch uses it) without
+  counting as a stall. Simulated: 20.6 → 3.3 s.
+- `get` of a directory can no longer be redirected by someone who can rename inside the output swapping one of
+  its directories for a link or junction (or another directory) while it is written. On Linux and macOS the
+  output being written is private (0700, setgid kept) and must start empty, every entry is created relative to
+  its parent's descriptor without following links, and each directory is checked by device and inode before
+  anything is written into it. On Windows it gets a private access list while it is written, and each file's
+  final path must be inside it. A swap fails the get with "output was changed while being written".
+- On Linux and macOS, `rnfs.toml` is now checked before its settings are used, as on Windows: a symlink, a FIFO
+  or anything else that isn't a regular file is refused, and so is a file another user owns; one others may
+  access is made 0600, with a warning; at most 1 MiB of it is read. Its settings choose the Reticulum config, and
+  with it programs rnfs starts, so anyone who could write it could run code as you. Reticulum's `config` gets the
+  same check when `reticulum_dir` is the rnfs dir.
+- The rnfs dir's subdirectories (`state`, `blocks`, `storage`, `names`, `lxmf`) are checked at every start: a
+  symlink, a non-directory or one another user owns stops the start before Reticulum starts; a loose one is made
+  0700, with a notice; and if others could write to it, entries another user owns are reported. Before, a user
+  who could once write in a loose rnfs dir kept their access to `blocks/` and `names/` after it was tightened.
+- The shared folder is no longer scanned when `files/` leads into the rnfs dir. Before, a symlinked `files/` that
+  led to `storage/` or `names/` (or that someone who could write to a directory above it retargeted there)
+  imported, pinned and provided the node's identity or the name keys, and one that led to the rnfs dir or a
+  directory above it shared everything in it. A folder that resolves, as opened, to the rnfs dir, a directory
+  holding it, or anything inside `storage/`, `names/`, `state/`, `blocks/` or `lxmf/` is now refused with a
+  warning and scanned as empty: nothing is imported, and every pin with source `folder` is released, so keys a
+  0.1.5 node already shared that way stop being provided at the first scan after the upgrade. On Linux and macOS,
+  a directory above the folder that other users can change gets a warning, once.
+- A node no longer reads request packets sent to it on `rnfs.dht` links it opened. That end of a link has no
+  request handlers, yet RNS decoded each request (up to the link's packet size) and started a thread for it
+  before finding nothing to run, for any node rnfs linked to. LXMF and host-program links are unchanged.
+- An explicit `max_upload_rate` now applies to every `/blocks` response, including one that fits in one packet.
+  Such responses never give the link a rate estimate, and the cap applied only once there was one, so on a
+  large-MTU path (RNS's TCP interfaces) a requester asking only for single-packet answers was never paced. Waits
+  of up to 5.6 s are held and longer ones refused as busy, as for larger responses. The default cap (half the
+  rate estimate, on slow links) is unchanged.
+- The wait for a previous `/blocks` response's proof uses the round-trip time the requester claims only if it is
+  a finite, non-negative number, and still at most 5 s. Before, a negative claim gave an honest proof no grace,
+  and a value that wasn't a number made the request handler fail.
+- `install.sh` ties a release install to the tag it asked for: where `gh` supports them, the provenance check
+  passes `--source-ref=refs/tags/<tag>` and `--deny-self-hosted-runners`, and only an `rnfs-<version>-*.whl` of
+  that tag's version is installed. Before, an older release's genuinely attested sdist, renamed to the new
+  release's file name, passed both checks.
+- `install.sh` stops when the GitHub CLI has `gh attestation` but isn't logged in (root installs usually hit
+  this), instead of quietly checking `SHA256SUMS` only. Log in with `gh auth login`, or set
+  `RNFS_REQUIRE_ATTESTATION=0` to install with the checksum only. Without `gh` it still warns, and the README now
+  says that `curl | sh` without `gh` trusts whoever can write the release's files.
+- The Flatpak's sandbox is narrowed to `~/.rnfs`, `~/.reticulum` and the Downloads folder, with no devices
+  (before: your whole home folder and every device, so a compromised daemon could write `~/.bashrc`). See the
+  upgrade note below.
+- `install.sh` warns when `RNFS_SOURCE` is, or names, a plain `http://` URL, and the `.deb`'s postinst
+  byte-compiles with `python3 -I`.
+- The file-index-node NomadNet page renders at most once a minute, one visit at a time, and serves its cached
+  page meanwhile (before, every visit ran `rnfs pin ls`).
+- `examples/rnfs_share.py` and `rnfs.Client`'s log escape names and daemon messages, so a name can't drive the
+  terminal.
+- `rnfs.Client` and the CLI check the daemon's proof before believing anything else the API port answers: while
+  the daemon is down, a program listening on its port can no longer make the client raise `Denied`, `NotFound`
+  or `StorageFull` with its own text. Without a valid proof a 503 is `Busy` and anything else `AuthFailed`, both
+  in the client's own words. Connecting and proving time out after 15 s (or the client's timeout, if shorter),
+  and at most 64 KiB of the proof response is read.
+- After the proof, the client sends the request on a new connection only to a daemon that proved a version below
+  0.1.5 (those close every connection); a newer daemon that closes the proved connection gets
+  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.1.7.
+- A followed name can no longer fill the follower's disk: its new target is fetched only if its size, and the
+  bytes of its DAG's blocks, fit in `follow_quota` (default 1 GiB); otherwise the check fails, the follow's state
+  says why, and the previous target stays pinned. While one target replaces another both are held, so a followed
+  name can use up to twice the quota for a time. Targets already pinned over the quota stay.
+- An auto-fetch sender can no longer push another auto-fetch sender's pinned messages out of the inbox.
+  Re-linking a CID it already pins costs no quota, so about 500 such messages filled the inbox with protected
+  records, and each further message dropped the oldest record of anyone, releasing its pin. Each of the n senders
+  in `lxmf_auto_fetch_from` now keeps at most 1/n of the inbox's messages and bytes, messages holding pins
+  included, and when every other message holds pins, a new one may push out only its own sender's.
+- Auto-fetches still queued for a sender removed from `lxmf_auto_fetch_from` are refused at the next start (with
+  LXMF off too) and when their turn comes. Before, up to 64 of them were fetched and pinned after a restart.
+- `rnfs inbox` shows each sender's address before its display name, marked `untrusted`, `trusted` or
+  `contact <nick>`; the display name, which the sender chooses, comes last, quoted and escaped. Before, a display
+  name like `alice <trusted address>` came first and pushed the real address off to the right.
+- A node's own provider records can no longer be evicted from its own store: about 1000 Sybil stores to a key it
+  provides pushed its record out, and a full newcomer pool could take it too. Its own records don't count toward
+  the publishers a key keeps and are never chosen for eviction.
+
+Changed:
+- `POST /api/lxmf/inbox/get` answers 404 for a name link whose name can't be resolved, unless the request sets
+  `use_sent_cid` (before, it fetched the sender's CID).
+- While the deny list has file hashes, a highly repetitive file over 64 MiB (a zero-filled disk image, say) can't
+  be read or imported (451). The user's own gateway HEAD of a file that isn't wholly stored is then typed by its
+  name only, not by its first bytes.
+- On Windows, a directory `get` output is private to the user while it is written, then inherits its folder's
+  access list again before it gets its final name (if that fails, a warning is logged and it stays private).
+- A symlinked `rnfs.toml` is refused: dotfile setups that symlink it into the rnfs dir stop working (put the
+  file itself there). A loose `rnfs.toml` (such as 0664) or subdirectory (such as 0775) is tightened at the next
+  start, with a warning; it isn't refused.
+- The daemon and `rnfs.Node` check, in order, the rnfs dir, the settings, the subdirectories, then take the lock.
+  The CLI prints settings warnings, and `rnfs.Client` raises them as `RuntimeWarning`. On Windows, a loose
+  `rnfs.toml` no longer makes the CLI or `rnfs.Client` load RNS.
+- When a file is refused because its SHA-256 is on the deny list, the log suggests `rnfs deny add <file cid>`
+  (once per file): a `sha256:` entry doesn't stop the file's blocks being served one by one, and denying its CID
+  does.
+- The README says plainly that pipx and plain `pip install` resolve dependencies unpinned, not at the versions in
+  `packaging/requirements.lock`.
+- The gateway treats a request without `Sec-Fetch-Site` as the user's own only if its `User-Agent` doesn't start
+  with `Mozilla/`. Browsers without Fetch Metadata (Safari before 16.4, Firefox before 90) are now treated like a
+  web page on every request: `?format=` downloads get 409, and their network fetches count against
+  `gateway_fetches`. curl, scripts and other tools keep the user's own access, and so does a browser's own
+  navigation (`Sec-Fetch-Site: none`).
+- `rnfs name publish` in private mode warns that the name's announce (its sequence and target CID) is visible
+  outside the private network; only the content is served to members only. `POST /api/name/publish` then carries
+  the warning as an optional `warning` key, and `rnfs.Node`/`rnfs.Client` raise it as a `RuntimeWarning`; outside
+  private mode nothing changes.
+- The specification documents that the API's proof keep-open lets one connection hold an API slot about twice as
+  long as one request, and the measured cost of grinding node IDs near a key (raising it needs a change to how
+  node IDs are derived, so it is deferred).
+- `rnfs inbox` prints each message as number, time, address, trust, method, then the quoted display name (the
+  text format isn't a stable interface; scripts should use the API). Display names are also escaped for
+  backslashes, blank filler characters (U+115F, U+1160, U+3164, U+FFA0, U+2800), stacked or leading combining
+  marks, and names of only spaces.
+- The specification documents that many LXMF identities can keep the strangers' bucket empty; contacts and other
+  trusted senders are unaffected.
+- The request server checks a feature path's response (keepers' `/name`) as requesters do, and answers `False`,
+  logging an error, rather than send one they would refuse. Unexpected errors at five places that catch broadly
+  (the fetcher's `/blocks` worker, the lookup's routing-table callbacks, sending a request on a link, path
+  lookups, the peers listing) are logged as warnings with their traceback in the debug log (the last two at most
+  once a minute).
+- Stopping the node is exception-safe: every step (features, announcer, request server, names, saves, closing
+  the state database, releasing an embedded node's destination) runs even if an earlier one fails, so a failing
+  step no longer leaves the database open or the `rnfs.dht` destination registered in a host program. Stopping
+  waits at most 5 s in all for the features' threads and the node's own (LXMF and jobs no longer add 2 s each),
+  and remote-pin fetches stop with the node (their pins are fetched at the next start).
+- A pin name or contact whose save failed (a full disk, say) is written again by the node's next save, at the
+  latest at stop, rather than only at the next change.
+- Gateway and other resolves with a `max_age` (60 s on the gateway) reuse a network refresh of the name for that
+  long, including one that found nothing, and simultaneous resolves of a name share one refresh: a page with many
+  `/name/<n>/…` assets whose owner is offline costs one path request and one keeper query, not one each. A name
+  republished moments ago may show its older record on the gateway for up to 60 s. CLI resolves always refresh.
+- GitHub releases take their notes from the version's section of this file instead of generated notes, and the
+  release workflow refuses a tag whose section is still marked unreleased. The check that the Flatpak's wheels
+  match `packaging/requirements.lock` runs on every push and pull request, and the release builds (Flatpak,
+  Windows exe, arm64 .deb, Debian 12 smoke test) also run, without publishing, on pull requests that touch
+  packaging and weekly. The Flatpak build no longer copies local debris from a checkout.
+- A block that doesn't match its CID raises `BlockMismatch`, and a damaged sealed file `SealError`: both are
+  `RnfsError`s and still `ValueError`s, so the API keeps answering 400 (and logs a `BlockMismatch` as a warning,
+  as it means a bug rather than a bad request). A shared-folder entry that fails with an unexpected `ValueError`
+  is logged and tried again after 10 minutes rather than skipped until the file changes. `dir rm` refuses a
+  target without a path in the node itself, before fetching anything.
+- `rnfs jobs` (`--background`, `cancel`, `clear` and the progress line), `rnfs peers` and `rnfs stats` escape every
+  field the daemon sends, as the other feature commands already did. Internally, features declare the features
+  they use, and the node checks those and every feature's API routes and request paths when it loads them.
+- 16-byte IDs written as hex (node IDs, names, identity hashes, LXMF addresses) are parsed in one place with the
+  same rules everywhere; the only input refused that was accepted before is a `bootstrap_nodes` entry with
+  whitespace between its hex digits, now skipped with the warning other malformed entries get.
+- A DHT lookup run also ends after 80 `/find` queries, or after 9 answers in a row (3 × max(`alpha`, `beta`))
+  that bring the closest nodes no nearer the key. Honest lookups end as before (in a simulated network of 2000
+  nodes they complete within 12 queries); peers see fewer `/find` requests.
+- The specification now says a requester that gives up on a `/blocks` response closes its link, and never
+  cancels the Resource (0.1.5 and earlier already do so).
+- `rnfs inbox` shows the CID each name link was sent as ("sent as `<cid>`"), and marks an auto-fetch that
+  pinned the sent CID because the name didn't resolve ("auto-fetch pinned (sent CID; name unresolved)";
+  `"sent_cid": true` in the inbox record).
+
+Faster:
+- `cat`, gateway and range reads ask for the next 32-chunk window before handing the reader the current one, so
+  every provider stays busy across window boundaries: a 48 MiB read over 3 simulated 40 Mbit/s providers went
+  from 8.06 to 5.95 s (links 57% → 77% busy; 6.12 → 4.73 s without fsync). A reader that stops early has fetched
+  at most one extra window; closing it closes its links, except one another fetch is using (that request is left
+  to finish), and never cancels a Resource.
+- `get`, `pin add` and `ls` ask for a block's children as soon as the block arrives instead of one tree level at a
+  time, and count `max_output_entries` per block (small gains in simulation: up to about 4%, one request fewer on
+  a single LoRa provider).
+- The fetcher keeps a set beside its queue of blocks to fetch, so requeueing a refused or budget-cut request's
+  blocks no longer scans the queue: 22 ms → 0.01 ms per answer with 16 000 blocks pending (1 GiB), 242 → 0.015
+  ms at 10 GiB.
+- `open()` on `rnfs.Client` or `rnfs.Node` reads ahead while reads are sequential, doubling each refill from 64
+  KiB up to 4 MiB; a seek that moves starts again with a read of only what it covers. Sequential 64 KiB reads: 33
+  → 560 MB/s through `rnfs.Client`, 79 → 1219 MB/s on `rnfs.Node`; `read()` of a whole file 310 → 589 MB/s.
+- An add makes one durable commit instead of two: the pin is committed durably first, and the name `pin ls` shows
+  for it is written after it without a sync of its own, so a power loss can lose at most the latest names, never
+  a pin. 4 KiB adds 12.9 → 10.5 ms, 1 MiB adds 18.9 → 16.4 ms on a local SSD.
+- The shared folder re-reads only the files that changed inside a changed entry: a per-file cache keyed by
+  device, inode, size, modification time and execute bit reuses a file's CID while all its blocks are stored and
+  none is denied, and its remembered content hash still goes through the deny list. Rescanning a 5000-file, 1 GiB
+  folder after a 4 KiB change: 1.20 → 0.10 s (256 MiB: 0.33 → 0.10 s). The cache is kept in the state database (a
+  new `shared_folder_files` table, added by the upgrade), so it holds right after a restart too.
+- `dir set` and `dir rm` no longer walk the whole tree to check its depth: subtree heights are remembered, so an
+  edit reads only the directories it rebuilds. On a 16 GiB tree, an edit after the first went from about 0.9 s to
+  0.3 ms (30 edits: 27.5 → 0.89 s).
+- Storage no longer walks complete DAGs again under its lock: eviction takes a DAG known to be complete as a
+  whole, `dag_bytes` sums it once, and `is_complete` remembers an incomplete DAG's missing block until it
+  arrives. With about 550 000 blocks an eviction pass holds the lock for about 240 ms instead of 900 ms;
+  `is_complete` on a 4 GiB file missing its first chunk went from 530 ms per call to 0.002 ms after the first.
+- Expiring provider records no longer checks every record for a time in the future unless the clock went back
+  since a time was taken: one expiry pass at 100 000 records went from 16.6 to 8.7 ms, held under the store's
+  lock.
+- `cat`, `info` and `GET /api/cat` remember which files aren't sealed (at most 4096; forgotten when the deny
+  list changes), so reading one again doesn't read its first bytes to check, and `GET /api/cat` opens a sealed
+  file once instead of twice: a 64 KiB read of a stored file 0.32 → 0.19 ms (through the API 0.47 → 0.21 ms).
+- `pin ls` remembers each complete pin's type, name and whether it is sealed instead of reading its blocks again
+  at every call: 68 → 3.8 ms at 2000 pins after the first.
+- The publisher's refresh after an add reads a cached set of pinned CIDs instead of copying every pin, and
+  gathers the keys of queued withdrawals once: the first refresh with 10 000 CIDs and withdrawals queued for 300
+  nodes 71 → 14.5 ms; a refresh after a pin at 3000 pins 2.25 → 1.69 ms.
+- Attached to a shared Reticulum instance, path lookups no longer cost an RPC per node each time (about 41 ms each
+  over TCP, which macOS and Windows use for it): each node's next-hop interface is kept for 15 s (hops and whether
+  there is a path are still read fresh), and `rnfs peers` and the start of a fetch read every interface they need
+  from one path-table RPC. A 1000-peer `rnfs peers` went from 41.4 s to 95 ms, and the path lookups of 20 open
+  links at the start of a fetch from 825 ms to one RPC (under 0.1 ms within 15 s of the last).
+- Read-only identity checks no longer mark destinations as used in RNS (the peers listing, the DHT lookup's
+  known-identity check, private-mode routing admission, the link opener's polls while it waits for an identity):
+  on a shared instance each mark was an RPC. A link actually opened still marks its destination.
+- The peers feature no longer registers a second `rnfs.dht` announce handler: the node's own records what `rnfs
+  peers` shows, which halves the threads RNS starts per announce (2 → 1; about 130 → 62 µs of dispatch each).
+- Opening a node scans its block directory about twice as fast: block file names are checked for canonical CID
+  form without being encoded again (10.4 → 4.5 µs per block, about 6 s less per million blocks).
+- Hearing a DHT announce no longer scans every remembered ban and dropped node: 201 → 0.9 µs with 3000 dropped
+  nodes (247 → 0.9 µs with 3000 bans as well).
+- A background job nobody polls no longer keeps a rate sample for every second it runs (about 10 MB a day): it
+  keeps the last 5 minutes' (301 samples), and reports the same rate.
+- An LXMF auto-fetch checks whether its sender already pins a target with one lookup instead of copying every
+  pin: 1.96 ms → 0.24 µs per link at 10 000 pins.
+- An idle node no longer wakes every second: the LXMF loop polls only while a message is being sent or held or a
+  propagation-node download runs (a newly queued message is polled at once), and on Linux and macOS the daemon's
+  main thread waits for SIGINT/SIGTERM with no timeout (Windows still wakes each second to run signal
+  handlers): 120 fewer wakeups a minute on an idle daemon.
+
+Added:
+- `rnfs inbox get --use-sent-cid`, and an optional `use_sent_cid` on `POST /api/lxmf/inbox/get`.
+- `trusted` and `contact` fields in `GET /api/lxmf/inbox` records, and an `untrusted_dropped` counter in
+  `status` (messages from untrusted senders dropped by the rate limits since the start).
+- `rnfs.BlockMismatch`, `rnfs.SealError` and `rnfs.NotRecipient`, to catch these errors by class. `ApiConnection`
+  has a typed method for every core API route (`dir_set`, `dir_rm`, `pin_remote`, `providers`, `ping`,
+  `name_import`, `name_export`, `name_rm`, `export`, `import_archive`, `gc`, `verify`).
+- `tests/security/README.md`: an index from each security finding's audit ID to its regression tests, the code they
+  guard and the commits that fixed it, grouped by subsystem (a test checks that every security test is listed).
+- CONTRIBUTING.md: running the tests and their options, lint, the dependency locks, adding a schema step or an
+  API route, and releasing. `specification.md` names the version it describes and that the wire format is
+  byte-identical since 0.1.3. Dependabot updates the workflows' pinned actions. Tests check that the supported
+  Python versions agree across CI, `pyproject.toml`, the lock scripts, `build-deb.sh` and `install.sh`, and that
+  this file's version is `rnfs.__version__`'s.
+- The `follow_quota` setting: bytes a followed name's target may take (default 1 GiB; `0` stops fetching
+  followed names).
+- `contrib/rnfs.service.d/hardening.conf`: an opt-in systemd drop-in with `ProtectSystem=full` and
+  `PrivateTmp=yes`, for systems with unprivileged user namespaces. The default unit sets neither, nor `UMask`.
+
 ## 0.1.5
 
 Performance work, a debug log, state kept in one SQLite database, deny lists, and a public API for apps. No

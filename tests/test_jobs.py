@@ -20,7 +20,7 @@ from rnfs.constants import CHUNK_SIZE
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER
 from rnfs.features import jobs
-from rnfs.node import RnfsNode
+from rnfs.node import STOP_TIMEOUT, RnfsNode
 from tests.support import failing_commits, real, state_execute, state_rows, wait_for, write_legacy
 from tests.test_api import FakeNode
 from tests.test_names import FakeNetwork
@@ -211,6 +211,21 @@ class JobsTest(JobsBase):
         self.net.gate.set()
         self.assertEqual(self.finished(started)["state"], "done")
         self.assertEqual(self.finished(queued)["state"], "done")
+
+    def test_a_stalled_running_job_isnt_saved_again(self):
+        """The periodic save writes a running job only when its record changed: a stalled one costs no commit."""
+        cid = self.share(b"stalled")
+        self.net.gate.clear()
+        job_id = self.jobs.submit("get", cid, self.out("stalled"))["id"]
+        self.assertTrue(wait_for(lambda: self.jobs.get(job_id)["state"] == "running"))
+        self.jobs.save()
+        with mock.patch.object(self.jobs._db, "transaction", wraps=self.jobs._db.transaction) as write:
+            self.jobs.save()
+            self.jobs.save()
+        self.assertEqual(write.call_count, 0)
+        self.net.gate.set()
+        self.assertEqual(self.finished(job_id)["state"], "done")
+        self.assertTrue(wait_for(lambda: [r["state"] for r in self.saved()] == ["done"]))  # its outcome saved
 
     def test_cancel_queued_job_and_concurrency_limit(self):
         self.b.config.max_jobs = 1
@@ -471,7 +486,7 @@ class JobsTest(JobsBase):
         with failing_commits():
             job_id = self.jobs.submit("pin", cid)["id"]
         self.assertEqual(self.saved(), [])
-        self.assertTrue(self.jobs._dirty)
+        self.assertEqual(self.jobs._store.pending, {job_id})  # left for the next save
         self.jobs.save()
         self.assertEqual([(r["id"], r["state"]) for r in self.saved()], [(job_id, "queued")])
 
@@ -490,7 +505,8 @@ class JobsTest(JobsBase):
         self.assertTrue(wait_for(lambda: self.net.waiting > 0))
         started = time.monotonic()
         self.b.stop()
-        self.assertLess(time.monotonic() - started, jobs.STOP_WAIT + 2)
+        # Its fetch notices the stop at its next step, well within the node's stop budget
+        self.assertLess(time.monotonic() - started, STOP_TIMEOUT - 1)
 
 
 class ApiBase(JobsBase):
@@ -735,6 +751,26 @@ class ParsingAndFormattingTest(unittest.TestCase):
         # Samples older than the window are dropped, keeping one at its start as the base
         job._samples.append((start + jobs.RATE_WINDOW + 50, 10_000))
         self.assertAlmostEqual(job.rate(start + jobs.RATE_WINDOW + 60), 0.0)
+
+    def test_rate_samples_pruned_without_polling(self):
+        """S1: a running job nobody polls keeps only the window's samples (plus the base), and its rate is
+        the one an unpruned job would give."""
+        clock = [1000.0]
+        with mock.patch.object(jobs.time, "monotonic", lambda: clock[0]):
+            job = jobs.Job("0123abcd", "get", "x", "/o")
+            job.begin_run()
+            seconds = 3 * int(jobs.RATE_WINDOW)
+            for n in range(seconds):
+                clock[0] += 1.0
+                job.block(Cid.for_block(RAW, n.to_bytes(4, "big")), 100 if n < seconds - 60 else 400, True)
+            # One a second over the window, plus the base sample at its start
+            self.assertEqual(len(job._samples), int(jobs.RATE_WINDOW / jobs.SAMPLE_INTERVAL) + 1)
+            self.assertLessEqual(job._samples[0][0], clock[0] - jobs.RATE_WINDOW)
+            self.assertGreater(job._samples[1][0], clock[0] - jobs.RATE_WINDOW)
+            # The last RATE_WINDOW seconds: 240 at 100 B/s, 60 at 400 B/s
+            self.assertAlmostEqual(job.rate(), (240 * 100 + 60 * 400) / jobs.RATE_WINDOW)
+            self.assertEqual(job.downloaded_bytes, (seconds - 60) * 100 + 60 * 400)
+            self.assertEqual(job.blocks, seconds)
 
     def test_settings_validated(self):
         for settings in ({"max_jobs": 0}, {"max_jobs": True}, {"max_jobs": 1.5}, {"max_finished_jobs": -1},

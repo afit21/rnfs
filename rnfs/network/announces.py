@@ -29,7 +29,7 @@ def parse_mode(app_data) -> int:
     stream = io.BytesIO(bytes(app_data))
     try:
         value = umsgpack.unpack(stream)
-    except Exception:
+    except Exception:  # noqa: BLE001 - umsgpack raises several types for hostile bytes
         return MODE_CLIENT
     # Booleans are a separate msgpack type, and trailing bytes make it something other than msgpack 1
     if type(value) is int and value == MODE_SERVER and not stream.read(1):
@@ -54,7 +54,7 @@ class DhtAnnouncer:
         try:
             self.destination.announce()
             log(f"announced as a DHT {'server' if self.server else 'client'}", LOG_VERBOSE)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - announcing is retried at the next interval; logged
             log(f"could not announce: {e}", LOG_WARNING)
 
     def start(self):
@@ -101,7 +101,7 @@ class DhtAnnounceHandler:
                 self.on_server(node_id)
             else:
                 self.on_client(node_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - runs on RNS's announce thread; logged
             log(f"error handling the announce of {node_name(node_id)}: {e}", LOG_WARNING)
 
     def register(self):

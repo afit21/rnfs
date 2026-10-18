@@ -1,18 +1,22 @@
-"""Tests for building trees (specification section 5): the tree rule, files, directories, wrap, only-hash."""
+"""Tests for building trees (specification section 5): the tree rule, files, directories, wrap, only-hash, and the
+options a build is given."""
+import hashlib
 import io
 import os
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from rnfs import constants, fsutil
-from rnfs.content import builder, dag
+from rnfs.content import builder, chunker, dag
 from rnfs.content.builder import NO_PUT
 from rnfs.content.cid import DAG, EMPTY_DIRECTORY, EMPTY_FILE, RAW, Cid
 from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, IndexNode
 from rnfs.errors import TooLarge
 from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES
+from tests.test_chunker import FIXED_CID, VECTOR_CID, pseudo
 
 HELLO_WORLD = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
 # What add records for a file with the execute bit: Windows has none, so there every file is kind 0
@@ -27,7 +31,7 @@ def within(seconds: float, function, *args):
         """Call function, keeping its result or exception."""
         try:
             outcome.append(("result", function(*args)))
-        except BaseException as e:  # noqa: B902 - handed back to the test
+        except BaseException as e:  # handed back to the test
             outcome.append(("error", e))
 
     thread = threading.Thread(target=run, daemon=True)  # a hung call mustn't keep the test run alive
@@ -506,6 +510,85 @@ class PathTest(unittest.TestCase):
             built, warnings = within(5, builder.add_path, self.root, NO_PUT)
         self.assertEqual(built.cid, builder.build_directory([], NO_PUT).cid)
         self.assertTrue(any("victim" in w and "changed" in w for w in warnings))
+
+
+class Refused(Exception):
+    """What the tests' deny checks raise."""
+
+
+class OptionsTest(unittest.TestCase):
+    """BuildOptions passed explicitly (maintainability audit CT2): a ContextVar isn't copied to a worker thread, so
+    the chunker and the deny check must travel with the build."""
+
+    def setUp(self):
+        """A temporary directory with a small tree."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.join(self.tmp.name, "root")
+        os.makedirs(os.path.join(self.root, "sub"))
+        for relative, data in (("a.txt", b"a"), ("sub/denied.txt", b"denied content")):
+            with open(os.path.join(self.root, relative), "wb") as f:
+                f.write(data)
+
+    @staticmethod
+    def deny(content: bytes):
+        """A check refusing files whose content is content."""
+        denied = hashlib.sha256(content).digest()
+
+        def check(digest: bytes):
+            """Raise Refused for the denied digest."""
+            if digest == denied:
+                raise Refused(digest.hex())
+        return check
+
+    def on_worker(self, function, *args, **kwargs):
+        """function's result, run on a worker thread (which starts with a fresh context, as a pool's do)."""
+        with ThreadPoolExecutor(1) as pool:
+            return pool.submit(function, *args, **kwargs).result(10)
+
+    def test_a_build_on_a_worker_thread_with_explicit_options_still_denies(self):
+        check = self.deny(b"denied content")
+        options = builder.BuildOptions(check=check)
+        with self.assertRaises(Refused):
+            self.on_worker(builder.add_path, self.root, NO_PUT, options=options)
+        with self.assertRaises(Refused):
+            self.on_worker(builder.add_stream, io.BytesIO(b"denied content"), NO_PUT, options=options)
+        # What CT2 fixes: the context's check doesn't reach a worker thread, so only explicit options are safe there
+        with builder.checking(check):
+            with self.assertRaises(Refused):
+                builder.add_path(self.root, NO_PUT)  # the wrapper still works on its own thread
+            built, _ = self.on_worker(builder.add_path, self.root, NO_PUT)
+        self.assertEqual(built.cid, builder.add_path(self.root, NO_PUT)[0].cid)
+
+    def test_explicit_options_override_the_context(self):
+        with builder.checking(self.deny(b"denied content")):
+            builder.add_path(self.root, NO_PUT, options=builder.BuildOptions())  # no check: not refused
+        with self.assertRaises(Refused):
+            builder.add_path(self.root, NO_PUT, options=builder.BuildOptions(check=self.deny(b"a")))
+
+    def test_check_sees_every_file_once(self):
+        seen = []
+        builder.add_path(self.root, NO_PUT, options=builder.BuildOptions(check=seen.append))
+        self.assertEqual(sorted(seen), sorted(hashlib.sha256(data).digest() for data in (b"a", b"denied content")))
+
+    def test_fastcdc_vector_with_explicit_options(self):
+        data = pseudo(1 << 20)
+        fastcdc = builder.BuildOptions(chunker.FASTCDC)
+        self.assertEqual(str(self.on_worker(builder.build_bytes, data, NO_PUT, options=fastcdc).cid), VECTOR_CID)
+        self.assertEqual(str(builder.build_bytes(data, NO_PUT, options=fastcdc).cid), VECTOR_CID)
+        self.assertEqual(str(builder.build_bytes(data, NO_PUT, options=builder.BuildOptions()).cid), FIXED_CID)
+        with chunker.using(chunker.FASTCDC):  # the wrapper, kept
+            self.assertEqual(str(builder.build_bytes(data, NO_PUT).cid), VECTOR_CID)
+            self.assertEqual(str(self.on_worker(builder.build_bytes, data, NO_PUT).cid), FIXED_CID)
+            self.assertEqual(builder.current_options(), fastcdc)
+            self.assertEqual(str(self.on_worker(builder.build_bytes, data, NO_PUT,
+                                                options=builder.current_options()).cid), VECTOR_CID)
+
+    def test_chunker_names(self):
+        self.assertEqual(builder.BuildOptions(None).chunker, chunker.FIXED)
+        self.assertEqual(builder.BuildOptions().chunker, chunker.FIXED)
+        with self.assertRaises(ValueError):
+            builder.BuildOptions("rabin")
 
 
 if __name__ == "__main__":

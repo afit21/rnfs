@@ -73,7 +73,7 @@ class IdentityFileTest(unittest.TestCase):
             try:
                 load_or_create_identity(self.path)
                 outcome.append("loaded")
-            except Exception as e:  # noqa: BLE001 - whatever it is, the test reports it
+            except Exception as e:  # whatever it is, the test reports it
                 outcome.append(e)
 
         thread = threading.Thread(target=start, daemon=True)

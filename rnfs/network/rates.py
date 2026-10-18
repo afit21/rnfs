@@ -1,4 +1,5 @@
-"""Rate estimates, slow links and slow nodes (specification section 2). Used by both server and client.
+"""Rate estimates, slow links and slow nodes (specification section 2), and the /blocks size rules that follow
+from them (sections 3 and 7). Used by both server and client.
 
 A link's rate estimate is what RNS measured (Link.get_expected_rate()) for the last response of at least
 min_rate_sample on it, recorded when that response completes, since RNS overwrites the value with every
@@ -7,7 +8,7 @@ Resource transfer. Rates are never derived from round-trip times, which the remo
 import threading
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE
+from rnfs.constants import CHUNK_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
 from rnfs.log import LOG_WARNING, log
 
 SLOW_MTU = 500  # a link whose MTU RNS never raised above this crosses an interface that doesn't support more
@@ -68,7 +69,7 @@ def link_is_slow(link, rate_estimate: float | None, config: Config) -> bool:
     """is_slow_link for an RNS link, reading its MTU with Link.get_mtu()."""
     try:
         mtu = link.get_mtu()
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS internals: MTU unknown if they fail
         mtu = None
     return is_slow_link(rate_estimate, mtu, config.slow_bitrate)
 
@@ -95,6 +96,37 @@ def requester_max_bytes(rate_estimate: float | None, config: Config) -> int:
         # Small enough to finish on any link, and large enough that its completion gives an estimate
         return CHUNK_SIZE
     return transfer_bytes(config.response_target, rate_estimate)
+
+
+# The /blocks size rules both ends share (section 7): the responder enforces them (server.blocks_budget), the
+# requester sizes its batches by them (fetcher), so changing one end's rule can't leave the other's estimate wrong
+
+def response_capacity(max_bytes: int, rate_estimate: float | None, upload_cap: float | None,
+                      response_target: float) -> int:
+    """Total block bytes a /blocks response may hold after its first served block: max_bytes, at most what one
+    response carries, and response_target of transfer at the link's rate (capped by upload_cap, if any); CHUNK_SIZE
+    at most while the link has no rate estimate."""
+    limit = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
+    if rate_estimate is None:
+        # What a requester asks for until the link has a rate estimate (section 7), enforced: otherwise one
+        # small request could ask for a ~1 MiB response with a deadline of many hours
+        return min(limit, CHUNK_SIZE)
+    rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
+    return min(limit, transfer_bytes(response_target, rate))
+
+
+# Without max_upload_rate, a slow link's upload cap is its rate estimate divided by this (section 3). The responder
+# then starts the next /blocks response on the link no sooner than this many times its transfer time at the rate
+# estimate after the last one started, which the requester waits out (fetcher's _pace)
+UPLOAD_CAP_DIVISOR = 2
+
+
+def default_upload_cap(slow_link: bool, rate_estimate: float | None) -> float | None:
+    """The upload cap of a link in bits/s when max_upload_rate isn't set: a slow link's rate estimate divided by
+    UPLOAD_CAP_DIVISOR. None (no cap) on a fast link, or one without a rate estimate."""
+    if slow_link and rate_estimate is not None:
+        return rate_estimate / UPLOAD_CAP_DIVISOR
+    return None
 
 
 # Slow nodes
@@ -140,7 +172,7 @@ def is_slow_node(config: Config, reticulum=None) -> bool:
             import RNS
             reticulum = RNS.Reticulum.get_instance()
         stats = reticulum.get_interface_stats()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - not slow if the stats can't be read; logged
         log(f"could not read interface stats to decide whether this node is slow: {e}", LOG_WARNING)
         return False
     return slow_from_stats(stats, config.slow_bitrate)

@@ -12,7 +12,7 @@ Access any file on RNFS by it's **'CID'**.
 ***Example:*** Moby Dick book .txt file: ```bagaibqabciqfweclrlsfdkqgkhtmbavijftqfkiogrprcntnew5jalakjsykq4q```
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![Reticulum](https://img.shields.io/badge/Reticulum-Mesh_Network-purple.svg)](https://reticulum.network/)
 
 <hr>
@@ -76,7 +76,7 @@ Different package options available at [latest release](https://github.com/afit2
 
 **Windows:**
 
-[`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe), saved as `rnfs.exe`
+[`rnfs-0.1.6-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-windows-x64.exe), saved as `rnfs.exe`
   somewhere on your PATH ([how](#windows)).
 
 **Linux:**
@@ -93,7 +93,7 @@ Or installers for ([Debian & Ubuntu](#debian-and-ubuntu)).  [Flatpak](#other-lin
 
 **macOS:**
 
-`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl` ([details](#macos)).
+`pipx install https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-py3-none-any.whl` ([details](#macos)).
 
 ## 2 - Start rnfs and leave it running in its own terminal:
 
@@ -127,14 +127,14 @@ command. Your data in `~/.rnfs` is never touched by an update or uninstall.
 
 | System | Download |
 |---|---|
-| Windows (64-bit) | [`rnfs-0.1.5-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-windows-x64.exe) ([how](#windows)) |
-| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.5_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb) or [`rnfs_0.1.5_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_arm64.deb) ([how](#debian-and-ubuntu)) |
-| Other Linux (x86_64) | [`rnfs-0.1.5-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
-| macOS, or any system with Python 3.11+ | [`rnfs-0.1.5-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl) ([how](#macos)) |
+| Windows (64-bit) | [`rnfs-0.1.6-windows-x64.exe`](https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-windows-x64.exe) ([how](#windows)) |
+| Debian 12+, Ubuntu 24.04+, Raspberry Pi OS (64-bit) | [`rnfs_0.1.6_amd64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs_0.1.6_amd64.deb) or [`rnfs_0.1.6_arm64.deb`](https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs_0.1.6_arm64.deb) ([how](#debian-and-ubuntu)) |
+| Other Linux (x86_64) | [`rnfs-0.1.6-x86_64.flatpak`](https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-x86_64.flatpak) ([how](#other-linux-flatpak)), or the [install script](#install-script) |
+| macOS, or any system with Python 3.11+ | [`rnfs-0.1.6-py3-none-any.whl`](https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-py3-none-any.whl) ([how](#macos)) |
 
-These links are for 0.1.5; for a newer version, take the same files from the
+These links are for 0.1.6; for a newer version, take the same files from the
 [latest release](https://github.com/afit21/rnfs/releases/latest), which also has the source archive
-(`rnfs-0.1.5.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
+(`rnfs-0.1.6.tar.gz`) and `SHA256SUMS` ([checking a download](#checking-a-download)).
 
 ## Windows
 
@@ -143,7 +143,7 @@ The exe is a single file with Python, Reticulum and LXMF inside. In PowerShell, 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
-Move-Item .\rnfs-0.1.5-windows-x64.exe "$bin\rnfs.exe" -Force
+Move-Item .\rnfs-0.1.6-windows-x64.exe "$bin\rnfs.exe" -Force
 Unblock-File "$bin\rnfs.exe"
 [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$bin", "User")
 # open a new terminal, then:
@@ -164,8 +164,8 @@ Pick `amd64` or `arm64` to match `dpkg --print-architecture`. Ubuntu 22.04 has P
 use the [install script](#install-script) there.
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs_0.1.5_amd64.deb
-sudo apt install ./rnfs_0.1.5_amd64.deb
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs_0.1.6_amd64.deb
+sudo apt install ./rnfs_0.1.6_amd64.deb
 systemctl --user enable --now rnfs      # run it as a service; logs: journalctl --user -u rnfs -f
 loginctl enable-linger $USER            # keep it running while you're logged out
 ```
@@ -176,23 +176,25 @@ loginctl enable-linger $USER            # keep it running while you're logged ou
 ## Other Linux (Flatpak)
 
 ```sh
-curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-x86_64.flatpak
+curl -LO https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-x86_64.flatpak
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user rnfs-0.1.5-x86_64.flatpak
+flatpak install --user rnfs-0.1.6-x86_64.flatpak
 alias rnfs='flatpak run io.github.afit21.rnfs'      # add to ~/.bashrc
 rnfs daemon
 ```
 
-The app can use the network, your home folder and all devices (for RNode and other serial interfaces; remove
-that with `flatpak override --user --nodevice=all io.github.afit21.rnfs`). Other folders need
-`flatpak override --user --filesystem=/mnt/data io.github.afit21.rnfs`. Update by installing the newer
-`.flatpak`; uninstall with `flatpak uninstall --user io.github.afit21.rnfs`.
+The app can use the network, `~/.rnfs` and `~/.reticulum`, and your Downloads folder: not the rest of your home
+folder, nor any device. Grant more with `flatpak override --user --device=all io.github.afit21.rnfs` (RNode and
+other serial interfaces) or `flatpak override --user --filesystem=<folder> io.github.afit21.rnfs` (another
+folder, or `~/.config/reticulum` if your Reticulum config is there); `--reset` takes them back. Until 0.1.6 the app had your whole home folder and every
+device: after updating, grant the ones you used again. Update by installing the newer `.flatpak`; uninstall
+with `flatpak uninstall --user io.github.afit21.rnfs`.
 
 ## macOS
 
 ```sh
 brew install pipx && pipx ensurepath          # then open a new terminal
-pipx install https://github.com/afit21/rnfs/releases/download/v0.1.5/rnfs-0.1.5-py3-none-any.whl
+pipx install https://github.com/afit21/rnfs/releases/download/v0.1.6/rnfs-0.1.6-py3-none-any.whl
 rnfs daemon
 ```
 
@@ -203,15 +205,19 @@ rnfs daemon
     https://raw.githubusercontent.com/afit21/rnfs/main/contrib/io.github.afit21.rnfs.plist
   launchctl load -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist
   ```
-- pipx installs the newest Reticulum and LXMF rnfs allows, not the exact tested versions the other packages
-  bundle.
+- pipx (and plain `pip install`) resolves rnfs's dependencies unpinned, at the newest Reticulum, LXMF and
+  cryptography rnfs allows, not at the tested versions and hashes in `packaging/requirements.lock` that the
+  other packages and the install script use.
 
 ## Install script
 
 For any Linux with Python 3.11+ and venv (`sudo apt install python3 python3-venv` on Debian/Ubuntu). It
 installs the latest release into `~/.local/share/rnfs/venv`, with the dependency versions and hashes pinned in
-the release, and checks the download against `SHA256SUMS` (and its signed provenance, if the GitHub CLI is
-installed and logged in; `RNFS_REQUIRE_ATTESTATION=1` makes that required).
+the release, and checks the download against `SHA256SUMS` and, if the GitHub CLI is installed, its signed
+provenance for that release's tag. If `gh` is installed but not logged in, it stops: run `gh auth login`, or set
+`RNFS_REQUIRE_ATTESTATION=0` to check the checksum only. Without `gh` it warns (`RNFS_REQUIRE_ATTESTATION=1` makes
+it stop): `curl | sh` without `gh` trusts whoever can write the release's files, since `SHA256SUMS` comes from
+the same place.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh                   # install or update
@@ -223,8 +229,11 @@ curl -fsSL https://raw.githubusercontent.com/afit21/rnfs/main/install.sh | sh -s
 - `--main` installs the main branch instead (no checksum to check; give it on every update).
 - `--system`, as root, installs for all users in `/opt/rnfs` and `/usr/local/bin/rnfs`.
 - `--python PATH` picks the Python; `--force` replaces another `rnfs` command (e.g. pipx's);
-  `RNFS_SOURCE=<dir, archive, .whl or URL>` installs something other than the latest release.
-- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out.
+  `RNFS_SOURCE=<dir, archive, .whl or URL>` installs something other than the latest release (nothing checks
+  it; a plain `http://` URL gets a warning).
+- With the service, `loginctl enable-linger $USER` keeps it running while you're logged out. More sandboxing
+  (`ProtectSystem`, `PrivateTmp`) needs unprivileged user namespaces, so it is an optional drop-in, for this
+  unit or the `.deb`'s: see [`contrib/rnfs.service.d/hardening.conf`](contrib/rnfs.service.d/hardening.conf).
 
 ## Checking a download
 
@@ -232,12 +241,12 @@ Each release's `SHA256SUMS` lists every file's checksum. With it next to your do
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing                  # Linux; macOS: shasum -a 256 <file>
-gh attestation verify rnfs_0.1.5_amd64.deb --repo afit21/rnfs
+gh attestation verify rnfs_0.1.6_amd64.deb --repo afit21/rnfs
 ```
 
 A matching checksum shows the file is whole, not who made it. The signed build provenance, checked with the
 [GitHub CLI](https://cli.github.com/) (2.49 or newer, logged in), shows it was built by this repository's
-release workflow. On Windows, `Get-FileHash .\rnfs-0.1.5-windows-x64.exe` gives the checksum.
+release workflow. On Windows, `Get-FileHash .\rnfs-0.1.6-windows-x64.exe` gives the checksum.
 
 ## From source
 
@@ -250,7 +259,9 @@ python3 -m unittest discover tests                             # the tests
 ```
 
 `pipx install git+https://github.com/afit21/rnfs` installs the main branch without a checkout. The release
-packages are built by `.github/workflows/release.yml`; the scripts it uses are in `packaging/`.
+packages are built by `.github/workflows/release.yml`; the scripts it uses are in `packaging/`. To work on rnfs
+itself (the tests and their options, lint, the locks, adding a schema step or an API route, releasing), see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Reticulum and where things live
 
@@ -419,6 +430,7 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `remote_pin_identities`, `remote_pin_quota` | `[]`, 1 GiB | Identities allowed to ask this node to pin (`pin remote add`), and the storage each may use |
 | `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
 | `keep_max_names` | `100` | Names you keep or follow for others |
+| `follow_quota` | 1 GiB | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned (up to twice this while it changes). `0` stops fetching followed names |
 | `lxmf_accept_from` | everyone | Only keep LXMF messages from these addresses (recommended if you only expect links from people you know) |
 | `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota` | `[]`, 1 GiB | Senders whose links are fetched and pinned automatically, and the storage each may use |
 | `lxmf_propagation_node` | none | Propagation node for offline delivery (`send --propagate`) and periodic downloads |
@@ -429,7 +441,9 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `verbosity` | `0` | Extra logging: 1 per-query detail, 2 RNS debug output (`daemon -v`, `-vv`) |
 
 <a id="privacy"></a>**Private mode.** `private = true` with a `members` list (identity hashes, from each
-node's `rnfs status`) makes the node link to, serve and keep records for members only.
+node's `rnfs status`) makes the node link to, serve and keep records for members only. A name's announce still
+reaches everyone, so outsiders can see which CID it points at and when it changes (not fetch it), and
+`rnfs name publish` warns of this in private mode.
 
 LXMF senders you've named (in `lxmf_accept_from`, `lxmf_auto_fetch_from`, or as an LXMF contact) are trusted.
 Anyone can make new LXMF addresses for free, so messages from everyone else only push out each other's, within
@@ -464,7 +478,7 @@ Every command except `daemon` talks to the running daemon, so run them as the da
 | `rnfs contacts add NICK HEX` / `rm` / `ls` | Nicknames for names, node IDs and LXMF addresses |
 | `rnfs lxmf address` / `lxmf sync` | Your LXMF address / download waiting messages now |
 | `rnfs send ADDRESS TARGET [-m TEXT] [--propagate]` | Send an `rnfs:` link over LXMF |
-| `rnfs inbox` / `inbox get N` / `inbox rm N` / `outbox` | Received links, fetching them, sent messages |
+| `rnfs inbox` / `inbox get N` / `inbox rm N` / `outbox` | Received links (each line starts with the sender's address and whether it is `untrusted`, `trusted` or a contact; the display name the sender chose comes last, quoted), fetching them (a name link whose name can't be resolved needs `--use-sent-cid`), sent messages |
 
 `add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
@@ -499,7 +513,7 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
     added = node.add("photos/")                   # rnfs.Added: .cid, .size, .warnings
     for entry in node.ls(added.cid):              # rnfs.Entry(name, kind, size, cid)
         print(entry.name, entry.size)
-    with node.open(f"{added.cid}/cat.jpg") as f:  # seekable: each read fetches only the chunks it covers
+    with node.open(f"{added.cid}/cat.jpg") as f:  # seekable: a read after a seek fetches only what it covers
         data = f.read(4096)
     site = node.names.create("site")
     site.publish(added.cid)
@@ -530,7 +544,10 @@ To use a list someone maintains (a text file, one entry per line, `#` for commen
 A denied CID is never fetched, stored or served, whether asked for directly or found inside other content
 (the gateway answers 451). Cached copies are deleted and remote pins released; your own pins are kept but not
 served, and the log names them so you can remove them. A file hash is only known once a file is downloaded,
-so it stops the file being handed out or added, not its blocks being fetched: deny the CID for that.
+so it stops the file being handed out or added, not its blocks being fetched: deny the CID for that (the first
+time rnfs refuses a file by its hash, the log names the command). While there are file hashes, a file that
+repeats its content more than 16 times beyond 64 MiB can't be read or imported (451): it can't be checked
+cheaply.
 
 # Example use cases
 

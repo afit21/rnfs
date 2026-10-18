@@ -15,21 +15,12 @@ from rnfs.dht.routing import RoutingTable
 from rnfs.fetcher import Fetcher
 from rnfs.network import protocol, rates, server
 from rnfs.network.client import BUSY, OK, BlocksResult
+from tests.fakes.log import quiet_log
 from tests.support import FakeClock
 from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResource
 
 OWN, PROVIDER = bytes(16), bytes([1]) * 16
-_saved_loglevel = RNS.loglevel
-
-
-def setUpModule():
-    """Silence the fetcher's and server's logs."""
-    RNS.loglevel = RNS.LOG_CRITICAL
-
-
-def tearDownModule():
-    """Restore RNS's loglevel."""
-    RNS.loglevel = _saved_loglevel
+setUpModule, tearDownModule = quiet_log()
 
 
 class PacingTest(unittest.TestCase):
@@ -44,8 +35,9 @@ class PacingTest(unittest.TestCase):
         self.tmp = tmp.name
 
     def fetch(self, rate: float, rtt: float, chunks: int, server_config: Config | None = None,
-              server_measures: float = 1.0) -> tuple[int, float]:
-        """Fetch a file of chunks chunks from one provider over a link of rate bits/s and rtt seconds.
+              server_measures: float = 1.0, mtu: int = 500, mdu: int = 431) -> tuple[int, float]:
+        """Fetch a file of chunks chunks from one provider over a link of rate bits/s and rtt seconds, whose
+        MTU and MDU are mtu and mdu bytes.
 
         The responder measures server_measures × the rate (RNS's sender-side span includes a round trip).
         Returns (refusals, virtual seconds taken); fails the test if the provider is dropped.
@@ -62,7 +54,7 @@ class PacingTest(unittest.TestCase):
             """The responder holding a response back, in virtual time."""
             clock.now += wait
         responder._pace = pace
-        link = FakeLink(b"L" * 16, mtu=500, mdu=431)
+        link = FakeLink(b"L" * 16, mtu=mtu, mdu=mdu)
         link.rtt = rtt
         destination.links.append(link)
         destination.established(link)
@@ -115,7 +107,8 @@ class PacingTest(unittest.TestCase):
                     result = BlocksResult(OK, unsent=batch[len(entries):])
                     for cid, entry in zip(batch, entries):
                         result.blocks[cid] = entry
-                fetch._handle(PROVIDER, batch, result, False, wanted, children, outstanding, sent_at, sent_rate)
+                fetch._handle(PROVIDER, batch, result, False, wanted, children, outstanding, fetch.budget, sent_at,
+                              sent_rate)
                 pending = [cid for cid in pending if cid in outstanding]
             self.assertTrue(storage.is_complete(built.cid))
         return refusals, clock.now - start
@@ -148,6 +141,15 @@ class PacingTest(unittest.TestCase):
         # max_upload_rate set on the responder, which the requester can't know: refused, but not dropped
         refusals, _ = self.fetch(50_000, 0.5, 12, Config(max_upload_rate=12_500))
         self.assertGreater(refusals, 0)
+
+    def test_large_mtu_single_packet_responses_are_paced(self):
+        # A fast path whose MTU holds a whole response (RNS: 256 KiB at 750 Mbit/s): every response goes as one
+        # packet, so the responder never gets a rate estimate, but an explicit max_upload_rate applies all the
+        # same (NET-2); its waits are within the bound, so they are held, not refused
+        cap = 2_000_000
+        refusals, taken = self.fetch(10_000_000, 0.05, 30, Config(max_upload_rate=cap), mtu=262144, mdu=262000)
+        self.assertEqual(refusals, 0)
+        self.assertGreater(taken, 0.9 * 30 * CHUNK_SIZE * 8 / cap)
 
 
 if __name__ == "__main__":

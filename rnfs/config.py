@@ -4,18 +4,20 @@ Each node may change these, in `<rnfs dir>/rnfs.toml` or on the command line. Ti
 sizes in bytes and rates in bits/s. A setting left as None takes a default that depends on whether
 the node (or link) is slow; use the `effective_*` helpers rather than reading those fields directly.
 """
+import errno
 import math
 import os
-import re
+import stat
 import tomllib
 from dataclasses import dataclass, field, fields
 
-from rnfs import winacl
-from rnfs.constants import DAY, GIB, HOUR, KIB, PROVIDER_TTL
+from rnfs import fsutil, ids
+from rnfs.constants import DAY, GIB, HOUR, KIB, MIB, PROVIDER_TTL
 
 DEFAULT_API_PORT = 8788
 DEFAULT_GATEWAY_PORT = 8789
 SETTINGS_FILE = "rnfs.toml"
+MAX_SETTINGS_SIZE = 1 * MIB  # bytes of rnfs.toml read; a larger file is refused
 # In the rnfs dir, locked by the daemon or embedded node using it (node.lock_rnfs_dir), so a second can't start
 LOCK_FILE = "daemon.lock"
 
@@ -40,7 +42,7 @@ OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset 
 MAX_DURATION = 30 * DAY
 FLAGS = ("private", "gateway_scripts", "default_bootstrap", "debug_log")
 IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
-_HEX_ID = re.compile(r"[0-9a-fA-F]{32}")
+_HEX_ID = ids.HEX16  # the name other modules used before rnfs.ids
 
 
 def _is_number(value) -> bool:
@@ -50,7 +52,13 @@ def _is_number(value) -> bool:
 
 @dataclass
 class Config:
-    """Settings for an RnfsNode."""
+    """Settings for an RnfsNode.
+
+    warnings: what Config.load changed to trust the settings, for the caller to show (a plain attribute, not a
+    field, so rnfs.toml can't set it).
+    """
+
+    warnings = ()  # unannotated, so not a dataclass field; Config.load sets a list
 
     rnfs_dir: str = "~/.rnfs/"  # identity, blocks, pins, names and shared folder live here
     # Reticulum config directory. None uses RNS's own default (/etc/reticulum, ~/.config/reticulum or
@@ -118,6 +126,9 @@ class Config:
     # (at least every 3 days) and, if followed, a pin: 100 keeps a slow channel's republish airtime small
     keep_max_names: int = 100
     keeper_query: str = "fallback"  # "fallback": ask keepers when a path request heard nothing; "always"
+    # Bytes a followed name's new target may hold (its size and its DAG's blocks); 0: no follow fetches. A swap
+    # briefly holds the old target and the new one, so up to twice this per followed name
+    follow_quota: int = 1 * GIB
     # --- content (pin=false, sealing, chunker, gateway formats) ---
     # --- lxmf (rnfs/features/lxmf.py) ---
     lxmf_enabled: bool | None = None  # None: on if the LXMF package is installed
@@ -166,6 +177,19 @@ class Config:
         """rnfs's own persistent state: pins, cache records, provider records, sequences."""
         return os.path.join(self.root, "state")
 
+    # Identity lists, each normalised once here for its users: two sets differently normalised could disagree
+    # about who is a member
+
+    @property
+    def member_set(self) -> frozenset[str]:
+        """members as lowercase hex (as identity.hash.hex() writes them), for private mode's membership checks."""
+        return frozenset(ids.normal_hex16(value) for value in self.members)
+
+    @property
+    def remote_pin_set(self) -> frozenset[str]:
+        """remote_pin_identities as lowercase hex (as identity.hash.hex() writes them): who may send /pin."""
+        return frozenset(ids.normal_hex16(value) for value in self.remote_pin_identities)
+
     # Values that depend on whether the node is slow (section 2)
 
     def effective_alpha(self, slow_node: bool) -> int:
@@ -184,12 +208,13 @@ class Config:
         return 1 if slow_node else 3
 
     def effective_max_upload_rate(self, slow_link: bool, rate_estimate: float | None) -> float | None:
-        """The upload cap for a link in bits/s, or None for no cap."""
+        """The upload cap for a link in bits/s, or None for no cap: max_upload_rate if set, else the default
+        (rates.default_upload_cap: a slow link's rate estimate halved)."""
         if self.max_upload_rate is not None:
             return self.max_upload_rate
-        if slow_link and rate_estimate is not None:
-            return rate_estimate / 2
-        return None
+        # Here: rnfs.network.rates imports this module, and RNS (through rnfs.log), which settings alone don't need
+        from rnfs.network import rates
+        return rates.default_upload_cap(slow_link, rate_estimate)
 
     def validate(self):
         """Raise ValueError for settings the spec forbids, or of the wrong type or out of range."""
@@ -215,6 +240,8 @@ class Config:
             raise ValueError("keep_max_names must be a whole number, not negative")
         if self.keeper_query not in ("fallback", "always"):
             raise ValueError("keeper_query must be fallback or always")
+        if type(self.follow_quota) is not int or self.follow_quota < 0:
+            raise ValueError("follow_quota must be a whole number of bytes, not negative")
         # lxmf
         from rnfs.features import lxmf  # here, like mesh: only needed once settings are checked
         lxmf.validate_settings(self)
@@ -257,8 +284,7 @@ class Config:
                 raise ValueError(f"{name} must be true or false")
         for name in IDENTITY_LISTS:
             values = getattr(self, name)
-            if not isinstance(values, list) or not all(
-                    isinstance(value, str) and _HEX_ID.fullmatch(value.strip().strip("<>")) for value in values):
+            if not isinstance(values, list) or not all(ids.is_hex16(value, brackets=True) for value in values):
                 raise ValueError(f"{name} must be a list of RNS identity hashes (32 hex characters each)")
         # Node IDs that don't parse are skipped with a warning when joining, but a string isn't a list of them
         if not isinstance(self.bootstrap_nodes, list) or not all(isinstance(v, str) for v in self.bootstrap_nodes):
@@ -269,17 +295,30 @@ class Config:
     @classmethod
     def load(cls, rnfs_dir: str = "~/.rnfs/", defaults: dict | None = None, **overrides) -> "Config":
         """Settings from `<rnfs_dir>/rnfs.toml` if it exists, then overrides (None values ignored), validated.
-        defaults (an embedded node's) apply where neither sets a value."""
+        defaults (an embedded node's) apply where neither sets a value.
+
+        rnfs.toml, and RNS's `config` when reticulum_dir is the rnfs dir, must be regular files of this user's;
+        one others may access is made private (open_checked). What was changed is in the result's warnings, for
+        the caller to show: this module doesn't log, as rnfs.log imports RNS, which the CLI and rnfs.Client never
+        load. Raises PermissionError if either file can't be trusted, ValueError for settings that aren't valid
+        (also a settings file over MAX_SETTINGS_SIZE), OSError if the file can't be read.
+        """
         values: dict = dict(defaults or {})
-        path = os.path.join(os.path.expanduser(rnfs_dir), SETTINGS_FILE)
-        if os.path.isfile(path):
-            with open(path, "rb") as f:
-                # On Windows, owned by and private to this user: its settings pick programs rnfs runs
-                try:
-                    winacl.secure_settings(path, f.fileno())
-                except OSError as e:
-                    raise PermissionError(f"can't trust the settings file: {e}") from None
-                values.update(tomllib.load(f))
+        warnings: list[str] = []
+        root = os.path.expanduser(rnfs_dir)
+        path = os.path.join(root, SETTINGS_FILE)
+        # Its settings choose the Reticulum config, and with it programs rnfs starts, and the API port the CLI
+        # sends its token to: whoever could change it could choose them
+        opened = open_checked(path, "the settings file")
+        if opened is not None:
+            fd, warning = opened
+            if warning is not None:
+                warnings.append(f"{warning}. Check that its settings are yours")
+            with os.fdopen(fd, "rb") as f:
+                data = f.read(MAX_SETTINGS_SIZE + 1)
+            if len(data) > MAX_SETTINGS_SIZE:
+                raise ValueError(f"{path} is larger than {MAX_SETTINGS_SIZE // MIB} MiB")
+            values.update(tomllib.loads(data.decode("utf-8")))
         known = {f.name for f in fields(cls)}
         unknown = values.keys() - known
         if unknown:
@@ -291,4 +330,57 @@ class Config:
         values["rnfs_dir"] = rnfs_dir
         config = cls(**values)
         config.validate()
+        reticulum_root = config.reticulum_root
+        if reticulum_root is not None and os.path.realpath(reticulum_root) == os.path.realpath(root):
+            # Earlier versions' layout: RNS reads its config (interfaces, and their commands) from the rnfs dir
+            opened = open_checked(os.path.join(root, "config"), "the Reticulum config")
+            if opened is not None:
+                fd, warning = opened
+                os.close(fd)
+                if warning is not None:
+                    warnings.append(f"{warning}. Check that its interfaces are yours")
+        config.warnings = warnings
         return config
+
+
+def open_checked(path: str, what: str) -> tuple[int, str | None] | None:
+    """Open the file at path for reading, once checked through its descriptor: (the descriptor, a warning if it
+    was made private) or None if nothing is at path. what (e.g. "the settings file") names it in messages.
+
+    It must be a regular file (a FIFO would block the start, a device be read without end), not a symlink
+    (whoever can write to the directory could point it at a file of theirs), and the user's own; one others may
+    access is made private (fsutil.check_owned_fd). Opened with O_NOFOLLOW and O_NONBLOCK, so neither a symlink
+    nor a FIFO is followed or waited on. Raises PermissionError if it can't be trusted, OSError if it can't be
+    opened.
+    """
+    try:
+        # On Windows, which has no O_NOFOLLOW, a symlink or junction is found here (O_NOFOLLOW catches a swap)
+        listed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if fsutil.is_link(listed):
+        raise PermissionError(f"{what} {path} is a symlink; rnfs only reads a regular file there (put the file "
+                              f"itself there)")
+    try:
+        fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | fsutil.O_BINARY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None  # removed since the lstat
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):  # O_NOFOLLOW's answer for a symlink (EMLINK on FreeBSD)
+            raise PermissionError(f"{what} {path} is a symlink; rnfs only reads a regular file there") from None
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PermissionError(f"{what} {path} is not a regular file; rnfs only reads a regular file there")
+        try:
+            warning = fsutil.check_owned_fd(path, fd, info, what)
+        except OSError as e:
+            if not fsutil.IS_WINDOWS:
+                raise  # its message says what and why
+            raise PermissionError(f"can't trust {what}: {e}") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, warning

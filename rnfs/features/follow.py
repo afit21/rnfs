@@ -12,7 +12,11 @@
   held, without a path request.
 - One background thread does every check and fetch, one at a time, so following many names never runs more
   than one transfer. Fetches obey the usual limits (max_download_size, the DAG byte bound of the new
-  target's declared size, disk reserve); a followed target is a pin, so it is provided.
+  target's declared size, disk reserve) and follow_quota: a new target whose size, or the bytes of its DAG's
+  blocks, would exceed it is refused (TooLarge, shown as the check's state; the old target stays pinned), and 0
+  fetches nothing. A pinned fetch never stops at max_storage, so the quota is what keeps a name's owner from
+  filling the disk; while a target replaces another both are held, so up to twice the quota per name. A target
+  pinned before the quota was lowered stays. A followed target is a pin, so it is provided.
 - Followed names count against keep_max_names. State: the follow table of the state database (rnfs.statedb),
   each change committed durably as it is made (the rows of the names it changes), and a meta value saying it
   was saved whole ("clean"), which the reconcile at start needs.
@@ -22,9 +26,9 @@ No RNS at module level (the CLI imports this module).
 import threading
 import time
 
-from rnfs.constants import ID_LENGTH
+from rnfs.constants import ID_LENGTH, MISSED_ANNOUNCES
 from rnfs.content.cid import Cid
-from rnfs.errors import NotFound, RnfsError
+from rnfs.errors import NotFound, RnfsError, TooLarge
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, RETRY_INTERVAL, retry_delay
 from rnfs.features.keepers import FOLLOW, name_subcommands, parse_name_arg
@@ -33,7 +37,6 @@ from rnfs.fsutil import printable
 NAME = "follow"
 SOURCE_PREFIX = "follow:"
 FAR_FUTURE = float("inf")
-STALE_ANNOUNCES = 2  # a record not heard for this many announce_intervals is refreshed from the network
 
 
 def follow_source(name: bytes) -> str:
@@ -75,6 +78,8 @@ class FollowFeature(Feature):
     """Followed names and their pins. Thread-safe."""
 
     name = NAME
+    requires = ("keepers",)  # a followed name is kept
+    optional = ("contacts",)  # a name contact's nick names a name (parse_name_arg)
 
     def __init__(self, node):
         """Load followed names; no network."""
@@ -90,8 +95,7 @@ class FollowFeature(Feature):
         self._resolved: set[bytes] = set()  # names whose last check resolved them (a failed fetch, then)
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._keepers = node.feature("keepers")
+        self._keepers = self.dependency("keepers")
         self._keepers.add_listener(self._changed)
         try:
             self._reconcile(self._load())
@@ -187,13 +191,14 @@ class FollowFeature(Feature):
         with self._lock:
             for name in self._pinned:
                 self._due[name] = (first, True)
-        self._thread = threading.Thread(target=self._loop, name="rnfs-follow", daemon=True)
-        self._thread.start()
+        self._spawn(self._loop, "rnfs-follow")
 
-    def stop(self):
-        """Stop the background thread (a fetch in progress stops at its next network wait)."""
+    def stop(self, deadline: float | None = None):
+        """Stop the background thread and wait for it until deadline (a fetch in progress stops at its next network
+        wait), so the node doesn't close the state database under it."""
         self._stop.set()
         self._wake.set()
+        self._join(deadline)
 
     def close(self):
         """Release the state database."""
@@ -271,7 +276,7 @@ class FollowFeature(Feature):
         """Bring name's follow pin up to date with its latest target; True if it is (or nothing to do).
 
         network=True resolves through the network (a flooded path request, maybe a DHT lookup) only if the
-        record held wasn't heard within STALE_ANNOUNCES x announce_interval; network=False uses the record held
+        record held wasn't heard within MISSED_ANNOUNCES x announce_interval; network=False uses the record held
         whatever its age (the network only when none is held).
         """
         with self._lock:
@@ -280,7 +285,7 @@ class FollowFeature(Feature):
             pinned = self._pinned[name]
             self._resolved.discard(name)
         try:
-            max_age = STALE_ANNOUNCES * self.node.config.announce_interval if network else FAR_FUTURE
+            max_age = MISSED_ANNOUNCES * self.node.config.announce_interval if network else FAR_FUTURE
             result = self.node.names.resolve(name, persist=True, max_age=max_age)
         except Exception as e:  # noqa: BLE001 - resolving is retried later
             self._set_state(name, f"resolve failed: {e}")
@@ -296,9 +301,25 @@ class FollowFeature(Feature):
             return True
         self._set_state(name, f"fetching {target}")
         source = follow_source(name)
+        quota = self.node.config.follow_quota
         try:
+            if quota == 0:
+                raise TooLarge("follow fetches are off (follow_quota is 0)")
             with self.node.fetcher.open(target, pinned=True) as fetch:
-                fetch.fetch_dag(fetch.resolve())
+                # A pinned fetch never stops at max_storage, so without this the name's owner could fill the disk
+                expect = fetch.resolve()
+                content = fetch.size_of(expect)
+                if content > quota:
+                    raise TooLarge(f"{content} bytes would exceed follow_quota ({quota})")
+                # A DAG of empty files has size 0 yet can hold gigabytes of directory nodes: count its blocks too
+                # (fetch_dag also bounds them by what the size can hold, whichever is lower)
+                fetch.max_dag_bytes = quota
+                try:
+                    fetch.fetch_dag(expect)
+                except TooLarge as e:
+                    if fetch.dag_bytes <= quota:
+                        raise  # the bound of its size, not the quota
+                    raise TooLarge(f"{e}, more than follow_quota") from e
                 with self._lock:
                     followed = name in self._pinned
                     if followed:

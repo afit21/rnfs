@@ -39,6 +39,10 @@ rnfs.dht links two more RNS methods are wrapped, to check the packed response's 
   link that negotiated a larger one, up to hundreds of KiB) is decrypted and checked first, so such a link
   decrypts an honest one twice. An rnfs.dht server sends no requests, so a response packet arriving on an
   incoming link is dropped unread: RNS would otherwise decode it before finding no request it answers.
+Link.receive likewise drops, unread, a request packet arriving on an rnfs.dht link this node opened: the remote
+destination of such a link has no request handlers and no max_request_size, so RNS would decode any request up
+to the link's MDU and start a thread for it before finding nothing to run it. The node's server takes requests
+on incoming links only.
 A refused response answers its request with None, which every rnfs.dht parser refuses as malformed, so the
 requester fails it at once, as it would a malformed response.
 
@@ -60,7 +64,7 @@ import RNS
 
 from rnfs import __version__
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_RESPONSE_SIZE
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, plural
+from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, plural
 from rnfs.network import protocol
 
 # Resource data is a 4-byte random hash plus the payload, encrypted as an RNS Token: 16-byte IV, 32-byte HMAC
@@ -148,7 +152,7 @@ def _fail_pending_request(packet, adv):
         if getattr(pending, "request_id", None) == request_id:
             try:
                 pending.response_rejected()
-            except Exception:
+            except Exception:  # noqa: BLE001 - RNS internals: best effort
                 pass
 
 
@@ -158,7 +162,7 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
     link = getattr(advertisement_packet, "link", None)
     try:
         adv = RNS.ResourceAdvertisement.unpack(advertisement_packet.plaintext)
-    except Exception:
+    except Exception:  # noqa: BLE001 - unreadable advertisements are left to RNS
         adv = None  # let RNS handle an advertisement it can't read, as it always has
     reason = refusal(adv, link) if adv is not None else None
     if reason is not None:
@@ -178,31 +182,10 @@ def guarded_accept(advertisement_packet, callback=None, progress_callback=None, 
 PACKET_CHECK_SIZE = RNS.Reticulum.MTU  # response packets larger than RNS's default MTU are checked first
 REFUSAL_LOG_INTERVAL = 60.0  # seconds between log lines about refused responses, after the first
 
-
-class _ThrottledLog:
-    """A log line at most every REFUSAL_LOG_INTERVAL seconds, counting the ones left out, so whoever sends
-    refused responses can't flood the log."""
-
-    def __init__(self, clock=time.monotonic):
-        """Nothing logged yet."""
-        self.clock = clock
-        self.lock = threading.Lock()
-        self.logged_at = None
-        self.skipped = 0
-
-    def __call__(self, message: str, level: int):
-        """Log message at level now, or count it if a line was logged less than REFUSAL_LOG_INTERVAL ago."""
-        with self.lock:
-            now = self.clock()
-            if self.logged_at is not None and now - self.logged_at < REFUSAL_LOG_INTERVAL:
-                self.skipped += 1
-                return
-            skipped, self.skipped, self.logged_at = self.skipped, 0, now
-        log(message + (f" ({plural(skipped, 'more')} since the last)" if skipped else ""), level)
-
-
-_log_refused_response = _ThrottledLog()
-_log_unexpected_response = _ThrottledLog()
+# Whoever sends refused or unexpected responses or requests can't flood the log
+_log_refused_response = ThrottledLog(REFUSAL_LOG_INTERVAL)
+_log_unexpected_response = ThrottledLog(REFUSAL_LOG_INTERVAL)
+_log_unexpected_request = ThrottledLog(REFUSAL_LOG_INTERVAL)
 
 
 def _answer_as_malformed(link, request_id, size: int):
@@ -211,7 +194,7 @@ def _answer_as_malformed(link, request_id, size: int):
         return
     try:
         link.handle_response(request_id, None, size, size)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - runs inside RNS's packet handling; logged
         log(f"error failing a request whose response was refused: {e}", LOG_WARNING)
 
 
@@ -221,7 +204,7 @@ def _read_resource(resource) -> bytes | None:
     try:
         packed = data.read()
         data.seek(0)
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS's stream: unreadable means not checked here
         return None
     return packed if isinstance(packed, (bytes, bytearray)) else None
 
@@ -243,7 +226,14 @@ def guarded_response_resource_concluded(link, resource):
 
 
 def guarded_receive(link, packet):
-    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it."""
+    """RNS.Link.receive, but on rnfs.dht links checking a response packet before RNS decodes it, and dropping a
+    request packet on a link this node opened."""
+    if getattr(packet, "context", None) == RNS.Packet.REQUEST and getattr(link, "initiator", False) is True \
+            and getattr(packet, "packet_type", None) == RNS.Packet.DATA and is_dht_link(link):
+        # The remote destination of a link this node opened has no max_request_size and no handlers, so RNS
+        # would decode the request (up to the link's MDU) and start a thread for it before finding nothing to run
+        _log_unexpected_request("dropped a request arriving on an outgoing link, which serves none", LOG_VERBOSE)
+        return None
     if getattr(packet, "context", None) == RNS.Packet.RESPONSE and is_dht_link(link) \
             and getattr(packet, "packet_type", None) == RNS.Packet.DATA:
         if not getattr(link, "initiator", False):
@@ -254,7 +244,7 @@ def guarded_receive(link, packet):
         if len(data) > PACKET_CHECK_SIZE:
             try:
                 packed = link.decrypt(data)
-            except Exception:
+            except Exception:  # noqa: BLE001 - undecryptable is left to RNS, as before
                 packed = None
             reason = protocol.response_refusal(packed) if packed is not None else None
             if reason is not None:
@@ -382,7 +372,7 @@ class HalfOpenLimit:
         handshake was cut short learns at once and can try again."""
         try:
             link.teardown()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - runs on the guard's timer thread; logged
             log(f"error closing a half-open link: {e}", LOG_WARNING)
             return
         self.closed += 1

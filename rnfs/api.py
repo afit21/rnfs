@@ -34,6 +34,40 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | POST | /api/export | JSON `target`, `output` | `export(target, output)` |
 | POST | /api/import | JSON `path` | `import_archive(path)` |
 
+The features (rnfs.features, each's `api_routes()`) add these; `name` is a name or a name contact's nick:
+
+| Method | Path | Parameters | Response |
+|---|---|---|---|
+| GET  | /api/jobs | | `{"jobs": [job]}`, oldest first |
+| POST | /api/jobs | JSON `kind` (get, pin, export), `target`, `output`, `from`, `sealed_name`, `fallback_dht` | the job queued |
+| GET  | /api/jobs/get | `id`, `wait` (≤ 30 s) | the job, once it ends or after `wait` |
+| POST | /api/jobs/cancel | JSON `id` | the job |
+| POST | /api/jobs/clear | JSON `id` (optional) | `{"removed": count}` of the finished jobs forgotten |
+| GET  | /api/peers | | `{"peers": [...]}` |
+| GET  | /api/stats | | traffic totals, refusals and per-interface bytes |
+| POST | /api/name/keep | JSON `name` | the kept name |
+| POST | /api/name/unkeep | JSON `name` | `{}` |
+| GET  | /api/name/kept | | `{"kept": [{"name", "reasons", "sequence", "cid", "emitted"}]}` |
+| POST | /api/name/follow | JSON `name` | the followed name |
+| POST | /api/name/unfollow | JSON `name` | `{}` |
+| GET  | /api/name/following | | `{"following": [{"name", "pinned", "latest", "sequence", "state"}]}` |
+| GET  | /api/contacts | | `{"contacts": [{"nick", "kind", "id"}]}` |
+| GET  | /api/contacts/get | `nick` | the contact |
+| POST | /api/contacts/add | JSON `nick`, `id`, `kind` (optional) | the contact |
+| POST | /api/contacts/rm | JSON `nick` | `{}` |
+| GET  | /api/lxmf/address | | `{"address", "display_name", "propagation_node", "nearest_propagation_node"}` |
+| POST | /api/lxmf/send | JSON `to`, `target`, `message`, `propagate`, `nearest` | `{"id", "hash", "to", "method"}` |
+| GET  | /api/lxmf/inbox | | `{"messages": [...]}` |
+| POST | /api/lxmf/inbox/get | JSON `id`, `link`, `output` or `directory`, `use_sent_cid` | `{"results": [...]}` |
+| POST | /api/lxmf/inbox/rm | JSON `id`, or `all` | `{"removed": count}` |
+| GET  | /api/lxmf/outbox | | `{"messages": [...]}` |
+| POST | /api/lxmf/sync | JSON `nearest` | `{"propagation_node", "started"}` |
+| GET  | /api/deny | | `{"entries": [local entry], "lists": [{"source", "cid", "entries", "state"}]}` |
+| POST | /api/deny/add | JSON `entries` | `{"added": [entries new to the local list]}` |
+| POST | /api/deny/rm | JSON `entries` | `{"removed": [...]}` (404 if one isn't on the local list) |
+
+Both tables are checked against ApiHandler.ROUTES and the features' routes (tests/test_api.py).
+
 GET parameters are in the query string. Request bodies may use Content-Length or chunked encoding.
 
 Watching names (rnfs.Client's names.watch): `GET /api/name/watch` is a long poll, level-triggered so a client loses
@@ -57,8 +91,10 @@ Security:
   (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
   so another local user listening there while the daemon is down learns neither the token nor a name key being
   imported.
-- Errors map to statuses as design.md says: ValueError 400, NotFound 404, TooLarge 413, Denied 451 (the deny
-  list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500.
+- Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
+  Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
+  error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
+  warning, with its traceback in the debug log.
 
 Connections (both this API and the gateway, through LocalServer):
 - The request line, headers and any JSON body must arrive within request_timeout of connecting, else the
@@ -80,13 +116,12 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from rnfs import __version__, fsutil
+from rnfs import __version__, fsutil, ids
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
-from rnfs.config import _HEX_ID  # exactly 32 hex digits, as names.parse_name and identity lists are checked
 from rnfs.content.cid import Cid
-from rnfs.errors import Busy, Denied, InvalidDag, NotFound, StorageFull, TooLarge
-from rnfs.log import LOG_ERROR, log
+from rnfs.errors import STATUSES, BlockMismatch, Busy
+from rnfs.log import LOG_ERROR, LOG_WARNING, log
 
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
@@ -99,9 +134,8 @@ MAX_WATCH_WAIT = 30  # seconds one may wait, as GET /api/jobs/get's wait=
 WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it ends
 MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
 
-# Exception class → HTTP status, checked in order (design.md); anything else is 500
-ERROR_STATUSES = [(ValueError, 400), (NotFound, 404), (TooLarge, 413), (Denied, 451), (InvalidDag, 422), (Busy, 503),
-                  (StorageFull, 507)]
+# Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
+ERROR_STATUSES = STATUSES
 
 
 _feature_routes: dict | None = None
@@ -162,11 +196,9 @@ def parse_cid(text) -> str:
 
 
 def parse_hex_id(text, what: str = "node ID") -> bytes:
-    """A 16-byte node ID or name written as 32 hex characters (spaces around allowed). Raises ValueError."""
-    # Hex digits only: bytes.fromhex alone would skip whitespace between them (as names.parse_name checks)
-    if not isinstance(text, str) or not _HEX_ID.fullmatch(text.strip()):
-        raise ValueError(f"invalid {what} {text!r}: must be 32 hex characters")
-    return bytes.fromhex(text.strip())
+    """A 16-byte node ID or name written as 32 hex characters (spaces around allowed, no <angle brackets>).
+    Raises ValueError."""
+    return ids.parse_hex16(text, what)
 
 
 def parse_path(text) -> str:
@@ -607,7 +639,8 @@ class ApiHandler(TimedHandler):
     server_version = "rnfs"
     sys_version = ""
 
-    # (method, path) → handler method name. GET routes never change pins, names or content
+    # (method, path) → handler method name, as the module docstring's table lists them (test_api checks both).
+    # GET routes never change pins, names or content
     ROUTES = {
         ("GET", "/api/status"): "api_status",
         ("GET", "/api/info"): "api_info",
@@ -772,6 +805,9 @@ class ApiHandler(TimedHandler):
             status = error_status(e)
             if status == 500:
                 log(f"API {self.command} {loggable(url.path)} failed: {e!r}", LOG_ERROR)
+            elif isinstance(e, BlockMismatch):
+                # Answered 400 as a ValueError, as before, but the node's own fault: logged, with its traceback
+                log(f"API {self.command} {loggable(url.path)} failed: {e!r}", LOG_WARNING)
             message = str(e) or type(e).__name__
             self.respond_error(status, message, {"Retry-After": "10"} if status == 503 else None)
 
@@ -962,14 +998,15 @@ class ApiHandler(TimedHandler):
     # POST endpoints
 
     def api_add(self):
-        """POST /api/add {"path", "wrap", "only_hash"}: import a file or directory on this machine."""
+        """POST /api/add: import a file or directory on this machine (parameters: the module docstring's table)."""
         body = self.json_body()
         self.send_json(200, self.node.add_path(parse_path(body.get("path")), wrap=parse_bool(body.get("wrap")),
                                                only_hash=parse_bool(body.get("only_hash")),
                                                **node_content.add_options(body.get)))  # pin, to, chunker…
 
     def api_add_stream(self):
-        """POST /api/add/stream?name=&only_hash=: import the request body, wrapped as name if given."""
+        """POST /api/add/stream: import the request body, wrapped as name if given (parameters: the module
+        docstring's table)."""
         reader = self.stream_reader()
         size = None if reader.chunked else reader.remaining
         name = self.param("name", False) or None
@@ -978,7 +1015,7 @@ class ApiHandler(TimedHandler):
         self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
 
     def api_get(self):
-        """POST /api/get {"target", "output", "from"}: fetch and write out to a path on this machine."""
+        """POST /api/get: fetch and write out to a path on this machine (parameters: the module docstring's table)."""
         body = self.json_body()
         from_node = parse_hex_id(body["from"]) if body.get("from") else None
         raw = {"raw": True} if parse_bool(body.get("raw")) else {}  # sealed files: the ciphertext
@@ -995,11 +1032,8 @@ class ApiHandler(TimedHandler):
                                               executable=parse_bool(body.get("executable"))))
 
     def api_dir_rm(self):
-        """POST /api/dir/rm {"target"}: a new directory without the target's entry."""
-        target = parse_target(self.json_body().get("target"))
-        if "/" not in target.rstrip("/"):
-            raise ValueError("dir rm needs <cid>/<path>: the entry to remove")
-        self.send_json(200, self.node.dir_rm(target))
+        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one)."""
+        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target"))))
 
     def api_pin_add(self):
         """POST /api/pin/add {"target"}: fetch and pin with source user; answers once complete."""

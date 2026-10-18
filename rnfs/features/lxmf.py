@@ -15,7 +15,8 @@ startup_announce_delay and every announce_interval. LXMF keeps its router state 
 - Receiving: messages with rnfs links go to a bounded inbox. Links from senders in lxmf_auto_fetch_from are
   fetched and pinned with source `lxmf:<sender>`, within lxmf_auto_fetch_quota per sender; removing the
   message from the inbox releases those pins, and a message holding pins is never dropped to make room for
-  others. lxmf_accept_from restricts senders.
+  others' (each such sender keeps at most 1/n of the inbox, so none fills it). lxmf_accept_from restricts
+  senders.
 - The inbox and outbox are kept in the state database (rnfs.statedb, the lxmf_messages table) and saved in
   batches, each save writing the records changed since the last; outbox messages still unfinished at a start
   are marked failed (LXMF doesn't persist its outbound queue).
@@ -25,7 +26,8 @@ Everything received is untrusted: fields are parsed strictly and capped, text is
 printed. A message is only accepted once LXMF has validated its signature against the sender's identity; one
 from a sender whose identity isn't known yet is held while a path request fetches it.
 
-LXMF is optional: without the package (or with lxmf_enabled = false) the feature stays off and says so once.
+The LXMF package is a dependency (pyproject.toml), but the node runs without it: if it can't be imported (or with
+lxmf_enabled = false), the feature stays off and says so once.
 Nothing here imports RNS or LXMF at module level (CLI commands mustn't load them); LxmfNetwork, made in
 start(), holds every RNS and LXMF object, so the rest works on offline test nodes with a stand-in network.
 """
@@ -37,12 +39,12 @@ import signal
 import sys
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
 
-from rnfs import features, fsutil
+from rnfs import features, fsutil, ids
 from rnfs.features import _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
@@ -100,10 +102,9 @@ DEFAULT_DISPLAY_NAME = "rnfs node"  # nothing in it links the LXMF address to th
 PROPAGATION_NODES_LIMIT = 64  # propagation nodes remembered from announces
 PROPAGATION_NODE_AGE = 7 * 24 * 3600.0  # forget a propagation node not heard this long
 IDENTITY_WAIT = 15.0  # seconds `send` waits for an unknown recipient's identity (capped by path_timeout)
-TICK = 1.0  # seconds between polls of outbound message states
+TICK = 1.0  # seconds between polls of outbound message states (while any is followed, held or downloading)
 SYNC_TIMEOUT = 900.0  # a propagation node download still unfinished after this is abandoned
 
-_HEX32 = re.compile(r"[0-9a-fA-F]{32}")
 _SEGMENT = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+")
 _QUERY_VALUE = re.compile(r"(?:[A-Za-z0-9\-._~!$'()*+,;=:@/]|%[0-9A-Fa-f]{2})*")  # "&" separates parameters
 # An rnfs: link in free text: not glued to a preceding word, ending at whitespace or a character URIs never hold
@@ -133,9 +134,7 @@ def _check_name(name: str):
 
 def parse_address(text) -> bytes:
     """An LXMF address (destination hash) from 32 hex characters, with or without <angle brackets>."""
-    if not isinstance(text, str) or not _HEX32.fullmatch(text.strip().strip("<>")):
-        raise ValueError(f"invalid LXMF address {text!r}: must be 32 hex characters")
-    return bytes.fromhex(text.strip().strip("<>"))
+    return ids.parse_hex16(text, "LXMF address", brackets=True)
 
 
 def validate_settings(config):
@@ -252,7 +251,7 @@ def parse_uri(text) -> Link:
         segments.pop()  # "<cid>/dir/" names the same directory as "<cid>/dir"
     cid = name = None
     if segments[0] == NAME_SEGMENT:
-        if len(segments) < 2 or not _HEX32.fullmatch(segments[1]):
+        if len(segments) < 2 or not ids.HEX16.fullmatch(segments[1]):
             raise ValueError("rnfs:name/ must be followed by a name: 32 hex characters")
         name = bytes.fromhex(segments[1])
         segments = segments[2:]
@@ -282,7 +281,7 @@ def parse_uri(text) -> Link:
             if key == "from":
                 if from_node is not None:
                     raise ValueError("from is given twice")
-                if not _HEX32.fullmatch(value):
+                if not ids.HEX16.fullmatch(value):
                     raise ValueError("from must be a node ID: 32 hex characters")
                 from_node = bytes.fromhex(value)
     return Link(cid, name, tuple(names), None, from_node)
@@ -485,13 +484,16 @@ class MessageLog:
     per record in its box: a save writes the records added, changed or removed since the last. Thread-safe.
 
     At most limit records and max_bytes of JSON are kept. To make room, the oldest record protect() is false
-    for is dropped; a protected one only when every other is protected too. add() may also name records that
-    are dropped only for each other's (reserved). valid() checks records loaded (malformed ones are dropped;
-    clean says whether the box was saved whole, or imported from a whole file, and every record was read).
+    for is dropped; a protected one only when every other is protected too, and then only one with the new
+    record's "from". add() may also name records that are dropped only for each other's (reserved), and limit
+    the new record's "from" to a share. holds(record) is what a protected record holds (the inbox: pinned CIDs
+    and queued links): one whose holdings another record of its sender also holds is dropped first among a
+    sender's protected records. valid() checks records loaded (malformed ones are dropped; clean says whether
+    the box was saved whole, or imported from a whole file, and every record was read).
     """
 
     def __init__(self, state_dir: str, box: str, limit: int, max_bytes: int | None = None, protect=None,
-                 valid=None):
+                 valid=None, holds=None):
         """Load box's records from the state database in state_dir (malformed ones are dropped). Close it when
         done."""
         from rnfs import statedb
@@ -499,6 +501,7 @@ class MessageLog:
         self.limit = limit
         self.max_bytes = max_bytes
         self.protect = protect or (lambda entry: False)
+        self.holds = holds or (lambda entry: ())
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._dirty: set[int] = set()  # ids of records added, changed or removed since the last save
@@ -540,12 +543,15 @@ class MessageLog:
                 if bad:
                     statedb.set_meta(tx, self.box, "clean", 0)
 
-    def add(self, entry: dict, per_from: int | None = None, reserved=None) -> tuple[int | None, list[dict]]:
+    def add(self, entry: dict, per_from: int | None = None, reserved=None,
+            share: tuple[int, int] | None = None) -> tuple[int | None, list[dict]]:
         """Append entry with a new id; returns the id (None if entry itself was dropped: every other record is
-        protected and it isn't) and the entries dropped to stay within the bounds. per_from: also keep at most
-        that many unprotected records with entry's "from". reserved(record): records it is true for are dropped
-        to make room only for an entry it is true for too, and only once no other unprotected record is left
-        (trusted senders' records, so new identities can't push them out)."""
+        protected and it isn't, or none of the others it may push out has its "from") and the entries dropped to
+        stay within the bounds. per_from: also keep at most that many unprotected records with entry's "from".
+        share (records, bytes): keep at most that many records and bytes with entry's "from", protected ones
+        included (entry is kept even if it alone exceeds them). reserved(record): records it is true for are
+        dropped to make room only for an entry it is true for too, and only once no other unprotected record is
+        left (trusted senders' records, so new identities can't push them out)."""
         reserved = reserved or (lambda record: False)
         with self._lock:
             if self._next_id > MAX_ID:  # only a hand-edited next id gets here: refused, so saves keep working
@@ -559,6 +565,8 @@ class MessageLog:
             if per_from is not None:
                 same = [e for e in self._entries if e.get("from") == entry.get("from") and not self.protect(e)]
                 dropped += same[:max(0, len(same) - per_from)]
+            if share is not None:
+                dropped += self._over_share(entry, share, dropped)
             entry_reserved = reserved(entry)
             while self._over(dropped):
                 gone = {id(e) for e in dropped}
@@ -568,9 +576,11 @@ class MessageLog:
                     victim = others[0]
                 if victim is None:
                     # Every other record holds pins (or is reserved, and entry isn't): refuse entry rather than
-                    # drop them, unless it holds pins too (then the oldest goes; only a trusted sender gets here)
-                    victim = entry if not self.protect(entry) or len(self._entries) - len(dropped) == 1 else \
-                        next(e for e in self._entries if id(e) not in gone and e is not entry)
+                    # drop them, unless it holds pins too. Then one of its own sender's records goes, never another
+                    # sender's, so no sender pushes out another's pins (FEAT-1); with none, entry is refused
+                    own = [e for e in self._entries
+                           if e.get("from") == entry.get("from") and id(e) not in gone and e is not entry]
+                    victim = self._own_victim(own, own + [entry]) if self.protect(entry) and own else entry
                 dropped.append(victim)
                 if victim is entry:
                     break
@@ -580,6 +590,31 @@ class MessageLog:
                 self._sizes.pop(e["id"], None)
             self._dirty.update(e["id"] for e in [entry, *dropped])  # a refused entry still took an id
             return (None if id(entry) in gone else entry["id"]), [e for e in dropped if e is not entry]
+
+    def _over_share(self, entry: dict, share: tuple[int, int], dropped: list[dict]) -> list[dict]:
+        """The records of entry's "from" to drop (besides dropped) so that its records, entry and protected ones
+        included, are within share (records, bytes), chosen by _own_victim; never entry (lock held)."""
+        max_records, max_bytes = share
+        gone = {id(e) for e in dropped}
+        own = [e for e in self._entries if e.get("from") == entry.get("from") and id(e) not in gone]
+        size = sum(self._sizes[e["id"]] for e in own)
+        victims = []
+        while len(own) > 1 and (len(own) > max_records or size > max_bytes):
+            victim = self._own_victim([e for e in own if e is not entry], own)
+            victims.append(victim)
+            own = [e for e in own if e is not victim]
+            size -= self._sizes[victim["id"]]
+        return victims
+
+    def _own_victim(self, candidates: list[dict], own: list[dict]) -> dict:
+        """Which of candidates (records of one sender, oldest first) to drop: the oldest unprotected; else the
+        oldest whose holdings another of own (that sender's records kept so far) also holds, which drops no pin
+        (a sender re-linking one CID over and over has many such records); else the oldest (lock held)."""
+        victim = next((e for e in candidates if not self.protect(e)), None)
+        if victim is not None:
+            return victim
+        held = Counter(item for e in own for item in set(self.holds(e)))
+        return next((e for e in candidates if all(held[item] > 1 for item in set(self.holds(e)))), candidates[0])
 
     def _over(self, dropped: list[dict]) -> bool:
         """Whether the records left after dropping these exceed the limit or max_bytes (lock held)."""
@@ -680,7 +715,7 @@ def _valid_inbox_entry(entry: dict) -> bool:
     """Whether a loaded inbox record has the shape received() gives it."""
     auto = entry.get("auto")
     return (isinstance(entry.get("hash"), str) and isinstance(entry.get("from"), str)
-            and _HEX32.fullmatch(entry["from"]) is not None and _valid_links(entry.get("links"))
+            and ids.HEX16.fullmatch(entry["from"]) is not None and _valid_links(entry.get("links"))
             and (auto is None or (isinstance(auto, list) and len(auto) == len(entry["links"])
                                   and all(isinstance(a, dict) and _str_or_none(a.get("state")) for a in auto)))
             and all(_str_or_none(entry.get(key)) for key in ("display_name", "title", "text", "method")))
@@ -692,9 +727,26 @@ def _valid_outbox_entry(entry: dict) -> bool:
             and _valid_links(entry.get("links")) and all(_str_or_none(entry.get(key)) for key in ("text", "error")))
 
 
+def _unlisted() -> dict:
+    """The auto-fetch result of a link whose sender was taken off lxmf_auto_fetch_from before it was fetched."""
+    return {"state": "refused", "error": "the sender is no longer in lxmf_auto_fetch_from"}
+
+
 def _holds_pins(entry: dict) -> bool:
     """Whether an inbox record has auto-fetched pins, or is about to (queued): a flood mustn't release them."""
     return any(isinstance(a, dict) and a.get("state") in ("queued", "pinned") for a in entry.get("auto") or [])
+
+
+def _held(entry: dict) -> set:
+    """What an inbox record holds for its sender (MessageLog's holds): the CIDs pinned for it, and each link
+    still queued (its own: nobody else's record holds what it will pin)."""
+    held = set()
+    for index, result in enumerate(entry.get("auto") or []):
+        if isinstance(result, dict) and result.get("state") == "pinned":
+            held.add(str(result.get("cid")))
+        elif isinstance(result, dict) and result.get("state") == "queued":
+            held.add((entry.get("id"), index))
+    return held
 
 
 @dataclass
@@ -729,7 +781,7 @@ def _fit_entry(entry: dict):
     """Bound an inbox record to MAX_ENTRY_BYTES as JSON: drop links from the last (keeping one), then cut text.
 
     Room is left for the auto-fetch results it may get."""
-    reserve = 128 * len(entry["links"])  # {"state": "pinned", "cid": ...} per link
+    reserve = 128 * len(entry["links"])  # {"state": "pinned", "cid": ..., "sent_cid": true} per link
     while len(entry["links"]) > 1 and _json_bytes(entry) + reserve > MAX_ENTRY_BYTES:
         entry["links"].pop()
         reserve -= 128
@@ -805,6 +857,8 @@ class LxmfFeature(features.Feature):
     """Sends and receives rnfs links over LXMF; see the module docstring."""
 
     name = NAME
+    # contacts: send to a nick, trust LXMF contacts, name senders in the inbox; jobs: links fetched in the background
+    optional = ("contacts", "jobs")
 
     def __init__(self, node):
         """Load the inbox and outbox; LXMF itself is started in start()."""
@@ -815,8 +869,23 @@ class LxmfFeature(features.Feature):
         self.off_reason = "LXMF has not been started"
         self.accept_from = {parse_address(a).hex() for a in config.lxmf_accept_from}
         self.auto_fetch_from = {parse_address(a).hex() for a in config.lxmf_auto_fetch_from}
+        # Every attribute is set before any method runs: the start-up steps below can reach the inbox, the
+        # auto-fetch queue and the lock (_release_unrecorded -> _record_kept -> _release)
+        self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
+        self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
+        self._told_no_pn = False  # logged once how to set a propagation node
+        self._auto_queue = _RoundRobin()  # (entry id, link index) by sender
+        self.clock = time.monotonic  # for the rate limit on senders not trusted (tests set their own)
+        self._untrusted_tokens = float(UNTRUSTED_BURST)
+        self._untrusted_at: float | None = None
+        self._untrusted_dry = False  # logged (notice) that the bucket ran dry; verbose until a token is taken
+        self._untrusted_dropped = 0  # untrusted senders' messages the rate limits dropped since the start
+        self._sender_tokens: OrderedDict[bytes, tuple[float, float]] = OrderedDict()  # sender -> (tokens, when)
+        self._auto_wanted = threading.Condition()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
         self.inbox = MessageLog(config.state_dir, INBOX, INBOX_LIMIT, MAX_INBOX_BYTES, protect=_holds_pins,
-                                valid=_valid_inbox_entry)
+                                valid=_valid_inbox_entry, holds=_held)
         try:
             self.outbox = MessageLog(config.state_dir, OUTBOX, OUTBOX_LIMIT, valid=_valid_outbox_entry)
         except BaseException:
@@ -828,23 +897,11 @@ class LxmfFeature(features.Feature):
                     # LXMF doesn't persist its outbound queue
                     self.outbox.update(entry["id"], state="failed",
                                        error="the daemon stopped before it was delivered")
-            self._lock = threading.RLock()  # inbox removals and auto-fetch pins, so a pin is never left behind
             self._release_unrecorded()
+            self._refuse_unlisted()
         except BaseException:
             self.close()
             raise
-        self._resend: dict[str, tuple] = {}  # direct message hash -> (address, content, fields, nearest)
-        self._told_no_pn = False  # logged once how to set a propagation node
-        self._auto_queue = _RoundRobin()  # (entry id, link index) by sender
-        self.clock = time.monotonic  # for the rate limit on senders not trusted (tests set their own)
-        self._untrusted_tokens = float(UNTRUSTED_BURST)
-        self._untrusted_at: float | None = None
-        self._untrusted_dry = False  # logged (notice) that the bucket ran dry; verbose until a token is taken
-        self._sender_tokens: OrderedDict[bytes, tuple[float, float]] = OrderedDict()  # sender -> (tokens, when)
-        self._auto_wanted = threading.Condition()
-        self._stop = threading.Event()
-        self._wake = threading.Event()
-        self._threads: list[threading.Thread] = []
 
     def _release_unrecorded(self):
         """Release lxmf: pins no inbox message records as pinned. Pins are saved at once and the inbox every
@@ -876,11 +933,22 @@ class LxmfFeature(features.Feature):
                 except OSError as e:  # e.g. a read-only state directory: tried again at the next start
                     _log(f"could not release {cid}: {e}", LOG_ERROR)
 
+    def _refuse_unlisted(self):
+        """Mark "refused" the auto-fetches still queued for senders no longer in lxmf_auto_fetch_from: the user took
+        them off the list since, and a queued link holds its message in the inbox like a pin. Runs whether or not
+        LXMF then starts."""
+        for entry in self.inbox.entries():
+            if entry.get("from") in self.auto_fetch_from:
+                continue
+            for index, result in enumerate(entry.get("auto") or []):
+                if isinstance(result, dict) and result.get("state") == "queued":
+                    self._set_auto(entry["id"], index, _unlisted())
+
     def _record_kept(self, sender: str, cids: list[Cid]):
         """Keep sender's lxmf: pins of cids, which an inbox that didn't load whole doesn't record: add an inbox
         message from sender recording them as pinned, and save the inbox."""
         listed = ", ".join(str(cid) for cid in cids)
-        if _HEX32.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
+        if ids.HEX16.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
             _log(f"keeping {listed}, pinned for {sender!r}, which isn't an LXMF address", LOG_WARNING)
             return
         _log(f"the saved inbox is missing, damaged or incomplete: keeping {listed}, pinned for a message from "
@@ -893,8 +961,11 @@ class LxmfFeature(features.Feature):
                          "release them.",
                  "auto": [{"state": "pinned", "cid": str(cid)} for cid in cids]}
         with self._lock:
-            _, dropped = self.inbox.add(entry)
+            entry_id, dropped = self.inbox.add(entry)
             self._release(dropped)
+        if entry_id is None:  # never another sender's pins for these: kept unrecorded, released at a later start
+            _log(f"no room for that message: the inbox is full of other senders' messages holding pins; {listed} "
+                 f"stay pinned until a start finds the inbox whole", LOG_WARNING)
         try:
             self.inbox.save()
         except OSError as e:  # the pins are kept; recorded again at the next start
@@ -927,23 +998,20 @@ class LxmfFeature(features.Feature):
         self.attach(network)
         self._requeue_auto_fetches()
         for name, target in (("rnfs-lxmf", self._run), ("rnfs-lxmf-fetch", self._run_auto_fetch)):
-            thread = threading.Thread(target=target, name=name, daemon=True)
-            thread.start()
-            self._threads.append(thread)
+            self._spawn(target, name)
         _log(f"LXMF address {network.address.hex()} ({network.display_name})", LOG_NOTICE)
 
     def attach(self, network):
         """Use network (LxmfNetwork, or a stand-in in tests) for sending and receiving."""
         self.network = network
 
-    def stop(self):
-        """Stop the loops, LXMF's router, and save."""
+    def stop(self, deadline: float | None = None):
+        """Stop the loops (waiting for them until deadline, as Feature.stop), LXMF's router, and save."""
         self._stop.set()
         self._wake.set()
         with self._auto_wanted:
             self._auto_wanted.notify_all()
-        for thread in self._threads:
-            thread.join(2.0)
+        self._join(deadline)
         if self.network is not None:
             try:
                 self.network.stop()
@@ -962,9 +1030,19 @@ class LxmfFeature(features.Feature):
         self.outbox.close()
 
     def status(self) -> dict:
-        """The LXMF address (None when off) and the number of inbox messages."""
+        """The LXMF address (None when off), the number of inbox messages, and how many messages from untrusted
+        senders the rate limits dropped since the start: many identities can keep the strangers' bucket empty, so
+        a rising count is a reason to add the senders the user expects as contacts."""
         return {"lxmf_address": self.network.address.hex() if self.network is not None else None,
-                "lxmf_inbox": len(self.inbox)}
+                "lxmf_inbox": len(self.inbox), "untrusted_dropped": self._untrusted_dropped}
+
+    def sync(self, nearest: bool = False) -> dict:
+        """Start downloading waiting messages from the propagation node (nearest: without lxmf_propagation_node
+        set, the nearest heard): {"propagation_node", "started"}. ValueError if LXMF is off."""
+        network = self._require_network()
+        node = network.propagation_node(nearest)
+        return {"propagation_node": node.hex() if node is not None else None,
+                "started": bool(node is not None and network.sync(nearest))}
 
     def _require_network(self):
         """The network, or ValueError explaining why LXMF is off."""
@@ -974,13 +1052,17 @@ class LxmfFeature(features.Feature):
 
     def _run(self):
         """Announce (at start, after startup_announce_delay, then every announce_interval), download from the
-        propagation node every lxmf_sync_interval, and poll outbound messages."""
+        propagation node every lxmf_sync_interval, and poll outbound messages every TICK. While the network has
+        nothing to poll (network.idle()), sleep until the next announce or download is due instead: the network
+        wakes the loop (wake()) when it queues or holds a message or starts a download, so an idle node doesn't
+        wake each second."""
         network = self.network
         now = time.monotonic()
         announce_at = [now, now + self.config.startup_announce_delay]
         sync_at = now + max(self.config.startup_announce_delay, 10.0) if self.config.lxmf_sync_interval else None
         while not self._stop.is_set():
             now = time.monotonic()
+            timeout = TICK
             try:
                 if announce_at and now >= announce_at[0]:
                     announce_at.pop(0)
@@ -995,10 +1077,18 @@ class LxmfFeature(features.Feature):
                         network.sync()
                 for message_hash, state, progress in network.poll():
                     self.outbound_changed(message_hash, state, progress)
+                # A message queued or held after this check sets _wake, so the wait below returns at once
+                if network.idle():
+                    due = announce_at[0] if sync_at is None else min(announce_at[0], sync_at)
+                    timeout = max(0.0, due - time.monotonic())
             except Exception as e:  # noqa: BLE001 - keep the loop alive
                 _log(f"loop failed: {e!r}", LOG_ERROR)
-            self._wake.wait(TICK)
+            self._wake.wait(timeout)
             self._wake.clear()
+
+    def wake(self):
+        """Wake the loop to poll the network now: it queued or held a message, or started a download."""
+        self._wake.set()
 
     def _no_propagation_node(self, consequence: str):
         """Log, once, that no propagation node is set and how to set one."""
@@ -1024,26 +1114,20 @@ class LxmfFeature(features.Feature):
                 "nearest_propagation_node": nearest.hex() if nearest is not None else None}
 
     def _recipient(self, to: str) -> bytes:
-        """An LXMF address, or the LXMF address of a contact nick."""
+        """An LXMF address, or the LXMF address of a contact nick (contacts.resolve_id)."""
         if not isinstance(to, str) or not to.strip():
             raise ValueError("a recipient is required: an LXMF address or a contact")
-        if _HEX32.fullmatch(to.strip().strip("<>")):
+        if ids.is_hex16(to, brackets=True):
             return parse_address(to)
-        # A contact nick, through rnfs/features/contacts.py when that feature is loaded
-        contacts = getattr(self.node, "features", {}).get("contacts")
-        if contacts is not None and hasattr(contacts, "lookup"):
-            found = contacts.lookup(to, "lxmf")
-            if isinstance(found, (bytes, bytearray)) and len(found) == ID_LENGTH:
-                return bytes(found)
-            if contacts.lookup(to) is not None:
-                raise ValueError(f"contact {to} is not an LXMF address")
-            raise ValueError(f"no LXMF contact {to!r}, and it isn't an LXMF address (32 hex characters)")
-        raise ValueError(f"{to!r} is not an LXMF address (32 hex characters), and contacts aren't available")
+        contacts = self.dependency("contacts")
+        if contacts is None:
+            raise ValueError(f"{to!r} is not an LXMF address (32 hex characters), and contacts aren't available")
+        return contacts.resolve_id(to, "lxmf")
 
     def _contact_target(self, target):
         """target with a leading name contact's nick replaced by name/<name>, so the link follows the name."""
-        contacts = getattr(self.node, "features", {}).get("contacts")
-        if not isinstance(target, str) or contacts is None or not hasattr(contacts, "lookup"):
+        contacts = self.dependency("contacts")
+        if not isinstance(target, str) or contacts is None:
             return target
         first, slash, rest = target.partition("/")
         if first == NAME_SEGMENT or target[:len(URI_SCHEME)].lower() == URI_SCHEME:
@@ -1172,13 +1256,18 @@ class LxmfFeature(features.Feature):
             _log(f"message {message_hash} from {sender} not kept: too many new messages from this sender, or from "
                  f"senders not in contacts, lxmf_accept_from or lxmf_auto_fetch_from",
                  LOG_VERBOSE if self._untrusted_dry else LOG_NOTICE)
-            self._untrusted_dry = True
+            with self._lock:
+                self._untrusted_dry = True
+                self._untrusted_dropped += 1
             return None
         with self._lock:
             # A sender not trusted with auto-fetch gets INBOX_PER_SENDER records, so one can't push out others',
-            # and records of trusted senders are dropped only for each other's: identities are free
+            # and records of trusted senders are dropped only for each other's: identities are free. An
+            # auto-fetch sender's records hold pins, which others' records never push out, so each such sender
+            # gets 1/n of the inbox, protected records included: one can't fill it and push out another's (FEAT-1)
             entry_id, dropped = self.inbox.add(entry, per_from=None if auto else INBOX_PER_SENDER,
-                                               reserved=lambda record: self._trusted_hex(record.get("from")))
+                                               reserved=lambda record: self._trusted_hex(record.get("from")),
+                                               share=self._auto_share() if auto else None)
             self._release(dropped)
         if entry_id is None:
             _log(f"message {message_hash} from {sender} not kept: the inbox is full of messages from trusted "
@@ -1190,6 +1279,12 @@ class LxmfFeature(features.Feature):
             for index in range(len(entry["links"])):
                 self._queue_auto_fetch(entry_id, index, sender)
         return entry_id
+
+    def _auto_share(self) -> tuple[int, int]:
+        """The inbox records and bytes one auto-fetch sender may hold: 1/n of the inbox's limits for n senders in
+        lxmf_auto_fetch_from, and always room for one record."""
+        senders = max(1, len(self.auto_fetch_from))
+        return max(1, self.inbox.limit // senders), max(MAX_ENTRY_BYTES, self.inbox.max_bytes // senders)
 
     def accepts(self, source: bytes) -> bool:
         """Whether messages from LXMF address source are kept: lxmf_accept_from (empty: everyone), and
@@ -1207,8 +1302,8 @@ class LxmfFeature(features.Feature):
         """trusted() for an address as 32 hex characters (an inbox record's "from")."""
         if sender in self.accept_from or sender in self.auto_fetch_from:
             return True
-        contacts = getattr(self.node, "features", {}).get("contacts")
-        if contacts is None or not hasattr(contacts, "has") or not isinstance(sender, str):
+        contacts = self.dependency("contacts")
+        if contacts is None or not isinstance(sender, str):
             return False
         try:
             return bool(contacts.has(bytes.fromhex(sender), "lxmf"))
@@ -1240,8 +1335,20 @@ class LxmfFeature(features.Feature):
             return True
 
     def inbox_list(self) -> list[dict]:
-        """Inbox messages, oldest first."""
-        return self.inbox.entries()
+        """Inbox messages, oldest first, each with "trusted" (whether its sender is trusted now) and "contact" (the
+        nick of the LXMF contact with its address, or None) added: the display name is the sender's own word, so
+        `rnfs inbox` shows these instead."""
+        contacts = self.dependency("contacts")
+        entries = self.inbox.entries()
+        for entry in entries:
+            entry["trusted"] = self._trusted_hex(entry.get("from"))
+            entry["contact"] = None
+            if contacts is not None and entry["trusted"]:
+                try:
+                    entry["contact"] = contacts.nick_of(bytes.fromhex(entry["from"]), "lxmf")
+                except (TypeError, ValueError):
+                    pass
+        return entries
 
     def outbox_list(self) -> list[dict]:
         """Sent messages, oldest first."""
@@ -1278,27 +1385,37 @@ class LxmfFeature(features.Feature):
         if released:
             self.node.publisher.refresh()
 
-    def _resolve(self, link: Link, persist: bool = True) -> tuple[Cid, list[str]]:
-        """The root CID and path a link names, resolving a name (falling back to the CID it was sent with).
+    def _resolve(self, link: Link, persist: bool = True,
+                 allow_sent_cid: bool = False) -> tuple[Cid, list[str], bool]:
+        """The root CID and path a link names, resolving a name, and whether it fell back to the CID the name link
+        was sent with: only if allow_sent_cid and the name can't be resolved. NotFound if it can't be resolved
+        and that isn't allowed (naming --use-sent-cid if the link has a sent CID).
+
+        The sender chose the sent CID: nothing ties it to the name, so a stranger could pose as a well-known name
+        with it. A name that resolves is always used.
 
         persist False (auto-fetch): the name's record goes only into the bounded table, so names arriving
         unasked don't grow the held records; its sequence still goes into the bounded, saved floor, so a later
         auto-fetch of the name never resolves to an older record."""
         if link.name is None:
-            return link.cid, list(link.path)
+            return link.cid, list(link.path), False
         from rnfs.errors import NotFound
         try:
             if persist:
-                return Cid.parse(self.node.name_resolve(link.name.hex())["cid"]), list(link.path)
+                return Cid.parse(self.node.name_resolve(link.name.hex())["cid"]), list(link.path), False
             record = self.node.names.resolve(link.name, persist=False)
             if record is None:
                 raise NotFound(f"name {link.name.hex()} could not be resolved")
-            return Cid.parse(record["cid"]), list(link.path)
+            return Cid.parse(record["cid"]), list(link.path), False
         except NotFound:
             if link.cid is None:
                 raise
+            if not allow_sent_cid:
+                raise NotFound(f"name {link.name.hex()} could not be resolved; the sender says it pointed at "
+                               f"{link.cid}, but nothing ties that CID to the name: to get it anyway, use "
+                               f"--use-sent-cid") from None
             _log(f"name {link.name.hex()} could not be resolved; using the CID it was sent with", LOG_NOTICE)
-            return link.cid, list(link.path)
+            return link.cid, list(link.path), True
 
     def _hints(self, link: Link) -> list[bytes | None]:
         """Where to fetch from: the link's provider hint first (unless it is this node), then the DHT."""
@@ -1307,11 +1424,14 @@ class LxmfFeature(features.Feature):
         return [None]
 
     def inbox_get(self, entry_id: int, index: int | None = None, output: str | None = None,
-                  directory: str | None = None) -> list[dict]:
+                  directory: str | None = None, use_sent_cid: bool = False) -> list[dict]:
         """Fetch the links of inbox message entry_id (only link index, 1-based, if given) and write each out:
         to output, or into directory under its last path name (the root CID if that name is hidden,
         non-printable or not a plain file name here: the sender chose it). Tries the sender's node first, then
-        the DHT. Once one link has started, a later one's failure is a result with "error", not raised."""
+        the DHT. Once one link has started, a later one's failure is a result with "error", not raised.
+
+        A name link whose name can't be resolved is NotFound before anything is written or started, unless
+        use_sent_cid: then the CID it was sent with is fetched, and its result says so in "warnings"."""
         from rnfs.errors import NotFound
         entry = self.inbox.get(entry_id)
         if entry is None:
@@ -1328,29 +1448,33 @@ class LxmfFeature(features.Feature):
         # Every output is checked before anything starts, so a clash can't stop the fetches halfway
         planned = []
         for number, link in enumerate(links, 1):
-            root, names = self._resolve(link)
+            root, names, fell_back = self._resolve(link, allow_sent_cid=use_sent_cid)
+            warnings = [f"name {link.name.hex()} could not be resolved: fetching {root}, the CID the sender says it "
+                        f"pointed at (nothing ties that CID to the name)"] if fell_back else []
             target = "/".join([str(root), *names])
             if output is not None:
                 path = output
             else:
-                from rnfs import fsutil
                 path = os.path.join(directory, fsutil.safe_default_name(names[-1] if names else None, str(root)))
             if os.path.lexists(path):
                 raise ValueError(f"{fsutil.printable(path)} already exists; remove it or choose another with -o")
-            same = next((i for i, (_, other, _) in enumerate(planned) if other == path), None)
+            same = next((i for i, (_, other, _, _) in enumerate(planned) if other == path), None)
             if same is not None:
                 raise ValueError(f"links {same + 1} and {number} would both be written to {fsutil.printable(path)}: "
                                  f"get them one at a time with --link and -o")
-            planned.append((link, path, target))
+            planned.append((link, path, target, warnings))
         results = []
-        for link, path, target in planned:
+        for link, path, target, warnings in planned:
             try:
-                results.append(self._get_link(link, path, target))
-            except Exception as e:  # noqa: BLE001 - raised as is when nothing has started
+                result = self._get_link(link, path, target)
+            except Exception as e:  # raised as is when nothing has started
                 if not results:
                     raise
                 # Something has started already: report it, and this failure with it
-                results.append({"target": target, "output": path, "error": str(e) or type(e).__name__})
+                result = {"target": target, "output": path, "error": str(e) or type(e).__name__}
+            if warnings:
+                result["warnings"] = [*result.get("warnings", []), *warnings]
+            results.append(result)
         return results
 
     def _get_link(self, link: Link, path: str, target: str) -> dict:
@@ -1379,8 +1503,8 @@ class LxmfFeature(features.Feature):
 
         Like a fetch here: the link's provider hint first, then (fallback_dht) ordinary DHT discovery.
         """
-        jobs = getattr(self.node, "features", {}).get("jobs")
-        if jobs is None or not hasattr(jobs, "submit"):
+        jobs = self.dependency("jobs")
+        if jobs is None:
             return None
         from_node = self._hints(link)[0]
         if from_node is None:
@@ -1408,6 +1532,8 @@ class LxmfFeature(features.Feature):
         """Queue again, oldest first, the auto-fetches still "queued" when the daemon stopped (also one that
         was running then): the queue itself isn't saved, and a queued record is never dropped for others."""
         for entry in self.inbox.entries():
+            if entry.get("from") not in self.auto_fetch_from:
+                continue  # refused at construction (_refuse_unlisted)
             for index, result in enumerate(entry.get("auto") or []):
                 if isinstance(result, dict) and result.get("state") == "queued":
                     self._queue_auto_fetch(entry["id"], index, entry["from"])
@@ -1446,25 +1572,32 @@ class LxmfFeature(features.Feature):
     def auto_fetch(self, entry_id: int, index: int):
         """Fetch one link of an inbox message and pin it with source lxmf:<sender>, within the sender's quota.
 
-        The fetch stops (within fetcher.POLL) when the node stops, leaving the link queued for the next start,
-        or when the message is removed."""
+        The sender is trusted, so a name link whose name can't be resolved falls back to the CID it was sent with;
+        the result then records "sent_cid": true, which the inbox listing shows. The fetch stops (within
+        fetcher.POLL) when the node stops, leaving the link queued for the next start, or when the message is
+        removed. A sender taken off lxmf_auto_fetch_from while the link waited is refused."""
         from rnfs import fetcher
         from rnfs.content.storage import LXMF_PREFIX
         from rnfs.errors import Denied, InvalidDag, RnfsError, StorageFull, TooLarge
         entry = self.inbox.get(entry_id)
         if entry is None:
             return
+        if entry.get("from") not in self.auto_fetch_from:  # taken off the list while the link waited
+            _log(f"auto-fetch of inbox #{entry_id} link {index + 1}: refused: the sender is no longer in "
+                 f"lxmf_auto_fetch_from", LOG_NOTICE)
+            self._set_auto(entry_id, index, _unlisted())
+            return
         observer = fetcher.Observer()
         observer.cancelled = lambda: self._stop.is_set() or self.inbox.get(entry_id) is None
         try:
             link = Link.from_json(entry["links"][index])
             source = LXMF_PREFIX + entry["from"]
-            root, names = self._resolve(link, persist=False)
+            root, names, sent_cid = self._resolve(link, persist=False, allow_sent_cid=True)
             hints = self._hints(link)
             for attempt, from_node in enumerate(hints):
                 try:
                     with fetcher.observing(observer):
-                        cid = self._fetch_and_pin(entry_id, index, root, names, from_node, source)
+                        cid = self._fetch_and_pin(entry_id, index, root, names, from_node, source, sent_cid)
                     break
                 except (TooLarge, InvalidDag, StorageFull, fetcher.Cancelled):
                     raise
@@ -1490,27 +1623,32 @@ class LxmfFeature(features.Feature):
              f"{fsutil.printable(result['error'])}", LOG_NOTICE)
         self._set_auto(entry_id, index, result)
 
-    def _pin_recorded(self, entry_id: int, index: int, cid: Cid, source: str) -> bool:
-        """Pin cid with source and record it in the inbox entry, in one locked step so a removal can't come
-        between them and leave a pin no entry releases; False (nothing pinned) if the entry is gone."""
+    def _pin_recorded(self, entry_id: int, index: int, cid: Cid, source: str, sent_cid: bool = False) -> bool:
+        """Pin cid with source and record it in the inbox entry (with "sent_cid": true if it is a name link's sent
+        CID, the name unresolved), in one locked step so a removal can't come between them and leave a pin no
+        entry releases; False (nothing pinned) if the entry is gone."""
+        result = {"state": "pinned", "cid": str(cid)}
+        if sent_cid:
+            result["sent_cid"] = True
         with self._lock:
             if self.inbox.get(entry_id) is None:
                 return False
             self.node.storage.pin(cid, source)
-            self._set_auto(entry_id, index, {"state": "pinned", "cid": str(cid)})
+            self._set_auto(entry_id, index, result)
             return True
 
     def _fetch_and_pin(self, entry_id: int, index: int, root: Cid, names: list[str], from_node: bytes | None,
-                       source: str) -> Cid | None:
+                       source: str, sent_cid: bool = False) -> Cid | None:
         """Fetch <root>/<names> completely and pin the target with source, unless it would exceed the
-        sender's quota (TooLarge). Returns the CID pinned, or None if the message went away meanwhile."""
+        sender's quota (TooLarge). Returns the CID pinned, or None if the message went away meanwhile. sent_cid:
+        root is a name link's sent CID (recorded with the pin)."""
         from rnfs.errors import TooLarge
         quota = self.config.lxmf_auto_fetch_quota
         storage = self.node.storage
         with self.node.fetcher.open(root, names, from_node, pinned=True) as fetch:
             expect = fetch.resolve()
-            if source in storage.pins().get(expect.cid, set()):
-                return expect.cid if self._pin_recorded(entry_id, index, expect.cid, source) else None
+            if storage.has_pin(expect.cid, source):
+                return expect.cid if self._pin_recorded(entry_id, index, expect.cid, source, sent_cid) else None
             content = fetch.size_of(expect)
             used = storage.source_usage(source)
             if used + content > quota:
@@ -1519,7 +1657,7 @@ class LxmfFeature(features.Feature):
             # A DAG of empty files has size 0 yet can hold many directory nodes: count its blocks too
             fetch.max_dag_bytes = quota - used
             fetch.fetch_dag(expect)
-            if not self._pin_recorded(entry_id, index, expect.cid, source):
+            if not self._pin_recorded(entry_id, index, expect.cid, source, sent_cid):
                 return None
         self.node.publisher.refresh()
         return expect.cid
@@ -1553,6 +1691,9 @@ class LxmfFeature(features.Feature):
         get.add_argument("n", type=int, metavar="N", help="message number, from `rnfs inbox`")
         get.add_argument("--link", type=int, metavar="K", help="only the K-th link of the message")
         get.add_argument("-o", "--output", help="where to write (one link only; default: its name, here)")
+        get.add_argument("--use-sent-cid", action="store_true",
+                         help="if a name link's name can't be resolved, get the CID the sender says it pointed at "
+                              "(nothing ties that CID to the name: only for a sender you trust)")
         rm = command(inbox_commands, "rm", _run_inbox_rm,
                      "remove inbox messages, releasing what they auto-fetched")
         rm.add_argument("n", type=int, nargs="?", metavar="N", help="message number")
@@ -1608,13 +1749,14 @@ def _int(value, name: str, required: bool = True) -> int | None:
 
 
 def _api_inbox_get(handler):
-    """POST /api/lxmf/inbox/get {id, link?, output? | directory?}: {"results": [...]}."""
-    from rnfs.api import parse_path
+    """POST /api/lxmf/inbox/get {id, link?, output? | directory?, use_sent_cid?}: {"results": [...]}. A name link
+    whose name can't be resolved is 404 unless use_sent_cid (then its result carries a warning)."""
+    from rnfs.api import parse_bool, parse_path
     body = handler.json_body()
     output = parse_path(body["output"]) if body.get("output") is not None else None
     directory = parse_path(body["directory"]) if body.get("directory") is not None else None
     results = _feature(handler).inbox_get(_int(body.get("id"), "id"), _int(body.get("link"), "link", False),
-                                          output, directory)
+                                          output, directory, parse_bool(body.get("use_sent_cid", False)))
     handler.send_json(200, {"results": results})
 
 
@@ -1640,10 +1782,7 @@ def _api_sync(handler):
     from rnfs.api import parse_bool
     body = handler.json_body()
     nearest = parse_bool(body.get("nearest", False))
-    network = _feature(handler)._require_network()
-    node = network.propagation_node(nearest)
-    handler.send_json(200, {"propagation_node": node.hex() if node is not None else None,
-                            "started": bool(node is not None and network.sync(nearest))})
+    handler.send_json(200, _feature(handler).sync(nearest))
 
 
 # CLI commands
@@ -1657,7 +1796,8 @@ def _when(timestamp) -> str:
 
 
 def _print_links(entry: dict, printable):
-    """Print a message's links, one per line, with size and auto-fetch state."""
+    """Print a message's links, one per line, with size, the CID a name link was sent as (the sender's word: only
+    the name's own record ties a CID to it) and auto-fetch state."""
     auto = entry.get("auto") if isinstance(entry.get("auto"), list) else []
     for i, link in enumerate(entry.get("links") or []):
         if not isinstance(link, dict):
@@ -1665,8 +1805,12 @@ def _print_links(entry: dict, printable):
         notes = []
         if isinstance(link.get("size"), int):
             notes.append(human_size(link["size"]))
+        if link.get("name") is not None and link.get("cid") is not None:
+            notes.append(f"sent as {link['cid']}")
         if i < len(auto) and isinstance(auto[i], dict):
             state = auto[i].get("state")
+            if auto[i].get("sent_cid") is True:
+                state = f"{state} (sent CID; name unresolved)"
             notes.append(f"auto-fetch {state}" + (f": {auto[i]['error']}" if auto[i].get("error") else ""))
         print(f"    [{i + 1}] {printable(link.get('uri'))}" + (f"  ({printable(', '.join(notes))})" if notes else ""))
 
@@ -1685,18 +1829,35 @@ def _run_send(args):
     print(cli.printable(result["hash"]))
 
 
+def _trust_label(entry: dict) -> str:
+    """How `rnfs inbox` marks a message's sender: "contact <nick>", "trusted" or "untrusted"; "?" when the daemon
+    (older than 0.1.6) doesn't say."""
+    if isinstance(entry.get("contact"), str):
+        return f"contact {fsutil.printable_label(entry['contact'])}"
+    if isinstance(entry.get("trusted"), bool):
+        return "trusted" if entry["trusted"] else "untrusted"
+    return "?"
+
+
+def _quoted_label(name) -> str:
+    """A display name, the sender's own word, in double quotes and escaped as a label (fsutil.printable_label,
+    which escapes backslashes, so an escaped quote can't be faked either)."""
+    return '"' + fsutil.printable_label(name).replace('"', '\\"') + '"'
+
+
 def _run_inbox(args):
-    """List inbox messages: number, time, sender, links and text."""
+    """List inbox messages: number, time, the sender's address and whether it is a contact or trusted, method,
+    then the display name it announced (last and quoted: it is the sender's own word, and could otherwise pose as
+    another address), links and text."""
     from rnfs import cli
     messages = cli.client(args).get("/api/lxmf/inbox")["messages"]
     if not messages:
         print("no messages")
     for entry in messages:
-        sender = entry.get("from") or "?"
         name = entry.get("display_name")
-        who = f"{cli.printable(name)} <{cli.printable(sender)}>" if name else f"<{cli.printable(sender)}>"
-        print(f"#{cli.printable(entry.get('id'))}  {_when(entry.get('received'))}  {who}  "
-              f"{cli.printable(entry.get('method') or '')}")
+        print(f"#{cli.printable(entry.get('id'))}  {_when(entry.get('received'))}  "
+              f"<{cli.printable(entry.get('from') or '?')}>  {_trust_label(entry)}  "
+              f"{cli.printable(entry.get('method') or '?')}" + (f"  {_quoted_label(name)}" if name else ""))
         _print_links(entry, cli.printable)
         _print_text(_strip_links(entry), cli.printable)
 
@@ -1715,7 +1876,7 @@ def _run_inbox_get(args):
     if output is not None and os.path.lexists(output):
         cli.fail(f"{output} already exists; remove it or choose another with -o")
     result = cli.client(args).post("/api/lxmf/inbox/get", id=args.n, link=args.link, output=output,
-                                   directory=os.getcwd())
+                                   directory=os.getcwd(), use_sent_cid=args.use_sent_cid)
     failed = False
     for item in result["results"]:
         cli.print_warnings(item)
@@ -1958,7 +2119,7 @@ class LxmfNetwork:
         if node is None:
             return False
         router = self.router
-        busy = router.PR_PATH_REQUESTED <= router.propagation_transfer_state < router.PR_COMPLETE
+        busy = self._downloading()
         if busy and time.monotonic() - self._sync_started < SYNC_TIMEOUT:
             return False
         if busy:
@@ -1966,7 +2127,21 @@ class LxmfNetwork:
         router.acknowledge_sync_completion(reset_state=True)
         self._sync_started = time.monotonic()
         router.request_messages_from_propagation_node(self.identity, SYNC_MAX_MESSAGES)
+        self.feature.wake()  # poll() bounds the download's link from now on, until it ends
         return True
+
+    def idle(self) -> bool:
+        """True while poll() has nothing to do: no outbound message followed, none held, and no propagation node
+        download running. The feature's loop then sleeps until its next announce or download."""
+        with self._lock:
+            if self._outbound or self._held:
+                return False
+        return not self._downloading()
+
+    def _downloading(self) -> bool:
+        """True while a propagation node download runs: from its path request until it completes or fails."""
+        router = self.router
+        return router.PR_PATH_REQUESTED <= router.propagation_transfer_state < router.PR_COMPLETE
 
     # Sending
 
@@ -2001,6 +2176,7 @@ class LxmfNetwork:
         self.router.handle_outbound(message)
         with self._lock:
             self._outbound[bytes(message.hash)] = [message, None, None]
+        self.feature.wake()  # follow its state from now on
         return bytes(message.hash)
 
     def poll(self) -> list[tuple[bytes, str, float | None]]:
@@ -2127,6 +2303,7 @@ class LxmfNetwork:
             _log(f"dropped a held message from unknown sender {victim[1][ID_LENGTH:2 * ID_LENGTH].hex()} for one "
                  f"from trusted sender {source.hex()}", LOG_VERBOSE)
         self._held.append((time.monotonic() + HOLD_TIME, packed, method))
+        self.feature.wake()  # poll() retries it once its sender's identity is known
         return True
 
     def _request_path(self, destination: bytes) -> bool:

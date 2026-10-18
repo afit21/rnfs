@@ -507,14 +507,13 @@ class DaemonLockTest(unittest.TestCase):
     def test_second_daemon_stops_at_once(self):
         """With the lock held, `rnfs daemon` exits with an error naming the holder, before writing state or
         rotating the debug log."""
-        from rnfs.config import Config
         from rnfs.node import _make_private_dirs
         from tests.test_fsutil import hold_lock
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rnfs_dir = os.path.join(tmp.name, "rnfs")
-        _make_private_dirs(Config(rnfs_dir=rnfs_dir))  # as the first daemon left it
+        _make_private_dirs(rnfs_dir)  # as the first daemon left it
         debug_log = os.path.join(rnfs_dir, "debug.log")
         with open(debug_log, "w", encoding="utf-8") as f:
             f.write("the first daemon's log\n")

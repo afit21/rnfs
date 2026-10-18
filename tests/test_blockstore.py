@@ -1,4 +1,5 @@
 """Tests for BlockStore: one verified, atomically written file per CID (specification section 8)."""
+import base64
 import os
 import tempfile
 import unittest
@@ -6,7 +7,7 @@ from unittest import mock
 
 from rnfs import fsutil
 from rnfs.constants import MAX_BLOCK_SIZE
-from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore
+from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore, matches
 from rnfs.content.cid import DAG, RAW, Cid
 
 HELLO_WORLD = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
@@ -120,6 +121,57 @@ class BlockStoreTest(unittest.TestCase):
         store = BlockStore(self.tmp.name)
         self.assertEqual(list(store.scan()), [])
         self.assertEqual(sorted(os.listdir(self.tmp.name)), sorted(["notes.txt", HELLO_WORLD.upper()]))
+
+
+    def test_scan_names_blocks_by_their_canonical_cids_only(self):
+        raw, node = Cid.for_block(RAW, b"leaf"), Cid.for_block(DAG, b"node")
+        self.store.put(raw, b"leaf")
+        self.store.put(node, b"node")
+        alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+        spare_bits_set = str(raw)[:-1] + alphabet[alphabet.index(str(raw)[-1]) + 1]  # parse() refuses it
+        dag_pb = "b" + base64.b32encode(bytes([1, 0x70, 0x12, 0x20]) + bytes(32)).decode().lower().rstrip("=")
+        names = [spare_bits_set, dag_pb, str(raw) + "="]
+        upper = "b" + str(node)[1:].upper()
+        # On a case-insensitive filesystem (macOS, Windows) the upper-case name is the node's own file: writing it
+        # would empty the block, and it can't be a second file there anyway
+        if not os.path.exists(os.path.join(self.tmp.name, upper)):
+            names.append(upper)
+        for name in names:
+            open(os.path.join(self.tmp.name, name), "wb").close()
+        scanned = sorted(BlockStore(self.tmp.name).scan())
+        self.assertEqual(scanned, sorted([(raw, 4), (node, 4)]))
+        self.assertEqual(sorted(str(cid) for cid, _ in scanned), sorted([str(raw), str(node)]))
+        self.assertEqual({cid.codec for cid, _ in scanned}, {RAW, DAG})
+
+
+class MatchesTest(unittest.TestCase):
+    """matches(): the one block validity check (size limit and hash) that storing, reading and recovery share."""
+
+    def test_raw_and_dag_cids_match_their_blocks(self):
+        for codec in (RAW, DAG):
+            with self.subTest(codec=codec):
+                self.assertTrue(matches(Cid.for_block(codec, b"block"), b"block"))
+
+    def test_wrong_block(self):
+        for codec in (RAW, DAG):
+            with self.subTest(codec=codec):
+                self.assertFalse(matches(Cid.for_block(codec, b"real"), b"fake"))
+                self.assertFalse(matches(Cid.for_block(codec, b"real"), b"real "))
+
+    def test_empty_block(self):
+        empty = Cid.for_block(RAW, b"")
+        self.assertTrue(matches(empty, b""))
+        self.assertFalse(matches(empty, b"x"))
+        self.assertFalse(matches(Cid.for_block(RAW, b"x"), b""))
+
+    def test_size_limit(self):
+        largest = bytes(MAX_BLOCK_SIZE)
+        self.assertTrue(matches(Cid.for_block(RAW, largest), largest))
+        too_large = bytes(MAX_BLOCK_SIZE + 1)
+        cid = Cid.for_block(RAW, too_large)
+        with mock.patch.object(Cid, "verify", wraps=cid.verify) as verify:
+            self.assertFalse(matches(cid, too_large))
+        verify.assert_not_called()  # refused on its size, without hashing it
 
 
 if __name__ == "__main__":

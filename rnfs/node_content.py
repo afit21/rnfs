@@ -16,7 +16,7 @@ from typing import BinaryIO
 from rnfs.content import archive, builder, dag, seal, walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER
-from rnfs.errors import InvalidDag, NotFound
+from rnfs.errors import Denied, InvalidDag, NotFound
 
 
 def keep_added(node, cid: Cid, pin: bool):
@@ -81,9 +81,10 @@ def sealing_stream(stream: BinaryIO, size: int | None, recipients: list[bytes],
     return seal.SealingReader(stream, recipients, seal_name, size), None
 
 
-def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes],
-                    seal_name: bool) -> builder.Built:
-    """Seal the regular file at path and build it (wrapped under its visible name if wrap)."""
+def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes], seal_name: bool,
+                    options: builder.BuildOptions | None = None) -> builder.Built:
+    """Seal the regular file at path and build it (wrapped under its visible name if wrap), with options (the
+    chunker, and the deny check of the sealed bytes; builder.build_file)."""
     handle, st = builder.open_path(path)
     try:
         if not stat.S_ISREG(st.st_mode):
@@ -92,7 +93,7 @@ def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[by
         sealed_name = name if seal_name and dag.is_valid_name(name) else None
         with os.fdopen(handle, "rb", closefd=False) as f:
             return builder.add_stream(seal.SealingReader(f, recipients, sealed_name), put, None,
-                                      name if wrap else None)
+                                      name if wrap else None, options=options)
     finally:
         builder.close(handle)
 
@@ -103,7 +104,7 @@ def open_sealed(node, fetch, expect: walker.Expect, unlock: bool = True) -> seal
     Raises NotRecipient (unlocking) if the node's identity can't open it, SealError if it is damaged.
     """
     block = fetch.get(expect)
-    if walker.kind_of(expect, block) != "file":
+    if walker.kind_of(expect, block) != walker.FILE_TYPE:
         return None
     stored_size = walker.size_of(expect, block)
     sealed = seal.open_sealed(lambda offset, length: fetch.read_range(expect, offset, length), stored_size)
@@ -112,26 +113,35 @@ def open_sealed(node, fetch, expect: walker.Expect, unlock: bool = True) -> seal
         # would show "of ?": its stored size is what the chunks met add up to
         fetch.observer.total(stored_size)
     if sealed is not None and unlock:
-        identity = getattr(node, "identity", None)
-        if identity is None:
-            raise seal.NotRecipient("this node has no identity to open sealed files with (use --raw)")
-        sealed.unlock(identity)
+        unlock_sealed(node, sealed)
     return sealed
 
 
-def sealed_info(node, fetch, expect: walker.Expect, info: dict) -> dict:
-    """info, plus for a sealed file "sealed", "recipient" and "stored_size", and when this node is a
-    recipient its plaintext "size" and sealed "name"."""
-    if info.get("type") != "file":
-        return info
-    sealed = open_sealed(node, fetch, expect, unlock=False)
+def unlock_sealed(node, sealed: seal.SealedFile):
+    """Unlock sealed with the node's identity. Raises NotRecipient if the node has none or isn't a recipient,
+    SealError if the content key sealed for it doesn't decrypt."""
+    identity = getattr(node, "identity", None)
+    if identity is None:
+        raise seal.NotRecipient("this node has no identity to open sealed files with (use --raw)")
+    sealed.unlock(identity)
+
+
+def is_recipient(node, sealed: seal.SealedFile) -> bool:
+    """True if the node's identity is one of sealed's recipients."""
+    identity = getattr(node, "identity", None)
+    return identity is not None and bytes(identity.hash) in sealed.recipients
+
+
+def sealed_info(node, info: dict, sealed: seal.SealedFile | None) -> dict:
+    """A file's info, plus when it is sealed (sealed, as open_sealed opened it without unlocking) "sealed",
+    "recipient" and "stored_size", and when this node is a recipient its plaintext "size" and sealed "name"
+    (sealed is then unlocked)."""
     if sealed is None:
         return info
-    identity = getattr(node, "identity", None)
-    recipient = identity is not None and bytes(identity.hash) in sealed.recipients
+    recipient = is_recipient(node, sealed)
     info = {**info, "sealed": True, "recipient": recipient, "stored_size": info["size"]}
     if recipient:
-        sealed.unlock(identity)
+        unlock_sealed(node, sealed)
         info.update(size=sealed.size, name=sealed_name(sealed))
     return info
 
@@ -171,16 +181,41 @@ def write_sealed(sealed: seal.SealedFile, output: str, blocks_dir: str | None = 
     return {"sealed": True, "name": name}
 
 
-def stored_head(node, target: str, length: int) -> bytes | None:
+def stored_head(node, target: str, length: int, deny: bool = True) -> bytes | None:
     """A file's first length bytes from stored blocks only (the gateway's sealed check and sniffing), or
-    None if one they need isn't stored (or the target is a directory or invalid). Never fetches."""
+    None if one they need isn't stored (or the target is a directory or invalid). Never fetches.
+
+    With deny, the deny list applies as to a read (a HEAD of a denied file answers 451, like GET): Denied for a
+    denied CID met, and while there are file hashes the file is checked first (node._check_file, bounded), which
+    takes it wholly stored (None otherwise: it can't be checked without fetching). `pin ls` passes deny=False.
+    """
     try:
         root, names = walker.parse_target(target)
         get = node.storage.getter()
+        if deny:
+            get = denying(node, get)
         expect = walker.resolve(root, names, get)
+        if deny and node.deny.hashes and walker.kind_of(expect, get(expect)) == walker.FILE_TYPE:
+            if not expect.cid.is_raw and node.deny.known_hash(expect.cid) is None \
+                    and not node.storage.is_complete(expect.cid):
+                # leaf_bytes counts the chunks its file nodes list, so they must all be there to be counted
+                return None
+            node._check_file(expect, get)
         return b"".join(walker.read_range(expect, get, 0, length))
     except (ValueError, NotFound, InvalidDag):
         return None
+
+
+def denying(node, get: walker.Get) -> walker.Get:
+    """get, raising Denied for a CID on the node's deny list instead of reading it (as a fetch does)."""
+
+    def checked(expect: walker.Expect) -> bytes:
+        """The block for expect, unless its CID is denied."""
+        if node.deny.denies(expect.cid):
+            raise Denied(f"{expect.cid} is on this node's deny list")
+        return get(expect)
+
+    return checked
 
 
 def block(node, cid: str, for_gateway: bool = False) -> bytes:
@@ -190,7 +225,7 @@ def block(node, cid: str, for_gateway: bool = False) -> bytes:
     with node._fetching(root, [], None, for_gateway) as fetch:
         expect = fetch.resolve()
         if expect.cid.is_raw:
-            node._check_file(expect, fetch.read_range)  # never reads: a raw CID carries the hash
+            node._check_file(expect, fetch.get)  # never reads: a raw CID carries the hash
         data = node.storage.get(expect.cid, verify=True)
     if data is None:
         raise NotFound(f"block {cid} was damaged locally and has been deleted; try again")
@@ -209,7 +244,7 @@ def export_stream(node, target: str, start: Callable[[int], BinaryIO | None], fo
         walker.count_entries(expect, fetch.get, node.config.max_output_entries)
         if node.deny.hashes:
             for file in walker.iter_files(expect, fetch.get):
-                node._check_file(file, lambda e: walker.read_range(e, fetch.get))
+                node._check_file(file, fetch.get)
         blocks = node.storage.dag_blocks(expect.cid)
         length = archive.archive_size([expect.cid], ((cid, node.storage.block_size(cid) or 0) for cid in blocks))
         out = start(length)

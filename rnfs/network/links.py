@@ -27,6 +27,7 @@ import RNS
 
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_REQUESTS_PER_LINK
+from rnfs import log as rnfs_log
 from rnfs.log import LOG_DEBUG, LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, protocol, rates
 
@@ -56,12 +57,18 @@ def close_reason(link) -> str:
     return "closed"
 
 
+def _debug_logged() -> bool:
+    """True if a LOG_DEBUG message is kept anywhere: RNS logs at debug level, or the debug log (which keeps
+    every message, whatever RNS's loglevel) is on."""
+    return RNS.loglevel >= LOG_DEBUG or rnfs_log._debug_sink is not None
+
+
 def path_description(node_id: bytes) -> str:
     """How far RNS's path to node_id goes and through which interface, for the log ("" if it can't tell)."""
     try:
         hops = RNS.Transport.hops_to(node_id)
         interface = RNS.Transport.next_hop_interface(node_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS internals: no description if they fail
         return ""
     if hops >= RNS.Transport.PATHFINDER_M:
         return ""
@@ -95,7 +102,7 @@ class Exchange:
         """Record the response and the link's measured rate, which the next Resource would overwrite."""
         try:
             self.expected_rate = receipt.link.get_expected_rate()
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no rate if they fail
             self.expected_rate = None
         self.response_size = receipt.response_size
         self.response = receipt.get_response()
@@ -132,6 +139,9 @@ class PeerLink:
         self.rate: float | None = None  # rate estimate in bits/s (section 2)
         self.requests = 0
         self.blocks = 0
+        # Threads with a request in progress on the link or waiting for a slot -> how many each: who would lose a
+        # request if the link were closed now (PeerClient.close_unless_used)
+        self.users: dict[int, int] = {}
         self.closed = False
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
         self.cond = threading.Condition()
@@ -144,7 +154,7 @@ class PeerLink:
         """The link's packet MDU, which bounds request sizes."""
         try:
             return self.link.get_mdu()
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no MDU if they fail
             return None
 
     def acquire(self, blocks: bool, timeout: float | None = None) -> bool:
@@ -179,6 +189,26 @@ class PeerLink:
         with self.cond:
             return self.requests > 0
 
+    def enter(self):
+        """The calling thread is about to wait for a slot and send a request (LinkPool.request)."""
+        ident = threading.get_ident()
+        with self.cond:
+            self.users[ident] = self.users.get(ident, 0) + 1
+
+    def leave(self):
+        """The calling thread's request is over, sent or not."""
+        ident = threading.get_ident()
+        with self.cond:
+            if self.users.get(ident, 0) <= 1:
+                self.users.pop(ident, None)
+            else:
+                self.users[ident] -= 1
+
+    def used_by_others(self, own: set[int]) -> bool:
+        """True if a thread not in own (thread idents) has a request in progress on the link or waiting for a slot."""
+        with self.cond:
+            return any(ident not in own for ident in self.users)
+
     def mark_closed(self):
         """The link closed: wake everyone waiting for a slot."""
         with self.cond:
@@ -203,7 +233,7 @@ class LinkPool:
         self.config = config
         self.clock = clock
         # Private mode links only to members: every link identifies, and an outsider mustn't learn who we are
-        self.members = {h.strip().strip("<>").lower() for h in config.members}
+        self.members = config.member_set
         self.shared: dict[bytes, PeerLink] = {}
         self.oneshot: set[PeerLink] = set()
         self.connecting: dict[bytes, threading.Event] = {}  # one thread opens a node's shared link at a time
@@ -282,7 +312,8 @@ class LinkPool:
         if not RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
             return False
-        log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
+        if _debug_logged():  # RNS path lookups, only for a message that will be kept
+            log(f"path to {name}: {path_description(node_id) or 'known'}", LOG_DEBUG)
 
         identity = self._recall(node_id)
         if identity is None:
@@ -330,16 +361,23 @@ class LinkPool:
         return True
 
     def _recall(self, node_id: bytes):
-        """The node's identity from RNS, asking for a path again (whose response carries it) if needed."""
+        """The node's identity from RNS, asking for a path again (whose response carries it) if needed.
+
+        A recall marks the destination used, which keeps it in RNS's known destinations for longer (and is
+        an RPC of its own on a shared instance): right for a node being contacted, but not for each of the
+        polls while its identity is awaited, so those don't mark it, and one recall marks it once it is there.
+        """
         identity = RNS.Identity.recall(node_id)
         if identity is not None:
             return identity
         RNS.Transport.request_path(node_id)
         deadline = time.monotonic() + self.config.path_timeout
-        while identity is None and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(0.1)
-            identity = RNS.Identity.recall(node_id)
-        return identity
+            found = RNS.Identity.recall(node_id, _no_use=True)
+            if found is not None:
+                return RNS.Identity.recall(node_id) or found
+        return None
 
     def identify(self, peer: PeerLink):
         """Identify again on peer's link (unacknowledged, so it may need repeating)."""
@@ -374,6 +412,15 @@ class LinkPool:
         """Tear down the shared link to node_id, if any (e.g. after a stalled transfer)."""
         self.close_link(self.shared_peer(node_id))
 
+    def close_unless_used(self, node_id: bytes, own: set[int]) -> bool:
+        """Tear down the shared link to node_id unless a thread not in own (thread idents) has a request in
+        progress on it or waiting for a slot. True if there was nothing else on it (the link, if any, is closed)."""
+        peer = self.shared_peer(node_id)
+        if peer is not None and peer.used_by_others(own):
+            return False
+        self.close_link(peer)
+        return True
+
     def close_all(self):
         """Stop the idle sweeper and tear down every link."""
         self.stop_event.set()
@@ -392,7 +439,7 @@ class LinkPool:
         for peer in peers:
             try:
                 quiet = peer.link.no_data_for()
-            except Exception:
+            except Exception:  # noqa: BLE001 - a link closing meanwhile is skipped
                 continue
             if not peer.busy() and quiet >= timeout:
                 idle.append(peer)
@@ -425,7 +472,7 @@ class LinkPool:
         while not self.stop_event.wait(interval):
             try:
                 self.sweep()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the sweeper thread keeps running; logged
                 log(f"error closing idle links: {e}", LOG_WARNING)
 
     # Queries
@@ -445,7 +492,7 @@ class LinkPool:
             """Seconds since data crossed the link."""
             try:
                 return peer.link.no_data_for()
-            except Exception:
+            except Exception:  # noqa: BLE001 - a link closing meanwhile sorts last
                 return float("inf")
 
         return [peer.node_id for peer in sorted(peers, key=quiet_for)]
@@ -462,6 +509,16 @@ class LinkPool:
         request_deadline has passed since it was sent, or if it waited that long for a slot. A request larger
         than the link's packet MDU isn't sent (the exchange is returned unanswered).
         """
+        peer.enter()
+        try:
+            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress)
+        finally:
+            peer.leave()
+
+    def _request(self, peer: PeerLink, path: str, data, blocks: bool, max_response_size: int | None,
+                 watchdog: Callable[[Exchange, float], str | None] | None,
+                 on_progress: Callable[[float], None] | None) -> Exchange:
+        """request(), with the calling thread counted among the link's users."""
         exchange = Exchange(self.clock)
         deadline = None if blocks else self.request_deadline(peer)
         if not peer.acquire(blocks, timeout=deadline):
@@ -484,8 +541,9 @@ class LinkPool:
                                             failed_callback=exchange.on_failed,
                                             progress_callback=exchange.on_progress,
                                             timeout=None, max_response_size=max_response_size)
-            except Exception as e:
-                log(f"could not send {path} to {node_name(peer.node_id)}: {e}", LOG_VERBOSE)
+            except Exception as e:  # noqa: BLE001 - a failed send is a failed request; logged
+                # Link.request answers False when it can't send (a closed link too), so an exception is a bug
+                log(f"could not send {path} to {node_name(peer.node_id)}: {e!r}", LOG_WARNING)
                 return exchange
             if not receipt:
                 log(f"could not send {path} to {node_name(peer.node_id)}", LOG_VERBOSE)

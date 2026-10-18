@@ -15,7 +15,9 @@ import RNS
 
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE, DEFAULT_BOOTSTRAP_NODES, K
+from rnfs.content import dag, seal
 from rnfs.content.cid import RAW, Cid
+from rnfs.content.seal import SEGMENT_SIZE
 from rnfs.content.storage import remote_source
 from rnfs import fetcher
 from rnfs.errors import Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
@@ -59,6 +61,10 @@ class NetClient:
 
     def rate_estimate(self, node_id):
         """No estimates."""
+        return None
+
+    def link_mdu(self, node_id):
+        """No open links, so no MDU known."""
         return None
 
     def find(self, node_id, key):
@@ -341,6 +347,185 @@ class NetworkFacadeTest(NodeTest):
             self.b.info(str(Cid.for_block(RAW, b"bad")))
 
 
+class SealedCheckTest(NodeTest):
+    """Whether a file is sealed is read from its first bytes once: plain files are remembered (_not_sealed), and
+    read_file passes what its info opened on to its read."""
+
+    def setUp(self):
+        """Node A, with an identity to seal for itself, counting seal.open_sealed's calls (each reads a file's
+        first bytes)."""
+        super().setUp()
+        self.a.identity = RNS.Identity()
+        opened = mock.patch.object(seal, "open_sealed", wraps=seal.open_sealed)
+        self.opened = opened.start()
+        self.addCleanup(opened.stop)
+
+    def test_plain_files_are_checked_once(self):
+        """A plain file's first bytes are read once, whatever reads it afterwards; each target separately."""
+        data = os.urandom(3 * CHUNK_SIZE)
+        cid = self.a.add_stream(io.BytesIO(data))["cid"]
+        self.assertEqual(b"".join(self.a.read(cid, CHUNK_SIZE, 10)), data[CHUNK_SIZE:CHUNK_SIZE + 10])
+        self.assertEqual(self.opened.call_count, 1)
+        info, chunks = self.a.read_file(cid, 5, 10)
+        self.assertEqual((info["size"], b"".join(chunks)), (len(data), data[5:15]))
+        self.assertNotIn("sealed", self.a.info(cid))
+        self.assertEqual(b"".join(self.a.read(cid)), data)
+        self.assertEqual(self.opened.call_count, 1)
+        # The same file under a directory is another target (its expectation differs): checked once too
+        root = self.a.add_stream(io.BytesIO(data), name="f.bin")["cid"]
+        for _ in range(2):
+            self.assertEqual(b"".join(self.a.read(f"{root}/f.bin", 0, 4)), data[:4])
+        self.assertEqual(self.opened.call_count, 2)
+
+    def test_sealed_files_are_opened_each_time_once_per_read_file(self):
+        """A sealed file isn't remembered; read_file opens it once (for its info), not again for its bytes."""
+        data = os.urandom(SEGMENT_SIZE + 5)
+        cid = self.a.add_stream(io.BytesIO(data), to_self=True)["cid"]
+        for _ in range(2):
+            self.assertEqual(b"".join(self.a.read(cid, 3, 4)), data[3:7])
+        self.assertEqual(self.opened.call_count, 2)
+        self.assertEqual(len(self.a._not_sealed), 0)
+        for count in (3, 4):
+            info, chunks = self.a.read_file(cid, SEGMENT_SIZE - 1, 3)
+            self.assertEqual((info["sealed"], info["recipient"], info["size"]), (True, True, len(data)))
+            self.assertEqual(b"".join(chunks), data[SEGMENT_SIZE - 1:SEGMENT_SIZE + 2])
+            self.assertEqual(self.opened.call_count, count)
+
+    def test_read_file_of_a_file_sealed_for_others(self):
+        """What info opened isn't unlocked for a non-recipient: the read raises NotRecipient, and for a denied
+        file Denied first, as when the read opened it itself."""
+        other = RNS.Identity()
+        data = b"for someone else" * 10
+        cid = self.a.add_stream(io.BytesIO(data), to=[other.get_public_key().hex()])["cid"]
+        info, chunks = self.a.read_file(cid)
+        self.assertEqual((info["sealed"], info["recipient"]), (True, False))
+        with self.assertRaises(seal.NotRecipient):
+            next(chunks)
+        self.a.identity = None
+        info, chunks = self.a.read_file(cid)
+        with self.assertRaisesRegex(seal.NotRecipient, "no identity"):
+            next(chunks)
+        stored = b"".join(self.a.read(cid, raw=True))
+        self.a.deny.add(["sha256:" + hashlib.sha256(stored).hexdigest()])
+        info, chunks = self.a.read_file(cid)
+        with self.assertRaises(Denied):
+            next(chunks)
+
+    def test_the_memo_is_bounded(self):
+        """At most NOT_SEALED_MEMO targets are remembered, the least recently used forgotten first."""
+        cids = [self.a.add_stream(io.BytesIO(b"file %d" % i))["cid"] for i in range(3)]
+        with mock.patch.object(node_module, "NOT_SEALED_MEMO", 2):
+            for cid in cids[:2]:
+                b"".join(self.a.read(cid))
+            b"".join(self.a.read(cids[0]))  # used again: now the most recent
+            b"".join(self.a.read(cids[2]))
+            self.assertEqual([str(expect.cid) for expect in self.a._not_sealed], [cids[0], cids[2]])
+            self.assertEqual(self.opened.call_count, 3)
+            b"".join(self.a.read(cids[1]))  # forgotten: read again
+            self.assertEqual(self.opened.call_count, 4)
+
+    def test_a_deny_list_change_empties_the_memo(self):
+        """Reading the first bytes checks the deny list: once their chunk is denied, a read of a remembered file
+        raises Denied as it did before the file was remembered, though the range read doesn't cover it."""
+        data = os.urandom(3 * CHUNK_SIZE)
+        cid = self.a.add_stream(io.BytesIO(data))["cid"]
+        self.assertEqual(b"".join(self.a.read(cid, 2 * CHUNK_SIZE, 4)), data[2 * CHUNK_SIZE:2 * CHUNK_SIZE + 4])
+        first = dag.decode(self.a.storage.get(Cid.parse(cid))).children[0].cid
+        self.a.deny.add([str(first)])
+        with self.assertRaises(Denied):
+            b"".join(self.a.read(cid, 2 * CHUNK_SIZE, 4))
+        self.assertEqual(self.opened.call_count, 2)
+        self.assertEqual(len(self.a._not_sealed), 0)
+
+
+class PinLsMemoTest(NodeTest):
+    """pin_ls remembers each complete pin's type, name from inside and sealed status, rather than reading its
+    blocks at every call; what it gives is what reading them gives."""
+
+    def setUp(self):
+        """Node A, with an identity, counting _pin_shape's calls (each reads the pin's root block)."""
+        super().setUp()
+        self.a.identity = RNS.Identity()
+        shape = mock.patch.object(self.a, "_pin_shape", wraps=self.a._pin_shape)
+        self.shape = shape.start()
+        self.addCleanup(shape.stop)
+
+    def fresh(self) -> list[dict]:
+        """pin_ls as it is without the memo."""
+        with mock.patch.object(node_module, "PIN_MEMO", 0):
+            saved, self.a._pin_memo = self.a._pin_memo, {}
+            try:
+                return self.a.pin_ls()
+            finally:
+                self.a._pin_memo = saved
+
+    def test_complete_pins_are_read_once(self):
+        """A second pin_ls reads no pin's blocks again and answers the same, for files, directories and sealed
+        files; pin_ls(cid) uses the memo too."""
+        cids = [self.a.add_stream(io.BytesIO(b"small"))["cid"],
+                self.a.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"],
+                self.a.add_stream(io.BytesIO(b"inside"), name="one.txt")["cid"],
+                self.a.add_stream(io.BytesIO(b"secret"), to_self=True)["cid"]]
+        first = self.a.pin_ls()
+        self.assertEqual(self.shape.call_count, 4)
+        self.assertEqual({entry["cid"]: (entry["type"], entry["sealed"]) for entry in first},
+                         {cids[0]: ("file", False), cids[1]: ("file", False), cids[2]: ("directory", False),
+                          cids[3]: ("file", True)})
+        self.assertEqual(self.a.pin_ls(), first)
+        self.assertEqual(self.a.pin_ls(cids[2]), [entry for entry in first if entry["cid"] == cids[2]])
+        self.assertEqual(self.shape.call_count, 4)
+        self.assertEqual(first, self.fresh())
+
+    def test_released_pins_are_forgotten(self):
+        """pin_ls forgets the pins released since the last."""
+        keep, drop = (self.a.add_stream(io.BytesIO(b"%d" % i))["cid"] for i in range(2))
+        self.a.pin_ls()
+        self.assertEqual({str(c) for c in self.a._pin_memo}, {keep, drop})
+        self.a.pin_rm(drop)
+        self.assertEqual([entry["cid"] for entry in self.a.pin_ls()], [keep])
+        self.assertEqual({str(c) for c in self.a._pin_memo}, {keep})
+
+    def test_incomplete_pins_are_read_each_time(self):
+        """A pin missing blocks isn't remembered: once they arrive it is seen complete, its sealed status known."""
+        data = os.urandom(2 * CHUNK_SIZE)
+        cid = Cid.parse(self.b.add_stream(io.BytesIO(data))["cid"])
+        self.a.storage.put(cid, self.b.storage.get(cid))
+        self.a.storage.pin(cid, "user")
+        for _ in range(2):
+            self.assertEqual([(e["complete"], e["type"], e["sealed"]) for e in self.a.pin_ls()], [(False, "file", None)])
+        self.assertEqual(self.a._pin_memo, {})
+        for child in dag.decode(self.b.storage.get(cid)).child_cids:
+            self.a.storage.put(child, self.b.storage.get(child))
+        self.assertEqual([(e["complete"], e["type"], e["sealed"]) for e in self.a.pin_ls()], [(True, "file", False)])
+        self.assertIn(cid, self.a._pin_memo)
+
+    def test_a_pin_that_loses_a_block_is_read_again(self):
+        """A remembered pin whose first chunk is found damaged (and deleted) is incomplete again: its sealed
+        status is unknown, as reading its blocks says."""
+        cid = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"])
+        self.assertEqual([(e["complete"], e["sealed"]) for e in self.a.pin_ls()], [(True, False)])
+        first = dag.decode(self.a.storage.get(cid)).child_cids[0]
+        path = self.a.storage.blocks.path(first)
+        os.chmod(path, 0o600)
+        with open(path, "r+b") as f:
+            f.write(b"damaged")
+        self.assertIsNone(self.a.storage.get(first, verify=True))  # deleted
+        self.assertEqual([(e["complete"], e["type"], e["sealed"]) for e in self.a.pin_ls()], [(False, "file", None)])
+        self.assertEqual(self.a.pin_ls(), self.fresh())
+
+    def test_the_memo_is_bounded(self):
+        """At most PIN_MEMO pins are remembered (the first met); the others are read each time, answering the
+        same."""
+        for i in range(3):
+            self.a.add_stream(io.BytesIO(b"%d" % i))
+        with mock.patch.object(node_module, "PIN_MEMO", 2):
+            first = self.a.pin_ls()
+            self.assertEqual(len(self.a._pin_memo), 2)
+            self.assertEqual(self.a.pin_ls(), first)
+            self.assertEqual(self.shape.call_count, 4)  # 3, then the one past the bound again
+        self.assertEqual(first, self.fresh())
+
+
 class BackendTest(NodeTest):
     """What the request server asks of the node."""
 
@@ -387,6 +572,15 @@ class BackendTest(NodeTest):
         node = self.make_node("p", bytes([0xD] * 16), private=True, members=[IDENTITY.hex()])
         self.assertTrue(node.backend.is_member(IDENTITY))
         self.assertFalse(node.backend.is_member(bytes(16)))
+
+    def test_identity_checks_dont_mark_destinations_used(self):
+        # Checks, not contacts (C2): recalled with _no_use, which skips RNS's "used" RPC on a shared instance
+        node = self.make_node("p", bytes([0xD] * 16), private=True, members=[IDENTITY.hex()])
+        member = mock.Mock(hash=IDENTITY)
+        with mock.patch.object(RNS.Identity, "recall", return_value=member) as recall:
+            self.assertTrue(node._is_member_node(A_ID))
+            self.assertTrue(node_module._rns_is_known(B_ID))
+        self.assertEqual(recall.call_args_list, [mock.call(A_ID, _no_use=True), mock.call(B_ID, _no_use=True)])
 
     def wait_for(self, condition, timeout=10):
         """Poll until condition() is true."""
@@ -471,7 +665,7 @@ class SecurityTest(NodeTest):
         os.mkdir(theirs)
         with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
             with self.assertRaisesRegex(RnfsError, "belongs to another user"):
-                node_module._make_private_dirs(Config(rnfs_dir=theirs))
+                node_module._make_private_dirs(theirs)
         self.assertFalse(os.path.exists(os.path.join(theirs, "state")))  # nothing written there
 
     @unittest.skipUnless(POSIX_MODES, "Unix permission bits")
@@ -481,7 +675,7 @@ class SecurityTest(NodeTest):
         os.chmod(loose, 0o777)
         with mock.patch("os.chmod", side_effect=PermissionError("not permitted")):
             with self.assertRaisesRegex(RnfsError, "couldn't make .* private"):
-                node_module._make_private_dirs(Config(rnfs_dir=loose))
+                node_module._make_private_dirs(loose)
 
     def test_no_permission_fix_on_windows(self):
         # Windows' st_mode always shows others allowed: no chmod and no notice at every start
@@ -490,7 +684,7 @@ class SecurityTest(NodeTest):
         with mock.patch.object(fsutil, "IS_WINDOWS", True), mock.patch("os.chmod") as chmod, \
                 mock.patch.object(node_module, "log") as log, \
                 mock.patch("os.stat", return_value=mock.Mock(st_mode=0o40777)):
-            node_module._make_private_dirs(Config(rnfs_dir=loose))
+            node_module._make_private_dirs(loose)
         chmod.assert_not_called()
         log.assert_not_called()
 
@@ -744,6 +938,90 @@ class RestartTest(NodeTest):
         self.b._save_fetched()
         self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM fetched"),
                          [(Cid.for_block(RAW, b"other").binary,)])
+
+
+class StopTest(NodeTest):
+    """stop() runs every step whatever raises, and waits for the threads it ends (audit XC5)."""
+
+    def test_a_raising_service_still_closes_the_state_and_releases_the_destination(self):
+        """An embedded node whose announcer fails to stop: its state database is still closed and its rnfs.dht
+        destination still released, so a later node in the process can use both."""
+        node = self.make_node("embedded", N1)
+        node.embedded = True
+        node.destination = mock.Mock(links=[])
+        node.announcer = mock.Mock(**{"stop.side_effect": RuntimeError("announcer broke")})
+        with mock.patch.object(RNS.Transport, "deregister_destination") as deregister, \
+                mock.patch("rnfs.node.log") as log:
+            node.stop()
+        deregister.assert_called_once_with(node.destination)
+        self.assertIsNone(node._db._database)
+        self.assertTrue(any("announcer broke" in call.args[0] for call in log.call_args_list))
+        self.make_node("embedded", N1).stop()
+
+    def test_links_close_before_the_threads_are_waited_for(self):
+        """A background thread stuck on the network (the publisher connecting to a node that has gone) is freed by
+        closing the links, and its last save lands while the state database is still open (found by the interop
+        harness: `publishing failed: StateDbError(... is closed)` at stop)."""
+        node = self.make_node("stuck", N1)
+        freed = threading.Event()
+        saved = []
+
+        def stuck_publisher():
+            """Waits on the network until the links close, then saves, as the publisher's loop does."""
+            freed.wait(10)
+            node.publisher.save()
+            saved.append(node._db._database is not None)
+
+        node.links = mock.Mock(**{"close_all.side_effect": freed.set})
+        thread = threading.Thread(target=stuck_publisher, daemon=True)
+        thread.start()
+        node.threads.append(thread)
+        with mock.patch("rnfs.node.log") as log:
+            node.stop()
+        self.assertEqual(saved, [True])
+        self.assertFalse([call for call in log.call_args_list if "failed" in call.args[0]])
+
+    def test_a_raising_feature_or_save_skips_nothing(self):
+        """A feature's stop and a store's save raising something other than OSError: the other stores are still
+        saved and the state closed."""
+        node = self.make_node("broken", N1)
+        cid = node.add_stream(io.BytesIO(b"cached"), pin=False)["cid"]
+        node._note_fetched(Cid.parse(cid))
+        with mock.patch.object(node.feature("follow"), "stop", side_effect=RuntimeError("follow broke")), \
+                mock.patch.object(node.storage, "save", side_effect=ValueError("bad row")), \
+                mock.patch("rnfs.node.log") as log:
+            node.stop()
+        logged = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(any("follow broke" in line for line in logged), logged)
+        self.assertTrue(any("bad row" in line for line in logged), logged)
+        self.assertEqual(state_rows(node.config.state_dir, "SELECT cid FROM fetched"), [(Cid.parse(cid).binary,)])
+        self.assertIsNone(node._db._database)
+
+    def test_stop_cancels_remote_pin_fetches_and_waits_for_their_workers(self):
+        """A remote pin being fetched when the node stops: its fetch watches stop_event, stop waits for its worker,
+        and the pin is saved as waiting, for the next start."""
+        cid = Cid.parse(self.a.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"])
+        self.advertise(str(cid))
+        asked, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+
+        def held(node_id, cids, on_progress=None):
+            """Hold every /blocks until the test ends, then fail it."""
+            asked.set()
+            go.wait(30)
+            return BlocksResult("failed", unsent=list(cids))
+
+        self.net.blocks = held
+        before = set(threading.enumerate())
+        self.assertTrue(self.b.backend.remote_pin(IDENTITY, cid, True))
+        self.assertTrue(asked.wait(10))
+        workers = [t for t in threading.enumerate() if t not in before and t.name == "rnfs-remote-pin"]
+        self.assertEqual(len(workers), 1)
+        started = time.monotonic()
+        self.b.stop()
+        self.assertFalse(workers[0].is_alive(), "stop didn't wait for the remote-pin worker")
+        self.assertLess(time.monotonic() - started, node_module.STOP_TIMEOUT)
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT cid FROM remote_pins"), [(cid.binary,)])
 
 
 class MakeRoomTest(NodeTest):

@@ -12,7 +12,8 @@ It is an RnfsNode (rnfs/node.py) started embedded, in its own rnfs dir, behind r
 - If starting fails, nothing of it is left in the process (RnfsNode releases its rnfs.dht destination), so the
   program may try again.
 - It locks the rnfs dir as the daemon does (node.lock_rnfs_dir), so a daemon or another node can't share it,
-  and only one Node runs in a process at a time.
+  and only one Node runs in a process at a time. As in the daemon, the rnfs dir is made private before its
+  rnfs.toml is read, and what was changed to trust that file is logged as a warning.
 
 Name records are heard through NameManager's record listener, which only queues them for the event thread; jobs
 are the jobs feature's, polled for progress.
@@ -28,8 +29,8 @@ import RNS
 from rnfs import fetcher, fsutil, interface
 from rnfs.config import Config
 from rnfs.errors import RnfsError
-from rnfs.log import LOG_ERROR, log
-from rnfs.node import RnfsNode, lock_rnfs_dir
+from rnfs.log import LOG_ERROR, LOG_WARNING, log
+from rnfs.node import RnfsNode, lock_rnfs_dir, make_private_root
 from rnfs.objects import Record
 
 # An embedded node's settings where neither rnfs.toml nor the program's settings give them: an app's node is
@@ -66,7 +67,13 @@ class Node(interface.Rnfs):
         unknown = settings.keys() - ({f.name for f in fields(Config)} - {"rnfs_dir"})
         if unknown:
             raise ValueError(f"unknown settings: {', '.join(sorted(unknown))}")
-        config = Config.load(os.fspath(rnfs_dir), defaults=EMBEDDED_DEFAULTS, **settings)
+        rnfs_dir = os.fspath(rnfs_dir)
+        # As the daemon starts: the rnfs dir made private, then its settings read, then its subdirectories made
+        # private and the dir locked (lock_rnfs_dir)
+        make_private_root(os.path.expanduser(rnfs_dir))
+        config = Config.load(rnfs_dir, defaults=EMBEDDED_DEFAULTS, **settings)
+        for warning in config.warnings:
+            log(warning, LOG_WARNING)
         with _process_lock:
             if _running is not None:
                 raise RnfsError("an rnfs.Node is already running in this process; close it first")
@@ -185,9 +192,7 @@ class _Backend:
         return self.node.dir_set(target, name, child, executable=executable)
 
     def dir_rm(self, target: str) -> dict:
-        """RnfsNode.dir_rm, which needs a path to remove."""
-        if "/" not in target.rstrip("/"):
-            raise ValueError("dir_rm needs <cid>/<path>: the entry to remove")
+        """RnfsNode.dir_rm, which needs a path to remove (and checks it has one)."""
         return self.node.dir_rm(target)
 
     def pin_add(self, target: str) -> dict:

@@ -1,0 +1,24 @@
+# Dependabot (TS8). Turning on Dependabot alerts and security updates is a repository setting; this file only
+# configures version updates.
+version: 2
+updates:
+  # The workflows pin every action to a commit SHA with its tag in a comment; Dependabot updates both together.
+  # One grouped pull request a week. The Flatpak and Debian container digests in release.yml aren't covered:
+  # update those by hand
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Report only: open-pull-requests-limit 0 turns off version-update pull requests for pyproject.toml's
+  # dependencies, while a vulnerable one is still reported (Dependabot alerts and security updates, once turned on
+  # in the repository's settings). rnfs relies on RNS and LXMF internals, so a new version is taken deliberately:
+  # packaging/update-lock.py, packaging/flatpak/generate-sources.py and tests/test_rns_compat.py (CONTRIBUTING.md)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0

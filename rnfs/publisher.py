@@ -100,6 +100,11 @@ class DhtKey:
         return hash((DhtKey, self.key))
 
 
+# What the publisher provides: a CID, or a feature's DhtKey. Both have .key, hashing, str() and parse(), but only a
+# Cid has .binary or is served, so code that needs those must check (provided() does)
+ProvidedItem = Cid | DhtKey
+
+
 def key_interval(key: bytes, base: float) -> float:
     """The republish interval of DhtKey key: max(base, KEY_MIN_INTERVAL) with key's fixed jitter, below
     PROVIDER_TTL / 2 (base is already below it: Config.validate)."""
@@ -110,12 +115,12 @@ def key_interval(key: bytes, base: float) -> float:
     return min(jittered, max(interval, PROVIDER_TTL / 2 - HOUR))
 
 
-def _parse_item(text: str) -> "Cid | DhtKey":
+def _parse_item(text: str) -> ProvidedItem:
     """A provided item as str() writes it (the published tables' item). Raises ValueError."""
     return DhtKey.parse(text) if isinstance(text, str) and text.startswith(KEY_PREFIX) else Cid.parse(text)
 
 
-def _item(text) -> "Cid | DhtKey":
+def _item(text) -> ProvidedItem:
     """A saved provided item: _parse_item, but only an ID_LENGTH-byte DhtKey. Raises ValueError."""
     item = _parse_item(text)
     if isinstance(item, DhtKey) and len(item.key) != ID_LENGTH:
@@ -187,6 +192,42 @@ def import_published(value: dict, tx) -> int:
     return sum(len(table) for table in rows)
 
 
+_ITEM, _NODE = "item", "node"  # the two kinds of key _PublishState writes
+
+
+class _PublishState(statedb.RowStore):
+    """The publisher's three tables, saved together (not durably: NORMAL) in one transaction. A key is (_ITEM,
+    item), whose published row and published_earlier rows are written again, or (_NODE, node ID), whose
+    withdrawals rows are."""
+
+    def __init__(self, db: statedb.StateDb, publisher: "Publisher"):
+        """The saves of publisher's state, whose lock guards it."""
+        super().__init__(db, "published", ("item",), durable=False, mode=statedb.SNAPSHOT, lock=publisher._lock)
+        self.publisher = publisher
+
+    def snapshot(self, keys) -> tuple:
+        """The rows of keys (lock held): (item texts, published rows, earlier rows, node IDs, withdrawal rows)."""
+        publisher = self.publisher
+        items = [key for kind, key in keys if kind == _ITEM]
+        nodes = [key for kind, key in keys if kind == _NODE]
+        texts = {item: str(item) for item in items}
+        published = [(texts[item], publisher._published[item][0], b"".join(publisher._published[item][1]))
+                     for item in items if item in publisher._published]
+        earlier = [(texts[item], node, at) for item in items for node, at in publisher._earlier.get(item, {}).items()]
+        withdrawals = [(node, key) for node in nodes for key in publisher._withdrawals.get(node, ())]
+        return list(texts.values()), published, earlier, nodes, withdrawals
+
+    def write_rows(self, tx, snapshot: tuple):
+        """Replace the rows of the snapshot's items and nodes inside transaction tx."""
+        texts, published, earlier, nodes, withdrawals = snapshot
+        tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in texts])
+        tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in texts])
+        tx.executemany("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", published)
+        tx.executemany("INSERT OR REPLACE INTO published_earlier (item, node, at) VALUES (?, ?, ?)", earlier)
+        tx.executemany("DELETE FROM withdrawals WHERE node = ?", [(node,) for node in nodes])
+        tx.executemany("INSERT OR REPLACE INTO withdrawals (node, key) VALUES (?, ?)", withdrawals)
+
+
 class Publisher:
     """The provide set, the served set, and the publish/withdraw schedule. Thread-safe."""
 
@@ -213,9 +254,8 @@ class Publisher:
         self.retry_interval = retry_interval
         self.generation = generation
         self._lock = threading.RLock()
-        self._save_lock = threading.Lock()  # one save at a time, so an older snapshot never lands last
         self._wake = threading.Event()
-        self._provided: frozenset[Cid] = frozenset()
+        self._provided: frozenset[ProvidedItem] = frozenset()
         self._served: frozenset[Cid] = frozenset()
         # What _compute last built, and from what, so a refresh that changed nothing needn't build it again: the
         # served set from each provided CID's dag_blocks (memoised by storage, so the same object while its DAG
@@ -227,26 +267,18 @@ class Publisher:
         self._denied_dags: dict[Cid, tuple[frozenset[bytes], frozenset[Cid], bool]] = {}
         # (generation(), deny list's CID set, keys, strategy) of the last full refresh; None: the next computes
         self._inputs: tuple | None = None
-        self._published: dict[Cid, tuple[float, list[bytes]]] = {}  # CID -> (when, nodes that recorded it)
-        # Other nodes that may still hold our record of a CID (earlier rounds' closest nodes, or a round cut
+        self._published: dict[ProvidedItem, tuple[float, list[bytes]]] = {}  # item -> (when, nodes that recorded it)
+        # Other nodes that may still hold our record of an item (earlier rounds' closest nodes, or a round cut
         # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
-        self._earlier: dict[Cid, dict[bytes, float]] = {}
+        self._earlier: dict[ProvidedItem, dict[bytes, float]] = {}
         self._withdrawals: dict[bytes, set[bytes]] = {}  # node -> keys to withdraw from it
-        self._retry_at: dict[Cid, float] = {}  # CIDs whose last lookup found no nodes
+        self._retry_at: dict[ProvidedItem, float] = {}  # items whose last lookup found no nodes
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
-        # Changed since the last save (only tracked when persisted): items whose published or earlier rows, and
-        # nodes whose withdrawals, save() writes again
-        self._dirty_items: set = set()
-        self._dirty_nodes: set = set()
-        self._db = None if state_dir is None else statedb.connect(state_dir)
-        if self._db is not None:
-            try:
-                self._load()
-            except BaseException:
-                self._db.close()
-                raise
+        # Writes what changed since the last save (_touch_item, _touch_node), when persisted
+        self._store: _PublishState | None = None
+        self._db = None if state_dir is None else statedb.open_store(state_dir, self._load)
 
     def add_key_source(self, source: Callable[[], set[bytes]]):
         """Also provide the keys source() returns (DhtKeys), recomputed at each refresh(). Must not block."""
@@ -259,7 +291,7 @@ class Publisher:
         """Seconds between republishes: republish_interval, 3 days on slow nodes by default."""
         return self.config.effective_republish_interval(self.slow_node)
 
-    def interval_for(self, item: "Cid | DhtKey") -> float:
+    def interval_for(self, item: ProvidedItem) -> float:
         """Seconds between republishes of item: interval for a CID, key_interval for a DhtKey."""
         if isinstance(item, DhtKey):
             return key_interval(item.key, self.interval)
@@ -267,10 +299,11 @@ class Publisher:
 
     # Persistence
 
-    def _load(self):
+    def _load(self, db: statedb.StateDb):
         """Load last-published times and nodes, earlier rounds' nodes and pending withdrawals. Rows of the wrong
         shape are skipped (logged) and deleted; those the load changes (times clamped, earlier nodes past
         PROVIDER_TTL dropped) are marked changed, so the next save writes them as memory has them."""
+        self._store = _PublishState(db, self)
         now = self.clock()
 
         def when(number) -> float:
@@ -280,7 +313,7 @@ class Publisher:
         doomed: set = set()  # item texts whose rows are deleted here: they don't parse, or aren't as str() writes
         malformed = 0
 
-        def item_of(text) -> "Cid | DhtKey | None":
+        def item_of(text) -> ProvidedItem | None:
             """The item a row's text names, or None if it doesn't parse (counted and doomed)."""
             nonlocal malformed
             try:
@@ -294,7 +327,7 @@ class Publisher:
                 self._touch_item(item)
             return item
 
-        for text, at, nodes in self._db.query("SELECT item, at, nodes FROM published"):
+        for text, at, nodes in db.query("SELECT item, at, nodes FROM published"):
             item = item_of(text)
             if item is None:
                 continue
@@ -306,7 +339,7 @@ class Publisher:
                 continue
             if self._published[item][0] != at:
                 self._touch_item(item)
-        for text, node, stored in self._db.query("SELECT item, node, at FROM published_earlier"):
+        for text, node, stored in db.query("SELECT item, node, at FROM published_earlier"):
             item = item_of(text)
             if item is None:
                 continue
@@ -322,7 +355,7 @@ class Publisher:
                 self._earlier.setdefault(item, {})[node] = stored_at
             if stored_at != stored or now - stored_at >= PROVIDER_TTL:
                 self._touch_item(item)
-        for node, key in self._db.query("SELECT node, key FROM withdrawals"):
+        for node, key in db.query("SELECT node, key FROM withdrawals"):
             if not all(isinstance(value, bytes) and len(value) == ID_LENGTH for value in (node, key)):
                 malformed += 1
                 self._touch_node(node)
@@ -331,59 +364,31 @@ class Publisher:
         if malformed:
             log(f"publisher: ignoring {plural(malformed, 'malformed row')} in the state database", LOG_WARNING)
         if doomed:
-            with self._db.transaction() as tx:
+            with db.transaction() as tx:
                 tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in doomed])
                 tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in doomed])
 
     def save(self):
         """Persist the publish state changed since the last save, if any. Called without the lock: it is written
-        outside it. Raises OSError (StateDbError) if the database fails; what it held is then written next time."""
-        if self._db is None:
-            return
-        # Saves come from refresh(), the publish loop and stop(): one at a time, or a snapshot taken before the
-        # other's could be written last
-        with self._save_lock:
-            with self._lock:
-                items, nodes = self._dirty_items, self._dirty_nodes
-                if not items and not nodes:
-                    return
-                self._dirty_items, self._dirty_nodes = set(), set()
-                texts = {item: str(item) for item in items}
-                published = [(texts[item], self._published[item][0], b"".join(self._published[item][1]))
-                             for item in items if item in self._published]
-                earlier = [(texts[item], node, at)
-                           for item in items for node, at in self._earlier.get(item, {}).items()]
-                withdrawals = [(node, key) for node in nodes for key in self._withdrawals.get(node, ())]
-            try:
-                with self._db.transaction() as tx:
-                    tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in texts.values()])
-                    tx.executemany("DELETE FROM published_earlier WHERE item = ?",
-                                   [(text,) for text in texts.values()])
-                    tx.executemany("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", published)
-                    tx.executemany("INSERT OR REPLACE INTO published_earlier (item, node, at) VALUES (?, ?, ?)",
-                                   earlier)
-                    tx.executemany("DELETE FROM withdrawals WHERE node = ?", [(node,) for node in nodes])
-                    tx.executemany("INSERT OR REPLACE INTO withdrawals (node, key) VALUES (?, ?)", withdrawals)
-            except BaseException:
-                with self._lock:  # written by the next save
-                    self._dirty_items |= items
-                    self._dirty_nodes |= nodes
-                raise
+        outside it, one save at a time (saves come from refresh(), the publish loop and stop()). Raises OSError
+        (StateDbError) if the database fails; what it held is then written next time."""
+        if self._store is not None:
+            self._store.save()
 
     def close(self):
         """Release the state database (the node calls this once it has saved everything at shutdown)."""
         if self._db is not None:
             self._db.close()
 
-    def _touch_item(self, item: "Cid | DhtKey"):
+    def _touch_item(self, item: ProvidedItem):
         """Note that item's published or earlier entry changed, for the next save. Caller holds the lock."""
-        if self._db is not None:
-            self._dirty_items.add(item)
+        if self._store is not None:
+            self._store.changed((_ITEM, item))
 
     def _touch_node(self, node_id: bytes):
         """Note that the withdrawals queued for node_id changed, for the next save. Caller holds the lock."""
-        if self._db is not None:
-            self._dirty_nodes.add(node_id)
+        if self._store is not None:
+            self._store.changed((_NODE, node_id))
 
     # The provide set
 
@@ -411,7 +416,7 @@ class Publisher:
                 log(f"a provided-key source failed: {e!r}", LOG_ERROR)
         return keys
 
-    def _compute(self, keys: set[bytes], denied: frozenset[bytes]) -> tuple[frozenset[Cid], frozenset[Cid]]:
+    def _compute(self, keys: set[bytes], denied: frozenset[bytes]) -> tuple[frozenset[ProvidedItem], frozenset[Cid]]:
         """(provided CIDs and DhtKeys of keys, blocks they reach) from storage, the strategy and denied (the
         deny list's binary CIDs). Lock held.
 
@@ -419,7 +424,7 @@ class Publisher:
         (most refreshes): the same complete CIDs with the same dag_blocks objects, and the same keys. CIDs only
         added since add their blocks to it; only one gone or changed builds it again.
         """
-        candidates = set(self.storage.pins())
+        candidates = self.storage.pinned_cids()  # the same frozenset until pins change: not copied
         if self.config.provide_strategy == "roots":
             candidates |= self.storage.cached_targets() & set(self.cached_eligible())
         dags: dict[Cid, frozenset[Cid]] = {}
@@ -487,7 +492,9 @@ class Publisher:
                 for node_id in set(record[1] if record else []) | set(earlier):
                     self._withdrawals.setdefault(node_id, set()).add(cid.key)
                     self._touch_node(node_id)
-            cancelled = [cid for cid in added if self._provide_again(cid)]
+            # The keys withdrawals are queued for, gathered once: most added items have none to cancel
+            pending = {key for keys in self._withdrawals.values() for key in keys} if added else set()
+            cancelled = [cid for cid in added if self._provide_again(cid, pending)]
             self._inputs = inputs  # only once everything above is done: an exception computes again next time
             if removed:
                 log(f"no longer providing {plural(len(removed), 'CID')}", LOG_VERBOSE)
@@ -496,9 +503,10 @@ class Publisher:
         if removed or any(self._is_due(cid, self.clock()) for cid in added):
             self.wake()
 
-    def _provide_again(self, cid: "Cid | DhtKey") -> bool:
+    def _provide_again(self, cid: ProvidedItem, pending: set[bytes]) -> bool:
         """cid is provided (again): record ourselves locally and cancel withdrawals of its key still queued;
-        True if any were. Lock held.
+        True if any were. pending holds every key a withdrawal is queued for (it may hold more: those already
+        cancelled), so the queues are searched only for those. Lock held.
 
         A withdrawal queued when it stopped being provided would otherwise reach a node after a round stored it
         there again, deleting the fresh record (section 6). Those nodes may still hold a record of it, so they
@@ -506,6 +514,8 @@ class Publisher:
         """
         key = cid.key
         self.providers.store(key, self.own_id)  # refresh() withdrew it when it stopped being provided
+        if key not in pending:
+            return False
         now = self.clock()
         cancelled = False
         for node_id in [node_id for node_id, keys in self._withdrawals.items() if key in keys]:
@@ -526,7 +536,7 @@ class Publisher:
         """Make the publish loop look for due work now."""
         self._wake.set()
 
-    def _is_due(self, cid: Cid, now: float) -> bool:
+    def _is_due(self, cid: ProvidedItem, now: float) -> bool:
         """True if cid should be (re)published now (lock held or not; reads are atomic)."""
         retry = self._retry_at.get(cid)
         if retry is not None:
@@ -592,7 +602,7 @@ class Publisher:
                 del closest[cid]
                 self.providers.withdraw(cid.key, self.own_id)
 
-            by_node: dict[bytes, list[Cid]] = {}
+            by_node: dict[bytes, list[ProvidedItem]] = {}
             for cid, nodes in closest.items():
                 for node_id in nodes:
                     by_node.setdefault(node_id, []).append(cid)
@@ -607,7 +617,7 @@ class Publisher:
                     if not self._withdrawals[node_id]:
                         del self._withdrawals[node_id]
                     self._touch_node(node_id)
-        accepted: dict[Cid, list[bytes]] = {cid: [] for cid in closest}
+        accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
         unsaved, saved_at = 0, self.clock()
         for node_id in sorted(set(by_node) | set(withdrawals)):
@@ -646,7 +656,7 @@ class Publisher:
                 self.save()
                 unsaved, saved_at = 0, answered
 
-        unfinished: list[Cid] = []
+        unfinished: list[ProvidedItem] = []
         with self._lock:
             for node_id, keys in sent_withdrawals.items():
                 remaining = self._withdrawals.get(node_id, set()) - keys
@@ -695,12 +705,12 @@ class Publisher:
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values())}
 
-    def _find_closest(self, cid: "Cid | DhtKey") -> list[bytes]:
+    def _find_closest(self, cid: ProvidedItem) -> list[bytes]:
         """Record this node as cid's provider locally, then look up the nodes closest to its key (but this)."""
         self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
         return [n for n in self.make_lookup(cid.key).find_closest() if n != self.own_id]
 
-    def _lookups(self, due: list, should_stop: Callable[[], bool]) -> dict:
+    def _lookups(self, due: list[ProvidedItem], should_stop: Callable[[], bool]) -> dict[ProvidedItem, list[bytes]]:
         """{item: its closest nodes} for due's items whose lookup ran, in due's order, so a round's batches are
         the same however the lookups were run. Called without the lock: refresh() may run meanwhile.
 
@@ -764,7 +774,7 @@ class Publisher:
             try:
                 if self.next_due() <= 0:
                     self.publish_due(stop_event.is_set)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the publisher thread keeps running; logged
                 log(f"publishing failed: {e!r}", LOG_ERROR)
             self._wake.wait(min(MAX_WAIT, max(0.5, self.next_due())))
             if stop_event.is_set():

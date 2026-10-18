@@ -34,6 +34,12 @@ class ValidateTest(unittest.TestCase):
             self.assert_invalid(**{name: value})
         Config(gateway_fetches=0, max_output_entries=0, max_storage=0, max_blocks_responses=2).validate()
 
+    def test_follow_quota(self):
+        """A whole number of bytes; 0 turns follow fetches off."""
+        for value in (-1, "1", 1.5, True, None):
+            self.assert_invalid(follow_quota=value)
+        Config(follow_quota=0).validate()
+
     def test_optional_whole_numbers(self):
         for name in ("alpha", "max_parallel_providers"):
             for value in (0, "3", True, 1.5):
@@ -73,6 +79,16 @@ class ValidateTest(unittest.TestCase):
             for value in (ID, [ID[:-2]], ["zz" * 16], [7], {ID: 1}, None):
                 self.assert_invalid(**{name: value})
             Config(**{name: [ID, f"<{ID.upper()}>", f" {ID} "]}).validate()
+
+    def test_identity_sets(self):
+        """member_set and remote_pin_set hold each list once, as identity.hash.hex() writes it, so the node, the
+        link pool and the server all agree on who is listed; they follow later changes to the lists."""
+        other = "cd" * 16
+        config = Config(members=[f" <{ID.upper()}>", ID], remote_pin_identities=[f"{other.upper()}\n"])
+        self.assertEqual(config.member_set, frozenset({ID}))
+        self.assertEqual(config.remote_pin_set, frozenset({other}))
+        config.remote_pin_identities = []
+        self.assertEqual(config.remote_pin_set, frozenset())
 
     def test_other_lists_and_paths(self):
         for value in (ID, [1], None):

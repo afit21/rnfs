@@ -15,6 +15,10 @@ read without a lock, so /blocks serving and each block a fetch stores pay one lo
 parse_list refuses one over MAX_LIST_BYTES or MAX_LIST_ENTRIES, not UTF-8, or with a line that isn't an entry,
 and its source keeps the version it had. Listeners (the node) are told after every change, outside the lock.
 
+Hashing reads every occurrence of repeated content, so a few small blocks can declare a file of 2^56 bytes. While
+there are file hashes, a file declaring more than DENY_HASH_RATIO times the bytes of its distinct chunks, plus
+DENY_HASH_SLACK, is refused (Denied) unhashed: it can't be checked (the node's _check_file).
+
 So a file isn't read and hashed again before each send, the SHA-256 of the files checked is remembered by CID
 (at most MAX_KNOWN_HASHES, least recently used forgotten first). A CID's content never changes, so a hash
 remembered never goes stale, and they are kept across restarts in the deny_hashes table: memory is what checks
@@ -28,7 +32,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 from rnfs import statedb
-from rnfs.constants import KIB
+from rnfs.constants import KIB, MIB
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound
 from rnfs.log import LOG_WARNING, log, plural
@@ -39,6 +43,10 @@ MAX_LIST_BYTES = 4096 * KIB  # a list file (about 60 000 CIDs)
 MAX_LIST_ENTRIES = 100_000  # entries in one list
 MAX_LOCAL_ENTRIES = 100_000  # entries in the local list
 MAX_KNOWN_HASHES = 10_000  # files whose content hash is remembered (a CID's content never changes)
+# A file is hashed only if it declares at most DENY_HASH_RATIO × the bytes of its distinct chunks + DENY_HASH_SLACK:
+# hashing then costs at most 16 times what its blocks cost to store, and any file of up to 64 MiB is hashed
+DENY_HASH_RATIO = 16
+DENY_HASH_SLACK = 64 * MIB
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 

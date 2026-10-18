@@ -42,8 +42,9 @@ class NewRnfsDirTest(WindowsTestCase):
     def test_root_and_subdirectories_are_created_private(self):
         """Each directory has the private DACL from the call that creates it: none is ever set afterwards
         (the old code made the root with os.makedirs, then set its DACL)."""
-        node_module._make_private_dirs(Config(rnfs_dir=self.root))
-        expected = [self.root] + [os.path.join(self.root, name) for name in ("state", "blocks", "storage", "names")]
+        node_module._make_private_dirs(self.root)
+        expected = [self.root] + [os.path.join(self.root, name) for name in ("state", "blocks", "storage", "names",
+                                                                                     "lxmf")]
         self.assertEqual(self.acl.set_calls, [], "a DACL was set after the directory was created with its "
                                                  "parent's access list")
         self.assertEqual(self.acl.created, expected)
@@ -63,12 +64,12 @@ class NewRnfsDirTest(WindowsTestCase):
 
         with mock.patch("os.mkdir", mkdir_then_plant):
             with self.assertRaisesRegex(RnfsError, "was just created, yet it already holds 1 entries"):
-                node_module._make_private_dirs(Config(rnfs_dir=self.root))
+                node_module._make_private_dirs(self.root)
         self.assertEqual(sorted(os.listdir(self.root)), [SETTINGS_FILE], "rnfs went on to use the planted dir")
 
     def test_trailing_separator(self):
         """The default dir is given as "~/.rnfs/": its parent is the profile, not the dir itself."""
-        node_module._make_private_dirs(Config(rnfs_dir=self.root + os.sep))
+        node_module._make_private_dirs(self.root + os.sep)
         self.assertEqual(self.acl.created[0], self.root)
 
 
@@ -102,11 +103,14 @@ class SettingsFileTest(WindowsTestCase):
             Config.load(self.root)
 
     def test_settings_others_may_access_are_tightened_with_a_warning(self):
+        # The warning is returned for the caller to show (ND6: logging it loaded RNS in the CLI and rnfs.Client)
         with mock.patch("rnfs.log.log") as log:
             config = Config.load(self.root)
         self.assertEqual(config.reticulum_dir, "C:/Users/Public/evil-reticulum")  # read, after the warning
         self.assertTrue(self.private(self.path), "the settings file was used without making it private")
-        self.assertIn("Check that its settings are yours", log.call_args.args[0])
+        [warning] = config.warnings
+        self.assertIn("Check that its settings are yours", warning)
+        log.assert_not_called()
         self.assertIsNotNone(self.acl.read_fds[0], "the DACL checked must be the opened file's")
 
     def test_settings_that_cant_be_tightened_are_refused(self):
@@ -117,7 +121,7 @@ class SettingsFileTest(WindowsTestCase):
     def test_private_settings_load_quietly(self):
         self.acl.set(self.path, Dacl(USER, [allow(USER), allow(winacl.SYSTEM)]))
         with mock.patch("rnfs.log.log") as log:
-            Config.load(self.root)
+            self.assertEqual(Config.load(self.root).warnings, [])
         log.assert_not_called()
         self.assertEqual(self.acl.set_calls, [])
 

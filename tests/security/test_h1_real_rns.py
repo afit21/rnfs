@@ -16,7 +16,6 @@ Opt in with RNFS_E2E=1 (real daemons and RNS networking), like tests/test_e2e.py
 """
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -26,6 +25,7 @@ import urllib.request
 
 from tests import support
 from tests.security import _h1_real_helpers as helpers
+from tests.test_e2e import INTERRUPT, POPEN_OPTIONS
 
 HELPER = helpers.__file__
 ROOT = helpers.ROOT
@@ -75,7 +75,7 @@ class H1RealRnsTest(unittest.TestCase):
     def _spawn(self, argv, name, env=None):
         log = open(os.path.join(self.base, f"{name}.log"), "wb")
         self.logs.append(log)
-        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env)
+        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env, **POPEN_OPTIONS)
         self.procs.append(proc)
         return proc
 
@@ -94,7 +94,7 @@ class H1RealRnsTest(unittest.TestCase):
     def _stop_all(self):
         for p in self.procs:
             if p.poll() is None:
-                p.send_signal(signal.SIGINT)
+                p.send_signal(INTERRUPT)  # Ctrl+C; Windows can't send SIGINT, so CTRL_BREAK_EVENT (as test_e2e)
         time.sleep(2)
         for p in self.procs:
             if p.poll() is None:

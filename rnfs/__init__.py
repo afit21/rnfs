@@ -20,7 +20,7 @@ cli.py       command line: run a daemon, or talk to one through its API
 interface.py, objects.py, embedded.py, remote.py: the public API (rnfs.Node, rnfs.Client)
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) may change until rnfs 0.2
 
 # Public name -> the module defining it, imported on first use (PEP 562)
@@ -31,7 +31,8 @@ _EXPORTS = {
                                          "Status", "Collected", "Verified", "Exported", "Imported", "DenyState")},
     **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File")},
     **{name: "rnfs.errors" for name in ("RnfsError", "NotFound", "TooLarge", "InvalidDag", "StorageFull", "Busy",
-                                        "Denied", "Cancelled", "Closed")},
+                                        "Denied", "Cancelled", "Closed", "BlockMismatch", "SealError",
+                                        "NotRecipient")},
     **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "ConnectionFailed", "TokenError",
                                            "AuthFailed", "SettingsError", "BadRequest", "ServerError")},
 }

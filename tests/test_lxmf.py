@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -23,7 +25,7 @@ from rnfs.features import lxmf
 from rnfs.features.lxmf import FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE, Incoming, Link, MessageLog
 from rnfs.node import RnfsNode
 
-from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
+from tests.support import FakeClock, failing_commits, state_execute, state_rows, wait_for, write_legacy
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -414,6 +416,10 @@ class FakeLxmf:
     def poll(self):
         """Nothing changes by itself."""
         return []
+
+    def idle(self):
+        """Nothing to poll."""
+        return True
 
     def sync(self, nearest=False):
         """Started if there is a propagation node to use."""
@@ -830,23 +836,28 @@ class SendTest(FeatureTestCase):
         self.assertEqual(self.network.sent, [])
 
     def test_contact_nick(self):
+        # The node's own address book (contacts.resolve_id finds the recipient)
         feature = self.feature_node()
-        contacts = mock.Mock()
-        contacts.lookup.side_effect = lambda nick, kind=None: SENDER if nick == "alice" and kind in ("lxmf", None) \
-            else (OTHER if nick == "bob" else None)
-        self.addCleanup(self.b.features["contacts"].close)  # the node closes the stand-in instead
-        self.b.features["contacts"] = contacts
+        contacts = self.b.feature("contacts")
+        contacts.add("alice", SENDER.hex(), "lxmf")
+        contacts.add("bob", OTHER.hex(), "node")
+        contacts.add("site", NAME.hex(), "name")
         feature.send("alice", str(self.cid))
         self.assertEqual(self.network.sent[0][0], SENDER)
-        contacts.lookup.side_effect = lambda nick, kind=None: OTHER if kind is None else None
-        with self.assertRaisesRegex(ValueError, "not an LXMF address"):
+        with self.assertRaisesRegex(ValueError, "contact bob is not an LXMF address"):
             feature.send("bob", str(self.cid))
+        with self.assertRaisesRegex(ValueError, "no LXMF contact carol"):
+            feature.send("carol", str(self.cid))
         # A name contact as the target: the link follows the name
-        contacts.lookup.side_effect = lambda nick, kind=None: {("alice", "lxmf"): SENDER,
-                                                               ("site", "name"): NAME}.get((nick, kind))
         feature.send("alice", "site/docs/a.txt")
         self.assertEqual(lxmf.decode_field(self.network.sent[1][2]),
                          [Link(name=NAME, path=("docs", "a.txt"), from_node=B_ID)])
+
+    def test_sync(self):
+        """POST /api/lxmf/sync's answer: the propagation node asked, and whether a download started."""
+        feature = self.feature_node(FakeLxmf(heard=OTHER))
+        self.assertEqual(feature.sync(), {"propagation_node": None, "started": False})
+        self.assertEqual(feature.sync(nearest=True), {"propagation_node": OTHER.hex(), "started": True})
 
     def test_unfinished_messages_fail_after_restart(self):
         feature = self.feature_node()
@@ -856,6 +867,93 @@ class SendTest(FeatureTestCase):
         self.assertEqual(again.outbox_list()[0]["state"], "failed")
         again.save()
         self.assertEqual(self.reloaded().outbox_list()[0]["state"], "failed")
+
+
+class LoopNetwork(FakeLxmf):
+    """FakeLxmf counting the loop's announces, downloads and polls; idle unless the test queues a message."""
+
+    def __init__(self):
+        """Nothing queued; feature is set by the test, for wake()."""
+        super().__init__()
+        self.announces = self.syncs = self.polls = 0
+        self.pending = 0  # polls until the queued message is done with
+        self.feature = None
+
+    def announce(self):
+        """Count it."""
+        self.announces += 1
+
+    def sync(self, nearest=False):
+        """Count it."""
+        self.syncs += 1
+        return super().sync(nearest)
+
+    def poll(self):
+        """Count it; the queued message is done with after its polls."""
+        self.polls += 1
+        self.pending = max(0, self.pending - 1)
+        return []
+
+    def idle(self):
+        """Idle once the queued message is done with."""
+        return not self.pending
+
+    def queue(self, polls: int):
+        """Queue a message followed for polls polls, waking the loop as LxmfNetwork.send does."""
+        self.pending = polls
+        self.feature.wake()
+
+
+class LoopTest(FeatureTestCase):
+    """S7: the announce/sync/poll loop polls each TICK only while the network has something to poll."""
+
+    def test_idle_loop_waits_until_the_next_announce_or_download(self):
+        network = LoopNetwork()
+        feature = self.feature_node(network, startup_announce_delay=30, lxmf_sync_interval=3600)
+        timeouts = []
+
+        class Recording(threading.Event):
+            """Records each wait's timeout and returns at once; queues a message at the third, stops at the sixth."""
+
+            def wait(self, timeout=None):
+                timeouts.append(timeout)
+                if len(timeouts) == 3:
+                    network.pending = 2
+                if len(timeouts) == 6:
+                    feature._stop.set()
+                return super().wait(0)
+
+        feature._wake = Recording()
+        feature._run()  # here, until the sixth wait stops it
+        self.assertEqual((network.announces, network.syncs, network.polls), (1, 0, 6))
+        # Idle: until the second announce (startup_announce_delay); the queued message: each TICK
+        self.assertEqual(timeouts[3], lxmf.TICK)
+        for timeout in timeouts[:3] + timeouts[4:]:
+            self.assertTrue(29 < timeout <= 30, timeouts)
+
+    def test_a_queued_message_wakes_the_idle_loop(self):
+        network = LoopNetwork()
+        feature = self.feature_node(network)  # the default startup_announce_delay: idle, it waits 30 s
+        network.feature = feature
+        thread = threading.Thread(target=feature._run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(feature.wake)
+        self.addCleanup(feature._stop.set)
+        wait_for(lambda: network.polls, 10, "the first poll")
+        time.sleep(1.2)
+        self.assertEqual(network.polls, 1)  # no polls each second while idle
+        network.queue(2)
+        # Polled at once, then each TICK until it is done with; then idle again
+        wait_for(lambda: network.polls >= 3, 10, "the queued message's polls")
+        time.sleep(1.2)
+        self.assertEqual(network.polls, 3)
+        self.assertEqual(network.announces, 1)
+        # stop() wakes the idle loop
+        feature._stop.set()
+        feature.wake()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
 
 
 class DisabledTest(FeatureTestCase):
@@ -868,12 +966,14 @@ class DisabledTest(FeatureTestCase):
             feature.start()
         self.assertIsNone(feature.network)
         self.assertIn("not installed", feature.off_reason)
-        self.assertEqual(feature._threads, [])
+        self.assertEqual(feature._spawned, [])
         self.assertIsNone(self.b.status()["lxmf_address"])
         with self.assertRaisesRegex(ValueError, "not installed"):
             feature.send(SENDER.hex(), str(self.cid))
         with self.assertRaisesRegex(ValueError, "not installed"):
             feature.address()
+        with self.assertRaisesRegex(ValueError, "not installed"):
+            feature.sync()
         self.assertEqual(feature.inbox_list(), [])  # stored messages stay readable
         feature.stop()
 
@@ -991,6 +1091,8 @@ class CliTest(unittest.TestCase):
         self.assertEqual(parser.parse_args(["inbox"]).run.__name__, "_run_inbox")
         args = parser.parse_args(["inbox", "get", "4", "--link", "2", "-o", "x"])
         self.assertEqual((args.run.__name__, args.n, args.link, args.output), ("_run_inbox_get", 4, 2, "x"))
+        self.assertFalse(args.use_sent_cid)
+        self.assertTrue(parser.parse_args(["inbox", "get", "4", "--use-sent-cid"]).use_sent_cid)
         self.assertTrue(parser.parse_args(["inbox", "rm", "--all"]).all)
         self.assertEqual(parser.parse_args(["outbox"]).run.__name__, "_run_outbox")
         self.assertEqual(parser.parse_args(["lxmf", "address"]).run.__name__, "_run_address")
@@ -1058,7 +1160,7 @@ class AuditFixesTest(FeatureTestCase):
         for number in range(20):
             feature.received(self.link_message(number=number, source=bytes([number]) * 16,
                                                text=("é" * 3000).encode()))
-        sizes = [lxmf._json_bytes(e) for e in feature.inbox_list()]
+        sizes = [lxmf._json_bytes(e) for e in feature.inbox.entries()]
         self.assertLessEqual(sum(sizes), 20_000)
         self.assertEqual(feature.inbox_list()[-1]["id"], 20)
         feature.save()
@@ -1086,7 +1188,7 @@ class AuditFixesTest(FeatureTestCase):
         client.post.return_value = results
         out = io.StringIO()
         with mock.patch("rnfs.cli.client", return_value=client), mock.patch("sys.stdout", out):
-            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None))
+            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None, use_sent_cid=False))
         self.assertNotIn("\x1b", out.getvalue())
         self.assertNotIn("\x07", out.getvalue())
 
@@ -1235,7 +1337,7 @@ class RestartAndCancelTest(FeatureTestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("rnfs.cli.client", return_value=client), mock.patch("sys.stdout", out), \
                 mock.patch("sys.stderr", err), self.assertRaises(SystemExit):
-            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None))
+            lxmf._run_inbox_get(SimpleNamespace(output=None, n=1, link=None, use_sent_cid=False))
         self.assertIn("job 0123abcd: /x/a", out.getvalue())
         self.assertIn("/x/b: too many jobs", err.getvalue())
         self.assertNotIn("\x1b", err.getvalue())
@@ -1268,6 +1370,30 @@ class RestartAndCancelTest(FeatureTestCase):
                 self.assertRaises(OSError):
             lxmf.LxmfFeature(self.b)
         self.assertEqual(database.references, before)
+
+    def test_constructor_sets_every_attribute_before_its_start_up_steps(self):
+        """FT1: building the feature over an inbox that isn't clean records an unrecorded lxmf: pin in a new
+        message (_release_unrecorded -> _record_kept, which takes the lock and adds to the inbox); every attribute
+        the finished feature has is already set when that runs."""
+        self.feature_node()
+        target = Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"])
+        self.b.storage.pin(target, f"lxmf:{SENDER.hex()}")  # the inbox was never saved, so it isn't clean
+        seen = []
+        original = lxmf.LxmfFeature._release_unrecorded
+
+        def release_unrecorded(feature):
+            """Note the attributes set so far, then run the real start-up step."""
+            seen.append(set(vars(feature)))
+            original(feature)
+
+        with mock.patch.object(lxmf.LxmfFeature, "_release_unrecorded", release_unrecorded):
+            again = self.reloaded()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(vars(again)) - seen[0], set(), "attributes set only after the start-up steps")
+        records = again.inbox_list()
+        self.assertEqual([(e["from"], e["auto"]) for e in records],
+                         [(SENDER.hex(), [{"state": "pinned", "cid": str(target)}])])
+        self.assertEqual(self.b.storage.pins()[target], {f"lxmf:{SENDER.hex()}"})
 
 
 class MessageLogBoundsTest(unittest.TestCase):
@@ -1330,6 +1456,7 @@ class NetworkBoundsTest(unittest.TestCase):
         network._propagation_nodes = {}
         network._configured_pn = network._current_pn = None
         network._sync_started = float("-inf")
+        network._outbound = {}
         network.identity = object()
         return network
 
@@ -1447,6 +1574,40 @@ class NetworkBoundsTest(unittest.TestCase):
             self.assertTrue(network.sync(nearest=True))
         network.router.request_messages_from_propagation_node.assert_called_once_with(
             network.identity, lxmf.SYNC_MAX_MESSAGES)
+
+    def test_idle_and_wakes(self):
+        # S7: the feature's loop polls only while a message is followed or held or a download runs, and the
+        # network wakes it when one starts
+        network = self.network()
+        self.network_lxmf = LXMF = network.LXMF
+        router, wake = network.router, network.feature.wake
+        router.PR_PATH_REQUESTED, router.PR_COMPLETE = LXMF.LXMRouter.PR_PATH_REQUESTED, LXMF.LXMRouter.PR_COMPLETE
+        router.propagation_transfer_state = LXMF.LXMRouter.PR_IDLE
+        self.assertTrue(network.idle())
+        with mock.patch.object(RNS.Transport, "request_path"):
+            network._delivered(self.forged(os.urandom(16), b"HELD"))
+        wake.assert_called_once_with()
+        self.assertFalse(network.idle())
+        network._held = []
+        self.assertTrue(network.idle())
+        for state, idle in ((LXMF.LXMRouter.PR_PATH_REQUESTED, False), (LXMF.LXMRouter.PR_RECEIVING, False),
+                            (LXMF.LXMRouter.PR_COMPLETE, True), (LXMF.LXMRouter.PR_FAILED, True)):
+            router.propagation_transfer_state = state
+            self.assertEqual(network.idle(), idle, state)
+        router.propagation_transfer_state = LXMF.LXMRouter.PR_IDLE
+        network._configured_pn = OTHER
+        wake.reset_mock()
+        self.assertTrue(network.sync())
+        wake.assert_called_once_with()
+        # Sending: followed (and the loop woken) from when it is queued
+        wake.reset_mock()
+        network.LXMF, network.destination = mock.Mock(), mock.Mock()
+        network.LXMF.LXMessage.return_value = mock.Mock(hash=b"m" * 32)
+        with mock.patch.object(RNS.Identity, "recall", return_value=mock.Mock()), \
+                mock.patch.object(RNS, "Destination"):
+            self.assertEqual(network.send(SENDER, "hi", {}, False), b"m" * 32)
+        wake.assert_called_once_with()
+        self.assertFalse(network.idle())
 
     def test_settings(self):
         # BG-L7 and the new lxmf_send_from_hint

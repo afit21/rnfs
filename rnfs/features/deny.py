@@ -8,7 +8,7 @@ The deny list itself (what is checked, and where) is core: rnfs/denylist.py. Thi
   can't be fetched, read or parsed is logged, and the source keeps the version it had.
 - A name is resolved as `name resolve` does (persisted, so its announces keep the record held up to date),
   checked every CHECK_INTERVAL from the record held, and through the network only if nothing was heard for
-  STALE_ANNOUNCES x announce_interval. A failed check is retried after RETRY_INTERVAL, doubling up to
+  MISSED_ANNOUNCES x announce_interval. A failed check is retried after RETRY_INTERVAL, doubling up to
   announce_interval; a CID source once accepted is never checked again.
 - At start, sources no longer in deny_lists are forgotten and every "deny" pin no source uses is released.
 - One background thread does every check and fetch, one at a time.
@@ -19,7 +19,7 @@ No RNS at module level (the CLI imports this module, and Config.validate calls v
 import threading
 import time
 
-from rnfs.constants import ID_LENGTH
+from rnfs.constants import ID_LENGTH, MISSED_ANNOUNCES
 from rnfs.content.cid import Cid
 from rnfs.errors import RnfsError
 from rnfs.features import Feature, _common
@@ -29,7 +29,6 @@ from rnfs.fsutil import printable
 NAME = "deny"
 NAME_PREFIX = "name/"
 CHECK_INTERVAL = 600.0  # seconds between checks of a name source's record held (no network)
-STALE_ANNOUNCES = 2  # a record not heard for this many announce_intervals is refreshed from the network
 FAR_FUTURE = float("inf")
 
 
@@ -86,7 +85,6 @@ class DenyFeature(Feature):
         self._failures: dict[str, int] = {}  # source -> checks failed in a row
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         for source in self.deny.accepted():
             if source not in self._sources:
                 self.deny.forget(source)
@@ -112,13 +110,14 @@ class DenyFeature(Feature):
         with self._lock:
             for source in self._sources:
                 self._due[source] = first
-        self._thread = threading.Thread(target=self._loop, name="rnfs-deny", daemon=True)
-        self._thread.start()
+        self._spawn(self._loop, "rnfs-deny")
 
-    def stop(self):
-        """Stop the background thread (a fetch in progress stops at its next network wait)."""
+    def stop(self, deadline: float | None = None):
+        """Stop the background thread and wait for it until deadline (a fetch in progress stops at its next network
+        wait), so the node doesn't close the state database under it."""
         self._stop.set()
         self._wake.set()
+        self._join(deadline)
 
     def status(self) -> dict:
         """Entries denied (the local list's and every source's) and sources configured."""
@@ -142,7 +141,7 @@ class DenyFeature(Feature):
         root, name, names = parse_source(source)
         previous = self.deny.accepted().get(source)
         if name is not None:
-            max_age = STALE_ANNOUNCES * self.node.config.announce_interval
+            max_age = MISSED_ANNOUNCES * self.node.config.announce_interval
             try:
                 result = self.node.names.resolve(name, persist=True, max_age=max_age)
             except Exception as e:  # noqa: BLE001 - resolving is retried later
@@ -161,7 +160,7 @@ class DenyFeature(Feature):
                 if previous == expect.cid and self.deny.in_use(source):
                     self._set_state(source, "in use")
                     return True
-                if walker.kind_of(expect, fetch.get(expect)) != "file":
+                if walker.kind_of(expect, fetch.get(expect)) != walker.FILE_TYPE:
                     raise ValueError("it is a directory, not a file")
                 if fetch.size_of(expect) > denylist.MAX_LIST_BYTES:
                     raise ValueError(f"it is over {denylist.MAX_LIST_BYTES // 1024} KiB")

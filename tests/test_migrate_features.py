@@ -384,7 +384,7 @@ class InboxTest(Common, LogTests, MigrateTest):
                 write_legacy(self.state, "pins.json", {"pins": {str(A): [source], str(C): [source]}})
                 write_legacy(self.state, self.FILE, text=inbox)
                 node = self.node()
-                messages = node.feature("lxmf").inbox_list()
+                messages = node.feature("lxmf").inbox.entries()  # the records, as imported
                 self.assertEqual(node.storage.pinned_by(source), {A, C} if kept else {A})
                 if kept:
                     self.assertEqual([m["auto"] for m in messages], [[{"state": "pinned", "cid": str(A)},

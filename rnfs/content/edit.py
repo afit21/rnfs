@@ -34,7 +34,9 @@ def _rebuild(chain: list[walker.Expect], names: list[str], entries: list[Entry],
         siblings = [entry for entry in walker.list_directory(parent, get) if entry.name != name]
         siblings.append(Entry(name, built.cid, built.size, dag.KIND_DIRECTORY))
         built = builder.build_directory(siblings, put)
-    # The builder can't see the depth of subtrees it didn't build, so check the finished tree
+    # The builder can't see the depth of subtrees it didn't build, so check the finished tree: walker.height
+    # remembers the subtrees it measured before, so once a tree has been measured an edit of it reads only the
+    # directories it rebuilt (rather than every node: building a directory one entry at a time was O(n²))
     if walker.height(walker.root_expect(built.cid), get) > constants.MAX_DEPTH:
         raise TooLarge(f"the edited tree would be deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     return built.cid
@@ -51,7 +53,7 @@ def dir_set(root: Cid, names: list[str], name: str, child: Cid, executable: bool
     dag.check_name(name)
     child_expect = walker.root_expect(child)
     child_block = get(child_expect)
-    if walker.kind_of(child_expect, child_block) == "directory":
+    if walker.kind_of(child_expect, child_block) == walker.DIRECTORY_TYPE:
         if executable:
             raise ValueError("a directory can't be executable")
         kind = dag.KIND_DIRECTORY
@@ -64,10 +66,21 @@ def dir_set(root: Cid, names: list[str], name: str, child: Cid, executable: bool
     return _rebuild(chain, names, entries, get, put)
 
 
+NEEDS_ENTRY = "dir rm needs <cid>/<path>: the entry to remove"
+
+
+def check_entry_target(target) -> None:
+    """Raise ValueError unless target names an entry inside a directory, `<cid>/<path>` (dir rm's target: a root
+    can't be removed). The node checks this before fetching anything; the path itself is checked as it is
+    parsed."""
+    if not isinstance(target, str) or "/" not in target.rstrip("/"):
+        raise ValueError(NEEDS_ENTRY)
+
+
 def dir_rm(root: Cid, names: list[str], get: walker.Get, put: Put) -> Cid:
     """The new root after removing the entry <root>/<names...>. Raises NotFound if it doesn't exist."""
     if not names:
-        raise ValueError("dir rm needs a path: <cid>/<name>...")
+        raise ValueError(NEEDS_ENTRY)
     chain = _directory_chain(root, names[:-1], get)
     entries = list(walker.list_directory(chain[-1], get))
     remaining = [e for e in entries if e.name != names[-1]]

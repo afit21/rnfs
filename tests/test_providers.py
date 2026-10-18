@@ -23,14 +23,26 @@ KEY = ident(0xABC)
 
 
 class StoreTestCase(unittest.TestCase):
-    """Base: an in-memory store with a fake clock and seeded rng."""
+    """Base: an in-memory store with a fake clock and seeded rng; every store's indexes are checked after each test."""
 
     max_records = 1000
 
     def setUp(self):
         """Create the store."""
         self.clock = FakeClock(1_700_000_000.0)
-        self.store = ProviderStore(self.max_records, None, clock=self.clock, rng=random.Random(1))
+        self.stores: list[ProviderStore] = []
+        self.store = self.new_store(self.max_records, rng=random.Random(1))
+
+    def new_store(self, max_records: int, **settings) -> ProviderStore:
+        """An in-memory store on the fake clock, checked for consistency after the test."""
+        store = ProviderStore(max_records, None, clock=self.clock, **settings)
+        self.stores.append(store)
+        return store
+
+    def tearDown(self):
+        """Every index of every store agrees with its records."""
+        for store in self.stores:
+            store._check_consistency()
 
 
 class RecordTest(StoreTestCase):
@@ -57,6 +69,34 @@ class RecordTest(StoreTestCase):
         self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
         self.clock.now += PROVIDER_TTL
         self.assertEqual(self.store.expire(), 1)
+
+    def test_expiry_clamps_only_after_the_clock_went_back(self):
+        """The clamping pass runs only when the clock reads earlier than a time it gave before (S5)."""
+        with mock.patch.object(self.store, "_clamp", wraps=self.store._clamp) as clamp:
+            self.store.expire()
+            self.store.store(KEY, ident(1))
+            self.store.expire()
+            self.clock.now += 60
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 0)
+            self.clock.now -= 100  # corrected backwards: the record was stored in the future
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 1)
+            self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
+            self.store.expire()  # every time is now at most the clock's: nothing more to clamp
+            self.clock.now += 5
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 1)
+
+    def test_departure_in_the_future_clamped_at_expiry(self):
+        """A departure time, taken when the publisher's last record went, is clamped too (S5): the withdrawal's own
+        clock reading counts as one the store has seen."""
+        self.store.store(KEY, ident(1))
+        self.clock.now += DAY
+        self.store.withdraw(KEY, ident(1))  # departs a day ahead of the corrected clock
+        self.clock.now -= DAY
+        self.store.expire()
+        self.assertEqual(self.store._departed[ident(1)], (self.clock.now, self.clock.now))
 
     def test_expires_ttl_after_last_stored(self):
         self.store.store(KEY, ident(1))
@@ -262,7 +302,7 @@ class PublisherLimitTest(StoreTestCase):
         self.assertTrue(self.store.store(ident(100), ident(1)))  # republishing is never refused
 
     def test_own_records_are_not_limited(self):
-        store = ProviderStore(self.max_records, None, clock=self.clock, own_id=ident(1))
+        store = self.new_store(self.max_records, own_id=ident(1))
         for i in range(3 * store.max_per_publisher):
             self.assertTrue(store.store(ident(100 + i), ident(1)))
         self.assertTrue(store.store(KEY, ident(1)))
@@ -280,7 +320,7 @@ class PublisherLimitTest(StoreTestCase):
         self.assertEqual(self.store.record_count(), 1)
 
     def test_full_key_evicts_a_random_non_senior_publisher(self):
-        store = ProviderStore(1000, None, clock=self.clock, rng=random.Random(1), max_per_key=20)
+        store = self.new_store(1000, rng=random.Random(1), max_per_key=20)
         accepted = [store.store(KEY, ident(i)) for i in range(1, 31)]
         self.assertEqual(accepted, [True] * 30)  # newcomers are never locked out
         providers = store.providers(KEY)
@@ -295,7 +335,7 @@ class PublisherLimitTest(StoreTestCase):
         self.assertEqual(store.providers(KEY), [ident(31)])
 
     def test_sybils_holding_a_key_cannot_lock_out_later_providers(self):
-        store = ProviderStore(100_000, None, clock=self.clock, rng=random.Random(1))
+        store = self.new_store(100_000, rng=random.Random(1))
         early = ident(1)
         store.store(KEY, early)
         for i in range(store.max_per_key - 1):
@@ -306,7 +346,7 @@ class PublisherLimitTest(StoreTestCase):
         self.assertIn(early, store.for_reply(KEY)[:K // 2])  # long-standing providers are never evicted
 
     def test_reply_asks_exclude_only_about_chosen_candidates(self):
-        store = ProviderStore(10_000, None, clock=self.clock, rng=random.Random(1))
+        store = self.new_store(10_000, rng=random.Random(1))
         for i in range(store.max_per_key):
             store.store(KEY, ident(i))
         self.assertEqual(len(store.providers(KEY)), store.max_per_key)
@@ -399,12 +439,19 @@ class PersistenceTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.state = os.path.join(self.directory.name, "state")
         self.clock = FakeClock(1_700_000_000.0)
+        self.stores: list[ProviderStore] = []
 
     def open(self, max_records: int = 100, **settings) -> ProviderStore:
-        """A store on self.state, closed when the test ends."""
+        """A store on self.state, checked for consistency and closed when the test ends."""
         store = ProviderStore(max_records, self.state, clock=self.clock, **settings)
         self.addCleanup(store.close)
+        self.stores.append(store)
         return store
+
+    def tearDown(self):
+        """Every index of every store opened agrees with its records (before cleanups close them)."""
+        for store in self.stores:
+            store._check_consistency()
 
     def test_round_trip(self):
         """Records and first-seen times are saved, and loaded by the next store."""
@@ -422,6 +469,18 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(loaded.record_count(), 3)
         self.assertEqual(loaded.first_seen(ident(1)), store.first_seen(ident(1)))
         self.assertEqual(loaded.first_seen(ident(2)), store.first_seen(ident(2)))
+
+    def test_own_record_beyond_a_full_key_survives_restart(self):
+        """The node's own record doesn't count toward max_per_key on load either (DHT-5)."""
+        own = ident(1)
+        store = self.open(1000, max_per_key=5, own_id=own)
+        for i in range(5):
+            store.store(KEY, ident(100 + i))
+        self.clock.now += 1
+        store.store(KEY, own)
+        store.save()
+        loaded = self.open(1000, max_per_key=5, own_id=own)
+        self.assertEqual(loaded.providers(KEY), [ident(100 + i) for i in range(5)] + [own])
 
     def test_first_seen_order_survives_restart(self):
         """A publisher seen first still evicts the newest one's records after a restart."""
@@ -635,6 +694,8 @@ class PersistenceTest(unittest.TestCase):
             store.save()
             loaded = ProviderStore(60, self.state, clock=self.clock, **settings)
             try:
+                store._check_consistency()
+                loaded._check_consistency()
                 self.assertEqual(held(loaded), held(store))
                 self.assertEqual(saved(self.state), held(store))
                 self.assertFalse(loaded._dirty_records or loaded._dirty_publishers or loaded._dirty_gone)
@@ -673,6 +734,65 @@ class PersistenceTest(unittest.TestCase):
         self.assertGreater(store._count, 0)
         self.assertTrue(store._departed or store._evicted)
         check()
+
+    def test_random_operations_keep_indexes_consistent(self):
+        """Random stores, withdrawals, expiries, clock corrections and reloads (some with smaller limits) in a store
+        kept full: every index agrees with the records after each step, and after expire() no time is later than
+        now."""
+        rng = random.Random(11)
+        own = ident(1)
+        publishers = [ident(1 + n) for n in range(25)]
+        keys = [ident(1000 + n) for n in range(20)]
+        limits = [{"max_records": 40}, {"max_records": 40}, {"max_records": 30, "max_per_publisher": 5},
+                  {"max_records": 20, "max_per_key": 3}]
+        settings = {"max_per_key": 5, "own_id": own, "seniority": DAY, "rng": random.Random(2)}
+        store = self.open(**(settings | limits[0]))
+        counts = {"pooled": 0, "reloads": 0, "clamped": 0}
+
+        def no_future_times(store: ProviderStore):
+            """Nothing store holds is later than now."""
+            now = self.clock.now
+            state = held(store)
+            self.assertTrue(all(seen <= now for seen in state["publishers"].values()))
+            self.assertTrue(all(first <= now and last <= now for first, last, _ in state["records"].values()))
+            for memory in ("departed", "evicted"):
+                self.assertTrue(all(seen <= now and at <= now for seen, at in state[memory].values()))
+
+        for _ in range(3000):
+            action = rng.random()
+            publisher = rng.choice(publishers)
+            if action < 0.45:
+                store.store(rng.choice(keys), publisher)
+            elif action < 0.6:
+                store.withdraw(rng.choice(keys), publisher)
+            elif action < 0.75:
+                self.clock.now += rng.choice((1, 600, 3 * 3600, DAY, 3 * DAY))
+            elif action < 0.8:
+                self.clock.now -= rng.choice((1, 600, DAY))  # corrected backwards: times are now in the future
+                counts["clamped"] += 1
+            elif action < 0.88:
+                store.expire()
+                no_future_times(store)
+            elif action < 0.9:
+                store.retain(lambda p: p not in {publisher})
+            elif action < 0.95:
+                # A restart, sometimes with expired records and future times still held (the load drops and clamps
+                # them): after an expire(), the reloaded store holds what this one did unless its limits are smaller
+                expired = rng.random() < 0.5
+                if expired:
+                    store.expire()
+                store.save()
+                store.close()
+                setting = rng.choice(limits)
+                reloaded = self.open(**(settings | setting))
+                if expired and setting == limits[0] and store.max_records == 40:
+                    self.assertEqual(held(reloaded), held(store))
+                no_future_times(reloaded)
+                store = reloaded
+                counts["reloads"] += 1
+            counts["pooled"] = max(counts["pooled"], store._pool_count)
+            store._check_consistency()
+        self.assertTrue(counts["pooled"] and counts["reloads"] > 50 and counts["clamped"] > 50)
 
 
 class ThreadSafetyTest(StoreTestCase):

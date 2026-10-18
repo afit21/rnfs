@@ -32,9 +32,9 @@ class GetPartialTest(unittest.TestCase):
     def test_failed_write_out_leaves_nothing(self):
         real = walker.write_out
 
-        def write_then_fail(expect, get, dest, max_entries):
+        def write_then_fail(expect, get, dest, max_entries, **kwargs):
             """Write the whole tree, then fail as a late error would."""
-            real(expect, get, dest, max_entries)
+            real(expect, get, dest, max_entries, **kwargs)
             raise TooLarge("failed after writing")
 
         with mock.patch.object(walker, "write_out", write_then_fail):

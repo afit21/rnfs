@@ -6,13 +6,13 @@ chunker always gets the same CID, and every implementation of FastCDC as specifi
 
 FastCDC (Xia et al., "FastCDC: a Fast and Efficient Content-Defined Chunking Approach", 2016), with
 normalized chunking, as fixed by the specification:
-- MIN_SIZE 16 KiB, AVG_SIZE 64 KiB, MAX_SIZE 128 KiB (= MAX_BLOCK_SIZE).
+- MIN_SIZE 16 KiB, AVG_SIZE 64 KiB, FASTCDC_MAX 128 KiB (= MAX_BLOCK_SIZE; the specification's MAX_SIZE).
 - GEAR[i] (i = 0..255) is the first 8 bytes, big-endian, of SHA-256("rnfs-fastcdc-gear" || byte i).
 - Gear hash: h = 0 at offset MIN_SIZE of each chunk, then for every byte b: h = ((h << 1) + GEAR[b]) mod 2^64.
-- At chunk offset i (0-based, MIN_SIZE <= i < MAX_SIZE), after hashing byte i: cut after it (the chunk is
+- At chunk offset i (0-based, MIN_SIZE <= i < FASTCDC_MAX), after hashing byte i: cut after it (the chunk is
   bytes 0..i) if h & MASK_S == 0 while i < AVG_SIZE, or h & MASK_L == 0 from AVG_SIZE on. MASK_S is the top
   18 bits of 64 (harder to meet before the average), MASK_L the top 14 bits (easier after it).
-- A chunk with no cut point ends at MAX_SIZE; data left of at most MIN_SIZE bytes is the last chunk.
+- A chunk with no cut point ends at FASTCDC_MAX; data left of at most MIN_SIZE bytes is the last chunk.
 
 Speed: a byte-by-byte loop in CPython manages about 15 MB/s. The hash after byte i only depends on the 64
 bytes before it: h_i = sum over k < 64 of GEAR[b_(i-k)] << k (mod 2^64), with nothing before the chunk's
@@ -36,7 +36,10 @@ CHUNKERS = (FIXED, FASTCDC)
 
 MIN_SIZE = 16 * constants.KIB
 AVG_SIZE = 64 * constants.KIB
-MAX_SIZE = 128 * constants.KIB
+# The largest FastCDC chunk. It decides fastcdc CIDs, so it never changes, and a chunk is one block
+FASTCDC_MAX = 128 * constants.KIB
+assert FASTCDC_MAX <= constants.MAX_BLOCK_SIZE
+MAX_SIZE = FASTCDC_MAX  # its name before 0.1.6 (not dag.MAX_SIZE, which is unrelated)
 GEAR_SEED = b"rnfs-fastcdc-gear"
 GEAR = tuple(int.from_bytes(hashlib.sha256(GEAR_SEED + bytes([i])).digest()[:8], "big") for i in range(256))
 MASK_S = ((1 << 18) - 1) << 46
@@ -124,20 +127,20 @@ def fixed_chunks(stream: BinaryIO, size: int | None = None) -> Iterator[bytes]:
 
 
 def fastcdc_stream(stream: BinaryIO, size: int | None = None) -> Iterator[bytes]:
-    """FastCDC chunks of a stream, holding at most READ_SIZE + MAX_SIZE bytes."""
+    """FastCDC chunks of a stream, holding at most READ_SIZE + FASTCDC_MAX bytes."""
     remaining = size
     buffer = b""
     start = 0
     eof = False
     while True:
-        if not eof and len(buffer) - start < MAX_SIZE:
+        if not eof and len(buffer) - start < FASTCDC_MAX:
             data, remaining = read_limited(stream, READ_SIZE, remaining)
             eof = len(data) < READ_SIZE or remaining == 0
             buffer = buffer[start:] + data
             start = 0
         if start >= len(buffer):
             return
-        end = cut_point(buffer, start, len(buffer)) if eof or len(buffer) - start >= MAX_SIZE else None
+        end = cut_point(buffer, start, len(buffer)) if eof or len(buffer) - start >= FASTCDC_MAX else None
         if end is None:
             continue
         yield buffer[start:end]
@@ -158,11 +161,11 @@ def fastcdc_cuts(data: bytes) -> list[int]:
 def cut_point(data: bytes, start: int, end: int) -> int:
     """Where the chunk starting at data[start] ends, given that the data (as far as known) ends at end.
 
-    The caller must provide at least MAX_SIZE bytes from start unless end is the end of the file.
+    The caller must provide at least FASTCDC_MAX bytes from start unless end is the end of the file.
     """
     if end - start <= MIN_SIZE:
         return end
-    limit = min(end, start + MAX_SIZE)
+    limit = min(end, start + FASTCDC_MAX)
     normal = min(limit, start + AVG_SIZE)
     base = start + MIN_SIZE
     cut = _scan(data, base, normal, base, False)
@@ -175,7 +178,7 @@ def cut_point_simple(data: bytes, start: int, end: int) -> int:
     """cut_point by the byte-by-byte definition: the reference the fast version is tested against."""
     if end - start <= MIN_SIZE:
         return end
-    limit = min(end, start + MAX_SIZE)
+    limit = min(end, start + FASTCDC_MAX)
     normal = min(limit, start + AVG_SIZE)
     h = 0
     for i in range(start + MIN_SIZE, limit):

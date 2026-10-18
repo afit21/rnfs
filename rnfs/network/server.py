@@ -23,12 +23,13 @@ from collections import Counter, OrderedDict
 from typing import Callable, Protocol
 
 import RNS
+from RNS.vendor import umsgpack
 
 from rnfs.config import Config
-from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK,
-                            MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+from rnfs.constants import (BLOCKS_PATH, FIND_PATH, MAX_REQUEST_SIZE, MAX_REQUESTS_PER_LINK, PIN_PATH,
+                            PROVIDE_PATH, RESPONSE_OVERHEAD)
 from rnfs.content.cid import Cid
-from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
+from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, LOG_WARNING, ThrottledLog, log, node_name, plural, size
 from rnfs.network import guards, protocol, rates
 from rnfs.network.identity import node_id_for_identity
 from rnfs.network.links import close_reason
@@ -64,6 +65,13 @@ FLOOR_FRACTION = 1 / 1000
 # A response displaced for a newcomer while making progress at less than this fraction of the rate it needs to
 # be done when it is due (Response.due) counts as making none: its requester cools down
 FAR_BEHIND = 1 / 4
+# A response whose Resource its requester rejects or cancels before this fraction of it was sent made no real
+# progress: its requester cools down (section 3). Otherwise one could take the first window of parts of each
+# response, cancel it and ask again, having the node read, hash, pack and encrypt a whole response per window
+# (on a slow link, a window of RNS.Resource.WINDOW_MAX_SLOW parts is about 7% of a 64 KiB response). An honest
+# 0.1.5 fetcher never cancels a Resource (a reader giving up closes the link), so only RNS running out of
+# retries on a lossy path does
+NO_PROGRESS_FRACTION = 1 / 4
 COOLDOWN_MEMORY = 4096  # links and identities on a /blocks cooldown remembered at most
 # Requests per incoming link (section 3): a token bucket of REQUEST_BURST, refilled at REQUEST_RATE a second.
 # An honest requester waits for its answers, with at most MAX_REQUESTS_PER_LINK in progress, so it sends at most
@@ -99,8 +107,8 @@ class Backend(Protocol):
         """cid's block if it's in the DAG of a CID this node provides, re-verified; else None."""
 
     def served_block_size(self, cid: Cid) -> int | None:
-        """Optional (looked up with getattr): the stored length of the block served_block(cid) would return, or
-        None if it isn't served (or isn't known). Lets /blocks stop at the block over its budget unread."""
+        """The stored length of the block served_block(cid) would return, or None if it isn't served (or isn't
+        known). Lets /blocks stop at the block over its budget unread."""
 
     def remote_pin(self, identity_hash: bytes, cid: Cid, pin: bool) -> bool:
         """Accept (True) or refuse a /pin from the identity with this 16-byte hash."""
@@ -109,22 +117,17 @@ class Backend(Protocol):
         """In private mode, True if the identity with this 16-byte hash is a member."""
 
     def feature_requests(self) -> dict:
-        """Optional (looked up with getattr): request paths added by features, {path: handler(data,
-        remote_identity)}, served within the same per-link limits; a path rnfs serves itself is ignored."""
+        """Request paths added by features, {path: handler(data, remote_identity)} ({} for none), served within the
+        same per-link limits; a path rnfs serves itself is ignored."""
 
 
 # Pure policy
 
 def blocks_budget(max_bytes: int, rate_estimate: float | None, upload_cap: float | None,
                   response_target: float) -> int:
-    """Total block bytes a /blocks response may hold after its first served block (section 7)."""
-    limit = min(max_bytes, MAX_RESPONSE_SIZE - RESPONSE_OVERHEAD)
-    if rate_estimate is None:
-        # What a requester asks for until the link has a rate estimate (section 7), enforced: otherwise one
-        # small request could ask for a ~1 MiB response with a deadline of many hours
-        return min(limit, CHUNK_SIZE)
-    rate = min(rate_estimate, upload_cap) if upload_cap else rate_estimate
-    return min(limit, rates.transfer_bytes(response_target, rate))
+    """Total block bytes a /blocks response may hold after its first served block (section 7): the rule the
+    requester sizes its batches by too (rates.response_capacity)."""
+    return rates.response_capacity(max_bytes, rate_estimate, upload_cap, response_target)
 
 
 def select_blocks(cids: list[Cid], served_block: Callable[[Cid], bytes | None], limit: int,
@@ -194,7 +197,7 @@ def fast_path(link) -> bool:
     KISS radio on it. A requester can lower its link's MTU, never raise it past what the path allows."""
     try:
         mtu = link.get_mtu()
-    except Exception:
+    except Exception:  # noqa: BLE001 - RNS internals: not a fast link if they fail
         return False
     return type(mtu) is int and mtu > rates.SLOW_MTU
 
@@ -231,7 +234,44 @@ def progress_floor(bitrate: float | None, hops: int | None, config: Config) -> f
 
 
 class Response:
-    """A /blocks response in progress, holding a slot in one of the pools."""
+    """A /blocks response in progress, holding a slot in one of the pools.
+
+    Threads and locks. A response is touched by its request's handler thread (RNS starts one per request), the
+    next request's handler on the same link (_previous_done), the monitor thread (check_responses), RNS's threads
+    (the outgoing-Resource registration hook on the packet thread; the Resource's callback on the packet thread,
+    on a Resource's watchdog, on the thread RNS starts for a rejection's callback, or on whichever thread
+    cancelled it) and link-closed callbacks (_link_closed, on the thread that tore the link down). Python
+    assigns attributes atomically; what matters is who may write a field, under which lock, and in what order:
+    - link_id, request_id, pool and started: set at construction, never changed.
+    - grace, floor, interface and identity: set by ResponsePools.reserve under ResponsePools.lock, before the
+      response is visible to any other thread. grace is set again, with no lock, by the handler thread at
+      handover, dropping the pacing wait it covered until then: a reader sees one value or the other.
+    - size, deadline, due, find_until and untracked: written once each, with no lock, by the handler thread at
+      handover, size first and the others after it, before it returns the body (so before RNS can build the
+      Resource) and before it wakes the monitor. Readers take size None to mean not yet handed over and skip
+      the response (check_responses), so a reader that sees size set but an older deadline (inf) or
+      find_until (inf) only waits one more pass. requester is likewise set once by the handler, before _admit.
+    - sent and first_progress: written by the monitor thread only (note_progress), with no lock. Other threads
+      read them as a snapshot: a stale value only makes a response look slower than it is.
+    - grace_start and progress_at: moved forward only (max), with no lock, by the handler at handover, by
+      _attach (on the packet thread or the monitor) and, for progress_at, by the monitor. A lost update loses
+      at most the gap between two near-simultaneous "now"s.
+    - resource: set by _attach, with no lock, from the registration hook (packet thread) or the monitor's
+      poll, whichever sees the Resource first; both check it is still None and would attach the same
+      Resource, so a race only runs _hook twice, which installs the callback once (and _concluded runs once).
+    - idle: set under ResponsePools.lock when a newcomer displaces it (_displaceable), or with no lock by the
+      monitor (_check_progress) just before it cancels it, and read by the _cancel that follows. A displaced
+      response has left the pool, so only a monitor pass whose snapshot predates that can still reach it; both
+      then cancel it, which _finish makes harmless, and either one's idle decides the cooldown.
+    - finished and concluded: check-and-set under RequestServer.lock (_finish, _concluded), so each runs once
+      whichever thread gets there first. Read without the lock elsewhere as a hint: neither ever goes back to
+      False, so a stale False only means that thread's later _finish (or _concluded) call returns early.
+    - cost, charged and settled: written under RequestServer.lock (_admit, _charge_progress, _settle, and the
+      handler's settled=True for single-packet and untracked responses). Read without it by commitment() and
+      _committed() outside _admit, where a stale value only shifts an admission estimate.
+    - done: a threading.Event, set by _finish.
+    NW2's later steps (in a later release) give a response its own lock; until then, keep to these owners.
+    """
 
     def __init__(self, link_id: bytes, request_id: bytes, pool: str, started: float):
         """A response that has just taken a slot; its size and deadline follow once it's built."""
@@ -681,10 +721,9 @@ class RequestServer:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.wake = threading.Event()
-        self.pin_identities = {h.strip().strip("<>").lower() for h in config.remote_pin_identities}
+        self.pin_identities = config.remote_pin_set
         self.over_rate = 0  # requests over their link's rate limit, in all (refused or dropped)
-        self.over_rate_logged_at: float | None = None
-        self.over_rate_logged = 0
+        self.over_rate_log = ThrottledLog(OVER_RATE_LOG_INTERVAL, clock)
 
         # Reject request Resources, compressed ones and advertisements whose transfer outgrows their size: on
         # every link in the daemon, which also turns RNS's compression off process-wide, or on rnfs.dht links
@@ -701,7 +740,7 @@ class RequestServer:
             PIN_PATH: self._handle_pin,
         }
         # Paths added by features (rnfs.features: Feature.requests), within the same per-link limit
-        for path, handler in getattr(backend, "feature_requests", dict)().items():
+        for path, handler in backend.feature_requests().items():
             if path not in handlers:
                 handlers[path] = self._feature_handler(handler)
         for path, handler in handlers.items():
@@ -751,7 +790,7 @@ class RequestServer:
         for link in links:
             try:
                 identity = link.get_remote_identity()
-            except Exception:
+            except Exception:  # noqa: BLE001 - RNS internals: no identity if they fail
                 identity = None
             if self._is_member(identity):
                 members.add(link.link_id)
@@ -812,7 +851,7 @@ class RequestServer:
                     log(f"refused {path} from a non-member", LOG_VERBOSE)
                     return False
                 return handler(path, data, request_id, link_id, remote_identity)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - runs on RNS's request thread: refuse and log
                 log(f"error answering {path}: {e}", LOG_ERROR)
                 return False
         return response_generator
@@ -821,32 +860,43 @@ class RequestServer:
         """Count a request over its link's rate limit, logging at most once a minute."""
         with self.lock:
             self.over_rate += 1
-            now = self.clock()
-            if self.over_rate_logged_at is not None and now - self.over_rate_logged_at < OVER_RATE_LOG_INTERVAL:
-                return
-            dropped, self.over_rate_logged, self.over_rate_logged_at = (self.over_rate - self.over_rate_logged,
-                                                                        self.over_rate, now)
-        log(f"refused or dropped {plural(dropped, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
+        skipped = self.over_rate_log.due()
+        if skipped is None:
+            return
+        log(f"refused or dropped {plural(skipped + 1, 'request')} over the per-link rate limit ({REQUEST_BURST} at "
             f"once, {REQUEST_RATE:g} a second)", LOG_WARNING)
 
     def _is_member(self, remote_identity) -> bool:
         """True if the requester identified as a member (private mode)."""
         return remote_identity is not None and bool(self.backend.is_member(remote_identity.hash))
 
+    def _in_slot(self, link_id: bytes, answer: Callable[[], object]):
+        """answer() run in one of the link's MAX_REQUESTS_PER_LINK request slots, which is freed when it returns
+        or raises; False at once if the link has none free.
+
+        Every handler but /blocks (whose slot outlives the handler, until its Resource concludes) runs its
+        work here, after its own checks: a refusal from those comes first and takes no slot.
+        """
+        if not self.incoming.start_request(link_id, blocks=False):
+            return False
+        try:
+            return answer()
+        finally:
+            self.incoming.finish_request(link_id, blocks=False)
+
     def _handle_find(self, path, data, request_id, link_id, remote_identity):
         """Answer /find with providers of the key and the servers closest to it."""
         key = protocol.parse_find_request(data)
         if key is None or not self.backend.is_dht_server():
             return False
-        if not self.incoming.start_request(link_id, blocks=False):
-            return False
-        try:
+
+        def answer():
+            """Look the key up."""
             providers, nodes = self.backend.find(key)
             log(f"/find {key.hex()}: {plural(len(providers), 'provider')}, {plural(len(nodes), 'node')}",
                 LOG_VERBOSE)
             return protocol.encode_find_response(list(providers), list(nodes))
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        return self._in_slot(link_id, answer)
 
     def _handle_provide(self, path, data, request_id, link_id, remote_identity):
         """Record the identified requester as a provider of the keys, and withdraw the withdrawn ones."""
@@ -854,29 +904,37 @@ class RequestServer:
         if remote_identity is None or not self.backend.is_dht_server():
             return False
         parsed = protocol.parse_provide_request(data)
-        if parsed is None or not self.incoming.start_request(link_id, blocks=False):
+        if parsed is None:
             return False
-        try:
+
+        def answer():
+            """Record the keys and withdraw the withdrawn ones."""
             keys, withdrawn = parsed
             publisher = node_id_for_identity(remote_identity)
             recorded = self.backend.provide(publisher, keys, withdrawn) is True
             log(f"/provide from {node_name(publisher)}: {plural(len(keys), 'key')}, {len(withdrawn)} withdrawn, "
                 f"{'recorded' if recorded else 'refused'}", LOG_VERBOSE)
             return recorded
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        return self._in_slot(link_id, answer)
 
     def _feature_handler(self, handler):
-        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, and never answering None."""
+        """A handler for a feature's path: counted against MAX_REQUESTS_PER_LINK, never answering None, and
+        answering False rather than a response requesters would refuse."""
         def handle(path, data, request_id, link_id, remote_identity):
             """Run the feature's handler(data, remote_identity) inside the per-link request limit."""
-            if not self.incoming.start_request(link_id, blocks=False):
-                return False
-            try:
+            def answer():
+                """The feature's response, False for None or a shape no requester accepts."""
                 response = handler(data, remote_identity)
-                return False if response is None else response
-            finally:
-                self.incoming.finish_request(link_id, blocks=False)
+                if response is None:
+                    return False
+                # Requesters since 0.1.4 check every response's shape before decoding it (protocol.response_refusal):
+                # one they refuse would fail every request to this path, so it's a bug in the feature, said here
+                refusal = protocol.body_refusal(umsgpack.packb(response))
+                if refusal is not None:
+                    log(f"refused to answer {path} with a response no requester accepts: {refusal}", LOG_ERROR)
+                    return False
+                return response
+            return self._in_slot(link_id, answer)
         return handle
 
     def _handle_pin(self, path, data, request_id, link_id, remote_identity):
@@ -884,13 +942,10 @@ class RequestServer:
         if remote_identity is None or remote_identity.hash.hex() not in self.pin_identities:
             return False
         parsed = protocol.parse_pin_request(data)
-        if parsed is None or not self.incoming.start_request(link_id, blocks=False):
+        if parsed is None:
             return False
-        try:
-            cid, pin = parsed
-            return self.backend.remote_pin(remote_identity.hash, cid, pin) is True
-        finally:
-            self.incoming.finish_request(link_id, blocks=False)
+        cid, pin = parsed
+        return self._in_slot(link_id, lambda: self.backend.remote_pin(remote_identity.hash, cid, pin) is True)
 
     def _handle_blocks(self, path, data, request_id, link_id, remote_identity):
         """Answer /blocks within the per-link limit, the response pools, upload pacing and the budget."""
@@ -942,8 +997,9 @@ class RequestServer:
                 if response.finished:
                     return False  # displaced, or its link closed, while it waited
 
-            # The upload cap applies once the link has a rate estimate (section 3)
-            cap = self.config.effective_max_upload_rate(slow, rate) if rate is not None else None
+            # An explicit max_upload_rate applies to every response, also one sent as a single packet, which
+            # never gives a rate estimate; the default cap (half the estimate on slow links) needs one (section 3)
+            cap = self.config.effective_max_upload_rate(slow, rate)
             limit = self.airtime.limit(blocks_budget(max_bytes, rate, cap, self.config.response_target),
                                        self._committed(response))
             response.requester = identity if identity is not None else link_id
@@ -954,8 +1010,7 @@ class RequestServer:
                     log("refused /blocks: that requester's responses in flight hold half of upload_budget", LOG_VERBOSE)
                     return False
                 limit = min(limit, max(0, share - RESPONSE_OVERHEAD))
-            entries = select_blocks(cids, self.backend.served_block, limit,
-                                    getattr(self.backend, "served_block_size", None))
+            entries = select_blocks(cids, self.backend.served_block, limit, self.backend.served_block_size)
             body = protocol.encode_blocks_response(entries)
             packed = protocol.packed_response_size(request_id, body)
             mdu = link.get_mdu() or protocol.DEFAULT_MDU
@@ -1031,6 +1086,17 @@ class RequestServer:
         finally:
             self.incoming.stop_waiting(link_id)
 
+    @staticmethod
+    def _proof_wait(link) -> float:
+        """Seconds a new /blocks waits for the previous response's proof: 2 × the link's RTT + 1, at most
+        PROOF_GRACE. The only server-side use of link.rtt, and it must stay capped: on an incoming link it is
+        whatever the requester claims (RNS keeps the larger of what it measured and what the requester's RTT
+        packet says), so anything but a finite, non-negative int or float (a bool included) counts as none."""
+        rtt = getattr(link, "rtt", None)
+        if type(rtt) not in (int, float) or not 0 <= rtt < math.inf:  # NaN fails both comparisons
+            rtt = 0
+        return float(min(PROOF_GRACE, 2 * rtt + 1))
+
     def _previous_done(self, link, link_id: bytes) -> bool:
         """Whether the link's previous /blocks response, if any, has finished, so a new one may start.
 
@@ -1041,7 +1107,7 @@ class RequestServer:
         previous = [r for r in self.pools.responses() if r.link_id == link_id and not r.finished]
         if not previous:
             return True
-        deadline = time.monotonic() + min(PROOF_GRACE, 2 * (getattr(link, "rtt", None) or 0) + 1)
+        deadline = self.clock() + self._proof_wait(link)
         for response in previous:
             if response.untracked:
                 # Without RNS internals, the requester asking again is the only sign the response arrived
@@ -1051,7 +1117,7 @@ class RequestServer:
             resource = response.resource
             if resource is None or getattr(resource, "status", 0) < RNS.Resource.AWAITING_PROOF:
                 return False  # not yet sent, or still transferring
-            while not response.finished and time.monotonic() < deadline:
+            while not response.finished and self.clock() < deadline:
                 if getattr(resource, "status", 0) >= RNS.Resource.COMPLETE:
                     self._concluded(response, link, resource)
                     break
@@ -1078,14 +1144,14 @@ class RequestServer:
             result = original(resource, *args, **kwargs)
             try:
                 self._registered(link, resource)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - runs inside RNS's Resource code; logged
                 log(f"error tracking a /blocks response: {e}", LOG_WARNING)
             return result
 
         register_outgoing_resource.rnfs_watch = True
         try:
             link.register_outgoing_resource = register_outgoing_resource
-        except Exception:
+        except Exception:  # noqa: BLE001 - a link that can't be watched isn't
             return
         self.watched.add(link.link_id)
 
@@ -1178,7 +1244,7 @@ class RequestServer:
             try:
                 sent = resource.get_progress() * (response.size or 0) if resource is not None else response.sent
                 final = min(response.cost, int(max(0.0, sent)))
-            except Exception:
+            except Exception:  # noqa: BLE001 - progress unknown: charged in full
                 pass  # progress unknown: it is charged in full
         with self.lock:
             response.charged = final
@@ -1206,7 +1272,7 @@ class RequestServer:
 
     def _concluded(self, response: Response, link, resource):
         """The response's Resource concluded: record the rate if it completed, start a cooldown if its requester
-        rejected it with nothing sent, and free the slots."""
+        rejected or cancelled it before it made real progress (_made_progress), and free the slots."""
         with self.lock:
             # The Resource's callback, the monitor and the next request may all notice; handle it once
             first, response.concluded = not response.concluded, True
@@ -1214,28 +1280,34 @@ class RequestServer:
         status = getattr(resource, "status", None)
         if first and status == RNS.Resource.COMPLETE:
             self.rates.record(response.link_id, response.size, self._expected_rate(link))
-        elif first and status == RNS.Resource.REJECTED and not self._sent_any(response, resource):
-            # Turned down at its advertisement (no honest requester does that): no progress, so its requester
-            # cools down as for a response cancelled for making none, rather than having the node build another
-            # at once (section 3)
-            log("a /blocks response was rejected with nothing sent: its requester cools down", LOG_VERBOSE)
+        elif first and status == RNS.Resource.REJECTED and not self._made_progress(response, resource):
+            # Turned down at its advertisement or cancelled by its requester (on RNS 1.5.6 both arrive as
+            # REJECTED) before a quarter of it was sent: no honest 0.1.5 fetcher does that, it closes the link.
+            # So no real progress, and its requester cools down as for a response cancelled for making none,
+            # rather than having the node build another at once (section 3)
+            log(f"a /blocks response ({size(response.size or 0)}) was rejected before a quarter of it was sent: "
+                "its requester cools down", LOG_VERBOSE)
             self.cooldowns.add(response.link_id, response.identity)
         elif first and not cancelled and status in (RNS.Resource.FAILED, RNS.Resource.CORRUPT):
-            # Not cancelled here: RNS gave up on the transfer, so the requester sees it stop arriving
+            # Not cancelled here: RNS gave up on the transfer, or the requester closed the link, so the requester
+            # sees it stop arriving. No cooldown, however little was sent: an honest reader that gives up early
+            # closes its links, and in private mode a cooldown would hold back its own identity
             log(f"a /blocks response ({size(response.size or 0)}) failed after {size(int(response.sent))} sent: "
                 f"{'its link closed' if getattr(link, 'status', None) == RNS.Link.CLOSED else 'lost in transit'}",
                 LOG_DEBUG)
         self._finish(response)  # charges what was sent: all of a completed Resource
 
     @staticmethod
-    def _sent_any(response: Response, resource) -> bool:
-        """Whether any of response's Resource was sent (or that can't be read)."""
-        if response.sent > 0:
+    def _made_progress(response: Response, resource) -> bool:
+        """Whether at least NO_PROGRESS_FRACTION of response was sent: the more of what the monitor last saw and
+        what its Resource reads now. True if its size or the Resource's progress can't be read."""
+        if response.size is None:
             return True
         try:
-            return resource.get_progress() > 0
-        except Exception:
+            sent = max(response.sent, resource.get_progress() * response.size)
+        except Exception:  # noqa: BLE001 - progress unknown counts as progress
             return True
+        return sent >= NO_PROGRESS_FRACTION * response.size
 
     def _cancel(self, response: Response, reason: str):
         """Stop sending a response: cancel its Resource, or close its link if we can't reach the Resource."""
@@ -1267,7 +1339,7 @@ class RequestServer:
         """Link.get_expected_rate(), or None if unavailable."""
         try:
             return link.get_expected_rate()
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: no rate if they fail
             return None
 
     def _hook(self, response: Response, link, resource):
@@ -1279,7 +1351,7 @@ class RequestServer:
 
             try:
                 resource.callback = concluded
-            except Exception:
+            except Exception:  # noqa: BLE001 - RNS internals: the deadline still applies
                 pass
         if getattr(resource, "status", 0) >= RNS.Resource.COMPLETE:
             # It concluded before the hook was in place
@@ -1322,7 +1394,7 @@ class RequestServer:
                     continue
                 try:
                     response.note_progress(resource.get_progress() * response.size, now)
-                except Exception:
+                except Exception:  # noqa: BLE001 - progress unknown: only the deadline applies
                     resource = None  # progress unknown: only the deadline applies
                 else:
                     self._charge_progress(response)
@@ -1358,7 +1430,7 @@ class RequestServer:
                 searching = self.check_responses()
                 # check_responses only looks at responses handed to RNS, and each handover sets wake
                 idle = not any(r.size is not None and not r.finished for r in self.pools.responses())
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the monitor thread keeps running; logged
                 log(f"error tracking /blocks responses: {e}", LOG_WARNING)
                 searching = idle = False
             self.wake.wait(None if idle else MONITOR_FAST_TICK if searching else MONITOR_TICK)

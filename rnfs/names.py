@@ -5,7 +5,9 @@ A name is the hash of an `rnfs.name` destination whose RNS identity is the name'
 any validly signed announce, including a replayed old one, so the highest sequence seen is persisted for every
 name this node publishes or resolves for the user, and lower sequences are never accepted from any source. RNS
 also remembers a replayed announce as just heard, so an announce shows its record current only up to
-ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers.
+ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers. One
+older than the announce RNS took the path from, or carrying another record, is a suspected replay, as old as it is
+(RnsNetwork.recalled_emission), and resolves ask keepers at once.
 Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
 names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
 within seconds of a resolve or an announce raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten
@@ -31,14 +33,15 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import RNS
 from RNS.vendor import umsgpack
 
-from rnfs import fsutil, statedb
-from rnfs.config import _HEX_ID, Config  # _HEX_ID: exactly 32 hex digits, as identity lists are checked
-from rnfs.constants import APP_NAME, ID_LENGTH, NAME_ASPECT
+from rnfs import fsutil, ids, statedb
+from rnfs.config import Config
+from rnfs.constants import APP_NAME, ID_LENGTH, MISSED_ANNOUNCES, NAME_ASPECT
 from rnfs.content.cid import Cid
 from rnfs.errors import NotFound, RnfsError
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, log
@@ -58,6 +61,10 @@ FLOOR_HARD_FACTOR = 2  # ... up to this many times as many in all (the file stay
 FLOOR_SAVE_INTERVAL = 5.0  # seconds: a resolve raising the floor saves it at once, or this long after the last save
 FLOOR_TOUCH_SAVE = 3600.0  # a resolve that only renews a floor entry's time marks it for the next save after this
 PIN_SOURCE_PREFIX = "name:"
+# Private mode restricts rnfs's links, not RNS announces: a name's record rides in its announce, which RNS
+# propagates to every node that hears it (specification sections 3 and 10)
+PRIVATE_NAME_WARNING = ("private mode doesn't hide names: this name's announce, with its sequence and target CID, "
+                        "is visible outside the private network, though its content is served to members only")
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _PARTIAL = re.compile(re.escape(fsutil.PARTIAL_PREFIX) + r"[0-9a-f]{16}")  # a key write's temp file (write_atomic)
 _DECIMAL = re.compile(r"-?[0-9]+")  # a sequence column (decimal text: sequences don't fit SQLite's integers)
@@ -65,9 +72,11 @@ _MAX_USED = 2**62  # floor rows' used values stay below this, so the ones after 
 _POLL_INTERVAL = 0.25  # how often a refresh checks whether RNS has heard a path response
 # An announce shows its record current for this many announce_intervals after it was emitted, however recently
 # it was heard: RNS remembers a replayed announce as just heard (_announce_heard)
-ANNOUNCE_VALIDITY = 2
+ANNOUNCE_VALIDITY = MISSED_ANNOUNCES
 _PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds its announces' random blobs
+_PATH_PACKET = 6  # RNS's IDX_PT_PACKET: where a path table entry holds the packet hash of the path's announce
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up
+REFRESHED_SIZE = 4096  # how many names' last network refresh a resolve remembers (E1), least recent forgotten first
 
 
 # Records and names
@@ -85,7 +94,7 @@ def parse_record(app_data) -> tuple[int, Cid] | None:
     app_data = bytes(app_data)
     try:
         value = umsgpack.unpackb(app_data)
-    except Exception:
+    except Exception:  # noqa: BLE001 - umsgpack raises several types for hostile bytes
         return None
     if not isinstance(value, list) or len(value) != 2:
         return None
@@ -108,13 +117,7 @@ def parse_record(app_data) -> tuple[int, Cid] | None:
 
 def parse_name(text: str) -> bytes:
     """A name from its 32 hex character form, with or without RNS's <angle brackets>. Raises ValueError."""
-    if not isinstance(text, str):
-        raise ValueError("name must be a string")
-    stripped = text.strip().strip("<>")
-    # Hex digits only: bytes.fromhex alone would skip whitespace between them, giving a shorter name
-    if not _HEX_ID.fullmatch(stripped):
-        raise ValueError(f"name must be {NAME_LENGTH * 2} hex characters: {text!r}")
-    return bytes.fromhex(stripped)
+    return ids.parse_hex16(text, "name", brackets=True)
 
 
 def check_alias(alias) -> str:
@@ -269,7 +272,7 @@ def import_floor(value: dict, tx) -> int:
     first, replace the name_floor rows, each checked as rnfs 0.1.4 loaded it: one that doesn't parse is skipped
     (and counted in a warning), one without a valid resolve time counts as resolved long ago, and a name listed
     twice keeps the higher sequence, at its later place. Held names, future times and the floor's bound are left
-    to the load (_load_floor). Returns the number of entries imported."""
+    to the load (_NameFloor.load). Returns the number of entries imported."""
     floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
     skipped = 0
     for entry in value["floor"]:
@@ -340,8 +343,58 @@ class RnsNetwork:
                 return None
             emitted = RNS.Transport.timebase_from_random_blobs(entry[_PATH_RANDOM_BLOBS])
             return float(emitted) if type(emitted) is int and emitted > 0 else None
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
+
+    def recalled_emission(self, name: bytes, app_data: bytes) -> tuple[float | None, bool]:
+        """(emitted, takes_path) for the announce RNS last stored for name, whose app_data (recall_app_data) is
+        app_data: when that announce was emitted (its owner's clock, signed), or None if RNS no longer has it; and
+        False if RNS shows it isn't the record of the announce RNS took name's path from (a replay, usually of an
+        older announce, which RNS stores all the same).
+
+        RNS internals (Identity.known_destinations[hash][1], the packet hash Identity.remember stores;
+        Transport.path_table[hash][IDX_PT_PACKET], the packet hash of the path's announce; Transport's announce
+        cache, written only for an announce that takes the path, read with Transport.get_cached_packet). The path's
+        announce is read first: if it carries app_data, so does the path (an announce heard again, or repeated in
+        a path response, which RNS hashes with its context, gets another packet hash and is never cached). Else
+        the stored one is read for its own emission time. Without a path, or with neither announce cached (a
+        shared instance's client whose cache isn't rnsd's), nothing shows a replay: (None, True), or the path's
+        emission time if the stored announce is the path's. If an internal changes in another RNS version this
+        returns (None, True) and callers go by emitted_time alone.
+        """
+        try:
+            known = RNS.Identity.known_destinations.get(name)
+            path = RNS.Transport.path_table.get(name)
+            # known[3] is another record if RNS stored a newer announce since app_data was read: judge that one later
+            if not known or not path or known[3] != app_data:
+                return None, True
+            stored, path_packet = known[1], path[_PATH_PACKET]
+            in_path = self._cached_announce(name, path_packet)
+            if in_path is not None and in_path[1] == app_data:
+                return in_path[0], True
+            own = in_path if stored == path_packet else self._cached_announce(name, stored)
+            emitted = own[0] if own is not None and own[1] == app_data else None
+            if in_path is not None:
+                return emitted, False  # the path's announce carries another record
+            if stored == path_packet:
+                return self.emitted_time(name), True
+            return emitted, True
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
+            return None, True
+
+    @staticmethod
+    def _cached_announce(name: bytes, packet_hash) -> tuple[float, bytes] | None:
+        """(emission time, app_data) of name's announce with packet_hash in RNS's announce cache, or None if it
+        isn't there (or isn't an announce of name). Not verified again: RNS caches only announces it validated."""
+        packet = RNS.Transport.get_cached_packet(packet_hash, packet_type="announce")
+        if packet is None or packet.unpack() is False or packet.packet_type != RNS.Packet.ANNOUNCE \
+                or packet.destination_hash != name:
+            return None
+        data = bytes(packet.data)
+        blob = RNS.Identity.KEYSIZE // 8 + RNS.Identity.NAME_HASH_LENGTH // 8  # the random blob: emission time
+        ratchet = RNS.Identity.RATCHETSIZE // 8 if packet.context_flag == RNS.Packet.FLAG_SET else 0
+        app_data = data[blob + 10 + ratchet + RNS.Identity.SIGLENGTH // 8:]
+        return float(RNS.Transport.timebase_from_random_blob(data[blob:blob + 10])), app_data
 
     def heard_time(self, name: bytes) -> float | None:
         """When RNS last stored a validly signed announce for name (wall clock), or None.
@@ -353,7 +406,7 @@ class RnsNetwork:
         try:
             entry = RNS.Identity.known_destinations.get(name)
             return float(entry[0]) if entry else None
-        except Exception:
+        except Exception:  # noqa: BLE001 - RNS internals: unknown if they fail
             return None
 
 
@@ -378,7 +431,230 @@ class NameAnnounceHandler:
         self._on_announce(destination_hash, app_data, announce_packet_hash)
 
 
+# The floor
+
+
+class _NameFloor(Mapping):
+    """The highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), and when it was last
+    resolved (wall clock), least recently resolved first, persisted in the name_floor table. One value per name,
+    (sequence, resolved, used), used being its row's place in the table; read as a mapping of name -> (sequence,
+    resolved).
+
+    At most FLOOR_FACTOR × name_table_size names (size()), more (up to FLOOR_HARD_FACTOR times that) while those
+    resolved within FLOOR_KEEP_AGE need the room (trim). Saved, so such a resolve never goes back after table churn
+    or a restart: at once, or FLOOR_SAVE_INTERVAL after the last save (a timer), writing only the rows changed.
+
+    Changed only under the manager's lock, which every caller but save() holds; save() snapshots the rows under it
+    and writes without it.
+    """
+
+    def __init__(self, db, lock, clock, monotonic, size):
+        """An empty floor over the state database db (load() reads it); lock is the manager's, clock and monotonic
+        its clocks, and size() how many names the floor holds before trimming."""
+        self._db = db
+        self._lock = lock
+        self._clock = clock  # resolve times: persisted, so wall clock
+        self._monotonic = monotonic  # save pacing
+        self._size = size
+        self._entries: OrderedDict[bytes, tuple[int, float, int]] = OrderedDict()
+        self._next_used = 0  # above every used value given out
+        self._changed: set[bytes] = set()  # names whose row the next save writes (or deletes)
+        self._dirty = False  # a save is due
+        self._saved_at = float("-inf")  # monotonic time of the last save
+        self._timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
+        self._closed = False  # close() has run: no timer is started
+        # Saves write without the lock, one at a time, so an older snapshot never lands last. Taken before the
+        # manager's lock, never while holding it
+        self._save_lock = threading.Lock()
+
+    # Reading: name -> (sequence, resolved)
+
+    def __getitem__(self, name: bytes) -> tuple[int, float]:
+        """name's (sequence, resolve time); KeyError if it has no entry."""
+        sequence, resolved, _ = self._entries[name]
+        return sequence, resolved
+
+    def __iter__(self):
+        """The names, least recently resolved first."""
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        """How many names the floor holds."""
+        return len(self._entries)
+
+    def __contains__(self, name) -> bool:
+        """True if name has an entry."""
+        return name in self._entries
+
+    # Changes; callers hold the manager's lock
+
+    def raise_to(self, name: bytes, sequence: int):
+        """A higher record was accepted for name: raise its entry (if it has one) to sequence, keeping its place and
+        resolve time, and save it within FLOOR_SAVE_INTERVAL (by the timer, since callers hold the lock, some on
+        RNS's thread)."""
+        entry = self._entries.get(name)
+        if entry is not None and sequence > entry[0]:
+            self._entries[name] = (sequence, entry[1], entry[2])
+            self._changed.add(name)
+            self._dirty = True
+            self.save_soon(inline=False)
+
+    def drop(self, name: bytes):
+        """Forget name (held for the user now: its held record is its floor); the next save deletes its row."""
+        if self._entries.pop(name, None) is not None:
+            self._changed.add(name)
+            self._dirty = True
+
+    def resolved(self, name: bytes, sequence: int) -> bool:
+        """A resolve without persist returned name's record at sequence: it becomes the most recently resolved, and
+        its sequence the floor for later resolves (trim says which are forgotten). A floor raised (or a new one) is
+        saved at once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little. True if the
+        caller is to save it now (save()), once it has released the lock."""
+        now = self._clock()
+        previous = self._entries.pop(name, None)
+        # Last, with a new used value: the most recently resolved
+        self._entries[name] = (sequence if previous is None else max(previous[0], sequence), now, self._next_used)
+        self._next_used += 1
+        self._changed.add(name)  # written by the next save, even if this change doesn't call for one
+        trimmed = self.trim()
+        if previous is None or self._entries[name][0] != previous[0] or trimmed:
+            self._dirty = True
+            return self.save_soon()
+        if not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
+            self._dirty = True  # only its time renewed: saved with the next change or by announce_due
+        return False
+
+    def trim(self) -> bool:
+        """Forget the least recently resolved names over size(), but not those resolved within FLOOR_KEEP_AGE unless
+        the floor holds FLOOR_HARD_FACTOR times that. True if any went."""
+        size = self._size()
+        now = self._clock()
+        trimmed = False
+        while len(self._entries) > size:
+            _, at, _ = next(iter(self._entries.values()))
+            if len(self._entries) <= FLOOR_HARD_FACTOR * size and now - at < FLOOR_KEEP_AGE:
+                break
+            name, _ = self._entries.popitem(last=False)
+            self._changed.add(name)
+            trimmed = True
+        return trimmed
+
+    def save_soon(self, inline: bool = True) -> bool:
+        """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
+        has released the lock; else it is saved once it is (a timer). Without inline, a save due now is the
+        timer's too, started at once."""
+        wait = self._saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
+        if wait <= 0 and inline:
+            return True
+        if self._timer is None and not self._closed:
+            timer = threading.Timer(max(0.0, wait), self._save_later)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+        return False
+
+    def cancel_timer(self):
+        """Cancel a save waiting for its time (stop() saves at once instead)."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def close(self):
+        """Start no timer from now on, and cancel a waiting one."""
+        self._closed = True
+        self.cancel_timer()
+
+    # Loading and saving
+
+    def load(self, held):
+        """Read the name_floor rows, least recently resolved first. A row that doesn't parse is logged and deleted
+        (the floor only bounds rollback of gateway and auto-fetch resolves), as are those of names in held (resolved
+        for the user since: their held record is their floor) and those trim drops. A resolve time in the future
+        (the clock was corrected since) counts as now, and is written so by the next save that has a change to
+        write."""
+        now = self._clock()
+        dropped = []
+        for name, sequence, resolved, used in self._db.query(
+                "SELECT name, sequence, resolved, used FROM name_floor ORDER BY used"):
+            try:
+                _check_name(name)
+                sequence = _sequence(sequence)
+                if not 0 <= sequence <= MAX_SEQUENCE:
+                    raise ValueError(f"sequence {sequence} out of range")
+                if type(resolved) not in (int, float) or not math.isfinite(resolved):
+                    raise ValueError(f"invalid resolve time {resolved!r}")
+                if type(used) is not int or not 0 <= used < _MAX_USED:
+                    raise ValueError(f"invalid used value {used!r}")
+            except (TypeError, ValueError) as e:
+                log(f"dropping an invalid name floor entry {name!r}: {e}", LOG_WARNING)
+                dropped.append(name)
+                continue
+            if name in held:
+                dropped.append(name)
+                continue
+            self._entries[name] = (sequence, min(float(resolved), now), used)
+            self._next_used = max(self._next_used, used + 1)
+            if resolved > now:
+                self._changed.add(name)
+        self.trim()
+        trimmed = [name for name in self._changed if name not in self._entries]
+        self._changed.difference_update(trimmed)
+        if dropped or trimmed:
+            with self._db.transaction() as tx:
+                tx.executemany("DELETE FROM name_floor WHERE name = ?", [(name,) for name in dropped + trimmed])
+
+    def _snapshot(self) -> tuple[set[bytes], list[tuple], list[tuple]]:
+        """(the names changed, the rows to write for them, the rows to delete), taken as saved. The lock held."""
+        changed, self._changed = self._changed, set()
+        rows = [(name, str(self._entries[name][0]), self._entries[name][1], self._entries[name][2])
+                for name in changed if name in self._entries]
+        gone = [(name,) for name in changed if name not in self._entries]
+        self._dirty = False
+        return changed, rows, gone
+
+    def save(self):
+        """Write the entries changed (or forgotten) since the last save, if a save is due, with synchronous=NORMAL.
+        Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds thousands of names),
+        the timer, announce_due (at least every minute while running) and stop().
+
+        Called without the lock: only the rows are made under it, so resolves and announces needn't wait for the
+        write. The save counts from when they were made; a failed one is retried by the next."""
+        with self._save_lock:
+            with self._lock:
+                if not self._dirty:
+                    return
+                changed, rows, gone = self._snapshot()
+                saved_at, self._saved_at = self._saved_at, self._monotonic()
+            saved = False
+            try:
+                try:
+                    with self._db.transaction() as tx:
+                        tx.executemany("DELETE FROM name_floor WHERE name = ?", gone)
+                        tx.executemany("INSERT OR REPLACE INTO name_floor (name, sequence, resolved, used) "
+                                       "VALUES (?, ?, ?, ?)", rows)
+                    saved = True
+                except OSError as e:
+                    log(f"could not save the name floor: {e}", LOG_WARNING)
+            finally:
+                if not saved:
+                    with self._lock:
+                        self._changed |= changed
+                        self._dirty = True
+                        self._saved_at = saved_at
+
+    def _save_later(self):
+        """The timer's save."""
+        with self._lock:
+            self._timer = None
+        self.save()
+
+
 # Names
+
+
+def _wait_event(event: threading.Event, timeout: float) -> bool:
+    """Wait up to timeout seconds for event to be set: True if it was."""
+    return event.wait(timeout)
 
 
 class NameManager:
@@ -389,13 +665,17 @@ class NameManager:
     shutdown.
     """
 
-    def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic):
-        """Names under config.names_dir and config.state_dir; pins has pin(cid, source) and unpin(cid, source)."""
+    def __init__(self, config: Config, pins, network=None, clock=time.time, monotonic=time.monotonic,
+                 wait=_wait_event):
+        """Names under config.names_dir and config.state_dir; pins has pin(cid, source) and unpin(cid, source).
+        wait(event, timeout) is how a refresh waits for an answer (_wait_event; tests pass one that doesn't
+        block)."""
         self.config = config
         self._pins = pins
         self._network = network if network is not None else RnsNetwork()
         self._clock = clock  # wall clock: heard times are persisted across restarts
         self._monotonic = monotonic  # announce schedule
+        self._wait = wait
         self._lock = threading.RLock()
 
         self._keys: dict[str, RNS.Identity] = {}
@@ -415,26 +695,16 @@ class NameManager:
         # name this node isn't resolving and doesn't know may only take the place of one of these, so a flood of
         # new names can't push out the names it resolved
         self._heard_only: OrderedDict[bytes, None] = OrderedDict()
-        # Highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), and when it was last
-        # resolved (wall clock), least recently resolved first; at most FLOOR_FACTOR × name_table_size, more (up to
-        # FLOOR_HARD_FACTOR times that) while those resolved within FLOOR_KEEP_AGE need the room. Saved, so such a
-        # resolve never goes back after table churn or a restart
-        self._floor: OrderedDict[bytes, tuple[int, float]] = OrderedDict()
-        self._floor_used: dict[bytes, int] = {}  # each floor name's used value, its place in the name_floor table
-        self._floor_next_used = 0  # above every used value given out
-        self._floor_changed: set[bytes] = set()  # floor names whose row the next save writes (or deletes)
-        self._floor_dirty = False  # a floor save is due
-        self._floor_saved_at = float("-inf")  # monotonic time of the last floor save
-        self._floor_timer: threading.Timer | None = None  # a save waiting for FLOOR_SAVE_INTERVAL to pass
-        self._closed = False  # close() has run: no floor timer is started
-        # Floor saves write without self._lock, one at a time, so an older snapshot never lands last. Taken before
-        # self._lock, never while holding it
-        self._floor_save_lock = threading.Lock()
         self._held_dirty = False  # held records changed without a save (heard again, or a save that failed)
 
         self._destinations: dict[str, object] = {}
         self._next_announce: dict[str, float] = {}  # alias -> monotonic time
         self._waiters: dict[bytes, list[threading.Event]] = {}
+        # A resolve's network refresh of each name (E1): when it last finished (monotonic) and whether a record was
+        # held after it, least recent first, at most REFRESHED_SIZE; and the refreshes running, which other
+        # resolves of the name wait for rather than refresh again
+        self._refreshed: OrderedDict[bytes, tuple[float, bool]] = OrderedDict()
+        self._refreshing: dict[bytes, threading.Event] = {}
         self._handler = NameAnnounceHandler(self._heard)
         self._started = False
         # The keepers feature (rnfs.features.keepers), if loaded: told of heard and published records, and asked
@@ -460,10 +730,12 @@ class NameManager:
 
         self._remove_old_temps()
         self._db = statedb.connect(config.state_dir)
+        # The highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), bounded and saved
+        self._floor = _NameFloor(self._db, self._lock, clock, monotonic, self._floor_size)
         try:
             self._load_keys()
             self._load_state()
-            self._load_floor()
+            self._floor.load(self._held)
         except BaseException:
             self._db.close()
             raise
@@ -625,7 +897,8 @@ class NameManager:
     # Publishing
 
     def publish(self, alias: str, cid: Cid) -> dict:
-        """Point alias's name at cid, pin it, announce it. Returns {"name", "cid", "sequence"}."""
+        """Point alias's name at cid, pin it, announce it. Returns {"name", "cid", "sequence"}, and in private mode
+        a "warning" (PRIVATE_NAME_WARNING): the announce reaches outsiders all the same."""
         if not isinstance(cid, Cid):
             raise ValueError("publish needs a CID")
         with self._lock:
@@ -635,10 +908,7 @@ class NameManager:
             # A freshly imported key: its previous home may have published sequences we've never heard, which
             # keepers may hold after its announces have expired (section 9: above the highest it can resolve)
             self._offer_kept(name)
-            self._refresh(name)
-            if self.keepers is not None:
-                for sequence, kept_cid, heard in self.keepers.query(name):
-                    self.offer(name, sequence, kept_cid, heard)
+            self._refresh_name(name, ask="always")
 
         with self._lock:
             if self.name(alias) != name:  # NotFound if removed while refreshing
@@ -679,7 +949,10 @@ class NameManager:
         if self.keepers is not None:
             # This node keeps its own names, so they resolve through it while the owner's announce is gone
             self.keepers.published(name, identity, encode_record(sequence, cid))
-        return {"name": name.hex(), "cid": str(cid), "sequence": sequence}
+        result = {"name": name.hex(), "cid": str(cid), "sequence": sequence}
+        if self.config.private:
+            result["warning"] = PRIVATE_NAME_WARNING
+        return result
 
     def start(self):
         """Register the announce handler, re-create every local name's destination and announce published ones."""
@@ -709,19 +982,14 @@ class NameManager:
             for events in self._waiters.values():
                 for event in events:
                     event.set()
-            if self._floor_timer is not None:
-                self._floor_timer.cancel()
-                self._floor_timer = None
+            self._floor.cancel_timer()
             self._save()
-        self._save_floor()
+        self._floor.save()
 
     def close(self):
         """Release the state database, once stop() has saved everything (idempotent)."""
         with self._lock:
-            self._closed = True
-            if self._floor_timer is not None:
-                self._floor_timer.cancel()
-                self._floor_timer = None
+            self._floor.close()
         self._db.close()
 
     def announce_due(self) -> float:
@@ -737,7 +1005,7 @@ class NameManager:
                 wait = self.config.announce_interval
             else:
                 wait = max(0.0, min(self._next_announce.values()) - now)
-        self._save_floor()
+        self._floor.save()
         return wait
 
     def run(self, stop_event: threading.Event):
@@ -745,7 +1013,7 @@ class NameManager:
         while not stop_event.is_set():
             try:
                 delay = self.announce_due()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - the announce thread keeps running; logged
                 log(f"name re-announce failed: {e}", LOG_ERROR)
                 delay = _MAX_LOOP_WAIT
             stop_event.wait(min(delay, _MAX_LOOP_WAIT))
@@ -799,8 +1067,9 @@ class NameManager:
 
         persist is True for the CLI and API (the highest sequence is then kept forever) and False for the gateway
         and LXMF auto-fetch (the record goes only into the bounded table, and its sequence into the bounded floor).
-        The network refresh, which can take path_timeout, is skipped for this node's own names and when the held
-        record was heard less than max_age seconds ago.
+        The network refresh, which can take path_timeout and then a keeper query, is skipped for this node's own
+        names, when the held record was heard less than max_age seconds ago, and when a refresh of the name ended
+        less than max_age ago (_shared_refresh). A resolve finding a refresh of the name running waits for it.
         """
         name = _check_name(name)
         self._offer_kept(name)
@@ -812,16 +1081,7 @@ class NameManager:
             # This node's own names need no refresh, unless imported and not yet published here
             local = alias is not None and not self._published[alias].unsettled
         if not local and not fresh:
-            started = self._clock()
-            self._refresh(name)
-            if self.keepers is not None:
-                with self._lock:
-                    self._absorb_recalled(name)
-                    record = self._record(name, touch=False)
-                # Nothing heard during the refresh: the owner and the paths may be gone, so ask keepers
-                if record is None or record.heard < started or self.keepers.always_ask():
-                    for sequence, cid, heard in self.keepers.query(name):
-                        self.offer(name, sequence, cid, heard)
+            self._shared_refresh(name, max_age)
 
         # Again: the bounded table may have evicted it meanwhile, letting a replayed announce in
         self._offer_kept(name)
@@ -840,8 +1100,84 @@ class NameManager:
             result = {"name": name.hex(), "cid": str(record.cid), "sequence": record.sequence,
                       "age": max(0.0, self._clock() - record.heard)}
         if save_floor:
-            self._save_floor()
+            self._floor.save()
         return result
+
+    def _shared_refresh(self, name: bytes, max_age: float):
+        """A resolve's network refresh of name (_refresh_name, asking keepers if nothing was heard), shared (E1).
+
+        Skipped if one ended less than max_age ago (never for max_age 0, the CLI's), unless it left a record that
+        has gone since (the bounded table evicted it): with the owner offline, a keeper's record shows its old
+        emission time, so going by heard times alone every gateway request would refresh again. Nothing found
+        counts too, a short negative cache. A refresh leaving a suspected replay (DHT-2) isn't remembered.
+        Resolves of a name being refreshed wait for that refresh, whatever their max_age, then each takes the
+        record held. Called without the lock."""
+        with self._lock:
+            if max_age > 0 and self._refreshed_within(name, max_age):
+                return
+            running = self._refreshing.get(name)
+            if running is None:
+                running = self._refreshing[name] = threading.Event()
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            running.wait()
+            return
+        suspect = True  # a refresh that raised isn't remembered
+        try:
+            suspect = self._refresh_name(name, ask="if_unheard")
+        finally:
+            with self._lock:
+                del self._refreshing[name]
+                if not suspect:
+                    self._refreshed.pop(name, None)
+                    self._refreshed[name] = (self._monotonic(), self._record(name, touch=False) is not None)
+                    while len(self._refreshed) > REFRESHED_SIZE:
+                        self._refreshed.popitem(last=False)
+            running.set()
+
+    def _refreshed_within(self, name: bytes, max_age: float) -> bool:
+        """True if a refresh of name ended less than max_age ago, and the record it left (if any) is still held.
+        Lock held."""
+        refreshed = self._refreshed.get(name)
+        if refreshed is None:
+            return False
+        at, found = refreshed
+        return 0 <= self._monotonic() - at < max_age and (not found or self._record(name, touch=False) is not None)
+
+    def _refresh_name(self, name: bytes, *, ask: str) -> bool:
+        """Ask the network for name's newest record (_refresh), then keepers, offering what they answer. ask is
+        "always" (the first publish of an imported key: its previous home's sequences may be held by keepers alone)
+        or "if_unheard" (a resolve: only if nothing was heard during the refresh, the record RNS stored is a
+        suspected replay, or keeper_query is "always"). True if the record held after it is a suspected replay
+        (DHT-2; asked only with "if_unheard"). Called without the lock."""
+        if ask not in ("always", "if_unheard"):
+            raise ValueError(f"ask is 'always' or 'if_unheard', not {ask!r}")
+        started = self._clock()
+        self._refresh(name)
+        suspect = None
+        if ask == "if_unheard":
+            with self._lock:
+                suspect = self._absorb_recalled(name)
+                record = self._record(name, touch=False)
+            # Heard during the refresh, and no replay suspected: the owner (or a path to it) answered. If not, the
+            # owner and the paths may be gone, or a neighbour repeats an old announce
+            heard = suspect is None and record is not None and record.heard >= started
+            if self.keepers is None or (heard and not self.keepers.always_ask()):
+                return self._held_is(name, suspect)
+        if self.keepers is not None:
+            for sequence, cid, kept_heard in self.keepers.query(name):
+                self.offer(name, sequence, cid, kept_heard)
+        return self._held_is(name, suspect)
+
+    def _held_is(self, name: bytes, record: tuple[int, Cid] | None) -> bool:
+        """True if the record held for name is record, a (sequence, CID)."""
+        if record is None:
+            return False
+        with self._lock:
+            held = self._record(name, touch=False)
+            return held is not None and (held.sequence, held.cid) == record
 
     def _offer_kept(self, name: bytes):
         """Offer the signed record keepers hold for name, so it is a floor no replayed announce gets under.
@@ -863,18 +1199,19 @@ class NameManager:
         started = self._clock()
         try:
             self._network.request_path(name)
-            # Real time, not the injected clock: this is an actual wait
-            deadline = time.monotonic() + self.config.path_timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or event.wait(min(_POLL_INTERVAL, remaining)):
+            # Counted in the steps waited rather than read from a clock, so a test's wait runs it in virtual time
+            remaining = self.config.path_timeout
+            while remaining > 0:
+                step = min(_POLL_INTERVAL, remaining)
+                if self._wait(event, step):
                     break
+                remaining -= step
                 # A path response repeating an announce RNS already has doesn't change the path table, so it
                 # never reaches the handler; RNS still records when it heard it
                 heard = self._network.heard_time(name)
                 if heard is not None and heard >= started:
                     break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - the resolve goes on with what is held; logged
             log(f"path request for name {name.hex()} failed: {e}", LOG_WARNING)
         finally:
             with self._lock:
@@ -884,16 +1221,17 @@ class NameManager:
                 if not events:
                     self._waiters.pop(name, None)
 
-    def _absorb_recalled(self, name: bytes):
-        """Offer the record RNS last stored for name (which may be a replay) to the sequence rules."""
+    def _absorb_recalled(self, name: bytes) -> tuple[int, Cid] | None:
+        """Offer the record RNS last stored for name (which may be a replay) to the sequence rules. Its (sequence,
+        CID) if it is a suspected replay (_announce_heard), which a resolve takes as a reason to ask keepers."""
         try:
             app_data = self._network.recall_app_data(name)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - the resolve goes on with what is held; logged
             log(f"could not recall name {name.hex()}: {e}", LOG_WARNING)
-            return
+            return None
         parsed = parse_record(app_data)
         if parsed is None:
-            return
+            return None
         sequence, cid = parsed
         heard = self._network.heard_time(name)
         if heard is None:
@@ -901,19 +1239,30 @@ class NameManager:
             held = self._record(name, touch=False)
             same = held is not None and held.sequence == sequence and held.cid == cid
             heard = held.heard if same else self._clock()
-        self._offer(name, sequence, cid, self._announce_heard(name, heard))
+        heard, suspect = self._announce_heard(name, bytes(app_data), heard)
+        self._offer(name, sequence, cid, heard)
+        return parsed if suspect else None
 
-    def _announce_heard(self, name: bytes, heard: float) -> float:
-        """The heard time of name's record from an announce RNS heard at heard: no later than ANNOUNCE_VALIDITY
-        announce_intervals after RNS's newest announce of name was emitted. Anyone may repeat an old announce, and
-        RNS remembers it as just heard, so by its time alone a record its owner has since replaced would look
-        current, and resolves would never ask keepers for the newer one. The owner announces every
-        announce_interval, so an announce older than ANNOUNCE_VALIDITY of them no longer shows its record current.
+    def _announce_heard(self, name: bytes, app_data: bytes, heard: float) -> tuple[float, bool]:
+        """(heard time, suspected replay) of name's record from the announce RNS last stored, carrying app_data and
+        heard at heard.
+
+        Anyone may repeat an old announce, and RNS stores it as just heard, so by its time alone a record its
+        owner has since replaced would look current, and resolves would never ask keepers for the newer one:
+        - The record is heard no later than ANNOUNCE_VALIDITY announce_intervals after RNS's newest announce of
+          name was emitted (the path's: emitted_time), since the owner announces every announce_interval.
+        - An announce emitted before the path's newest, or carrying another record than the path's announce
+          (RnsNetwork.recalled_emission), is a suspected replay (DHT-2): it is heard no later than its own
+          emission time, or the path's if its own is unknown. Without a path nothing is compared.
         """
-        emitted = self._network.emitted_time(name)
-        if emitted is None:
-            return heard
-        return min(heard, emitted + ANNOUNCE_VALIDITY * self.config.announce_interval)
+        path_emitted = self._network.emitted_time(name)
+        if path_emitted is None:
+            return heard, False
+        emitted, takes_path = self._network.recalled_emission(name, app_data)
+        suspect = not takes_path or (emitted is not None and emitted < path_emitted)
+        if suspect:
+            heard = min(heard, emitted if emitted is not None else path_emitted)
+        return min(heard, path_emitted + ANNOUNCE_VALIDITY * self.config.announce_interval), suspect
 
     def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
@@ -921,11 +1270,13 @@ class NameManager:
         parsed = parse_record(app_data)
         # A name kept here may take a table place like a resolved one (asked outside our lock, as always)
         kept = parsed is not None and self.keepers is not None and self.keepers.local_record(name) is not None
+        # Read before taking the lock: it may read RNS's announce cache on disk
+        heard = self._announce_heard(name, bytes(app_data), self._clock())[0] if parsed is not None else None
         with self._lock:
             if parsed is not None:
                 # Unasked: not being resolved (a path response would have a waiter), kept nor watched
                 unasked = not kept and name not in self._waiters and name not in self._watched
-                self._offer(name, parsed[0], parsed[1], self._announce_heard(name, self._clock()), unasked=unasked)
+                self._offer(name, parsed[0], parsed[1], heard, unasked=unasked)
             else:
                 log(f"ignored malformed record for name {RNS.prettyhexrep(name)}", LOG_VERBOSE)
             for event in self._waiters.get(name, ()):
@@ -1023,12 +1374,7 @@ class NameManager:
                 self._heard_only[name] = None
         self._table[name] = record
         self._touch(name)
-        floor = self._floor.get(name)
-        if floor is not None and record.sequence > floor[0]:
-            self._floor[name] = (record.sequence, floor[1])
-            self._floor_changed.add(name)
-            self._floor_dirty = True
-            self._save_floor_soon(inline=False)
+        self._floor.raise_to(name, record.sequence)
         if len(self._table) > limit:  # name_table_size 0: nothing is kept
             self._drop_from_table(name)
         return True
@@ -1048,66 +1394,14 @@ class NameManager:
         """name's record is held now: out of the table, and out of the floor (its held record is its floor), whose
         row the next floor save deletes."""
         self._drop_from_table(name)
-        if self._floor.pop(name, None) is not None:
-            del self._floor_used[name]
-            self._floor_changed.add(name)
-            self._floor_dirty = True
+        self._floor.drop(name)
 
     def _resolved(self, name: bytes, sequence: int) -> bool:
         """A resolve without persist returned name's record: it is no longer only heard, and its sequence is the
-        floor for later resolves (_trim_floor says which are forgotten). A floor raised (or a new one) is saved at
-        once, or FLOOR_SAVE_INTERVAL after the last save, so a crash soon after loses little. True if the caller
-        is to save it now, once it has released the lock."""
+        floor for later resolves (_NameFloor.resolved). True if the caller is to save the floor now, once it has
+        released the lock."""
         self._heard_only.pop(name, None)
-        now = self._clock()
-        previous = self._floor.pop(name, None)
-        self._floor[name] = (sequence if previous is None else max(previous[0], sequence), now)
-        self._floor_used[name] = self._floor_next_used  # last: the most recently resolved
-        self._floor_next_used += 1
-        self._floor_changed.add(name)  # written by the next save, even if this change doesn't call for one
-        trimmed = self._trim_floor()
-        if previous is None or self._floor[name][0] != previous[0] or trimmed:
-            self._floor_dirty = True
-            return self._save_floor_soon()
-        if not 0 <= now - previous[1] < FLOOR_TOUCH_SAVE:
-            self._floor_dirty = True  # only its time renewed: saved with the next change or by announce_due
-        return False
-
-    def _trim_floor(self) -> bool:
-        """Forget the least recently resolved names over FLOOR_FACTOR × name_table_size, but not those resolved
-        within FLOOR_KEEP_AGE unless the floor holds FLOOR_HARD_FACTOR times that. True if any went."""
-        size = self._floor_size()
-        now = self._clock()
-        trimmed = False
-        while len(self._floor) > size:
-            _, at = next(iter(self._floor.values()))
-            if len(self._floor) <= FLOOR_HARD_FACTOR * size and now - at < FLOOR_KEEP_AGE:
-                break
-            name, _ = self._floor.popitem(last=False)
-            del self._floor_used[name]
-            self._floor_changed.add(name)
-            trimmed = True
-        return trimmed
-
-    def _save_floor_soon(self, inline: bool = True) -> bool:
-        """True if the floor is to be saved now (the last save was FLOOR_SAVE_INTERVAL ago), by the caller once it
-        has released the lock; else it is saved once it is (a timer). Without inline, a save due now is the
-        timer's too, started at once."""
-        wait = self._floor_saved_at + FLOOR_SAVE_INTERVAL - self._monotonic()
-        if wait <= 0 and inline:
-            return True
-        if self._floor_timer is None and not self._closed:
-            timer = threading.Timer(max(0.0, wait), self._save_floor_later)
-            timer.daemon = True
-            self._floor_timer = timer
-            timer.start()
-        return False
-
-    def _save_floor_later(self):
-        """The timer's save."""
-        with self._lock:
-            self._floor_timer = None
-        self._save_floor()
+        return self._floor.resolved(name, sequence)
 
     def _floor_size(self) -> int:
         """How many names the floor holds, past which only names resolved within FLOOR_KEEP_AGE are kept."""
@@ -1119,7 +1413,7 @@ class NameManager:
         """Register alias's destination with its record as default app_data (so path responses carry it)."""
         try:
             destination = self._network.name_destination(self._keys[alias])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one name's failure doesn't stop the others; logged
             log(f"could not open name {alias}: {e}", LOG_ERROR)
             return
         self._destinations[alias] = destination
@@ -1138,7 +1432,7 @@ class NameManager:
         try:
             destination.set_default_app_data(encode_record(published.sequence, published.cid))
             destination.announce()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one name's failure doesn't stop the others; logged
             log(f"could not announce name {alias}: {e}", LOG_ERROR)
             return False
         log(f"announced name {self._names[alias].hex()} ({alias}), sequence {published.sequence}", LOG_VERBOSE)
@@ -1247,77 +1541,6 @@ class NameManager:
             # A key with no saved record (the state was lost, or the key copied in by hand) may have been
             # published elsewhere: treated as imported, so its first publish looks for its records first
             self._published.setdefault(alias, _Published(0, None, imported=True))
-
-    def _load_floor(self):
-        """Read the floor of names resolved without persist, least recently resolved first. A row that doesn't
-        parse is logged and deleted (the floor only bounds rollback of gateway and auto-fetch resolves), as are
-        those of names held for the user and those _trim_floor drops. A resolve time in the future (the clock was
-        corrected since) counts as now, and is written so by the next floor save that has a change to write."""
-        now = self._clock()
-        dropped = []
-        for name, sequence, resolved, used in self._db.query(
-                "SELECT name, sequence, resolved, used FROM name_floor ORDER BY used"):
-            try:
-                _check_name(name)
-                sequence = _sequence(sequence)
-                if not 0 <= sequence <= MAX_SEQUENCE:
-                    raise ValueError(f"sequence {sequence} out of range")
-                if type(resolved) not in (int, float) or not math.isfinite(resolved):
-                    raise ValueError(f"invalid resolve time {resolved!r}")
-                if type(used) is not int or not 0 <= used < _MAX_USED:
-                    raise ValueError(f"invalid used value {used!r}")
-            except (TypeError, ValueError) as e:
-                log(f"dropping an invalid name floor entry {name!r}: {e}", LOG_WARNING)
-                dropped.append(name)
-                continue
-            if name in self._held:
-                dropped.append(name)  # resolved for the user since: its held record is its floor
-                continue
-            self._floor[name] = (sequence, min(float(resolved), now))
-            self._floor_used[name] = used
-            self._floor_next_used = max(self._floor_next_used, used + 1)
-            if resolved > now:
-                self._floor_changed.add(name)
-        self._trim_floor()
-        trimmed = [name for name in self._floor_changed if name not in self._floor]
-        self._floor_changed.difference_update(trimmed)
-        if dropped or trimmed:
-            with self._db.transaction() as tx:
-                tx.executemany("DELETE FROM name_floor WHERE name = ?", [(name,) for name in dropped + trimmed])
-
-    def _save_floor(self):
-        """Write the floor entries changed (or forgotten) since the last save, if a save is due, with
-        synchronous=NORMAL. Saved by a resolve that raised it (at most every FLOOR_SAVE_INTERVAL, since it holds
-        thousands of names), announce_due (at least every minute while running) and stop().
-
-        Called without the lock: only the rows are made under it, so resolves and announces needn't wait for
-        the write. The save counts from when they were made; a failed one is retried by the next."""
-        with self._floor_save_lock:
-            with self._lock:
-                if not self._floor_dirty:
-                    return
-                changed, self._floor_changed = self._floor_changed, set()
-                rows = [(name, str(self._floor[name][0]), self._floor[name][1], self._floor_used[name])
-                        for name in changed if name in self._floor]
-                gone = [(name,) for name in changed if name not in self._floor]
-                saved_at, self._floor_saved_at = self._floor_saved_at, self._monotonic()
-                self._floor_dirty = False
-            saved = False
-            try:
-                try:
-                    with self._db.transaction() as tx:
-                        tx.executemany("DELETE FROM name_floor WHERE name = ?", gone)
-                        tx.executemany("INSERT OR REPLACE INTO name_floor (name, sequence, resolved, used) "
-                                       "VALUES (?, ?, ?, ?)", rows)
-                    saved = True
-                except OSError as e:
-                    log(f"could not save the name floor: {e}", LOG_WARNING)
-            finally:
-                if not saved:
-                    with self._lock:
-                        self._floor_changed |= changed
-                        self._floor_dirty = True
-                        self._floor_saved_at = saved_at
 
     def _save(self):
         """Write the published and held records changed since the last save, durably (on disk when it returns:

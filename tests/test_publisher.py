@@ -6,8 +6,6 @@ import time
 import unittest
 from unittest import mock
 
-import RNS
-
 from rnfs import publisher as publisher_module
 from rnfs.config import Config
 from rnfs.constants import PROVIDER_TTL
@@ -17,40 +15,15 @@ from rnfs.content.storage import USER, Storage
 from rnfs.denylist import DenyList
 from rnfs.dht.providers import ProviderStore
 from rnfs.publisher import PUBLISH_LOOKUPS, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
+from tests.fakes.client import FakeClient
+from tests.fakes.log import quiet_log
 from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
 from tests.test_providers import recorded_writes, rows_written
 
 OWN = bytes(16)
 N1, N2, N3 = (bytes([i]) * 16 for i in (1, 2, 3))
 
-_saved_loglevel = RNS.loglevel
-
-
-def setUpModule():
-    """Silence the publisher's log."""
-    RNS.loglevel = RNS.LOG_CRITICAL
-
-
-def tearDownModule():
-    """Restore RNS's loglevel."""
-    RNS.loglevel = _saved_loglevel
-
-
-class FakeClient:
-    """Records /provide requests; nodes in refuse record nothing, a node in limit records only its first keys."""
-
-    def __init__(self):
-        """No requests yet."""
-        self.calls: list[tuple[bytes, list[bytes], list[bytes]]] = []
-        self.refuse: set[bytes] = set()
-        self.limit: dict[bytes, int] = {}
-
-    def provide(self, node_id, keys, withdrawn):
-        """Record one batched /provide; the keys the node may have recorded, as PeerClient.provide returns."""
-        self.calls.append((node_id, list(keys), list(withdrawn)))
-        if node_id in self.refuse:
-            return set()
-        return set(list(keys)[:self.limit.get(node_id, len(keys))])
+setUpModule, tearDownModule = quiet_log()
 
 
 class FakeLookup:
@@ -480,6 +453,25 @@ class PublisherTest(unittest.TestCase):
         restarted.save()
         self.assertEqual(self.saved()["earlier"], {})
 
+    def test_provided_again_cancels_only_its_queued_withdrawals(self):
+        """A CID provided (again) cancels the withdrawals queued for its key at every node, whose nodes join its
+        earlier ones; the other keys' stay queued, and a CID with none queued cancels nothing."""
+        a, b = self.pinned(b"a"), self.pinned(b"b")
+        other = bytes([7]) * 16
+        with self.publisher._lock:  # as if queued earlier, and saved
+            self.publisher._withdrawals = {N1: {a.key, other}, N2: {a.key}, N3: {other}}
+            for node in (N1, N2, N3):
+                self.publisher._touch_node(node)
+        self.publisher.save()
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {a, b})
+        self.assertEqual(self.publisher._withdrawals, {N1: {other}, N3: {other}})
+        self.assertEqual(set(self.publisher._earlier[a]), {N1, N2})
+        self.assertNotIn(b, self.publisher._earlier)
+        self.assertEqual(self.saved()["withdraw"], {N1: {other}, N3: {other}})
+        self.assertEqual(self.records.providers(a.key), [OWN])
+        self.assertEqual(self.records.providers(b.key), [OWN])  # recorded locally, nothing to cancel
+
     def test_served_blocks_are_the_provided_dags(self):
         cid = self.pinned(os.urandom(200_000))
         self.publisher.refresh()
@@ -604,18 +596,13 @@ class PublisherTest(unittest.TestCase):
 
     def test_lookups_run_at_once(self):
         """A round's lookups run PUBLISH_LOOKUPS at once, on threads of their own, so a round of many keys whose
-        lookups take time finishes in a fraction of the time one at a time takes."""
+        lookups take time finishes in a fraction of the time one at a time takes (the peak count shows it)."""
         self.due_keys(20)
         self.lookup_delay = lambda key: 0.1  # 2 s one at a time
-        started = time.monotonic()
         result = self.publisher.publish_due()
-        elapsed = time.monotonic() - started
         self.assertEqual(len(result["published"]), 20)
         self.assertEqual(self.running.peak, PUBLISH_LOOKUPS)
         self.assertEqual(self.running.threads, {"rnfs-publish-lookup"})
-        # About 20 / PUBLISH_LOOKUPS × 0.1 = 0.5 s; CI runners have taken 0.4 s more, so the bound only rules out
-        # lookups one at a time
-        self.assertLess(elapsed, 1.5)
         self.assertEqual(len(self.client.calls), 2)  # still one /provide per node, every key in it
         self.assertTrue(all(len(keys) == 20 for _, keys, _ in self.client.calls))
 
@@ -702,8 +689,8 @@ class PublisherTest(unittest.TestCase):
     # Refreshes that change nothing
 
     def counting(self) -> dict[str, int]:
-        """Count the calls of storage.pins and dag_blocks from now until the test ends: {name: calls}."""
-        counts = {"pins": 0, "dag_blocks": 0}
+        """Count the calls of storage.pinned_cids and dag_blocks from now until the test ends: {name: calls}."""
+        counts = {"pinned_cids": 0, "dag_blocks": 0}
         for name in counts:
             original = getattr(self.storage, name)
 
@@ -729,16 +716,16 @@ class PublisherTest(unittest.TestCase):
         counts = self.counting()
         for _ in range(3):
             self.publisher.refresh()
-        self.assertEqual(counts, {"pins": 0, "dag_blocks": 0})
+        self.assertEqual(counts, {"pinned_cids": 0, "dag_blocks": 0})
         self.assertIs(self.publisher._provided, provided)
         self.assertIs(self.publisher._served, served)
         self.assertEqual(self.publisher.provided(), {cid})
         self.assertEqual(self.publisher.provided_keys(), keys)
         publisher = self.make_publisher()
         publisher.refresh()
-        counts["pins"] = 0
+        counts["pinned_cids"] = 0
         publisher.refresh()
-        self.assertEqual(counts["pins"], 1)
+        self.assertEqual(counts["pinned_cids"], 1)
 
     def test_refresh_computes_after_each_kind_of_change(self):
         """With a generation, each change a refresh is computed from makes the next refresh compute, and what
@@ -756,9 +743,9 @@ class PublisherTest(unittest.TestCase):
         def refresh(provided: set, withdrawn: Cid | bytes | None = None):
             """Refresh: it computes, provides provided (CIDs and keys) and has queued, at once, the withdrawal
             of withdrawn (a CID or key published to N1 and N2). Then publish, and a refresh computes nothing."""
-            counts["pins"] = 0
+            counts["pinned_cids"] = 0
             self.publisher.refresh()
-            self.assertEqual(counts["pins"], 1)
+            self.assertEqual(counts["pinned_cids"], 1)
             self.assertEqual(self.publisher.provided() | self.publisher.provided_keys(), provided)
             if withdrawn is not None:
                 key = withdrawn if isinstance(withdrawn, bytes) else withdrawn.key
@@ -766,9 +753,9 @@ class PublisherTest(unittest.TestCase):
                 self.assertEqual(self.held(self.publisher)["withdraw"], {N1: {key}, N2: {key}})
             self.publisher.publish_due()  # also published, so a later withdrawal has nodes to go to
             self.assertEqual(self.held(self.publisher)["withdraw"], {})
-            counts["pins"] = 0
+            counts["pinned_cids"] = 0
             self.publisher.refresh()
-            self.assertEqual(counts["pins"], 0)
+            self.assertEqual(counts["pinned_cids"], 0)
 
         with self.subTest("pin"):
             a = self.pinned(b"a")
@@ -834,16 +821,16 @@ class PublisherTest(unittest.TestCase):
         self.publisher = self.make_publisher(generation=True)
         a = self.pinned(b"a")
         built = builder.build_bytes(b"pinned meanwhile", self.storage.put)
-        pins = self.storage.pins
+        pinned_cids = self.storage.pinned_cids
 
         def pins_then_pin():
-            """The pins as they were, then (once) another pin."""
-            result = pins()
+            """The pinned CIDs as they were, then (once) another pin."""
+            result = pinned_cids()
             if not self.storage.is_pinned(built.cid):
                 self.storage.pin(built.cid, USER)
             return result
 
-        with mock.patch.object(self.storage, "pins", pins_then_pin):
+        with mock.patch.object(self.storage, "pinned_cids", pins_then_pin):
             self.publisher.refresh()
         self.assertEqual(self.publisher.provided(), {a})
         self.publisher.refresh()
@@ -873,6 +860,18 @@ class PublisherTest(unittest.TestCase):
         restarted = self.make_publisher()
         restarted.refresh()
         self.assertEqual(restarted.publish_due()["published"], [])
+
+    def test_saves_are_one_transaction_not_durable(self):
+        """A save writes published, published_earlier and withdrawals in one transaction, not durably (NORMAL)."""
+        cid = self.pinned(b"normal")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.storage.unpin(cid, USER)
+        real = self.publisher._db.transaction
+        with mock.patch.object(self.publisher._db, "transaction", side_effect=real) as opened:
+            self.publisher.refresh()  # the item's rows deleted and its withdrawals queued, in one save
+        self.assertEqual([call.args for call in opened.call_args_list], [(False,)])
+        self.assertEqual(self.saved(), self.held(self.publisher))
 
 
 if __name__ == "__main__":

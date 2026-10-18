@@ -12,7 +12,6 @@ import unittest
 from unittest import mock
 
 from rnfs import node as node_module
-from rnfs.config import Config
 from rnfs.errors import RnfsError
 from tests.security.test_l7_windows_acl import WindowsTestCase
 from tests.support import CAN_SYMLINK
@@ -35,7 +34,7 @@ class LinkedRootTest(WindowsTestCase):
     def assert_refused(self):
         """The start is refused, and nothing is set or created through the link."""
         with self.assertRaisesRegex(RnfsError, "is a junction or symlink"):
-            node_module._make_private_dirs(Config(rnfs_dir=self.root))
+            node_module._make_private_dirs(self.root)
         self.assertEqual(self.acl.set_calls, [], "the target's DACL was changed through the link")
         self.assertEqual(os.listdir(self.target), [], "rnfs created its directories in the link's target")
 
@@ -57,7 +56,7 @@ class LinkedRootTest(WindowsTestCase):
 
         with mock.patch("os.lstat", lstat):
             with self.assertRaisesRegex(RnfsError, "is a junction or symlink"):
-                node_module._make_private_dirs(Config(rnfs_dir=self.root))
+                node_module._make_private_dirs(self.root)
         self.assertEqual(self.acl.set_calls, [], "the target's DACL was changed through the junction")
         self.assertEqual(os.listdir(self.root), [], "rnfs created its directories through the junction")
 
@@ -73,7 +72,7 @@ class LinkedRootTest(WindowsTestCase):
             return mock.Mock(st_mode=stat.S_IFDIR | 0o777, st_reparse_tag=0x9000001A)  # IO_REPARSE_TAG_CLOUD
 
         with mock.patch("os.lstat", lstat):
-            node_module._make_private_dirs(Config(rnfs_dir=self.root))
+            node_module._make_private_dirs(self.root)
         self.assertTrue(self.private(self.root))
 
 

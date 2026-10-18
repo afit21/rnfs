@@ -5,9 +5,14 @@
 | /provide  | [[key, ...], [withdrawn key, ...]]| True if recorded               |
 | /blocks   | [max_bytes, [cid, ...]]           | [block or None, ...]           |
 | /pin      | [cid, pin]                        | True if accepted               |
+| /name     | name                              | the record's fields, or []     |
 
-Keys and node IDs are 16-byte bin, CIDs binary CIDs as bin, blocks bin, max_bytes a non-negative integer
+Keys, node IDs and names are 16-byte bin, CIDs binary CIDs as bin, blocks bin, max_bytes a non-negative integer
 (never a boolean), pin a boolean. Any other shape, or a refusal, is answered False.
+
+/name is the keepers feature's path (rnfs.features.keepers encodes and parses it). Its response is a kept
+record's [public_key, name_hash, random_hash, ratchet, signature, app_data], every field bin, or [] if the node
+keeps none: the shape of a /blocks answer, which is what lets response_refusal accept it.
 
 Everything parsed here comes from other nodes, so parsers are strict and return None for anything malformed.
 Every request must fit in one packet: at most min(link MDU, MAX_REQUEST_SIZE) bytes including RNS's request
@@ -357,14 +362,25 @@ def response_refusal(packed: bytes) -> str | None:
     """Why packed (RNS's response framing, [request_id, response], as received) can't hold any rnfs.dht
     response, judged from msgpack headers alone without decoding it; None if it may.
 
-    The response may be True, False or None (a /provide or /pin answer, or a refusal), a /find answer, or a
-    /blocks answer (also the shape of a /name one). Nothing may follow it.
+    The response may be any that body_refusal accepts. Nothing may follow it.
     """
     outer = _array_at(packed, 0)
     request_id = _bin_at(packed, outer[1]) if outer is not None and outer[0] == 2 else None
     if request_id is None or request_id[0] != REQUEST_ID_LENGTH or request_id[1] >= len(packed):
         return "not a response"
-    position = request_id[1]
+    return body_refusal(packed, request_id[1])
+
+
+def body_refusal(packed: bytes, position: int = 0) -> str | None:
+    """Why the packed response at position (to the end of packed) can't be any rnfs.dht response, from msgpack
+    headers alone; None if it may.
+
+    The response may be True, False or None (a /provide or /pin answer, or a refusal), a /find answer, or a
+    /blocks answer (also the shape of a /name one). Nothing may follow it. Requesters check every response
+    with this (through response_refusal), so a node checks its features' responses with it before sending.
+    """
+    if position >= len(packed):
+        return "no response"
     if packed[position] in (_NIL, _FALSE, _TRUE):
         end = position + 1
     else:

@@ -1,17 +1,25 @@
 """Tests for the shared folder (specification section 8): entries imported and pinned with source "folder"."""
+import hashlib
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
 from rnfs import fsutil, statedb
-from rnfs.content import builder, shared_folder
+from rnfs.config import Config
+from rnfs.content import builder, chunker, shared_folder
+from rnfs.content.builder import Built
 from rnfs.content.cid import RAW, Cid
-from rnfs.content.shared_folder import SharedFolder
+from rnfs.content.shared_folder import FolderFiles, SharedFolder
 from rnfs.content.storage import FOLDER, USER, Storage
+from rnfs.errors import BlockMismatch, Denied, TooLarge
+from rnfs.node import RnfsNode
 from tests.support import CAN_SYMLINK, HAS_FIFO, POSIX_MODES, state_execute, state_rows, write_legacy
 from tests.test_builder import swap_on_open, within
+from tests.test_names import FakeNetwork
+from tests.test_node import A_ID, NetClient
 
 SECRET = b"private key"
 
@@ -130,11 +138,12 @@ class SharedFolderTest(unittest.TestCase):
         self.assertEqual(self.storage.pinned_by(FOLDER), {self.cid_of("a.txt")})
 
     def test_import_failing_for_its_content_waits_for_a_change(self):
-        """A failure of the content itself (here ValueError) isn't tried again, however long, until it changes."""
+        """A failure of the content itself (an RnfsError: here TooLarge) isn't tried again, however long, until it
+        changes."""
         clock = [100.0]
         self.folder.clock = lambda: clock[0]
         self.write("a.txt", b"a")
-        with mock.patch.object(builder, "build_open", side_effect=ValueError("bad")), \
+        with mock.patch.object(builder, "build_open", side_effect=TooLarge("too deep")), \
                 mock.patch("rnfs.content.shared_folder.log"):
             self.folder.scan()
         clock[0] += 100 * shared_folder.RETRY_AFTER
@@ -142,6 +151,26 @@ class SharedFolderTest(unittest.TestCase):
             self.assertEqual(self.folder.scan(), set())
         self.write("a.txt", b"changed")
         self.assertEqual(self.folder.scan(), {self.cid_of("a.txt")})
+
+    def test_unexpected_value_error_is_tried_again(self):
+        """A ValueError isn't the content's (invalid names and special files inside are skipped): a bug, such as a
+        BlockMismatch, so the entry is logged with the error's type and tried again RETRY_AFTER later, not parked
+        until it changes (XC4)."""
+        for error in (ValueError("bug"), BlockMismatch("block does not match")):
+            with self.subTest(type(error).__name__):
+                clock = [100.0]
+                self.folder.clock = lambda: clock[0]
+                name = f"{type(error).__name__}.txt"
+                self.write(name, name.encode())
+                with mock.patch.object(builder, "build_open", side_effect=error), \
+                        mock.patch("rnfs.content.shared_folder.log") as log:
+                    self.folder.scan()
+                self.assertIn(type(error).__name__, log.call_args_list[0].args[0])
+                self.assertEqual(log.call_args_list[0].args[1], shared_folder.LOG_WARNING)
+                with mock.patch.object(builder, "build_open", side_effect=AssertionError("tried again")):
+                    self.folder.scan()  # not yet: no retry before RETRY_AFTER
+                clock[0] += shared_folder.RETRY_AFTER
+                self.assertIn(self.cid_of(name), self.folder.scan())
 
     def test_unchanged_entry_whose_pin_fails_doesnt_stop_the_scan(self):
         """A failed pin of an unchanged entry is logged; the other entries are scanned and it is kept."""
@@ -193,6 +222,253 @@ class SharedFolderTest(unittest.TestCase):
                 release.set()
                 scan.join(10)
         self.assertEqual(self.folder.names(), {a: "a.txt", b: "b.txt"})
+
+    # The per-file cache (audit D1): inside an entry that changed, files that didn't aren't read again
+
+    def tree(self, count: int, entry: str = "dir") -> list[str]:
+        """entry/f0 ... with content "file 0" ...: paths."""
+        return [self.write(os.path.join(entry, f"f{i}"), f"file {i}".encode()) for i in range(count)]
+
+    def rewrite(self, path: str, data: bytes):
+        """Write data over path (the same inode), a second later by its modification time (a rewrite within the
+        filesystem's time resolution would keep it)."""
+        st = os.stat(path)
+        with open(path, "wb") as f:
+            f.write(data)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+
+    def scan_counting(self, options: builder.BuildOptions | None = None) -> tuple[set[Cid], int]:
+        """A scan's pins, and how many files it read."""
+        with mock.patch.object(builder, "build_file", wraps=builder.build_file) as build_file:
+            pins = self.folder.scan(options)
+        return pins, build_file.call_count
+
+    def test_changing_one_file_reads_only_that_file(self):
+        paths = self.tree(5)
+        self.assertEqual(self.scan_counting(), ({self.cid_of("dir")}, 5))
+        self.rewrite(paths[2], b"changed, and longer")
+        pins, read = self.scan_counting()
+        self.assertEqual(read, 1)
+        self.assertEqual(pins, {self.cid_of("dir")})
+        self.assertEqual(self.storage.pinned_by(FOLDER), pins)
+        self.assertTrue(self.storage.is_complete(self.cid_of("dir")))
+
+    def test_same_size_rewrite_and_touch_are_read_again(self):
+        """A file rewritten with content of the same size, or only touched, has a new modification time: read."""
+        paths = self.tree(3)
+        self.folder.scan()
+        self.rewrite(paths[0], b"FILE 0")
+        pins, read = self.scan_counting()
+        self.assertEqual((pins, read), ({self.cid_of("dir")}, 1))
+        st = os.stat(paths[1])
+        os.utime(paths[1], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        self.assertEqual(self.scan_counting(), (pins, 1))  # read again; the same content, so the same CID
+
+    def test_renamed_files_are_not_read_again(self):
+        """A file renamed in place, over another, or into another entry is the same inode, size and time."""
+        paths = self.tree(3)
+        self.tree(1, "other")
+        self.write("top.txt", b"a top-level file")
+        self.folder.scan()
+        os.rename(paths[0], os.path.join(self.files, "dir", "renamed"))
+        os.replace(paths[1], paths[2])
+        os.rename(os.path.join(self.files, "top.txt"), os.path.join(self.files, "moved.txt"))
+        pins, read = self.scan_counting()
+        self.assertEqual(read, 0)
+        self.assertEqual(pins, {self.cid_of("dir"), self.cid_of("other"), self.cid_of("moved.txt")})
+        os.rename(os.path.join(self.files, "dir", "renamed"), os.path.join(self.files, "other", "from dir"))
+        pins, read = self.scan_counting()
+        self.assertEqual(read, 0)
+        self.assertEqual(pins, {self.cid_of("dir"), self.cid_of("other"), self.cid_of("moved.txt")})
+        self.assertEqual(self.storage.pinned_by(FOLDER), pins)
+
+    def test_a_newly_denied_hash_is_still_refused(self):
+        """A remembered file's content hash goes through the deny check as if it were read."""
+        paths = self.tree(3)
+        self.folder.scan(builder.BuildOptions(check=lambda digest: None))  # hashed: the deny list has hashes
+        denied = hashlib.sha256(b"file 1").digest()
+
+        def deny(digest: bytes):
+            """The deny list's check, denying file 1's content."""
+            if digest == denied:
+                raise Denied("denied")
+
+        self.rewrite(paths[0], b"changed")
+        with mock.patch("rnfs.content.shared_folder.log") as log:
+            pins, read = self.scan_counting(builder.BuildOptions(check=deny))
+        self.assertEqual(read, 1)  # only the changed file: file 1's remembered hash was checked
+        self.assertEqual(pins, set())
+        self.assertEqual(self.storage.pinned_by(FOLDER), set())
+        self.assertIn("couldn't import", log.call_args.args[0])
+
+    def test_a_file_remembered_without_its_hash_is_read_when_there_is_a_check(self):
+        """Files built while the deny list had no hashes were never hashed: with a check, they are read again."""
+        paths = self.tree(3)
+        self.folder.scan()
+        checked = []
+        self.rewrite(paths[0], b"changed")
+        pins, read = self.scan_counting(builder.BuildOptions(check=checked.append))
+        self.assertEqual((pins, read), ({self.cid_of("dir")}, 3))
+        self.assertEqual(len(checked), 3)
+        self.rewrite(paths[0], b"changed again")
+        checked.clear()
+        self.assertEqual(self.scan_counting(builder.BuildOptions(check=checked.append)), ({self.cid_of("dir")}, 1))
+        self.assertEqual(sorted(checked), sorted(hashlib.sha256(data).digest()
+                                                 for data in (b"changed again", b"file 1", b"file 2")))
+
+    def test_a_denied_block_under_a_remembered_file_is_refused(self):
+        """A file one of whose blocks is denied since is read again, so storing that block refuses the import."""
+        paths = self.tree(3)
+        self.folder.scan()
+        denied = Cid.for_block(RAW, b"file 1")
+        self.storage.deny = mock.Mock(cids=frozenset({denied.binary}), denies=lambda cid: cid == denied)
+        self.rewrite(paths[0], b"changed")
+        with mock.patch("rnfs.content.shared_folder.log"):
+            pins, read = self.scan_counting()
+        self.assertEqual(read, 2)
+        self.assertEqual(pins, set())
+
+    def test_a_block_gone_under_a_remembered_file_is_read_again(self):
+        """A remembered file whose block was deleted (damaged), or collected once its entry's pin went, is read
+        again and stored."""
+        paths = self.tree(3)
+        (first,) = self.folder.scan()
+        self.storage._delete({Cid.for_block(RAW, b"file 1")})
+        self.rewrite(paths[0], b"changed")
+        pins, read = self.scan_counting()
+        self.assertEqual((pins, read), ({self.cid_of("dir")}, 2))
+        self.assertTrue(self.storage.is_complete(self.cid_of("dir")))
+        (second,) = pins
+        self.storage.unpin(second, FOLDER)  # as `rnfs gc` after the pin went: every block of it is collected
+        self.storage.gc()
+        self.assertFalse(self.storage.is_complete(Cid.for_block(RAW, b"file 2")))
+        self.rewrite(paths[0], b"changed again")
+        pins, read = self.scan_counting()
+        self.assertEqual((pins, read), ({self.cid_of("dir")}, 3))
+        self.assertTrue(self.storage.is_complete(self.cid_of("dir")))
+        self.assertNotEqual(first, second)
+
+    def test_a_file_written_while_read_is_not_remembered(self):
+        """A file that changed while it was read may have given neither version: it is read again next time."""
+        paths = self.tree(2)
+        build_file = builder.build_file
+        before = builder.file_state(os.stat(paths[0]))
+
+        def writing(stream, *args, **kwargs):
+            """build_file, appending to f0 once it is read."""
+            built = build_file(stream, *args, **kwargs)
+            if built.cid == Cid.for_block(RAW, b"file 0"):
+                with open(paths[0], "ab") as f:
+                    f.write(b" and more")
+            return built
+
+        with mock.patch.object(builder, "build_file", side_effect=writing):
+            self.folder.scan()
+        self.assertIsNone(self.folder.files.get(before))
+        self.assertIsNotNone(self.folder.files.get(builder.file_state(os.stat(paths[1]))))
+        self.assertEqual(self.scan_counting(), ({self.cid_of("dir")}, 1))
+
+    def test_removed_entries_are_forgotten(self):
+        """The files of an entry removed, or of one changed, that it no longer holds, are forgotten."""
+        paths = self.tree(2)
+        other = self.tree(1, "other")
+        self.folder.scan()
+        states = [builder.file_state(os.stat(path)) for path in [*paths, *other]]
+        os.remove(paths[0])
+        os.remove(other[0])
+        os.rmdir(os.path.join(self.files, "other"))
+        self.folder.scan()
+        self.assertEqual([self.folder.files.get(state) is not None for state in states], [False, True, False])
+
+    def test_only_fixed_chunks_are_remembered(self):
+        """What files were built as stands only for the folder's chunker (fixed): a scan with another reads all."""
+        paths = self.tree(2)
+        self.folder.scan(builder.BuildOptions(chunker.FASTCDC))
+        self.assertIsNone(self.folder.files.get(builder.file_state(os.stat(paths[0]))))
+
+    def file_rows(self) -> dict:
+        """What the shared_folder_files table holds: (entry name, state) -> (CID, height, digest)."""
+        return {(statedb.load(name), tuple(statedb.load(state))): (Cid.from_bytes(cid), height, digest)
+                for name, state, cid, height, digest in state_rows(
+                    self.state, "SELECT name, state, cid, height, digest FROM shared_folder_files")}
+
+    def test_the_file_cache_survives_a_restart(self):
+        """What files were built as is saved (by save(), with the node's batched stores), and a restart keeps it;
+        rows follow the entries: a file replaced or removed, and an entry removed, take their rows with them."""
+        paths = self.tree(3)
+        hashing = builder.BuildOptions(check=lambda digest: None)
+        self.folder.scan(hashing)
+        self.assertEqual(self.file_rows(), {})  # saved by save(), not by the scan
+        self.folder.files.save()
+        states = [builder.file_state(os.stat(path)) for path in paths]
+        self.assertEqual(self.file_rows(), {("dir", state): (Cid.for_block(RAW, f"file {i}".encode()), 0,
+                                                             hashlib.sha256(f"file {i}".encode()).digest())
+                                            for i, state in enumerate(states)})
+        self.folder.close()
+        self.folder = self.open()
+        self.rewrite(paths[0], b"changed")
+        self.assertEqual(self.scan_counting(hashing), ({self.cid_of("dir")}, 1))
+        self.folder.files.save()
+        rows = self.file_rows()
+        self.assertEqual(len(rows), 3)
+        self.assertNotIn(("dir", states[0]), rows)
+        self.assertIn(("dir", builder.file_state(os.stat(paths[0]))), rows)
+        os.remove(paths[1])
+        self.folder.scan(hashing)
+        self.folder.files.save()
+        self.assertEqual(len(self.file_rows()), 2)
+        for path in (paths[0], paths[2]):
+            os.remove(path)
+        os.rmdir(os.path.dirname(paths[0]))
+        self.folder.scan(hashing)
+        self.folder.files.save()
+        self.assertEqual(self.file_rows(), {})
+
+    def test_damaged_file_rows_are_deleted(self):
+        """File rows that don't parse are skipped at load and deleted; the others are kept."""
+        (path,) = self.tree(1)
+        self.folder.scan()
+        self.folder.files.save()
+        ((name, state), (cid, _, _)), = self.file_rows().items()
+        good = statedb.dump(list(state))
+        bad = [("not json", good, cid.binary, 0, None), ("7", good, cid.binary, 0, None),
+               ('"x"', "not json", cid.binary, 0, None), ('"x"', "[1, 2]", cid.binary, 0, None),
+               ('"x"', "[1, 2, -3, 4, false]", cid.binary, 0, None), ('"x"', "[true, 2, 3, 4, false]", cid.binary, 0, None),
+               ('"x"', "[1, 2, 3, 4, 1]", cid.binary, 0, None), ('"a"', good, b"not a cid", 0, None),
+               ('"b"', good, cid.binary, -1, None), ('"c"', good, cid.binary, "zero", None),
+               ('"d"', good, cid.binary, 0, b"short")]
+        for row in bad:
+            state_execute(self.state, "INSERT INTO shared_folder_files (name, state, cid, height, digest) "
+                                      "VALUES (?, ?, ?, ?, ?)", row)
+        with mock.patch("rnfs.content.shared_folder.log"):
+            folder = self.open()
+        self.assertEqual(set(self.file_rows()), {(name, state)})
+        self.assertEqual(folder.files.get(builder.file_state(os.stat(path))), Built(cid, 6, 0, 0))
+
+    def test_failed_file_save_is_written_by_the_next(self):
+        """A save whose commit failed raises, keeps the changes, and the next save writes them."""
+        self.tree(2)
+        self.folder.scan()
+        with mock.patch.object(self.folder.files._rows.db, "transaction",
+                               side_effect=statedb.StateDbError("disk I/O error")):
+            with self.assertRaises(OSError):
+                self.folder.files.save()
+        self.assertEqual(self.file_rows(), {})
+        self.folder.files.save()
+        self.assertEqual(len(self.file_rows()), 2)
+
+    def test_file_entry_names_that_are_not_unicode_round_trip(self):
+        """An entry name with a lone surrogate is saved and loaded as it was."""
+        files = FolderFiles(self.state)
+        self.addCleanup(files.close)
+        state = (1, 2, 1, 4, False)
+        built = Built(Cid.for_block(RAW, b"x"), 1, 0, 0, hashlib.sha256(b"x").digest())
+        files.update("caf\udce9", {state: built}, complete=True)
+        files.save()
+        loaded = FolderFiles(self.state)
+        self.addCleanup(loaded.close)
+        self.assertEqual(loaded._entries, {"caf\udce9": {state: built}})
+        self.assertEqual(loaded.get(state).digest, built.digest)
 
     def test_creates_missing_directory(self):
         self.assertEqual(self.folder.scan(), set())
@@ -362,6 +638,40 @@ class SharedFolderTest(unittest.TestCase):
             pins = within(5, self.folder.scan)
         self.assertEqual(pins, {self.cid_of("dir")})
         self.assertEqual(within(5, self.folder.scan), pins)
+
+
+class NodeFileCacheTest(unittest.TestCase):
+    """The node saves the shared folder's per-file cache with its other stores (D1, XC5)."""
+
+    def test_saved_at_stop_and_used_after_a_restart(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=os.path.join(tmp.name, "rnfs"), slow="no")
+        paths = []
+        for i in range(3):
+            path = os.path.join(config.files_dir, "dir", f"f{i}")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(f"file {i}".encode())
+            paths.append(path)
+        node = RnfsNode.offline(config, A_ID, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        self.assertIn(node.shared_folder.files, node._every_store(batched=True))
+        node.maintain(time.monotonic(), {})
+        self.assertEqual(state_rows(config.state_dir, "SELECT COUNT(*) FROM shared_folder_files"), [(0,)])
+        node.stop()
+        self.assertEqual(state_rows(config.state_dir, "SELECT COUNT(*) FROM shared_folder_files"), [(3,)])
+        st = os.stat(paths[0])
+        with open(paths[0], "wb") as f:
+            f.write(b"changed")
+        os.utime(paths[0], ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        node = RnfsNode.offline(config, A_ID, NetClient(), FakeNetwork())
+        self.addCleanup(node.stop)
+        with mock.patch.object(builder, "build_file", wraps=builder.build_file) as build_file:
+            node.maintain(time.monotonic(), {})
+        self.assertEqual(build_file.call_count, 1)
+        self.assertEqual(node.storage.pinned_by(FOLDER),
+                         {builder.add_path(os.path.join(config.files_dir, "dir"), builder.NO_PUT)[0].cid})
 
 
 if __name__ == "__main__":

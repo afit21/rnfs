@@ -1,5 +1,5 @@
-"""Helpers for the /blocks server security tests (H1, L2): fake links that know their RNS path, and a
-RequestServer over tests/test_server.py's fakes driven by a FakeClock."""
+"""Helpers for the /blocks server security tests (H1, L2, L17, NET-1): fake links that know their RNS path, a
+RequestServer over tests/test_server.py's fakes driven by a FakeClock, and a requester rejecting a response."""
 import RNS
 
 from rnfs.config import Config
@@ -10,6 +10,17 @@ from tests.test_server import FakeBackend, FakeDestination, FakeLink, FakeResour
 
 TCP_BITRATE = 10_000_000  # what RNS's TCP interfaces assume (TCPClientInterface.BITRATE_GUESS)
 LORA_BITRATE = 1_000  # a slow LoRa channel
+
+
+def reject(resource, progress: float = 0.0):
+    """The requester rejects (or, mid-transfer, cancels) the response: RNS's Resource._rejected on an outgoing
+    Resource sets REJECTED, leaves the link's outgoing Resources and runs the callback. On RNS 1.5.6 every
+    receiver cancel arrives this way (RESOURCE_RCL), whether before or after parts were sent."""
+    resource.progress = progress
+    resource.status = RNS.Resource.REJECTED
+    resource.conclude()
+    if resource.callback:
+        resource.callback(resource)
 
 
 class FakeInterface:

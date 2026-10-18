@@ -159,9 +159,20 @@ INTERNALS = [
                               "random_blobs.append(random_blob)",
                               "path_table_entry = [now, received_from, announce_hops, expires, random_blobs, "
                               "packet.receiving_interface, packet.packet_hash]"))),
-    Internal("node_content.py", "Identity.recall(hash, from_identity_hash=, _no_use=), raising AttributeError "
-             "without a Reticulum instance unless _no_use", lambda: _recall()),
-    Internal("features/keepers.py", "Transport.get_cached_packet(packet_hash, packet_type=\"announce\") and the "
+    Internal("names.py", "Transport.path_table entries holding, at IDX_PT_PACKET, the packet hash of the announce "
+             "the path was taken from; Identity.remember storing each announce's packet hash at entry[1], a "
+             "known destination's too; the announce cache written, in Transport._inbound, only for an announce "
+             "that takes the path (should_add)",
+             lambda: (_true(sys.modules["RNS.Transport"].IDX_PT_PACKET == names._PATH_PACKET, "IDX_PT_PACKET moved"),
+                      _source(RNS.Identity.remember, "entry[1] = packet_hash"),
+                      _announce_cache_on_path())),
+    Internal("node_content.py, node.py, features/peers.py, network/links.py",
+             "Identity.recall(hash, from_identity_hash=, _no_use=), raising AttributeError without a Reticulum "
+             "instance unless _no_use (read-only checks pass _no_use=True so they don't mark the destination used)",
+             lambda: _recall()),
+    Internal("features/peers.py", "Identity.recall_app_data(hash, _no_use=)",
+             lambda: _params(RNS.Identity.recall_app_data, "_no_use")),
+    Internal("features/keepers.py, names.py", "Transport.get_cached_packet(packet_hash, packet_type=\"announce\") and the "
              "signed announce in it: public key, name hash, random hash (emission time in its last 5 bytes), "
              "ratchet, signature, app_data", lambda: _cached_announce()),
     Internal("names.py", "announce handlers with five parameters get announce_packet_hash and is_path_response",
@@ -178,6 +189,12 @@ INTERNALS = [
                       _has(RNS.Transport, "hops_to", "next_hop_interface"),
                       _has(RNS.Reticulum, "get_next_hop_if_name", "get_instance", "configdir"),
                       _assigns(RNS.Reticulum.__init__, "is_connected_to_shared_instance"))),
+    Internal("mesh.py", "Reticulum.get_path_table() entries {hash, interface}, interface being the str() of the "
+             "interface that get_next_hop_if_name gives (RnsPaths.infos)",
+             lambda: (_source(RNS.Reticulum.get_path_table, "'hash': dst_hash",
+                              "'interface': str(RNS.Transport.path_table[dst_hash][5])"),
+                      _source(RNS.Reticulum.get_next_hop_if_name,
+                              "return str(RNS.Transport.next_hop_interface(destination))"))),
     Internal("mesh.py, network/rates.py", "Reticulum.get_interface_stats() {\"interfaces\": [{name, short_name, "
              "type, status, bitrate}]}, with LocalServerInterface and LocalClientInterface types",
              lambda: (_source(RNS.Reticulum.get_interface_stats, "ifstats['name'] = str(interface)",
@@ -438,6 +455,20 @@ def _known_destinations():
               "the public key doesn't make the destination hash")
 
 
+def _announce_cache_on_path():
+    """Transport._inbound caches announces (packet_type "announce") only under `if should_add:`."""
+    tree = _tree(RNS.Transport._inbound)
+    guarded = {id(node) for branch in ast.walk(tree)
+               if isinstance(branch, ast.If) and ast.unparse(branch.test) == "should_add"
+               for statement in branch.body for node in ast.walk(statement)}
+    caches = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+              and ast.unparse(node.func) == "Transport.cache"
+              and any(keyword.arg == "packet_type" and ast.unparse(keyword.value) == "'announce'"
+                      for keyword in node.keywords)]
+    _true(caches, "Transport._inbound no longer caches announces")
+    _true(all(id(node) in guarded for node in caches), "Transport._inbound caches an announce outside should_add")
+
+
 def _recall():
     """Identity.recall with _no_use, as node_content does without a Reticulum instance."""
     destination = _destination("rnfs", "dht")
@@ -457,7 +488,8 @@ def _recall():
 
 
 def _cached_announce():
-    """An rnfs.name announce, cached as Transport caches it, read back and verified as keepers does."""
+    """An rnfs.name announce, cached as Transport caches it, read back as names reads it and verified as keepers
+    does."""
     _true((keepers.PUBLIC_KEY_LENGTH, keepers.NAME_HASH_LENGTH, keepers.RATCHET_LENGTH, keepers.SIGNATURE_LENGTH)
           == (RNS.Identity.KEYSIZE // 8, RNS.Identity.NAME_HASH_LENGTH // 8, RNS.Identity.RATCHETSIZE // 8,
               RNS.Identity.SIGLENGTH // 8), "announce field sizes changed")
@@ -471,6 +503,9 @@ def _cached_announce():
         os.mkdir(os.path.join(cache, "announces"))
         RNS.Transport.cache(packet, force_cache=True, packet_type="announce")
         cached = RNS.Transport.get_cached_packet(packet.get_hash(), packet_type="announce")
+        # As RnsNetwork.recalled_emission reads it
+        emitted, app_data_read = names.RnsNetwork._cached_announce(destination.hash, packet.get_hash())
+    _true(app_data_read == app_data and abs(emitted - time.time()) < 60, f"names read {emitted}, {app_data_read}")
     # As KeeperFeature._from_rns_cache reads it
     _true(cached is not None and cached.unpack() is not False, "the cached packet doesn't unpack")
     _true(cached.destination_hash == destination.hash and cached.packet_type == RNS.Packet.ANNOUNCE,

@@ -388,6 +388,14 @@ class E2EBackend:
         """Whether the identity is a member."""
         return False
 
+    def served_block_size(self, cid):
+        """Not known: blocks are read to size them."""
+        return None
+
+    def feature_requests(self):
+        """No feature paths."""
+        return {}
+
 
 def run_e2e_server(configdir: str):
     """Serve rnfs.dht until stdin closes, printing the node ID first."""

@@ -8,7 +8,8 @@ Behaviour:
   segment is exactly one name.
 - Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. The
   user's own HEAD, or range not starting at byte 0, uses the first bytes only if they are stored (else the
-  name, or application/octet-stream), so it never fetches what it doesn't send. A web page's request (see
+  name, or application/octet-stream), so it never fetches what it doesn't send; the deny list applies to
+  them as to any read (451). A web page's request (see
   limited() below) always reads them, fetching them if need be, so what a page can observe of the type
   (e.g. through nosniff or opaque-response blocking) never depends on what is stored.
   Single byte ranges (206, 416, Accept-Ranges; If-Range honoured); several ranges get the whole file.
@@ -31,8 +32,10 @@ Behaviour:
 - Requests that aren't the user's own navigation (Sec-Fetch-Site present and not "none") may hold at most
   gateway_fetches network fetches or name resolutions at a time; over that, 503 with Retry-After.
   Content already stored (node.is_local) is served without limit. A request with no Sec-Fetch-Site is
-  treated as the user's own: every browser sends the header to 127.0.0.1/localhost (potentially
-  trustworthy origins), so its absence means a local tool such as curl, run by the user.
+  treated as the user's own only if its User-Agent doesn't start with "Mozilla/": browsers with Fetch
+  Metadata send the header to 127.0.0.1/localhost (potentially trustworthy origins), so its absence means
+  a local tool such as curl, run by the user, or a browser without Fetch Metadata (Safari < 16.4, Firefox
+  < 90), whose every request is then treated as a web page's (no ?format=, held to gateway_fetches).
 - Everything is requested with for_gateway=True: fetched content is cache, never provided, and names go
   only into the capped table. Name resolutions are reused for NAME_CACHE_TIME, so a page's many
   subresources don't each start a resolution against gateway_fetches.
@@ -71,8 +74,9 @@ SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing s
 NAME_CACHE_TIME = 60.0
 NAME_CACHE_SIZE = 1000
 INDEX = "index.html"
-# What an error from the node says on the gateway, by status: never its own text (see the module docstring)
-ERROR_MESSAGES = {400: "invalid request", 413: "too large for this node's download limits",
+# What an error from the node says on the gateway, by status: never its own text (see the module docstring). Every
+# status of rnfs.errors.STATUSES has one, and 500; a NotFound's own text is shown, this only if it has none
+ERROR_MESSAGES = {400: "invalid request", 404: "not found", 413: "too large for this node's download limits",
                   451: "unavailable: this node's deny list blocks this content",
                   422: "invalid content: it breaks the rnfs format's rules", 503: "the node is busy; try again shortly",
                   507: "not enough free disk space on this node", 500: "internal error; see the rnfs daemon's log"}
@@ -423,7 +427,7 @@ class GatewayHandler(TimedHandler):
             self.respond_error(e.status, str(e), e.headers)
         except NotFound as e:
             log(f"gateway: {loggable(self.path)} not found: {e}", LOG_DEBUG)
-            self.respond_error(404, str(e) or "not found", {})
+            self.respond_error(404, str(e) or ERROR_MESSAGES[404], {})
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             # str(e) may name local paths (a StorageFull's or an OSError's) or the node's limits: logged only
@@ -449,7 +453,11 @@ class GatewayHandler(TimedHandler):
     def limited(self) -> bool:
         """True if this request isn't the user's own navigation, so its network use is limited."""
         site = self.headers.get("Sec-Fetch-Site")
-        return site is not None and site.strip().lower() != "none"
+        if site is None:
+            # Browsers without Fetch Metadata (Safari < 16.4, Firefox < 90) send no Sec-Fetch-Site for a web page's
+            # requests either, and every browser's User-Agent starts with "Mozilla/": only a tool's is the user's own
+            return (self.headers.get("User-Agent") or "").strip().lower().startswith("mozilla/")
+        return site.strip().lower() != "none"
 
     def need_network(self):
         """Take a gateway_fetches slot for a limited request about to use the network (once per request)."""

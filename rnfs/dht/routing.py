@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 from rnfs.config import Config
-from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
+from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K, MISSED_ANNOUNCES
 
 AVOID_AFTER = 300.0  # seconds an unreliable node isn't retried after max_failures failed queries in a row ...
 AVOID_MAX = 3600.0  # ... doubling with each further failure up to this
@@ -69,6 +69,8 @@ class RoutingTable:
         self.clock = clock
         self.admit = admit
         self._buckets: list[dict[bytes, _Entry]] = [{} for _ in range(BUCKET_COUNT)]
+        # Both in the order their entries expire (when dropped, ban end), each popped and re-inserted when set, so
+        # _prune only looks at the front of each
         self._dropped: dict[bytes, tuple[float, float]] = {}  # node ID -> (first seen, when dropped)
         self._bans: dict[bytes, float] = {}  # node ID -> ban end
         # Node ID -> [failed queries in a row, when it may be retried], for any node; only an answer clears it
@@ -77,8 +79,8 @@ class RoutingTable:
 
     @property
     def _silence_limit(self) -> float:
-        """Silence after which a node is presumed gone: it missed two announces."""
-        return 2 * self.config.announce_interval
+        """Silence after which a node is presumed gone: it missed MISSED_ANNOUNCES (two) announces."""
+        return MISSED_ANNOUNCES * self.config.announce_interval
 
     def bucket_index(self, node_id: bytes) -> int:
         """Index of the bucket node_id belongs in: i for distance in [2^i, 2^(i+1)). ValueError for own_id."""
@@ -92,11 +94,30 @@ class RoutingTable:
         return entry.failures > 0 or now - entry.last_heard > self._silence_limit
 
     def _prune(self, now: float):
-        """Forget expired bans, and dropped nodes whose seniority can no longer be regained."""
-        for node_id in [n for n, until in self._bans.items() if until <= now]:
+        """Forget expired bans, and dropped nodes whose seniority can no longer be regained. Caller holds the lock.
+
+        Runs on every announce heard, so it stops at the first entry still current: both dicts are in expiry order.
+        Their readers (_hear, _add, is_banned) check expiry themselves, so an entry left out of order by a clock step
+        or a changed setting only costs memory until those before it expire."""
+        expired = []
+        for node_id, until in self._bans.items():
+            if until > now:
+                break
+            expired.append(node_id)
+        for node_id in expired:
             del self._bans[node_id]
-        for node_id in [n for n, (_, dropped) in self._dropped.items() if now - dropped > self._silence_limit]:
+        expired = []
+        for node_id, (_, dropped) in self._dropped.items():
+            if now - dropped <= self._silence_limit:
+                break
+            expired.append(node_id)
+        for node_id in expired:
             del self._dropped[node_id]
+
+    def _set_dropped(self, node_id: bytes, first_seen: float, now: float):
+        """Remember node_id's seniority as dropped now, at the end of _dropped's expiry order. Caller holds the lock."""
+        self._dropped.pop(node_id, None)
+        self._dropped[node_id] = (first_seen, now)
 
     def heard(self, node_id: bytes) -> bool:
         """Record that node_id proved to be a reachable server (server-mode announce, or answered /find; for an
@@ -127,7 +148,7 @@ class RoutingTable:
                     self._unanswered.pop(node_id, None)
                 now = self.clock()
                 self._prune(now)
-                if node_id in self._bans:
+                if self._bans.get(node_id, now) > now:  # banned; an expired ban may be left (see _prune)
                     return False
                 bucket = self._buckets[self.bucket_index(node_id)]
                 entry = bucket.get(node_id)
@@ -152,10 +173,12 @@ class RoutingTable:
                 return False
             del bucket[victim.node_id]
             # Displaced, not dropped for failures: it may come back with its seniority like a dropped node
-            self._dropped[victim.node_id] = (victim.first_seen, now)
+            self._set_dropped(victim.node_id, victim.first_seen, now)
 
         # A node dropped recently (e.g. by a lossy link) regains its seniority
-        first_seen, _ = self._dropped.pop(node_id, (now, now))
+        first_seen, dropped = self._dropped.pop(node_id, (now, now))
+        if now - dropped > self._silence_limit:  # expired, but not yet pruned (see _prune)
+            first_seen = now
         bucket[node_id] = _Entry(node_id, first_seen, now)
         return True
 
@@ -178,7 +201,7 @@ class RoutingTable:
             if entry.failures < self.config.max_failures:
                 return False
             del bucket[node_id]
-            self._dropped[node_id] = (entry.first_seen, now)
+            self._set_dropped(node_id, entry.first_seen, now)
             return True
 
     def _count_unanswered(self, node_id: bytes, now: float):
@@ -233,6 +256,7 @@ class RoutingTable:
             return
         with self._lock:
             self.remove(node_id)
+            self._bans.pop(node_id, None)  # re-inserted last, keeping _bans in expiry order
             self._bans[node_id] = self.clock() + self.config.ban_time
 
     def is_banned(self, node_id: bytes) -> bool:

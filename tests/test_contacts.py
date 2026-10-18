@@ -1,6 +1,7 @@
 """Tests for the address book (rnfs/features/contacts.py): nicks, kinds, persistence, and nick targets and
 node IDs end to end through the node facade, the local API (including jobs) and the CLI helpers."""
 import http.client
+import inspect
 import json
 import os
 import tempfile
@@ -15,6 +16,7 @@ from rnfs.api import ApiServer
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER
+from rnfs import features
 from rnfs.errors import NotFound
 from rnfs.features import contacts
 from rnfs.features.contacts import check_nick, is_nick, node_arg
@@ -161,6 +163,19 @@ class ContactsNodeTest(unittest.TestCase):
         self.book.remove("bnode")
         self.assertEqual(self.rows(), [])
 
+    def test_changes_are_durable_and_a_failed_one_is_written_by_save(self):
+        """Each change is committed durably as it is made; one whose commit failed is written by the node's next
+        save of its features (periodic, and at stop)."""
+        real = self.book._db.transaction
+        with mock.patch.object(self.book._db, "transaction", side_effect=real) as opened:
+            self.book.add("anode", A_ID.hex(), "node")
+        self.assertEqual([call.args for call in opened.call_args_list], [(True,)])
+        with failing_commits(), self.assertRaises(OSError):
+            self.book.remove("anode")
+        self.assertEqual(self.rows(), [("anode", "node", A_ID)])
+        self.b._save_state()
+        self.assertEqual(self.rows(), [])
+
     def test_kind_detection(self):
         self.assertEqual(self.book.add("alice", self.name.hex())["kind"], "name")  # a record B holds
         self.assertEqual(self.book.add("anode", A_ID.hex())["kind"], "node")  # in B's routing table
@@ -209,6 +224,35 @@ class ContactsNodeTest(unittest.TestCase):
         for text, kind in (("anode", "name"), ("nobody", "node"), ("Bad!", "node")):
             with self.assertRaises(ValueError):
                 self.book.resolve_id(text, kind)
+        # Worded for each kind: LXMF's recipients come through here too
+        self.book.add("relay", B_ID.hex(), "lxmf")
+        self.assertEqual(self.book.resolve_id("relay", "lxmf"), B_ID)
+        for text, kind, message in (("anode", "lxmf", "contact anode is not an LXMF address"),
+                                    ("relay", "name", "contact relay is not a name"),
+                                    ("nobody", "lxmf", "no LXMF contact nobody"),
+                                    ("Bad!", "lxmf", "invalid LXMF address 'Bad!'"),
+                                    ("Bad!", "node", "invalid node 'Bad!'")):
+            with self.assertRaisesRegex(ValueError, message):
+                self.book.resolve_id(text, kind)
+
+    def test_meets_the_contacts_api(self):
+        """The contract other features rely on (rnfs.features.ContactsApi): every method, with the same
+        parameters, so renaming one fails here instead of silently turning off what uses it (audit FT4)."""
+        self.assertIsInstance(self.book, features.ContactsApi)
+        self.assertIs(self.b.feature("contacts"), self.book)
+        methods = [name for name, value in vars(features.ContactsApi).items()
+                   if callable(value) and not name.startswith("_")]
+        self.assertEqual(len(methods), 5)
+        for method in methods:
+            with self.subTest(method):
+                expected = inspect.signature(getattr(features.ContactsApi, method))
+                actual = inspect.signature(getattr(contacts.ContactsFeature, method))
+                self.assertEqual(list(actual.parameters), list(expected.parameters))
+                self.assertEqual([p.default for p in actual.parameters.values()],
+                                 [p.default for p in expected.parameters.values()])
+        # And the features using it declare it
+        for name in ("jobs", "keepers", "follow", "lxmf"):
+            self.assertIs(self.b.feature(name).dependency("contacts"), self.book)
 
 
 class ContactsApiTest(ContactsNodeTest.__base__):

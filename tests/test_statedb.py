@@ -1,12 +1,15 @@
 """Tests for the state database (rnfs.statedb): opening and checking it, transactions, references, and the
 migration of the JSON state files earlier versions wrote."""
 import builtins
+import hashlib
 import json
 import os
 import sqlite3
 import tempfile
 import threading
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest import mock
 
 import RNS
@@ -14,6 +17,11 @@ import RNS
 from rnfs import statedb
 from rnfs.errors import RnfsError
 from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
+
+# The schema steps rnfs 0.1.5 released: a database 0.1.5 wrote has them already, so an edit to one would never
+# reach it. Never change this digest: append a step instead.
+RELEASED_0_1_5 = "50bd4ec20bbf10e408a9313cb168d35915af0f9d2afcf850d812dd1a7b7fb72b"
+RELEASED_0_1_5_STEPS = 16
 
 _saved_loglevel = RNS.loglevel
 
@@ -102,6 +110,43 @@ class OpenTest(StateDbTest):
         self.assertEqual(db.query("PRAGMA user_version"), [(len(statedb.SCHEMA),)])
         self.assertEqual(db.query("SELECT cid, source FROM pins"), [(b"x", "user")])
         self.assertEqual(db.query("SELECT count(*) FROM lxmf_messages"), [(0,)])
+
+    def test_released_steps_are_unchanged(self):
+        """The steps 0.1.5 released are exactly as released (statedb.SCHEMA's comment): new steps are appended."""
+        released = statedb.SCHEMA[:RELEASED_0_1_5_STEPS]
+        self.assertTrue(all(isinstance(step, str) for _, steps in released for step in steps))
+        digest = hashlib.sha256(json.dumps([[label, list(steps)] for label, steps in released]).encode()).hexdigest()
+        self.assertEqual(digest, RELEASED_0_1_5)
+
+    def test_callable_step_runs_in_the_upgrade_transaction(self):
+        """A step's callable gets the upgrade's transaction: its writes commit with the step, and a raise rolls the
+        whole step back (user_version included) and stops startup."""
+        calls = []
+
+        def copy_pins(tx):
+            calls.append(tx)
+            tx.execute("INSERT INTO extra (cid) SELECT cid FROM pins")
+
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:2]):
+            db = statedb.connect(self.state)
+            with db.transaction() as tx:
+                tx.execute("INSERT INTO pins (cid, source) VALUES (?, ?)", (b"x", "user"))
+            db.close()
+        extra = ("extra", ("CREATE TABLE extra (cid BLOB PRIMARY KEY) WITHOUT ROWID", copy_pins))
+
+        def failing(tx):
+            raise RuntimeError("migration failed")
+
+        with mock.patch.object(statedb, "SCHEMA", (*statedb.SCHEMA[:2], ("broken", (
+                "CREATE TABLE broken (x)", failing)))), self.assertRaises(RuntimeError):
+            statedb.connect(self.state)
+        self.assertEqual(state_rows(self.state, "PRAGMA user_version"), [(2,)])
+        self.assertEqual(state_rows(self.state, "SELECT name FROM sqlite_master WHERE name = 'broken'"), [])
+        with mock.patch.object(statedb, "SCHEMA", (*statedb.SCHEMA[:2], extra)):
+            self.connect().close()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state_rows(self.state, "PRAGMA user_version"), [(3,)])
+        self.assertEqual(state_rows(self.state, "SELECT cid FROM extra"), [(b"x",)])
 
     def test_file_that_isnt_a_database_stops_startup(self):
         """A file that isn't an SQLite database is refused with what to do, and left as it was."""
@@ -276,6 +321,220 @@ class TransactionTest(StateDbTest):
         self.assertIn("é \U0001f600", text)
 
 
+class RowStoreTest(StateDbTest):
+    """RowStore, on the contacts table (nick -> (kind, id)), and the other store helpers."""
+
+    def setUp(self):
+        """A state database and an address book kept in memory under its own lock."""
+        super().setUp()
+        self.db = self.connect()
+        self.lock = threading.Lock()
+        self.memory: dict[str, tuple[str, bytes]] = {}
+
+    def store(self, mode: str, durable: bool = True, **options) -> statedb.RowStore:
+        """A RowStore for self.memory in mode."""
+        return statedb.RowStore(self.db, "contacts", ("nick",), durable=durable, mode=mode, lock=self.lock,
+                                row=self.row, **options)
+
+    def row(self, nick: str) -> tuple | None:
+        """nick's contacts row, or None if it is gone."""
+        entry = self.memory.get(nick)
+        return None if entry is None else (nick, *entry)
+
+    def set(self, store: statedb.RowStore, nick: str, entry: tuple[str, bytes] | None):
+        """Change nick in memory (None: delete it) and tell store, as a store does."""
+        with self.lock:
+            if entry is None:
+                self.memory.pop(nick, None)
+            else:
+                self.memory[nick] = entry
+            store.changed(nick)
+
+    def saved(self) -> dict:
+        """What the contacts table holds."""
+        return {nick: (kind, ident) for nick, kind, ident in state_rows(self.state, "SELECT * FROM contacts")}
+
+    @contextmanager
+    def transactions(self) -> Iterator[list[bool]]:
+        """Within the with block, the durable flag of each transaction opened on self.db, in order."""
+        opened, real = [], self.db.transaction
+
+        def transaction(durable: bool = False):
+            """The real transaction, noted."""
+            opened.append(durable)
+            return real(durable)
+
+        with mock.patch.object(self.db, "transaction", transaction):
+            yield opened
+
+    def test_write_through_writes_each_change_at_once(self):
+        """WRITE_THROUGH: each change is committed by changed() itself, durable as asked; a key gone is deleted."""
+        for durable in (True, False):
+            with self.subTest(durable=durable):
+                store = self.store(statedb.WRITE_THROUGH, durable)
+                with self.transactions() as opened:
+                    self.set(store, "alice", ("name", b"a" * 16))
+                    self.assertEqual(self.saved(), {"alice": ("name", b"a" * 16)})
+                    self.set(store, "alice", None)
+                    self.assertEqual(self.saved(), {})
+                self.assertEqual(opened, [durable, durable])
+                store.save()  # nothing left to write
+                self.assertEqual(store.pending, frozenset())
+
+    def test_write_through_failed_transaction_raises_and_is_written_next(self):
+        """WRITE_THROUGH: a failing transaction raises OSError and changes nothing on disk; the change stays in
+        memory, and the next change, or a save, writes it."""
+        store = self.store(statedb.WRITE_THROUGH)
+        self.set(store, "alice", ("name", b"a" * 16))
+        with failing_commits(), self.assertRaises(OSError):
+            self.set(store, "bob", ("node", b"b" * 16))
+        self.assertEqual(self.saved(), {"alice": ("name", b"a" * 16)})
+        self.assertIn("bob", self.memory)
+        self.assertEqual(store.pending, {"bob"})
+        self.set(store, "alice", None)
+        self.assertEqual(self.saved(), {"bob": ("node", b"b" * 16)})
+        with failing_commits(), self.assertRaises(OSError):
+            self.set(store, "carol", ("lxmf", b"c" * 16))
+        store.save()
+        self.assertEqual(set(self.saved()), {"bob", "carol"})
+        self.assertEqual(store.pending, frozenset())
+
+    def test_snapshot_writes_at_save_outside_the_lock(self):
+        """SNAPSHOT: changed() writes nothing; save() writes every change since the last save in one transaction,
+        durable as asked, with the store's lock free while it commits."""
+        store = self.store(statedb.SNAPSHOT, durable=False)
+        self.set(store, "alice", ("name", b"a" * 16))
+        self.set(store, "bob", ("node", b"b" * 16))
+        self.assertEqual(self.saved(), {})
+        free = []
+        real = statedb._Database._commit
+
+        def commit(database, conn):
+            """Note whether the store's lock is free, then commit."""
+            free.append(self.lock.acquire(blocking=False) and (self.lock.release() or True))
+            real(database, conn)
+
+        with self.transactions() as opened, mock.patch.object(statedb._Database, "_commit", commit):
+            store.save()
+            store.save()  # nothing changed since
+        self.assertEqual((opened, free), ([False], [True]))
+        self.assertEqual(set(self.saved()), {"alice", "bob"})
+
+    def test_snapshot_failed_transaction_is_written_by_the_next_save(self):
+        """SNAPSHOT: a failing transaction raises OSError and the keys it held are noted again, with changes made
+        since; the next save writes them all."""
+        store = self.store(statedb.SNAPSHOT)
+        self.set(store, "alice", ("name", b"a" * 16))
+        with failing_commits(), self.assertRaises(OSError):
+            store.save()
+        self.assertEqual(self.saved(), {})
+        self.assertEqual(store.pending, {"alice"})
+        self.set(store, "bob", ("node", b"b" * 16))
+        store.save()
+        self.assertEqual(set(self.saved()), {"alice", "bob"})
+        self.assertEqual(store.pending, frozenset())
+
+    def test_snapshot_an_older_snapshot_never_lands_last(self):
+        """SNAPSHOT: a save taking its snapshot while another writes waits for it, so the newer row lands last."""
+        store = self.store(statedb.SNAPSHOT)
+        self.set(store, "alice", ("name", b"1" * 16))
+        later = []
+        real = statedb._Database._commit
+
+        def commit(database, conn):
+            """As the first save commits, change alice and start a second save on another thread."""
+            if not later:
+                self.set(store, "alice", ("name", b"2" * 16))
+                later.append(threading.Thread(target=store.save))
+                later[0].start()
+                later[0].join(0.2)  # it waits for this save to end
+                self.assertTrue(later[0].is_alive())
+            real(database, conn)
+
+        with mock.patch.object(statedb._Database, "_commit", commit):
+            store.save()
+            later[0].join(5)
+        self.assertEqual(self.saved(), {"alice": ("name", b"2" * 16)})
+
+    def test_skip_unchanged_writes_only_rows_that_changed(self):
+        """skip_unchanged: a key whose row is as last written is left out, and no transaction opens for none."""
+        for mode in (statedb.WRITE_THROUGH, statedb.SNAPSHOT):
+            with self.subTest(mode=mode):
+                store = self.store(mode, skip_unchanged=True)
+                self.set(store, "alice", ("name", b"a" * 16))
+                store.save()
+                with self.transactions() as opened:
+                    self.set(store, "alice", ("name", b"a" * 16))
+                    store.save()
+                self.assertEqual(opened, [])
+                self.set(store, "alice", None)
+                store.save()
+                self.assertEqual(self.saved(), {})
+
+    def test_unknown_mode_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.store("sometimes")
+
+    def test_open_store_releases_the_database_if_the_load_fails(self):
+        """open_store gives the reference once load has read it; a load that raises releases it."""
+        db = statedb.open_store(self.state, lambda db: db.query("SELECT * FROM contacts"))
+        db.close()
+        self.db.close()
+        with self.assertRaises(KeyError):
+            statedb.open_store(self.state, lambda db: {}["missing"])
+        self.assertNotIn(self.path, statedb.open_databases())
+
+    def test_delete_rows(self):
+        """delete_rows deletes the rows with those keys, in one transaction, and nothing for none."""
+        with self.db.transaction() as tx:
+            tx.executemany("INSERT INTO contacts VALUES (?, 'name', ?)", [("a", b"a"), ("b", b"b"), ("c", b"c")])
+        with self.transactions() as opened:
+            statedb.delete_rows(self.db, "contacts", ("nick",), [])
+            statedb.delete_rows(self.db, "contacts", ("nick",), [("a",), ("c",)])
+        self.assertEqual((opened, set(self.saved())), ([False], {"b"}))
+
+
+class ReconcilePinsTest(unittest.TestCase):
+    """reconcile_pins: a feature's pins against its saved state."""
+
+    PINS = {"cid1": {"user", "lxmf:aa"}, "cid2": {"lxmf:aa", "lxmf:bb"}, "cid3": {"follow:aa"}, "cid4": {"lxmf:cc"}}
+
+    def reconcile(self, clean: bool, release=None) -> tuple[list, list]:
+        """reconcile_pins over PINS for "lxmf:", with lxmf:bb's pin of cid2 recorded: (adopted, released)."""
+        adopted, released = [], []
+        statedb.reconcile_pins(self.PINS, "lxmf:", lambda owner, cid: (owner, cid) == ("bb", "cid2"), clean,
+                               adopted.append, release or (lambda owner, cid: released.append((owner, cid))))
+        return adopted, released
+
+    def test_clean_state_releases_the_pins_it_doesnt_record(self):
+        adopted, released = self.reconcile(clean=True)
+        self.assertEqual((adopted, sorted(released)), ([], [("aa", "cid1"), ("aa", "cid2"), ("cc", "cid4")]))
+
+    def test_state_not_clean_adopts_them(self):
+        adopted, released = self.reconcile(clean=False)
+        self.assertEqual((adopted, released), ([{"aa": ["cid1", "cid2"], "cc": ["cid4"]}], []))
+
+    def test_a_failed_release_is_logged_and_the_rest_released(self):
+        released = []
+
+        def release(owner, cid):
+            """Fail for cid1, as a read-only state directory would."""
+            if cid == "cid1":
+                raise OSError("read-only")
+            released.append(cid)
+
+        with mock.patch.object(statedb, "log") as log:
+            self.reconcile(clean=True, release=release)
+        self.assertEqual(sorted(released), ["cid2", "cid4"])
+        self.assertIn("could not release cid1", log.call_args.args[0])
+
+    def test_nothing_unrecorded_does_nothing(self):
+        adopted = []
+        statedb.reconcile_pins({"cid1": {"lxmf:aa"}}, "lxmf:", lambda owner, cid: True, False, adopted.append,
+                               None)
+        self.assertEqual(adopted, [])
+
+
 def _import_rows(value, tx) -> int:
     """A test importer: value's strings become pins of source "user"; returns how many."""
     tx.execute("DELETE FROM pins")
@@ -397,7 +656,7 @@ class MigrateTest(StateDbTest):
             """Connect, keeping the reference or the error."""
             try:
                 dbs.append(statedb.connect(self.state))
-            except BaseException as e:  # noqa: BLE001 - reported below
+            except BaseException as e:  # reported below
                 errors.append(e)
 
         with mock.patch.object(statedb, "LEGACY", TEST_LEGACY), \

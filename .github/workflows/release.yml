@@ -2,10 +2,16 @@ name: release
 
 # Push a tag vX.Y.Z (matching rnfs.__version__) to build every package and publish a GitHub Release with them,
 # SHA256SUMS and signed build provenance. Run it by hand (workflow_dispatch, on any branch or tag) to build the
-# same artifacts without releasing.
+# same artifacts without releasing. It also builds them, without releasing, for a pull request that changes the
+# packaging or the workflows and once a week, so a build that only a release runs (the Flatpak, the Windows exe,
+# the arm64 .deb, the Debian 12 smoke test) is known to work before a tag is pushed.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: ["packaging/**", "pyproject.toml", ".github/**"]
+  schedule:
+    - cron: "23 5 * * 1"  # Mondays, 05:23 UTC
   workflow_dispatch:
 
 permissions:
@@ -17,9 +23,10 @@ permissions:
 # --require-hashes, and builds run without build isolation, so nothing unpinned is fetched for a build.
 jobs:
   # The whole tests workflow (unit and end-to-end tests on every OS and Python, lint, packaging smoke tests);
-  # the release waits for it
+  # the release waits for it. A pull request runs tests.yml itself, so it isn't run twice
   tests:
     uses: ./.github/workflows/tests.yml
+    if: github.event_name != 'pull_request'
 
   version:
     runs-on: ubuntu-latest
@@ -39,6 +46,28 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The release notes are CHANGELOG.md's section for this version (`## X.Y.Z`, ended by the next `## `). A tag
+      # needs it to be the first section and no longer marked "(unreleased)"; any other run takes the version's
+      # section as it stands
+      - name: Release notes from CHANGELOG.md (and check the version's section is released)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          first=$(grep -m1 '^## ' CHANGELOG.md)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "$first" != "## $VERSION" ]; then
+            echo "::error::CHANGELOG.md's first section is \"$first\", not \"## $VERSION\" (still unreleased?)"
+            exit 1
+          fi
+          awk -v heading="## $VERSION" '
+            /^## / { if (on) exit; on = ($0 == heading || index($0, heading " (") == 1); next }
+            on' CHANGELOG.md > release-notes.md
+          grep -q . release-notes.md || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          cat release-notes.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: notes  # not release-*: it isn't one of the release's files
+          path: release-notes.md
+          if-no-files-found: error
 
   python:
     name: wheel and sdist
@@ -118,32 +147,10 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
-  flatpak-sources:
-    name: flatpak sources
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-        with:
-          persist-credentials: false  # no token left in .git/config for the build code that runs next
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-        with:
-          python-version: "3.12"
-      # The Flatpak's wheels must be the ones packaging/requirements.lock pins (what every other package
-      # installs): regenerate them from the lock and fail if that changes the committed files
-      - name: Check the pinned Flatpak wheels match packaging/requirements.lock
-        run: |
-          python -I packaging/flatpak/generate-sources.py
-          git diff --exit-code -- packaging/flatpak || {
-            echo "::error::packaging/flatpak/*.json is out of date: run python3 packaging/flatpak/generate-sources.py and commit"
-            exit 1
-          }
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: flatpak-sources
-          path: packaging/flatpak/*.json
-
+  # The committed packaging/flatpak/*.json are built: the tests workflow (tests.yml's flatpak-sources job, which
+  # the release waits for) checks they match packaging/requirements.lock
   flatpak:
-    needs: [version, flatpak-sources]
+    needs: version
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:c91a88269eee8fcdd73ecf43064232fbebe27411f926f63f38bdf70c51f2ceae
@@ -152,16 +159,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false  # no token left in .git/config for the build code that runs next
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-        with:
-          name: flatpak-sources
-          path: packaging/flatpak
       - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3  # v6
         with:
           manifest-path: packaging/flatpak/io.github.afit21.rnfs.yml
           bundle: rnfs.flatpak
           arch: x86_64
-          cache-key: flatpak-builder-${{ github.sha }}
+          # No Actions cache: any default-branch workflow can write one, and a restored cache would go into the
+          # attested bundle
+          cache: false
           upload-artifact: false
       - name: Install and smoke test the bundle
         # Best effort: running sandboxed apps inside the CI container depends on the runner's kernel settings
@@ -171,6 +176,8 @@ jobs:
           flatpak run io.github.afit21.rnfs --version
           if command -v python3 >/dev/null; then
             mkdir -p "$HOME/smoke-tmp"
+            # The sandbox reaches only ~/.rnfs, ~/.reticulum and Downloads unless granted more
+            flatpak override --user --filesystem="$HOME/smoke-tmp" io.github.afit21.rnfs
             TMPDIR="$HOME/smoke-tmp" python3 packaging/smoke_test.py flatpak run io.github.afit21.rnfs
           fi
       - name: Name it for the release
@@ -237,6 +244,10 @@ jobs:
           pattern: release-*
           path: artifacts
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: notes
+          path: notes
       - name: Checksums
         working-directory: artifacts
         run: |
@@ -252,8 +263,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
         # A release already made for this tag on GitHub's release page gets the files attached rather than
-        # failing; otherwise the release is created here. Files already attached are never replaced (no
-        # --clobber): users may have downloaded and checked them, so a re-run with the same names fails instead
+        # failing (its notes are left as they are); otherwise the release is created here, with the version's
+        # CHANGELOG.md section as its notes. Files already attached are never replaced (no --clobber): users may
+        # have downloaded and checked them, so a re-run with the same names fails instead
         run: |
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY"
@@ -261,6 +273,6 @@ jobs:
             gh release create "$GITHUB_REF_NAME" artifacts/* \
               --repo "$GITHUB_REPOSITORY" \
               --title "rnfs $VERSION" \
-              --generate-notes \
+              --notes-file notes/release-notes.md \
               --verify-tag
           fi

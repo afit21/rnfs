@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from unittest import mock
 
 import RNS
@@ -177,6 +178,48 @@ class PublicTests:
             self.assertEqual(f.read(), data)
         self.assertEqual(reads, [(0, len(data))])  # the rest in one read, not one per 8 KiB
 
+    def test_open_reads_ahead_while_sequential(self):
+        """Sequential refills double up to READ_AHEAD; a seek starts again with a refill of only what it covers."""
+        data = os.urandom(1_000_000)
+        cid = self.share(data, "f.bin")
+        reads = []
+        original = self.rnfs._backend.read
+
+        def spy(target, offset, length, raw, from_node):
+            """Record each read the file makes."""
+            reads.append((offset, length))
+            return original(target, offset, length, raw, from_node)
+        buffer = interface.FILE_BUFFER
+        with mock.patch.object(self.rnfs._backend, "read", spy), \
+                mock.patch.object(interface, "READ_AHEAD", 4 * buffer), self.rnfs.open(f"{cid}/f.bin") as f:
+            self.assertEqual(b"".join(iter(lambda: f.read(1000), b"")), data)
+            self.assertEqual(f.tell(), len(data))
+            self.assertEqual(reads, [(0, buffer), (buffer, 2 * buffer), (3 * buffer, 4 * buffer),
+                                     (7 * buffer, 4 * buffer), (11 * buffer, 4 * buffer),
+                                     (15 * buffer, len(data) - 15 * buffer)])
+            # Random reads: each refill reads only the chunks it covers, however far the read-ahead had grown
+            reads.clear()
+            for offset in (500_000, 10, 999_990, 300_000):
+                f.seek(offset)
+                self.assertEqual(f.read(10), data[offset:offset + 10])
+            self.assertEqual(reads, [(500_000, buffer), (10, buffer), (999_990, 10), (300_000, buffer)])
+            # Reading on from a seek grows again from FILE_BUFFER, and tell() counts what was read ahead as unread
+            reads.clear()
+            self.assertEqual(f.read(3 * buffer), data[300_010:300_010 + 3 * buffer])
+            self.assertEqual(f.tell(), 300_010 + 3 * buffer)
+            self.assertEqual(reads, [(300_000 + buffer, 2 * buffer), (300_000 + 3 * buffer, 4 * buffer)])
+            # A seek into what was read ahead (past the File's own buffer) reads it again, from there only
+            reads.clear()
+            f.seek(300_000 + 5 * buffer)
+            self.assertEqual(f.read(10), data[300_000 + 5 * buffer:300_010 + 5 * buffer])
+            self.assertEqual(reads, [(300_000 + 5 * buffer, buffer)])
+            # The rest: what was read ahead, then one read
+            reads.clear()
+            self.assertEqual(f.read(buffer), data[300_010 + 5 * buffer:300_010 + 6 * buffer])
+            self.assertEqual(f.read(), data[300_010 + 6 * buffer:])
+            self.assertEqual(reads, [(300_000 + 6 * buffer, 2 * buffer), (300_000 + 8 * buffer,
+                                                                          len(data) - 300_000 - 8 * buffer)])
+
     def test_cat_get_and_uri_targets(self):
         """cat and get, rnfs: URI targets (from= and a name), and block()."""
         data = os.urandom(100_000)
@@ -217,6 +260,30 @@ class PublicTests:
         self.assertIsInstance(self.rnfs.gc(), rnfs.Collected)
         self.assertEqual(self.rnfs.verify().bad, ())
 
+    def test_dir_set_and_rm(self):
+        """dir_set adds an entry, dir_rm removes it again; dir_rm of a root is ValueError (a 400 for a Client),
+        refused by the node itself before it fetches anything (ND3)."""
+        directory = self.share(b"inside", name="a.txt")
+        child = self.rnfs.add(b"child").cid
+        edited = self.rnfs.dir_set(directory, "b.txt", child, executable=True)
+        self.assertEqual([(e.name, e.kind) for e in self.rnfs.ls(edited)], [("a.txt", "file"), ("b.txt", "executable")])
+        self.assertEqual(self.rnfs.dir_rm(f"{edited}/b.txt"), directory)
+        remote = self.share(b"not here", name="c.txt")
+        for target in (remote, f"{remote}/"):
+            with self.subTest(target), self.assertRaisesRegex(ValueError, "the entry to remove"):
+                self.rnfs.dir_rm(target)
+        self.assertFalse(self.b.storage.has(remote))  # not fetched
+
+    def test_remote_pin_providers_and_ping(self):
+        """pin_remote asks the node (as /pin), providers finds the provider, ping times a node or answers None."""
+        cid = self.share(b"provided")
+        self.assertIs(self.rnfs.pin_remote(A_ID, cid), True)
+        self.assertIs(self.rnfs.pin_remote(A_ID, cid, pin=False), True)
+        self.assertEqual(self.net.pins, [(A_ID, cid, True), (A_ID, cid, False)])
+        self.assertIn(A_ID, self.rnfs.providers(cid))
+        self.assertEqual(self.rnfs.ping(A_ID), 0.1)
+        self.assertIsNone(self.rnfs.ping(OTHER))
+
     def test_errors_are_one_hierarchy(self):
         """The same exception classes whichever class raises them."""
         data = os.urandom(1000)
@@ -248,6 +315,24 @@ class PublicTests:
         with self.assertRaises(rnfs.NotFound):
             self.rnfs.names.get("site")
         self.assertEqual(self.rnfs.names.import_key("again", key).name, name.name)
+
+    def test_publish_warning_is_a_runtime_warning(self):
+        """The node's private-mode warning on publish (DHT-4) reaches the program as a RuntimeWarning, and the
+        record is returned as usual; without one, nothing is warned."""
+        cid = self.rnfs.add(b"site").cid
+        name = self.rnfs.names.create("site")
+        original = self.rnfs._backend.name_publish
+
+        def warning_publish(alias, target):
+            return {**original(alias, target), "warning": "visible outside the private network"}
+
+        with mock.patch.object(self.rnfs._backend, "name_publish", warning_publish), \
+                self.assertWarnsRegex(RuntimeWarning, "visible outside the private network"):
+            record = name.publish(cid)
+        self.assertEqual((record.cid, record.sequence), (cid, 1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertEqual(name.publish(cid).sequence, 2)
         self.assertEqual(rnfs.Name.from_dict(name.to_dict()), name)
 
     def test_watch_hears_newer_records_on_the_event_thread(self):
@@ -783,7 +868,8 @@ class ImportTest(unittest.TestCase):
     def test_client_loads_no_rns(self):
         """rnfs.Client, the objects and errors load no RNS."""
         code = ("import sys, rnfs; rnfs.Client(port=1); rnfs.Cid, rnfs.Record, rnfs.NotFound, rnfs.ApiError, "
-                "rnfs.Job, rnfs.File; print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
+                "rnfs.Job, rnfs.File, rnfs.SealError, rnfs.NotRecipient, rnfs.BlockMismatch; "
+                "print(any(m == 'RNS' or m.startswith('RNS.') for m in sys.modules))")
         self.assertEqual(self.run_python(code), "False")
 
     def test_node_loads_rns_when_used(self):
@@ -795,6 +881,11 @@ class ImportTest(unittest.TestCase):
         """API_STATUS, the exported names, and an unknown one."""
         self.assertEqual(rnfs.API_STATUS, "provisional")
         self.assertIs(rnfs.NotFound, __import__("rnfs.errors").errors.NotFound)
+        # The errors programs could only catch as ValueError before (XC4): the classes rnfs raises
+        from rnfs.content import blockstore, seal
+        self.assertIs(rnfs.SealError, seal.SealError)
+        self.assertIs(rnfs.NotRecipient, seal.NotRecipient)
+        self.assertIs(rnfs.BlockMismatch, blockstore.BlockMismatch)
         self.assertIs(rnfs.Client, remote.Client)
         self.assertIn("Node", dir(rnfs))
         with self.assertRaises(AttributeError):
