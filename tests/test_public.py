@@ -27,7 +27,7 @@ import rnfs
 from rnfs import api, cli, embedded, fsutil, interface, objects, remote
 from rnfs import events as events_module
 from rnfs.api import ApiHandler, ApiServer, NameWatches
-from rnfs.config import Config
+from rnfs.config import LXMF_DEPRECATION, Config
 from rnfs.content.cid import RAW, Cid
 from rnfs.features.lxmf import Link, encode_field
 from rnfs.names import encode_record
@@ -713,9 +713,12 @@ class PublicTests:
         self.assertEqual((settings["max_jobs"].value, settings["max_jobs"].live), (2, True))
         change = self.rnfs.config_set({"max_jobs": 3, "lxmf_accept_from": (SENDER.hex(),)})
         self.assertEqual((change.applied, change.restart_required), (("max_jobs", "lxmf_accept_from"), ()))
+        self.assertEqual(change.warnings, (f"lxmf_accept_from is deprecated: {LXMF_DEPRECATION}",))
         self.assertEqual(self.b.config.max_jobs, 3)
         settings = self.rnfs.config()
         self.assertEqual((settings["max_jobs"].file, settings["lxmf_accept_from"].file), (3, (SENDER.hex(),)))
+        self.assertEqual((settings["max_jobs"].deprecated, settings["lxmf_accept_from"].deprecated),
+                         (None, LXMF_DEPRECATION))
         self.assertEqual(rnfs.Settings.from_dict(settings.to_dict()), settings)
         for bad in ({"no_such_setting": 1}, {}, {"max_jobs": "many"}, "max_jobs"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):

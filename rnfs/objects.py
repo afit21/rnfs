@@ -674,7 +674,8 @@ class Setting(_Object):
     """One setting (config()): its schema (rnfs.config.settings_schema: name, group, type, choices, nullable,
     default, unit, minimum, maximum, exclusive_minimum, description, live: a change applies without a restart),
     the running value, rnfs.toml's (file; None where it doesn't set it), whether the command line (a Node's
-    settings) overrides rnfs.toml, and whether a restart would run another value (pending). Lists are tuples."""
+    settings) overrides rnfs.toml, and whether a restart would run another value (pending); deprecated: why the
+    setting is going away though it still works (the lxmf_* settings), else None. Lists are tuples."""
 
     name: str
     group: str | None = None
@@ -692,6 +693,7 @@ class Setting(_Object):
     file: object = _field(_frozen, None)
     overridden: bool = False
     pending: bool = False
+    deprecated: str | None = None  # last, after the fields a caller may give by position
 
     def __str__(self) -> str:
         """The setting's name."""

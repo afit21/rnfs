@@ -148,6 +148,9 @@ RETIRED_SETTINGS: MappingProxyType = MappingProxyType({
 # standard library only, so the CLI and rnfs.Client can say it without loading RNS
 LXMF_DEPRECATION = ("LXMF messaging is moving out of rnfs into a separate app built on the local API and the "
                     "library, and a later release removes it from rnfs")
+# Groups of settings (SECTIONS) that still work but are going away: group -> why. The schema gives each of their
+# settings that reason ("deprecated"), and rnfs.toml or a change through the API setting one is warned about
+DEPRECATED_GROUPS: MappingProxyType = MappingProxyType({"lxmf": LXMF_DEPRECATION})
 _TYPE_NAMES = {int: "int", float: "float", bool: "bool", str: "string", list[str]: "list[string]"}
 MAX_TOML_INT = 2 ** 63 - 1  # TOML integers are 64-bit signed
 
@@ -519,8 +522,9 @@ def settings_schema() -> list[dict]:
     "choice"), "choices" (a list for "choice", else None), "nullable" (whether it may be unset, taking the default
     its description says), "default", "unit" ("seconds", "bytes", "bits/s", "bytes/hour" or None), "minimum",
     "maximum" (None for no bound), "exclusive_minimum" (true: the value must be above minimum), "description",
-    "live" (a change through the API applies without a restart)}. Standard library only, so apps and the CLI can
-    use it without a daemon."""
+    "live" (a change through the API applies without a restart), "deprecated" (why the setting is going away,
+    though it still works, else None; DEPRECATED_GROUPS)}. Standard library only, so apps and the CLI can use it
+    without a daemon."""
     starts = dict((first, group) for group, first in SECTIONS)
     group = "core"
     schema = []
@@ -554,7 +558,25 @@ def _schema_entry(f, group: str) -> dict:
     default = f.default_factory() if f.default is MISSING else f.default
     return {"name": name, "group": group, "type": kind, "choices": list(CHOICES[name]) if name in CHOICES else None,
             "nullable": nullable, "default": default, "unit": unit, "minimum": minimum, "maximum": maximum,
-            "exclusive_minimum": exclusive, "description": DESCRIPTIONS[name], "live": name in LIVE_SETTINGS}
+            "exclusive_minimum": exclusive, "description": DESCRIPTIONS[name], "live": name in LIVE_SETTINGS,
+            "deprecated": DEPRECATED_GROUPS.get(group)}
+
+
+def deprecated_settings() -> dict[str, str]:
+    """The settings that still work but are going away (DEPRECATED_GROUPS), in Config's order: name -> why."""
+    return {entry["name"]: entry["deprecated"] for entry in settings_schema() if entry["deprecated"] is not None}
+
+
+def deprecation_warnings(names, where: str = "") -> list[str]:
+    """The warnings for setting names (any iterable of names): one per reason the deprecated ones among them have,
+    naming them, in Config's order, and where (e.g. " in <path>"); [] if none is deprecated."""
+    given = set(names)
+    reasons: dict[str, list[str]] = {}
+    for name, why in deprecated_settings().items():
+        if name in given:
+            reasons.setdefault(why, []).append(name)
+    return [f"{', '.join(listed)}{where} {'is' if len(listed) == 1 else 'are'} deprecated: {why}"
+            for why, listed in reasons.items()]
 
 
 # Editing rnfs.toml

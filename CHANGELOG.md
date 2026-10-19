@@ -49,6 +49,10 @@ Deprecated:
 - The `/api/lxmf/` routes' responses, errors included, carry `Deprecation: @1792368000` (RFC 9745: deprecated since
   2026-10-19); their bodies are unchanged. `GET /api/capabilities` gains `"deprecated": ["lxmf"]`
   (`Capabilities.deprecated`, `is_deprecated("lxmf")`).
+- The settings schema (`GET /api/config`, `rnfs.config.settings_schema()`, `Setting.deprecated`) gains
+  `deprecated`: for each `lxmf_*` setting why it is going away, `null` for the others; `rnfs config get` shows it.
+  `GET /api/config` warns about the `lxmf_*` settings `rnfs.toml` sets, and `POST /api/config/set` (`rnfs config
+  set`, printed on stderr) about those a change sets; removing one isn't warned about.
 
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
