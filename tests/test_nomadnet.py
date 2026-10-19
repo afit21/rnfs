@@ -404,6 +404,7 @@ class CliTest(ApiBase):
         self.assertEqual(self.run_cli("add", DEST + ":/page/missing.mu")[0], 1)
         self.assertEqual(self.run_cli("add", "-", "--identify")[0], 1)
 
+    @unittest.skipIf(os.name == "nt", "Windows reads ':' in a file name as a stream, so no file is named like a link")
     def test_local_file_named_like_a_link(self):
         os.makedirs(os.path.join(self.tmp.name, DEST + ":", "page"))
         local = os.path.join(self.tmp.name, DEST + ":", "page", "index.mu")

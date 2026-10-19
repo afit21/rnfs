@@ -78,17 +78,21 @@ END = bytes(1024)
 
 
 def files_of(top: str) -> dict:
-    """{relative path: (bytes, executable)} of the regular files below top, and {path/: None} of its directories."""
+    """{relative path: (bytes, executable)} of the regular files below top, and {path/: None} of its directories.
+
+    Paths are written with "/" on every OS. Windows keeps no execute bit (st_mode reports one only by file
+    extension), so an expected True there is support.POSIX_MODES."""
     found = {}
     for directory, dirs, names in os.walk(top):
         for name in dirs:
-            found[os.path.relpath(os.path.join(directory, name), top) + "/"] = None
+            found[os.path.relpath(os.path.join(directory, name), top).replace(os.sep, "/") + "/"] = None
         for name in names:
             path = os.path.join(directory, name)
             if os.path.islink(path):
                 continue
             with open(path, "rb") as f:
-                found[os.path.relpath(path, top)] = (f.read(), bool(os.stat(path).st_mode & stat.S_IXUSR))
+                found[os.path.relpath(path, top).replace(os.sep, "/")] = (f.read(),
+                                                                          bool(os.stat(path).st_mode & stat.S_IXUSR))
     return found
 
 
@@ -444,15 +448,21 @@ class FolderTarTest(unittest.TestCase):
         hard links is an ordinary file (never a hard-link member, which an unpacker would drop)."""
         top = os.path.join(self.tmp, "top")
         os.makedirs(top)
-        for name in ("plain", "back\\slash", "C:drive"):
+        # Windows reads "back\\slash" as a path and "C:drive" as a stream of a file C, so they exist only elsewhere
+        for name in ("plain",) + (("back\\slash", "C:drive") if os.name != "nt" else ()):
             with open(os.path.join(top, name), "wb") as f:
                 f.write(name.encode())
+        bad_name = False
         if os.name != "nt":
             os.link(os.path.join(top, "plain"), os.path.join(top, "linked"))
             os.mkfifo(os.path.join(top, "fifo"))  # noqa: TID251 - not on Windows (os.name checked above)
             os.symlink("/etc/passwd", os.path.join(top, "escape"))
-            with open(os.path.join(top.encode(), b"bad\xff"), "wb") as f:
-                f.write(b"x")
+            try:
+                with open(os.path.join(top.encode(), b"bad\xff"), "wb") as f:
+                    f.write(b"x")
+                bad_name = True
+            except OSError:
+                pass  # macOS (APFS) refuses names that aren't UTF-8 itself, so there is nothing to skip
         data, warnings = self.pack(top)
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
             members = {info.name: info for info in archive.getmembers()}
@@ -461,8 +471,9 @@ class FolderTarTest(unittest.TestCase):
         self.assertTrue(all(info.isfile() or info.isdir() for info in members.values()))
         expected = {"top", "top/plain"} | ({"top/linked"} if os.name != "nt" else set())
         self.assertEqual(set(members), expected)
-        self.assertEqual(len(warnings), 5 if os.name != "nt" else 2, warnings)
-        self.assertTrue(any("back\\slash" in text and "separator" in text for text in warnings), warnings)
+        self.assertEqual(len(warnings), 4 + bad_name if os.name != "nt" else 0, warnings)
+        if os.name != "nt":
+            self.assertTrue(any("back\\slash" in text and "separator" in text for text in warnings), warnings)
 
     def test_top_names_that_cant_be_used_are_refused(self):
         top = os.path.join(self.tmp, "top")

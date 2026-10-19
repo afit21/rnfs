@@ -300,13 +300,14 @@ class NameSyncTest(unittest.TestCase):
         if not CAN_SYMLINK:
             return
         link = os.path.join(self.tmp.name, "link")
-        os.symlink(self.folder, link)
+        # Links to directories: Windows needs to be told, and removes one as a directory
+        os.symlink(self.folder, link, target_is_directory=True)
         self.node.name_sync("site", link)
         self.tick()
         self.tick(SETTLE_TIME)
         cid = self.target()
-        os.remove(link)
-        os.symlink(os.path.join(root, "names"), link)
+        (os.rmdir if os.name == "nt" else os.remove)(link)
+        os.symlink(os.path.join(root, "names"), link, target_is_directory=True)
         self.write("index.html", b"<h1>changed</h1>")
         self.tick(PUBLISH_INTERVAL)
         self.tick(SETTLE_TIME)

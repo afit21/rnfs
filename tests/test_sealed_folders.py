@@ -20,7 +20,7 @@ from rnfs.errors import TooLarge
 from rnfs.features import jobs
 
 from tests import test_jobs, test_seal
-from tests.support import real, state_rows, wait_for
+from tests.support import POSIX_MODES, real, state_rows, wait_for
 from tests.test_seal import ALICE, BOB, open_all
 from tests.test_tar_stream import END, Blocks, files_of, member
 
@@ -285,7 +285,7 @@ class GetSealedFolderTest(SealedFolderBase):
         result = self.b.get(cid, out)
         self.assertEqual((result["extracted"], result["name"]), (True, "top"))
         self.assertEqual(len(result["warnings"]), 7 + (os.name == "nt"), result["warnings"])
-        self.assertEqual(files_of(out), {"good": (b"good", False), "sub/": None, "sub/deep": (b"deep", True)})
+        self.assertEqual(files_of(out), {"good": (b"good", False), "sub/": None, "sub/deep": (b"deep", POSIX_MODES)})
         self.assertFalse(os.stat(os.path.join(out, "sub", "deep")).st_mode & 0o4000)  # no setuid from a tar
         self.assertEqual(sorted(os.listdir(self.tmp.name)), sorted(["a", "b", "c", "out"]))
         self.assertFalse(os.path.lexists(os.path.join(os.path.dirname(self.tmp.name), "evil")))
