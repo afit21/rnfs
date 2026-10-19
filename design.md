@@ -918,8 +918,9 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
 
 ## Public API (rnfs.Node, rnfs.Client)
 
-**Provisional until 0.2.** Names, signatures and objects may change after use in a real app. Said in the
-module docstring of `rnfs/__init__.py`, in `rnfs.API_STATUS == "provisional"`, and in README.md.
+**Provisional until 1.0.0.** Names, signatures and objects, and the local API, may change after use in real apps,
+in 0.2.x releases too. Said in the module docstring of `rnfs/__init__.py`, in `rnfs.API_STATUS == "provisional"`,
+in README.md and in the OpenAPI reference (`docs/openapi.json`, `info`).
 
 Two classes with one interface (`rnfs.interface.Rnfs`): **`rnfs.Node`** runs a node inside the app's process,
 as RNS runs inside it; **`rnfs.Client`** drives the user's running daemon through its local API. Same methods,

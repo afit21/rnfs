@@ -1,4 +1,4 @@
-"""The objects rnfs.Node and rnfs.Client return (design.md, "Public API"; provisional until 0.2). No RNS.
+"""The objects rnfs.Node and rnfs.Client return (design.md, "Public API"; provisional until 1.0.0). No RNS.
 
 Each is a frozen dataclass made from the local API's JSON form (from_dict, which the facade's dicts share) and
 turned back into it (to_dict: CIDs as their written form, node IDs, names and hashes as hex, nested objects as

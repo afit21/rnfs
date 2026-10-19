@@ -102,6 +102,8 @@ Added, for apps:
   `unsupported`). So a 404 for an endpoint a daemon lacks (`no_such_endpoint`) is told from one for missing
   content (`not_found`). `ApiError.code`, and `NoSuchEndpoint` and `Unsupported` (both `NotFound`s) in the
   library, which also recognises an older daemon's unknown-endpoint 404 by its message.
+- **No API stability until 1.0.0:** the library (`rnfs.Node`, `rnfs.Client`) and the local API stay provisional
+  (`rnfs.API_STATUS`), and may change in 0.2.x releases; `GET /api/capabilities` says what a daemon offers.
 - **An OpenAPI reference for the local API:** `docs/openapi.json` (OpenAPI 3.1) describes every route, its
   parameters and bodies (streamed ones too), its answers, the error codes, the token headers, the `Deprecation`
   header and the event kinds, for apps in any language; tests check it against the code (routes, codes, kinds,

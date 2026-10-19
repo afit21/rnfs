@@ -542,7 +542,8 @@ errors:
 - **`rnfs.Client`** uses the user's running daemon (their content, pins and names). It never loads Reticulum,
   so it starts fast.
 
-**The API is provisional until rnfs 0.2** (`rnfs.API_STATUS`).
+**The API is provisional until rnfs 1.0.0** (`rnfs.API_STATUS`): the library and the local API may change in
+0.2.x releases too; `capabilities()` (`GET /api/capabilities`) says what a daemon offers.
 
 ```python
 import RNS, rnfs

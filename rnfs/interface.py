@@ -1,4 +1,4 @@
-"""The interface rnfs.Node and rnfs.Client share (design.md, "Public API"; provisional until 0.2). No RNS.
+"""The interface rnfs.Node and rnfs.Client share (design.md, "Public API"; provisional until 1.0.0). No RNS.
 
 Rnfs implements every method once, over a backend offering the node facade's operations with the local API's
 argument and result forms (JSON-ready dicts; CIDs written out, node IDs and names as hex): rnfs.embedded's over

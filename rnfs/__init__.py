@@ -1,8 +1,8 @@
 """rnfs: content-addressed file sharing over Reticulum (RNS).
 
-For programs (design.md, "Public API"). PROVISIONAL until rnfs 0.2 (API_STATUS): names, signatures and objects
-may still change. Two classes with the same methods, objects and exceptions, so a program switches by changing
-the line that constructs one:
+For programs (design.md, "Public API"). PROVISIONAL until rnfs 1.0.0 (API_STATUS): names, signatures and objects,
+and the local API (docs/openapi.json), may still change, in 0.2.x releases too. Two classes with the same methods,
+objects and exceptions, so a program switches by changing the line that constructs one:
 - rnfs.Node(rnfs_dir, reticulum=..., settings=...) runs a node inside the program, beside its own Reticulum;
 - rnfs.Client(rnfs_dir=None) uses the user's running daemon through its local API (it never loads RNS).
 Every public name is loaded when first used, so `import rnfs` loads nothing more, and RNS only with rnfs.Node.
@@ -21,7 +21,7 @@ interface.py, objects.py, embedded.py, remote.py: the public API (rnfs.Node, rnf
 """
 
 __version__ = "0.1.6"
-API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) may change until rnfs 0.2
+API_STATUS = "provisional"  # the public API (rnfs.Node, rnfs.Client) and the local API may change until 1.0.0
 
 # Public name -> the module defining it, imported on first use (PEP 562)
 _EXPORTS = {

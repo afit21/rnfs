@@ -1,5 +1,5 @@
 """rnfs.Node: an rnfs node inside the program's own process, as RNS runs inside it (design.md, "Public API";
-provisional until 0.2). Importing this module loads RNS; `import rnfs` loads it only when rnfs.Node is used.
+provisional until 1.0.0). Importing this module loads RNS; `import rnfs` loads it only when rnfs.Node is used.
 
 It is an RnfsNode (rnfs/node.py) started embedded, in its own rnfs dir, behind rnfs.interface's methods:
 - Reticulum is the program's running instance (or one the node starts, from the reticulum_dir setting, if none
