@@ -101,19 +101,23 @@ class SleepingLookup(FakeLookup):
 class SlowClient(FakeClient):
     """A FakeClient whose /provide takes delay seconds, counting the requests in flight at once (the most in peak)."""
 
-    def __init__(self, delay: float):
-        """Each request takes delay seconds."""
+    def __init__(self, delay: float, together: int = 0):
+        """Each request takes delay seconds, and is held (up to 5 s) until together have been in flight at once, so
+        the peak doesn't depend on how fast a runner starts threads."""
         super().__init__()
-        self.delay = delay
+        self.delay, self.together = delay, together
         self.now = self.peak = 0
+        self.in_flight = threading.Condition()
 
     def provide(self, node_id, keys, withdrawn):
         """Record the request after delay seconds."""
-        with self.lock:
+        with self.in_flight:
             self.now += 1
             self.peak = max(self.peak, self.now)
+            self.in_flight.notify_all()
+            self.in_flight.wait_for(lambda: self.peak >= self.together, timeout=5)
         time.sleep(self.delay)
-        with self.lock:
+        with self.in_flight:
             self.now -= 1
         return super().provide(node_id, keys, withdrawn)
 
@@ -874,7 +878,7 @@ class PublisherTest(PublisherCase):
         rounds = []
         for parallel in (PROVIDE_PARALLEL, 1):
             with self.subTest(parallel=parallel), mock.patch.object(publisher_module, "PROVIDE_PARALLEL", parallel):
-                self.client = SlowClient(0.02)
+                self.client = SlowClient(0.02, together=parallel)
                 publisher = self.make_publisher(state=os.path.join(self.tmp.name, f"state {parallel}"))
                 publisher._withdrawals = {N1: {gone}, servers[3]: {gone}, N3: {gone}}  # as if queued earlier
                 publisher.refresh()

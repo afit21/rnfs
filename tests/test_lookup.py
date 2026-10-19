@@ -799,7 +799,8 @@ class CandidatesTest(LookupTestCase):
             net.add(n)
         net.hang.add(hung)
         far = ident(0x8000)  # unreliable and never asked: there are enough others
-        lookup = self.lookup(net, key, [dead, hung, far] + near, timeout=0.3, unreliable={far}.__contains__)
+        # The lookup waits out the hung node: long enough that the near nodes' answers, on threads, are in by then
+        lookup = self.lookup(net, key, [dead, hung, far] + near, timeout=2, unreliable={far}.__contains__)
         lookup.find_closest()
         self.assertEqual(lookup.candidates(), {**{n: FIRST for n in near}, far: UNRELIABLE})
 

@@ -25,7 +25,7 @@ from rnfs.network import client as client_module, links, protocol, server
 from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
 from tests.fakes.client import BATCH, FakeClient
 from tests.fakes.log import quiet_log
-from tests.support import failing_commits, state_execute, state_rows
+from tests.support import FakeClock, failing_commits, state_execute, state_rows
 import tests.test_links as link_fakes  # a module, so its test cases don't run twice
 
 OWN = bytes(16)
@@ -284,6 +284,11 @@ class FailureRuleTest(FetcherTest):
 class ScoreTest(FetcherTest):
     """Local scores (section 6): raised by verified blocks and the answers that led to them, lowered by failures."""
 
+    def setUp(self):
+        """Scores on a clock that stands still, so none decays while a slow runner works through a fetch."""
+        super().setUp()
+        self.fetcher.scores.clock = FakeClock()
+
     def test_verified_blocks_raise_the_provider_and_once_per_fetch_its_listers(self):
         self.config.max_parallel_providers = 1
         built = self.file(os.urandom(5 * CHUNK_SIZE))
@@ -294,7 +299,6 @@ class ScoreTest(FetcherTest):
         responses = len([n for n, _ in self.client.requests if n == P1])
         self.assertGreater(responses, 1)
         scores = self.fetcher.scores
-        # Scores decay on the wall clock, by a hair during the test
         self.assertAlmostEqual(scores.score(P1), responses * scoring.SERVED, places=4)
         self.assertAlmostEqual(scores.score(P2), scoring.USEFUL_ANSWER, places=4)
         self.assertAlmostEqual(scores.score(P3), scoring.USEFUL_ANSWER, places=4)

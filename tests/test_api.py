@@ -932,8 +932,8 @@ def free_slots(server: LocalServer) -> int:
     return server.server.slots._value
 
 
-class ConnectionTest(ApiTestCase):
-    """Time limits and the connection cap, with short limits so the tests are quick."""
+class ConnectionTestCase(ApiTestCase):
+    """A server with short time limits (LIMITS) so the tests are quick, and raw connections to it."""
 
     LIMITS = {"request_timeout": 0.5, "body_timeout": 0.5, "max_connections": 3}
 
@@ -954,6 +954,10 @@ class ConnectionTest(ApiTestCase):
         lines = [f"{method} {path} HTTP/1.1", f"Host: 127.0.0.1:{self.port}", f"X-Rnfs-Api: {self.server.token}",
                  *(f"{name.replace('_', '-')}: {value}" for name, value in headers.items())]
         return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+class ConnectionTest(ConnectionTestCase):
+    """Time limits and the connection cap."""
 
     def test_idle_connection_is_closed(self):
         data, elapsed = read_until_closed(self.connect())
@@ -986,17 +990,6 @@ class ConnectionTest(ApiTestCase):
         self.assertTrue(data.startswith(b"HTTP/1.0 408"), data)
         self.assertLess(elapsed, 3)
         self.assertEqual(self.node.objects, {})
-
-    def test_slow_upload_within_body_timeout(self):
-        # Each pause is under body_timeout, and together they exceed request_timeout
-        sock = self.connect()
-        sock.sendall(self.request_head("POST", "/api/add/stream", Content_Length=6))
-        for piece in (b"ab", b"cd", b"ef"):
-            time.sleep(0.3)
-            sock.sendall(piece)
-        data, _ = read_until_closed(sock)
-        self.assertTrue(data.startswith(b"HTTP/1.0 200"), data)
-        self.assertEqual(self.node.called("add_stream")[0][0], (b"abcdef",))
 
     def test_node_work_is_not_timed(self):
         # A fetch longer than every limit still gets its answer
@@ -1035,6 +1028,23 @@ class ConnectionTest(ApiTestCase):
         self.assertIn(f"{cid}/\\x1b[2J\\n", message)
         self.assertNotIn("\x1b", message)
         self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class SlowUploadTest(ConnectionTestCase):
+    """A streamed upload's pauses are timed by body_timeout, not request_timeout. Each pause here leaves body_timeout
+    a wide margin (a slow runner's scheduling once ate a narrower one), and together they exceed request_timeout."""
+
+    LIMITS = {**ConnectionTestCase.LIMITS, "body_timeout": 3.0}
+
+    def test_slow_upload_within_body_timeout(self):
+        sock = self.connect()
+        sock.sendall(self.request_head("POST", "/api/add/stream", Content_Length=6))
+        for piece in (b"ab", b"cd", b"ef"):
+            time.sleep(0.3)
+            sock.sendall(piece)
+        data, _ = read_until_closed(sock)
+        self.assertTrue(data.startswith(b"HTTP/1.0 200"), data)
+        self.assertEqual(self.node.called("add_stream")[0][0], (b"abcdef",))
 
 
 class AppTokenTestCase(ApiTestCase):

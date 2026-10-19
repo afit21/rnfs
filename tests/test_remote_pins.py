@@ -66,7 +66,10 @@ class FakeProviding:
         self.running = 0
         self.most = 0
         self.delay = 0.0
-        self.lock = threading.Lock()
+        # Hold each lookup (up to 5 s) until this many have run at once: a count of lookups at once that doesn't
+        # depend on how fast a runner starts threads
+        self.together = 0
+        self.lock = threading.Condition()
 
     def __call__(self, node_id: bytes, cid: Cid) -> bool | None:
         """Whether node_id provides cid (None while inconclusive)."""
@@ -74,6 +77,8 @@ class FakeProviding:
             self.calls.append((node_id, cid))
             self.running += 1
             self.most = max(self.most, self.running)
+            self.lock.notify_all()
+            self.lock.wait_for(lambda: self.most >= self.together, timeout=5)
         try:
             if self.delay:
                 time.sleep(self.delay)
@@ -211,7 +216,7 @@ class AskedPinsTest(unittest.TestCase):
         for n in range(100):
             self.asked.record(N1, cid_of(n), True, True)
         self.clock.now += remote_pins.FIRST_CHECK[False]
-        self.providing.delay = 0.05
+        self.providing.together = remote_pins.CHECKS_AT_ONCE[False]
         self.assertEqual(self.asked.check_due(), remote_pins.CHECKS_AT_ONCE[False])
         self.assertEqual(self.providing.most, remote_pins.CHECKS_AT_ONCE[False])
         total = remote_pins.CHECKS_AT_ONCE[False] + sum(self.asked.check_due() for _ in range(30))
