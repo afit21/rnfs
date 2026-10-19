@@ -675,8 +675,11 @@ def run_ping(args):
 
 
 def run_name_create(args):
-    """Create a name key; print the name."""
-    print(printable(client(args).name_create(args.alias)["name"]))
+    """Create a name key; print the name, and on stderr how to back up its key."""
+    result = client(args).name_create(args.alias)
+    print(printable(result["name"]))
+    if result.get("warning"):  # an older daemon gives none
+        warn(result["warning"])
 
 
 def run_name_rm(args):
@@ -716,6 +719,8 @@ def run_name_import(args):
             fail(f"can't read {args.file}: {e}")
     result = client(args).call("POST", "/api/name/import", params={"alias": args.alias}, body=key)
     print(printable(result["name"]))
+    if result.get("warning"):
+        warn(result["warning"])
 
 
 def run_name_list(args):

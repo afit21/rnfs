@@ -243,6 +243,17 @@ class LocalFacadeTest(NodeTest):
         self.a.name_rm("site")
         self.assertNotIn(Cid.parse(published["cid"]), self.a.publisher.provided())
 
+    def test_name_key_backups(self):
+        """create and import remind the user to back the key up; status lists the keys never exported until the
+        user's export (not a feature reading the key) or an import."""
+        created = self.a.name_create("site")
+        self.assertIn("rnfs name export site", created["warning"])
+        self.assertEqual(self.a.status()["unexported_names"], ["site"])
+        key = self.a.name_export("site")
+        self.assertEqual(self.a.status()["unexported_names"], [])
+        self.assertIn("rnfs name export moved", self.b.name_import("moved", key)["warning"])
+        self.assertEqual(self.b.status()["unexported_names"], [])
+
 
 class NetworkFacadeTest(NodeTest):
     """B fetching from A through the backend."""

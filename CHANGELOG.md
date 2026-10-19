@@ -9,8 +9,9 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains two tables (`pin_times`, `pin_labels`); an older rnfs can't open it
-  afterwards. Pins made before the upgrade have no `added` time.
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`); an older rnfs can't
+  open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count as
+  never exported (`rnfs status` lists them until `rnfs name export` is run).
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
@@ -83,6 +84,13 @@ Added, for apps:
   labels, the cache, settings, streams). A Node raises what a Client gets back.
 - **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
+
+Added:
+- **Name key backups:** losing a name's key loses the name for good. `rnfs name create` and `rnfs name import`
+  say so and print the `rnfs name export` command (the API's results carry it as `warning`); the node remembers
+  which keys were exported by `name export` or imported, and `rnfs status` (`GET /api/status`,
+  `Status.unexported_names`) lists the names whose key never was. `name list` entries and `rnfs.Name` gain
+  `exported`.
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

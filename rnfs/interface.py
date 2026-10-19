@@ -1040,14 +1040,16 @@ class File(io.BufferedReader):
 
 @dataclass(frozen=True)
 class Name:
-    """A name of this node: its alias, the name (16 bytes; str() is its hex), and the CID and sequence it last
-    published (None and 0 before a publish). A snapshot: refresh() reads it again."""
+    """A name of this node: its alias, the name (16 bytes; str() is its hex), the CID and sequence it last
+    published (None and 0 before a publish), and whether its key was ever exported or imported (False: losing
+    this node's copy would lose the name for good). A snapshot: refresh() reads it again."""
 
     alias: str
     name: bytes
     cid: Cid | None = None
     sequence: int = 0
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
+    exported: bool = False
 
     def __str__(self) -> str:
         """The name in hex."""
@@ -1060,15 +1062,16 @@ class Name:
 
     @classmethod
     def from_dict(cls, data: dict, owner: Rnfs | None = None) -> "Name":
-        """From the API's form: {"alias", "name", "cid", "sequence"}."""
+        """From the API's form: {"alias", "name", "cid", "sequence", "exported"} ("exported" is missing from an
+        older daemon's: False)."""
         cid = data.get("cid")
         return cls(data["alias"], bytes.fromhex(data["name"]), Cid.parse(cid) if cid else None,
-                   data.get("sequence", 0), owner)
+                   data.get("sequence", 0), owner, bool(data.get("exported", False)))
 
     def to_dict(self) -> dict:
         """The API's form."""
         return {"alias": self.alias, "name": self.name.hex(), "cid": str(self.cid) if self.cid else None,
-                "sequence": self.sequence}
+                "sequence": self.sequence, "exported": self.exported}
 
     def publish(self, target) -> Record:
         """Point the name at target (a path in it resolved locally) and announce it; the new record. Raises

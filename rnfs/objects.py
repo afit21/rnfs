@@ -218,6 +218,7 @@ class Status(_Object):
     used_bytes: int | None = None
     max_storage: int | None = None
     names: int | None = None
+    unexported_names: list | None = None  # aliases whose key was never exported or imported (rnfs 0.2.0)
     features: dict = field(default_factory=dict, repr=False, metadata={"json": False})
 
     def to_dict(self) -> dict:

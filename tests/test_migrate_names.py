@@ -157,8 +157,9 @@ class NamesFileTest(FileTests, MigrateNamesTest):
         self.assertEqual(self.rows("SELECT name, sequence, cid, heard FROM names_held ORDER BY name"),
                          sorted([(N[1], str(MAX), C.binary, 99.5), (self.site, "5", A.binary, 1234.0)]))
         self.assertEqual(manager.list(), [
-            {"alias": "moved", "name": self.moved.hex(), "cid": None, "sequence": 0},
-            {"alias": "site", "name": self.site.hex(), "cid": str(A), "sequence": 5}])
+            # Keys from before 0.2.0 count as never exported (name_exports has no row for them)
+            {"alias": "moved", "name": self.moved.hex(), "cid": None, "sequence": 0, "exported": False},
+            {"alias": "site", "name": self.site.hex(), "cid": str(A), "sequence": 5, "exported": False}])
         self.assertEqual((manager._published["moved"].imported, manager._published["site"].imported), (True, False))
         self.assertEqual(manager.record(N[1]), Record(MAX, C, 99.5))
         self.assertEqual(manager._gone, [("gone", B)])  # its pin is released once the node is set up

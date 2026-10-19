@@ -150,6 +150,11 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # A label the user gave a pin (pin label), kept apart from where it was added from (pin_names); dump()ed
         "CREATE TABLE pin_labels (cid BLOB PRIMARY KEY, label TEXT NOT NULL) WITHOUT ROWID",
     )),
+    ("name_exports", (
+        # Name keys known to exist outside this node (rnfs 0.2.0): exported through `name export` (how "export")
+        # or imported from such a file (how "import"), when it last happened. A key made before 0.2.0 has no row
+        "CREATE TABLE name_exports (name BLOB PRIMARY KEY, at REAL NOT NULL, how TEXT NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

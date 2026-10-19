@@ -53,7 +53,7 @@ from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, TooL
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
-from rnfs.names import NameManager, RnsNetwork, parse_name
+from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, rates
 from rnfs.network.announces import DhtAnnounceHandler, DhtAnnouncer, parse_mode
@@ -2064,20 +2064,23 @@ class RnfsNode:
     # Facade: names
 
     def name_create(self, alias: str) -> dict:
-        """Create a name key."""
-        return {"alias": alias, "name": self.names.create(alias).hex()}
+        """Create a name key; the result's "warning" says how to back it up."""
+        return {"alias": alias, "name": self.names.create(alias).hex(), "warning": key_backup_warning(alias)}
 
     def name_import(self, alias: str, key_bytes: bytes) -> dict:
-        """Import a name key exported elsewhere."""
-        return {"alias": alias, "name": self.names.import_key(alias, key_bytes).hex()}
+        """Import a name key exported elsewhere; the result's "warning" says how to back it up."""
+        return {"alias": alias, "name": self.names.import_key(alias, key_bytes).hex(),
+                "warning": key_backup_warning(alias)}
 
     def name_rm(self, alias: str):
         """Delete a name key, releasing its pin."""
         self.names.remove(alias)
 
     def name_export(self, alias: str) -> bytes:
-        """A name's private key."""
-        return self.names.export_key(alias)
+        """A name's private key, for the user to keep: from now on the name isn't listed as never exported."""
+        key = self.names.export_key(alias)
+        self.names.mark_exported(alias)
+        return key
 
     def name_list(self) -> list[dict]:
         """This node's names."""
@@ -2179,6 +2182,6 @@ class RnfsNode:
                 "records": self.records.record_count(), "pins": self.storage.pin_count(),
                 "provided": len(self.publisher.provided()), "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
-                "names": len(self.names.list()),
+                "names": len(self.names.list()), "unexported_names": self.names.unexported(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}
 

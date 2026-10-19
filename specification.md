@@ -1233,7 +1233,7 @@ are local conveniences, not part of the protocol.
 | `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
 | `providers <cid>` | Find nodes providing a CID |
 | `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
-| `name create\|rm\|export\|import <alias>`, `name list` | Manage name keys; `rm` releases the name's pin |
+| `name create\|rm\|export\|import <alias>`, `name list` | Manage name keys; `rm` releases the name's pin. A name can't move to another key, so losing its key loses the name for good: `create` and `import` say so and give the `export` command, the node remembers which keys were exported (by `name export`) or imported, and `status` lists the others (`unexported_names`; keys made before rnfs 0.2.0 count as never exported) |
 | `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |

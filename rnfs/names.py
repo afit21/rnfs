@@ -652,6 +652,13 @@ class _NameFloor(Mapping):
 # Names
 
 
+def key_backup_warning(alias: str) -> str:
+    """What `name create` and `name import` tell the user: a name can't move to another key, so its key file is
+    the name. alias is a checked alias (check_alias), safe to show as a command."""
+    return (f"losing this name's key loses the name for good (nothing can move a name to a new key); keep a copy: "
+            f"rnfs name export {alias} -o {alias}.key")
+
+
 def _wait_event(event: threading.Event, timeout: float) -> bool:
     """Wait up to timeout seconds for event to be set: True if it was."""
     return event.wait(timeout)
@@ -730,6 +737,9 @@ class NameManager:
         # alias -> CIDs its pin source holds that its record doesn't (left by a crash, or an unpin that failed):
         # released by its next publish or removal
         self._stale: dict[str, set[Cid]] = {}
+        # Names whose key is known to exist outside this node: name -> (when, "export" or "import"), saved at once
+        # (name_exports). A key whose loss would lose the name for good has no entry (unexported())
+        self._exports: dict[bytes, tuple[float, str]] = {}
 
         self._remove_old_temps()
         self._db = statedb.connect(config.state_dir)
@@ -770,13 +780,37 @@ class NameManager:
             if name in self._aliases:
                 raise ValueError(f"this key is already held as {self._aliases[name]}")
             self._add_key(alias, identity, _Published(0, None, imported=True))
+            # It came from an export: the file it was imported from is a copy of the key
+            self._note_export(name, "import")
         log(f"imported name {name.hex()} as {alias}", LOG_NOTICE)
         return name
 
     def export_key(self, alias: str) -> bytes:
-        """The private key of alias's name, for import_key on another machine. NotFound if no such alias."""
+        """The private key of alias's name, for import_key on another machine. NotFound if no such alias.
+
+        Doesn't count as a backup (features read keys through it too): the user's export calls mark_exported."""
         with self._lock:
             return self._identity(alias).get_private_key()
+
+    def mark_exported(self, alias: str):
+        """Note that alias's key was exported for the user (`name export`), so it is no longer listed as having no
+        copy outside this node. NotFound if no such alias."""
+        with self._lock:
+            self._identity(alias)
+            self._note_export(self._names[alias], "export")
+
+    def unexported(self) -> list[str]:
+        """The aliases whose key has never been exported or imported (as far as this node knows, which for keys
+        made before rnfs 0.2.0 is never): losing this node's copy would lose those names for good."""
+        with self._lock:
+            return sorted(alias for alias, name in self._names.items() if name not in self._exports)
+
+    def _note_export(self, name: bytes, how: str):
+        """Record that name's key exists outside this node (how: "export" or "import"), durably. Lock held."""
+        at = self._clock()
+        with self._db.transaction(durable=True) as tx:
+            tx.execute("INSERT OR REPLACE INTO name_exports (name, at, how) VALUES (?, ?, ?)", (name, at, how))
+        self._exports[name] = (at, how)
 
     def remove(self, alias: str):
         """Delete alias's key, stop announcing it and release its pin. Its highest sequence stays persisted."""
@@ -796,6 +830,9 @@ class NameManager:
             del self._aliases[name]
             del self._keys[alias]
             self._recorded.discard(alias)
+            if self._exports.pop(name, None) is not None:
+                with self._db.transaction(durable=True) as tx:
+                    tx.execute("DELETE FROM name_exports WHERE name = ?", (name,))
             # State first: a crash before the key file is gone leaves an unpublished name, not a lost pin
             self._save()
             key_path = self._key_path(alias)
@@ -887,14 +924,15 @@ class NameManager:
             return self._names[alias]
 
     def list(self) -> list[dict]:
-        """[{"alias", "name", "cid" or None, "sequence"}] for every local name, by alias."""
+        """[{"alias", "name", "cid" or None, "sequence", "exported"}] for every local name, by alias ("exported":
+        its key was exported or imported, unexported())."""
         with self._lock:
             result = []
             for alias in sorted(self._keys):
                 published = self._published.get(alias, _Published(0, None))
                 result.append({"alias": alias, "name": self._names[alias].hex(),
                                "cid": str(published.cid) if published.cid is not None else None,
-                               "sequence": published.sequence})
+                               "sequence": published.sequence, "exported": self._names[alias] in self._exports})
             return result
 
     # Publishing
@@ -1542,6 +1580,9 @@ class NameManager:
             for row in self._db.query("SELECT name, sequence, cid, heard FROM names_held ORDER BY name"):
                 name, record = _held_row(*row)
                 self._held[name] = record
+            for name, at, how in self._db.query("SELECT name, at, how FROM name_exports"):
+                # Only ever read for a reminder: a malformed row counts as an export rather than stop startup
+                self._exports[name] = (at, how)
         except (TypeError, ValueError) as e:
             raise RnfsError(f"malformed name record in {self._db.path} ({e}); rnfs won't start on it, since starting "
                             "without it would let a name go back to an older record") from None

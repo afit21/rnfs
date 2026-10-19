@@ -292,9 +292,37 @@ class KeyTest(NamesTestCase):
         with open(path, "rb") as f:
             self.assertEqual(len(f.read()), 64)  # RNS's raw private key, unchanged by newline translation
         self.assertEqual(len(name), 16)
-        self.assertEqual(self.manager.list(), [{"alias": "site", "name": name.hex(), "cid": None, "sequence": 0}])
+        self.assertEqual(self.manager.list(), [{"alias": "site", "name": name.hex(), "cid": None, "sequence": 0,
+                                                "exported": False}])
         with self.assertRaises(ValueError):
             self.manager.create("site")
+
+    def test_keys_never_exported_are_listed_until_exported(self):
+        """A created key is unexported until the user exports it; an imported one never is (the file it came from
+        is a copy); reading a key for a feature (export_key) doesn't count; it all survives a restart, and rm
+        forgets it."""
+        self.manager.create("made")
+        self.manager.create("other")
+        key = self.manager.export_key("other")  # what keepers and the user's export both call
+        self.assertEqual(self.manager.unexported(), ["made", "other"])
+        self.manager.mark_exported("other")
+        self.assertEqual(self.manager.unexported(), ["made"])
+        self.manager.remove("other")
+        self.manager.import_key("again", key)
+        self.assertEqual(self.manager.unexported(), ["made"])
+        self.assertEqual({entry["alias"]: entry["exported"] for entry in self.manager.list()},
+                         {"made": False, "again": True})
+        with self.assertRaises(NotFound):
+            self.manager.mark_exported("missing")
+        self.manager.close()
+        self.manager = self.make_manager()
+        self.assertEqual(self.manager.unexported(), ["made"])
+        self.manager.remove("again")
+        self.assertEqual(self.rows("SELECT how FROM name_exports"), [])
+
+    def test_backup_warning_names_the_export_command(self):
+        """create's and import's reminder gives the command that backs the key up."""
+        self.assertIn("rnfs name export site -o site.key", names.key_backup_warning("site"))
 
     @unittest.skipUnless(CAN_SYMLINK, "creating symlinks needs Developer Mode or an admin on Windows")
     def test_create_refuses_an_alias_whose_key_is_a_dangling_symlink(self):
