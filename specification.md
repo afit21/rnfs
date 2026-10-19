@@ -922,8 +922,9 @@ a directory above the folder can be changed by other users, who could replace th
     *pinned*, *dropped* (`quota`; the fetch failing: `not_found`, `denied`, `invalid_dag`, `too_large`,
     `storage_full`, `failed`; released by the deny list, `denied`; waiting at a start from an identity no longer
     on `remote_pin_identities`, `identity_removed`; recorded as current but lost in a crash, `lost`), *refused*
-    (`denied`, `queue_full`, `failed`) or *released* by its identity, with when. Pins and pins waiting are what it
-    holds; rnfs keeps the latest outcome of at most 1 000 others (those that ended go first, oldest first). It
+    (`denied`, `queue_full`, `failed`) or *released* by its identity, with when. Its pins and the pins queued
+    are listed as it holds them, whatever was recorded; rnfs keeps the latest outcome of each pin, at most 1 000
+    (past that those that ended go first, then pinned ones, oldest first; never one waiting or fetching). It
     reports each identity's use of `remote_pin_quota`, counted as the quota counts it.
 
 **Deny lists.** A node MAY refuse chosen content, so operators of public gateways and provider nodes can keep it
