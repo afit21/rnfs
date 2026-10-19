@@ -2835,5 +2835,16 @@ class RnfsNode:
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
                 "local_servers": len(self.local), **self.partition.state(),
+                "network": self._network_status(), "record_store": self.records.usage(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}
+
+    def _network_status(self) -> dict:
+        """What the node sees of the network, for status() (specification section 11), from what it keeps in memory:
+        {"size_estimate": the DHT servers the density check estimates there are (None until enough lookups
+        completed), "size_samples": the complete lookups it pools (it needs MIN_SIZE_SAMPLES), and how many searches
+        and published keys the density check ran on and fired on in the last hour and day (CheckCounts.status)}.
+        The routing table's servers, the local servers and partition mode are status() fields of their own."""
+        estimate = self.sizes.estimate()
+        return {"size_estimate": None if estimate is None else round(estimate), "size_samples": len(self.sizes),
+                **self.lookups.checks.status()}
 

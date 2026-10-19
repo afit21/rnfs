@@ -230,6 +230,13 @@ class Status(_Object):
     local_servers: int | None = None  # the servers on this node's island it knows of (rnfs 0.2.0)
     partition: bool | None = None  # cut off from the servers beyond its island: local ones only (rnfs 0.2.0)
     partition_since: float | None = None  # Unix time partition mode began, while in it
+    # What the node sees of the network (rnfs 0.2.0): {"size_estimate" (DHT servers, None until estimated),
+    # "size_samples", "density_checked_hour", "density_flagged_hour", "density_checked_day", "density_flagged_day"}
+    network: dict | None = None
+    # The provider records it stores against record_budget (rnfs 0.2.0): {"bytes", "budget", "capacity", "full",
+    # "publishers", "own_records", "tiers": {"known"|"earned"|"newcomer": {"records", "share", "floor",
+    # "refused_hour", "refused_day", "evicted_hour", "evicted_day"}}}
+    record_store: dict | None = None
     features: dict = field(default_factory=dict, repr=False, metadata={"json": False})
 
     def to_dict(self) -> dict:

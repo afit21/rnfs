@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -330,6 +331,45 @@ class OtherCommandTest(CliTestCase):
         self.assertEqual(self.ok("ping", "cd" * 16), "round-trip time 250 ms\n")
         self.assertEqual(self.run_cli("ping", "ff" * 16)[0], 1)
         self.assertIn(f"node_id: {bytes(range(16)).hex()}", self.ok("status"))
+
+    def test_status_network(self):
+        """status prints every field as "name: value", and what the node sees of the network as a few lines at the
+        end; a daemon without those fields (before 0.2.0) gets none of them."""
+        tier = {"records": 0, "share": 0.0, "floor": 0.3, "refused_hour": 0, "refused_day": 0, "evicted_hour": 0,
+                "evicted_day": 0}
+        status = {"node_id": "ab" * 16, "private": False, "known_nodes": 57, "records": 7105, "partition": True,
+                  "partition_since": time.time() - 2 * 3600 - 300,
+                  "network": {"size_estimate": 1240, "size_samples": 16, "density_checked_hour": 48,
+                              "density_flagged_hour": 2, "density_checked_day": 1104, "density_flagged_day": 9},
+                  "record_store": {"bytes": 3 * 1024 * 1024, "budget": 1024 ** 3, "capacity": 7_000_000,
+                                   "full": True, "publishers": 141, "own_records": 5,
+                                   "tiers": {"known": {**tier, "records": 100, "share": 0.0001},
+                                             "earned": {**tier, "records": 6000, "share": 0.0009, "floor": 0.6},
+                                             "newcomer": {**tier, "records": 1000, "share": 0.1429, "floor": 0.1,
+                                                          "refused_hour": 3, "refused_day": 40, "evicted_hour": 1,
+                                                          "evicted_day": 12}}}}
+        with mock.patch.object(self.node, "status", return_value=status):
+            out = self.ok("status").splitlines()
+        self.assertEqual(out[:6], [f"node_id: {'ab' * 16}", "private: False", "known_nodes: 57", "records: 7105",
+                                   "partition: True", f"partition_since: {status['partition_since']}"])
+        self.assertEqual(out[6:], [
+            "network_size: about 1240 DHT servers (estimated from 16 lookups); 57 servers in the routing table",
+            "density_check: fired on 2 of 48 checks in the last hour, 9 of 1104 in the last day",
+            "partition_for: 2 h 5 min",
+            "record_store: 3.0 MiB of 1.0 GiB (room for 7000000 records), full; 7105 records (5 this node's) from 141 "
+            "publishers",
+            "record_tiers: known 100 (0.0%, floor 30%), earned 6000 (0.1%, floor 60%), newcomer 1000 (14.3%, floor "
+            "10%)",
+            "records_refused: 3 in the last hour, 40 in the last day (newcomer 40)",
+            "records_evicted: 1 in the last hour, 12 in the last day (newcomer 12)"])
+        status["network"]["size_estimate"] = None
+        status["network"]["size_samples"] = 3
+        with mock.patch.object(self.node, "status", return_value=status):
+            self.assertIn("network_size: not estimated yet (3 of the 8 complete lookups it needs); 57 servers in the "
+                          "routing table", self.ok("status").splitlines())
+        older = {key: value for key, value in status.items() if key not in ("network", "record_store", "partition")}
+        with mock.patch.object(self.node, "status", return_value=older):
+            self.assertEqual(self.ok("status").splitlines(), [f"{key}: {value}" for key, value in older.items()])
 
     def test_names(self):
         cid = self.node.put_file(b"abc")

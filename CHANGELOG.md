@@ -400,6 +400,17 @@ The DHT (local behaviour: nothing on the wire changes):
   of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
   republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
   partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.
+- **Network status** (spec section 11, "Network status"): `rnfs status` (`GET /api/status`, the library's
+  `Status.network` and `Status.record_store`) reports what the node sees of the network, with nothing sent to learn
+  it: `network` gives the number of DHT servers the density check estimates (`size_estimate`, null until 8 lookups
+  completed; `known_nodes` is the routing table's, to compare) and how many searches and published keys the check ran
+  on and fired on in the last hour and day; `record_store` gives the provider records' bytes against `record_budget`,
+  the capacity, whether it is full, and for each storage tier (Known, Earned, Newcomer) its records and share against
+  its floor and the new records refused and records evicted in the last hour and day. `rnfs status` sums these up in
+  a few lines after the other fields (`network_size`, `density_check`, `partition_for` while in partition mode,
+  `record_store`, `record_tiers`, `records_refused`, `records_evicted`); every existing field and line is unchanged.
+  The counts are kept in memory (per minute over the last day; a restart starts them afresh), and the status reads
+  nothing more from the state database, so apps can call it as often as before.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

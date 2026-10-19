@@ -7829,6 +7829,12 @@
               "null"
             ],
             "description": "Unix time partition mode began; null when not in it."
+          },
+          "network": {
+            "$ref": "#/components/schemas/StatusNetwork"
+          },
+          "record_store": {
+            "$ref": "#/components/schemas/StatusRecordStore"
           }
         },
         "required": [
@@ -7852,7 +7858,9 @@
           "unexported_names",
           "local_servers",
           "partition",
-          "partition_since"
+          "partition_since",
+          "network",
+          "record_store"
         ],
         "description": "The node's own fields (RnfsNode.status)."
       },
@@ -7940,6 +7948,47 @@
         ],
         "description": "The lxmf feature's status fields (deprecated with the feature)."
       },
+      "StatusNetwork": {
+        "type": "object",
+        "description": "What the node sees of the network, from its own state: nothing is sent to learn it (spec section 11, \"Network status\"). The routing table's servers (`known_nodes`), the local servers and partition mode are fields of `StatusCore`. The counts are kept in memory: a restart starts them afresh.",
+        "properties": {
+          "size_estimate": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The number of DHT servers the density check estimates (spec section 6, \"Network size estimate\"); null until it pools enough complete lookups."
+          },
+          "size_samples": {
+            "type": "integer",
+            "description": "Complete lookups (distinct keys) the estimate pools: up to 16, and it needs 8."
+          },
+          "density_checked_hour": {
+            "type": "integer",
+            "description": "Searches and published keys the density check ran on in the last hour."
+          },
+          "density_flagged_hour": {
+            "type": "integer",
+            "description": "Of those, the ones it fired on (servers packed near the key)."
+          },
+          "density_checked_day": {
+            "type": "integer",
+            "description": "Searches and published keys the density check ran on in the last day."
+          },
+          "density_flagged_day": {
+            "type": "integer",
+            "description": "Of those, the ones it fired on. Without an attack a few percent fire."
+          }
+        },
+        "required": [
+          "size_estimate",
+          "size_samples",
+          "density_checked_hour",
+          "density_flagged_hour",
+          "density_checked_day",
+          "density_flagged_day"
+        ]
+      },
       "StatusPeers": {
         "type": "object",
         "properties": {
@@ -7976,6 +8025,108 @@
           "blocks_refused_quiet_hours"
         ],
         "description": "The peers feature's status fields."
+      },
+      "StatusRecordStore": {
+        "type": "object",
+        "description": "The provider records this node stores for others against `record_budget`, and its storage tiers (spec section 6, \"Provider records\"); from counts kept in memory.",
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "description": "What the records count for against the budget: the records held times the bytes a record takes, as last measured."
+          },
+          "budget": {
+            "type": "integer",
+            "description": "`record_budget`, bytes."
+          },
+          "capacity": {
+            "type": "integer",
+            "description": "Records the store holds when full: the budget's, or fewer while the free disk is short."
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Full: the storage tiers decide whose records are kept."
+          },
+          "publishers": {
+            "type": "integer",
+            "description": "Publishers holding records here (this node included, if it does)."
+          },
+          "own_records": {
+            "type": "integer",
+            "description": "This node's own records (never evicted)."
+          },
+          "tiers": {
+            "type": "object",
+            "description": "Each storage tier's fill and recent refusals and evictions.",
+            "properties": {
+              "known": {
+                "$ref": "#/components/schemas/StatusRecordTier"
+              },
+              "earned": {
+                "$ref": "#/components/schemas/StatusRecordTier"
+              },
+              "newcomer": {
+                "$ref": "#/components/schemas/StatusRecordTier"
+              }
+            },
+            "required": [
+              "known",
+              "earned",
+              "newcomer"
+            ]
+          }
+        },
+        "required": [
+          "bytes",
+          "budget",
+          "capacity",
+          "full",
+          "publishers",
+          "own_records",
+          "tiers"
+        ]
+      },
+      "StatusRecordTier": {
+        "type": "object",
+        "description": "A storage tier: its records against its floor, and the new records refused and records evicted to make room (a full budget or a key's publisher cap) in the last hour and day, by the storer's tier and the evicted publisher's.",
+        "properties": {
+          "records": {
+            "type": "integer",
+            "description": "Records its publishers hold."
+          },
+          "share": {
+            "type": "number",
+            "description": "Its records' share of `capacity`."
+          },
+          "floor": {
+            "type": "number",
+            "description": "The share of the budget a full store keeps for it."
+          },
+          "refused_hour": {
+            "type": "integer",
+            "description": "New records of its publishers refused in the last hour."
+          },
+          "refused_day": {
+            "type": "integer",
+            "description": "New records of its publishers refused in the last day."
+          },
+          "evicted_hour": {
+            "type": "integer",
+            "description": "Records of its publishers evicted in the last hour."
+          },
+          "evicted_day": {
+            "type": "integer",
+            "description": "Records of its publishers evicted in the last day."
+          }
+        },
+        "required": [
+          "records",
+          "share",
+          "floor",
+          "refused_hour",
+          "refused_day",
+          "evicted_hour",
+          "evicted_day"
+        ]
       },
       "Uncached": {
         "type": "object",

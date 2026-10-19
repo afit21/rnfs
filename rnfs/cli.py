@@ -1019,15 +1019,77 @@ def run_app_rm(args):
                     f"{'' if result['released'] == 1 else 's'}"))
 
 
+def human_size(size: float) -> str:
+    """A size in bytes, KiB, MiB or GiB."""
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def human_duration(seconds: float) -> str:
+    """A duration in whole minutes, hours and days ("under a minute" below one)."""
+    minutes = int(max(0, seconds) // 60)
+    if not minutes:
+        return "under a minute"
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    return " ".join(f"{value} {unit}" for value, unit in ((days, "d"), (hours, "h"), (minutes, "min")) if value)
+
+
+def network_lines(status: dict) -> list[str]:
+    """`rnfs status`'s lines for what the node sees of the network ("network" and "record_store", and how long
+    partition mode has lasted), as "name: value"; none for a field a daemon before 0.2.0 doesn't give."""
+    from rnfs.dht.density import MIN_SIZE_SAMPLES  # no RNS
+
+    lines = []
+    network = status.get("network")
+    if isinstance(network, dict):
+        known = f"{status.get('known_nodes')} servers in the routing table"
+        if network.get("size_estimate") is None:
+            lines.append(f"network_size: not estimated yet ({network.get('size_samples')} of the {MIN_SIZE_SAMPLES} "
+                         f"complete lookups it needs); {known}")
+        else:
+            lines.append(f"network_size: about {network['size_estimate']} DHT servers (estimated from "
+                         f"{network.get('size_samples')} lookups); {known}")
+        lines.append(f"density_check: fired on {network.get('density_flagged_hour')} of "
+                     f"{network.get('density_checked_hour')} checks in the last hour, "
+                     f"{network.get('density_flagged_day')} of {network.get('density_checked_day')} in the last day")
+    since = status.get("partition_since")
+    if status.get("partition") and isinstance(since, (int, float)):
+        lines.append(f"partition_for: {human_duration(time.time() - since)}")
+    store = status.get("record_store")
+    if isinstance(store, dict):
+        tiers = store.get("tiers") or {}
+        lines.append(f"record_store: {human_size(store.get('bytes', 0))} of {human_size(store.get('budget', 0))} "
+                     f"(room for {store.get('capacity')} records), {'full' if store.get('full') else 'not full'}; "
+                     f"{status.get('records')} records ({store.get('own_records')} this node's) from "
+                     f"{store.get('publishers')} publishers")
+        lines.append("record_tiers: " + ", ".join(
+            f"{name} {tier.get('records')} ({tier.get('share', 0):.1%}, floor {tier.get('floor', 0):.0%})"
+            for name, tier in tiers.items()))
+        for what in ("refused", "evicted"):
+            day = {name: tier.get(f"{what}_day", 0) for name, tier in tiers.items()}
+            hour = sum(tier.get(f"{what}_hour", 0) for tier in tiers.values())
+            by_tier = ", ".join(f"{name} {count}" for name, count in day.items() if count)
+            lines.append(f"records_{what}: {hour} in the last hour, {sum(day.values())} in the last day"
+                         + (f" ({by_tier})" if by_tier else ""))
+    return lines
+
+
 def run_status(args):
-    """Print the daemon's status, one "name: value" per line. Without a readable API token (a health check by
-    another user), only the version the daemon says without it."""
+    """Print the daemon's status, one "name: value" per line, what it sees of the network summed up in a few lines
+    at the end. Without a readable API token (a health check by another user), only the version the daemon says
+    without it."""
     api = client(args)
     if not os.access(api.token_file, os.R_OK):
         print_fields(api.call("GET", "/api/status", authenticated=False))
         warn(f"no readable API token at {api.token_file}: the daemon only says its version without it")
         return
-    print_fields(api.status())
+    status = api.status()
+    print_fields({name: value for name, value in status.items() if name not in ("network", "record_store")})
+    for line in network_lines(status):
+        print(line)
 
 
 # Parser

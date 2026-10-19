@@ -894,6 +894,12 @@ class PublicTests:
         self.assertEqual((status.node_id, status.version), (B_ID, rnfs.__version__))
         self.assertIn("jobs_running", status.features)
         self.assertEqual(status.to_dict()["jobs_running"], status.features["jobs_running"])
+        # What the node sees of the network are fields of their own, not features
+        self.assertEqual(status.network["size_samples"], 0)
+        self.assertIsNone(status.network["size_estimate"])
+        self.assertEqual(set(status.record_store["tiers"]), {"known", "earned", "newcomer"})
+        self.assertEqual(status.record_store["budget"], status.to_dict()["record_store"]["budget"])
+        self.assertNotIn("network", status.features)
         self.assertTrue(self.rnfs.wait_joined(1))
         with self.rnfs:
             pass
@@ -1461,6 +1467,8 @@ class ObjectsTest(unittest.TestCase):
                       objects.Record(OTHER, cid, 2, 1.5), objects.Collected(1, 2), objects.Verified(3, (cid,)),
                       objects.Exported((cid,), 1), objects.Imported((cid,), (), 1), objects.DenyState(("a",), ()),
                       objects.Status("0.1.4", B_ID, None, "client", features={"jobs_running": 0}),
+                      objects.Status("0.2.0", B_ID, network={"size_estimate": 1240, "size_samples": 16},
+                                     record_store={"full": True, "tiers": {"newcomer": {"records": 3}}}),
                       objects.Peer(A_ID, "server", True, 12.5, False, 2, "TCP", 1e6, True, 800.0, 1.7e9, None,
                                    False, 1, 2, 3, 4, 5, 6, 7, 1.6e9, 0.25, 1.7e9, True),
                       objects.Stats(1.7e9, {"sent": 1}, {"budget": 2}, {"TCP": {"sent": 1, "received": 0}}, 10, 5),
