@@ -66,7 +66,7 @@ from rnfs.network.links import LinkPool
 from rnfs.network.server import RequestServer
 from rnfs.publisher import Publisher
 
-SAVE_INTERVAL = 300.0  # seconds between saves of provider records
+RECORDS_INTERVAL = 30.0  # seconds between passes over the provider records (expiry), each saving their changes
 STATE_SAVE_INTERVAL = 30.0  # seconds between saves of cache records, fetched targets and invalid roots, when changed
 ARCHIVE_BLOCK_OVERHEAD = 64  # bytes an archive spends on each block beyond the block (msgpack framing, CID)
 EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else triggers one
@@ -594,9 +594,13 @@ class RnfsNode:
         # When each server's announce was first heard (section 6; for publishing and searching to come); saved with
         # the batched stores
         self.first_seen = self._add_store(FirstSeenLog(config.state_dir))
-        # Saved with their expiry, every SAVE_INTERVAL (maintain): they change with every /provide
-        self.records = self._add_store(ProviderStore(config.max_records, config.state_dir, own_id=node_id,
-                                                     seniority=config.provider_seniority), batched=False)
+        # The storage tiers' Known publishers besides contacts and members: the bootstrap nodes a join may contact
+        defaults = DEFAULT_BOOTSTRAP_NODES if config.default_bootstrap and not config.private else ()
+        self._known_bootstrap = frozenset(self._bootstrap_nodes + [bytes.fromhex(text) for text in defaults])
+        # Saved with their expiry, every RECORDS_INTERVAL (maintain): they change with every /provide
+        self.records = self._add_store(ProviderStore(config.state_dir, config.record_budget, own_id=node_id,
+                                                     known=self._known_publisher, free_space=self._records_room),
+                                       batched=False)
         if config.private:
             # Records stored while the node was public, or from a member removed since, are never handed out
             removed = self.records.retain(self._is_member_publisher)
@@ -918,6 +922,20 @@ class RnfsNode:
         provided as a member this run, or one whose identity RNS knows to be a member)."""
         return node_id == self.node_id or node_id in self._member_publishers or self._is_member_node(node_id)
 
+    def _known_publisher(self, node_id: bytes) -> bool:
+        """The provider store's Known tier (spec section 6): a contact of kind node, a bootstrap node a join may
+        contact, or in private mode a member (one that provided as a member this run, as every publisher there
+        has). Called under the store's lock, so it asks nothing of RNS."""
+        if node_id in self._known_bootstrap or (self.config.private and node_id in self._member_publishers):
+            return True
+        contacts = features.find(self, "contacts")  # None until the features are made, after the store
+        return contacts is not None and contacts.has(node_id, "node")
+
+    def _records_room(self) -> int:
+        """Bytes free on the state database's disk beyond the reserve blocks keep there (the provider store's room)."""
+        usage = shutil.disk_usage(self.config.state_dir)
+        return usage.free - disk_reserve(usage.total)
+
     def excluded_provider(self, node_id: bytes) -> bool:
         """True if a provider must be left out of /find replies and providers(): banned, or in private mode
         not a member."""
@@ -1135,11 +1153,10 @@ class RnfsNode:
                 self.publisher.refresh()
             except Exception as e:  # noqa: BLE001 - the next scan tries again; logged
                 log(f"shared folder scan failed: {e!r}", LOG_ERROR)
-        if now - last.get("save", now) >= SAVE_INTERVAL:
-            last["save"] = now
-            self.records.expire()
-            self.records.save()
-        last.setdefault("save", now)
+        if now - last.get("records", now) >= RECORDS_INTERVAL:
+            last["records"] = now
+            self.records.maintain()
+        last.setdefault("records", now)
         if now - last.get("state", now) >= STATE_SAVE_INTERVAL:
             last["state"] = now
             self._save_state()

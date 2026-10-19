@@ -402,7 +402,8 @@ IP networks. It is **not** compatible with IPFS. The full comparison is in
 # Settings
 
 Settings go in `~/.rnfs/rnfs.toml`; command-line options override them. Times are in seconds, sizes in bytes,
-rates in bits/s, and an unknown setting is an error. These are the ones you're most likely to change; every
+rates in bits/s, and an unknown setting is an error (one a newer version retired, such as `max_records`, is ignored
+with a warning). These are the ones you're most likely to change; every
 setting and its default is in [specification.md, section 12](specification.md#12-constants).
 
 ```toml
@@ -425,6 +426,7 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
 | `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
+| `record_budget` | 1 GiB | Disk the provider records your node stores for others (as a DHT server) may take; when full, your node contacts and publishers seen for days keep their place, and strangers share a small part |
 | `max_jobs` | 2; 1 on slow nodes | Transfers running at once |
 | `upload_budget` | none | Bytes per hour your node uploads in total |
 | `serve_interfaces`, `no_serve_interfaces` | all, none | Reticulum interfaces to upload on, or never upload on (names or prefixes) |

@@ -181,7 +181,7 @@ class KeyCadenceTest(unittest.TestCase):
         self.addCleanup(storage.close)  # its state database, before the directory goes (Windows)
         self.clock = FakeClock(1_000_000.0)
         self.client = FakeClient()
-        publisher = Publisher(bytes(16), config, storage, ProviderStore(10_000, None), self.client,
+        publisher = Publisher(bytes(16), config, storage, ProviderStore(None), self.client,
                               lambda key: FakeLookup([N1, N2]), slow_node=slow, clock=self.clock)
         publisher.add_key_source(lambda: set(keys))
         publisher.refresh()
@@ -249,7 +249,7 @@ class RestartKeysTest(NodeTestCase):
         gone = [os.urandom(16) for _ in range(20)]
         batches = protocol.provide_batches(keys, keys + gone, 400)  # ~ a link MDU: several batches
         self.assertGreater(len(batches), 1)
-        store = ProviderStore(10_000, None)
+        store = ProviderStore(None)
         store.provide(A_ID, gone)
         for batch_keys, batch_withdrawn in batches:
             store.provide(A_ID, batch_keys, batch_withdrawn)
