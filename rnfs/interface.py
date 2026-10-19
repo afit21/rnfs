@@ -598,14 +598,16 @@ class Rnfs:
                                               **options)
         return Added.from_dict(result)
 
-    def get(self, target, output, *, from_node=None, raw: bool = False) -> Written:
+    def get(self, target, output, *, from_node=None, raw: bool = False, no_extract: bool = False) -> Written:
         """Fetch a file or directory and write it to output (a path that must not exist), all in this call. A
-        sealed file this node can open is decrypted unless raw. Raises the fetch errors (NotFound, TooLarge,
-        InvalidDag, Denied, StorageFull, Busy), ValueError (output exists), OSError."""
+        sealed file this node can open is decrypted unless raw, and a sealed folder (a sealed .tar holding a valid
+        tar) unpacked to a directory unless no_extract (Written.extracted; a daemon older than 0.2.0 never unpacks).
+        Raises the fetch errors (NotFound, TooLarge, InvalidDag, Denied, StorageFull, Busy), ValueError (output
+        exists), OSError."""
         self._check()
         text, hint = self._target(target)
         output = _abspath(output)
-        result = self._backend.get(text, output, self._from(from_node, hint), raw)
+        result = self._backend.get(text, output, self._from(from_node, hint), raw, no_extract)
         return Written.from_dict({**result, "output": output})
 
     def open(self, target, *, from_node=None, raw: bool = False) -> "File":
@@ -1199,6 +1201,7 @@ class Job:
     fallback_dht: bool = False
     path: str | None = None
     options: dict | None = None
+    no_extract: bool = False
     state: str = "queued"
     created: float | None = None
     started: float | None = None
@@ -1215,8 +1218,8 @@ class Job:
     eta: float | None = None
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
-    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "state", "created",
-              "started",
+    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "no_extract",
+              "state", "created", "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
               "downloaded_bytes", "rate", "eta")
 
@@ -1273,12 +1276,14 @@ class Jobs:
         self._owner = owner
 
     def get(self, target, output, *, from_node=None, sealed_name: bool = False, fallback_dht: bool = False,
-            on_progress=None) -> Job:
+            on_progress=None, no_extract: bool = False) -> Job:
         """Fetch target and write it to output (which must not exist) as a job. sealed_name writes a sealed
-        file this node opens under its sealed name in output's directory; fallback_dht retries by DHT discovery
-        if from_node fails. on_progress(job) as Job.watch. Raises ValueError (output exists or in use), Busy."""
+        file this node opens under its sealed name in output's directory (a sealed folder unpacked: under the
+        name of the directory written); fallback_dht retries by DHT discovery if from_node fails; no_extract
+        writes a sealed folder as its tar instead of unpacking it. on_progress(job) as Job.watch. Raises
+        ValueError (output exists or in use), Busy."""
         return self._submit("get", target, _abspath(output), from_node, on_progress, sealed_name=sealed_name,
-                            fallback_dht=fallback_dht)
+                            fallback_dht=fallback_dht, no_extract=no_extract)
 
     def pin(self, target, *, on_progress=None) -> Job:
         """Fetch target completely and pin it "user", as a job."""

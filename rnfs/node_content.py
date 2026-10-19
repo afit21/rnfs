@@ -2,12 +2,15 @@
 
 - `add --no-pin`: what was added is kept as a cached fetch instead of a "user" pin (keep_added).
 - Sealed files (rnfs/content/seal.py): resolving recipients to public keys, sealing a file being added,
-  and opening a sealed target with the node's identity for get, cat and info.
+  and opening a sealed target with the node's identity for get, cat and info. Sealed folders: a folder being
+  added is sealed as one tar named `<folder>.tar` (add_sealed_path), and get unpacks a sealed `.tar` that is a
+  valid tar (get_sealed, unpack_sealed).
 - Gateway formats: a CID's own block (?format=raw) and a target's archive streamed with its exact length
   (?format=archive, and GET /api/export/stream); a target as a tar streamed the same way (GET /api/get/stream).
 
 Functions take the RnfsNode first. RNS is imported inside functions: the daemon has loaded it already.
 """
+import itertools
 import os
 import stat
 import time
@@ -222,6 +225,96 @@ def write_sealed(sealed: seal.SealedFile, output: str, blocks_dir: str | None = 
         _remove_created(output, created)
         raise
     return {"sealed": True, "name": name}
+
+
+class NotATar(Exception):
+    """A sealed file named as a tar holds something else (unpack_sealed): it is written as a file instead."""
+
+
+def is_tar_name(name: str | None) -> bool:
+    """True if a sealed name says the file is a tar to unpack: it ends in TAR_SUFFIX, after at least one character."""
+    return isinstance(name, str) and len(name) > len(TAR_SUFFIX) and name.endswith(TAR_SUFFIX)
+
+
+def get_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
+               created: list[walker.Identity] | None = None, extract: bool = True) -> dict:
+    """Write a sealed file the node opened (unlocked) to output, which must not exist: unpacked (unpack_sealed) if
+    extract, its sealed name ends in .tar and its plaintext is a valid tar; otherwise decrypted as the file
+    (write_sealed), with a warning when a .tar wasn't unpacked because it isn't one. get's {"sealed", "name",
+    "warnings"} (+ "warnings_total"; "extracted" True when unpacked). to_fetch and created as for unpack_sealed."""
+    warnings = []
+    if extract and is_tar_name(sealed.name):
+        try:
+            return unpack_sealed(node, sealed, output, to_fetch, created)
+        except NotATar as e:
+            warnings.append(f"not unpacked, written as the file: its content isn't a valid tar ({e})")
+    return {**write_sealed(sealed, output, node.config.blocks_dir, to_fetch), "warnings": warnings}
+
+
+def unpack_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
+                  created: list[walker.Identity] | None = None) -> dict:
+    """Unpack a sealed tar to the directory output (which must not exist), reusing both existing rule sets as they
+    are: its plaintext is built into the block store by tarstream.build_tar (POST /api/add/stream?format=tar's
+    reader: regular files and directories only, no absolute or .. paths, links and devices skipped with warnings,
+    max_output_entries and MAX_DEPTH, the deny list's file hashes), then written out by walker.write_out (get's
+    rules: unsafe names skipped, the same limits); created gets the output directory's identity, as write_out
+    gives it. Everything happens inside a protection session, so no collection takes the blocks meanwhile, and they
+    are never pinned, recorded as a fetch or provided: once it ends (unpacked or not) they are collected.
+
+    The output is the tar's one top directory (`<folder>/`, as add packs a folder), or, for a tar holding anything
+    else, the whole tar as a directory; "name" is that directory's name (the top one's, or the sealed name without
+    .tar), only if safe_default_name accepts it. Raises NotATar (having written nothing) if the plaintext isn't a
+    valid tar, TooLarge past a limit or if the disk can't hold both the plaintext's blocks and the files written
+    (they may be on one filesystem: counted twice then, with the to_fetch bytes still to fetch), and what the
+    decryption raises (SealError, NotRecipient)."""
+    from rnfs import fsutil
+    from rnfs.content import tarstream
+    from rnfs.errors import BlockMismatch, TooLarge
+    from rnfs.log import LOG_ERROR, log
+    from rnfs.node import _check_free_space  # rnfs.node imports this module
+
+    plain = sealed.size
+    blocks_dir = node.config.blocks_dir
+    # The blocks and the files: the second is counted on the output's filesystem only if the blocks are there too
+    _check_free_space(output, plain, blocks_dir, to_fetch + plain)
+    node.storage.check_disk(plain + to_fetch)
+    max_entries = node.config.max_output_entries
+    warnings = tarstream.Warnings()
+    tar = tarstream.IteratorReader(sealed.read())
+    try:
+        with node.storage.protect() as session:
+            try:
+                with session.writer() as put:
+                    built = tarstream.build_tar(tar, put, warnings, max_entries,
+                                                builder.BuildOptions(check=node._hash_check()))
+            except (seal.SealError, BlockMismatch):
+                raise  # ValueErrors, but a damaged sealed file or a bug, not a plaintext that isn't a tar
+            except TooLarge as e:
+                raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
+            except ValueError as e:
+                raise NotATar(str(e)) from None
+            get = node.storage.getter()
+            root = walker.root_expect(built.cid)
+            first = list(itertools.islice(walker.directory_entries(root, get), 2))
+            if len(first) == 1 and first[0][0].kind == dag.KIND_DIRECTORY:
+                entry, target = first[0]
+                name = entry.name
+            else:
+                target, name = root, sealed.name[:-len(TAR_SUFFIX)]
+            try:
+                written = walker.write_out(target, get, output, max_entries, created=created)
+            except TooLarge as e:
+                raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
+    finally:
+        tar.close()
+        # Nothing reaches the plaintext's blocks now (unless the same blocks are kept for another reason)
+        try:
+            node.storage.collect()
+        except Exception as e:  # noqa: BLE001 - never hide the get's own outcome; the next collection retries
+            log(f"get: collecting an unpacked tar's blocks failed: {e!r}", LOG_ERROR)
+    for warning in written:
+        warnings(warning)
+    return {"sealed": True, "name": fsutil.safe_default_name(name, None), "extracted": True, **warnings.result()}
 
 
 def stored_head(node, target: str, length: int, deny: bool = True) -> bytes | None:

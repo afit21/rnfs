@@ -93,6 +93,17 @@ Added:
   with warnings; names holding `\`, `＼` or `／`, or starting as a Windows drive does, skipped too); more than
   `max_output_entries` entries or a tree deeper than `MAX_DEPTH` is refused, and so are a folder name over 251
   bytes and `--no-sealed-name` with a folder (the name is what makes a recipient's `get` unpack it).
+- **Unpacking sealed folders:** `rnfs get` of a sealed file whose sealed name ends in `.tar` and whose content is
+  a valid tar unpacks it, by a recipient: the decrypted tar is read with `POST /api/add/stream?format=tar`'s rules
+  (links, devices, absolute or `..` paths skipped; `max_output_entries` and `MAX_DEPTH`) and written with `get`'s
+  (temporary name, unsafe names skipped). Without `-o` the output is named after the tar's top directory. The
+  free-space check counts the content twice (its blocks, then the files), and the decrypted blocks are deleted
+  afterwards, never pinned or provided. A `.tar` whose content isn't a tar is written as the file, as before,
+  with a warning; one past a limit is refused. `rnfs get --no-extract` writes the `.tar` instead; `POST /api/get`,
+  `POST /api/jobs` (kept with the job), `Node/Client.get` and `jobs.get` take `no_extract`, and `Written` gains
+  `extracted`. Behaviour change: `POST /api/get` without `no_extract` now unpacks such a file where it wrote it.
+  `GET /api/capabilities` lists `sealed_folders`. `cat` still gives the decrypted tar, and the gateway and
+  `--raw` the sealed bytes. `POST /api/add/stream?format=tar` still can't seal (400).
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

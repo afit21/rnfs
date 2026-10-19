@@ -496,6 +496,23 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
   - What it hides: the folder's file names, its structure and each file's size. What it doesn't: the
     recipients, and the approximate total size (the tar's: the files' sizes rounded up to 512 bytes, plus at
     least 512 bytes per entry), which says roughly how much the folder holds.
+  - **Unpacking.** `get` by a recipient unpacks a sealed file only if its sealed name ends in `.tar` (after at
+    least one character) and its plaintext is a valid tar; anything else, including a `.tar`-named file that
+    isn't one, is written as the file, as for any sealed file (with a warning for the latter). Unpacking
+    applies both existing rule sets unchanged: the plaintext is read as `POST /api/add/stream?format=tar` reads
+    an upload (regular files and directories only; symlinks, hard links, devices, FIFOs, absolute paths, `..`
+    components and invalid names skipped with a warning; a later member replacing an earlier one of the same
+    path; `max_output_entries`, `MAX_DEPTH` and the header bounds of section 11), then written as `get` writes a
+    directory (a temporary name renamed when complete, names the local filesystem would read as a path or can't
+    represent skipped). A file is executable only by its owner-execute bit; no other mode, owner or time is
+    taken from the tar. A tar past a limit is refused (rnfs: 413, naming `--no-extract`) rather than written in
+    part. The output is the tar's one top directory, or the whole tar as a directory when it holds anything else;
+    without `-o` it is named by `get`'s default-name rule (section 11) after that directory (or the sealed name
+    without `.tar`). The node MUST check that its free space holds the plaintext twice where its blocks and the
+    output share a filesystem (rnfs builds the tar into its block store, then writes the files), and MUST NOT
+    pin, cache or provide those plaintext blocks: rnfs holds them in a protection session (section 8) while
+    unpacking and collects them at once after, so none stays stored unless something else keeps the same block.
+    `--no-extract` writes the decrypted `.tar` instead, as `get` of a 0.1.x node does.
 
   Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
 - **Gateways MUST NOT decrypt** sealed files (the gateway is reachable by web pages); they serve the stored
@@ -1245,8 +1262,8 @@ are local conveniences, not part of the protocol.
 | Command | Does |
 |---|---|
 | `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files; a directory as one tar named `<directory>.tar`); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
-| `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; `--raw` writes the stored bytes |
-| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
+| `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw] [--no-extract]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; a sealed folder (a sealed `.tar` holding a valid tar) is unpacked to a directory (section 5, Unpacking), named without `-o` (for a bare CID, or a path ending in `.tar`) after its top directory by the same rule; `--no-extract` writes it as the decrypted `.tar` instead; `--raw` writes the stored bytes |
+| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range), a sealed folder giving its tar (never unpacked); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
 | `stat <cid>[/path]` | Size, block count, and how much is held locally |
 | `dir set <cid>[/path] <name> <cid> [--exec]`, `dir rm <cid>/<path>` | Make a new directory with an entry added, replaced or removed, and pin it with source `user` (fetching the complete directory, file contents included) |
@@ -1461,6 +1478,8 @@ message that call would have reported.
   temporary output is removed (a resumed job removes one left by a crash).
 - A `get` job MAY ask (`sealed_name`) that a sealed file this node opens be written under its sealed name, if
   that passes the `get` default-name rule, in the output's directory; the final path is then the job's output.
+  For a sealed folder unpacked that name is its top directory's (the result's `name`). A `get` job MAY ask
+  (`no_extract`, kept with the job) that a sealed folder be written as its tar rather than unpacked.
   A `get` job with a `from` node MAY ask (`fallback_dht`) to be retried once with ordinary DHT discovery if it
   fails for any reason other than cancellation, a size limit or a full disk.
 - A get's result (and a job's) keeps at most the first 100 warnings, then one saying how many more there were,

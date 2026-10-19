@@ -407,7 +407,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`); with `to`/`to_self` a directory is packed as one tar and sealed as `<name>.tar` (`node_content.add_sealed_path`, `tarstream.folder_chunks`) |
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
 | `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `name` or `(tar upload)` |
-| `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw`; a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
+| `get(target, output, from_node=None, raw=False, no_extract=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it; + `"extracted"` for a sealed folder unpacked, `name` then the directory's); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` and unpacking a sealed folder unless `no_extract` (`node_content.get_sealed`); a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`; the sealed name is None unless `safe_default_name` accepts it) |
 | `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
 | `read(target, offset=0, length=None, for_gateway=False, from_node=None, raw=False)` | iterator of bytes of a file (range fetched only; sealed files decrypted unless `raw` or `for_gateway`) |
@@ -544,7 +544,8 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `Unsupported` for `unsupported`, both `NotFound` subclasses, so existing `except NotFound` clauses still hold.
   `http.server`'s own error pages (a malformed request line) have no code.
 - **Capabilities.** `GET /api/capabilities`: `api.CAPABILITIES` (what a route list can't say: `events`,
-  `pin_details`, ...), every core and feature route, the loaded features, `events.EVENT_KINDS` and
+  `pin_details`, `sealed_folders` (add seals a folder, get unpacks one and takes `no_extract`), ...), every core
+  and feature route, the loaded features, `events.EVENT_KINDS` and
   `errors.CODES`. `ApiConnection.capabilities()` answers `{}` from an older daemon.
 - **Events.** `rnfs/events.py`: `EventLog`, one per node (`RnfsNode.events`, made first in `_setup`), holding the
   last `MAX_EVENTS` (1024) events, each `{"seq", "kind", "time", ...}` numbered from 1 per run, with a random
@@ -695,7 +696,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 |---|---|---|
 | `Cid` | `rnfs/content/cid.py` as is: `.binary`, `.codec`, `.digest`, `.key`, `parse`, `from_bytes` | written form |
 | `Added` | `cid`, `size`, `warnings: tuple[str]`, `sealed: bool` | the CID |
-| `Written` | `cid`, `output`, `warnings`, `warnings_total`, `sealed`, `name` (get) | the output path |
+| `Written` | `cid`, `output`, `warnings`, `warnings_total`, `sealed`, `name`, `extracted` (get) | the output path |
 | `Entry` | `name`, `kind` ("file", "executable", "directory"), `size`, `cid` | the name |
 | `Info` | `cid`, `type` ("file", "directory"), `size`, `executable`, `sealed`, `recipient`, `stored_size`, `name` | — |
 | `Stat` | `cid`, `size`, `blocks`, `local_blocks`, `local_bytes` | — |
@@ -740,7 +741,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `status() -> Status` | | `status()` / `GET /api/status` |
 | `node_id -> bytes` (property) | | `node_id` / status, read once |
 | `add(source, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None) -> Added` | `ValueError` (options: `name` with a path, `wrap` without `name`, a source neither a path, bytes nor a binary file), `NotFound` (path), `Denied` (a file's hash), `StorageFull`, `OSError` | a path (str or PathLike): `add_path` / `POST /api/add`; bytes or a binary file: `add_stream(name=name)` / `POST /api/add/stream`, sealing with `name` as the sealed name unless `seal_name` is False |
-| `get(target, output, *, from_node=None, raw=False) -> Written` | fetch errors, `ValueError` (output exists), `OSError` | `get` / `POST /api/get` |
+| `get(target, output, *, from_node=None, raw=False, no_extract=False) -> Written` | fetch errors, `ValueError` (output exists), `OSError` | `get` / `POST /api/get` (`no_extract` sent only when set) |
 | `open(target, *, from_node=None, raw=False) -> File` | fetch errors, `ValueError` (a directory) | `info`, then `read(target, offset, length)` per refill / `GET /api/info`, then `GET /api/cat?offset=&length=&from=` per refill |
 | `cat(target, *, offset=0, length=None, from_node=None, raw=False) -> Iterator[bytes]` | fetch errors, `ValueError` | `read` / `GET /api/cat` |
 | `block(cid) -> bytes` | fetch errors | `block` / `GET /api/cat?block=1` |
@@ -770,9 +771,9 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `names.resolve(name) -> Record` (bytes, hex, `Name` or a contact's nick) | `NotFound` (unresolved), `ValueError` | `name_resolve` / `GET /api/name/resolve` |
 | `names.watch(name, callback) -> Watch` | `ValueError`; a Client: `NotFound` from a daemon without the endpoint | below / `GET /api/name/watch` |
 | `Name`: `alias`, `name: bytes`, `cid`, `sequence`, `str()` hex; `publish(target) -> Record`, `export_key() -> bytes`, `remove()`, `refresh() -> Name` | `publish`: `NotFound` (path not stored), `ValueError`, `RnfsError` (highest sequence) | `name_publish`, `name_export`, `name_rm` / `POST /api/name/publish`, `/api/name/export`, `/api/name/rm` |
-| `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None) -> Job`, `jobs.pin(target, *, on_progress=None) -> Job`, `jobs.export(target, output, *, on_progress=None) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
+| `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False) -> Job`, `jobs.pin(target, *, on_progress=None) -> Job`, `jobs.export(target, output, *, on_progress=None) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
 | `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]`, `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
-| `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `path`, `options` (add and import), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
+| `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
 | `deny.list() -> DenyState`, `deny.add(entries) -> list[str]`, `deny.remove(entries) -> list[str]` | `ValueError` (malformed entry, too many), `NotFound` (remove: not on it) | `node.deny.entries`/`add`/`remove`, `DenyFeature.lists` / `GET /api/deny`, `POST /api/deny/add`, `/api/deny/rm` |
 | `timeout(seconds) -> context manager` | `ValueError` (not None or a positive number) | a Client: `ApiConnection.using_timeout`; a Node: nothing (above) |
 | `peers() -> list[Peer]`, `stats() -> Stats` | `NotFound` (no peers feature) | `PeersFeature.peers`, `stats` / `GET /api/peers`, `/api/stats` |
@@ -957,7 +958,19 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 - `node_content.py` — `keep_added` (a `user` pin, or for `--no-pin` a cached fetch recorded in
   the fetched targets for the roots strategy), `seal_recipients` (`RNS.Identity.recall` by destination hash, then
   identity hash; the node's own identity; contacts), `open_sealed` over a Fetch's `read_range`,
-  `sealed_info`, `write_sealed`, `block`, `export_stream`, and the API option parser `add_options`.
+  `sealed_info`, `write_sealed`, `get_sealed`/`unpack_sealed`, `block`, `export_stream`, and the API option
+  parser `add_options`.
+- Unpacking a sealed folder (`get_sealed`, for a sealed name ending in `.tar` unless `no_extract`):
+  `unpack_sealed` checks the free space for the plaintext twice where the blocks and the output share a
+  filesystem (`_check_free_space` with the plaintext added to what is still to fetch, and `Storage.check_disk`
+  for the blocks' own), then, inside a protection session of its own (within the fetch's), feeds the
+  decrypted segments (`IteratorReader` over `SealedFile.read()`) to `tarstream.build_tar` through a
+  `Session.writer()`, with the deny list's hash check, and writes out with `walker.write_out` from the stored
+  blocks (`Storage.getter()`). The target is the root's one entry if it is a directory, else the root. A
+  `ValueError` from `build_tar` (not `SealError` or `BlockMismatch`) means the plaintext isn't a valid tar:
+  `NotATar`, and `get_sealed` writes the file with `write_sealed` and a warning. `TooLarge` is raised again
+  naming `--no-extract`. In every case the session ends and `storage.collect()` deletes what nothing else
+  reaches, so the plaintext is never pinned, recorded as a fetch or provided.
 - Sealed folders (`add_sealed_path` of a directory): `folder_sealed_name` refuses a name `<name>.tar` couldn't
   carry (over 251 bytes, invalid) and `seal_name=False` before anything is read, rather than sealing unnamed as
   a file with an invalid name is. `tarstream.folder_chunks` is a generator writing the tar as it walks
@@ -1245,9 +1258,10 @@ An output without `-o` is named with `fsutil.safe_default_name`. Sent links carr
 (`{"settings": {name: value or null}}`). `POST /api/jobs`
 takes, for a get, the JSON booleans `sealed_name` (write a sealed file this node opens under its safe sealed
 name in the output's directory; the CLI sets it for `rnfs get <bare cid>` without `-o`, so it no longer calls
-`GET /api/info` first) and `fallback_dht` (a get with `from` that fails, other than by cancellation,
-`TooLarge` or `StorageFull`, is retried once through the DHT); for `kind` `add`, `path` and `POST /api/add`'s
-options (flat, as `/api/add` takes them; kept in the job as `options`, only those set), for `import`, `path`.
+`GET /api/info` first, and for a path ending in `.tar`, so an unpacked folder is named after its directory),
+`fallback_dht` (a get with `from` that fails, other than by cancellation, `TooLarge` or `StorageFull`, is retried
+once through the DHT) and `no_extract` (a sealed folder written as its tar; kept in the job's record only when set,
+so other records stay as 0.1.6 wrote them); for `kind` `add`, `path` and `POST /api/add`'s options (flat, as `/api/add` takes them; kept in the job as `options`, only those set), for `import`, `path`.
 Add and import jobs run `add_path`/`import_archive` with `progress=Job.read`, which counts `done_bytes` (and the
 rate, of bytes read) and raises `Cancelled` once cancelled or stopping; their `total_bytes` is `builder.tree_size`
 (measured first, cancellable between entries) or the archive's size. They hold no protection session (they fetch
@@ -1261,7 +1275,7 @@ at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job
 address, then `contact <nick>`, `trusted` or `untrusted` (`?` without the fields), the method, and last the
 display name quoted and escaped with `fsutil.printable_label`.
 Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
-`chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`; `GET /api/cat`
+`chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`, `no_extract`; `GET /api/cat`
 `raw=1`, `block=1`; `GET /api/info` `from`.
 
 ## Threads
@@ -1691,6 +1705,14 @@ Everything in the specification is implemented, with these simplifications and a
 - **Contacts.** Every `<name>` argument (`name resolve|keep|unkeep|follow|unfollow`) takes a name contact's
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.
+- **Sealed folders.** Unpacking stores the plaintext as blocks before writing the files (both rule sets
+  reused as they are, rather than a second tar extractor), so it needs the space twice on one disk; they are
+  collected by `storage.collect()`, which walks every pin, right after. A `.tar`-named sealed file that isn't a
+  valid tar is decrypted twice (once into `build_tar`, once to the file); one with a malformed header fails at
+  once, before anything is stored. A daemon without the job manager can't tell the top directory's name
+  before the get, so the CLI asks for the sealed name and drops `.tar`. `POST /api/add/stream?format=tar`
+  can't seal (a tar uploaded by an app would have to be repacked under one top directory): sealed folders are
+  added from a path.
 - **Sealed files.** `get` of a *directory* containing sealed files writes them as stored (get each with
   `get <cid>/<path>`). Sealing hides content and name but not size, recipients or wrapper names, and gives no
   sender authentication. A sealed file's 65600-byte segments don't align with 64 KiB chunks, so a

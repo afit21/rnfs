@@ -186,8 +186,9 @@ class FakeNode:
             self.pins.setdefault(cid, set()).add("user")
         return {"cid": cid, "size": len(data), "warnings": []}
 
-    def get(self, target, output, from_node=None, raw=False):  # nothing is sealed here, so raw changes nothing
-        self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw))
+    def get(self, target, output, from_node=None, raw=False, no_extract=False):  # nothing is sealed here, so raw
+        # and no_extract change nothing
+        self.record("get", target, output, from_node=from_node, **self._given("get", raw=raw, no_extract=no_extract))
         cid = self._resolve(target)
 
         def write(cid, dest):
@@ -825,6 +826,9 @@ class EndpointTest(ApiTestCase):
             self.assertEqual(self.node.called("get")[0][1], {"from_node": bytes.fromhex("ab" * 16)})
             with open(os.path.join(out, "a"), "rb") as f:
                 self.assertEqual(f.read(), b"abc")
+            # no_extract (a sealed folder written as its tar) is passed on only when set, as raw is
+            self.ok("POST", "/api/get", {"target": directory, "output": os.path.join(tmp, "tar"), "no_extract": True})
+            self.assertEqual(self.node.called("get")[1][1], {"from_node": None, "no_extract": True})
             archive = os.path.join(tmp, "archive")
             self.assertEqual(self.ok("POST", "/api/export", {"target": directory, "output": archive})["roots"],
                              [directory])

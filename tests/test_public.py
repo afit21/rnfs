@@ -705,6 +705,28 @@ class PublicTests:
             with self.subTest(to=to), self.assertRaisesRegex(ValueError, "to must be a list of recipients"):
                 self.rnfs.add(b"data", to=to)
 
+    def test_sealed_folder(self):
+        """add() of a folder with to_self seals it as one tar; get() unpacks it unless no_extract (Written.extracted),
+        and jobs.get takes no_extract too, alike on both classes."""
+        self.b.identity = RNS.Identity()  # B opens what it seals for itself
+        folder = self.out("photos")
+        os.makedirs(os.path.join(folder, "sub"))
+        with open(os.path.join(folder, "sub", "a.txt"), "wb") as f:
+            f.write(b"a")
+        added = self.rnfs.add(folder, to_self=True)
+        self.assertTrue(added.sealed)
+        written = self.rnfs.get(added.cid, self.out("unpacked"))
+        self.assertEqual((written.sealed, written.extracted, written.name), (True, True, "photos"))
+        with open(os.path.join(self.out("unpacked"), "sub", "a.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"a")
+        written = self.rnfs.get(added.cid, self.out("tar"), no_extract=True)
+        self.assertEqual((written.sealed, written.extracted, written.name), (True, False, "photos.tar"))
+        self.assertTrue(tarfile.is_tarfile(self.out("tar")))
+        job = self.rnfs.jobs.get(added.cid, self.out("job.tar"), no_extract=True).wait(10)
+        self.assertEqual((job.state, job.no_extract), ("done", True))
+        self.assertTrue(tarfile.is_tarfile(self.out("job.tar")))
+        self.assertTrue(self.rnfs.capabilities().has("sealed_folders"))
+
     def test_streams(self):
         """add_tar, get_tar, export_stream and import_stream: a tar and an archive through the program."""
         source = self.out("tree")

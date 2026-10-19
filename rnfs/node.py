@@ -1411,9 +1411,11 @@ class RnfsNode:
             target = contacts.expand_target(target)
         return walker.parse_target(target)
 
-    def get(self, target: str, output: str, from_node: bytes | None = None, raw: bool = False) -> dict:
+    def get(self, target: str, output: str, from_node: bytes | None = None, raw: bool = False,
+            no_extract: bool = False) -> dict:
         """Fetch a file or directory and write it to output, which must not exist. A sealed file this node
-        can open is decrypted, unless raw."""
+        can open is decrypted, unless raw; one whose sealed name ends in .tar and whose content is a valid tar (a
+        sealed folder) is unpacked to a directory, unless no_extract (node_content.get_sealed)."""
         root, names = self._parse_target(target)
         if os.path.lexists(output):
             raise ValueError(f"{output} already exists")
@@ -1434,8 +1436,8 @@ class RnfsNode:
                 sealed = None if raw else node_content.open_sealed(self, fetch, expect)
                 if sealed is not None:  # decrypted as it is fetched (rnfs/content/seal.py)
                     self._check_fetched(fetch, expect)  # its stored (sealed) bytes, as others hold them
-                    written = node_content.write_sealed(sealed, partial, self.config.blocks_dir, to_fetch)
-                    result = {"cid": str(expect.cid), "warnings": [], **written}
+                    written = node_content.get_sealed(self, sealed, partial, to_fetch, created, not no_extract)
+                    result = {"cid": str(expect.cid), **written}
                 else:
                     fetch.fetch_dag(expect, self.config.max_output_entries)
                     # Each file is checked before it is written while the deny list has file hashes

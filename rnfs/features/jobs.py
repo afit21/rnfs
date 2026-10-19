@@ -35,8 +35,10 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
 - A get job writes to <output's directory>/.rnfs-job-<id>.partial and renames that to its output once
   complete, so an interrupted write-out never leaves a partial output behind, and a resumed run removes what
   an earlier run left there. With sealed_name, a sealed file this node opens is renamed to its sealed name
-  (if fit, fsutil.safe_default_name) in the output's directory instead. With fallback_dht, a get whose
-  from node fails is retried with ordinary DHT discovery.
+  (if fit, fsutil.safe_default_name) in the output's directory instead: for a sealed folder unpacked, the
+  name of the directory written. With no_extract, a sealed folder is written as its tar rather than unpacked
+  (node.get's no_extract). With fallback_dht, a get whose from node fails is retried with ordinary DHT
+  discovery.
 - Finished jobs (done, failed, cancelled) are kept for `rnfs jobs`, at most max_finished_jobs, but each
   for at least FINISHED_GRACE: a CLI following a fast job must still find it once it ends.
 - Job threads are daemon threads, so they never hold up the process; stop() asks running fetches to stop
@@ -100,9 +102,10 @@ class Job:
 
     def __init__(self, job_id: str, kind: str, target: str | None, output: str | None = None,
                  from_node: str | None = None, created: float | None = None, sealed_name: bool = False,
-                 fallback_dht: bool = False, path: str | None = None, options: dict | None = None):
-        """A queued job; from_node is a node ID in hex. sealed_name and fallback_dht are for get jobs; path (and
-        for add, options: ADD_OPTIONS) for add and import jobs, which have no target."""
+                 fallback_dht: bool = False, path: str | None = None, options: dict | None = None,
+                 no_extract: bool = False):
+        """A queued job; from_node is a node ID in hex. sealed_name, fallback_dht and no_extract are for get jobs;
+        path (and for add, options: ADD_OPTIONS) for add and import jobs, which have no target."""
         self.id = job_id
         self.kind = kind
         self.target = target
@@ -110,6 +113,7 @@ class Job:
         self.from_node = from_node
         self.sealed_name = sealed_name  # write a sealed file under its sealed name, beside output
         self.fallback_dht = fallback_dht  # if from_node fails, try again with ordinary DHT discovery
+        self.no_extract = no_extract  # write a sealed folder as its tar rather than unpacking it
         self.path = path  # what an add or import job reads, on this machine
         self.options = options  # an add job's add_path options (only those set)
         self.state = QUEUED
@@ -249,9 +253,12 @@ class Job:
 
     def to_record(self) -> dict:
         """The job as saved (a running job is saved as such, and queued again when loaded). path and options
-        only for the kinds that have them (add, import), so the record of every other job is as 0.1.6 saved it."""
+        only for the kinds that have them (add, import), and no_extract only when set, so the record of every other
+        job is as 0.1.6 saved it."""
         record = {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
                   "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht}
+        if self.no_extract:
+            record["no_extract"] = True
         if self.path is not None or self.options is not None:
             record.update(path=self.path, options=self.options)
         record.update({"state": self.state, "created": self.created, "started": self.started,
@@ -272,10 +279,10 @@ class Job:
         if kind not in KINDS or state not in STATES:
             raise ValueError("bad kind or state")
         sealed_name, fallback_dht = record.get("sealed_name", False), record.get("fallback_dht", False)
-        path, options = record.get("path"), record.get("options")
-        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options)
+        path, options, no_extract = record.get("path"), record.get("options"), record.get("no_extract", False)
+        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options, no_extract)
         job = cls(job_id, kind, target, output, from_node, _number(record.get("created"), time.time()),
-                  sealed_name, fallback_dht, path, options)
+                  sealed_name, fallback_dht, path, options, no_extract)
         job.state = state
         job.started = _number(record.get("started"), None)
         job.finished = _number(record.get("finished"), None)
@@ -317,10 +324,10 @@ def _capped(result: dict) -> dict:
 
 
 def check_job_params(kind: str, target, output, from_node, sealed_name=False, fallback_dht=False, path=None,
-                     options=None):
+                     options=None, no_extract=False):
     """Raise ValueError unless these fit a job of kind: for get, pin and export a well-formed target, an absolute
-    output path for get and export (none for pin), and from (a node ID in hex), sealed_name and fallback_dht
-    (booleans) only for get; for add and import an absolute path and neither target nor output, and options
+    output path for get and export (none for pin), and from (a node ID in hex), sealed_name, fallback_dht and
+    no_extract (booleans) only for get; for add and import an absolute path and neither target nor output, and options
     (check_add_options) only for add."""
     from rnfs.content import walker  # validates the root CID and every path name
     if kind not in KINDS:
@@ -348,7 +355,7 @@ def check_job_params(kind: str, target, output, from_node, sealed_name=False, fa
             raise ValueError("only get jobs take from")
         if not isinstance(from_node, str) or not _NODE_ID.fullmatch(from_node):
             raise ValueError(f"invalid node ID {from_node!r}: must be 32 hex characters")
-    for name, value in (("sealed_name", sealed_name), ("fallback_dht", fallback_dht)):
+    for name, value in (("sealed_name", sealed_name), ("fallback_dht", fallback_dht), ("no_extract", no_extract)):
         if type(value) is not bool:
             raise ValueError(f"{name} must be true or false")
         if value and kind != "get":
@@ -688,8 +695,9 @@ class JobsFeature(Feature):
         from rnfs import fetcher
         from rnfs.errors import Denied, RnfsError, StorageFull, TooLarge
         from_node = bytes.fromhex(job.from_node) if job.from_node else None
+        options = {"no_extract": True} if job.no_extract else {}
         try:
-            return self.node.get(job.target, path, from_node=from_node)
+            return self.node.get(job.target, path, from_node=from_node, **options)
         except RnfsError as e:
             # Cancelled must stop the job; the content's size, the node's storage and its deny list don't depend
             # on the source
@@ -699,7 +707,7 @@ class JobsFeature(Feature):
             _log(f"job {job.id}: getting {job.target} from {job.from_node} failed ({e}); trying the DHT",
                  LOG_NOTICE)
         remove_partial(path)
-        return self.node.get(job.target, path)
+        return self.node.get(job.target, path, **options)
 
     def _dag_block_count(self, result: dict) -> int | None:
         """How many blocks the finished job's DAG has, now that it is complete."""
@@ -737,19 +745,20 @@ class JobsFeature(Feature):
 
     def submit(self, kind: str, target: str | None = None, output: str | None = None, from_node: str | None = None,
                sealed_name: bool = False, fallback_dht: bool = False, path: str | None = None,
-               options: dict | None = None) -> dict:
+               options: dict | None = None, no_extract: bool = False) -> dict:
         """Queue a job; its dict. Raises ValueError for bad parameters or an output in use, NotFound for an add's
         or import's path that doesn't exist, Busy when full.
 
         For get: sealed_name writes a sealed file under its sealed name beside output; fallback_dht retries
-        by DHT discovery if from_node fails. For add and import: path, and for add options (ADD_OPTIONS).
+        by DHT discovery if from_node fails; no_extract writes a sealed folder as its tar. For add and import:
+        path, and for add options (ADD_OPTIONS).
         """
         from rnfs.errors import Busy, NotFound
         contacts = self.dependency("contacts")
         if contacts is not None and target is not None:
             # `alice/docs`: a name contact's nick becomes the CID its name points at now (rnfs.features.contacts)
             target = contacts.expand_target(target)
-        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options)
+        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options, no_extract)
         if output is not None and os.path.lexists(output):
             raise ValueError(f"{output} already exists")
         if path is not None and not os.path.lexists(path):
@@ -769,7 +778,7 @@ class JobsFeature(Feature):
             while job_id in self._jobs:
                 job_id = secrets.token_hex(4)
             job = Job(job_id, kind, target, output, from_node, sealed_name=sealed_name, fallback_dht=fallback_dht,
-                      path=path, options=options)
+                      path=path, options=options, no_extract=no_extract)
             job.stop_event = self._stop_event
             job.on_progress = self._publish
             job.position = self._position
@@ -892,7 +901,8 @@ def _feature(handler) -> JobsFeature:
 
 
 def api_start(handler):
-    """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht"} for get, pin and export;
+    """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht", "no_extract"} for get,
+    pin and export;
     {"kind": "add", "path", and POST /api/add's options} or {"kind": "import", "path"}: queue a job; the job."""
     from rnfs import api
     body = handler.json_body()
@@ -910,6 +920,8 @@ def api_start(handler):
     output = api.parse_path(body.get("output")) if kind != "pin" else body.get("output")
     from_node = api.parse_hex_id(body["from"]).hex() if body.get("from") else None
     flags = {name: body.get(name, False) for name in ("sealed_name", "fallback_dht")}  # checked by submit
+    if "no_extract" in body:
+        flags["no_extract"] = body["no_extract"]  # checked by submit too
     handler.send_json(200, _feature(handler).submit(kind, target, output, from_node, **flags))
 
 
@@ -1011,7 +1023,7 @@ def format_job(job: dict) -> str:
 def job_fields(job: dict) -> dict:
     """A job's fields for `rnfs jobs show`, readable."""
     fields = {"id": job["id"], "kind": job["kind"], "state": job["state"]}
-    for name in ("target", "path", "output", "from", "sealed_name", "fallback_dht"):
+    for name in ("target", "path", "output", "from", "sealed_name", "fallback_dht", "no_extract"):
         if job.get(name):
             fields[name] = job[name]
     if job.get("options"):

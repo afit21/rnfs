@@ -232,9 +232,9 @@ class _Backend:
         """POST /api/add/stream."""
         return self.api.add_stream(data, name=name, length=length, **options)
 
-    def get(self, target: str, output: str, from_node: str | None, raw: bool) -> dict:
+    def get(self, target: str, output: str, from_node: str | None, raw: bool, no_extract: bool) -> dict:
         """POST /api/get."""
-        return self.api.fetch(target, output, from_node=from_node, raw=raw)
+        return self.api.fetch(target, output, from_node=from_node, raw=raw, no_extract=no_extract)
 
     def read(self, target: str, offset: int, length: int | None, raw: bool, from_node: str | None):
         """GET /api/cat: the body, read as it arrives, closing the connection when done or closed early. Sent once

@@ -22,7 +22,7 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/get/stream | `target`, `format` (`tar`) | the target as a tar stream (`get_tar`), fetched first, Content-Length set |
 | GET  | /api/export/stream | `target` | the target's archive (`export_chunks`), byte-identical to `export`, Content-Length set |
 | POST | /api/import/stream | body is an archive | `import_stream(body)`, as `/api/import` answers |
-| POST | /api/get | JSON `target`, `output`, `from`, `raw` | `get(...)` |
+| POST | /api/get | JSON `target`, `output`, `from`, `raw`, `no_extract` | `get(...)`; a sealed folder is unpacked unless `no_extract` |
 | POST | /api/dir/set | JSON `target`, `name`, `cid`, `executable` | `dir_set(...)` |
 | POST | /api/dir/rm | JSON `target` | `dir_rm(target)` |
 | POST | /api/pin/add | JSON `target` | `pin_add(target)` |
@@ -48,7 +48,7 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | Method | Path | Parameters | Response |
 |---|---|---|---|
 | GET  | /api/jobs | | `{"jobs": [job]}`, oldest first |
-| POST | /api/jobs | JSON `kind` (get, pin, export), `target`, `output`, `from`, `sealed_name`, `fallback_dht` | the job queued |
+| POST | /api/jobs | JSON `kind` (get, pin, export), `target`, `output`, `from`, `sealed_name`, `fallback_dht`, `no_extract` | the job queued |
 | GET  | /api/jobs/get | `id`, `wait` (≤ 30 s) | the job, once it ends or after `wait` |
 | POST | /api/jobs/cancel | JSON `id` | the job |
 | POST | /api/jobs/clear | JSON `id` (optional) | `{"removed": count}` of the finished jobs forgotten |
@@ -156,7 +156,7 @@ MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream")
+                "import_stream", "sealed_folders")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -1127,9 +1127,11 @@ class ApiHandler(TimedHandler):
         """POST /api/get: fetch and write out to a path on this machine (parameters: the module docstring's table)."""
         body = self.json_body()
         from_node = parse_hex_id(body["from"]) if body.get("from") else None
-        raw = {"raw": True} if parse_bool(body.get("raw")) else {}  # sealed files: the ciphertext
+        options = {"raw": True} if parse_bool(body.get("raw")) else {}  # sealed files: the ciphertext
+        if parse_bool(body.get("no_extract")):
+            options["no_extract"] = True  # a sealed folder written as its tar
         self.send_json(200, self.node.get(parse_target(body.get("target")), parse_path(body.get("output")),
-                                          from_node=from_node, **raw))
+                                          from_node=from_node, **options))
 
     def api_dir_set(self):
         """POST /api/dir/set {"target", "name", "cid", "executable"}: a new directory with an entry set."""

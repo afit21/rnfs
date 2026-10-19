@@ -105,7 +105,8 @@ class Added(_Object):
 @dataclass(frozen=True)
 class Written(_Object):
     """What get() wrote: the target's CID, the output path, warnings (warnings_total past the first 100), and for
-    a sealed file whether it was one and its sealed name (only a name fit to be an output name)."""
+    a sealed file whether it was one and its sealed name (only a name fit to be an output name); for a sealed folder
+    unpacked (extracted), the name of the directory written instead."""
 
     cid: Cid = _field(_cid)
     output: str | None = None
@@ -113,6 +114,7 @@ class Written(_Object):
     warnings_total: int | None = None
     sealed: bool = False
     name: str | None = None
+    extracted: bool = False
 
     def __str__(self) -> str:
         """The output path."""
