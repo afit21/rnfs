@@ -247,6 +247,15 @@ class LocalFacadeTest(NodeTest):
         self.assertNotIn(Cid.parse(published["cid"]), self.a.publisher.provided() - self.a.publisher.provided_entries())
         self.assertIn(Cid.parse(published["cid"]), self.a.publisher.provided_entries())
 
+    def test_known_servers_takes_the_larger_estimate(self):
+        """provide_entries' airtime estimate on slow nodes is given the routing table's size, or the density
+        check's network size estimate once it has one and it is larger."""
+        self.assertEqual(self.a._known_servers(), self.a.routing.node_count())
+        with mock.patch.object(self.a.sizes, "estimate", return_value=5000.4):
+            self.assertEqual(self.a._known_servers(), 5000)
+        with mock.patch.object(self.a.sizes, "estimate", return_value=None):
+            self.assertEqual(self.a._known_servers(), self.a.routing.node_count())
+
     def test_needs_reach(self):
         """A client keeps announcing only while something needs others to reach it: providing, a name, remote
         pins, private mode."""
@@ -1154,12 +1163,12 @@ class LookupStartTest(NodeTest):
             self.assertTrue(self.b.routing.heard(node_id))
         failed = others[0]
         self.b.routing.failed(failed)  # the closest node to its own ID, but no longer answering
-        start = self.b._lookup(failed)._start_nodes
+        start = self.b._lookup(failed).first._start_nodes
         self.assertNotIn(failed, start)
         self.assertEqual(len(start), K)  # A and the others that haven't failed
         self.b.routing.remove(others[1])
         self.b.routing.remove(others[2])
-        start = self.b._lookup(failed)._start_nodes
+        start = self.b._lookup(failed).first._start_nodes
         self.assertIn(failed, start)  # fewer than K healthy: made up from the rest
         self.assertEqual(len(start), K - 1)
 
@@ -1174,13 +1183,13 @@ class LookupStartTest(NodeTest):
             self.b.routing.heard(dead)  # announces don't clear its failures
             self.b.routing.failed(dead)
         self.b.routing.heard(dead)
-        lookup = self.b._lookup(dead)
+        lookup = self.b._lookup(dead).first  # the search's first lookup
         self.assertNotIn(dead, lookup._start_nodes)
         self.assertEqual(len(lookup._start_nodes), K)
         self.assertTrue(lookup.unreliable(dead))
         for node_id in others[1:4]:
             self.b.routing.remove(node_id)
-        start = self.b._lookup(dead)._start_nodes
+        start = self.b._lookup(dead).first._start_nodes
         self.assertEqual(start[-1], dead)  # fewer than K others: made up with it, last
         self.assertEqual(len(start), K - 1)
         self.b._answered(dead)

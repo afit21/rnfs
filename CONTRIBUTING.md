@@ -45,6 +45,7 @@ variables:
 | `RNFS_E2E=1` | Real daemons and real RNS over local TCP, driven through the CLI or the library. Run them with `RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins tests.test_nomadnet_e2e` (3 to 4 minutes). CI's end-to-end step lists every module gated on it, and `tests/test_packaging.py` fails if a new one is missing from that list. |
 | `RNFS_FUZZ_EXAMPLES=N` | A deeper, randomized run of `tests/security/test_fuzz_parsers.py` (e.g. 3000 examples per parser). That module needs hypothesis, which isn't one of rnfs's dependencies: without it every test there is skipped, as in CI. |
 | `RNFS_BENCH=1` | Prints the FastCDC chunking rate measured by `tests/test_chunker.py` (the test itself only checks a floor). |
+| `RNFS_ECLIPSE=1` | A larger run of `tests/test_eclipse.py` (identities placed next to a key: 2,000 servers, more keys, slow nodes too, about 1.5 minutes) that prints what it measured: findability under attack, false positives, `/find` and stores per search and publish. |
 
 `tests/bench_block_writes.py` is a benchmark, not a test: run it by hand on the disks that matter (its docstring
 says how, including on a Raspberry Pi SD card). So is `tests/bench_startup.py`, which times opening a large block

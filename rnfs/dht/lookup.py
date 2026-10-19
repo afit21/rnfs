@@ -17,6 +17,21 @@ Nodes whose recent queries all failed (the routing table's `unreliable`) rank af
 lookup asks and waits for them only when it has too few others. One whose retry is due (`may_retry`) is asked
 again on top of the `alpha` queries if it would otherwise rank among the closest, and nothing waits for that
 answer: a node that never establishes a link costs a lookup no time, yet one that comes back is found.
+
+Identities generated next to a key (specification section 6) can answer for it with each other only. Two local
+rules make a run wait for more than the beta closest, so they can't hide what honest servers near the key hold:
+- **Senior servers** (`seniors`: the servers closest to the key that the announce first-seen log heard at least
+  provider_seniority ago, which such identities can't be): the beta closest of them known that haven't failed must
+  answer too. Without an attack they are the beta closest anyway; at most len(seniors) extra queries.
+- **The density check** (`size`: the network size estimate, rnfs.dht.density): when the nodes known near the key are
+  packed more than DENSITY_THRESHOLD times denser than the estimate allows, RING_ANSWERS servers of each ring beyond
+  the dense core must answer too.
+Their extra queries go out within alpha like any other and count towards max_queries; their answers count as
+progress when they bring the key nearer, but never against the stall rule (they aren't meant to come nearer).
+
+Disjoint lookups (rnfs.dht.disjoint) run several Lookups that share no node: `claim(id)` is asked before each query
+(False: another path owns the node, which this one drops) and `taken(id)` leaves out nodes another path owns when a
+reply names them.
 """
 import heapq
 import queue
@@ -25,6 +40,7 @@ import time
 from collections.abc import Callable, Iterable
 
 from rnfs.constants import ID_LENGTH, K
+from rnfs.dht import density
 from rnfs.dht.routing import distance, is_id
 
 # query(node_id, key) -> (provider IDs, node IDs), or None if the node didn't answer, refused, or replied
@@ -57,6 +73,10 @@ def _quiet(text: str) -> None:
     """Default report: says nothing."""
 
 
+def _unsampled(key: bytes, kth: int) -> None:
+    """Default on_complete: keeps nothing."""
+
+
 def _name(node_id: bytes) -> str:
     """A node ID as the log writes it (RNS.prettyhexrep's form, without loading RNS)."""
     return f"<{node_id.hex()}>"
@@ -80,6 +100,11 @@ class Lookup:
     - `max_queries`: queries one run sends at most, retries included.
     - `on_useful(id)`: a node whose answer proved useful: it named a node closer to the key than itself that then
       answered (local scores, section 6). Called from the running thread, at most once per node per lookup.
+    - `size`: the network size estimate (rnfs.dht.density), which turns the density check on; `seniors`: the
+      announce first-seen log's servers closest to the key heard at least provider_seniority ago (see above).
+    - `claim(id)`, `taken(id)`: a disjoint lookup's paths' shared node ownership (see above).
+    - `on_complete(key, kth)`: told, at the end of each run that completed with at least k nodes known, the
+      distance from the key to the k-th closest (the network size estimate's sample).
 
     After find_closest, candidates() gives every node it chose from and ask() sends one more /find about a nearby
     key, so one lookup serves the keys of a region (sweep providing, rnfs.publisher).
@@ -96,7 +121,9 @@ class Lookup:
                  clock: Callable[[], float] = time.monotonic, poll_interval: float = _POLL_INTERVAL,
                  report: Callable[[str], None] = _quiet, unreliable: Callable[[bytes], bool] = _never,
                  may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES,
-                 on_useful: NodeCallback = _ignore):
+                 on_useful: NodeCallback = _ignore, size: float | None = None, seniors: Iterable[bytes] = (),
+                 claim: Callable[[bytes], bool] = _always, taken: Callable[[bytes], bool] = _never,
+                 on_complete: Callable[[bytes, int], object] = _unsampled):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -116,6 +143,13 @@ class Lookup:
         self.may_retry = may_retry
         self.max_queries = max(1, max_queries)
         self.on_useful = on_useful
+        self.size = size
+        self.claim = claim
+        self.taken = taken
+        self.on_complete = on_complete
+        self.ended = ""  # how the last run ended ("complete", "no progress", ...; "" before the first)
+        self.sent = 0  # queries the runs sent, in all (retries included)
+        self.dense = False  # the density check fired in a run
         self._useful: set[bytes] = set()  # nodes passed to on_useful, in any run
         self.deadline: float | None = None
         self._failed: set[bytes] = set()  # didn't answer: dropped for the rest of the lookup
@@ -135,6 +169,7 @@ class Lookup:
         self._wake: queue.Queue | None = None
         self._lock = threading.Lock()
         self._start_nodes = [n for n in dict.fromkeys(start_nodes) if self._usable(n)]
+        self._seniors = [n for n in dict.fromkeys(seniors) if self._usable(n)]
 
     # Public interface
 
@@ -317,14 +352,16 @@ class Lookup:
         # Nodes known to this run: the start nodes plus those that answered before, since they are
         # usually closer. Every run re-queries them, which is what gives a fresh random half of providers.
         known: dict[bytes, int] = {}  # node ID -> distance, for usable nodes
-        for node_id in list(self._start_nodes) + self.closest_answered():
-            if self._usable(node_id):
+        for node_id in list(self._start_nodes) + self.closest_answered() + self._seniors:
+            if self._usable(node_id) and not self.taken(node_id):
                 known[node_id] = self._distance(node_id)
+        seniors = [node_id for node_id in self._seniors if node_id in known]
         # Known nodes that were unreliable when found and haven't answered: ranked after every other
         doubtful = {node_id for node_id in known if self.unreliable(node_id)}
         queried: set[bytes] = set()
         answered: set[bytes] = set()
         retrying: set[bytes] = set()  # unreliable nodes asked again on top of alpha, which nothing waits for
+        extras: set[bytes] = set()  # nodes asked only because the senior rule or the density check required them
         passed: set[bytes] = set()  # unreliable nodes whose retry wasn't due (or needs a path request)
         found: list[bytes] = []
         introduced: dict[bytes, bytes] = {}  # node -> the node whose answer first named it, in this run
@@ -344,6 +381,20 @@ class Lookup:
             """Sort key: reliable nodes (and those that answered) first, then by distance."""
             return node_id in doubtful, known[node_id]
 
+        def required() -> list[bytes]:
+            """The nodes that must answer besides the beta closest known: the beta closest senior servers known, and
+            beyond a dense core RING_ANSWERS of each ring (ranked as rank ranks them)."""
+            needed = sorted((node_id for node_id in seniors if node_id in known), key=rank)[:self.beta]
+            if self.size is not None:
+                by_distance = sorted(known, key=known.__getitem__)
+                ring = density.rings(by_distance, [known[node_id] for node_id in by_distance], self.size,
+                                     density.RING_ANSWERS, later=doubtful.__contains__)
+                if ring:
+                    self.dense = True
+                    needed += [node_id for node_id in ring if node_id not in needed]
+            return needed
+
+        checks = bool(seniors) or self.size is not None
         started = self.clock()
         why = "stopped"
 
@@ -355,9 +406,10 @@ class Lookup:
                 why = "out of time"
                 break
             ranked = sorted(known, key=rank)
-            if ranked and all(node_id in answered for node_id in ranked[:self.beta]):
+            needed = required() if checks else []
+            if ranked and all(node_id in answered for node_id in ranked[:self.beta] + needed):
                 why = "complete"
-                break  # the beta closest known nodes have all answered: complete
+                break  # the beta closest known nodes, and those the checks need, have all answered: complete
             if stalled >= STALL_WINDOWS * window:
                 why = "no progress"
                 break  # nodes keep answering, but the closest known come no nearer
@@ -369,28 +421,39 @@ class Lookup:
             # Keep up to alpha queries in flight, to the closest nodes not yet queried. Only nodes ranked
             # within the closest max(alpha, beta) known can affect completion, so farther ones aren't
             # queried while nearer queries are pending: on slow networks every query costs airtime.
+            # The nodes the checks need are queried the same way, in rank order among the window's.
             while in_flight < self.alpha and sent < self.max_queries:
                 ranked = sorted(known, key=rank)[:window]
-                node_id = next((n for n in ranked if n not in queried), None)
+                targets = sorted(set(ranked).union(n for n in needed if n in known), key=rank) if needed else ranked
+                node_id = next((n for n in targets if n not in queried), None)
                 if node_id is None:
                     break
                 queried.add(node_id)
-                if not self.allow_unknown(node_id):
-                    del known[node_id]  # over the unknown-ID budget: dropped, but not a failure
+                if not self.claim(node_id) or not self.allow_unknown(node_id):
+                    # Another path's (a disjoint lookup), or over the unknown-ID budget: dropped, but not a failure
+                    del known[node_id]
                     continue
+                if node_id not in ranked:
+                    extras.add(node_id)
                 self._send(node_id, results)
                 sent += 1
+                self.sent += 1
                 in_flight += 1
             # An unreliable node that distance alone would rank among them is asked again once its retry is
             # due: only an answer shows it is back. On top of alpha, since nothing waits for it
             for node_id in sorted(known, key=known.__getitem__)[:window]:
                 if node_id not in doubtful or node_id in queried or node_id in passed or sent >= self.max_queries:
                     continue
-                if self.is_known(node_id) and self.may_retry(node_id):
+                if not self.is_known(node_id):
+                    passed.add(node_id)
+                elif not self.claim(node_id):
+                    known.pop(node_id, None)  # another path's (a disjoint lookup)
+                elif self.may_retry(node_id):
                     queried.add(node_id)
                     retrying.add(node_id)
                     retried += 1
                     sent += 1
+                    self.sent += 1
                     self._send(node_id, results)
                 else:
                     passed.add(node_id)
@@ -434,7 +497,7 @@ class Lookup:
                     for provider in providers:  # at most k per reply, from nodes that answered
                         self._listed_by.setdefault(provider, set()).add(node_id)
             for new_id in nodes:
-                if new_id not in known and new_id not in queried and self._usable(new_id):
+                if new_id not in known and new_id not in queried and self._usable(new_id) and not self.taken(new_id):
                     known[new_id] = self._distance(new_id)
                     introduced.setdefault(new_id, node_id)
                     if self.unreliable(new_id):
@@ -442,7 +505,7 @@ class Lookup:
             nearer = self._reach(known)
             if nearer < reach:
                 reach, stalled = nearer, 0
-            else:
+            elif node_id not in extras:  # the checks' nodes aren't asked to come nearer: not stalling
                 stalled += 1
             if on_provider is not None:
                 for provider in providers:
@@ -452,10 +515,20 @@ class Lookup:
                     found.append(provider)
                     on_provider(provider)
         failed = len(queried & self._failed)
+        self.ended = why
         self.report(f"lookup for {self.key.hex()}: {why} after {self.clock() - started:.1f}s; asked {len(queried)}, "
                     f"{len(answered)} answered, {failed} failed, {in_flight} still out"
                     + (f", retried {retried} unreliable ({len(retrying)} still out)" if retried else "")
+                    + (f", {len(extras)} for the senior rule and the density check" if extras else "")
+                    + ("; dense near the key" if self.dense else "")
                     + (f"; {len(found)} new providers" if on_provider is not None else ""))
+        kth = density.kth_distance(list(known.values())) if why == "complete" else None
+        if kth is not None:
+            try:
+                self.on_complete(self.key, kth)
+            except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged
+                from rnfs.log import LOG_WARNING, log
+                log(f"lookup for {self.key.hex()}: the completion callback raised {e!r}", LOG_WARNING)
         return found
 
     def _credit(self, introducer: bytes | None, node_id: bytes):
