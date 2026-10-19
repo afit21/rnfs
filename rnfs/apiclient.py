@@ -29,7 +29,8 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   itself on so the request could only go on a new one, is refused before the token is sent (until 0.2.0 the
   client did send it on a new connection).
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
-  (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
+  (DaemonNotRunning; DaemonStarting when nothing answers but a process holds the rnfs dir's lock, as a daemon
+  does from before it opens its block store until it has stopped), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
   refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS, from
   rnfs.errors.STATUSES: 400 BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507
   StorageFull, other 5xx ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a
@@ -61,7 +62,7 @@ import warnings
 from urllib.parse import urlencode
 
 from rnfs import errors, fsutil, winacl
-from rnfs.config import DEFAULT_API_PORT, Config
+from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
 
 DEFAULT_DIR = Config.rnfs_dir
 TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every client
@@ -97,6 +98,18 @@ class ApiError(errors.RnfsError):
 
 class DaemonNotRunning(ApiError):
     """Nothing listens on the API port."""
+
+
+class DaemonStarting(DaemonNotRunning):
+    """Nothing listens on the API port, but a process holds the rnfs dir's lock (dir_holder), its process ID pid: a
+    daemon still starting (it locks the dir before opening the block store, which takes a while when large, and
+    listens only after), or stopping (it keeps the lock until it has saved its state), or an app's own rnfs.Node,
+    which serves no API. A DaemonNotRunning, so code catching that is unchanged."""
+
+    def __init__(self, message: str, pid: int):
+        """The error, naming the process pid."""
+        super().__init__(message)
+        self.pid = pid
 
 
 class ConnectionFailed(ApiError):
@@ -211,6 +224,21 @@ def load_settings(rnfs_dir: str = DEFAULT_DIR) -> Config:
 def daemon_info_path(rnfs_dir: str = DEFAULT_DIR) -> str:
     """Where the daemon using rnfs_dir describes itself (DAEMON_FILE)."""
     return os.path.join(os.path.expanduser(rnfs_dir), DAEMON_FILE)
+
+
+def dir_holder(rnfs_dir: str = DEFAULT_DIR) -> int | None:
+    """The process ID of the daemon or rnfs.Node holding rnfs_dir's lock (<rnfs dir>/daemon.lock), or None if none
+    does or it can't be told. The process the lock file names is checked first, and the lock tested only while it
+    runs: testing it could make a daemon starting at that very instant fail (fsutil.lock_held). This process is
+    never named (its own Node holds the lock, but this isn't a daemon for its Client to wait for)."""
+    path = os.path.join(os.path.expanduser(rnfs_dir), LOCK_FILE)
+    pid = fsutil.lock_holder(path)
+    if pid is None or pid <= 0 or pid == os.getpid() or not _process_alive(pid):
+        return None
+    try:
+        return pid if fsutil.lock_held(path) else None
+    except OSError:
+        return None
 
 
 def _process_alive(pid: int) -> bool:
@@ -575,13 +603,20 @@ class ApiConnection:
     def _exchange(self, connection: http.client.HTTPConnection, method: str, url: str, body,
                   headers: dict) -> http.client.HTTPResponse:
         """Send one request on connection and return its response, whatever its status; a connection that fails
-        raises DaemonNotRunning or ConnectionFailed (also when the answer doesn't come within its timeout)."""
+        raises DaemonNotRunning (DaemonStarting while a process holds the rnfs dir) or ConnectionFailed (also when
+        the answer doesn't come within its timeout)."""
         try:
             connection.request(method, url, body=body, headers=headers)
             return connection.getresponse()
         except (http.client.HTTPException, OSError) as e:
             connection.close()
             if isinstance(e, ConnectionRefusedError):
+                holder = dir_holder(self.rnfs_dir)
+                if holder is not None:
+                    raise DaemonStarting(f"the daemon (process {holder}) is starting: it holds {self.rnfs_dir} but "
+                                         f"doesn't answer on API port {self.port} yet; try again in a moment. If "
+                                         f"this lasts, process {holder} may be stopping, or be an app's own rnfs "
+                                         f"node, which has no API", holder) from None
                 raise DaemonNotRunning(f"no daemon is running on API port {self.port}. Start one with: rnfs daemon") \
                     from None
             if isinstance(e, TimeoutError) and connection.timeout is not None:  # else the system's (ETIMEDOUT)
@@ -950,6 +985,23 @@ class ApiConnection:
     def pin_remote(self, node: str, cid: str, pin: bool = True) -> bool:
         """Ask node (hex) to pin cid for this node, or (pin=False) to release that pin; True if it accepted."""
         return self.post("/api/pin/remote", node=node, cid=cid, pin=pin)["accepted"]
+
+    def pin_remote_ls(self, node: str | None = None, cid: str | None = None, check: bool = False) -> list[dict]:
+        """The remote pins this node asked for (node's, cid's, or every one), most recently asked first: [{"node",
+        "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]; check: check them first (provider
+        lookups, paced). NoSuchEndpoint from a daemon before 0.2.0."""
+        try:
+            return self.get("/api/pin/remote", node=node, cid=cid, check=_flag(check))["pins"]
+        except ApiError as e:
+            if e.status == 405:  # a daemon before 0.2.0 has only POST /api/pin/remote
+                raise NoSuchEndpoint("this daemon doesn't list remote pins (rnfs 0.2.0 does)", 404,
+                                     "no_such_endpoint") from None
+            raise
+
+    def pin_remote_served(self) -> dict:
+        """The remote pins other identities asked of this node: {"pins": [{"identity", "cid", "state", "reason",
+        "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}."""
+        return self.get("/api/pin/remote/served")
 
     # The network
 

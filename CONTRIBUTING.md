@@ -47,8 +47,9 @@ variables:
 | `RNFS_BENCH=1` | Prints the FastCDC chunking rate measured by `tests/test_chunker.py` (the test itself only checks a floor). |
 
 `tests/bench_block_writes.py` is a benchmark, not a test: run it by hand on the disks that matter (its docstring
-says how, including on a Raspberry Pi SD card). Performance changes record their before and after numbers in
-CHANGELOG.md.
+says how, including on a Raspberry Pi SD card). So is `tests/bench_startup.py`, which times opening a large block
+store at startup (after a clean stop, after a crash, and the first start on 0.1.6's layout). Performance changes
+record their before and after numbers in CHANGELOG.md.
 
 `tests/interop.py` is a manual cross-version check, not a test either: it runs this tree's daemons against daemons
 of older releases over local TCP, in both directions, and prints a PASS/FAIL table (providers, get and cat,

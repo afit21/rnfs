@@ -99,9 +99,9 @@ class ApiClient(apiclient.ApiConnection):
     request (status without the token says only the daemon's version, for health checks).
     """
 
-    def __init__(self, port: int, token_file: str):
-        """A client of the daemon on port whose token is in token_file."""
-        super().__init__(port=port, token_file=token_file)
+    def __init__(self, port: int, token_file: str, rnfs_dir: str | None = None):
+        """A client of the daemon using rnfs_dir (default ~/.rnfs/), on port, whose token is in token_file."""
+        super().__init__(rnfs_dir=rnfs_dir, port=port, token_file=token_file)
 
     def request(self, *args, **kwargs) -> http.client.HTTPResponse:
         """ApiConnection.request (the successful response), exiting on errors."""
@@ -158,7 +158,7 @@ def client(args) -> ApiClient:
     if port is None:
         running = apiclient.read_daemon_info(args.dir)
         if running is not None:
-            return ApiClient(running["api_port"], token_path(args.dir))
+            return ApiClient(running["api_port"], token_path(args.dir), args.dir)
         try:
             config = apiclient.load_settings(args.dir)
         except apiclient.ApiError as e:
@@ -166,7 +166,7 @@ def client(args) -> ApiClient:
         for warning in config.warnings:
             warn(warning)
         port = config.api_port
-    return ApiClient(port, token_path(args.dir))
+    return ApiClient(port, token_path(args.dir), args.dir)
 
 
 def port_number(text: str, minimum: int = 1) -> int:
@@ -707,10 +707,45 @@ def run_pin_remote(args):
     """Ask a node to pin or release a CID."""
     from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
     args.node = node_arg(args, args.node)
-    result = client(args).post("/api/pin/remote", node=args.node, cid=args.cid, pin=args.action == "add")
-    if not result["accepted"]:
+    if not client(args).pin_remote(args.node, args.cid, pin=args.action == "add"):
         fail(f"{args.node} refused the request")
     print("accepted")
+
+
+def run_pin_remote_ls(args):
+    """List the remote pins this node asked for and whether each is done, or (--served) those others asked of it."""
+    from rnfs.features.peers import human_age, human_size  # no RNS there
+    if args.served:
+        if args.node or args.cid or args.check:
+            fail("--served takes no node, CID or --check")
+        served = client(args).pin_remote_served()
+        if args.json:
+            print(json.dumps(served, indent=2))
+            return
+        now = time.time()
+        for usage in served["usage"]:
+            gone = "" if usage["allowed"] else " (no longer in remote_pin_identities)"
+            print(printable(f"{usage['identity']}: {human_size(usage['used'])} of {human_size(usage['quota'])} used, "
+                            f"{usage['pinned']} pinned, {usage['waiting']} waiting{gone}"))
+        for pin in served["pins"]:
+            state = pin["state"] + (f" ({pin['reason']})" if pin.get("reason") else "")
+            when = f"  {human_age(now - pin['at'])} ago" if pin.get("at") is not None else ""
+            detail = f": {pin['detail']}" if pin.get("detail") else ""  # may name what others' DAGs hold: escaped
+            print(printable(f"{pin['identity']}  {pin['cid']}  {state}{when}{detail}"))
+        return
+    from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
+    node = node_arg(args, args.node) if args.node else None
+    pins = client(args).pin_remote_ls(node, args.cid, check=args.check)
+    if args.json:
+        print(json.dumps(pins, indent=2))
+        return
+    if not pins:
+        print("no remote pins asked for (those asked before rnfs 0.2.0 aren't listed)", file=sys.stderr)
+    now = time.time()
+    for pin in pins:
+        checked = f", checked {human_age(now - pin['checked'])} ago" if pin.get("checked") is not None else ""
+        print(printable(f"{pin['node']}  {pin['cid']}  {pin['state']}  asked {human_age(now - pin['asked'])} ago"
+                        f"{checked}"))
 
 
 def run_gc(args):
@@ -1029,6 +1064,15 @@ def build_parser() -> argparse.ArgumentParser:
         sub = command(remote, action, run_pin_remote, f"ask a node to {'pin' if action == 'add' else 'unpin'} a CID")
         sub.add_argument("node", metavar="NODE_ID")
         sub.add_argument("cid")
+    remote_ls = command(remote, "ls", run_pin_remote_ls,
+                        "list the remote pins asked for and whether each is done (--served: those asked of this node)")
+    remote_ls.add_argument("node", metavar="NODE_ID", nargs="?", help="only those asked of this node")
+    remote_ls.add_argument("cid", nargs="?", help="only those of this CID")
+    remote_ls.add_argument("--check", action="store_true",
+                           help="look each up among its CID's providers first (paced; at most 32, 4 on a slow node)")
+    remote_ls.add_argument("--served", action="store_true",
+                           help="the pins other identities asked of this node, and their use of remote_pin_quota")
+    remote_ls.add_argument("--json", action="store_true", help="print the full listing as JSON")
 
     command(commands, "gc", run_gc, "evict all cached fetches")
     cache = commands.add_parser("cache", help="cached fetches (downloads not pinned)").add_subparsers(

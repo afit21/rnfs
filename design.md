@@ -121,7 +121,7 @@ rnfs/
     seal.py           sealed files: SealingReader, open_sealed/SealedFile, recipients (section 5, Sealed files)
     walker.py         Expect, reader checks, path lookup, byte ranges, listing, writing out (sections 5, 7)
     edit.py           dir set / dir rm (section 11)
-    blockstore.py     one file per CID, atomic, verified (section 8)
+    blockstore.py     one file per CID in 1,024 subdirectories, atomic, verified (section 8)
     storage.py        Storage: blocks + pins (sources) + cached fetches + protection + eviction/GC (section 8)
     archive.py        export/import stream; archive_size for an exact Content-Length (section 8)
     tarstream.py      directories as tar streams: build_tar (an upload), plan/length/chunks (a download),
@@ -230,8 +230,20 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   `used_bytes()`. Adds, the shared folder and archive import store through `with session.writer() as put:`,
   which writes blocks on up to 16 threads (`WRITE_THREADS`, at most 32 queued) so their fsyncs overlap, and
   has stored every one, or raised the first error, before the block exits: nothing is pinned before its blocks
-  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
-  cache records, so they never refer to block names a power loss could undo.
+  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the
+  subdirectories blocks were renamed into since the last sync (16 at a time, `SYNC_THREADS`: they share the
+  filesystem's journal commits), and `blocks/` itself when a subdirectory was made; `Storage` calls it before
+  saving pins or cache records, so they never refer to block names a power loss could undo.
+- block layout (`blockstore.py`): `blocks/<xy>/<cid>`, `xy = shard_of(name)`, the written CID's `[-3:-1]`. `put`
+  writes its temporary file in the block's subdirectory, made 0700 on first use (`_shard_dir`, under a small
+  lock, since writers run in parallel). Opening the store lists `blocks/` itself only: `.partial-` files there
+  are deleted, each subdirectory is checked (`_check_shard`: `lstat`, then on POSIX an `O_NOFOLLOW` descriptor's
+  `fstat` for the owner and an `fchmod` to 0700; a link, non-directory or another user's raises RnfsError and
+  stops the start), and every canonical-CID file there (0.1.6's flat layout) is moved into its subdirectory
+  (`fsutil.replace`; if the target exists, the flat copy is deleted) before the subdirectories and `blocks/` are
+  synced. A move that fails leaves the CID in `_flat`, where `path()` looks first, until a start moves it, or
+  `delete` removes it. `scan(tidy)` lists every subdirectory (no links followed; a CID in another block's
+  subdirectory is ignored) and with `tidy` deletes the `.partial-` files it meets, which only a start may do.
 - pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
   `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]` (a copy), `pinned_cids() -> frozenset[Cid]` (the
   same set until pins change: the publisher's refresh reads it after every add), `has_pin(cid, source)`,
@@ -266,6 +278,21 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   since the last `save()`; those still cached are always the most recently used, so a save writes them with
   new `used` values (the table's LRU order) and deletes the others.
 - `verify() -> stats` re-checks every block, deleting bad ones.
+- The block index, `_sizes` (CID -> size), is also the `block_sizes` table (schema step `block_sizes`). `_put`
+  and `_delete` note each change in `_sizes_dirty` (a size, or None); `_save_pins` writes them in the pin's durable
+  transaction and `save()` with the cache records, each taking and writing them under the lock (`save()` syncs
+  the blocks first, outside it), so an older batch never lands after a newer one. The table is trusted only after
+  a clean stop: `close()` marks the store closed (`_put` raises `Closed`, `_delete` deletes nothing), syncs the
+  blocks, writes what is left and sets the meta value `(block_sizes, clean)` to 1 in one durable transaction,
+  unless a put is still writing (`_writing`, a thread that outlived the node's stop) or `BlockStore.untidy` (a
+  partial file it couldn't delete). At the next start `_index` clears the mark durably before the block store
+  is opened (so the move of flat blocks, or anything after, can't be trusted to a stale table), then loads the
+  table, adding the flat blocks `BlockStore` found (`found_flat`: an older rnfs may have stored some since); with
+  no mark, a 0, or a row that doesn't parse, it lists every block (`scan(tidy=True)`) and writes the rows that
+  differ from the table (all of them after a bad row). A row whose file is missing is found when the block is
+  read, as a damaged block is (`get` deletes it from the index). A million small blocks (NVMe, warm cache) are
+  indexed in 1.2 s from the table against 5.4 s for 0.1.6's listing; a start after an unclean stop takes 7.2 s
+  (1,024 directories listed, the table read and compared).
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.
@@ -485,7 +512,7 @@ failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `er
 `app_proof_key(token)`; `rnfs.Client(app=, token=)` passes them on. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
 `ls`, `stat`, `dir_set`, `dir_rm`, `export`, `import_archive`, `add_tar`, `get_tar`, `export_stream`,
 `import_stream` (uploads bytes or a binary file, chunked when their length is unknown; downloads a `Stream`), `gc`,
-`verify`, `pin_*` (with `pin_remote`),
+`verify`, `pin_*` (with `pin_remote`, `pin_remote_ls`, `pin_remote_served`),
 `providers`, `ping`, `name_*` (with `name_watch`, `name_import`, `name_export`, `name_rm`), `submit_job`, `job`,
 `jobs`, `cancel_job`, `clear_jobs`, `deny*`) cover every core route (`ApiHandler.ROUTES`; checked by
 test_apiclient), so `remote.py` writes no path itself, and send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
@@ -516,7 +543,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `pin_rm(cid, source="user")` | `None`; NotFound if `source` doesn't hold it |
 | `source=` (0.2.0) | taken by `add_path`, `add_stream`, `add_tar`, `dir_set`, `dir_rm`, `pin_add`, `pin_rm`, `import_archive` and `import_stream`: the source their caller pins and releases with, `user` (the default: the CLI, an embedded node) or an app's `app:<name>[:<key>]` (`ApiHandler.pin_source()`; anything else is ValueError, `node._caller_source`). After pinning with an app's source the node checks the app still exists (`_app_still_there`): `app_rm` forgets an app before it looks for its pins, so a pin a request already let in makes after that is released there and then, with NotFound |
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
-| `pin_remote(node_id, cid, pin)` | `bool` accepted |
+| `pin_remote(node_id, cid, pin)` | `bool` accepted; recorded (`AskedPins.record`) |
+| `pin_remote_ls(node_id=None, cid=None, check=False)` | `[{"node", "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]`, most recently asked first; `check` runs `AskedPins.check_now` first (Remote pin status, below) |
+| `pin_remote_served()` | `{"pins": [{"identity", "cid", "state", "reason", "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
 | `ping(node_id)` | round-trip seconds, or None |
@@ -556,7 +585,8 @@ handed the store not matching its CID: a bug, not a bad request) as a warning. P
 as a request body.
 
 **Core API routes** (`rnfs/api.py` `ROUTES`): `GET /api/status` (open), `/api/info`, `/api/cat`, `/api/ls`,
-`/api/stat`, `/api/pin/ls`, `/api/providers`, `/api/ping`, `/api/name/list`, `/api/name/resolve`,
+`/api/stat`, `/api/pin/ls`, `/api/pin/remote` (`node`, `cid`, `check`), `/api/pin/remote/served`,
+`/api/providers`, `/api/ping`, `/api/name/list`, `/api/name/resolve`,
 `/api/name/watch` (a long poll for newer records: Public API, API additions);
 `POST /api/add`, `/api/add/stream`, `/api/get`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`,
 `/api/pin/remote`, `/api/gc`, `/api/verify`, `/api/name/create`, `/api/name/rm`, `/api/name/export`,
@@ -576,7 +606,12 @@ prints the version and says why). The daemon writes a new random token to `<rnfs
 local users and processes can't drive the API. Before anything else uses the rnfs dir (the debug log, the
 node), the daemon locks `<rnfs dir>/daemon.lock` (`fsutil.lock_exclusive`: `flock`, or `msvcrt.locking` of a byte
 past the text on Windows; the file holds its process ID) and keeps the lock until it exits, so a second daemon
-on the same dir stops at once, naming the first (`lock_holder`). A start runs in this order, in the daemon
+on the same dir stops at once, naming the first (`lock_holder`). The lock is taken before the node opens its block
+store, and the API listens only after, so a client whose connection is refused checks the lock
+(`apiclient.dir_holder`: the process `lock_holder` names, if `_process_alive`, and then `fsutil.lock_held`, a
+shared `flock` (or the byte's lock on Windows) taken and released at once, writing nothing) and raises
+`DaemonStarting(pid)`, a `DaemonNotRunning`, in place of "no daemon is running": `rnfs status` and every other
+command say the daemon is starting. The CLI's `ApiClient` is given `--dir` for it. A start runs in this order, in the daemon
 (`cli.run_daemon`) and in `rnfs.Node` alike: the root (`node.make_private_root`), then the settings
 (`Config.load`), then the subdirectories and the lock (`lock_rnfs_dir`: `_make_private_dirs(root)`, then
 `lock_exclusive`), so each step relies only on what an earlier one secured. `make_private_root` refuses to start
@@ -682,8 +717,10 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `count`: storage's `pin_listener`, after the pins are saved; a label from `pin_label`), `cache` (`change`: added
   or removed, `cids`, `count`: storage's `cache_listener`, from `_set_record` and `_drop_records`), `name`
   (`name`, `cid`, `sequence`: `NameManager.held_listener`, for a newer record accepted for a name held — this
-  node's own, kept, followed or resolved — or watched), and `job`, `inbox` and `peer` from their features.
-  `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once (`ApiHandler.event_waiters`, a
+  node's own, kept, followed or resolved — or watched), `remote_pin` (`side` "asked": `node`, `cid`, `state`, as
+  a remote pin this node asked for is recorded or a check changes its state; `side` "served": `identity`, `cid`,
+  `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`,
+  `inbox` and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once (`ApiHandler.event_waiters`, a
   semaphore per server; 503 beyond).
 - **Shutdown.** `ApiServer(shutdown=)`: the daemon passes its `stopping.set`, the event its signal handlers set,
   so `POST /api/shutdown` answers `{"stopping": true}`, flushes, then stops the daemon exactly as SIGTERM does
@@ -880,6 +917,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `unpin(cid)` | `NotFound` (no `user` pin) | `pin_rm` / `POST /api/pin/rm` |
 | `pins(cid=None) -> list[Pin]` | | `pin_ls` / `GET /api/pin/ls` |
 | `pin_remote(node_id, cid, pin=True) -> bool` | | `pin_remote` / `POST /api/pin/remote` |
+| `remote_pins(node_id=None, cid=None, *, check=False) -> list[RemotePin]`, `served_pins() -> ServedPins` (`pins: tuple[ServedPin]`, `usage: tuple[RemotePinUsage]`, `quota`) | `ValueError`; a Client: `NoSuchEndpoint` (an older daemon: its 405 for the GET is turned into it) | `pin_remote_ls`, `pin_remote_served` / `GET /api/pin/remote`, `GET /api/pin/remote/served` |
 | `providers(cid) -> list[bytes]`, `ping(node_id) -> float \| None` | | `providers`, `ping` / `GET /api/providers`, `/api/ping` |
 | `export(target, output) -> Exported`, `import_archive(path) -> Imported` | fetch errors, `ValueError`, `OSError` | `export`, `import_archive` / `POST /api/export`, `/api/import` |
 | `add_tar(source, *, name=None, pin=True, only_hash=False, chunker=None) -> Added` (bytes or a binary file, read up to the tar's end; `Added.warnings_total`) | `ValueError` (a malformed tar, a chunker), `Denied`, `TooLarge`, `StorageFull` | `add_tar` / `POST /api/add/stream?format=tar` |
@@ -936,7 +974,8 @@ before submitting, as the CLI resolves a nick. Jobs are persisted, resumed at th
 `NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`, and
 `BlockMismatch` and `SealError` (a sealed file malformed or tampered with), which are `ValueError`s too, as is
 `NotRecipient` (this node can't open a sealed file).
-`ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning`, `ConnectionFailed`, `TokenError`,
+`ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning` (⊃ `DaemonStarting`, with `.pid`: a process holds the
+rnfs dir's lock, as a daemon does while it opens its block store), `ConnectionFailed`, `TokenError`,
 `AuthFailed`, `SettingsError`, `ServerError` (500, or another 5xx), and the API statuses, each also a subclass
 of the node's class: `apiclient.NotFound(ApiError, errors.NotFound)` and so on, `BadRequest(ApiError,
 ValueError)`. So `except rnfs.NotFound` and `except ValueError` catch both classes' errors. A Node raises
@@ -1423,6 +1462,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | Thread | Owner | Does |
 |---|---|---|
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
+| `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's lookups (up to 4 at once, ended with the round; none on slow nodes) |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
@@ -1492,6 +1532,10 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
   pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
   `invalid` (invalid roots, oldest first; with the cache records);
+- `remote_pins_asked` and `remote_pins_served` (0.2.0, rnfs/remote_pins.py: the remote pins this node asked for and
+  their checks, at most 10 000, saved after each ask and with the batched saves; the latest outcome of each remote
+  pin served, at most 1 000, saved with the remote pins waiting; NORMAL, changed rows only; tables of their own, so
+  `remote_pins` keeps its released meaning);
 - `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
 - `provider_records` (read per key; indexed by publisher and last-stored time for eviction and expiry; `pooled` is
@@ -1705,6 +1749,37 @@ Everything in the specification is implemented, with these simplifications and a
   wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
   fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
   (`_remote_workers` maps each source to its thread) within its budget.
+- **Remote pin status** (0.2.0, `rnfs/remote_pins.py`; local only, `/pin` unchanged). `AskedPins` records each
+  `/pin` this node sends (`RnfsNode.pin_remote`): one entry per (node, CID), replaced by a later ask, with pin or
+  release, whether accepted, when, and its checks (`tried`, the last attempt, for pacing; `checked` and `found`,
+  the last conclusive one; `seen`, the last finding the node). Its state is worked out when listed: `refused` (not
+  accepted, which includes no answer: `PeerClient.pin` can't tell them apart), `released`, `done` (the last
+  conclusive check found the node), `missing` (it didn't, and it ran `GRACE`, 24 h, or more after the ask) or
+  `waiting`. A check is `RnfsNode._providing`: the provider records held here first, else a provider lookup that
+  stops once the node is among the providers (`find_providers`' `should_stop`, also bound to `stop_event`);
+  inconclusive (None, nothing recorded but `tried`) when no node answered it (`Lookup.closest_answered()` empty) or
+  the node is stopping. The `rnfs-remote-pin-checks` thread (`AskedPins.run`, after the first join) makes a pass
+  every 30 s: the accepted pins due (first `FIRST_CHECK` after asking, then every `WAITING_RECHECK` while waiting,
+  `SETTLED_RECHECK` once done or missing), most overdue first, within `CHECKS_PER_HOUR` (a deque of the last
+  hour's starts, on-demand checks counted too) and `CHECKS_AT_ONCE` less those running; values are (fast, slow):
+  10 min / 1 h, 1 h / 6 h, 1 day / 3 days, 60 / 4 an hour, 4 / 1 at once. `check_now` (`pin_remote_ls(check=True)`)
+  runs one call at a time, the least recently tried first, at most `ON_DEMAND_CHECKS` (32 / 4), skipping pins tried
+  within `FRESH` (1 / 10 min) or being checked. Every lookup, background or on demand, holds a slot of one
+  semaphore of `CHECKS_AT_ONCE`, so a slow node never runs two; a pass runs its checks on up to that many
+  `rnfs-remote-pin-check` threads and waits for them. Entries are kept to `MAX_ASKED` (10 000): past it the oldest
+  released or refused, then done, then the rest go, never the one just recorded. `ServedPins` keeps the latest
+  outcome of each (identity, CID) another identity asked of this node, recorded by `remote_pin` (waiting, refused
+  `denied`, `queue_full` or `failed`, released), `_remote_pin_fetch` (fetching, pinned, dropped `quota` or by its
+  error's class, `_FAILURE_REASONS`; a fetch failing or cancelled while stopping stays waiting), `_apply_denied`
+  (dropped `denied`) and `_load_remote_pins` / `_resume_remote_pins` (dropped `identity_removed`, or `failed` when
+  no thread starts), with a detail (a log line's reason, at most 400 characters); at most `MAX_SERVED` (1 000),
+  those that ended forgotten first, then pinned ones, never one waiting or fetching. `RnfsNode.pin_remote_served`
+  joins them with what is current, which wins: storage's `remote:<identity>` pins are `pinned`, the queue's
+  `waiting` or `fetching`; an outcome claiming one is current that isn't (a crash lost it) shows `dropped`, reason
+  `lost`; usage per identity is `Storage.source_usage`, for every identity listed in `remote_pin_identities` or
+  holding pins. Both stores are `RowStore`s in SNAPSHOT mode, NORMAL: asked entries saved after each ask and with
+  the batched saves, served outcomes with the remote pins waiting (every second, in `maintain`); each change tells
+  the node, which publishes a `remote_pin` event.
 - Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks (`WINDOW`) at a time ahead of what
   has been written out. The next window is asked for before the current one is handed to the reader, so every
   provider stays busy across window boundaries (a block that arrives after the call that asked for it is stored,

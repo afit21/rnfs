@@ -878,9 +878,23 @@ silent longer than every one of them; announces are recorded in memory and writt
 
 ## 8. Storage
 
-- Blocks are stored in `<rnfs dir>/blocks/`, one file per CID, written atomically after verification, and
-  synced to disk before any pin or cache record that refers to them is saved, so a power loss can't leave a
-  pin without its blocks or an empty file under a CID name.
+- Blocks are stored in `<rnfs dir>/blocks/<xy>/<cid>`, one file per CID, written atomically after
+  verification, and synced to disk before any pin or cache record that refers to them is saved, so a power loss
+  can't leave a pin without its blocks or an empty file under a CID name. `<xy>` is the CID's third- and
+  second-to-last characters, in that order: 1,024 subdirectories, named in lowercase base32 for both codecs (a
+  CID's leading characters are the same for every CID of its codec, and its last carries only 2 or 3 bits).
+- Blocks rnfs 0.1.6 and earlier stored directly in `blocks/` are moved into their subdirectories at the start
+  (a rename within the filesystem; one already there makes the flat copy redundant, and it is deleted), and the
+  directories synced. Every start moves what is left, so an interrupted move loses nothing, and a block whose
+  move fails (on Windows, a file another program holds open) stays readable where it is until a later start.
+- rnfs stores blocks only in real directories of its own: a subdirectory of `blocks/` that is a link (or a
+  Windows junction), isn't a directory or belongs to another user stops the start; a loose one is made 0700.
+  Links inside `blocks/` are never followed.
+- Every stored block's size is kept in the state database too, written whenever pins or cache records are saved,
+  so a start needn't list every block: after a clean stop rnfs reads them from there. After a stop that wasn't
+  clean (a crash, a power loss, or the first start of 0.2.0) it lists every block, deleting partial files a crash
+  left, and writes the sizes again. A block whose file turns out to be missing counts as a damaged block: deleted
+  from the index once read, and fetched again if needed.
 - rnfs keeps the rest of its state (pins, cache records, names, provider records, jobs, ...) in one SQLite
   database, `<rnfs dir>/state/rnfs.db`, readable by its owner only. The JSON state files earlier versions wrote
   under `<rnfs dir>/state/` are imported into it at the first start, each once and whole, and kept as
@@ -979,7 +993,32 @@ a directory above the folder can be changed by other users, who could replace th
 - `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
-- `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
+- `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link; `rnfs pin remote ls`
+  shows their status (below, and section 11).
+- **Status** (rnfs 0.2.0; local only: `/pin` and every other message are unchanged).
+  - A node records each `/pin` it sends: the node, the CID, pin or release, when, and whether the node accepted
+    it, one entry per (node, CID), replaced by a later request. An accepted pin is *done* once the node is among
+    the CID's providers, as a provider lookup (or a record held locally) finds them: done is inferred from provider
+    records, so it lags the node's publishing and is only as good as the DHT. A pin not found within a grace
+    after asking (rnfs: 24 hours, a republish interval by default) is *waiting*, as it may still be fetched; a
+    check after it that doesn't find the node shows it *missing*: dropped (quota, not found), never fetched, or
+    no longer provided. A node that refused or didn't answer gives *refused*; an accepted release, *released*
+    (never checked). Pins asked before rnfs 0.2.0 have no entry.
+  - Checks are paced. rnfs checks in the background at most 60 pins an hour, 4 lookups at once, each pin first 10
+    minutes after asking, then hourly while waiting and daily once done or missing; on a slow node at most 4 an
+    hour, one lookup at a time, after an hour, then every 6 hours and every 3 days. An on-demand check
+    (`pin remote ls --check`) is one lookup per pin, at most 32 pins a call (4 on a slow node), least recently
+    checked first, skipping pins checked in the last minute (10 minutes on a slow node), its lookups sharing the
+    same limit at once. rnfs keeps at most 10 000 entries: past that the oldest released or refused go first,
+    then the oldest done, then the oldest of the rest.
+  - A node serving remote pins records what became of each pin an identity asked of it: *waiting*, *fetching*,
+    *pinned*, *dropped* (`quota`; the fetch failing: `not_found`, `denied`, `invalid_dag`, `too_large`,
+    `storage_full`, `failed`; released by the deny list, `denied`; waiting at a start from an identity no longer
+    on `remote_pin_identities`, `identity_removed`; recorded as current but lost in a crash, `lost`), *refused*
+    (`denied`, `queue_full`, `failed`) or *released* by its identity, with when. Its pins and the pins queued
+    are listed as it holds them, whatever was recorded; rnfs keeps the latest outcome of each pin, at most 1 000
+    (past that those that ended go first, then pinned ones, oldest first; never one waiting or fetching). It
+    reports each identity's use of `remote_pin_quota`, counted as the quota counts it.
 
 **Deny lists.** A node MAY refuse chosen content, so operators of public gateways and provider nodes can keep it
 off their node. Nothing on the wire changes.
@@ -1374,7 +1413,7 @@ are local conveniences, not part of the protocol.
 | `dir set <cid>[/path] <name> <cid> [--exec]`, `dir rm <cid>/<path>` | Make a new directory with an entry added, replaced or removed, and pin it with source `user` (fetching the complete directory, file contents included) |
 | `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]`, `pin label <cid> [<label>]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: the pin's label if it has one, else where it was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds. `--json` also gives each pin's `label`, `origin` (where it was added from, kept apart from the label), `size` (as its root block states it), `entries` (a directory's entry count) and `added` (when first pinned, by any source; null for pins made before rnfs 0.2.0). `label` sets a pin's label (local only, lasting while the CID is pinned); without a label it clears it |
 | `cache ls [--json]`, `cache rm <cid>…` | The cached fetches (downloads not pinned, section 8), most recently used first, with their size, completeness and whether the same content is pinned; `rm` evicts those leading to a CID now, deleting the blocks nothing else needs, as `gc` does for all of them |
-| `pin remote add\|rm <node ID> <cid>` | Remote pinning |
+| `pin remote add\|rm <node ID> <cid>`, `pin remote ls [<node ID>] [<cid>] [--check] [--json]`, `pin remote ls --served [--json]` | Remote pinning; `ls` lists the remote pins this node asked for (rnfs 0.2.0: node, CID, state, when asked and last checked; section 8, Status), `--check` checking them first, and `--served` those other identities asked of it, with each identity's use of `remote_pin_quota` |
 | `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
 | `providers <cid>` | Find nodes providing a CID |
 | `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
@@ -1391,7 +1430,7 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1483,6 +1522,13 @@ gateway can never reach the API.
   Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
   app's token; they can read the CLI's token already.
 - The API never sends CORS headers.
+- **Starting** (rnfs 0.2.0). The daemon locks `<rnfs dir>/daemon.lock`, which holds its process ID, before it
+  opens its block store, and its API listens only once that is done, which takes a while for a large store after
+  an unclean stop or at the upgrade (section 8). When nothing answers on the API port but a running process holds
+  that lock, a client reports the daemon as starting, naming that process, rather than as not running (it may
+  also be stopping, or an app's own node, which serves no API). The lock is tested only while the process the file
+  names runs, by taking a shared lock for an instant: a daemon trying to lock the dir at that very instant would
+  fail as if another held it.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
   gateway ports, version, start time, rnfs directory, Reticulum config directory, whether it attached to a shared
@@ -1494,7 +1540,8 @@ gateway can never reach the API.
   both `404`; `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
   capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does, after answering (Windows has no other
   clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
-  node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds and peers — numbered within a run:
+  node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds, peers and remote pins (those it asked
+  for and those it serves, section 8) — numbered within a run:
   answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
   level-triggered like the name watch below, so a client asking again with what it was given loses nothing. A
   node keeps a bounded number of events (rnfs: 1024) and says `lost` when the client asks for some it no longer

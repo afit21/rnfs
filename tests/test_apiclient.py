@@ -19,6 +19,7 @@ from rnfs.apiclient import (ApiConnection, ApiError, AuthFailed, BadRequest, Bus
 from rnfs.config import DEFAULT_API_PORT
 from rnfs import errors
 from tests.support import POSIX_MODES, free_port, real
+from tests.test_fsutil import hold_lock
 from tests.test_api import FakeNode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -464,6 +465,21 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.ping("cd" * 16), 0.25)
         self.assertIsNone(self.api.ping("ff" * 16))
 
+    def test_remote_pin_status(self):
+        """pin_remote_ls sends only the parameters given; pin_remote_served; a daemon with only the POST (before
+        0.2.0) answers the GET 405, which is NoSuchEndpoint here."""
+        cid = self.node.put_file(b"abc")
+        self.assertEqual(self.api.pin_remote_ls()[0]["state"], "waiting")
+        self.assertEqual(self.api.pin_remote_ls("ab" * 16, cid, check=True)[0]["state"], "done")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(self.api.pin_remote_served()["usage"][0]["quota"], 100)
+        with mock.patch.dict(ApiHandler.ROUTES):
+            del ApiHandler.ROUTES[("GET", "/api/pin/remote")]
+            with self.assertRaises(apiclient.NoSuchEndpoint) as raised:
+                self.api.pin_remote_ls()
+        self.assertEqual(raised.exception.code, "no_such_endpoint")
+
     def test_name_keys(self):
         """name_export, name_rm and name_import (the key as the body) (ND4)."""
         name = self.api.name_create("site")["name"]
@@ -864,6 +880,39 @@ class ErrorTest(ClientTestCase):
             ApiConnection(self.tmp, port=free_port()).version()
         self.assertIn("no daemon is running", str(raised.exception))
         self.assertIsNone(raised.exception.status)
+        self.assertNotIsInstance(raised.exception, apiclient.DaemonStarting)
+
+    def test_daemon_starting(self):
+        """Nothing on the port, but a process holds the rnfs dir's lock (a daemon opening a large block store
+        before its API listens): DaemonStarting, a DaemonNotRunning, naming that process."""
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            with self.assertRaises(apiclient.DaemonStarting) as raised:
+                ApiConnection(self.tmp, port=free_port()).version()
+            self.assertIsInstance(raised.exception, DaemonNotRunning)
+            self.assertEqual(raised.exception.pid, holder.pid)
+            self.assertIn(f"the daemon (process {holder.pid}) is starting", str(raised.exception))
+            self.assertEqual(apiclient.dir_holder(self.tmp), holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        # Once it has gone, the lock file is left, naming it: no daemon is running
+        self.assertIsNone(apiclient.dir_holder(self.tmp))
+        with self.assertRaises(DaemonNotRunning) as raised:
+            ApiConnection(self.tmp, port=free_port()).version()
+        self.assertNotIsInstance(raised.exception, apiclient.DaemonStarting)
+
+    def test_lock_of_a_process_gone_isnt_tested(self):
+        """A lock file naming a process that has ended isn't tested (testing it could make a daemon starting at that
+        moment fail), nor is one naming this process (its own Node)."""
+        for pid in (os.getpid(), 2**22 + 12345):
+            with self.subTest(pid=pid):
+                with open(os.path.join(self.tmp, "daemon.lock"), "w", encoding="ascii") as f:
+                    f.write(f"{pid}\n")
+                with mock.patch.object(apiclient.fsutil, "lock_held", side_effect=AssertionError("tested")), \
+                        mock.patch.object(apiclient, "_process_alive", return_value=pid == os.getpid()):
+                    self.assertIsNone(apiclient.dir_holder(self.tmp))
 
     def test_missing_token(self):
         """No token file: TokenError, and the request isn't sent."""

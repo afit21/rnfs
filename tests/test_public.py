@@ -290,6 +290,34 @@ class PublicTests:
         self.assertEqual(self.rnfs.ping(A_ID), 0.1)
         self.assertIsNone(self.rnfs.ping(OTHER))
 
+    def test_remote_pin_status(self):
+        """remote_pins() lists what was asked, a check finding the node among the providers (done); served_pins()
+        what other identities asked of this node, and their usage."""
+        cid = self.share(b"pinned for us")  # A provides it
+        other = Cid.for_block(RAW, b"nobody has it")
+        self.rnfs.pin_remote(A_ID, cid)
+        self.rnfs.pin_remote(A_ID.hex(), other, pin=False)
+        released, asked = self.rnfs.remote_pins()
+        self.assertIsInstance(asked, rnfs.RemotePin)
+        self.assertEqual((asked.node, asked.cid, asked.state, asked.done), (A_ID, cid, "waiting", False))
+        self.assertEqual((released.cid, released.pin, released.state), (other, False, "released"))
+        checked, = self.rnfs.remote_pins(A_ID, cid, check=True)
+        self.assertEqual((checked.state, checked.done, str(checked)), ("done", True, str(cid)))
+        self.assertIsInstance(checked.checked, float)
+        self.assertEqual(self.rnfs.remote_pins(cid=other)[0].state, "released")
+        identity = bytes(range(16))
+        self.b.config.remote_pin_identities = [identity.hex()]
+        self.assertTrue(self.b.backend.remote_pin(identity, cid, True))
+        wait_for(lambda: self.b.storage.has_pin(cid, f"remote:{identity.hex()}"), what="the remote pin")
+        served = self.rnfs.served_pins()
+        self.assertIsInstance(served, rnfs.ServedPins)
+        pin, = served.pins
+        self.assertEqual((pin.identity, pin.cid, pin.state, pin.reason), (identity, cid, "pinned", None))
+        usage, = served.usage
+        self.assertEqual((usage.identity, usage.pinned, usage.waiting, usage.allowed, usage.quota),
+                         (identity, 1, 0, True, served.quota))
+        self.assertGreater(usage.used, 0)
+
     def test_errors_are_one_hierarchy(self):
         """The same exception classes whichever class raises them."""
         data = os.urandom(1000)

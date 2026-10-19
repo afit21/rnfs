@@ -246,6 +246,14 @@ class _Backend:
         """RnfsNode.pin_remote."""
         return self.node.pin_remote(_bytes(node_id), cid, pin)
 
+    def pin_remote_ls(self, node_id: str | None, cid: str | None, check: bool) -> list[dict]:
+        """RnfsNode.pin_remote_ls."""
+        return self.node.pin_remote_ls(_bytes(node_id), cid, check=check)
+
+    def pin_remote_served(self) -> dict:
+        """RnfsNode.pin_remote_served."""
+        return self.node.pin_remote_served()
+
     def providers(self, cid: str) -> list[str]:
         """RnfsNode.providers, in hex."""
         return [node_id.hex() for node_id in self.node.providers(cid)]

@@ -17,6 +17,7 @@ from rnfs.api import ApiServer
 from rnfs.content.cid import RAW, Cid
 from tests.support import CAN_SYMLINK, POSIX_MODES, free_port, real
 from tests.test_api import FakeNode
+from tests.test_fsutil import hold_lock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -301,6 +302,23 @@ class OtherCommandTest(CliTestCase):
                          [(bytes.fromhex("ab" * 16), cid, True), (bytes.fromhex("ab" * 16), cid, False)])
         self.assertEqual(self.run_cli("pin", "remote", "add", "ff" * 16, cid)[0], 1)
 
+    def test_remote_pin_status(self):
+        """pin remote ls lists the pins asked for (filtered, --check passed on, --json), --served those served and
+        each identity's usage."""
+        cid = self.node.put_file(b"abc")
+        out = self.ok("pin", "remote", "ls")
+        self.assertRegex(out, rf"^{'ab' * 16}  bafkreie  waiting  asked \d+d ago\n$")
+        out = self.ok("pin", "remote", "ls", "ab" * 16, cid, "--check")
+        self.assertRegex(out, rf"^{'ab' * 16}  {cid}  done  asked \d+d ago, checked \d+d ago\n$")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(json.loads(self.ok("pin", "remote", "ls", "--json"))[0]["state"], "waiting")
+        out = self.ok("pin", "remote", "ls", "--served").splitlines()
+        self.assertEqual(out[0], f"{'cd' * 16}: 5 B of 100 B used, 1 pinned, 0 waiting")
+        self.assertRegex(out[1], rf"^{'cd' * 16}  bafkreie  dropped \(quota\)  \d+d ago: too big$")
+        self.assertEqual(json.loads(self.ok("pin", "remote", "ls", "--served", "--json"))["quota"], 100)
+        self.assertEqual(self.run_cli("pin", "remote", "ls", "--served", "--check")[0], 1)
+
     def test_maintenance_and_network(self):
         cid = self.node.put_file(b"abc")
         self.assertEqual(self.ok("gc"), "removed 3 blocks, freed 300 bytes\n")
@@ -348,6 +366,21 @@ class OtherCommandTest(CliTestCase):
         code, _, err = self.run_cli("status", port=free_port())
         self.assertEqual(code, 1)
         self.assertIn("no daemon is running", err)
+
+    def test_daemon_starting(self):
+        # The daemon locks its rnfs dir before opening the block store, and its API listens only after
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            for command in (("status",), ("pin", "ls")):
+                with self.subTest(command=command):
+                    code, _, err = self.run_cli(*command, port=free_port())
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"the daemon (process {holder.pid}) is starting", err)
+                    self.assertNotIn("no daemon is running", err)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
 
     def test_sends_api_header_and_host(self):
         # The server would answer 403 otherwise; check the exact header anyway

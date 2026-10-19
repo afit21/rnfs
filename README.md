@@ -276,8 +276,8 @@ Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`), which on
 |---|---|
 | `rnfs.toml` | your [settings](#settings) |
 | `storage/identity`, `storage/lxmf_identity` | the node's identity (your node ID comes from it) and your LXMF identity |
-| `blocks/` | stored blocks |
-| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
+| `blocks/` | stored blocks, one file per block in 1,024 subdirectories (`blocks/<xy>/<cid>`) |
+| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists, the stored blocks' sizes (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
 | `names/` | name keys: back them up with `rnfs name export` |
 | `files/` | the shared folder: anything put here is added, pinned and shared |
 | `api_token`, `daemon.lock` | the running daemon's API token and lock |
@@ -483,6 +483,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs export TARGET -o FILE` / `import FILE` | Write or import an archive (USB sticks, sneakernet) |
 | `rnfs pin add TARGET` / `pin rm CID` / `pin ls` | Fetch and pin / unpin / list pins, their sources and where they came from |
 | `rnfs pin remote add\|rm NODE_ID CID` | Ask another node to pin or unpin (it must list you in `remote_pin_identities`) |
+| `rnfs pin remote ls [NODE_ID] [CID] [--check]` / `pin remote ls --served` | The remote pins you asked for and whether each is done (the node found among the CID's providers; `--check` looks now) / those others asked of your node, what became of each and their use of `remote_pin_quota` |
 | `rnfs gc` / `verify` | Evict cached downloads / re-check every stored block |
 | `rnfs deny add\|rm ENTRY…` / `deny ls` | Edit your deny list / show it and the lists in use |
 | `rnfs jobs [list\|show\|wait\|cancel\|clear] [ID]` | Background transfers: progress, rate, time left |

@@ -26,7 +26,8 @@ again without dropping or reconciling away any record.
 - `files/notes.txt`: the shared folder's one entry (shared_folder.json records its scan).
 - `fixture_content.py`: the files 0.1.4 added (data only). There is no `blocks/`: the test adds the same files
   with the current code to make the blocks, so every pin is complete and provided, and checks the CIDs it gets
-  are those 0.1.4 recorded.
+  are those 0.1.4 recorded. It writes them in the flat layout 0.1.6 and earlier used (`blocks/<cid>`), as
+  those versions left them.
 
 Left out: the node identity (`storage/`, which a node creates), `lxmf/` router state, `api_token` and logs. No
 `rnfs.toml`: the settings the test starts with are `SETTINGS` in generate.py (a remote pin identity, an LXMF
