@@ -13,7 +13,7 @@ import RNS
 from rnfs import __version__, debuglog, log
 from rnfs.config import Config
 from rnfs.gateway import GatewayServer
-from tests.support import POSIX_MODES
+from tests.support import POSIX_MODES, wait_for
 from tests.test_api import FakeNode, raw_request
 
 
@@ -206,6 +206,9 @@ class GatewayRequestsTest(DebugLogTestCase):
         start, = self.logged(f"gateway GET /rnfs/{self.text} (")
         self.assertIn("Range: bytes=0-4", start)
         number = start.split("gateway #")[1].split("]")[0]
+        # The outcome is written once the response is sent, which the client may have read whole already
+        wait_for(lambda: any("gateway answered" in line for line in self.logged(f"gateway #{number}]")),
+                 what="the request's outcome in the debug log")
         tagged = self.logged(f"gateway #{number}]")
         self.assertIn("is stored here", "\n".join(tagged))
         self.assertIn("5 bytes from byte 0 of 13", "\n".join(tagged))

@@ -336,13 +336,15 @@ class WriteTarTest(unittest.TestCase):
             level = builder.build_directory([Entry("d" * 200, level.cid, level.size, dag.KIND_DIRECTORY),
                                              Entry("again", level.cid, level.size, dag.KIND_DIRECTORY)], self.store.put)
         data, _ = self.tar(level.cid, max_entries=200)
-        # Checked in memory, not extracted: the deepest path (~1300 bytes) is past macOS's PATH_MAX of 1024. The data
-        # filter still passes judgement on every member, as extractall would
-        where = os.path.join(self.tmp, "out")
+        # Checked in memory, not extracted: the deepest path (~1300 bytes) is past macOS's PATH_MAX of 1024, and from
+        # Python 3.13 tarfile's data filter resolves the whole path too, so it can't judge it there. What it would
+        # refuse is checked by hand: an absolute path, "..", a link, anything but a file or a directory
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
             files = []
             for info in archive.getmembers():
-                self.assertIsNotNone(tarfile.data_filter(info, where), info.name)
+                parts = info.name.split("/")
+                self.assertFalse(info.name.startswith("/") or ".." in parts or "" in parts, info.name)
+                self.assertTrue(info.isfile() or info.isdir(), info.name)
                 if info.isfile():
                     self.assertEqual(archive.extractfile(info).read(), b"same")
                     files.append(info.name)
