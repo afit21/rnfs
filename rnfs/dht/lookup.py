@@ -527,8 +527,8 @@ class Lookup:
                     continue
                 if not self.is_known(node_id):
                     passed.add(node_id)
-                elif not self.claim(node_id):
-                    known.pop(node_id, None)  # another path's (a disjoint lookup)
+                elif not self.allowed(node_id) or not self.claim(node_id):
+                    known.pop(node_id, None)  # no longer allowed (partition mode), or another path's (disjoint)
                 elif self.may_retry(node_id):
                     queried.add(node_id)
                     retrying.add(node_id)

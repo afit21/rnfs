@@ -451,6 +451,22 @@ class UnreliableNodeTest(LookupTestCase):
         self.assertEqual(sorted(retries), self.dead)
         wait_for(lambda: set(self.dead) <= set(self.net.queried), what="the retries")
 
+    def test_not_retried_once_disallowed(self):
+        """A due retry of a node the lookup may no longer query (partition mode began) isn't sent."""
+        allowed = set(self.dead + self.near)
+        retries = []
+
+        def may_retry(n: bytes) -> bool:
+            """Every unreliable node is due; partition mode begins as the first is asked."""
+            retries.append(n)
+            allowed.difference_update(self.dead)
+            return True
+
+        result = self.lookup(self.net, self.key, self.dead + self.near, alpha=1, unreliable=self.dead.__contains__,
+                             may_retry=may_retry, allowed=allowed.__contains__).find_closest()
+        self.assertEqual(result, self.near)
+        self.assertEqual(len(retries), 1)  # the second was dropped before its retry was claimed
+
     def test_asked_and_waited_for_when_needed(self):
         """With too few other nodes, unreliable ones are asked and waited for like any node."""
         self.net.hang.clear()
