@@ -2,7 +2,7 @@
 # Build a .deb of rnfs: packaging/build-deb.sh [--arch amd64|arm64] [--wheel PATH] [--out DIR]
 #
 # The package installs:
-#   /opt/rnfs/lib/              rnfs and its dependencies (rns, lxmf, pyserial, cryptography, cffi)
+#   /opt/rnfs/lib/              rnfs and its dependencies (rns, pyserial, cryptography, cffi)
 #   /opt/rnfs/bin/rnfs          launcher: the system python3 in isolated mode (-I) with /opt/rnfs/lib first
 #   /usr/bin/rnfs               symlink to it
 #   /usr/lib/systemd/user/rnfs.service   systemd user unit (systemctl --user enable --now rnfs)
@@ -181,7 +181,7 @@ if head -n 1 "$LICENSE_FILE" | grep -q '^MIT License'; then LICENSE_NAME=Expat; 
     echo "Upstream-Name: rnfs"
     echo "Upstream-Contact: https://github.com/afit21/rnfs/issues"
     echo "Source: https://github.com/afit21/rnfs"
-    echo "Comment: The third-party packages bundled in /opt/rnfs/lib (RNS, LXMF, pyserial,"
+    echo "Comment: The third-party packages bundled in /opt/rnfs/lib (RNS, pyserial,"
     echo " cryptography, cffi, pycparser) carry their own licenses in their *.dist-info"
     echo " directories there."
     echo
@@ -228,7 +228,7 @@ Description: content-addressed file sharing over Reticulum
  addressing, a DHT for finding providers, pinning, mutable names and an
  HTTP gateway.
  .
- Reticulum, LXMF and their Python dependencies are bundled in /opt/rnfs.
+ Reticulum and its Python dependencies are bundled in /opt/rnfs.
  A systemd user unit is included: systemctl --user enable --now rnfs
 EOF
 

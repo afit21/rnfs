@@ -1,6 +1,6 @@
 """Property-based fuzzing of the strict parsers that read untrusted bytes (security tooling, phase 2).
 
-Every parser here reads data from other nodes, archives, sealed files or LXMF messages. For each, arbitrary
+Every parser here reads data from other nodes, archives, sealed files or rnfs links. For each, arbitrary
 input (raw bytes, arbitrary msgpack values, and structured near-valid values built from the real format) must
 either parse or fail with the parser's documented outcome (None, or its own error type), never another
 exception. Where an encoder exists, decode(encode(x)) == x, and for canonical formats encode(decode(b)) == b
@@ -27,13 +27,13 @@ from rnfs.content.cid import DAG, RAW, Cid, from_base36, to_base36
 from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, IndexNode
 from rnfs.content.storage import Storage
 from rnfs.errors import InvalidDag, StorageFull
-from rnfs.features import keepers, lxmf
-from rnfs.features.lxmf import Incoming, Link
+from rnfs import uris as lxmf
+from rnfs.features import keepers
+from rnfs.uris import Link
 from rnfs.gateway import GatewayError, parse_host, parse_range
 from rnfs.names import encode_record, name_for_identity, parse_name, parse_record
 from rnfs.network import protocol
 from rnfs.network.announces import MODE_CLIENT, MODE_SERVER, parse_mode
-from tests import test_lxmf
 
 try:
     from hypothesis import HealthCheck, example, given, settings
@@ -77,7 +77,7 @@ _saved_loglevel = RNS.loglevel
 
 
 def setUpModule():
-    """Silence RNS's log (the LXMF feature and storage log what they reject)."""
+    """Silence RNS's log (storage logs what it rejects)."""
     RNS.loglevel = RNS.LOG_CRITICAL
 
 
@@ -452,7 +452,7 @@ class ArchiveFuzzTest(unittest.TestCase):
         self.assertEqual(archive.import_archive(io.BytesIO(exported), self.storage)["complete"], [root])
 
 
-# LXMF fields, URIs and messages (rnfs.features.lxmf)
+# The LXMF link-map field and rnfs: URIs (rnfs.uris)
 
 links = st.builds(
     Link, st.none() | cids, st.none() | ids, st.lists(valid_names, max_size=3).map(tuple),
@@ -473,9 +473,8 @@ uris = (st.text(max_size=60)
 
 
 @needs_hypothesis
-class LxmfFuzzTest(test_lxmf.FeatureTestCase):
-    """decode_field, parse_uri, find_links and received(): links or ValueError (decode_field and parse_uri),
-    and received() never raising whatever a validated message carries."""
+class LinkFuzzTest(unittest.TestCase):
+    """decode_field and parse_uri: links or ValueError."""
 
     @fuzz()
     @given(lxmf_fields)
@@ -497,40 +496,18 @@ class LxmfFuzzTest(test_lxmf.FeatureTestCase):
     @fuzz()
     @given(uris)
     def test_parse_uri(self, text):
-        for parse in (lxmf.parse_uri, lxmf.parse_target):
-            try:
-                link = parse(text)
-            except ValueError:
-                continue
-            # Whatever is accepted has a canonical form that reads back as the same link
-            self.assertEqual(lxmf.parse_uri(lxmf.format_uri(link)), link)
+        try:
+            link = lxmf.parse_uri(text)
+        except ValueError:
+            return
+        # Whatever is accepted has a canonical form that reads back as the same link
+        self.assertEqual(lxmf.parse_uri(lxmf.format_uri(link)), link)
 
     @fuzz()
     @given(links)
     def test_uri_round_trip(self, link):
         bare = Link(link.cid if link.name is None else None, link.name, link.path, None, link.from_node)
         self.assertEqual(lxmf.parse_uri(lxmf.format_uri(bare)), bare)
-
-    @fuzz()
-    @given(st.lists(uris | st.text(max_size=20), max_size=12).map(" \n".join) | st.text(max_size=200))
-    def test_find_links(self, text):
-        found = lxmf.find_links(text)
-        self.assertLessEqual(len(found), lxmf.MAX_LINKS)
-        self.assertEqual(len(found), len(set(found)))
-
-    @fuzz(0.5)
-    @given(st.binary(max_size=32) | st.text(max_size=8) | st.none(),
-           st.binary(max_size=400) | st.lists(uris, max_size=3).map(lambda u: "\n".join(u).encode()) | msgpack_leaves,
-           lxmf_fields, msgpack_leaves, msgpack_leaves)
-    def test_received(self, title, content, fields, timestamp, display_name):
-        if not hasattr(self, "feature"):
-            self.feature_node()
-            self.count = 0
-        self.count += 1
-        incoming = Incoming(test_lxmf.SENDER, self.count.to_bytes(32, "big"), timestamp, title, content, fields,
-                            "direct", display_name)
-        entry_id = self.feature.received(incoming)
-        self.assertTrue(entry_id is None or type(entry_id) is int)
 
 
 # Sealed files (rnfs.content.seal)

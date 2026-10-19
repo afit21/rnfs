@@ -15,7 +15,7 @@ updates:
 
   # Report only: open-pull-requests-limit 0 turns off version-update pull requests for pyproject.toml's
   # dependencies, while a vulnerable one is still reported (Dependabot alerts and security updates, once turned on
-  # in the repository's settings). rnfs relies on RNS and LXMF internals, so a new version is taken deliberately:
+  # in the repository's settings). rnfs relies on RNS internals, so a new version is taken deliberately:
   # packaging/update-lock.py, packaging/flatpak/generate-sources.py and tests/test_rns_compat.py (CONTRIBUTING.md)
   - package-ecosystem: pip
     directory: /

@@ -1,10 +1,10 @@
 """Regenerate the hash-locked requirement files in packaging/.
 
     python3 -I packaging/update-lock.py                                   # newest versions pyproject.toml allows
-    python3 -I packaging/update-lock.py rns==1.5.6 lxmf==1.2.0 ...        # these pins (the rest: newest)
+    python3 -I packaging/update-lock.py rns==1.5.6 ...                    # these pins (the rest: newest)
     python3 -I packaging/update-lock.py --build pyinstaller==6.22.3 ...   # the build locks (see below)
 
-requirements.lock lists every package rnfs needs at runtime (rns, lxmf and theirs) with the sha256 of every
+requirements.lock lists every package rnfs needs at runtime (rns and its dependencies) with the sha256 of every
 file PyPI has for that version (all wheels and the sdist), so `pip install --require-hashes -r
 requirements.lock` works on any platform and installs nothing else. install.sh, build-deb.sh, the PyInstaller
 builds, the tests and (through flatpak/generate-sources.py) the Flatpak all install from it. Pin the versions

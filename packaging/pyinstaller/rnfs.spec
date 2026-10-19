@@ -3,14 +3,14 @@
 #   pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock      # PyInstaller, setuptools
 #   pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock
 #   pip install --no-deps --no-build-isolation .
-#                                        # rnfs and its dependencies (rns, lxmf, ...) must be installed
+#                                        # rnfs and its dependencies (rns, ...) must be installed
 #   pyinstaller --clean --noconfirm packaging/pyinstaller/rnfs.spec
 #   dist/rnfs(.exe) --version
 #
 # Reticulum finds its interface modules by globbing its own package directory for *.py files
 # (RNS/__init__.py, RNS/Interfaces/__init__.py) and then does `from RNS.Interfaces import *`. In a frozen
 # app the modules live in the PYZ archive, so the glob would find nothing and no interface would load. So
-# every RNS (and LXMF) submodule is bundled as a hidden import AND its .py sources are bundled as data
+# every RNS submodule is bundled as a hidden import AND its .py sources are bundled as data
 # files, which makes the globs see the same file list as in a normal install.
 import os
 import re
@@ -44,14 +44,10 @@ hiddenimports = (
     collect_submodules("rnfs")
     + ["sqlite3"]  # the state database; imported inside a function, so named here (PyInstaller adds _sqlite3)
     + collect_submodules(required("RNS"))
-    + collect_submodules(required("LXMF"))
     + collect_submodules("serial")  # pyserial: Serial, KISS and RNode interfaces
     + collect_submodules("cryptography")
 )
-datas = (
-    collect_data_files("RNS", include_py_files=True)
-    + collect_data_files("LXMF", include_py_files=True)
-)
+datas = collect_data_files("RNS", include_py_files=True)
 
 # Windows version resource from rnfs.__version__ (numeric part, padded to four fields)
 version_file = None

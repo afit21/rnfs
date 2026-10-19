@@ -3,7 +3,7 @@
     python3 -I packaging/flatpak/generate-sources.py
 
 Writes, next to this script:
-  python3-deps.json   a flatpak-builder module installing rnfs's runtime dependencies (rns, lxmf and theirs)
+  python3-deps.json   a flatpak-builder module installing rnfs's runtime dependencies (rns and its own)
                       from PyPI wheels, for x86_64 and aarch64 (only-arches picks the right compiled wheels)
   build-sources.json  the setuptools wheel pip needs to build rnfs itself, offline
 

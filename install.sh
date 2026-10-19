@@ -39,7 +39,7 @@
 # goes ahead with a warning: SHA256SUMS shows the download is whole, but whoever could replace the release's
 # files could replace it too.
 #
-# Dependencies (rns, lxmf, cryptography, ...) are installed as wheels at the versions and sha256 hashes
+# Dependencies (rns, cryptography, ...) are installed as wheels at the versions and sha256 hashes
 # pinned in the source's packaging/requirements.lock (pip --require-hashes --only-binary=:all:), and rnfs
 # itself is built with the setuptools pinned in packaging/build-backend.lock, in a separate build venv
 # without pip's build isolation (which would fetch the newest setuptools). A source without those files (a

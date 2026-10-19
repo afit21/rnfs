@@ -1,10 +1,10 @@
-"""The installed RNS and LXMF still have every internal rnfs relies on.
+"""The installed RNS still has every internal rnfs relies on.
 
-rnfs reads private attributes of RNS and LXMF objects, replaces some of their methods, passes undocumented
-keywords and depends on data layouts neither documents, none of which their version numbers promise to keep.
-INTERNALS lists each one with the rnfs module relying on it, so a dependency bump (Dependabot, a lock update, a
-user's own environment) fails here, naming the module to update, rather than at runtime. Written against RNS
-1.5.6 and LXMF 1.2.0.
+rnfs reads private attributes of RNS objects, replaces some of their methods, passes undocumented keywords and
+depends on data layouts RNS doesn't document, none of which its version numbers promise to keep. INTERNALS lists
+each one with the rnfs module relying on it, so a dependency bump (Dependabot, a lock update, a user's own
+environment) fails here, naming the module to update, rather than at runtime. Written against RNS 1.5.6 (LXMF's
+internals left with the LXMF feature, in 0.2.0).
 
 Nothing here starts Reticulum: objects are built offline (Transport.register_destination patched out), and
 the process-wide state touched (Identity.known_destinations) is restored.
@@ -17,7 +17,6 @@ import re
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import types
 import unittest
@@ -25,23 +24,21 @@ from collections.abc import Callable
 from typing import NamedTuple
 from unittest import mock
 
-import LXMF
 import RNS
-from LXMF import LXMRouter
 from RNS.vendor import umsgpack
 
 from rnfs import mesh, names
 from rnfs.constants import ID_LENGTH
 from rnfs.content import seal
 from rnfs.content.cid import RAW, Cid
-from rnfs.features import keepers, lxmf
+from rnfs.features import keepers
 from rnfs.network import guards, protocol, rates
 
 
 class Internal(NamedTuple):
     module: str  # the rnfs modules that rely on it, under rnfs/ and separated by ", "
-    surface: str  # what of RNS or LXMF it relies on
-    check: Callable[[], None]  # raises if the installed RNS or LXMF doesn't provide it
+    surface: str  # what of RNS it relies on
+    check: Callable[[], None]  # raises if the installed RNS doesn't provide it
 
 
 INTERNALS = [
@@ -226,81 +223,14 @@ INTERNALS = [
              "AES.AES_256_CBC.encrypt/decrypt(data, key, iv), and Identity.encrypt of a content key being "
              "WRAPPED_KEY_SIZE bytes", lambda: _crypto()),
 
-    # LXMF
-    Internal("features/lxmf.py", "LXMRouter(identity, storagepath, delivery_limit, autopeer), keeping its state "
-             "in storagepath/lxmf and setting signal handlers through signal.signal",
-             lambda: (_params(LXMRouter.__init__, "identity", "storagepath", "delivery_limit", "autopeer"),
-                      _assigns(LXMRouter.__init__, storagepath="storagepath + '/lxmf'"),
-                      _source(LXMRouter.__init__, "signal.signal(signal.SIGINT, self.sigint_handler)",
-                              "signal.signal(signal.SIGTERM, self.sigterm_handler)"))),
-    Internal("features/lxmf.py", "LXMRouter.get_announce_app_data(destination_hash), looked up on the router "
-             "when announcing, and its layout [display name, stamp cost, supported functions]",
-             lambda: _announce_app_data()),
-    Internal("features/lxmf.py", "LXMRouter.delivery_resource_transfer_began(resource), looked up on the router "
-             "when a delivery link is established; Link.set_resource_started_callback",
-             lambda: (_params(LXMRouter.delivery_resource_transfer_began, "resource"),
-                      _source(LXMRouter.delivery_link_established,
-                              "link.set_resource_started_callback(self.delivery_resource_transfer_began)"),
-                      _has(RNS.Link, "set_resource_started_callback"))),
-    Internal("features/lxmf.py", "LXMRouter.delivery_resource_advertised(resource), looked up on the router "
-             "when a delivery link is established and given the ResourceAdvertisement, whose get_segments() "
-             "is its l and i its segment index",
-             lambda: (_params(LXMRouter.delivery_resource_advertised, "resource"),
-                      _source(LXMRouter.delivery_link_established,
-                              "link.set_resource_callback(self.delivery_resource_advertised)"),
-                      _source(RNS.Link, "if self.callbacks.resource(resource_advertisement)"),
-                      _source(RNS.ResourceAdvertisement.get_segments, "return self.l"),
-                      _source(RNS.ResourceAdvertisement.unpack, "adv.i = dictionary['i']"))),
-    Internal("features/lxmf.py", "LXMRouter.request_messages_from_propagation_node(identity, max_messages), "
-             "called again through the router once the propagation node link is up",
-             lambda: (_params(LXMRouter.request_messages_from_propagation_node, "identity", "max_messages"),
-                      _source(LXMRouter.request_messages_from_propagation_node,
-                              "self.request_messages_from_propagation_node(identity, "
-                              "self.propagation_transfer_max_messages)"))),
-    Internal("features/lxmf.py", "LXMRouter propagation_transfer_state, outbound_propagation_link, "
-             "delivery_destinations; PR_* order: PR_IDLE < PR_PATH_REQUESTED..PR_RESPONSE_RECEIVED < PR_COMPLETE "
-             "< every failure",
-             lambda: (_assigns(LXMRouter.__init__, "propagation_transfer_state", "outbound_propagation_link",
-                               delivery_destinations="{}"),
-                      _true(LXMRouter.PR_IDLE < LXMRouter.PR_PATH_REQUESTED < LXMRouter.PR_LINK_ESTABLISHING
-                            < LXMRouter.PR_LINK_ESTABLISHED < LXMRouter.PR_REQUEST_SENT < LXMRouter.PR_RECEIVING
-                            < LXMRouter.PR_RESPONSE_RECEIVED < LXMRouter.PR_COMPLETE
-                            < min(LXMRouter.PR_NO_PATH, LXMRouter.PR_LINK_FAILED, LXMRouter.PR_TRANSFER_FAILED,
-                                  LXMRouter.PR_NO_IDENTITY_RCVD, LXMRouter.PR_NO_ACCESS, LXMRouter.PR_FAILED),
-                            "PR_* states reordered"))),
-    Internal("features/lxmf.py", "LXMRouter cancel_propagation_node_requests(), acknowledge_sync_completion("
-             "reset_state=), set_outbound_propagation_node, register_delivery_identity(identity, display_name=), "
-             "register_delivery_callback, handle_outbound, announce, exit_handler",
-             lambda: (_params(LXMRouter.acknowledge_sync_completion, "reset_state"),
-                      _params(LXMRouter.register_delivery_identity, "identity", "display_name"),
-                      _has(LXMRouter, "cancel_propagation_node_requests", "set_outbound_propagation_node",
-                           "register_delivery_callback", "handle_outbound", "announce", "exit_handler"))),
-    Internal("features/lxmf.py", "propagation node announce data: pn_announce_data_is_valid, enabled flag at "
-             "index 2", lambda: _propagation_announce()),
-    Internal("features/lxmf.py", "LXMessage(destination, source, content, title=, fields=, desired_method=); "
-             "packed as destination hash, source hash, ...; unpack_from_bytes; signature_validated, "
-             "unverified_reason SOURCE_UNKNOWN, packed, hash, timestamp, title and content (bytes), fields, "
-             "method, state, progress", lambda: _message_round_trip()),
-    Internal("features/lxmf.py", "LXMessage state and method values (STATE_NAMES, METHOD_NAMES); "
-             "FIELD_CUSTOM_TYPE, FIELD_CUSTOM_DATA",
-             lambda: (_true({getattr(LXMF.LXMessage, name.upper()): name for name in lxmf.STATE_NAMES.values()}
-                            == lxmf.STATE_NAMES, "states renumbered"),
-                      _true({getattr(LXMF.LXMessage, name.upper()): name for name in lxmf.METHOD_NAMES.values()}
-                            == lxmf.METHOD_NAMES, "methods renumbered"),
-                      _true((LXMF.FIELD_CUSTOM_TYPE, LXMF.FIELD_CUSTOM_DATA)
-                            == (lxmf.FIELD_CUSTOM_TYPE, lxmf.FIELD_CUSTOM_DATA), "custom fields renumbered"))),
-    Internal("features/lxmf.py", "Resource get_data_size(), get_transfer_size(), get_segments(), cancel() and "
-             "link on the propagation node link's Resources; a foreign Link takes rnfs_bounded",
-             lambda: (_has(RNS.Resource, "get_data_size", "get_transfer_size", "get_segments", "cancel"),
-                      setattr(_incoming_link(), "rnfs_bounded", True))),
 ]
 
 
 class RnsCompatTest(unittest.TestCase):
-    """INTERNALS against the installed RNS and LXMF."""
+    """INTERNALS against the installed RNS."""
 
     def test_internals(self):
-        versions = f"RNS {RNS.__version__}, LXMF {LXMF.__version__}"
+        versions = f"RNS {RNS.__version__}"
         for internal in INTERNALS:
             with self.subTest(internal.surface):
                 try:
@@ -559,67 +489,6 @@ def _crypto():
     token = wrapped.encrypt(key)
     _true(len(token) == seal.WRAPPED_KEY_SIZE, f"a wrapped key is {len(token)} bytes")
     _true(identity.decrypt(token) == key, "Identity.decrypt round trip")
-
-
-# LXMF round trips
-
-
-def _announce_app_data():
-    """rnfs's announce data reads back in LXMF as LXMF's own does, minus compression support."""
-    for name in ("display_name_from_app_data", "stamp_cost_from_app_data", "compression_support_from_app_data"):
-        _has(LXMF, name)
-    _params(LXMRouter.get_announce_app_data, "destination_hash")
-    _source(LXMRouter.announce, "app_data=self.get_announce_app_data(destination_hash)")
-    _source(LXMRouter.register_delivery_identity, "self.get_announce_app_data(delivery_destination.hash)")
-    destination_hash = os.urandom(16)
-    router = types.SimpleNamespace(delivery_destinations={
-        destination_hash: types.SimpleNamespace(display_name="rnfs node", stamp_cost=8)})
-    ours = lxmf.LxmfNetwork._announce_app_data(types.SimpleNamespace(router=router, msgpack=umsgpack),
-                                               destination_hash)
-    theirs = LXMRouter.get_announce_app_data(router, destination_hash)
-    _true(umsgpack.unpackb(ours)[:2] == umsgpack.unpackb(theirs)[:2], f"{ours!r} isn't laid out as {theirs!r}")
-    _true((LXMF.display_name_from_app_data(ours), LXMF.stamp_cost_from_app_data(ours),
-           LXMF.compression_support_from_app_data(ours)) == ("rnfs node", 8, False), "LXMF reads it differently")
-
-
-def _propagation_announce():
-    """LXMF's propagation node announce data, enabled and not, as heard_propagation_node reads it."""
-    node = types.SimpleNamespace(LXMF=LXMF, msgpack=umsgpack, _lock=threading.Lock(), _propagation_nodes={})
-    destination_hash = os.urandom(16)
-    for enabled in (True, False):
-        router = types.SimpleNamespace(
-            propagation_node=enabled, from_static_only=False, propagation_stamp_cost=16,
-            propagation_stamp_cost_flexibility=3, peering_cost=18, propagation_per_transfer_limit=256,
-            propagation_per_sync_limit=10240, get_propagation_node_announce_metadata=lambda: {})
-        app_data = LXMRouter.get_propagation_node_app_data(router)
-        _true(LXMF.pn_announce_data_is_valid(app_data), "LXMF's own announce data isn't valid")
-        lxmf.LxmfNetwork.heard_propagation_node(node, destination_hash, app_data)
-        _true((destination_hash in node._propagation_nodes) == enabled, f"enabled {enabled} not read as such")
-
-
-def _message_round_trip():
-    """An LXMessage packed and unpacked, its sender unknown and then known, as LxmfNetwork reads it."""
-    sender = _destination("lxmf", "delivery")
-    recipient = _destination("lxmf", "delivery", direction=RNS.Destination.OUT)
-    fields = {lxmf.FIELD_CUSTOM_TYPE: lxmf.CUSTOM_TYPE}
-    message = LXMF.LXMessage(recipient, sender, "text", title="title", fields=fields,
-                             desired_method=LXMF.LXMessage.DIRECT)
-    _true((message.state, message.progress) == (LXMF.LXMessage.GENERATING, 0.0), "a new message's state")
-    message.pack()
-    packed = bytes(message.packed)
-    _true(packed[ID_LENGTH:2 * ID_LENGTH] == sender.hash, "the source hash isn't at packed[16:32]")
-    instance = types.SimpleNamespace(is_blackholed=lambda identity: False, _used_destination_data=lambda h: None)
-    with mock.patch.object(RNS.Transport, "register_destination"), _Remembered() as known:
-        unknown = LXMF.LXMessage.unpack_from_bytes(packed)
-        _true(not unknown.signature_validated and unknown.unverified_reason == LXMF.LXMessage.SOURCE_UNKNOWN
-              and bytes(unknown.packed) == packed, "a message from an unknown sender")
-        known.remember(sender)
-        with mock.patch.object(RNS.Reticulum, "get_instance", return_value=instance):
-            received = LXMF.LXMessage.unpack_from_bytes(packed)
-    _true(received.signature_validated, "a signed message from a known sender doesn't validate")
-    _true((bytes(received.source_hash), bytes(received.hash), received.title, received.content, received.fields)
-          == (sender.hash, bytes(message.hash), b"title", b"text", fields), "the received message's fields")
-    _true(isinstance(received.timestamp, float) and hasattr(received, "method"), "timestamp and method")
 
 
 if __name__ == "__main__":

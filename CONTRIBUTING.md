@@ -19,12 +19,12 @@ Compatibility rules every change keeps:
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
 python3 -m venv .venv && . .venv/bin/activate
-pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock   # rns, lxmf and theirs
+pip install --require-hashes --only-binary=:all: -r packaging/requirements.lock   # rns and its dependencies
 pip install --require-hashes --only-binary=:all: -r packaging/build-tools.lock    # ruff, coverage, build, ...
 pip install --no-deps --no-build-isolation -e .
 ```
 
-The library and the CLI use the standard library besides RNS and LXMF; `rnfs.apiclient`, `rnfs.remote`
+The library and the CLI use the standard library besides RNS; `rnfs.apiclient`, `rnfs.remote`
 (rnfs.Client) and the modules they import never import RNS. Keep it that way.
 
 ## Tests
@@ -54,7 +54,7 @@ record their before and after numbers in CHANGELOG.md.
 
 `tests/interop.py` is a manual cross-version check, not a test either: it runs this tree's daemons against daemons
 of older releases over local TCP, in both directions, and prints a PASS/FAIL table (providers, get and cat,
-transfers with and without `max_upload_rate` checked for refusals, names, keepers, LXMF). Run it before a release
+transfers with and without `max_upload_rate` checked for refusals, names, keepers). Run it before a release
 with each supported old release extracted by `git archive`:
 
     mkdir -p /tmp/rnfs-0.1.5 && git archive v0.1.5 | tar -x -C /tmp/rnfs-0.1.5
@@ -104,7 +104,7 @@ versions:
 
 | File | What | Regenerate with |
 |---|---|---|
-| `packaging/requirements.lock` | rnfs's runtime dependencies (rns, lxmf and theirs), every file PyPI has for each | `python3 -I packaging/update-lock.py [rns==X lxmf==Y ...]` (no arguments: the newest versions `pyproject.toml` allows) |
+| `packaging/requirements.lock` | rnfs's runtime dependencies (rns and its dependencies), every file PyPI has for each | `python3 -I packaging/update-lock.py [rns==X ...]` (no arguments: the newest versions `pyproject.toml` allows) |
 | `packaging/build-backend.lock`, `packaging/build-tools.lock` | setuptools; and build, twine, PyInstaller, ruff, coverage and their dependencies | `python3 -I packaging/update-lock.py --build pyinstaller==X ...` (run it on Linux with Python 3.12) |
 | `packaging/flatpak/python3-deps.json`, `build-sources.json` | the Flatpak's wheels, from the locks | `python3 -I packaging/flatpak/generate-sources.py` |
 

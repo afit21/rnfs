@@ -207,7 +207,7 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "DELETE FROM provider_evicted",
     )),
     ("lxmf_app_pins", (
-        # In-core LXMF's pins become the LXMF wrapper app's (rnfs 0.2.0): lxmf:<address> -> app:lxmf:<address>
+        # In-core LXMF's pins become the LXMF app's (rnfs 0.2.0): lxmf:<address> -> app:lxmf:<address>
         # (storage.LXMF_PREFIX). Only valid ones, as GLOB is case-sensitive and spelt out: an invalid lxmf: row is
         # still deleted when storage loads, never turned into a valid app: one. A row whose new form a pin already
         # has (none can, short of a database edited by hand) stays as it was, and is deleted
@@ -807,8 +807,8 @@ LEGACY: tuple[Legacy, ...] = (
     Legacy("keepers.json", "rnfs.features.keepers:import_keepers"),
     Legacy("follow.json", "rnfs.features.follow:import_follow"),
     Legacy("contacts.json", "rnfs.features.contacts:import_contacts"),
-    Legacy("lxmf_inbox.json", "rnfs.features.lxmf:import_inbox"),
-    Legacy("lxmf_outbox.json", "rnfs.features.lxmf:import_outbox"),
+    Legacy("lxmf_inbox.json", "rnfs.lxmf_messages:import_inbox"),
+    Legacy("lxmf_outbox.json", "rnfs.lxmf_messages:import_outbox"),
 )
 
 

@@ -60,7 +60,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | NEW-8 | `test_new8_provide_at_limit.py` (rebuilt for 0.2.0: a full budget) | `rnfs/dht/providers.py` (`ProviderStore.provide`, `_store`) | `d74dcc5` |
 | L4 | `test_l4_name_rollback.py` | `rnfs/names.py` (`NameManager`, the name table) | `97b2537` |
 | L4-R | `test_l4r_name_floor.py` | `rnfs/names.py` (the gateway's name floor) | `a9c5640` |
-| NEW-2 | `test_new2_name_publish_crash.py`, `test_new2_follow_lxmf_pins.py` | `rnfs/names.py` (`NameManager.publish`), `rnfs/node.py`, `rnfs/features/follow.py`, `rnfs/features/lxmf.py`, `rnfs/content/storage.py` | `8ecad5b`, `ef3cc9d` |
+| NEW-2 | `test_new2_name_publish_crash.py`, `test_new2_follow_lxmf_pins.py` | `rnfs/names.py` (`NameManager.publish`), `rnfs/node.py`, `rnfs/features/follow.py`, `rnfs/content/storage.py` | `8ecad5b`, `ef3cc9d` |
 | R-2 | `test_r2_name_key_unreadable.py` | `rnfs/names.py` (`release_gone`, `reconcile_pins`) | `56ed5ac` |
 | T1 | `test_t1_parse_name_whitespace.py`; residual: `test_t1_parse_hex_id_whitespace.py` | `rnfs/names.py` (`parse_name`); `rnfs/api.py` (`parse_hex_id`) | `63ebae9`; `bb23b64` |
 | DHT-1 | `test_dht1_keeper_query_budget.py` | `rnfs/features/keepers.py`, `rnfs/dht/lookup.py` | `73c8295` |
@@ -106,23 +106,17 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | API-5 | `test_api5_head_deny.py` | `rnfs/node_content.py` (`stored_head`), `rnfs/gateway.py`, `rnfs/node.py` | `cb5c93f` |
 | API-7 | `test_api7_missing_fetch_metadata.py` | `rnfs/gateway.py` (`limited`, the User-Agent rule) | `0d010b1` |
 
-## Features: LXMF and follow
+## Features: follow
+
+The LXMF feature's findings (L12, L12-R, L13, L13-R, FEAT-1 to FEAT-5 and the auto-fetch fairness fix) and their
+regression tests left rnfs with the feature in 0.2.0, when LXMF messaging became an app of its own; R-1 and NEW-2
+keep their follow tests.
 
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
 | L5 | `test_l5_follow_cap.py` | `rnfs/features/follow.py`, `rnfs/fetcher.py` (`dag_bound`) | `211c470` |
-| L12 | `test_l12_lxmf_inbox.py` | `rnfs/features/lxmf.py` (the inbox), `rnfs/features/contacts.py` | `0cc8193` |
-| L12-R | `test_l12r_untrusted_sender_allowance.py` | `rnfs/features/lxmf.py` (`SENDER_BURST`, `SENDER_INTERVAL`) | `dc1f71d` |
-| L13 | `test_l13_lxmf_hold_queue.py` | `rnfs/features/lxmf.py` (`LxmfNetwork`'s hold queue) | `24898d2` |
-| L13-R | `test_l13r_hold_replaces_oldest.py` | `rnfs/features/lxmf.py` | `dc1f71d` |
-| R-1 | `test_r1_reconcile_damaged_state.py` | `rnfs/features/follow.py`, `rnfs/features/lxmf.py` (the start-up reconcile) | `0e350ae` |
-| none (auto-fetch fairness) | `test_lxmf_auto_fetch_fairness.py` | `rnfs/features/lxmf.py` (the auto-fetch queue) | `84213fa` |
+| R-1 | `test_r1_reconcile_damaged_state.py` | `rnfs/features/follow.py` (the start-up reconcile) | `0e350ae` |
 | DHT-3 | `test_dht3_follow_quota.py`, `test_l5_follow_cap.py` | `rnfs/features/follow.py` (`follow_quota`), `rnfs/config.py` | `63a0157` |
-| FEAT-1 | `test_feat1_auto_sender_share.py` | `rnfs/features/lxmf.py` (each auto-fetch sender's share) | `81dc3a1` |
-| FEAT-2 | `test_feat2_inbox_sender_line.py` | `rnfs/features/lxmf.py` (`inbox_list`), `rnfs/features/contacts.py` | `3707a08` |
-| FEAT-3 | `test_feat3_untrusted_dropped_counter.py` | `rnfs/features/lxmf.py` (`untrusted_dropped`) | `6738659` |
-| FEAT-4 | `test_feat4_removed_auto_sender.py` | `rnfs/features/lxmf.py` (`auto_fetch`, the re-queue at start) | `58fe37a` |
-| FEAT-5 | `test_feat5_name_link_fallback.py` | `rnfs/features/lxmf.py` (`inbox get`, `use_sent_cid`) | `64ab89a` |
 | FEAT-6 | `test_feat6_printable_label.py` | `rnfs/fsutil.py` (`printable_label`) | `0c97eb7` |
 | FEAT-7 | `test_feat7_example_and_client_escaping.py` | `examples/rnfs_share.py`, `rnfs/remote.py` (`Client._report`) | `71d7cb2` |
 
@@ -168,4 +162,4 @@ N1's page half is in the content table.
 
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
-| none (fuzzing) | `test_fuzz_parsers.py` (needs hypothesis) | the strict parsers of untrusted bytes: `rnfs/content/cid.py`, `rnfs/content/dag.py`, `rnfs/content/storage.py`, `rnfs/names.py`, `rnfs/network/`, `rnfs/features/lxmf.py`, `rnfs/gateway.py` | `077f33a` (test); found T1 |
+| none (fuzzing) | `test_fuzz_parsers.py` (needs hypothesis) | the strict parsers of untrusted bytes: `rnfs/content/cid.py`, `rnfs/content/dag.py`, `rnfs/content/storage.py`, `rnfs/names.py`, `rnfs/network/`, `rnfs/uris.py`, `rnfs/gateway.py` | `077f33a` (test); found T1 |

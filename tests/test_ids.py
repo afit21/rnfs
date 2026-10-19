@@ -4,7 +4,6 @@ import unittest
 from rnfs import ids
 from rnfs.api import parse_hex_id
 from rnfs.features.contacts import parse_hex
-from rnfs.features.lxmf import parse_address
 from rnfs.names import parse_name
 from rnfs.network.identity import parse_node_id
 
@@ -61,7 +60,7 @@ class ParseHex16Test(unittest.TestCase):
 class CallersAgreeTest(unittest.TestCase):
     """Every 32-hex parser takes the same text, differing only in whether <angle brackets> are allowed."""
 
-    BRACKETED = (parse_node_id, parse_name, parse_hex, parse_address)
+    BRACKETED = (parse_node_id, parse_name, parse_hex)
 
     def test_bracketed_parsers(self):
         for parse in self.BRACKETED:

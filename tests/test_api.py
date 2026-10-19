@@ -1204,7 +1204,7 @@ class AppSupportTest(ApiTestCase):
         self.assertEqual(result["event_kinds"], list(rnfs_events.EVENT_KINDS))
         self.assertEqual(result["error_codes"], list(errors.CODES))
         self.assertIn("events", result["capabilities"])
-        self.assertEqual(result["deprecated"], ["lxmf"])  # LXMF moves to an app of its own (all features' routes)
+        self.assertEqual(set(result), {"version", "capabilities", "routes", "features", "event_kinds", "error_codes"})
 
     def test_events_long_poll(self):
         """No after: the next sequence at once; then events after it, as they come; kinds filter them; a wait

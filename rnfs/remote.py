@@ -469,35 +469,6 @@ class _Backend:
         """GET /api/name/following."""
         return self.api.name_following()
 
-    def lxmf_address(self) -> dict:
-        """GET /api/lxmf/address."""
-        return self.api.lxmf_address()
-
-    def lxmf_send(self, to: str, target: str, message: str | None, propagate: bool, nearest: bool) -> dict:
-        """POST /api/lxmf/send."""
-        return self.api.lxmf_send(to, target, message, propagate, nearest)
-
-    def lxmf_inbox(self) -> list[dict]:
-        """GET /api/lxmf/inbox."""
-        return self.api.lxmf_inbox()
-
-    def lxmf_inbox_get(self, entry_id, link, output: str | None, directory: str | None,
-                       use_sent_cid: bool) -> list[dict]:
-        """POST /api/lxmf/inbox/get."""
-        return self.api.lxmf_inbox_get(entry_id, link, output, directory, use_sent_cid)
-
-    def lxmf_inbox_rm(self, entry_id, every: bool) -> int:
-        """POST /api/lxmf/inbox/rm."""
-        return self.api.lxmf_inbox_rm(entry_id, every)
-
-    def lxmf_outbox(self) -> list[dict]:
-        """GET /api/lxmf/outbox."""
-        return self.api.lxmf_outbox()
-
-    def lxmf_sync(self, nearest: bool) -> dict:
-        """POST /api/lxmf/sync."""
-        return self.api.lxmf_sync(nearest)
-
     def pin_label(self, cid: str, label: str | None) -> dict:
         """POST /api/pin/label."""
         return self.api.pin_label(cid, label)

@@ -21,8 +21,7 @@ allocated (on every link with PROCESS, on rnfs.dht links only with DHT):
 - on rnfs.dht links, any multi-segment Resource: the checks above see one segment at a time, so a
   response of many segments (hundreds of MiB, later read wholly into memory) would pass them, while every
   legitimate rnfs response fits one. Other destinations' Resources are told apart by the link's destination
-  name, which this node chose itself (LXMF's delivery and propagation node links refuse several segments in
-  features/lxmf.py, which also covers an embedded node);
+  name, which this node chose itself;
 - on rnfs.dht links, any Resource carrying metadata: RNS decodes metadata with umsgpack as the Resource
   completes, before anyone can look at it, and rnfs responses never have any;
 - on rnfs.dht links, any compressed Resource (the advertisement's compressed flag): RNS would decompress it as

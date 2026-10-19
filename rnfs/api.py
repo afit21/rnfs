@@ -45,7 +45,7 @@ code}` (below).
 | POST | /api/name/unsync | JSON `alias` | `{}` after `name_unsync(alias)` (404 if the name isn't synced) |
 | POST | /api/export | JSON `target`, `output` | `export(target, output)` |
 | POST | /api/import | JSON `path` | `import_archive(path)` |
-| GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...], "deprecated": [feature]}` (below) |
+| GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...]}` (below) |
 | GET  | /api/events | `after` (a sequence; absent: none, only `next`), `kinds` (comma-separated), `epoch`, `wait` (≤ 30 s) | `{"events": [event], "next", "lost", "epoch"}` (rnfs.events): the events after `after`, as soon as there is one or after `wait` |
 | POST | /api/shutdown | | `{"stopping": true}`, then the daemon stops as on SIGTERM (`unsupported` 404 where nothing can stop it) |
 | GET  | /api/apps | | `{"apps": app_ls()}`: `[{"name", "created"}]` (the CLI's token only, below) |
@@ -73,13 +73,6 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | GET  | /api/contacts/get | `nick` | the contact |
 | POST | /api/contacts/add | JSON `nick`, `id`, `kind` (optional) | the contact |
 | POST | /api/contacts/rm | JSON `nick` | `{}` |
-| GET  | /api/lxmf/address | | `{"address", "display_name", "propagation_node", "nearest_propagation_node"}` |
-| POST | /api/lxmf/send | JSON `to`, `target`, `message`, `propagate`, `nearest` | `{"id", "hash", "to", "method"}` |
-| GET  | /api/lxmf/inbox | | `{"messages": [...]}` |
-| POST | /api/lxmf/inbox/get | JSON `id`, `link`, `output` or `directory`, `use_sent_cid` | `{"results": [...]}` |
-| POST | /api/lxmf/inbox/rm | JSON `id`, or `all` | `{"removed": count}` |
-| GET  | /api/lxmf/outbox | | `{"messages": [...]}` |
-| POST | /api/lxmf/sync | JSON `nearest` | `{"propagation_node", "started"}` |
 | GET  | /api/deny | | `{"entries": [local entry], "lists": [{"source", "cid", "entries", "state"}]}` |
 | POST | /api/deny/add | JSON `entries` | `{"added": [entries new to the local list]}` |
 | POST | /api/deny/rm | JSON `entries` | `{"removed": [...]}` (404 if one isn't on the local list) |
@@ -93,10 +86,6 @@ Errors are `{"error": message, "code": code}`: code is machine-readable (rnfs.er
 codes"), so a client tells "no such endpoint" (`no_such_endpoint`, an older daemon) from "no such content"
 (`not_found`), both 404, without reading the message. `GET /api/capabilities` lists what this daemon offers
 (CAPABILITIES, every route and feature), so a client checks once instead of trying each endpoint.
-
-Deprecated features (rnfs.features, Feature.deprecated; in 0.2.0 lxmf, which moves to an app of its own): their
-routes work as before, but every response of theirs, errors included, carries `Deprecation: @<Unix time>` (RFC
-9745, DEPRECATION_HEADER), and `GET /api/capabilities` lists them under `deprecated`. Bodies are unchanged.
 
 Events (rnfs.events, `GET /api/events`): a long poll like the name watch below, at most MAX_EVENT_WAITERS waiting
 at once (503 beyond); `after` absent answers at once with the `next` to start from.
@@ -118,7 +107,7 @@ Security:
   read the rnfs directory may use it. A custom header also forces a CORS preflight, which fails because
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
   health checks and the CLI's proof check below, but without the token it answers only `{"version": ...}`:
-  the node and identity hashes, LXMF address and traffic counters need the token like everything else.
+  the node and identity hashes and traffic counters need the token like everything else.
 - A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.apiclient.api_proof>` in its
   response, which only a server knowing the token can make. Before it first sends the token, a client
   (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
@@ -178,7 +167,6 @@ MAX_WATCH_WAIT = 30  # seconds one may wait, as GET /api/jobs/get's wait=
 WATCH_GRACE = 60.0  # seconds a name stays watched after the last call naming it ends
 MAX_WATCHED = 1024  # names watched for API clients at most; the soonest to end go first
 MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
-DEPRECATION_HEADER = "Deprecation"  # RFC 9745, on the responses of a deprecated feature's routes
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
@@ -189,7 +177,6 @@ ERROR_STATUSES = STATUSES
 
 
 _feature_routes: dict | None = None
-_deprecated_routes: dict | None = None
 
 
 def feature_routes() -> dict:
@@ -201,27 +188,15 @@ def feature_routes() -> dict:
     return _feature_routes
 
 
-def deprecated_routes() -> dict:
-    """The deprecated features' API routes, route -> when deprecated (a Unix time), loaded once."""
-    global _deprecated_routes
-    if _deprecated_routes is None:
-        from rnfs import features
-        _deprecated_routes = features.deprecated_routes()
-    return _deprecated_routes
-
-
 def capabilities(node, without=()) -> dict:
     """GET /api/capabilities' answer for node: {"version", "capabilities" (CAPABILITIES but those in without),
     "routes" (every core and feature route, by path), "features" (those node loaded), "event_kinds",
-    "error_codes", "deprecated" (the features that still work but a later release removes)}. rnfs.Node's
-    capabilities() too, without what an embedded node can't do."""
-    from rnfs import features
+    "error_codes"}. rnfs.Node's capabilities() too, without what an embedded node can't do."""
     loaded = getattr(node, "features", None) or {}
     routes = sorted({*ApiHandler.ROUTES, *feature_routes()}, key=lambda route: (route[1], route[0]))
     return {"version": __version__, "capabilities": sorted(set(CAPABILITIES) - set(without)),
             "routes": [list(route) for route in routes], "features": sorted(loaded),
-            "event_kinds": list(events.EVENT_KINDS), "error_codes": list(CODES),
-            "deprecated": features.deprecated_features()}
+            "event_kinds": list(events.EVENT_KINDS), "error_codes": list(CODES)}
 
 
 def error_status(error: Exception) -> int:
@@ -790,7 +765,6 @@ class ApiHandler(TimedHandler):
     proved = False  # this connection had its proof request kept open: it is closed after the next request
     principal: str | None = None  # caller() of the request being answered, set by dispatch
     keep_open = False  # the request being answered is a proof request whose connection stays open
-    deprecated_since: int | None = None  # set by dispatch for a deprecated feature's route: its Deprecation date
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
@@ -853,10 +827,6 @@ class ApiHandler(TimedHandler):
         key = self.proof_key() if CHALLENGE.fullmatch(challenge) else None
         if key is not None:
             self.send_header(PROOF_HEADER, api_proof(key, self.server.server_address[1], challenge))
-        if self.deprecated_since is not None:
-            # RFC 9745: the route still works, but is deprecated since that date; errors carry it too, so a
-            # client sees it whatever the route answers
-            self.send_header(DEPRECATION_HEADER, f"@{self.deprecated_since}")
         if self.keep_open:
             self.send_header("Connection", "keep-alive")
 
@@ -919,7 +889,6 @@ class ApiHandler(TimedHandler):
         # its request on that connection, which can only reach this server (apiclient.ApiConnection._prove)
         self.close_connection = True
         self.keep_open = False
-        self.deprecated_since = None
         url = urlsplit(self.path)
         self.query = parse_qs(url.query, keep_blank_values=True)
         self.headers_sent = False
@@ -935,8 +904,6 @@ class ApiHandler(TimedHandler):
                     return self.send_error_json(405, f"use {' or '.join(allowed)}", "method_not_allowed",
                                                 {"Allow": ", ".join(allowed)})
                 raise ApiRequestError(404, f"no such API endpoint: {url.path}", "no_such_endpoint")
-            if feature_route is not None:
-                self.deprecated_since = deprecated_routes().get(route)
             self.principal = self.caller()
             if route not in self.OPEN_ROUTES and self.principal is None:
                 if self.headers.get(APP_HEADER) is not None:

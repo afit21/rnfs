@@ -205,6 +205,27 @@ class NodeAppsTest(unittest.TestCase):
         again = self.make_node()
         self.assertTrue(again.apps.verify("wiki", token))
 
+    def test_lxmf_pins_stay_until_an_app_called_lxmf_is_removed(self):
+        """The app:lxmf:<sender> pins the LXMF feature of rnfs before 0.2.0 left (its upgrade rewrote lxmf:<sender>)
+        stay through restarts, as no part of rnfs releases them since LXMF left it: an app called lxmf holds them.
+        Adding that app (an LXMF app adopting them, or a user wanting them gone) is never refused now, and removing
+        it releases them, and only them."""
+        sender = "a0" * 16
+        source = app_source("lxmf", sender)
+        self.node.storage.pin(self.other, source)
+        self.node.storage.pin(self.cid, source)
+        self.node.stop()
+        self.node = self.make_node()
+        self.assertEqual(self.node.storage.pins(), {self.cid: {USER, source}, self.other: {source}})
+        self.node.app_add("lxmf")
+        self.node.stop()
+        self.node = self.make_node()
+        self.assertEqual(self.node.storage.pinned_by(source), {self.cid, self.other})  # the app's now: kept
+        self.assertEqual(self.node.app_rm("lxmf"), {"released": 2})
+        self.assertEqual(self.node.storage.pins(), {self.cid: {USER}})
+        self.node.stop()
+        self.assertEqual(self.make_node().storage.pins(), {self.cid: {USER}})
+
 
 
 class AppPinsTest(unittest.TestCase):

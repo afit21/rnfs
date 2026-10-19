@@ -174,19 +174,15 @@ class DocumentTest(unittest.TestCase):
                 self.assertEqual(PIN_KEY in self.operations.get(route, {}).get("parameters", []), uses,
                                  "documented X-Rnfs-Pin-Key" if not uses else "X-Rnfs-Pin-Key isn't documented")
 
-    def test_deprecated_routes(self):
-        """The deprecated features' routes, and only they, are deprecated, with the Deprecation header on every
-        response."""
-        deprecated = features.deprecated_routes()
-        header = {"$ref": "#/components/headers/Deprecation"}
+    def test_no_route_is_deprecated(self):
+        """No operation is marked deprecated or documents a Deprecation header: rnfs deprecates nothing (0.2.0
+        removed LXMF, the one feature it had deprecated, and the mechanism with it)."""
         for route, operation in self.operations.items():
             with self.subTest(route=route):
-                self.assertEqual(operation.get("deprecated", False), route in deprecated)
+                self.assertNotIn("deprecated", operation)
                 for status, response in operation["responses"].items():
-                    self.assertEqual(response.get("headers", {}).get("Deprecation") == header, route in deprecated,
-                                     status)
-        for since in deprecated.values():
-            self.assertIn(f"@{since}", self.document["components"]["headers"]["Deprecation"]["description"])
+                    self.assertNotIn("Deprecation", response.get("headers", {}), status)
+        self.assertNotIn("Deprecation", self.document["components"].get("headers", {}))
 
     def test_error_codes(self):
         """ErrorCode lists every code of rnfs.errors.CODES, and nothing else, each described."""

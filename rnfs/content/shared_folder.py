@@ -108,7 +108,8 @@ def open_signature(handle: builder.Handle, st: os.stat_result, path: str) -> str
 
 
 RETRY_AFTER = 600.0  # seconds before an entry whose import failed for a reason that may pass is tried again
-# The rnfs dir's subdirectories holding its keys (storage/identity, names/) and state: never scanned as the folder
+# The rnfs dir's subdirectories holding its keys (storage/identity, names/) and state: never scanned as the folder.
+# lxmf/ too: the LXMF router state rnfs before 0.2.0 kept there may still be on disk, for an LXMF app to adopt
 PRIVATE_SUBDIRS = ("storage", "names", "state", "blocks", "lxmf")
 
 

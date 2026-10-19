@@ -65,6 +65,9 @@ scan_interval = 2
 republish_interval = 600
 path_timeout = 10
 lookup_timeout = 30
+# Settings of rnfs before 0.2.0, which moved LXMF out of rnfs: ignored with a warning, never stopping the daemon
+lxmf_enabled = true
+lxmf_display_name = "e2e"
 """
 
 
@@ -444,27 +447,18 @@ class NetworkTest(unittest.TestCase):
         self.assertEqual(len(body), int(headers["Content-Length"]))
         # --- end content ---
 
-        # --- lxmf: A sends B a link over LXMF; B fetches it from its inbox ---
-        b_address = b.out("lxmf", "address").splitlines()[0]
-        self.assertEqual(b.status()["lxmf_address"], b_address)
+        # --- no lxmf: LXMF left rnfs in 0.2.0. Its settings are ignored with a warning, its commands are gone,
+        # and the daemon has no LXMF address and keeps no LXMF state ---
         with open(b.log_path, encoding="utf-8", errors="replace") as f:
-            self.assertIn("rnfs lxmf: deprecated: LXMF messaging is moving out of rnfs", f.read())  # said at start
-        wait_for(lambda: a.cli("send", b_address, file_cid, "-m", "hello B", check=False).returncode == 0, 60,
-                 "A to send B an LXMF message")
-        inbox = wait_for(lambda: (lambda out: out if file_cid in out else None)(b.out("inbox")), 90,
-                         "the message in B's inbox")
-        self.assertIn("hello B", inbox)
-        self.assertIn(f"from={a.node_id}", inbox)  # the sender's node, as a provider hint
-        wait_for(lambda: "delivered" in a.out("outbox"), 60, "A's outbox to show the message delivered")
-        self.assertIn(b"rnfs: warning: rnfs outbox is deprecated: ", a.cli("outbox").stderr)  # stdout as it was
-        number = inbox.split()[0].lstrip("#")
-        fetched = b.out("inbox", "get", number, "-o", self.path("b-lxmf")).split()
-        if fetched[0] == "job":  # with rnfs/features/jobs.py the fetch runs as a background job
-            b.out("jobs", "wait", fetched[1].rstrip(":"))
-        with open(self.path("b-lxmf"), "rb") as f:
-            self.assertEqual(f.read(), content)
-        self.assertIn("removed 1", b.out("inbox", "rm", number))
-        # --- end lxmf ---
+            log = f.read()
+        for setting in ("lxmf_enabled", "lxmf_display_name"):  # not `name`: the scenario's name, used below
+            self.assertIn(f"ignoring {setting} in ", log)
+        for command in (["send", b.node_id, file_cid], ["inbox"], ["outbox"], ["lxmf", "address"]):
+            self.assertNotEqual(a.cli(*command, check=False).returncode, 0, command)
+        self.assertNotIn("lxmf_address", b.status())
+        self.assertFalse(os.path.exists(os.path.join(b.dir, "lxmf")))
+        self.assertFalse(os.path.exists(os.path.join(b.dir, "storage", "lxmf_identity")))
+        # --- end no lxmf ---
 
         # --- names: keepers, contacts, follow. The hub keeps A's name; once A is gone, C gets the signed
         # record from the hub (only a keeper's /name answer carries the signature C keeps) ---

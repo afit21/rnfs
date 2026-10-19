@@ -40,8 +40,8 @@ class SettingsFeature(Feature):
     """Reads and changes rnfs.toml for the API, applying LIVE settings to the running node. Thread-safe."""
 
     name = NAME
-    # What some live settings are copied into: the job manager, the keeper store, LXMF's sender lists
-    optional = ("jobs", "keepers", "lxmf")
+    # What some live settings are copied into: the job manager, the keeper store
+    optional = ("jobs", "keepers")
 
     def __init__(self, node):
         """Nothing to load: rnfs.toml is read at each request."""
@@ -66,8 +66,6 @@ class SettingsFeature(Feature):
             warnings = [*warnings, *restart_config(config, file_values, path).warnings]
         except (ValueError, TypeError, AttributeError, OSError) as e:  # OSError: PermissionError too (untrusted)
             file_error = str(e)
-        # Deprecated settings it sets still work, but are going away (the lxmf_* ones, with LXMF)
-        warnings = [*warnings, *settings.deprecation_warnings(file_values, f" in {path}")]
         entries = [settings_entry(entry, config, file_values) for entry in settings.settings_schema()]
         return {"path": path, "settings": entries, "file_error": file_error, "warnings": warnings}
 
@@ -109,9 +107,8 @@ class SettingsFeature(Feature):
                 raise ValueError(str(e)) from None
             except (TypeError, AttributeError) as e:  # a value of a type a check didn't expect
                 raise ValueError(f"invalid settings: {e}") from None
-            # Retired settings the file still holds, and deprecated ones this sets (removing one is what's wanted)
-            warnings = [*warnings, *candidate.warnings,
-                        *settings.deprecation_warnings(name for name, value in changes.items() if value is not None)]
+            # Retired settings the file still holds
+            warnings = [*warnings, *candidate.warnings]
             text = settings.edit_settings(data.decode("utf-8") if data is not None else "", changes)
             new_data = text.encode("utf-8")
             if settings.parse_settings(new_data, path) != values:  # not expected: edit_settings checks each step
@@ -227,21 +224,6 @@ def _keep_max_names(feature: SettingsFeature, value: int):
         keepers.store.max_names = value
 
 
-def _lxmf_senders(attribute: str):
-    """A hook replacing LXMF's set of normalised addresses attribute (accept_from or auto_fetch_from) whole. A
-    sender taken off lxmf_auto_fetch_from has its queued links refused when their turn comes, as at a start."""
-
-    def hook(feature: SettingsFeature, value: list[str]):
-        """Replace the set."""
-        lxmf = feature.dependency("lxmf")
-        if lxmf is not None:
-            from rnfs.features.lxmf import parse_address
-            setattr(lxmf, attribute, {parse_address(address).hex() for address in value})
-
-    hook.__name__ = f"_lxmf_{attribute}"
-    return hook
-
-
 # Settings applied at once: name -> hook (None: read from node.config at each use, which is enough). Each was
 # checked against the code using it; config.LIVE_SETTINGS names exactly these (tests/test_settings.py checks)
 LIVE = {
@@ -260,10 +242,6 @@ LIVE = {
     "keep_max_names": _keep_max_names,
     "keeper_query": None,  # KeepersFeature.always_ask, at each resolve
     "follow_quota": None,  # FollowFeature, at each fetch of a new target
-    "lxmf_accept_from": _lxmf_senders("accept_from"),
-    "lxmf_auto_fetch_from": _lxmf_senders("auto_fetch_from"),
-    "lxmf_auto_fetch_quota": None,  # LxmfFeature._fetch_and_pin
-    "lxmf_send_from_hint": None,  # LxmfFeature, at each link sent
 }
 
 
@@ -403,8 +381,6 @@ def setting_fields(entry: dict) -> dict:
     if entry["pending"]:
         fields["pending"] = "rnfs.toml's value applies at the next start"
     fields["description"] = entry["description"]
-    if entry.get("deprecated"):  # .get: a daemon before 0.2.0's schema has no such key
-        fields["deprecated"] = entry["deprecated"]
     return fields
 
 

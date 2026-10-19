@@ -168,6 +168,23 @@ class LoadTest(unittest.TestCase):
         record_budget = next(e for e in config_module.settings_schema() if e["name"] == "record_budget")
         self.assertEqual((record_budget["unit"], record_budget["minimum"]), ("bytes", 0))
 
+    def test_lxmf_settings_are_retired(self):
+        """0.2.0 moved LXMF out of rnfs: every lxmf_* setting an older rnfs.toml holds, or a program gives an
+        embedded node, is ignored with a warning saying so, and the node starts with its other settings."""
+        path = os.path.join(self.dir, "rnfs.toml")
+        config = self.load('lxmf_enabled = true\nlxmf_display_name = "me"\nlxmf_propagation_node = "' + ID + '"\n'
+                           'lxmf_send_from_hint = false\nlxmf_sync_interval = 60\nlxmf_accept_from = ["' + ID + '"]\n'
+                           'lxmf_auto_fetch_from = ["' + ID + '"]\nlxmf_auto_fetch_quota = 5\nbeta = 4\n')
+        self.assertEqual(config.beta, 4)
+        names = sorted(["lxmf_enabled", "lxmf_display_name", "lxmf_propagation_node", "lxmf_send_from_hint",
+                        "lxmf_sync_interval", "lxmf_accept_from", "lxmf_auto_fetch_from", "lxmf_auto_fetch_quota"])
+        reason = "since rnfs 0.2.0 LXMF messaging is no longer part of rnfs, but an app of its own"
+        self.assertEqual(ignored(config), [f"ignoring {name} in {path}: it is no longer a setting ({reason}); remove it"
+                                           for name in names])
+        self.assertFalse(any(hasattr(config, name) for name in names))
+        self.assertEqual(ignored(self.load("", lxmf_enabled=False)),
+                         [f"ignoring lxmf_enabled: it is no longer a setting ({reason}); remove it"])
+
 
 if __name__ == "__main__":
     unittest.main()

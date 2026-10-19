@@ -33,9 +33,9 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 - **Names.** A name is a key pair whose RNS announces carry "this name points at CID X". Anyone can resolve it
   through RNS's own announce caching, or from *keepers* that store its signed announce; nobody but the owner
   can change it. A node can *follow* a name, keeping its latest target pinned.
-- **Sharing.** Content can be sealed for chosen identities (section 5) and linked from LXMF messages with
-  `rnfs:` URIs (section 13). Neither changes the protocol. rnfs's own LXMF messaging is deprecated in 0.2.0: it
-  moves to a separate app, while `rnfs:` URIs and the LXMF link-map field stay part of this specification.
+- **Sharing.** Content can be sealed for chosen identities (section 5) and linked with `rnfs:` URIs, which
+  LXMF messages carry too (section 13). Neither changes the protocol. LXMF messaging itself is a separate app's
+  since 0.2.0, which removed rnfs's own; `rnfs:` URIs and the LXMF link map stay part of this specification.
 
 ## 2. Terms
 
@@ -224,7 +224,7 @@ pass a `max_response_size` just above their largest honest answer.
   links not identified as a member's are chosen first.
 - **Half-open links.** RNS validates every link request (a key exchange, a proof, a watchdog thread) and keeps
   the link waiting for the initiator's RTT packet for `6 s × hops + 360 s`; only then is it established and
-  counted above. So, on `rnfs.dht` and on the LXMF delivery destination, links still waiting (RNS `PENDING`
+  counted above. So, on `rnfs.dht`, links still waiting (RNS `PENDING`
   or `HANDSHAKE`) are counted in a bucket of their own, also of `max_incoming_links`. When a link request
   arrives with the bucket full, the oldest waiting link on the interface holding the most of them (the
   request's own interface on a tie) is closed, rather than the request refused. So a flood can't fill the
@@ -251,8 +251,9 @@ pass a `max_response_size` just above their largest honest answer.
   `rnfs.dht` links (either end) a node SHOULD also reject any advertisement of more than one segment: every
   rnfs response fits one (`MAX_RESPONSE_SIZE`). On `rnfs.dht` links it SHOULD also reject one with metadata,
   which RNS decodes as the Resource completes and rnfs responses never carry. Other protocols' Resources in
-  the same process (LXMF) are not affected by these two. A node embedded in another program applies every
-  check in this item to its `rnfs.dht` links only, so the program's own links behave as with RNS alone.
+  the same process (an embedding program's LXMF, say) are not affected by these two. A node embedded in another
+  program applies every check in this item to its `rnfs.dht` links only, so the program's own links behave as
+  with RNS alone.
 - RNS decodes a whole response with msgpack before handing it over, and one-byte empty arrays or maps decode
   to some 70 times their size in objects (a 1 MiB response: ~70 MB and ~0.3 s of CPU). So on `rnfs.dht`
   links a node SHOULD check a response's msgpack headers before RNS decodes it, without building objects, and
@@ -1092,7 +1093,7 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 4. Writing out a DAG (`get`, `ls`, the gateway, `export`) stops with an error after `max_output_entries`
    entries, counting every occurrence. This catches DAGs that repeat empty subtrees, which have size 0.
 5. Fetching a target's whole DAG (`get`, `pin add`, `export`, `dir set` and `dir rm`, a followed name's new
-   target, the gateway's archives, remote pins and LXMF auto-fetches) is bounded by what its verified size can
+   target, the gateway's archives and remote pins) is bounded by what its verified size can
    hold. The bytes of its distinct blocks, stored or downloaded, may not exceed the size, plus 64 bytes per
    4 KiB of it (rounded up), plus 1 KiB, plus what its directory and index nodes bring: a directory node its
    own bytes and 16 bytes per entry, an index node its own bytes and 16 bytes per child less 64. A remote pin's
@@ -1165,28 +1166,25 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 - Pins are recursive: a pinned CID keeps every block of its DAG.
 - A pin is held by one or more *sources*: `user`, `folder`, `name:<alias>`, `remote:<identity>`,
   `follow:<name>` (the latest target of a followed name, section 9), `deny` (the deny lists in use, below), and
-  `app:<app>` or `app:<app>:<key>` (pins an app made through the local API with its own token, section 11),
-  among them `app:lxmf:<address>` (links auto-fetched from that LXMF sender, section 13: the LXMF wrapper app's,
-  made by the LXMF built into rnfs while it remains); names, identities and addresses are 32 hex characters.
-  Until rnfs 0.2.0 LXMF's pins were `lxmf:<address>`: the upgrade to 0.2.0 rewrites each as
-  `app:lxmf:<address>` (and those of an older version's `pins.json` as it is imported). An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
+  `app:<app>` or `app:<app>:<key>` (pins an app made through the local API with its own token, section 11);
+  names, identities and addresses are 32 hex characters. rnfs's own LXMF, until 0.2.0 removed it, pinned the
+  links it fetched from an LXMF sender as `lxmf:<address>`: the upgrade to 0.2.0 rewrites each as
+  `app:lxmf:<address>` (and those of an older version's `pins.json` as it is imported), the pins of an app called
+  `lxmf` (section 13). An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
   starting with a letter or digit (so never `:`), and a key 1–128 of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
   A pin lasts while any source holds it.
 - `pin rm` removes only its caller's source: `user` for the CLI, and for an app only its own (`app:<app>`, or
   `app:<app>:<key>` with its pin key; section 11). Other sources are released by whatever created them: the folder
   scan; `name publish` (a name's sync too, section 9) or `name rm`; `/pin` with `false` or a remote quota being
-  exceeded; `name unfollow`, or a followed name's newer target once that is complete; removing the LXMF messages
-  that hold it; removing the app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
+  exceeded; `name unfollow`, or a followed name's newer target once that is complete; removing the app
+  (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
 - Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
-  names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
-  `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
-  `follow:` pins of
-  names no longer followed and `app:lxmf:<address>` pins no saved inbox message records (a queued auto-fetch is fetched
-  again). A followed name's check releases every other target its source holds.
-- That release needs the state read whole. If the followed names or the inbox were never saved (or were
-  imported from a file that was damaged and moved aside as `.damaged`), or hold a malformed entry, such pins
-  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `app:lxmf:` pins get a new
-  inbox message listing them, whose removal releases them. A name key file that is there but can't be read
+  names) is saved separately, so a crash can leave them disagreeing. At start the node makes `name:` pins match
+  the names' records (pinning a recorded target again, releasing the rest), and releases `follow:` pins of names
+  no longer followed. A followed name's check releases every other target its source holds.
+- That release needs the state read whole. If the followed names were never saved (or were imported from a file
+  that was damaged and moved aside as `.damaged`), or hold a malformed entry, such pins are kept and recorded
+  again: a `follow:` pin's name is followed again. A name key file that is there but can't be read
   keeps its name's pins and records; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
   running jobs (section 11), are protected as if pinned.
@@ -1225,7 +1223,8 @@ device, inode, size, modification time and execute bit are as they were (its CID
 is still stored and none is denied, and its content hash still goes through the deny list). Content rewritten in
 place keeping all of these goes unnoticed until one changes. `files/` may be a
 symlink, but a scan MUST NOT import from a folder that resolves, as opened, to the rnfs dir, to a directory
-holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, which hold the node's keys and state:
+holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/` (the LXMF state of rnfs before 0.2.0,
+section 13), which hold the node's keys and state:
 rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin
 with source `folder` is released (including those an earlier version made from it). rnfs also warns, once, when
 a directory above the folder can be changed by other users, who could replace the folder with another.
@@ -1294,7 +1293,7 @@ off their node. Nothing on the wire changes.
   minutes, doubling up to `announce_interval`.
 - A denied CID is never fetched or read, whether it is the root or anywhere in the DAG being fetched, stored
   here or not: `get`, `cat`, `ls`, `stat`, `pin add`, `dir set`, `export`, the gateway, remote pins, followed
-  names, LXMF auto-fetch and jobs fail, saying the content is on the deny list (the API and the gateway answer
+  names and jobs fail, saying the content is on the deny list (the API and the gateway answer
   `451`). It is never stored (an add or import holding it fails and pins nothing), never served (`/blocks`
   answers it as a block not held), and nothing whose DAG holds it is provided: records already published are
   withdrawn. A `/pin` of it is refused.
@@ -1423,7 +1422,7 @@ what prevent rollback.
 - For every name this node has published, or resolved through the CLI or API, it MUST persist the highest
   sequence seen, and never accept a lower one from any source.
 - At equal sequence, the record already held is kept.
-- Records for other names (heard, or resolved by the gateway or LXMF auto-fetch) are kept only in a table of
+- Records for other names (heard, or resolved by the gateway) are kept only in a table of
   at most `name_table_size` entries, least recently used evicted first. An announce of a name the node isn't
   resolving or keeping takes a place only if one is free or held by another name that was only heard, so a
   flood of announces of new names can't push out the names the node resolved.
@@ -1557,12 +1556,11 @@ as is cheap. Rules live in the sections referenced.
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup (a slow node 10 per publishing lookup, 3 per search); lookup time budget (6) |
 | Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection, and end-game duplication of a response still arriving after `deadline_slack` (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
-| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links, LXMF delivery links and links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |
+| Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7) |
 | Reading another node's download history | Only provided content is served (7). Under the default `roots`, complete cached downloads are provided; `pinned` keeps them private |
 | Name rollback or forgery | Self-certifying names; RNS-verified signatures; persisted highest sequence (9) |
 | Forged or withheld kept names | Records verified against the name's key; highest persisted sequence; several keepers asked, ranked by routing-table standing from before the query and drawn from different sources; answers from established keepers only settle a name with no known sequence (9) |
 | Tampered or spliced sealed files | Per-segment HMAC bound to the header, index and final flag, checked before decrypting (5) |
-| Unsolicited LXMF links, inbox flooding | Strict field parsing, size caps per link, per message and for the whole inbox; at most 50 kept messages per untrusted sender; new ones from untrusted senders rate limited per sender, then node-wide; auto-fetched pins never pushed out by others' messages, and each auto-fetch sender held to 1/n of the inbox; signature-validated senders only; rate-limited path requests for unknown senders; `lxmf_accept_from`, per-sender `lxmf_auto_fetch_quota` (13) |
 | Unwanted content on a public gateway or provider node | Deny lists: denied CIDs never fetched, stored, served or provided, anywhere in a DAG; file hashes checked where content is assembled; lists size-capped and checked before use (8) |
 | Uploads exhausting a shared channel | `upload_budget` (charged for bytes sent, at most half of it per requester in flight), interface rules and quiet hours, applied to `/blocks` only (3) |
 | Names and paths chosen by others reaching the local user | Default output names only if printable, not hidden, not starting with `-` and one valid file name, else the CID; non-printable characters escaped in output and logs (11) |
@@ -1591,10 +1589,8 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
 - Transport nodes on the path see traffic volume and timing.
 - Content is public by CID. Sealed files (section 5) keep their content and name from everyone but their
   recipients, not their size or recipient list.
-- A node's LXMF address uses a separate identity, and its default display name (`rnfs node`) says nothing
-  about the node, so its announce can't be linked to its node ID (section 13). The links it sends do carry
-  its node ID as the `from` hint, so whoever reads them (and anyone who sees a propagated message) can link
-  the two, unless `lxmf_send_from_hint` is `false`.
+- An `rnfs:` link carrying a `from` hint names an rnfs node that has the content, so whoever reads a link a node
+  sends with its own node ID links the sender to that node (section 13).
 - The gateway never uses the address book (contacts) or decrypts sealed files, so web pages can't probe or
   read either.
 
@@ -1625,11 +1621,6 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   Once nothing else is left to ask for, another provider is asked for its blocks after `deadline_slack`
   (section 7); on slow nodes, which use one provider at a time, this can delay a fetch for a long time.
 - Mass announces from new identities compete for RNS's announce bandwidth, which RNS itself caps.
-- Many LXMF identities can keep the strangers' bucket empty (one message a minute, each from a new identity,
-  is enough), so no other untrusted sender's message is kept; contacts and other trusted senders are unaffected
-  (section 13). The node counts the messages dropped this way (`status`'s `untrusted_dropped`), so apps can
-  suggest adding the senders the user expects as contacts. LXMF stamps (proof of work) would make each message
-  cost the sender, but announcing a stamp cost changes the announce and refuses senders that haven't heard it.
 - RNS decrypts and decodes every request packet and starts a thread for it before rnfs sees it, so a link
   sending requests as fast as its interface carries them still costs the node that work (about 0.14 ms of CPU
   each over loopback): the request rate limit (section 3) removes only rnfs's share. Likewise a node rejecting
@@ -1722,12 +1713,11 @@ are local conveniences, not part of the protocol.
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
-| `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13), deprecated in 0.2.0: each prints a warning on stderr (stdout unchanged; `RNFS_NO_DEPRECATION_WARNINGS=1` silences it). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 **Network status** (rnfs 0.2.0). `status` (`GET /api/status`, the library's `Status`) also reports what the node can
 see of the network from its own state, with nothing sent to learn it: the cheapest way to learn how big the network
@@ -1756,8 +1746,8 @@ The counts of recent events are kept per minute over the last day, in memory onl
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
 
-**Output from other nodes.** Names, paths and text chosen by other nodes (DAG names, sealed names, LXMF
-links and messages) MUST be printed and logged with non-printable characters escaped, so they can't inject
+**Output from other nodes.** Names, paths and text chosen by other nodes (DAG names and sealed names, among
+others) MUST be printed and logged with non-printable characters escaped, so they can't inject
 terminal escapes or fake log lines. A name chosen by someone else is used as a default output name only under
 the `get` rule above. `get` writes out under a temporary hidden name in the output's directory and renames
 it to the output once complete (refusing if the output appeared meanwhile), so a failed or interrupted
@@ -1786,13 +1776,14 @@ gateway can never reach the API.
   learn the token, and the custom header needs a CORS preflight, which fails: this also blocks cross-site
   requests. `GET /api/status` stays open for health checks and the proof check below, but without the
   token it MUST say no more than the daemon's version (rnfs: `{"version": ...}`); the full status (node ID,
-  identity hash, LXMF address, traffic) needs the token like every other request.
+  identity hash, traffic) needs the token like every other request.
 - The daemon MUST refuse to start if the rnfs directory belongs to another user or can't be made accessible
   to its owner only (on Windows: a protected access list allowing only the user and SYSTEM, which the files
   below it inherit; Administrators are tolerated where an older version left them). On Windows a new rnfs
   directory and its subdirectories MUST get that access list when they are created (not after), the daemon
   MUST refuse a new one that already holds anything, and one that is a junction or symlink. Its existing
-  subdirectories (rnfs: `state`, `blocks`, `storage`, `names` and `lxmf`) MUST be real directories (not
+  subdirectories (rnfs: `state`, `blocks`, `storage` and `names`; `lxmf`, the LXMF state of rnfs before 0.2.0, is
+  left as it is) MUST be real directories (not
   symlinks or junctions) owned by the user, checked without following a link, and one others may access is
   made owner-only (rnfs: 0700, with a notice; if others could write to it, entries in it owned by another
   user are reported, as a warning). Anything else stops the daemon with an error before Reticulum starts.
@@ -1817,8 +1808,8 @@ gateway can never reach the API.
   pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
   CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token, the
   only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden`
-  there. While the LXMF built into rnfs is on, rnfs refuses an app called `lxmf`, whose pins (`app:lxmf:`) it
-  would share (section 13).
+  there. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF made before 0.2.0 (section 13): adding
+  it, then removing it, releases them.
 - **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
   `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
   `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of
@@ -1861,12 +1852,9 @@ gateway can never reach the API.
   both `404` (rnfs: `docs/openapi.json` is an OpenAPI 3.1 reference for every route, its parameters, answers,
   error codes and headers, checked against the code by the tests); `GET /api/capabilities` lists the daemon's
   routes, features, event kinds, error codes and
-  capabilities, and the features that are deprecated (`deprecated`: they still work, but a later release removes
-  them; rnfs 0.2.0: `lxmf`, section 13). Every response of a deprecated feature's routes, errors included,
-  carries `Deprecation: @<Unix time>` (RFC 9745, the time it was deprecated; rnfs's `/api/lxmf/` routes:
-  `@1792368000`, 2026-10-19), and is otherwise unchanged. `POST /api/shutdown` stops the daemon as SIGTERM does,
+  capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does,
   after answering (Windows has no other clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
-  node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds, peers and remote pins (those it asked
+  node's events — jobs, pins, cached fetches, names it holds, peers and remote pins (those it asked
   for and those it serves, section 8) — numbered within a run:
   answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
   level-triggered like the name watch below, so a client asking again with what it was given loses nothing. A
@@ -2134,7 +2122,8 @@ peer is first heard or contacted (`new`) and when its online state changes (`onl
 periodically: rnfs every 30 s, over the peers it met this run or has a link to); rnfs publishes none for the peers
 it knows when it starts, so a client lists them once and then follows the events, taking `new` as add-or-update.
 
-**Contacts.** A node MAY keep a local address book of nicks for names, node IDs and LXMF addresses. A nick is
+**Contacts.** A node MAY keep a local address book of nicks for names, node IDs and LXMF addresses (which an
+LXMF app reads through the local API, section 13). A nick is
 1–32 characters of `a-z`, `0-9`, `-`, `_` and `.`, starting with a letter or digit, and not 32 hex digits, so
 it can never be read as a node ID, name or CID. Contacts are local: they are never sent to other nodes.
 
@@ -2166,22 +2155,21 @@ sizes and counts at least 0; rates above 0; times above 0, except `startup_annou
 `provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
 `remote_pin_identities` are lists of identity hashes (32 hex digits). A node MUST NOT start with an invalid
 setting. A setting an earlier version had and this one retired is ignored with a warning, so settings an older
-version accepted still start the node (rnfs: `max_records`, replaced by `record_budget` in 0.2.0); it can't be set
-any more, only removed.
+version accepted still start the node (rnfs: `max_records`, replaced by `record_budget` in 0.2.0, and the
+`lxmf_*` settings, which left with rnfs's own LXMF in 0.2.0: `lxmf_enabled`, `lxmf_display_name`,
+`lxmf_propagation_node`, `lxmf_send_from_hint`, `lxmf_sync_interval`, `lxmf_accept_from`, `lxmf_auto_fetch_from`
+and `lxmf_auto_fetch_quota`, section 13); it can't be set any more, only removed.
 
 A node MAY let local clients change its settings while it runs (rnfs: `rnfs config`, `POST /api/config/set`,
-with each setting's type, range, unit, default, description and, for a setting that still works but is going
-away, why (`deprecated`: rnfs 0.2.0's `lxmf_*` settings, section 13) from `GET /api/config`, which also warns
-about the deprecated settings the file sets, as setting one through the API does). A change MUST be refused,
-leaving the settings file as it was, unless the whole resulting file is valid by itself and with the node's
-command-line options, under the same checks as at start (ownership, no symlink, size). Options given on the
-command line keep winning over the file. rnfs applies these at once, the rest at the next start: `max_storage`
-(enforced at once), `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`,
-`scan_interval`, `provide_entries` (entries provided or withdrawn at once), `max_jobs`, `max_finished_jobs`,
-`serve_interfaces`, `no_serve_interfaces`, `quiet_hours`, `keep_max_names` (names kept beyond a lower cap stay, as
-at a start), `keeper_query`, `follow_quota`, `lxmf_accept_from`, `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota`
-and `lxmf_send_from_hint`. Settings of identity, ports, Reticulum, the DHT mode and private mode never apply before
-a restart.
+with each setting's type, range, unit, default and description from `GET /api/config`). A change MUST be
+refused, leaving the settings file as it was, unless the whole resulting file is valid by itself and with the
+node's command-line options, under the same checks as at start (ownership, no symlink, size). Options given on
+the command line keep winning over the file. rnfs applies these at once, the rest at the next start:
+`max_storage` (enforced at once), `max_download_size`, `max_output_entries`, `max_upload_rate`,
+`remote_pin_quota`, `scan_interval`, `provide_entries` (entries provided or withdrawn at once), `max_jobs`,
+`max_finished_jobs`, `serve_interfaces`, `no_serve_interfaces`, `quiet_hours`, `keep_max_names` (names kept
+beyond a lower cap stay, as at a start), `keeper_query` and `follow_quota`. Settings of identity, ports,
+Reticulum, the DHT mode and private mode never apply before a restart.
 
 | Name | Default | Notes |
 |---|---|---|
@@ -2242,14 +2230,6 @@ a restart.
 | `follow_quota` | 1 GiB per followed name | Bytes a followed name's new target may hold, its size and its DAG's blocks; 0: followed names aren't fetched. A swap holds the old and new targets, so up to twice this (section 9) |
 | `max_jobs` | 2; 1 on slow nodes | Jobs running at once (a whole number ≥ 1). Foreground `get`, `pin add` and `export` run as jobs too, so they queue beyond this |
 | `max_finished_jobs` | 100 | Finished jobs kept (a whole number ≥ 1); each is kept at least 60 s regardless (section 11) |
-| `lxmf_enabled` | on if the LXMF package is installed | A boolean. `false` turns LXMF off; `true` without the package logs a warning and stays off. Like every `lxmf_*` setting, deprecated in 0.2.0 (section 13) |
-| `lxmf_display_name` | `rnfs node` | Announced with the LXMF address; 1–64 printable characters |
-| `lxmf_send_from_hint` | `true` | Sent links carry `from=<node ID>` as a provider hint; this tells recipients which rnfs node the LXMF address belongs to. `false` omits it |
-| `lxmf_propagation_node` | none | Propagation node (32 hex digits) used for `--propagate`, the fallback of failed direct messages and the periodic downloads. One only heard announcing itself is used only with `--nearest` |
-| `lxmf_sync_interval` | 1 h | Downloads from `lxmf_propagation_node`; 0: never |
-| `lxmf_accept_from` | empty: everyone | LXMF addresses whose messages are kept |
-| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`app:lxmf:<address>`; `lxmf:<address>` before 0.2.0) |
-| `lxmf_auto_fetch_quota` | 1 GiB per sender | Storage the pins of one auto-fetch sender may use |
 | `deny_lists` | empty | Deny-list sources: `<cid>[/path]` or `name/<name>[/path]`, each a file (section 8) |
 
 **Local limits.** Fixed by this implementation rather than set; other implementations may choose their own.
@@ -2261,33 +2241,32 @@ a restart.
 
 ## 13. rnfs URIs and LXMF
 
-**Deprecated (rnfs 0.2.0).** rnfs's own LXMF messaging (sending, receiving, the inbox and outbox, auto-fetch,
-the `lxmf_*` settings, and the commands, API routes, library methods and `inbox` events for them) is deprecated:
-it is moving to a separate app built on the local API (section 11) and rnfs's library, and a later release
-removes it from rnfs. Until then it works as this section says, and says it is deprecated wherever it is used:
-the node logs so at start while LXMF runs or an `lxmf_*` setting is given; each command warns on stderr; every
-response of the `/api/lxmf/` routes carries a `Deprecation` header and `GET /api/capabilities` lists `lxmf` under
-`deprecated` (section 11); the settings schema marks each `lxmf_*` setting `deprecated`; and the library's
-methods warn `DeprecationWarning`. Nothing on the network changes. The `rnfs:` URIs and the link-map field below
-stay part of this specification: they are the interop contract that app, other clients and rnfs itself (a target
-may be an `rnfs:` URI) keep using. The rules for messages, receiving and auto-fetch move to that app's
-specification once rnfs drops LXMF; its pins already use the source `app:lxmf:<address>` (section 8), which the
-app owns.
+rnfs links travel outside rnfs: as `rnfs:` URIs wherever text goes, and in [LXMF](https://github.com/markqvist/LXMF)
+messages, so content can be shared with people using Sideband, NomadNet, MeshChat or any other LXMF client. This
+section defines both forms: the URI syntax and the LXMF *link map*. Neither is part of the `rnfs.dht` protocol.
 
-rnfs links can be sent and received as [LXMF](https://github.com/markqvist/LXMF) messages, so content can be
-shared with people using Sideband, NomadNet, MeshChat or any other LXMF client. This is optional and not part
-of the `rnfs.dht` protocol: a node without the LXMF package (or with `lxmf_enabled = false`) does none of it.
-Nor does rnfs while an app called `lxmf` exists (section 11, app tokens): that is an LXMF wrapper built on the
-local API, which owns the `app:lxmf:` pins and the LXMF identity, so rnfs's own LXMF then neither starts nor
-releases any of those pins at start.
+**rnfs no longer sends or receives LXMF.** Until 0.2.0 rnfs had LXMF messaging of its own (`rnfs send`, an inbox
+and outbox, auto-fetch, the `lxmf_*` settings). 0.2.0 removed it: it is a separate app's now, built on the local
+API (section 11) and rnfs's library, and the rules for messages, receiving and auto-fetch are that app's
+specification. What this specification keeps is the interop contract the app, other clients and rnfs itself use:
 
-**Identity.** A node that uses LXMF has a separate RNS identity for it, kept at
-`<rnfs dir>/storage/lxmf_identity` (owner-only, like the node identity), so its LXMF address can't be linked
-to its node ID by key. Its LXMF address is the hash of that identity's `lxmf.delivery` destination. LXMF's
-own state is kept in `<rnfs dir>/lxmf/`. The node announces `lxmf.delivery` with its display name
-(`lxmf_display_name`, by default `rnfs node`, which says nothing about the node ID) at startup, again after `startup_announce_delay`, then every `announce_interval`, and
-never more often. The announce lists no supported functions, so senders don't compress messages to it (rnfs
-refuses compressed Resources, section 3).
+- the `rnfs:` URIs below, which rnfs.Node and rnfs.Client also accept as a target (section 11);
+- the link map below, the field an LXMF message carries its links in;
+- contacts of kind `lxmf` (section 11, Contacts), which an LXMF app reads through the local API to decide which
+  senders it trusts.
+
+What rnfs's own LXMF left behind, rnfs 0.2.0 and later keep for such an app and never use themselves:
+
+- Its pins: `app:lxmf:<sender address>` (section 8; `lxmf:<sender address>` before 0.2.0, whose upgrade rewrote
+  them). They are an app's pins like any other: an app called `lxmf` holds them, so no part of rnfs releases them,
+  and removing that app (`rnfs app rm lxmf`, after `rnfs app add lxmf` if there is none) releases them.
+- Its identity and state: `<rnfs dir>/storage/lxmf_identity` and `<rnfs dir>/lxmf/` are left as they are, so an
+  LXMF app can adopt them and keep the node's LXMF address.
+- Its inbox and outbox: the records in the state database's `lxmf_messages` table (those of 0.1.4's
+  `lxmf_inbox.json` and `lxmf_outbox.json` are still imported into it at the upgrade) stay as they are, for an
+  LXMF app to import; rnfs never reads, changes or deletes them.
+- Its settings: every `lxmf_*` setting is retired (section 12): one left in `rnfs.toml` is ignored with a
+  warning, and setting one is refused as unknown.
 
 **rnfs URIs.** A link to rnfs content is written:
 
@@ -2312,14 +2291,14 @@ unreserved, pct-encoded: as in RFC 3986
   characters, an invalid CID, or more than 4096 characters.
 - `from=<node ID>` (32 hex digits) is a hint: a node that has the content, normally the sender's. A reader
   MUST reject a link with a malformed or repeated `from`, and MUST ignore other parameters, so later versions
-  can add some. A node adds its own node ID as `from` to the links it sends unless `lxmf_send_from_hint` is
-  `false`; the hint tells every reader which rnfs node the LXMF address belongs to.
+  can add some. A sender that adds its own node ID as `from` tells every reader which rnfs node it is, so it
+  SHOULD let its user leave the hint out.
 - `rnfs:name/<name>[/path]` refers to whatever the name currently points at (section 9).
 - Examples: `rnfs:bafkreibm6jg3ux5qumhcn2b3flc3tyu6dmlb4xa7u5bf44yegnrjhc4yeq`,
   `rnfs:bagaib…/photos/caf%C3%A9%20night.jpg?from=9e0a158a1c3c4e8f9d2b7a6e5f4c3b2a`,
   `rnfs:name/1f2e3d4c5b6a79881f2e3d4c5b6a7988/index.html`.
 
-**Messages.** A message sharing rnfs content carries:
+**The link map.** An LXMF message sharing rnfs content carries:
 - in its content: optional text, then each link's URI on a line of its own, so people and clients that know
   nothing of rnfs see the links;
 - in its fields, for rnfs-aware clients: `FIELD_CUSTOM_TYPE` (`0xFB`) = the string `"rnfs"`, and
@@ -2334,90 +2313,16 @@ unreserved, pct-encoded: as in RFC 3986
   | `from` | bin, 16 bytes | Node ID of a node that has it (the sender's) |
 
   A link map has `cid`, `name` or both. These are LXMF's fields for embedding other protocols. An
-  incompatible change of the link map uses a new `FIELD_CUSTOM_TYPE` value.
+  incompatible change of the link map uses a new `FIELD_CUSTOM_TYPE` value. The bytes are part of the wire
+  format (`tests/test_wire.py` checks them against vectors of rnfs 0.1.3 and 0.1.4).
 - A reader MUST reject the field (and then read links from the content instead) if `FIELD_CUSTOM_DATA` is not
   an array of 1–8 maps, a map has a non-string key or more than 16 keys, a value has another type than shown
   (booleans are not integers; `str` is not `bin`), a CID or name is invalid, a map has neither `cid` nor
   `name`, or a link, written as an `rnfs:` URI, would be longer than 4096 characters (as for URIs in the
   text). Unknown keys MUST be ignored.
-- Messages are sent for direct delivery (over a link) unless the user asks for propagation. A direct message
-  that fails is sent again through `lxmf_propagation_node`, if set. A node with `lxmf_propagation_node` set
-  downloads the messages waiting there every `lxmf_sync_interval`, at most 64 per download. A propagation
-  node only heard announcing itself (the nearest: fewest hops, then most recently heard node announcing
-  `lxmf.propagation` with propagation enabled) is used only when the user asks (`--nearest`): it could be
-  anyone's, and gets the messages sent through it. Without `lxmf_propagation_node`, `send --propagate` without
-  `--nearest` fails, and the node logs once that downloads and the fallback are off.
-- On the link to a propagation node, a response Resource larger than 1 MB (4 × the 256 kB delivery limit,
-  which LXMF asks the node to respect) or of more than one segment is refused and the link torn down;
-  decompression is bounded to 1 MB.
-- On a delivery link, a Resource of more than one segment is refused before any of it is transferred: LXMF
-  checks only the size each segment advertises for itself, and a message within the 256 kB delivery limit
-  always fits one segment.
-
-**Receiving.**
-- Senders in `lxmf_accept_from` or `lxmf_auto_fetch_from`, and LXMF contacts (section 11), are *trusted*.
-  Anyone else can make as many LXMF identities as they like, so the bounds below protect trusted senders'
-  messages from them.
-- A message is accepted only once LXMF has validated its signature with the sender's identity. A message from
-  a sender whose identity isn't known yet is held while a path request fetches it, then validated: at most
-  32, at most 8 claiming one sender, for up to 2 minutes, and only 30 seconds after its path request was sent
-  (or after it arrived, if later) if no answer has made the identity known. A ninth message claiming one
-  sender takes the place of the oldest of its 8, so forgeries sent first can't keep the sender's real message
-  out. When 32 are held, a further one is dropped, so held ones are not pushed out, unless it claims a trusted
-  sender: then it takes the place of the newest message held for the untrusted sender holding the most. The source of such a message is
-  unauthenticated until its identity is known, so path requests for held senders are sent at most once per
-  sender per 2 minutes, and at most 3 at once, then one per 10 seconds node-wide, trusted senders first.
-- If `lxmf_accept_from` is not empty, messages from other senders (except those in `lxmf_auto_fetch_from`)
-  are ignored, and those from unknown senders are not held. Messages without rnfs links are ignored.
-- The links come from the field if it is valid, else from the first 16 384 characters of the content. A link
-  on a line of its own is read whole; elsewhere, trailing punctuation (`.,;:!?)]}'"`) is taken as the
-  sentence's. At most 8 links, 4000 characters of text, 256 of title and 64 of display name are kept. Text
-  from messages MUST be shown with control characters escaped.
-- A sender's display name is its own word, so it MUST NOT be shown where it could pass for the sender's address
-  or trust. `inbox` shows each message's sender address first, then `untrusted`, `trusted` or `contact <nick>`
-  (the API's computed `trusted` and `contact` fields; `?` from a daemon that doesn't give them), and the display
-  name last, quoted, with backslashes, quotes, blank fillers (U+115F, U+1160, U+3164, U+FFA0, U+2800), a
-  combining mark that follows nothing printed or is the third in a row, and a name of only spaces escaped too.
-- At most 500 messages and 4 MiB (as JSON) are kept, and at most 50 from one sender not in
-  `lxmf_auto_fetch_from`. To make room, the oldest message holding no auto-fetched pins (none pinned or
-  queued) is dropped; a message holding pins is not dropped for others' messages: if every kept message holds
-  pins, a new message without any is not kept, and one with pins pushes out its own sender's oldest message
-  (or, if that sender has none, is not kept). Each of the n senders in `lxmf_auto_fetch_from` keeps at most
-  1/n of the 500 messages and of the 4 MiB (at least one message and 16 KiB), messages holding pins included:
-  past its share, a new message from it drops its own messages, first those without pins, then those whose
-  pinned CIDs another of its messages also holds (dropping them releases nothing), then the oldest. A trusted
-  sender's message is dropped only to make room for another trusted sender's, and only once no untrusted sender's
-  message without pins is left; a new message from an untrusted sender that would need one dropped is not
-  kept. New messages from untrusted senders are also rate limited: each sender has an allowance of 4 at once,
-  then one per 15 minutes, and within it messages are taken from a node-wide bucket of 32 at once, then one
-  per minute; others are not kept, and counted (`untrusted_dropped` in `status`). So one sender can't keep the
-  node-wide bucket empty for everyone else (many can: section 10, Limits). Each message's record is at most 16
-  KiB as JSON: links beyond that are dropped (the
-  first is always kept), then text is cut.
-- **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `app:lxmf:<sender address>` (`lxmf:` before rnfs 0.2.0, section 8), one fetch at a time, taking senders in
-  turn. At most 64 links wait: when that many
-  do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
-  whose newest waiting link is skipped instead. Auto-fetches
-  still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or
-  removing the message stops a fetch in progress. A waiting link whose sender is no longer in
-  `lxmf_auto_fetch_from` is refused, not fetched: at the next start (with LXMF off too) and when its turn comes. The fetch is refused if the target's verified size plus what
-  that source already pins would exceed `lxmf_auto_fetch_quota`, or if the blocks of its DAG would (as for
-  remote pins, section 8); `max_download_size` applies too. A `name/` link is resolved without persisting
-  the name's sequence (only the capped table of section 9 holds it), so names arriving unasked don't grow
-  the node's state. Removing a message from the inbox (`inbox rm`) releases its pins unless another inbox
-  message from the same sender holds the same CID.
-- Fetching a link (auto-fetch or `inbox get`) asks the `from` node first, unless it is the node itself, and
-  the DHT if that fails. `inbox get` without `-o` names its output by the `get` rule (section 11): the link's
-  last path name only if it is printable, not hidden, doesn't start with `-` and is a valid file name, else
-  the root CID.
-- A `name/` link is fetched at what the name resolves to. Its `cid` is only the sender's word: nothing ties
-  it to the name, so any sender could pose as a well-known name with it. If the name can't be resolved,
-  `inbox get` fails (404 through the API) before writing anything or starting a job, unless the user passes
-  `--use-sent-cid` (API: `use_sent_cid`): then it fetches the sent CID and that link's result carries a
-  warning saying so. A name that resolves is always used. Auto-fetch, whose senders are trusted, falls back
-  to the sent CID and records `"sent_cid": true` with the pin. `inbox` shows a name link's sent CID ("sent
-  as `<cid>`") and such a pin ("auto-fetch pinned (sent CID; name unresolved)").
+- A `name/` link's `cid` is only the sender's word: nothing ties it to the name, so any sender could pose as a
+  well-known name with it. A reader SHOULD fetch what the name resolves to, and use the sent CID only when the
+  name can't be resolved and its user (or its trust in the sender) says so.
 
 ## Appendix A. Comparison with IPFS
 
@@ -2461,4 +2366,4 @@ unreserved, pct-encoded: as in RFC 3986
 | `ipfs://` URIs | `rnfs:` URIs (section 13) |
 | Long-running `get`/`pin add` in the foreground | Background jobs that survive restarts (section 11) |
 | `ping`, `routing findprovs`, `repo verify`, `dag stat` | `ping`, `providers`, `verify`, `stat` |
-| Pubsub | Not included: gossip floods are unaffordable on shared radio interfaces, and RNS has no routed multicast. rnfs links travel in LXMF messages instead (section 13), and `name follow` replaces subscriptions |
+| Pubsub | Not included: gossip floods are unaffordable on shared radio interfaces, and RNS has no routed multicast. rnfs links can travel in LXMF messages instead (section 13), and `name follow` replaces subscriptions |

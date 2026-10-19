@@ -25,6 +25,9 @@ from tests.test_jobs import ApiBase
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ADDRESS = "ab" * 16  # an LXMF address
+# The settings of the LXMF feature, retired when it left rnfs in 0.2.0
+LXMF_SETTINGS = ("lxmf_enabled", "lxmf_display_name", "lxmf_propagation_node", "lxmf_send_from_hint",
+                 "lxmf_sync_interval", "lxmf_accept_from", "lxmf_auto_fetch_from", "lxmf_auto_fetch_quota")
 
 
 def setUpModule():
@@ -61,22 +64,18 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual((groups["max_jobs"], groups["max_finished_jobs"]), ("transfers", "transfers"))
         self.assertEqual((groups["upload_budget"], groups["quiet_hours"]), ("mesh", "mesh"))
         self.assertEqual((groups["keep_max_names"], groups["follow_quota"]), ("names", "names"))
-        self.assertEqual((groups["lxmf_enabled"], groups["lxmf_auto_fetch_quota"]), ("lxmf", "lxmf"))
         self.assertEqual(groups["deny_lists"], "deny lists")
+        self.assertNotIn("lxmf", groups.values())
 
-    def test_lxmf_settings_are_deprecated(self):
-        """Every lxmf_* setting, and only those, says it is deprecated and why (LXMF moves to an app of its own)."""
-        for entry in settings.settings_schema():
-            with self.subTest(entry["name"]):
-                expected = settings.LXMF_DEPRECATION if entry["name"].startswith("lxmf_") else None
-                self.assertEqual(entry["deprecated"], expected)
-        self.assertEqual(list(settings.deprecated_settings()),
-                         [f.name for f in fields(Config) if f.name.startswith("lxmf_")])
-        self.assertEqual(settings.deprecation_warnings(["beta", "nope"]), [])
-        self.assertEqual(settings.deprecation_warnings(["lxmf_enabled"]),
-                         [f"lxmf_enabled is deprecated: {settings.LXMF_DEPRECATION}"])
-        self.assertEqual(settings.deprecation_warnings(iter(["lxmf_accept_from", "beta", "lxmf_enabled"]), " in x"),
-                         [f"lxmf_enabled, lxmf_accept_from in x are deprecated: {settings.LXMF_DEPRECATION}"])
+    def test_lxmf_settings_are_retired(self):
+        """Every lxmf_* setting left with LXMF in 0.2.0: retired, saying why, and neither a setting nor in the
+        schema any more (tests/test_config.py and ApiTest check what a retired setting does)."""
+        for name in LXMF_SETTINGS:
+            with self.subTest(name):
+                self.assertIn("LXMF messaging is no longer part of rnfs", settings.RETIRED_SETTINGS[name])
+        self.assertEqual([f.name for f in fields(Config) if f.name.startswith("lxmf")], [])
+        self.assertEqual([entry["name"] for entry in settings.settings_schema() if entry["name"].startswith("lxmf")],
+                         [])
 
     def test_entries_agree_with_validate(self):
         for entry in settings.settings_schema():
@@ -127,7 +126,7 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(live, settings.LIVE_SETTINGS)
         # Never live: identity, ports, Reticulum, the DHT, private mode and its members, the daemon's own logging
         never = {"reticulum_dir", "api_port", "gateway_port", "dht_mode", "private", "members", "bootstrap_nodes",
-                 "default_bootstrap", "slow", "debug_log", "remote_pin_identities", "lxmf_enabled"}
+                 "default_bootstrap", "slow", "debug_log", "remote_pin_identities"}
         self.assertFalse(never & settings.LIVE_SETTINGS)
 
     def test_schema_needs_no_rns(self):
@@ -215,9 +214,9 @@ class EditTest(unittest.TestCase):
         # NEL, U+2028 and U+2029 are text inside TOML's strings and comments, not line breaks
         for separator in ("\x85", " ", " "):
             with self.subTest(separator=separator):
-                text = f'lxmf_display_name = "x"  # c{separator}max_storage = 5\nquiet_hours = "a{separator}b"\n'
+                text = f'keeper_query = "x"  # c{separator}max_storage = 5\nquiet_hours = "a{separator}b"\n'
                 self.assertEqual(self.edit({"max_storage": 7}, text), text + "max_storage = 7\n")
-                self.assertEqual(self.edit({"lxmf_display_name": "q"}, text),
+                self.assertEqual(self.edit({"keeper_query": "q"}, text),
                                  text.replace('"x"', '"q"'))
                 written = settings.toml_value(f"a{separator}b")
                 self.assertNotIn(separator, written)  # escaped, so no editor splits the line there
@@ -226,13 +225,13 @@ class EditTest(unittest.TestCase):
 
     def test_strings_and_brackets(self):
         text = ('deny_lists = [\n  "a", # ]\n  "b]\\" #", # x\n] # tail\n'
-                "lxmf_display_name = '''x\n]''' # c\n"
+                "keeper_query = '''x\n]''' # c\n"
                 'quiet_hours = """a"""""  # q\n'
                 'reticulum_dir = """\\\n  ab\\"""\\\n  """\n'
                 'max_jobs=1#c')
-        self.assertEqual(self.edit({"deny_lists": ["z"], "lxmf_display_name": "y", "quiet_hours": "",
+        self.assertEqual(self.edit({"deny_lists": ["z"], "keeper_query": "y", "quiet_hours": "",
                                     "reticulum_dir": "/r", "max_jobs": 2}, text),
-                         'deny_lists = ["z"] # tail\nlxmf_display_name = "y" # c\nquiet_hours = ""  # q\n'
+                         'deny_lists = ["z"] # tail\nkeeper_query = "y" # c\nquiet_hours = ""  # q\n'
                          'reticulum_dir = "/r"\nmax_jobs = 2#c\n')
 
     def test_large_values_are_edited_in_linear_time(self):
@@ -338,7 +337,7 @@ class ApiTest(SettingsBase):
                    '  "' + "aa" * 16 + '",  # first\n'
                    '  "' + "bb" * 16 + '",\n'
                    ']  # members end\n'
-                   '"lxmf_display_name" = "node # not a comment"   # name\n'
+                   '"reticulum_dir" = "/rns # not a comment"   # name\n'
                    '# end\n')
         result = self.set({"max_storage": 5_000_000, "dht_mode": "client", "members": None,
                            "quiet_hours": "22:00-06:00"})
@@ -347,7 +346,7 @@ class ApiTest(SettingsBase):
         self.assertEqual(self.read(), '# my node\n'
                                       '\n'
                                       'max_storage = 5000000  # mine\n'
-                                      '"lxmf_display_name" = "node # not a comment"   # name\n'
+                                      '"reticulum_dir" = "/rns # not a comment"   # name\n'
                                       '# end\n'
                                       'dht_mode = "client"\n'
                                       'quiet_hours = "22:00-06:00"\n')
@@ -383,7 +382,8 @@ class ApiTest(SettingsBase):
         for changes in ({"nope": 1}, {"rnfs_dir": "/tmp/x"}, {"max_storage": "10GiB"}, {"max_storage": True},
                         {"api_port": 0}, {"slow": "maybe"}, {"members": ["not hex"]}, {"quiet_hours": "25:00-26:00"},
                         {"republish_interval": 4 * 86400}, {"max_storage": 2 ** 64}, {"max_storage": 1, "nope": 2},
-                        {"lxmf_accept_from": [ADDRESS, 5]}, {"deny_lists": [{"a": 1}]}, {}, {"beta": [1]}):
+                        {"serve_interfaces": ["TCP", 5]}, {"deny_lists": [{"a": 1}]}, {}, {"beta": [1]},
+                        {"lxmf_accept_from": [ADDRESS]}):
             with self.subTest(changes=changes):
                 body = self.set(changes, 400)
                 self.assertEqual(body["code"], "bad_request")
@@ -465,22 +465,24 @@ class ApiTest(SettingsBase):
             self.assertEqual(self.set({"old_limit": None})["warnings"], [])
             self.assertEqual(self.read(), "beta = 5\n")
 
-    def test_deprecated_settings_are_warned_about(self):
-        """rnfs.toml setting an lxmf_* setting is warned about in GET /api/config, and so is setting one through
-        the API; removing one, or changing another setting, isn't. They still work as before."""
+    def test_lxmf_settings_are_ignored_with_a_warning(self):
+        """The lxmf_* settings an rnfs.toml of rnfs before 0.2.0 holds are reported, never refused: GET /api/config
+        warns about each; setting one is refused as unknown; a change to another setting writes the file around
+        them; removing them (null) works and ends the warnings."""
         self.write(f'lxmf_accept_from = ["{ADDRESS}"]\nlxmf_display_name = "me"\nbeta = 4\n')
         listing = self.call("GET", "/api/config")[1]
-        self.assertEqual(listing["warnings"], [f"lxmf_display_name, lxmf_accept_from in {self.toml} are deprecated: "
-                                               f"{settings.LXMF_DEPRECATION}"])
         self.assertIsNone(listing["file_error"])
-        self.assertEqual(self.setting("lxmf_accept_from")["deprecated"], settings.LXMF_DEPRECATION)
-        self.assertIsNone(self.setting("beta")["deprecated"])
-        self.assertEqual(self.set({"beta": 5})["warnings"], [])
-        result = self.set({"lxmf_auto_fetch_from": [ADDRESS], "lxmf_display_name": None})
-        self.assertEqual(result["warnings"], [f"lxmf_auto_fetch_from is deprecated: {settings.LXMF_DEPRECATION}"])
-        self.assertEqual(result["applied"], ["lxmf_auto_fetch_from"])
-        self.assertEqual(self.b.config.lxmf_auto_fetch_from, [ADDRESS])
-        self.assertEqual(self.set({"lxmf_accept_from": None, "lxmf_auto_fetch_from": None})["warnings"], [])
+        reason = settings.RETIRED_SETTINGS["lxmf_accept_from"]
+        self.assertEqual([warning for warning in listing["warnings"] if "lxmf" in warning],
+                         [f"ignoring {name} in {self.toml}: it is no longer a setting ({reason}); remove it"
+                          for name in ("lxmf_accept_from", "lxmf_display_name")])
+        self.assertEqual([entry["name"] for entry in listing["settings"] if entry["name"].startswith("lxmf")], [])
+        for name in ("lxmf_accept_from", "lxmf_auto_fetch_from", "lxmf_enabled"):
+            self.assertIn(f"unknown setting '{name}'", self.set({name: [ADDRESS]}, 400)["error"])
+        self.assertEqual(self.set({"beta": 5})["applied"], [])
+        self.assertEqual(self.read(), f'lxmf_accept_from = ["{ADDRESS}"]\nlxmf_display_name = "me"\nbeta = 5\n')
+        self.assertEqual(self.set({"lxmf_accept_from": None, "lxmf_display_name": None})["warnings"], [])
+        self.assertEqual(self.read(), "beta = 5\n")
         self.assertEqual(self.call("GET", "/api/config")[1]["warnings"], [])
 
     def test_same_port_twice_is_refused(self):
@@ -595,19 +597,6 @@ class LiveTest(SettingsBase):
         self.set({"keep_max_names": 1})
         keepers.keep(b"\x01" * 16)
 
-    def test_lxmf_senders(self):
-        lxmf = self.b.feature("lxmf")
-        other = bytes.fromhex("cd" * 16)
-        self.assertTrue(lxmf.accepts(other))
-        self.set({"lxmf_accept_from": [ADDRESS.upper()]})
-        self.assertFalse(lxmf.accepts(other))
-        self.assertTrue(lxmf.accepts(bytes.fromhex(ADDRESS)))
-        self.set({"lxmf_auto_fetch_from": ["cd" * 16]})
-        self.assertTrue(lxmf.accepts(other))
-        self.assertTrue(lxmf.trusted(other))
-        self.set({"lxmf_accept_from": None, "lxmf_auto_fetch_from": None})
-        self.assertFalse(lxmf.trusted(other))
-
     def test_provide_entries(self):
         """Changing provide_entries provides or withdraws the files inside pins at once; the schema knows it as a
         flag that may be unset."""
@@ -635,11 +624,9 @@ class LiveTest(SettingsBase):
 
     def test_plain_settings_reach_their_users(self):
         # Read from node.config at each use, which the node's parts share
-        self.set({"max_output_entries": 7, "remote_pin_quota": 9, "lxmf_send_from_hint": False})
+        self.set({"max_output_entries": 7, "remote_pin_quota": 9})
         self.assertIs(self.b.fetcher.config, self.b.config)
-        self.assertIs(self.b.feature("lxmf").config, self.b.config)
-        self.assertEqual((self.b.config.max_output_entries, self.b.config.remote_pin_quota,
-                          self.b.config.lxmf_send_from_hint), (7, 9, False))
+        self.assertEqual((self.b.config.max_output_entries, self.b.config.remote_pin_quota), (7, 9))
 
     def test_restart_settings_are_left_running(self):
         result = self.set({"name_table_size": 5, "upload_budget": 1000})
@@ -687,16 +674,18 @@ class CliTest(SettingsBase):
 
         code, out, err = self.run_cli("config", "set", "quiet_hours", "22:00-06:00")
         self.assertEqual((code, out), (0, "quiet_hours: saved in rnfs.toml and applied\n"), err)
+        code, out, err = self.run_cli("config", "set", "serve_interfaces", '["TCP", "two words"]')
+        self.assertEqual(self.b.config.serve_interfaces, ["TCP", "two words"])
+        self.assertEqual((code, out), (0, "serve_interfaces: saved in rnfs.toml and applied\n"), err)
+        code, out, err = self.run_cli("config", "set", "reticulum_dir", '"two words"')
+        self.assertEqual(out, "reticulum_dir: saved in rnfs.toml; restart the daemon to apply it\n")
+        # The lxmf_* settings left rnfs with LXMF in 0.2.0: unknown now
         code, out, err = self.run_cli("config", "set", "lxmf_accept_from", f'["{ADDRESS}"]')
-        self.assertEqual(self.b.config.lxmf_accept_from, [ADDRESS])
-        # A deprecated setting still works, with a warning on stderr (stdout is what it always was)
-        self.assertEqual((code, out), (0, "lxmf_accept_from: saved in rnfs.toml and applied\n"), err)
-        self.assertEqual(err, f"rnfs: warning: lxmf_accept_from is deprecated: {settings.LXMF_DEPRECATION}\n")
-        code, out, err = self.run_cli("config", "set", "lxmf_display_name", '"two words"')
-        self.assertEqual(out, "lxmf_display_name: saved in rnfs.toml; restart the daemon to apply it\n")
-        self.assertIn("lxmf_display_name is deprecated", err)
-        self.assertIn(f"deprecated: {settings.LXMF_DEPRECATION}\n", self.run_cli("config", "get", "lxmf_enabled")[1])
-        self.assertNotIn("deprecated", self.run_cli("config", "get", "beta")[1])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("unknown setting 'lxmf_accept_from'", err)
+        self.assertEqual(self.run_cli("config", "get", "lxmf_enabled")[0], 1)
+        self.run_cli("config", "unset", "serve_interfaces")
+        self.run_cli("config", "unset", "reticulum_dir")
         self.assertEqual(self.run_cli("config", "set", "slow", "yes")[1],
                          "slow: saved in rnfs.toml, but the daemon's command line sets it, which wins\n")
         self.assertIn("* quiet_hours = \"22:00-06:00\"\n", self.run_cli("config")[1])

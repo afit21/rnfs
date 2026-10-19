@@ -2,9 +2,10 @@
 follow.json, keepers.json, lxmf_inbox.json and lxmf_outbox.json (both versions wrote them alike).
 
 For each: a valid file imports exactly, a damaged one is handled as those versions handled it (follow and the
-inbox then aren't clean, so the reconcile at start keeps their pins), an import interrupted after its commit
+inbox then aren't clean, so the reconcile at start keeps follow's pins), an import interrupted after its commit
 isn't repeated, a second start changes nothing, a .migrated file left behind is ignored, and an import whose
-commit fails leaves the file to import at the next start."""
+commit fails leaves the file to import at the next start. Since 0.2.0, which moved LXMF out of rnfs, nothing in
+rnfs reads the LXMF boxes after their import (rnfs.lxmf_messages): they are kept as imported for an LXMF app."""
 import json
 import os
 import tempfile
@@ -13,10 +14,9 @@ from unittest import mock
 
 import RNS
 
-from rnfs import statedb
+from rnfs import lxmf_messages, statedb
 from rnfs.config import Config
 from rnfs.content.cid import RAW, Cid
-from rnfs.features import lxmf
 from rnfs.features.keepers import FOLLOW, OWN, USER, KeeperStore, sign_record
 from rnfs.names import encode_record, name_for_identity
 from rnfs.node import RnfsNode
@@ -270,9 +270,6 @@ class LogTests:
     MigrateTest giving the box and its bounds)."""
 
     BOX = ""
-    LIMIT = 0
-    MAX_BYTES = None
-    VALID = None
     RECORDS: list = []
 
     def rows(self) -> list:
@@ -281,12 +278,17 @@ class LogTests:
                 + state_rows(self.state, "SELECT key, value FROM meta WHERE store = ? ORDER BY key", (self.BOX,)))
 
     def load(self) -> tuple[list[dict], bool, int]:
-        """The records a log of the box loads, whether it is clean, and the next id."""
-        log = lxmf.MessageLog(self.state, self.BOX, self.LIMIT, self.MAX_BYTES, valid=self.VALID)
+        """After a start: the box's records in the state database, whether it is clean (read whole), and the next
+        id (lxmf_messages.next_id, as an LXMF app would take it)."""
+        self.start()
+        db = statedb.connect(self.state)
         try:
-            return log.entries(), log.clean, log._next_id
+            entries = [statedb.load(record) for _, record in
+                       db.query("SELECT id, record FROM lxmf_messages WHERE box = ? ORDER BY id", (self.BOX,))]
+            return entries, db.meta(self.BOX, "clean") == 1, lxmf_messages.next_id(db.meta(self.BOX, "next_id"),
+                                                                                    entries)
         finally:
-            log.close()
+            db.close()
 
     def test_valid_file_imports_exactly(self):
         """Every record is imported exactly (lone surrogates and other non-ASCII text included), in order,
@@ -303,35 +305,29 @@ class LogTests:
         messages = [good, {**good, "id": "4"}, {**good, "id": 0}, {**good, "id": True}, "junk", {**good},
                     {**good, "id": 2 ** 63}, {**good, "id": 2 ** 70}, {**good, "id": 8, "links": "x"}]
         write_legacy(self.state, self.FILE, text=written({"next_id": "x", "messages": messages}))
-        with mock.patch.object(lxmf, "_log") as warned:
+        with mock.patch.object(lxmf_messages, "_log") as warned:
             entries, clean, next_id = self.load()
         self.assertEqual((entries, clean, next_id), ([good], False, good["id"] + 1))
         self.assertEqual(warned.call_args.args[0], f"dropped 8 malformed record(s) from {self.FILE}")
         self.assertEqual(self.records(), 1)
 
-    def test_exhausted_ids_refuse_new_records(self):
+    def test_next_id_fits_sqlite(self):
         """A next id at SQLite's largest integer (only a hand-edited file holds one) is refused; one just below
-        it is the last id given out, and saves keep working: no id or next id past 64 bits is ever stored."""
+        it is kept: no next id past 64 bits is ever stored."""
         statedb.connect(self.state).close()
-        for saved, expected in ((2 ** 63 - 1, 1), (lxmf.MAX_ID, lxmf.MAX_ID)):
+        for saved, expected in ((2 ** 63 - 1, 1), (lxmf_messages.MAX_ID, lxmf_messages.MAX_ID)):
             with self.subTest(saved=saved):
                 forget_import(self.state, self.FILE)
                 write_legacy(self.state, self.FILE, text=written({"next_id": saved, "messages": []}))
-                log = lxmf.MessageLog(self.state, self.BOX, self.LIMIT, self.MAX_BYTES, valid=self.VALID)
-                try:
-                    self.assertEqual(log._next_id, expected)
-                    log._next_id = lxmf.MAX_ID + 1  # as if every id up to MAX_ID were used
-                    self.assertEqual(log.add(dict(self.RECORDS[0]))[0], None)
-                    log.save()
-                finally:
-                    log.close()
+                self.assertEqual(self.load()[2], expected)
+                self.assertEqual(self.rows()[-1], ("next_id", expected))
 
     def test_limits_apply(self):
         """Past the box's limit (and the inbox's byte bound) the oldest records are dropped, as rnfs 0.1.4 did
         at load; that leaves the box clean."""
         messages = [{**self.RECORDS[0], "id": n, "text": "x" * 1000} for n in range(1, 6)]
         write_legacy(self.state, self.FILE, text=written({"next_id": 2, "messages": messages}))
-        with mock.patch.object(lxmf, self.LIMIT_NAME, 3):
+        with mock.patch.object(lxmf_messages, self.LIMIT_NAME, 3):
             self.start()
         self.assertEqual([row_id for row_id, _ in self.rows()[:-2]], [3, 4, 5])
         self.assertEqual(self.rows()[-2:], [("clean", 1), ("next_id", 6)])
@@ -354,11 +350,8 @@ class InboxTest(Common, LogTests, MigrateTest):
     """lxmf_inbox.json."""
 
     FILE = "lxmf_inbox.json"
-    BOX = lxmf.INBOX
-    LIMIT = lxmf.INBOX_LIMIT
+    BOX = lxmf_messages.INBOX
     LIMIT_NAME = "INBOX_LIMIT"
-    MAX_BYTES = lxmf.MAX_INBOX_BYTES
-    VALID = staticmethod(lxmf._valid_inbox_entry)
     RECORDS = INBOX_RECORDS
     VALUE = {"next_id": 6, "messages": INBOX_RECORDS}
     CHANGED = {"next_id": 2, "messages": [{**INBOX_RECORDS[1], "id": 1}]}
@@ -368,49 +361,46 @@ class InboxTest(Common, LogTests, MigrateTest):
         """Past MAX_INBOX_BYTES the oldest records are dropped, one kept whatever its size."""
         messages = [{**self.RECORDS[1], "id": n, "text": "é" * 1000} for n in range(1, 4)]
         write_legacy(self.state, self.FILE, text=written({"messages": messages}))
-        with mock.patch.object(lxmf, "MAX_INBOX_BYTES", 5000):
+        with mock.patch.object(lxmf_messages, "MAX_INBOX_BYTES", 5000):
             self.start()
         self.assertEqual([row_id for row_id, _ in self.rows()[:-2]], [2, 3])
 
-    def test_reconcile_after_the_upgrade(self):
-        """Upgrading with the inbox, a node's LXMF feature lists its messages and keeps the pins they record;
-        with a damaged inbox, a pin no message records is kept and recorded in a new message; with a whole one,
-        it is released. pins.json's lxmf: source is imported as rnfs 0.2.0's app:lxmf: (storage.upgraded_source)."""
+    def test_pins_are_kept_after_the_upgrade(self):
+        """Upgrading with the inbox and pins.json, a node keeps the messages as imported and every pin of their
+        sender, whether the inbox records it or not, damaged inbox or whole: since 0.2.0 an app called lxmf holds
+        them, and nothing else releases them. pins.json's lxmf: source is imported as rnfs 0.2.0's app:lxmf:
+        (storage.upgraded_source)."""
         legacy, source = "lxmf:" + SENDER, "app:lxmf:" + SENDER
-        for inbox, kept in (("{not json", True), (written(self.VALUE), False)):
+        for inbox, damaged in (("{not json", True), (written(self.VALUE), False)):
             with self.subTest(inbox=inbox):
-                self.config = Config(rnfs_dir=os.path.join(self.tmp.name, "node" + str(kept)))
+                self.config = Config(rnfs_dir=os.path.join(self.tmp.name, "node" + str(damaged)))
                 self.state = self.config.state_dir
                 write_legacy(self.state, "pins.json", {"pins": {str(A): [legacy], str(C): [legacy]}})
                 write_legacy(self.state, self.FILE, text=inbox)
                 node = self.node()
-                messages = node.feature("lxmf").inbox.entries()  # the records, as imported
-                self.assertEqual(node.storage.pinned_by(source), {A, C} if kept else {A})
-                if kept:
-                    self.assertEqual([m["auto"] for m in messages], [[{"state": "pinned", "cid": str(A)},
-                                                                      {"state": "pinned", "cid": str(C)}]])
-                else:
-                    self.assertEqual(messages, self.RECORDS)
+                self.assertEqual(node.storage.pinned_by(source), {A, C})
+                node.stop()
+                self.assertEqual(self.node().storage.pinned_by(source), {A, C})
+                self.assertEqual(self.load()[0], [] if damaged else self.RECORDS)
 
 
 class OutboxTest(Common, LogTests, MigrateTest):
     """lxmf_outbox.json."""
 
     FILE = "lxmf_outbox.json"
-    BOX = lxmf.OUTBOX
-    LIMIT = lxmf.OUTBOX_LIMIT
+    BOX = lxmf_messages.OUTBOX
     LIMIT_NAME = "OUTBOX_LIMIT"
-    VALID = staticmethod(lxmf._valid_outbox_entry)
     RECORDS = OUTBOX_RECORDS
     VALUE = {"next_id": 3, "messages": OUTBOX_RECORDS}
     CHANGED = {"next_id": 2, "messages": [OUTBOX_RECORDS[0]]}
     COUNT = 2
 
-    def test_unfinished_messages_fail_at_the_first_start(self):
-        """A message still unfinished in the file is marked failed when the node starts, as at any restart."""
+    def test_unfinished_messages_are_kept_as_written(self):
+        """A message still unfinished in the file stays as it was through a node's start: nothing in rnfs loads
+        the outbox since 0.2.0 (an LXMF app importing it decides what an unfinished message becomes)."""
         write_legacy(self.state, self.FILE, text=written(self.VALUE))
-        node = self.node()
-        self.assertEqual([e["state"] for e in node.feature("lxmf").outbox_list()], ["delivered", "failed"])
+        self.node().stop()
+        self.assertEqual([e["state"] for e in self.load()[0]], ["delivered", "outbound"])
 
 
 def forget_import(state_dir: str, name: str):

@@ -12,8 +12,7 @@ that tree's own CLI:
 - old-cap/new-cap one node of each version with max_upload_rate set (CAP_RATE), the serving side of the paced
           transfer, and later the name publishers of the keeper scenario.
 
-Every scenario runs in both directions, "A -> B" meaning A serves (or publishes, or sends) and B fetches (or
-resolves, or receives):
+Every scenario runs in both directions, "A -> B" meaning A serves (or publishes) and B fetches (or resolves):
 
 - version    each daemon's `rnfs --version`, /api/status and imported rnfs come from the tree it was given.
 - providers  B finds A among the providers of a CID A added.
@@ -30,10 +29,11 @@ resolves, or receives):
              -> a fresh new node): the keeper keeps the name, the publisher stops, then the resolver starts (so
              it never heard the name's announce) and must get the signed record by asking keepers, its log
              showing the keeper query that returned it.
-- lxmf       A sends B a link over LXMF; it arrives in B's inbox, A's outbox says delivered, and `inbox get`
-             fetches it.
+There is no LXMF scenario: this tree has no LXMF since 0.2.0, which moved it out of rnfs into an app of its own
+(the old releases still have it, but there is nothing to test between them and this tree). The rnfs link field
+an LXMF message carries is checked against the old releases' bytes by tests/test_wire.py.
 
-Usage, from a checkout (the Python that runs rnfs, with RNS and LXMF installed):
+Usage, from a checkout (the Python that runs rnfs, with RNS installed):
 
     git archive v0.1.5 | (mkdir -p /tmp/rnfs-0.1.5 && tar -x -C /tmp/rnfs-0.1.5)
     git archive v0.1.4 | (mkdir -p /tmp/rnfs-0.1.4 && tar -x -C /tmp/rnfs-0.1.4)
@@ -284,8 +284,6 @@ class Network:
             self.check("bulk-cap", self.direction(a, b), self.bulk, a, b)
         for a, b in pairs:
             self.check("names", self.direction(a, b), self.names, a, b, added[a.name])
-        for a, b in pairs:
-            self.check("lxmf", self.direction(a, b), self.lxmf, a, b)
         # Last: the publishers (the *-cap nodes) are stopped on the way
         for publisher, keeper, resolver in [(self.old_cap, self.new, self.old), (self.new_cap, self.old, self.new)]:
             self.check("keepers", self.direction(publisher, keeper, resolver), self.keepers, publisher, keeper,
@@ -490,40 +488,6 @@ class Network:
         if resolved != cid:
             raise AssertionError(f"{resolver.name} resolved {resolved!r}, not {cid}")
         return f"{keeper.name} kept it; with {publisher.name} stopped, a fresh {resolver.name} {evidence}"
-
-    def lxmf(self, a: Daemon, b: Daemon) -> str:
-        """a sends b a link over LXMF; b's inbox has it and `inbox get` fetches it."""
-        path, content = self.random_file(100 * KIB)
-        cid = a.out("add", path)
-        address = b.out("lxmf", "address").splitlines()[0]
-        note = f"from {a.name} {self.counter}"
-        self.counter += 1
-        wait_for(lambda: a.cli("send", address, cid, "-m", note, check=False).returncode == 0, 90,
-                 f"{a.name} to send {b.name} an LXMF message")
-
-        def arrived():
-            """The inbox number of the message carrying cid (a "#N ..." line, its links indented below it)."""
-            number = None
-            for line in b.out("inbox").splitlines():
-                if line.startswith("#"):
-                    number = line.split()[0].lstrip("#")
-                elif cid in line and number is not None:
-                    return number
-            return None
-
-        number = wait_for(arrived, 120, f"the message in {b.name}'s inbox")
-        inbox = b.out("inbox")
-        if note not in inbox:
-            raise AssertionError(f"the message text is missing from {b.name}'s inbox:\n{inbox}")
-        wait_for(lambda: "delivered" in a.out("outbox"), 90, f"{a.name}'s outbox to show the message delivered")
-        out = self.unique("lxmf")
-        fetched = b.out("inbox", "get", number, "-o", out).split()
-        if fetched and fetched[0] == "job":
-            b.out("jobs", "wait", fetched[1].rstrip(":"))
-        with open(out, "rb") as f:
-            if f.read() != content:
-                raise AssertionError("inbox get: the bytes differ")
-        return "sent, delivered, fetched from the inbox"
 
     # Reporting
 
