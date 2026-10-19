@@ -128,6 +128,10 @@ class Lookup:
         self._last_known: dict[bytes, int] = {}  # the nodes the last run knew of and hadn't seen fail
         self._last_queried: set[bytes] = set()  # the nodes the last run queried
         self._last_doubtful: set[bytes] = set()  # the nodes the last run knew of as unreliable and not answered
+        self._out: set[bytes] = set()  # nodes ask() sent to that haven't answered (still out at its deadline)
+        # node -> the nodes it named, for every answer about the key, also those that came after the run that asked
+        # stopped waiting (it completes with queries still out)
+        self._replies: dict[bytes, list[bytes]] = {}
         self._wake: queue.Queue | None = None
         self._lock = threading.Lock()
         self._start_nodes = [n for n in dict.fromkeys(start_nodes) if self._usable(n)]
@@ -144,7 +148,7 @@ class Lookup:
         come after every other, so stores are sent to them only to make up k.
         """
         self._run(None, lambda: False)
-        candidates = self.candidates()
+        candidates = self._choices(late=False)
         return sorted(candidates, key=lambda n: (candidates[n], self._distance(n)))[:self.k]
 
     def candidates(self) -> dict[bytes, bool]:
@@ -152,13 +156,28 @@ class Lookup:
         unreliable node that hasn't answered. Sweep providing ranks them for other keys near this one.
 
         The nodes the last run knew of that answered, or that it didn't query and whose identity is known; not
-        those that failed or were still not answering when it ended.
+        those that failed or were still not answering when it ended. Unlike find_closest, also the answers that came
+        after the run ended (a run that completes leaves queries out, usually to nodes that are fine): their nodes
+        answered, and the nodes they named are known as a run's replies' are.
         """
+        return self._choices(late=True)
+
+    def _choices(self, late: bool) -> dict[bytes, bool]:
+        """candidates(), with (late) or without the answers that came after the last run ended."""
         with self._lock:
             answered = set(self._answered)
-        doubtful = self._last_doubtful
-        return {n: n in doubtful for n in list(self._last_known)
-                if n in answered or (n not in self._last_queried and self.is_known(n))}
+            replies = dict(self._replies) if late else {}
+        known = dict(self._last_known)
+        for node_id, nodes in replies.items():
+            if node_id in self._failed:
+                continue
+            answered.add(node_id)
+            for n in [node_id] + nodes:
+                if n not in known and self._usable(n):
+                    known[n] = self._distance(n)
+        doubtful, queried, out = self._last_doubtful, self._last_queried, self._out
+        return {n: n in doubtful and n not in answered for n in known
+                if n in answered or (n not in out and n not in queried and self.is_known(n))}
 
     def ask(self, node_id: bytes, key: bytes) -> list[bytes] | None:
         """Send node_id one /find about key, a key near this lookup's (sweep providing asks about the far half of
@@ -174,7 +193,7 @@ class Lookup:
         if not self._usable(node_id) or not self.allow_unknown(node_id):
             return None
         results: queue.Queue = queue.Queue()
-        self._last_queried.add(node_id)
+        self._out.add(node_id)
         self._send(node_id, results, key)
         reply = None
         while True:
@@ -188,6 +207,7 @@ class Lookup:
             if answered_id == node_id:
                 break
         known = self._last_known
+        self._out.discard(node_id)
         if reply is None:
             with self._lock:
                 self._failed.add(node_id)
@@ -318,6 +338,7 @@ class Lookup:
         self._last_known = known  # live: find_closest reads them once the run ends
         self._last_queried = queried
         self._last_doubtful = doubtful
+        self._out = set()
 
         def rank(node_id: bytes) -> tuple[bool, int]:
             """Sort key: reliable nodes (and those that answered) first, then by distance."""
@@ -469,6 +490,9 @@ class Lookup:
                 self.report(f"lookup for {self.key.hex()}: {_name(node_id)}{about} " + (
                     f"failed after {took:.1f}s" if reply is None
                     else f"answered in {took:.1f}s: {len(reply[0])} providers, {len(reply[1])} nodes"))
+            if reply is not None and key == self.key:
+                with self._lock:
+                    self._replies[node_id] = reply[1]
             try:
                 (self.on_failure if reply is None else self.on_answer)(node_id)
             except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged
