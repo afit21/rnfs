@@ -346,6 +346,24 @@ The DHT (local behaviour: nothing on the wire changes):
   fallback). A slow node paces that fallback like its publish lookups (it counts as 2 of a round's lookups and runs
   only if the pacing allows within the lookup's time), and counts widened lookups among its round's 10 (a flagged
   key that doesn't fit waits for the next round).
+- **Fast nodes spare LoRa islands most lookup traffic** (spec section 6, "Slow paths"; nothing on the wire changes):
+  a node that isn't slow asks servers behind a slow path (an RNS path of more than 3 hops, or its own last link to
+  the server within 24 hours had a round trip above 1 s and a rate estimate below `slow_bitrate`) after every other
+  server but unreliable ones, in searches and publish lookups, and stores to them only to make up 10. They are still
+  asked when a lookup has too few others; the routing table, `/find` replies, provider ranking and failure counts are
+  unchanged. In the topology simulation this cut the airtime internet nodes' lookups cost islands by 97% (27 s to
+  0.6 s each; a 30-server island needed 135–141% of its channel for light internet use before), and internet nodes
+  still found island content 98% of the time. Over the fake network of `tests/test_topology.py` (1,000 servers,
+  21% on islands): island `/find` per internet search 0.76 to 0, island stores per internet publish 2.5 to 0.07. A
+  server whose path was unknown is judged again once the query's path request is answered, before a link is opened.
+  `rnfs peers` is unchanged; the traffic counters now keep each peer's last link's rate estimate too (in memory).
+- **Slow nodes place records better:** a slow node's lookups may make more path requests than its `alpha` (1): up to
+  10 per publishing lookup (its 2 disjoint paths 5 each, and a widened lookup 10) and 3 per search (and 3 more over
+  the fallback's paths). A slow node hears only some servers' announces, so a publish lookup stopped at the closest
+  servers it knew: in the topology simulation an island publisher's records reached 1.3–2.7 of their 10 closest
+  servers, and internet nodes found island content 68–91% of the time; with the larger budget 3.7–4.4 and 99%, for
+  11–19% more airtime per publish. Over the fake network of `tests/test_topology.py` (1,000 servers): 3.6 to 6.9 of
+  the 10 closest. Nodes that aren't slow are unchanged (`alpha` per lookup), as is the keeper query's own budget.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

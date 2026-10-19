@@ -14,6 +14,13 @@ No RNS dependency: the node gives Lookups (its routing table, client and callbac
 - **Publishing** (Lookups.publish: a region's lookup, rnfs.dht.sweep): always disjoint paths, without the checks;
   then each key of the region is checked (flags) over the servers the paths learned, and a key flagged gets a
   widened lookup of its own (widen: one Lookup with both checks), whose ring servers it is stored on too.
+- **Path requests.** A lookup tries at most its budget of unknown IDs (Lookup.unknowns, alpha by default). A slow
+  node, whose announce-starved routing table often knows only some of a key's closest servers, gives a publishing
+  lookup SLOW_PUBLISH_UNKNOWNS and a search SLOW_SEARCH_UNKNOWNS (the topology simulation's strategy UB: an island
+  publisher's records reached 3.7 of their 10 closest servers instead of 1.3, and backbone searchers found them 99% of
+  the time instead of 68%). Disjoint paths split their lookup's budget (split_budget), each path never below alpha: a
+  slow node's publish lookup sends at most 10 path requests over its 2 paths, and a search's fallback 3 (besides the
+  first lookup's 3). The widened lookup of a flagged key is a publishing lookup of its own.
 """
 import threading
 from collections.abc import Callable
@@ -26,9 +33,24 @@ from rnfs.dht.routing import distance
 
 DISJOINT_PATHS = 3  # paths of a publisher's lookups and a search's fallback (eclipse simulation: 4 added under 1 point)
 SLOW_DISJOINT_PATHS = 2  # on slow nodes, whose every /find costs seconds of airtime
+SLOW_PUBLISH_UNKNOWNS = 10  # unknown IDs (path requests) a slow node's publishing lookup tries at most (alpha: 1)
+SLOW_SEARCH_UNKNOWNS = 3  # unknown IDs a slow node's search (and its fallback) tries at most
 
 # new_lookup(key, start nodes, **Lookup options) -> a Lookup wired to the node (routing table, client, callbacks)
 NewLookup = Callable[..., Lookup]
+
+
+def split_budget(total: int | None, paths: int) -> list[int | None]:
+    """total unknown IDs dealt to paths disjoint paths, the first ones taking what doesn't divide evenly (None: each
+    path the Lookup's default, alpha). A Lookup never takes fewer than alpha, so a share may round up to it."""
+    if total is None:
+        return [None] * paths
+    return [total // paths + (1 if index < total % paths else 0) for index in range(paths)]
+
+
+def _budget(unknowns: int | None) -> dict:
+    """The Lookup option for a budget of unknowns unknown IDs (none: the Lookup's default)."""
+    return {} if unknowns is None else {"unknowns": unknowns}
 
 
 class Search:
@@ -142,11 +164,14 @@ class Search:
 class Lookups:
     """The node's recipe for lookups: new_lookup makes a Lookup wired to it, start(key) gives the start nodes,
     seniors(key) the senior servers (the announce first-seen log's), sizes the size estimate (fed by every complete
-    lookup); paths disjoint paths per publish lookup and fallback; pace (slow nodes) paces the fallback."""
+    lookup); paths disjoint paths per publish lookup and fallback; pace (slow nodes) paces the fallback;
+    publish_unknowns and search_unknowns the budgets of unknown IDs of a publishing lookup and of a search (and of its
+    fallback), split among disjoint paths (None: alpha per Lookup, as on nodes that aren't slow)."""
 
     def __init__(self, new_lookup: NewLookup, start: Callable[[bytes], list[bytes]], sizes: density.SizeEstimate,
                  seniors: Callable[[bytes], list[bytes]], paths: int = DISJOINT_PATHS,
-                 pace: Callable[[], float] | None = None):
+                 pace: Callable[[], float] | None = None, publish_unknowns: int | None = None,
+                 search_unknowns: int | None = None):
         """Lookups made with new_lookup."""
         self.new_lookup = new_lookup
         self.start = start
@@ -154,16 +179,20 @@ class Lookups:
         self.seniors = seniors
         self.paths = max(1, paths)
         self.pace = pace
+        self.publish_unknowns = publish_unknowns
+        self.search_unknowns = search_unknowns
 
     def search(self, key: bytes) -> Search:
         """A provider search for key: density-checked, the senior rule, and disjoint paths only as a fallback."""
         size, seniors = self.sizes.estimate(key), self.seniors(key)
-        first = self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note)
-        return Search(first, lambda left, queries: self._disjoint(key, size, seniors, left, queries), self.pace)
+        first = self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note,
+                                **_budget(self.search_unknowns))
+        return Search(first, lambda left, queries: self._disjoint(key, size, seniors, left, queries,
+                                                                  self.search_unknowns), self.pace)
 
     def publish(self, key: bytes) -> Lookup | DisjointLookup:
         """A region's closest-nodes lookup for key, over disjoint paths."""
-        return self._disjoint(key)
+        return self._disjoint(key, unknowns=self.publish_unknowns)
 
     def flags(self, key: bytes, region) -> bool:
         """The density check for key over what its region's lookup learned (a sweep.Region)."""
@@ -178,19 +207,21 @@ class Lookups:
         servers beyond the dense core. Returns K servers of each ring, from what it and the region learned."""
         size = self.sizes.estimate(key)
         lookup = self.new_lookup(key, self.start(key), size=size, seniors=self.seniors(key),
-                                 on_complete=self.sizes.note)
+                                 on_complete=self.sizes.note, **_budget(self.publish_unknowns))
         lookup.find_closest()
         nodes = dict(region.nodes)
-        for node_id, last in lookup.candidates().items():
-            nodes[node_id] = nodes.get(node_id, True) and last
+        for node_id, tier in lookup.candidates().items():
+            nodes[node_id] = min(nodes.get(node_id, tier), tier)
         ranked = sorted(nodes, key=lambda n: distance(n, key))
         return density.rings(ranked, [distance(n, key) for n in ranked], size, K, later=nodes.__getitem__)
 
     def _disjoint(self, key: bytes, size: float | None = None, seniors: list[bytes] | tuple = (),
-                  timeout: float | None = None, queries: int | None = None) -> Lookup | DisjointLookup | None:
+                  timeout: float | None = None, queries: int | None = None,
+                  unknowns: int | None = None) -> Lookup | DisjointLookup | None:
         """A lookup for key over self.paths disjoint paths (one Lookup for a single path), each with the checks given,
         within timeout (the node's lookup_timeout if None) and sending queries in all, split among the paths (each
-        path's run its own max_queries if None); None if that leaves a path none."""
+        path's run its own max_queries if None); None if that leaves a path none. unknowns unknown IDs are split among
+        the paths too (split_budget)."""
         options = {} if timeout is None else {"timeout": timeout}
         if queries is not None:
             if queries < self.paths:
@@ -198,10 +229,13 @@ class Lookups:
             options["max_queries"] = queries // self.paths
         if self.paths == 1:
             return self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note,
-                                   **options)
+                                   **options, **_budget(unknowns))
+        # DisjointLookup makes the paths in order, one call each: path i takes the i-th share
+        shares = iter(split_budget(unknowns, self.paths))
 
         def path(start: list[bytes], senior: list[bytes], claim, taken) -> Lookup:
-            """One path's Lookup."""
-            return self.new_lookup(key, start, size=size, seniors=senior, claim=claim, taken=taken, **options)
+            """One path's Lookup, with its share of the unknown IDs."""
+            return self.new_lookup(key, start, size=size, seniors=senior, claim=claim, taken=taken, **options,
+                                   **_budget(next(shares)))
 
         return DisjointLookup(key, self.start(key), path, self.paths, seniors, on_complete=self.sizes.note)

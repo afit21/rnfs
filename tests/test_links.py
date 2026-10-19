@@ -238,6 +238,18 @@ class LinkPoolTest(unittest.TestCase):
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
 
+    def test_await_path(self):
+        """A path a lookup waits for before its query (to see its hops): requested only if RNS has none."""
+        waited = []
+        links.RNS.Transport.await_path = lambda node_id, timeout: waited.append((node_id, timeout)) or True
+        self.assertTrue(self.pool.await_path(NODE))
+        self.assertEqual(waited, [])  # there is one
+        links.RNS.Transport.has_path = lambda node_id: False
+        self.assertTrue(self.pool.await_path(NODE))
+        self.assertEqual(waited, [(NODE, self.pool.config.path_timeout)])
+        links.RNS.Transport.await_path = lambda node_id, timeout: False
+        self.assertFalse(self.pool.await_path(NODE))
+
     def test_awaited_identity_marked_used_once(self):
         # Polls for an identity still on its way don't mark the destination used; contacting it does, once (C2)
         calls = []

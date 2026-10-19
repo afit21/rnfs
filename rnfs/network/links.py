@@ -291,6 +291,18 @@ class LinkPool:
         self._start_sweeper()
         return peer
 
+    def await_path(self, node_id: bytes) -> bool:
+        """Wait up to path_timeout for a path to node_id, requesting one if RNS has none (as opening a link would): True
+        once there is one. A lookup asks it before a query, to see how many hops the path takes (rnfs.mesh.SlowPaths).
+        """
+        if RNS.Transport.has_path(node_id):
+            return True
+        log(f"requesting a path to {node_name(node_id)}", LOG_VERBOSE)
+        if RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
+            return True
+        log(f"no path to {node_name(node_id)} after {self.config.path_timeout:g}s")
+        return False
+
     def open_identified(self, node_id: bytes) -> PeerLink | None:
         """A new link to node_id that identifies, for publishing or /pin. Close it with close_link when done."""
         return self.open_oneshot(node_id, identify=True)

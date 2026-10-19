@@ -51,14 +51,15 @@ from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, 
 from rnfs.dht.density import SizeEstimate
 from rnfs.dht.firstseen import FirstSeenLog
 from rnfs.dht.lookup import Lookup
-from rnfs.dht.lookups import DISJOINT_PATHS, SLOW_DISJOINT_PATHS, Lookups, Search
+from rnfs.dht.lookups import (DISJOINT_PATHS, SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups,
+                              Search)
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
 from rnfs.dht.routing_state import RoutingState
 from rnfs.dht.scores import Scores
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
-from rnfs.mesh import RnsPaths
+from rnfs.mesh import RnsPaths, SlowPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
 from rnfs.name_sync import NameSync
 from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
@@ -553,6 +554,9 @@ class RnfsNode:
         self.paths = RnsPaths(self.reticulum)
         self.fetcher.path_info = self.paths.info
         self.fetcher.path_infos = self.paths.infos
+        # Lookups judge slow paths by hops too, and check a path once a query's path request is answered
+        self.slow_paths.hops = self.paths.hops
+        self._check_path = self._path_check
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
@@ -649,11 +653,18 @@ class RnfsNode:
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))
         # Which lookups searching and publishing run (section 6): density-checked searches with the senior rule,
-        # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths
+        # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths.
+        # Slow nodes may make more path requests per lookup than alpha, most when publishing: they hear few announces
         self.lookups = Lookups(self._wired_lookup, self._start_nodes, self.sizes,
                                lambda key: self._senior_servers(key, None),
                                SLOW_DISJOINT_PATHS if slow else DISJOINT_PATHS,
-                               pace=self._pace_fallback if slow else None)
+                               pace=self._pace_fallback if slow else None,
+                               publish_unknowns=SLOW_PUBLISH_UNKNOWNS if slow else None,
+                               search_unknowns=SLOW_SEARCH_UNKNOWNS if slow else None)
+        # Servers behind a slow path (section 6): a node that isn't slow asks them last in its lookups. Judged from the
+        # links this node opened until Reticulum runs (_start_network adds hops, and the path check of _check_path)
+        self.slow_paths = SlowPaths(getattr(client, "traffic", None), config.slow_bitrate)
+        self._check_path: Callable[[bytes], bool | None] | None = None
         # The storage tiers' Known publishers besides contacts and members: the bootstrap nodes a join may contact
         defaults = DEFAULT_BOOTSTRAP_NODES if config.default_bootstrap and not config.private else ()
         self._known_bootstrap = frozenset(self._bootstrap_nodes + [bytes.fromhex(text) for text in defaults])
@@ -921,8 +932,23 @@ class RnfsNode:
         return (reliable + [n for n in nearest if n not in reliable])[:K]
 
     def _wired_lookup(self, key: bytes, start: list[bytes], **options) -> Lookup:
-        """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths)."""
+        """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths). On a node
+        that isn't slow, servers behind a slow path rank after the rest (section 6): searches and publishing only,
+        not the join's lookups (which fill the routing table, as it always was)."""
+        if not self.slow:
+            options.setdefault("slow_path", self.slow_paths)
+            options.setdefault("check_path", self._check_path)
         return self._new_lookup(key, start, self.routing.is_banned, **options)
+
+    def _path_check(self, node_id: bytes) -> bool | None:
+        """Lookup.check_path (once Reticulum runs): before a lookup asks node_id, if RNS had no path to it when the
+        lookup ranked it, wait for the path the query would request anyway, and say whether it is slow (True: ranked
+        again before a link is opened). False if no path came (the query fails as it would have); None to ask it."""
+        if self.paths.hops(node_id) is not None:
+            return None  # ranked with its path known
+        if not self.client.await_path(node_id):
+            return False
+        return True if self.slow_paths(node_id) else None
 
     def _pace_fallback(self) -> float:
         """Slow nodes: a search's fallback is paced like the publisher's lookups (Publisher.pace_lookups)."""

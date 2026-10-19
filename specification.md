@@ -68,6 +68,9 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   interfaces reporting no bitrate (or 0) are ignored; if none remain, the node is not slow. Node-wide settings
   (`alpha`, `republish_interval`, `max_parallel_providers`) depend on the node; per-link values (budgets,
   deadlines, `max_upload_rate`) on the link.
+- **Slow path** to a server: an RNS path of more than 3 hops, or a last link from this node within 24 hours with a
+  round trip above 1 s and a rate estimate below `slow_bitrate` (section 6, "Slow paths": nodes that aren't slow ask
+  such servers last in their lookups).
 
 ## 3. Use of Reticulum
 
@@ -619,6 +622,18 @@ and repeat.
 - A returned node or provider ID with no known identity (`Identity.recall` fails) costs a path request; at most
   `alpha` such IDs are tried per lookup. (A keeper query asks unknown keepers from a budget of its own, also
   `alpha`, so nodes named in `/find` replies can't use it up, section 9.)
+- **Unknown-ID budgets on slow nodes.** RNS lets announces take at most 2% of an interface's bitrate, so a slow
+  node hears only some of the network's servers and often knows few of a key's closest. A slow node MAY try more
+  unknown IDs than `alpha` (1), most when publishing: rnfs tries up to 10 per publishing lookup (a region's
+  closest-nodes lookup, its disjoint paths together; a widened lookup) and 3 per provider lookup (a search, and its
+  fallback's paths 3 more together). Disjoint paths split their lookup's budget, the first paths taking what doesn't
+  divide evenly, none below `alpha` (a slow node's 2 publishing paths 5 each; its fallback's 2 and 1). Nodes that
+  aren't slow keep `alpha` per lookup, and each disjoint path its own. In the topology simulation (islands of LoRa
+  servers hearing 5–16% of the internet servers' announces) an island publisher's records reached 3.7–4.4 of their
+  10 closest servers instead of 1.3–2.7, and internet nodes found island content 99% of the time instead of
+  68–91%, for 11–19% more publish airtime. Over the fake network of `tests/test_topology.py` (1,000 servers, islands
+  hearing 16%) its records reached 6.9 of their 10 closest instead of 3.6 (3,000 servers hearing 5.3%: 6.3 instead
+  of 2.4). The keeper query's own budget stays `alpha`.
 - Nodes that fail to answer are dropped from the lookup and counted in the routing table.
 - **Unreliable nodes.** An announce shows a node is alive, not that a link to it can be established: a far
   node whose announces keep arriving may never accept a link, and each query to it then costs RNS's whole
@@ -636,6 +651,32 @@ and repeat.
   Its queries aren't shortened: on a long radio path a link may take the whole timeout to establish, and
   only an answer shows the node is back. Its routing-table entry, `/find` replies and the join's count of
   live servers are unchanged.
+- **Slow paths.** Servers on a LoRa island behind an internet gateway are ordinary servers to the rest of the network,
+  so they answer a share of every lookup and hold records near their IDs, over radio: in the topology simulation
+  (docs/simulations/topology) light use by internet nodes alone (10 lookups and 10 CIDs a day each) needed 135–141%
+  of a 30-server island's channel. A node that isn't slow SHOULD ask servers behind a slow path last. In rnfs a server
+  is behind a *slow path* when RNS has a path to it of more than 3 hops (`RNS.Transport.hops_to`, local even through
+  a shared instance), or when this node's own last link to it, established within the last 24 hours, had a round
+  trip above 1 s **and** a rate estimate below `slow_bitrate` (section 2). A long round trip alone doesn't count: I2P
+  links have one, and cost no radio airtime. A server with neither known (no path, no link) is not behind one.
+  - It changes only the order of a lookup's queries (searches and their fallback, publishing's region and widened
+    lookups; not the join's): a lookup ranks its nodes in tiers, those that answered and the rest first, then those
+    behind a slow path, then unreliable ones, by distance within each, for its queries, its termination and its
+    result. So they are asked, and waited for, only when the lookup has too few others, and a publisher stores to
+    them only to make up `K` (and each disjoint path's `K`). One that answers ranks in the first tier for the rest of
+    the lookup. A server whose path was unknown when it was ranked is judged again once the query's path request is
+    answered, before its link is opened: found slow, it is ranked again, and asked at once only if it still ranks
+    among the nodes the lookup queries. The routing table, `/find` replies, provider ranking and failure counts are
+    unchanged; being asked last is not a failure. Slow nodes don't do this: to them every server is far.
+  - Abuse: only a transport node on the path can raise a hop count (announce signatures don't cover hops) or delay a
+    link's proof to inflate its round trip, and such a node could already drop the traffic. A hub can make every
+    server behind it look slow, but not hide them: they are still asked when the lookup needs them.
+  - In the topology simulation it cut the airtime internet nodes' lookups cost the islands by 97% (27 s to 0.6 s
+    each), while internet nodes still found island content 98% of the time (with the slow nodes' larger budgets
+    above). Over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands): island `/find` per
+    internet search 0.76 to 0, island stores per internet publish 2.5 to 0.07, island content still found 99% of the
+    time (3,000 servers: 0.93 to 0, 2.5 to 0.01, 100%). The 3-hop threshold assumes internet paths of at most 3
+    hops; deeper backbones need the link signal.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
   answered, or once every known node has been queried without finding new ones. Nodes near a key can keep
@@ -653,7 +694,8 @@ and repeat.
   towards the run's 80; their answers count as progress when they shorten that distance, and never as answers that
   don't (they aren't meant to come nearer), so each run keeps both bounds.
 - **Finding the closest nodes** (for publishing) runs until the lookup is complete. The result is the `K`
-  closest nodes known; the stores sent to them also show which are reachable.
+  closest nodes known, ranked in the tiers above (slow paths, then unreliable nodes, only to make up `K`); the stores
+  sent to them also show which are reachable.
 - **Finding providers.** Downloading starts with the first provider found. The search ends when
   `max_parallel_providers` providers are known and one has delivered the verified root block, when the lookup
   is complete, or at `lookup_timeout`. It does not stop at the first reply that lists providers, so one node
@@ -1431,7 +1473,7 @@ as is cheap. Rules live in the sections referenced.
 | Squatting or flooding provider records | Oldest-plus-random replies; long-known providers tried first; a record budget whose storage tiers, once it is full, keep the places of known nodes and of publishers seen refreshing for days, while strangers share a small, fast-expiring tier; no identity switching on a link (3, 6) |
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
-| Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
+| Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup (a slow node 10 per publishing lookup, 3 per search); lookup time budget (6) |
 | Slow or stalled transfers (both directions) | Rates measured from transfers, never from round-trip time; response deadlines; displacement protection earned by progress (a per-response grace, then a throughput floor), so a response that transfers nothing can't hold a slot; no-progress and stall cancellation with refund; a cooldown on a link whose response made no progress, was rejected or cancelled before a quarter of it was sent, or fell far behind its schedule; many fast-link slots; requester stall detection, and end-game duplication of a response still arriving after `deadline_slack` (2, 3, 7) |
 | Request flooding, link exhaustion | Request size, per-link and global limits; a per-link request rate limit; eviction of idle incoming links; half-open links capped in their own bucket, oldest closed first (3) |
 | Decompression and oversized-response bombs | Compressed Resources refused; response sizes capped; multi-segment Resources refused on `rnfs.dht` links, LXMF delivery links and links to LXMF propagation nodes; `rnfs.dht` responses' msgpack headers checked before RNS decodes them (3, 7, 13) |

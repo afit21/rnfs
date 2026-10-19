@@ -78,6 +78,10 @@ class PeerClient:
         open, its request left to finish. Never cancels a Resource: closing the link stops it (section 3)."""
         return self.links.close_unless_used(node_id, own)
 
+    def await_path(self, node_id: bytes) -> bool:
+        """Wait for a path to node_id, requesting one if RNS has none: True once there is one (LinkPool.await_path)."""
+        return self.links.await_path(node_id)
+
     # /find
 
     def find(self, node_id: bytes, key: bytes) -> tuple[list[bytes], list[bytes]] | None:
@@ -238,6 +242,7 @@ class PeerClient:
 
         if peer.record_rate(exchange, self.config.min_rate_sample):
             log(f"link to {name} measured at {size(peer.rate / 8)}/s", LOG_VERBOSE)
+            self.traffic.rated(node_id, peer.rate)  # the last link's estimate, a slow path's sign (mesh.SlowPaths)
         result = self._check_blocks(name, batch, entries, rest)
         # From when it was sent: not opening the link or waiting for its /blocks slot
         result.elapsed = max(0.0, self.links.clock() - exchange.sent_at)

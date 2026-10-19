@@ -1196,6 +1196,56 @@ class LookupStartTest(NodeTest):
         self.assertFalse(self.b.routing.unreliable(dead))
 
 
+    def test_unknown_id_budgets(self):
+        """A slow node's lookups may try more unknown IDs than alpha: 10 per publish lookup over its 2 paths, 3 per
+        search; a node that isn't slow gives every Lookup alpha (3)."""
+        config = Config(rnfs_dir=os.path.join(self.tmp.name, "slow"), lookup_timeout=5, path_timeout=0.5)
+        slow = RnfsNode.offline(config, bytes(range(16)), self.net, FakeNetwork(), slow=True)
+        self.addCleanup(slow.stop)
+        self.assertEqual([path.unknowns for path in slow.lookups.publish(A_ID).paths], [5, 5])
+        self.assertEqual(slow._lookup(A_ID).first.unknowns, 3)
+        self.assertEqual([path.unknowns for path in self.b.lookups.publish(A_ID).paths], [3, 3, 3])
+        self.assertEqual(self.b._lookup(A_ID).first.unknowns, 3)
+
+    def test_slow_paths_asked_last_on_fast_nodes_only(self):
+        """A node that isn't slow ranks servers behind a slow path (more than 3 hops here) after the rest in its
+        searches and publish lookups; a slow node doesn't (to it every server is far)."""
+        rng = random.Random(9)
+        others = [bytes(rng.getrandbits(8) for _ in range(16)) for _ in range(6)]
+        for node_id in others:
+            self.b.routing.heard(node_id)
+        hops = {node_id: 5 if index % 2 else 2 for index, node_id in enumerate(others)}
+        self.b.slow_paths.hops = hops.get
+        island = [node_id for node_id in others if hops[node_id] > 3]
+        for lookup in (self.b._lookup(A_ID).first, *self.b.lookups.publish(A_ID).paths):
+            self.assertEqual([n for n in others if lookup.slow_path(n)], island)
+        config = Config(rnfs_dir=os.path.join(self.tmp.name, "slow"), lookup_timeout=5, path_timeout=0.5)
+        slow = RnfsNode.offline(config, bytes(range(16)), self.net, FakeNetwork(), slow=True)
+        self.addCleanup(slow.stop)
+        slow.slow_paths.hops = hops.get
+        self.assertFalse(any(slow._lookup(A_ID).first.slow_path(n) for n in others))
+
+    def test_path_check(self):
+        """Lookup.check_path once Reticulum runs: a path unknown when ranked is awaited, then judged."""
+        hops: dict[bytes, int] = {A_ID: 2}
+        self.b.paths = mock.Mock(hops=lambda node_id: hops.get(node_id))
+        self.b.slow_paths.hops = self.b.paths.hops
+        paths = {bytes([1]) * 16: 5, bytes([2]) * 16: 1}
+
+        def await_path(node_id: bytes) -> bool:
+            """The path request's answer: a path for the nodes in paths."""
+            if node_id in paths:
+                hops[node_id] = paths[node_id]
+            return node_id in paths
+
+        with mock.patch.object(self.b.client, "await_path", side_effect=await_path, create=True) as awaited:
+            self.assertIsNone(self.b._path_check(A_ID))  # its path was known when ranked: asked as ranked
+            awaited.assert_not_called()
+            self.assertTrue(self.b._path_check(bytes([1]) * 16))  # 5 hops: ranked again
+            self.assertIsNone(self.b._path_check(bytes([2]) * 16))
+            self.assertIs(self.b._path_check(bytes([3]) * 16), False)  # no path: a failed query
+
+
 class JoinTest(NodeTest):
     """Joining: bootstrap nodes first (the user's, then the defaults), then a lookup; again while too few."""
 

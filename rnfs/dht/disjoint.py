@@ -19,7 +19,7 @@ import threading
 from collections.abc import Callable, Iterable
 
 from rnfs.dht import density
-from rnfs.dht.lookup import Lookup, NodeCallback
+from rnfs.dht.lookup import FIRST, Lookup, NodeCallback
 from rnfs.dht.routing import distance
 
 # make_path(start nodes, seniors, claim, taken) -> the Lookup of one path
@@ -124,13 +124,13 @@ class DisjointLookup:
 
     def find_closest(self) -> list[bytes]:
         """Run every path until complete or out of time; the k closest nodes they know of together, ranked as a
-        Lookup's find_closest ranks them (unreliable nodes that haven't answered last)."""
+        Lookup's find_closest ranks them (by tier: unreliable nodes that haven't answered last)."""
         results: list[list[bytes]] = []
         self._run_all(lambda path: results.append(path.find_closest()))
         status = self.candidates()
         merged = {node_id for result in results for node_id in result}
         self._sample()
-        return sorted(merged, key=lambda n: (status.get(n, False), distance(n, self.key)))[:self.k]
+        return sorted(merged, key=lambda n: (status.get(n, FIRST), distance(n, self.key)))[:self.k]
 
     def find_providers(self, on_provider: NodeCallback, should_stop: Callable[[], bool] = lambda: False
                        ) -> list[bytes]:
@@ -191,16 +191,16 @@ class DisjointLookup:
 
     # What the paths learned
 
-    def candidates(self) -> dict[bytes, bool]:
-        """Every node a path's find_closest chooses from (Lookup.candidates), with whether it ranks last: only if it
-        does on every path that knows it."""
-        merged: dict[bytes, bool] = {}
+    def candidates(self) -> dict[bytes, int]:
+        """Every node a path's find_closest chooses from (Lookup.candidates), with its rank tier: the lowest any path
+        that knows it gives it."""
+        merged: dict[bytes, int] = {}
         for path in self.paths:
-            for node_id, last in path.candidates().items():
-                merged[node_id] = merged.get(node_id, True) and last
+            for node_id, tier in path.candidates().items():
+                merged[node_id] = min(merged.get(node_id, tier), tier)
         return merged
 
-    def path_candidates(self) -> list[dict[bytes, bool]]:
+    def path_candidates(self) -> list[dict[bytes, int]]:
         """Each path's own candidates()."""
         return [path.candidates() for path in self.paths]
 
