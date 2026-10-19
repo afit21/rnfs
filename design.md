@@ -540,7 +540,8 @@ and `gateway_fetches` slot) and calls `serve_target`, the path gateway's own ser
 rebuilt from the decoded names (`quote(name, safe="")`), so it is always a path on the site. Logs name the site
 by its base32 CID or name (`path_for_log`, and `host_for_log` for the debug log's Host). No Origin header is
 checked: a page's `fetch()` of its own site is same-origin and needs no CORS header, and every other origin is
-refused by the browser for want of one, as on the path gateway.
+refused by the browser for want of one, as on the path gateway. `rnfs url` (`cli.site_url`) prints a target's site
+URL without asking the daemon: the gateway port from `daemon.json`, else `rnfs.toml`.
 
 ## Local API for apps (0.2.0)
 

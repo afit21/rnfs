@@ -91,7 +91,8 @@ Added, for apps:
   only by their own origin, and carry `Origin-Agent-Cluster: ?1`; service worker scripts (403) and `?format=`
   (400) are refused there, and paths are DAG paths only. Browsers resolve `*.localhost` themselves; other tools
   should keep using the path gateway, which is unchanged. All `*.rnfs.localhost` sites share cookies (as do all
-  `*.name.localhost` sites): neither the gateway nor the API uses them.
+  `*.name.localhost` sites): neither the gateway nor the API uses them. `rnfs url <cid>|<name>[/path]` prints a
+  target's site URL.
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

@@ -3,8 +3,9 @@
 `daemon` runs a node with its API and gateway, holding a lock on <rnfs dir>/daemon.lock from before it touches
 anything there, so a second daemon on the same rnfs dir stops at once, and describes itself in
 <rnfs dir>/daemon.json (its PID, ports, version, start time and Reticulum config) while it runs, so clients find
-it whatever rnfs.toml holds; every other command is one request to a running daemon's local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths given to them
-are resolved to absolute paths here, since the daemon reads and writes them itself.
+it whatever rnfs.toml holds; every other command but `url` (which only prints a gateway site's URL) is one request
+to a running daemon's local API (see rnfs/api.py). Client commands never import RNS, so they start quickly; paths
+given to them are resolved to absolute paths here, since the daemon reads and writes them itself.
 
 Client commands talk to the daemon through rnfs.apiclient, the library companion apps use too: it reads the token
 the daemon writes to <rnfs dir>/api_token at each start (specification section 11), so only users who can read
@@ -543,6 +544,48 @@ def run_stat(args):
     print_fields(client(args).stat(args.target))
 
 
+def site_url(target: str, port: int) -> str:
+    """The gateway URL of target (<cid>[/path] or <name>[/path], a name as 32 hex characters) on its own site
+    (specification section 11): http://<k-cid>.rnfs.localhost:<port>/<path> or
+    http://<name>.name.localhost:<port>/<path>, each path name percent-encoded. Raises ValueError for anything
+    else, contact nicks included: the gateway never expands them."""
+    from urllib.parse import quote
+
+    from rnfs import ids
+    from rnfs.content.cid import Cid, to_base36
+    root, _, path = target.partition("/")
+    if ids.is_hex16(root):
+        host = f"{ids.parse_hex16(root, 'name').hex()}.name.localhost"
+    else:
+        try:
+            host = f"{to_base36(Cid.parse(root))}.rnfs.localhost"
+        except ValueError:
+            raise ValueError(f"{root!r} is neither a CID nor a name (32 hex characters)") from None
+    names = path.split("/") if path else []
+    if "" in names[:-1]:
+        raise ValueError(f"empty name in path {path!r}")
+    return f"http://{host}:{port}/" + "/".join(quote(name, safe="") for name in names)
+
+
+def run_url(args):
+    """Print a target's URL on its gateway site, for the gateway port of the running daemon or else rnfs.toml's."""
+    running = apiclient.read_daemon_info(args.dir)
+    if running is not None and type(running.get("gateway_port")) is int and running["gateway_port"]:
+        port = running["gateway_port"]
+    else:
+        try:
+            config = apiclient.load_settings(args.dir)
+        except apiclient.ApiError as e:
+            fail(str(e))
+        port = config.gateway_port
+        if not port:
+            fail("gateway_port is 0 (any free port) and no daemon is running to say which it took")
+    try:
+        print(printable(site_url(args.target, port)))
+    except ValueError as e:
+        fail(str(e))
+
+
 def run_dir_set(args):
     """Make a directory with an entry added or replaced; print its CID."""
     print(printable(client(args).post("/api/dir/set", target=args.target, name=args.name, cid=args.cid,
@@ -868,6 +911,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     stat_ = command(commands, "stat", run_stat, "size, block count, and how much is held locally")
     stat_.add_argument("target", metavar="CID[/PATH]")
+    url = command(commands, "url", run_url, "print a target's gateway URL on its own site (<cid>.rnfs.localhost)")
+    url.add_argument("target", metavar="CID|NAME[/PATH]")
 
     dir_ = commands.add_parser("dir", help="edit directories (making new ones)").add_subparsers(
         dest="dir_command", required=True, metavar="command")
