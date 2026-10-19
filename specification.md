@@ -699,19 +699,44 @@ differently. A score can be earned quickly by serving popular blocks, so it neve
   before any raised); a peer without a score scores 0, so forgetting is always safe;
 - saves them, with wall-clock times, a time in the future when loaded counting as now.
 
-**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in
-server mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock
-times; one in the future when loaded counts as now). Identities generated next to a key can't be old ones, so
-among the servers near a key, those first heard at least `provider_seniority` ago were there before any such
-identity was made for it; the log gives the `K` closest of them to a key. It is local state: nothing about it is
-sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting the least
-recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only servers
-silent longer than every one of them; announces are recorded in memory and written together every 30 s.
+**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in server
+mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock times; one
+in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
+near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
+the log gives the `K` closest of them to a key, which publishers also store to (below). It is local state: nothing
+about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting
+the least recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only
+servers silent longer than every one of them; announces are recorded in memory and written together every 30 s.
 
 **Publishing.**
-- For each key, find the `K` closest nodes. Then send each node the keys it should store, in as few `/provide`
-  requests as the batch size allows (section 3), one at a time over a separate identified link closed
-  afterwards.
+- For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node
+  the keys it should store, in as few `/provide` requests as the batch size allows (section 3), one at a time
+  over a separate identified link closed afterwards. A publisher MAY send to several nodes at once, each over its
+  own link and in its own order (rnfs: up to 16 on nodes that aren't slow; a slow node one at a time).
+- **The store set.** A node SHOULD store each key on its `K` closest found as above, and also on the `K` servers
+  closest to the key in its announce first-seen log that it first heard at least `provider_seniority` ago (rnfs:
+  and has heard within 2 × `announce_interval`, as `/find` replies leave out servers silent that long; not banned;
+  in private mode, members only). Without an attack these are mostly the same servers, so it costs little; against
+  identities generated next to a key it keeps the record where they can't take its place. A key's store set is the
+  union, without duplicates; every server stored to is recorded, so withdrawals reach all of them. A key whose
+  lookup found no server isn't stored this round (rnfs: retried 30 s later).
+- **Sweep providing** finds the `K` closest of many keys with one lookup per *region*. It is local behaviour:
+  only which `/find` queries a publisher sends changes, and how it groups its `/provide`s. Take the due keys in
+  turn; for the first not yet covered, x, run the closest-nodes lookup. Let p be the length of the prefix x shares
+  with the farthest of the `K` closest found (of all found with fewer; 0 with none): the region is every due key
+  sharing x's first p bits. Every server closer to x than that one shares those bits, so a region holds at least
+  `K` servers and each of its keys has its `K` closest inside it. The lookup knows the half of the region holding
+  x; if the region holds 2 or more due keys, ask the known server nearest the centre of the other half about that
+  centre (`/find`), and while a reply names `K` servers inside the part asked about, ask about each half of it
+  too. Each key of the region then takes the `K` closest of every server learned, ranked as the lookup ranks them.
+  rnfs sends at most 7 such `/find` a region, and a server outside the part it was asked about hands over to the
+  one it names nearest the centre inside it (its routing table may hold only some of the part). Over a simulated
+  network of 2000 servers (Kademlia routing tables), this placed every record on its true `K` closest, against
+  about 97% for a lookup per key, for about 1.6 extra `/find` a region; a round needs about servers ÷ 12.5 lookups
+  however many keys are due (1M keys on 10,000 servers: about 800 lookups instead of 1M). rnfs takes the due keys
+  never published first, then those unpublished longest, and on nodes that aren't slow runs up to 4 lookups at
+  once, each claiming the keys sharing one bit fewer than the last region's p so that lookups running together
+  seldom find the same region.
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
   refused or failed store isn't retried until the next republish. A responder may have recorded some keys of
@@ -727,8 +752,13 @@ silent longer than every one of them; announces are recorded in memory and writt
   is providing to that node in the same round, and cancels the withdrawals still queued for a key when it
   provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
-  (rnfs: at most 10 per publish round, and after a round of n lookups the next waits 30 × n s; items never
-  published go first, then those unpublished longest). Withdrawals are not delayed by this.
+  (rnfs: at most 10 region lookups per publish round, each publishing every due key of its region, and after a
+  round of n lookups the next waits 30 × n s; items never published go first, then those unpublished longest).
+  It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
+  unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
+  rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server
+  only withdrawals reach as one of the round's 10 lookups (those with the most keys queued first; while any are
+  queued, up to 5 of the 10 are kept for them). Other nodes send withdrawals at once.
 
 **Provider records.**
 - `/provide` records the identified requester's node ID as a provider; a node can only advertise itself.
@@ -774,8 +804,9 @@ silent longer than every one of them; announces are recorded in memory and writt
   record out of its own store.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
-  max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
-  don't come due at once; the jittered interval stays below `PROVIDER_TTL / 2`.
+  max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key's first byte, so
+  many keys don't come due at once (256 slots) while keys sharing their leading bits come due together (the
+  same servers are closest to them); the jittered interval stays below `PROVIDER_TTL / 2`.
 - **Provide strategy** (`provide_strategy`):
   - `roots` (default) provides every complete pin, and every complete fetched target while it is cached
     (so at most `max_storage` of downloads at a time). That is every complete download, whatever the command:
@@ -918,9 +949,9 @@ silent longer than every one of them; announces are recorded in memory and writt
   A pin lasts while any source holds it.
 - `pin rm` removes only its caller's source: `user` for the CLI, and for an app only its own (`app:<app>`, or
   `app:<app>:<key>` with its pin key; section 11). Other sources are released by whatever created them: the folder
-  scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
-  a followed name's newer target once that is complete; removing the LXMF messages that hold it; removing the
-  app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
+  scan; `name publish` (a name's sync too, section 9) or `name rm`; `/pin` with `false` or a remote quota being
+  exceeded; `name unfollow`, or a followed name's newer target once that is complete; removing the LXMF messages
+  that hold it; removing the app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
 - Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
   names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
   `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
@@ -1231,6 +1262,41 @@ followed name is checked when a newer record is heard and every `announce_interv
   the name again. A failed fetch is retried with the record held, without a path request. A name whose owner
   is gone for good therefore costs a flooded path request at most every `announce_interval`.
 
+**Syncing a folder** (rnfs 0.2.0; local behaviour built on Publish: nothing on the wire changes). A node MAY keep
+one of its names pointing at a local folder's current content (rnfs: `name sync <alias> <folder>`).
+- Every `scan_interval` the folder is imported as the shared folder's entries are (section 8), the whole folder
+  as one directory: unchanged content is recognised by its metadata rather than read, links, devices, sockets and
+  files with other hard links are left out, and a folder that resolves, as opened, to the rnfs dir, a directory
+  holding it, or into the folders holding its keys and state is refused. Files are cut with FastCDC (section 5),
+  so an edited file shares most of its blocks with the version before: the root is the CID
+  `add --chunker fastcdc` gives the folder.
+- When the root differs from the one the sync last published and from the name's target, the name is published to
+  it as `name publish` does (Publish, above): pinned with source `name:<alias>`, the previous target's pin
+  released, so only the latest version is kept. The publish waits until:
+  - a scan at least 60 s after the new root was first seen finds the folder unchanged, so a folder still being
+    copied into isn't published half-copied (rnfs scans again then, if `scan_interval` is longer; a folder that
+    changes while it is read counts as changing). A copy that stalls for longer than that can still be published
+    part-way, and is published whole once it ends;
+  - an hour has passed since the sync last published the name (rnfs: the time is saved, so a restart doesn't
+    shorten it). RNS transport nodes count the announces of a destination arriving less than an hour apart
+    (`announce_rate_target`, 3600 s by default on transport instances) and, after more than
+    `announce_rate_grace` (5) of them, stop rebroadcasting it until an hour after the last one they let through
+    (Limits, below): publishing faster would spend airtime on announces that don't get through.
+- A folder that is missing, can't be read, is refused, isn't a folder or is empty (an unmounted drive's mount point
+  looks empty), or whose import fails (the deny list, a full disk), pauses the sync: nothing is published, the
+  name keeps its target, and rnfs logs why once and shows it in the sync's state. The sync resumes by itself once
+  the folder is back.
+- Stopping the sync (rnfs: `name unsync <alias>`) leaves the name where it last pointed, pinned; removing the name
+  (`name rm`) stops it too. A name published by hand while synced keeps that target until the folder next
+  changes. Two names may sync one folder: each imports it and publishes the same root, pinned by both. rnfs saves
+  its syncs (the name, the folder, its last import, and the root last published and when), so they resume after a
+  restart.
+- In private mode each publish's announce reaches outsiders (section 3): starting a sync warns of it as
+  `name publish` does (rnfs: a `warning` in `POST /api/name/sync`'s result, which `rnfs name sync` prints to
+  stderr), and rnfs logs it once per sync rather than at each publish.
+- Any caller of the local API may start or stop a name's sync, an app's token included, as any may publish the
+  name; the name's pin is always the name's own, `name:<alias>`, never the caller's.
+
 **Limits.**
 - A name resolves only while its owner is online, a reachable transport node still holds its announce, or a
   keeper of it is reachable. Paths last 1 week on normal interfaces, less on access-point and roaming ones.
@@ -1426,6 +1492,7 @@ are local conveniences, not part of the protocol.
 | `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
+| `name sync <alias> <folder>`, `name unsync <alias>`, `name syncs [--json]` | Keep a name pointing at a folder's current content, published at most once an hour once it has been unchanged a minute (section 9, Syncing a folder); `syncs` lists each sync's folder, state (`new`, `settling`, `waiting`, `synced`, `paused` and why), the root last imported and the one last published and when (rnfs: `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`, `GET /api/name/syncs`) |
 | `export <cid>[/path] -o file [--background]`, `import file [--background]` | Archives; `import --background` runs as an `import` job |
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
@@ -1900,7 +1967,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `remote_pin_identities` | empty | Identities allowed to send `/pin` |
 | `private` | off | Private mode (section 3) |
 | `members` | empty | Private mode's member identities |
-| `scan_interval` | 60 s | Shared folder |
+| `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9) |
 | `provide_strategy` | `roots` | `roots` (pins and complete cached downloads) or `pinned` (pins only) |
 | `gateway_scripts` | on | |
 | `gateway_fetches` | 2 | Network fetches at a time for requests that aren't the user's own navigation |

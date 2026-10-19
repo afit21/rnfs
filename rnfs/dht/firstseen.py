@@ -4,8 +4,8 @@ bucket keeps its nodes, and the log isn't limited by buckets).
 
 Identities generated next to a key can't be old ones: of the servers near a key, those this node has heard for at
 least provider_seniority were there before any such identity was made for it. closest(key, count, min_age) gives
-the count closest of them, for publishers to store to as well and searchers to ask (both to come; this module is
-only the log and its query). It is local state: nothing about it is sent.
+the count closest of them, for publishers to store to as well (rnfs.node's _senior_servers, a store part of the
+publisher) and searchers to ask (to come). It is local state: nothing about it is sent.
 
 - At most MAX_FIRST_SEEN servers (about 12 MB of memory when full); the least recently heard is forgotten first, so
   a flood of new identities pushes out only servers silent longer than every one of them. A server that announces
@@ -13,9 +13,12 @@ only the log and its query). It is local state: nothing about it is sent.
 - Each announce costs a dictionary update, and a sorted insert (a memory move) for a server not heard before; the
   rows changed are written together with the node's batched saves (every 30 s) and at stop, not durably, so a flood
   of announces costs one transaction per save, not one per announce. A row's last-heard time is the time of the
-  save that writes it (within the save interval of the last announce): it only orders forgetting.
+  save that writes it (within the save interval of the last announce): it orders forgetting, and is the last-heard
+  time after a restart.
 - Times are wall clock (seniority spans restarts); one in the future when loaded (a clock since corrected
   backwards) counts as now.
+- The last time each server was heard is kept in memory too (loaded as the time of the save that wrote its row), so
+  closest() can leave out servers that have gone silent.
 - closest() walks prefix ranges of the IDs kept sorted: the IDs sharing the key's first p bits are a contiguous run,
   all closer to the key than any outside it, so the run is widened one bit at a time until it holds count old
   enough, and only that run is ranked by distance.
@@ -52,6 +55,7 @@ class FirstSeenLog:
         self.max_rows = max_rows
         self._lock = threading.Lock()
         self._first: OrderedDict[bytes, float] = OrderedDict()  # node ID -> first heard; least recently heard first
+        self._last: dict[bytes, float] = {}  # node ID -> last heard (as loaded: the save that wrote it)
         self._sorted: list[bytes] = []  # the same node IDs in ascending order (as 128-bit big-endian integers)
         self._store: statedb.RowStore | None = None
         self._db = statedb.open_store(os.path.expanduser(state_dir), self._load) if state_dir else None
@@ -72,6 +76,7 @@ class FirstSeenLog:
             if first > now or last_heard > now:
                 changed.append(node)
             self._first[bytes(node)] = min(first, now)
+            self._last[bytes(node)] = min(max(first, last_heard), now)
         self._sorted = sorted(self._first)
         with self._lock:
             changed += self._evict()
@@ -110,6 +115,7 @@ class FirstSeenLog:
         gone = []
         while len(self._first) > self.max_rows:
             node_id, _ = self._first.popitem(last=False)
+            self._last.pop(node_id, None)
             self._remove(node_id)
             self._changed(node_id)
             gone.append(node_id)
@@ -123,11 +129,14 @@ class FirstSeenLog:
         if not is_id(node_id):
             return
         with self._lock:
+            now = self.clock()
             if node_id in self._first:
                 self._first.move_to_end(node_id)
             else:
-                self._first[node_id] = self.clock()
+                self._first[node_id] = now
                 bisect.insort(self._sorted, node_id)
+            self._last[node_id] = now
+            if len(self._first) > self.max_rows:
                 self._evict()
             self._changed(node_id)
 
@@ -135,6 +144,7 @@ class FirstSeenLog:
         """node_id announces client mode: it isn't a server any more."""
         with self._lock:
             if self._first.pop(node_id, None) is not None:
+                self._last.pop(node_id, None)
                 self._remove(node_id)
                 self._changed(node_id)
 
@@ -149,17 +159,20 @@ class FirstSeenLog:
             return len(self._first)
 
     def closest(self, key: bytes, count: int = K, min_age: float = 0.0,
-                exclude: Callable[[bytes], bool] = _never) -> list[bytes]:
+                exclude: Callable[[bytes], bool] = _never, heard_within: float | None = None) -> list[bytes]:
         """The count servers closest to key, closest first, among those first heard at least min_age seconds ago
-        (provider_seniority, for publishing and searching) and not excluded (banned, say). exclude is called with
-        the log's lock held, so it must not use the log."""
+        (provider_seniority, for publishing and searching), heard within heard_within seconds if given (a publisher
+        leaves out servers that have gone silent, as /find replies do) and not excluded (banned, say). exclude is
+        called with the log's lock held, so it must not use the log."""
         check_id(key)
         if count <= 0:
             return []
         value = int.from_bytes(key, "big")
         with self._lock:
-            horizon = self.clock() - min_age
-            first = self._first
+            now = self.clock()
+            horizon = now - min_age
+            fresh = float("-inf") if heard_within is None else now - heard_within
+            first, last = self._first, self._last
             # The narrowest run holding count IDs at all (a run only grows as it widens), then widened until it
             # holds count old enough
             low, high = 0, _ID_BITS
@@ -169,7 +182,8 @@ class FirstSeenLog:
                 low, high = (low, middle) if end - start >= count else (middle + 1, high)
             for shift in range(low, _ID_BITS + 1):
                 start, end = self._run(value, shift)
-                old = [n for n in self._sorted[start:end] if first[n] <= horizon and not exclude(n)]
+                old = [n for n in self._sorted[start:end]
+                       if first[n] <= horizon and last[n] >= fresh and not exclude(n)]
                 if len(old) >= count:
                     break
         return sorted(old, key=lambda n: distance(n, key))[:count]

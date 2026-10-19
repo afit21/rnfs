@@ -653,6 +653,36 @@ class BackendTest(NodeTest):
         self.b.publisher.publish_due()
         self.assertEqual(self.a.records.providers(Cid.parse(cid).key), [])
 
+    def test_published_to_senior_servers_of_the_first_seen_log_too(self):
+        """Each key is also stored on the closest servers B's announce first-seen log heard over provider_seniority
+        ago (none in its routing table here, so no lookup finds them), and withdrawn from them when it stops being
+        provided. Servers heard too recently, silent too long, or banned aren't stored to."""
+        senior, young, silent, banned = (bytes([n]) * 16 for n in (0xC, 0xD, 0xE, 0xF))
+        for node_id in (senior, young, silent, banned):
+            self.make_node(node_id.hex()[:2], node_id)
+        log = self.b.first_seen
+        real = log.clock
+        day = 86400.0
+        log.clock = lambda: real() - 3 * day
+        for node_id in (senior, silent, banned):
+            log.heard(node_id)
+        log.clock = real
+        for node_id in (senior, young, banned):
+            log.heard(node_id)  # heard again now: still first heard 3 days ago
+        self.b.routing.ban(banned)
+        cid = self.b.add_stream(io.BytesIO(b"stored on senior servers too"))["cid"]
+        key = Cid.parse(cid).key
+        self.b.publisher.publish_due()
+        self.assertEqual(self.net.nodes[senior].records.providers(key), [B_ID])
+        self.assertEqual(self.a.records.providers(key), [B_ID])  # the lookup's
+        for node_id in (young, silent, banned):
+            self.assertEqual(self.net.nodes[node_id].records.providers(key), [])
+        self.assertEqual(set(self.b.publisher._published[Cid.parse(cid)][1]), {A_ID, senior})
+        self.b.pin_rm(cid)
+        self.b.publisher.publish_due()
+        self.assertEqual(self.net.nodes[senior].records.providers(key), [])
+        self.assertEqual(self.a.records.providers(key), [])
+
     def test_pin_remote_sends_request(self):
         self.assertTrue(self.b.pin_remote(A_ID, str(Cid.for_block(RAW, b"x")), True))
         self.assertEqual(self.net.pins[0][0], A_ID)

@@ -113,7 +113,7 @@ DESCRIPTIONS = {
     "remote_pin_identities": "Identity hashes (hex) allowed to ask this node to pin (/pin)",
     "members": "Private mode's member identity hashes (hex)",
     "private": "Private mode: talk to members only",
-    "scan_interval": "How often the shared folder is scanned",
+    "scan_interval": "How often the shared folder and the folders synced to names are scanned",
     "provide_strategy": "roots (pins and complete cached downloads) or pinned (pins only) are provided",
     "gateway_scripts": "Let gateway pages run scripts",
     "gateway_fetches": "Gateway network fetches at a time for requests that aren't the user's own navigation",

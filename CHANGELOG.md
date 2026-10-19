@@ -10,7 +10,8 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
-  `remote_pins_asked`, `remote_pins_served`); an older rnfs can't open it afterwards. Pins made before the upgrade
+  `remote_pins_asked`, `remote_pins_served`, `name_syncs`, `name_sync_files`); an older rnfs can't open it
+  afterwards. Pins made before the upgrade
   have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
@@ -251,6 +252,21 @@ Added:
   `GET /api/pin/remote/served`; `ApiConnection.pin_remote_ls` / `pin_remote_served`; `Node/Client.remote_pins()`
   and `served_pins()` (`RemotePin`, `ServedPins`, `ServedPin`, `RemotePinUsage`); capability
   `remote_pin_status`.
+- **Publishing a folder to a name** (local behaviour built on `name publish`; nothing on the wire changes):
+  `rnfs name sync <alias> <folder>` keeps a name pointing at a folder's current content. Every `scan_interval` the
+  folder is imported as the shared folder is (unchanged files recognised by their metadata, not read again; links,
+  special files and files with other hard links left out; a folder in the rnfs directory refused), with FastCDC,
+  so an edited file shares most of its blocks with the version before. When its root changes the name is
+  published to it, as `name publish` does (the previous version's `name:` pin released), once the folder has
+  stayed unchanged a minute and at most once an hour per name (RNS's transport nodes stop rebroadcasting a
+  destination announcing faster than that). A folder that is missing, unreadable, empty or whose import fails
+  pauses the sync, logged once, and nothing is published. `rnfs name unsync <alias>` stops it, the name keeping
+  its target; `rnfs name rm` stops it too; `rnfs name syncs [--json]` lists the syncs and how they stand. Syncs
+  are kept in the state database and resume after a restart. In private mode `name sync` warns, as `name publish`
+  does, and the sync logs it once. `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`,
+  `GET /api/name/syncs`; `ApiConnection.name_sync`, `name_unsync`, `name_syncs`; `Node/Client.names.sync`,
+  `unsync` and `syncs()` (`FolderSync`); capability `name_sync`. An app's token may start and stop a sync, as it
+  may publish; the name's pin stays the name's.
 
 Changed:
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
@@ -289,7 +305,28 @@ The DHT (local behaviour: nothing on the wire changes):
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
   servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
-  next to a key can't be. Publishing and searching will use it.
+  next to a key can't be. Publishing uses it (below); searching will.
+- **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
+  due key of its region (the keys sharing as many leading bits as the key looked up shares with its 10th-closest
+  server), with about 1.6 more `/find` a region to fill in its far half; each key still gets its own 10 closest
+  servers (100% of keys on their true 10 closest over a simulated 2000-server network, against about 97% with a
+  lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
+  1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
+  not keys, so a round publishes every due key of up to 10 regions.
+- **Stores to long-known servers too:** each key is also stored on the 10 servers closest to it among those the
+  node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
+  Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
+  next to a key can't push the record off them. Withdrawals reach them too.
+- **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
+  servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
+  at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
+- **Slow nodes pace withdrawals:** unpinning many keys no longer sends every withdrawal at once over radio. A slow
+  node sends withdrawals along with its round's stores to the same servers, and each server only withdrawals
+  reach counts as one of the round's 10 lookups (up to 5 kept for them while any are queued), so the round waits
+  30 s for it before the next. Other nodes still send withdrawals at once.
+- Kept names' keys take their fixed ±10% republish jitter from the key's first byte rather than the whole key: 256
+  slots still spread them out, and keys sharing their leading bits (the same servers are closest to them) come due
+  together. A key's interval may change once, by at most a fifth, at the upgrade; it stays below 3.5 days.
 
 Faster:
 - A start no longer lists every stored block before the API answers: their sizes are kept in the state database

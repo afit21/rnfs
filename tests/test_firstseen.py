@@ -63,6 +63,21 @@ class LogTest(unittest.TestCase):
         self.assertEqual(self.log.closest(key, count=2, min_age=DAY, exclude=lambda n: n == old[0]), old[1:])
         self.assertEqual(self.log.closest(key, count=0), [])
 
+    def test_closest_leaves_out_servers_gone_silent(self):
+        """heard_within leaves out servers not heard for that long; hearing one again brings it back."""
+        key = node_id(0)
+        silent, live = [node_id(n) for n in (1, 2)], [node_id(n) for n in (5, 9, 1000)]
+        for n in silent + live:
+            self.log.heard(n)
+        self.clock.now += 2 * DAY
+        for n in live:
+            self.log.heard(n)
+        self.clock.now += DAY
+        self.assertEqual(self.log.closest(key, count=3, min_age=DAY), silent + live[:1])
+        self.assertEqual(self.log.closest(key, count=3, min_age=DAY, heard_within=2 * DAY), live)
+        self.log.heard(silent[1])
+        self.assertEqual(self.log.closest(key, count=3, min_age=DAY, heard_within=2 * DAY), [silent[1]] + live[:2])
+
     def test_closest_matches_ranking_every_server(self):
         rng = random.Random(4)
         for size in (0, 1, 5, 40, 3000):
@@ -153,6 +168,8 @@ class SavedTest(unittest.TestCase):
         log = self.open(max_rows=2)
         self.assertEqual(log.first_heard(a), WALL)
         self.assertEqual(log.closest(node_id(0), count=5, min_age=5 * DAY), [a, b])
+        # Last heard as of the save that wrote each row: b's, 60 s after a's
+        self.assertEqual(log.closest(node_id(0), count=5, heard_within=5 * DAY), [b])
         log.heard(c)  # a was heard least recently before the restart
         self.assertIsNone(log.first_heard(a))
         log.save()

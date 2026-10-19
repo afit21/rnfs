@@ -531,6 +531,117 @@ class TimeoutTest(LookupTestCase):
         self.assertEqual(lookup.remaining(), 0)
 
 
+class CandidatesTest(LookupTestCase):
+    """candidates() and ask(): what sweep providing reads off a finished lookup, and its extra /find."""
+
+    def test_candidates_are_what_find_closest_chooses_from(self):
+        net = self.network(200, seed=31)
+        rng = random.Random(32)
+        ids = list(net.nodes)
+        for _ in range(10):
+            key = rng.randbytes(ID_LENGTH)
+            lookup = self.lookup(net, key, rng.sample(ids, 3))
+            result = lookup.find_closest()
+            candidates = lookup.candidates()
+            self.assertGreater(len(candidates), K)
+            self.assertLessEqual(set(result), set(candidates))
+            # The K closest of the candidates are at least as close as find_closest's (answers that came after the
+            # run ended can only add nodes)
+            ranked = sorted(candidates, key=lambda n: distance(n, key))[:K]
+            self.assertLessEqual([distance(n, key) for n in ranked], [distance(n, key) for n in result])
+            self.assertFalse(any(candidates.values()))  # none unreliable
+
+    def test_answers_after_the_run_ended_are_candidates(self):
+        """A run completes with a query still out: find_closest leaves that node out, but once its answer comes,
+        candidates() has it and the nodes it named."""
+        key = ident(0x1000)
+        fast = [ident(0x1001), ident(0x1002), ident(0x1003)]
+        slow, named = ident(0x1100), ident(0x1004)
+        answer = threading.Event()
+
+        def query(node_id, about):
+            """The fast nodes name nothing new; the slow one answers once told to, naming another."""
+            if node_id == slow:
+                answer.wait(5)
+                return [], [named]
+            return [], fast
+
+        lookup = Lookup(key, fast + [slow], query, ident(0), alpha=4, timeout=5, poll_interval=0.05)
+        self.assertEqual(lookup.find_closest(), fast)
+        self.assertEqual(set(lookup.candidates()), set(fast))
+        answer.set()
+        wait_for(lambda: slow in lookup.candidates(), what="the late answer")
+        self.assertEqual(lookup.candidates(), {n: False for n in fast + [slow, named]})
+
+    def test_candidates_leave_out_failed_and_unanswered_nodes(self):
+        """Hung or failed queries aren't candidates; unreliable nodes not asked are, ranked last."""
+        net = self.network()
+        key = ident(0x1000)
+        dead, hung = ident(0x1001), ident(0x1002)  # unreachable; hangs
+        near = [ident(0x1010), ident(0x1020), ident(0x1030)]
+        for n in [hung] + near:
+            net.add(n)
+        net.hang.add(hung)
+        far = ident(0x8000)  # unreliable and never asked: there are enough others
+        lookup = self.lookup(net, key, [dead, hung, far] + near, timeout=0.3, unreliable={far}.__contains__)
+        lookup.find_closest()
+        self.assertEqual(lookup.candidates(), {**{n: False for n in near}, far: True})
+
+    def test_ask_merges_the_named_nodes(self):
+        """ask() sends one /find about another key: its answer is counted and the nodes it names become candidates,
+        returned as named (at most K)."""
+        net = self.network(300, seed=33)
+        rng = random.Random(34)
+        ids = list(net.nodes)
+        key = rng.randbytes(ID_LENGTH)
+        answered, failed = [], []
+        lookup = self.lookup(net, key, rng.sample(ids, 3), on_answer=answered.append, on_failure=failed.append)
+        lookup.find_closest()
+        before = set(lookup.candidates())
+        other = bytes(b ^ 0xFF for b in key)  # the far side of the key space
+        asked = min(before, key=lambda n: distance(n, other))
+        named = lookup.ask(asked, other)
+        self.assertEqual(named, net.nodes[asked].find(other)[1])
+        self.assertLessEqual(len(named), K)
+        self.assertEqual(net.queried[-1], asked)
+        self.assertEqual(answered[-1], asked)
+        self.assertLessEqual(set(named) | before, set(lookup.candidates()))
+        self.assertEqual(failed, [])
+
+    def test_ask_of_a_node_that_fails(self):
+        """A node that doesn't answer gives None, is counted as failed and is no longer a candidate."""
+        net = self.network()
+        key = ident(0x1000)
+        near = [ident(0x1010), ident(0x1020)]
+        for n in near:
+            net.add(n)
+        failed = []
+        lookup = self.lookup(net, key, near, on_failure=failed.append)
+        lookup.find_closest()
+        del net.nodes[near[0]]  # gone since
+        self.assertIsNone(lookup.ask(near[0], ident(0x2000)))
+        self.assertEqual(failed, [near[0]])
+        self.assertEqual(lookup.candidates(), {near[1]: False})
+        self.assertIsNone(lookup.ask(near[0], ident(0x2000)))  # failed: not asked again
+        self.assertEqual(net.queried.count(near[0]), 2)
+
+    def test_ask_within_the_deadline(self):
+        """A hung node gives None once the lookup's time budget is spent."""
+        net = self.network()
+        answering, hung = ident(1), ident(2)
+        net.add(answering)
+        net.add(hung)
+        lookup = self.lookup(net, ident(3), [answering, hung], timeout=0.3)
+        lookup.find_closest()
+        net.hang.add(hung)
+        started = time.monotonic()
+        self.assertIsNone(lookup.ask(hung, ident(4)))
+        self.assertLess(time.monotonic() - started, 1)
+        asked = len(net.queried)
+        self.assertIsNone(lookup.ask(answering, ident(4)))  # the budget is spent: nothing is sent
+        self.assertEqual(len(net.queried), asked)
+
+
 class FindProvidersTest(LookupTestCase):
     """Provider search: reports as found, doesn't stop early, resists hiding, stops when told."""
 
