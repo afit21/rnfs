@@ -421,34 +421,41 @@ after every test.
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
-unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns)` with
-`find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run
-(`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"),
-or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit length of the beta-th closest known
-distance (`_reach`) unchanged ("no progress"). A run ranks the nodes `unreliable` named when it learnt of them
-(`doubtful`) after every other, for its queries, its termination and `find_closest`'s result; one that distance
-alone would rank within the query window is asked again when `may_retry` says so, as a query beyond `alpha`
-(`retrying`) that the run waits for only if the node comes to rank within the window by `rank` (it is then counted
-in flight). `is_known(id)` says whether RNS knows its identity; at most `unknowns` unknown IDs are tried per lookup
-(`allow_unknown(id)`, also used by the fetcher for provider IDs; `alpha` if not given, never fewer).
-`listing_nodes()` is the nodes that have answered with at least one provider, and `listers(provider)` those that listed a given provider, so the keeper search can
-tell who vouches for its candidates (and the fetcher whose answers led to a provider that served). `on_useful(id)`
-(local scores): a run notes which node's answer first named each node (`introduced`); when a node answers that is
-closer to the key than the node that named it, that node is passed to `on_useful`, once per lookup (`_useful`,
-`_credit`). For sweep providing, `candidates()` gives every node `find_closest` chooses from (`_choices`), with
-whether it ranks last, plus the answers that came after the run ended (a run that completes leaves queries out;
-the workers keep every answer about the key in `_replies`), and `ask(node, key)` sends one more `/find` about a
-nearby key within the deadline, counted through `on_answer`/`on_failure` (a node still out at the deadline stays
-out of the candidates, `_out`) and merging the nodes it names.
-The checks against identities placed next to a key (section 6) live in the run too: `seniors` (the announce
-first-seen log's senior servers, added to the known nodes) and `size` (the size estimate, which turns the density
-check on) make `required()` name the nodes that must answer besides the `beta` closest: the `beta` closest seniors
-known, and `RING_ANSWERS` of each ring beyond a dense core (`density.rings` over the known nodes by distance,
-unreliable ones last; `dense` notes that it fired). They are queried among the window's nodes in rank order; those
-sent outside the window (`extras`) count towards `max_queries` but never against the stall rule. `claim`/`taken`
+unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns, slow_path,
+check_path)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
+completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and
+their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit
+length of the beta-th closest known distance (`_reach`) unchanged ("no progress"). A run ranks its nodes by `tier()`,
+then distance (`rank`), for its queries, its termination, the checks' nodes and `find_closest`'s result: `FIRST`
+(answered, or nothing against it), `SLOW_PATH` (`slow_path` said so and it hasn't answered in the lookup: `slow`, kept
+as `_last_slow`), `UNRELIABLE` (`unreliable` named it when the run learnt of it: `doubtful`). `slow_path` (the node's
+`mesh.SlowPaths`, given only on nodes that aren't slow) is asked once per node per lookup (`_is_slow`, cached in
+`_slow`). `check_path` (the node's `_path_check`) is asked on the query's worker thread (`_send(check=True)`) before a
+first-tier node that hasn't answered is queried, once per node (`_checked`): True puts `_SLOWER` on the run's queue
+instead of an answer, and the run gives the query back (`queried`, `sent`, `in_flight`), adds the node to `slow` and
+ranks again, so it is asked at once (unchecked) only if it still ranks among the nodes to query; False counts as a
+failed query, not sent. An unreliable node that distance alone would rank within the query window is asked again when
+`may_retry` says so, as a query beyond `alpha` (`retrying`) that the run waits for only if the node comes to rank within
+the window by `rank` (it is then counted in flight). `is_known(id)` says whether RNS knows its identity; at most
+`unknowns` unknown IDs are tried per lookup (`allow_unknown(id)`, also used by the fetcher for provider IDs; `alpha` if
+not given, never fewer). `listing_nodes()` is the nodes that have answered with at least one provider, and
+`listers(provider)` those that listed a given provider, so the keeper search can tell who vouches for its candidates
+(and the fetcher whose answers led to a provider that served). `on_useful(id)` (local scores): a run notes which node's
+answer first named each node (`introduced`); when a node answers that is closer to the key than the node that named it,
+that node is passed to `on_useful`, once per lookup (`_useful`, `_credit`). For sweep providing, `candidates()` gives
+every node `find_closest` chooses from (`_choices`), with its tier (nodes named only by late answers judged by
+`_is_slow`), plus the answers that came after the run ended (a run that completes leaves queries out; the workers keep
+every answer about the key in `_replies`), and `ask(node, key)` sends one more `/find` about a nearby key within the
+deadline, counted through `on_answer`/`on_failure` (a node still out at the deadline stays out of the candidates,
+`_out`) and merging the nodes it names. The checks against identities placed next to a key (section 6) live in the run
+too: `seniors` (the announce first-seen log's senior servers, added to the known nodes) and `size` (the size estimate,
+which turns the density check on) make `required()` name the nodes that must answer besides the `beta` closest: the
+`beta` closest seniors known, and `RING_ANSWERS` of each ring beyond a dense core (`density.rings` over the known nodes
+by distance, ordered by tier; `dense` notes that it fired). They are queried among the window's nodes in rank order;
+those sent outside the window (`extras`) count towards `max_queries` but never against the stall rule. `claim`/`taken`
 (a disjoint lookup's) drop a node another path owns before querying it and leave such nodes out of replies.
-`on_complete(key, kth)` is told the K-th closest known distance after each run that ended "complete" (`ended`
-holds how the last run ended); the size estimate samples it.
+`on_complete(key, kth)` is told the K-th closest known distance after each run that ended "complete" (`ended` holds how
+the last run ended); the size estimate samples it.
 
 `density.py` — `SizeEstimate(state_dir=None, samples=16, minimum=8)`, a `node.Store`: `note(key, kth)` keeps the
 latest sample per key, at most `samples` (an `OrderedDict`, least recent first); `estimate(key=None)` is (K − 1/3)
@@ -457,18 +464,18 @@ a sample) in the `meta` table (`size_estimate`, `samples`) with the batched save
 blob is ignored. It imports the state database only when given a state directory, since lookups import this module
 and `rnfs.statedb` loads RNS. `dense_core(distances, size)` (last rank j >= K closer than j × 2^128 / (T × size),
 stopping past 2K once a rank lies 4 times further out), `radius(size)` and `rings(nodes, distances, size, count,
-later)`: `count` from the rank after the core and from the first node beyond the radius, each ring reordered so
-`later` nodes come last, without duplicates. `DENSITY_THRESHOLD` (2), `RING_ANSWERS` (5).
+later)`: `count` from the rank after the core and from the first node beyond the radius, each ring ordered by
+`later` (a lookup's tier), stably, without duplicates. `DENSITY_THRESHOLD` (2), `RING_ANSWERS` (5).
 
 `disjoint.py` — `DisjointLookup(key, start_nodes, make_path, paths, seniors=(), on_complete)`: `make_path(start,
 seniors, claim, taken)` builds each path's `Lookup` (the node's `_new_lookup`, so answers and failures still reach
 the routing table and scores), dealt every paths-th start node and senior; `Claims` maps each claimed node to its
 path under a lock. `find_closest` runs the paths at once (the first in the caller's thread, the others on
-`rnfs-lookup-path` threads) and merges their results (the K best of their union by (unreliable, distance): each
+`rnfs-lookup-path` threads) and merges their results (the K best of their union by (tier, distance): each
 path's own K best holds every node of the merged K best). `find_providers` runs every path on a thread, each
 reporting into one queue; the caller's thread passes providers on (once each, `_reported`) and evaluates
-`should_stop`, setting the paths' stop flag and waking them. `candidates()` merges the paths' (a node ranks last
-only if it does on every path knowing it); `path_candidates()` each path's own; `ask` goes through the path knowing
+`should_stop`, setting the paths' stop flag and waking them. `candidates()` merges the paths' (a node takes the
+lowest tier a path knowing it gives it); `path_candidates()` each path's own; `ask` goes through the path knowing
 the node; `remaining`, `allow_unknown` (the first path's budget), `listing_nodes`, `listers`, `closest_answered`,
 `dense`, `ended`. It samples the size estimate once per call, from the merged candidates, if every path completed.
 
@@ -494,12 +501,12 @@ iterator. `None` passes no `unknowns` (alpha per Lookup). The node passes `SLOW_
 `sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
 the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when
 `members(p)` (due keys sharing it) is 2 or more, calls `explore`: breadth first over parts of the region, starting
-with the far half, it asks the candidate nearest each part's centre (`ask`, unreliable ones last) about that
+with the far half, it asks the candidate nearest each part's centre (`ask`, by tier first) about that
 centre; a reply naming `K` servers inside the part queues its two halves; a server outside the part hands over to
 the one it named inside it (its bucket holding the part may have been full); a part gives up after
 `REGION_FIND_TRIES` (3) unanswered; at most `MAX_REGION_FINDS` (7) in all. `Region` holds the key, p, the
 lookup's result, every candidate learned and the finds; `closest_to(key)` ranks the candidates for any key in it
-(`heapq.nsmallest` by (unreliable, distance); never fewer than the lookup found for its own key). `Sweep(keys,
+(`heapq.nsmallest` by (tier, distance); never fewer than the lookup found for its own key). `Sweep(keys,
 estimate)` is one round's bookkeeping, under a condition: `take()` gives the next key in the given order that is
 neither covered nor inside a claim and claims the keys sharing `estimate − 1` of its bits (everything before any
 region is known, so the first lookup runs alone), waiting while every key left is claimed; `cover(region)` covers
@@ -1382,6 +1389,13 @@ the names of many nodes from one `get_path_table` RPC, for `rnfs peers`);
 the airtime policy (`TokenBucket`, `AirtimePolicy`, interface matching, quiet-hours parsing, all with
 injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 1000), per interface (at most 64)
 and in total, never persisted.
+- `SlowPaths(traffic, slow_bitrate, hops)` is the slow-path predicate lookups rank by (spec section 6): `hops(id)`
+  (`RnsPaths.hops`: `has_path` and `hops_to` only, no RPC even through a shared instance) above `SLOW_PATH_HOPS` (3),
+  or `Traffic.slow_link(id, slow_bitrate)`: the last link to the peer, established within `SLOW_LINK_MEMORY` (24 h,
+  `link_at` on the monotonic clock), had `rtt` above `SLOW_PATH_RTT` (1 s) and a rate estimate (`link_rate`,
+  `rated`: `PeerClient._blocks` reports each one it records; `measured` clears it, as a new link has none yet)
+  below `slow_bitrate`. `slow_link` doesn't make the peer more recent. `LinkPool.await_path` waits for a path as
+  `_open` would (requesting one if RNS has none), so a lookup can read its hops before a link is opened.
 - Per peer, `Traffic` also keeps `first_heard` (wall time, when first counted), `rtt` and `rtt_at` (`measured`:
   `LinkPool` calls its `on_rtt`, which `PeerClient` sets to `traffic.measured`, with `Link.rtt` for every link
   `_open` establishes, shared, one-shot (`ping`) or identified, only a finite non-negative number) and, on
@@ -1861,8 +1875,13 @@ Everything in the specification is implemented, with these simplifications and a
   queries, `providers`, remote pin checks) are `Search`es with the density check and the senior rule
   (`_senior_servers`), falling back to disjoint paths when they find no provider (on slow nodes paced by
   `_pace_fallback`, `Publisher.pace_lookups`); publishing's region lookups are `Lookups.publish`, and
-  `Lookups.flags`/`widen` its widening. `RnfsNode.sizes` is the size estimate (`SizeEstimate`, a batched store);
-  every complete lookup's run feeds it.
+  `Lookups.flags`/`widen` its widening. On a node that isn't slow, `_wired_lookup` (all of `Lookups`'
+  lookups, not the join's) also passes `slow_path=self.slow_paths` (`mesh.SlowPaths` over the client's `Traffic`,
+  whose `hops` `_start_network` sets to `RnsPaths.hops`) and `check_path=self._check_path` (`_path_check` once
+  Reticulum runs, None before: a node RNS had no path to when the lookup ranked it gets its path awaited,
+  `PeerClient.await_path`, and is judged again). Slow nodes' `Lookups` get `SLOW_PUBLISH_UNKNOWNS` and
+  `SLOW_SEARCH_UNKNOWNS`. `RnfsNode.sizes` is the size estimate (`SizeEstimate`, a batched store); every complete
+  lookup's run feeds it.
 - Joining (`RnfsNode._join`, `join`): the join's candidates (`join_candidates`: up to `SAVED_JOIN_TRIES` (6)
   servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
   first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with

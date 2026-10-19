@@ -9,7 +9,7 @@ import unittest
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
 from rnfs.content.storage import Storage
-from rnfs.dht.lookup import Lookup
+from rnfs.dht.lookup import FIRST, SLOW_PATH, UNRELIABLE, Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable, distance
 from rnfs.dht.sweep import (ID_BITS, MAX_REGION_FINDS, REGION_FIND_TRIES, Region, Sweep, explore, find_region,
@@ -59,6 +59,13 @@ class PrefixTest(unittest.TestCase):
         # The key looked up keeps at least what its lookup found
         region = Region(top("0"), 0, [a, b, c], {a: False, b: False, c: False})
         self.assertEqual(len(region.closest_to(top("0"), 2)), 3)
+
+    def test_closest_to_ranks_by_tier(self):
+        """Servers behind a slow path (on a node that isn't slow) after the rest, before unreliable ones."""
+        a, b, c, d = top("1000"), top("1001"), top("1010"), top("1100")
+        region = Region(top("0"), 0, [], {a: UNRELIABLE, b: SLOW_PATH, c: FIRST, d: FIRST})
+        self.assertEqual(region.closest_to(top("10"), 2), [c, d])
+        self.assertEqual(region.closest_to(top("10"), 4), [c, d, b, a])
 
 
 class SweepOrderTest(unittest.TestCase):

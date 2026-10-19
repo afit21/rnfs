@@ -7,7 +7,7 @@ from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
-from rnfs.dht.lookup import FIRST, MAX_QUERIES, STALL_WINDOWS, UNRELIABLE, Lookup
+from rnfs.dht.lookup import FIRST, MAX_QUERIES, SLOW_PATH, STALL_WINDOWS, UNRELIABLE, Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import AVOID_AFTER, RoutingTable, distance
 from tests.support import FakeClock, wait_for
@@ -458,6 +458,122 @@ class UnreliableNodeTest(LookupTestCase):
                              unreliable=self.dead.__contains__).find_closest()
         self.assertEqual(result, sorted(self.dead + self.near[:1], key=lambda n: distance(n, self.key)))
         self.assertEqual(set(self.net.queried), set(self.dead + self.near[:1]))
+
+
+class SlowPathTest(LookupTestCase):
+    """Servers behind a slow path (on a node that isn't slow: LoRa islands) are asked after every other but unreliable
+    ones, and only when the lookup has too few others; ordering only."""
+
+    def setUp(self):
+        """A key with two slow-path servers closest to it, three servers on fast paths beyond them, and an unreliable
+        one beyond those; every server knows all of them."""
+        super().setUp()
+        self.net = self.network()
+        self.key = ident(0x1000)
+        self.island = [ident(0x1001), ident(0x1002)]
+        self.near = [ident(0x1010), ident(0x1020), ident(0x1030)]
+        self.dead = ident(0x1040)
+        everyone = self.island + self.near + [self.dead]
+        for n in everyone:
+            self.net.add(n, knows=[m for m in everyone if m != n])
+        self.asked: list[bytes] = []
+
+    def slow_path(self, node_id: bytes) -> bool:
+        """The island's servers are behind a slow path; counts each question."""
+        self.asked.append(node_id)
+        return node_id in self.island
+
+    def test_not_asked_while_enough_others_answer(self):
+        lookup = self.lookup(self.net, self.key, self.near[:1], slow_path=self.slow_path,
+                             unreliable={self.dead}.__contains__)
+        result = lookup.find_closest()
+        self.assertFalse(set(self.net.queried) & set(self.island))
+        # After the others, before the unreliable one: stores reach them only to make up k
+        self.assertEqual(result, self.near + self.island + [self.dead])
+        self.assertEqual(lookup.candidates(), {**dict.fromkeys(self.near, FIRST), **dict.fromkeys(self.island, SLOW_PATH),
+                                               self.dead: UNRELIABLE})
+        # Asked once per node, however often replies name it
+        self.assertEqual(sorted(self.asked), sorted(self.island + self.near + [self.dead]))
+
+    def test_asked_when_too_few_others_and_first_once_answered(self):
+        """With too few others they are asked and waited for like any node; once they answer they rank by distance
+        with the rest."""
+        net = self.network()
+        nodes = self.island + self.near[:1]
+        for n in nodes:
+            net.add(n, knows=[m for m in nodes if m != n])
+        lookup = self.lookup(net, self.key, self.near[:1], slow_path=self.slow_path)
+        result = lookup.find_closest()
+        self.assertEqual(set(net.queried), set(nodes))
+        self.assertEqual(result, nodes)
+        self.assertEqual(lookup.candidates()[self.island[0]], FIRST)
+        self.assertEqual(lookup.ended, "complete")
+
+    def test_providers_found_on_fast_paths_first(self):
+        for n in self.near + self.island:
+            self.net.nodes[n].store.store(self.key, ident(0x7777))
+        lookup = self.lookup(self.net, self.key, self.island + self.near, slow_path=self.slow_path)
+        self.assertEqual(lookup.find_providers(lambda p: None), [ident(0x7777)])
+        self.assertFalse(set(self.net.queried) & set(self.island))
+        asked = len(self.asked)
+        lookup.find_providers(lambda p: None)  # a second run: slow_path isn't asked again
+        self.assertEqual(len(self.asked), asked)
+
+    def test_found_slow_once_its_path_is_known(self):
+        """A server whose path was unknown when it was ranked is checked before it is asked: found slow, it is ranked
+        again and not asked while others remain. Nothing is sent to it, and nothing counts against it."""
+        late = ident(0x1003)  # ranked first: its path, and so its hops, are unknown until the query requests one
+        self.net.add(late, knows=self.near)
+        checked, failed = [], []
+
+        def check_path(node_id: bytes) -> bool | None:
+            """late's path request finds a slow path; the others are fine."""
+            checked.append(node_id)
+            return True if node_id == late else None
+
+        lookup = self.lookup(self.net, self.key, [late] + self.near, slow_path=self.slow_path, check_path=check_path,
+                             on_failure=failed.append)
+        result = lookup.find_closest()
+        self.assertNotIn(late, self.net.queried)
+        self.assertEqual(sorted(checked), sorted([late] + self.near))  # each first-tier node asked, once
+        self.assertEqual(result, self.near + [self.dead] + self.island + [late])
+        self.assertEqual(lookup.candidates()[late], SLOW_PATH)
+        self.assertEqual(failed, [])
+        self.assertEqual(lookup.sent, len(self.net.queried))
+
+    def test_asked_at_once_when_it_still_ranks_among_the_nodes_to_query(self):
+        net = self.network()
+        late = ident(0x1003)
+        for n in (late, self.near[0]):
+            net.add(n)
+        checked = []
+
+        def check_path(node_id: bytes) -> bool | None:
+            """late's path turns out slow."""
+            checked.append(node_id)
+            return node_id == late or None
+
+        lookup = self.lookup(net, self.key, [late, self.near[0]], check_path=check_path, alpha=1)
+        result = lookup.find_closest()
+        self.assertEqual(net.queried.count(late), 1)  # too few others: asked, without checking it again
+        self.assertEqual(checked, [late, self.near[0]])
+        self.assertEqual(result, [late, self.near[0]])  # it answered: first tier
+        self.assertEqual(lookup.sent, 2)
+
+    def test_no_path_is_a_failed_query(self):
+        failed = []
+        lookup = self.lookup(self.net, self.key, self.near, check_path=lambda n: False if n == self.near[0] else None,
+                             on_failure=failed.append)
+        lookup.find_closest()
+        self.assertEqual(failed, [self.near[0]])
+        self.assertNotIn(self.near[0], self.net.queried)
+
+    def test_checked_only_in_the_first_tier(self):
+        checked = []
+        self.lookup(self.net, self.key, self.island + self.near[:1], slow_path=self.slow_path,
+                    unreliable={self.near[0]}.__contains__, check_path=lambda n: checked.append(n)).find_closest()
+        self.assertTrue(set(self.net.queried) & set(self.island))  # asked: too few others
+        self.assertFalse(set(checked) & set(self.island + self.near[:1]))
 
 
 class UnreliableRoutingTest(LookupTestCase):

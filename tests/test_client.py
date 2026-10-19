@@ -188,6 +188,7 @@ class PeerClientTest(unittest.TestCase):
         peer.link.expected_rate = 80_000
         self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertEqual(self.client.rate_estimate(NODE), 80_000)
+        self.assertEqual(self.client.traffic.peer(NODE)["link_rate"], 80_000)  # the last link's, for slow paths
         self.call(lambda: self.client.blocks(NODE, [cid]))
         # response_target (60 s) at 80 kbit/s
         self.assertEqual(peer.link.requests[1][1][0], 600_000)
@@ -199,6 +200,7 @@ class PeerClientTest(unittest.TestCase):
         peer.link.expected_rate = 80_000
         self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertIsNone(self.client.rate_estimate(NODE))
+        self.assertIsNone(self.client.traffic.peer(NODE)["link_rate"])
 
     def test_blocks_elapsed_counts_from_sending(self):
         """A /blocks result's elapsed time runs from sending the request, not from opening the link."""

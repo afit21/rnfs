@@ -68,6 +68,9 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   interfaces reporting no bitrate (or 0) are ignored; if none remain, the node is not slow. Node-wide settings
   (`alpha`, `republish_interval`, `max_parallel_providers`) depend on the node; per-link values (budgets,
   deadlines, `max_upload_rate`) on the link.
+- **Slow path** to a server: an RNS path of more than 3 hops, or a last link from this node within 24 hours with a
+  round trip above 1 s and a rate estimate below `slow_bitrate` (section 6, "Slow paths": nodes that aren't slow ask
+  such servers last in their lookups).
 
 ## 3. Use of Reticulum
 
@@ -646,6 +649,29 @@ and repeat.
   Its queries aren't shortened: on a long radio path a link may take the whole timeout to establish, and
   only an answer shows the node is back. Its routing-table entry, `/find` replies and the join's count of
   live servers are unchanged.
+- **Slow paths.** Servers on a LoRa island behind an internet gateway are ordinary servers to the rest of the network,
+  so they answer a share of every lookup and hold records near their IDs, over radio: in the topology simulation
+  (docs/simulations/topology) light use by internet nodes alone (10 lookups and 10 CIDs a day each) needed 135–141%
+  of a 30-server island's channel. A node that isn't slow SHOULD ask servers behind a slow path last. In rnfs a server
+  is behind a *slow path* when RNS has a path to it of more than 3 hops (`RNS.Transport.hops_to`, local even through
+  a shared instance), or when this node's own last link to it, established within the last 24 hours, had a round
+  trip above 1 s **and** a rate estimate below `slow_bitrate` (section 2). A long round trip alone doesn't count: I2P
+  links have one, and cost no radio airtime. A server with neither known (no path, no link) is not behind one.
+  - It changes only the order of a lookup's queries (searches and their fallback, publishing's region and widened
+    lookups; not the join's): a lookup ranks its nodes in tiers, those that answered and the rest first, then those
+    behind a slow path, then unreliable ones, by distance within each, for its queries, its termination and its
+    result. So they are asked, and waited for, only when the lookup has too few others, and a publisher stores to
+    them only to make up `K` (and each disjoint path's `K`). One that answers ranks in the first tier for the rest of
+    the lookup. A server whose path was unknown when it was ranked is judged again once the query's path request is
+    answered, before its link is opened: found slow, it is ranked again, and asked at once only if it still ranks
+    among the nodes the lookup queries. The routing table, `/find` replies, provider ranking and failure counts are
+    unchanged; being asked last is not a failure. Slow nodes don't do this: to them every server is far.
+  - Abuse: only a transport node on the path can raise a hop count (announce signatures don't cover hops) or delay a
+    link's proof to inflate its round trip, and such a node could already drop the traffic. A hub can make every
+    server behind it look slow, but not hide them: they are still asked when the lookup needs them.
+  - In the topology simulation it cut the airtime internet nodes' lookups cost the islands by 97% (27 s to 0.6 s
+    each), while internet nodes still found island content 98% of the time (with the slow nodes' larger budgets
+    above). The 3-hop threshold assumes internet paths of at most 3 hops; deeper backbones need the link signal.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
   answered, or once every known node has been queried without finding new ones. Nodes near a key can keep
@@ -663,7 +689,8 @@ and repeat.
   towards the run's 80; their answers count as progress when they shorten that distance, and never as answers that
   don't (they aren't meant to come nearer), so each run keeps both bounds.
 - **Finding the closest nodes** (for publishing) runs until the lookup is complete. The result is the `K`
-  closest nodes known; the stores sent to them also show which are reachable.
+  closest nodes known, ranked in the tiers above (slow paths, then unreliable nodes, only to make up `K`); the stores
+  sent to them also show which are reachable.
 - **Finding providers.** Downloading starts with the first provider found. The search ends when
   `max_parallel_providers` providers are known and one has delivered the verified root block, when the lookup
   is complete, or at `lookup_timeout`. It does not stop at the first reply that lists providers, so one node

@@ -8,8 +8,12 @@ interface rules and quiet hours; design.md, "Mesh").
 - Airtime controls for /blocks (AirtimePolicy): a node-wide upload budget (a token bucket), interface rules
   and quiet hours. /find, /provide and /pin are tiny and never refused by them.
 - Traffic: bounded, thread-safe counters of bytes and requests per peer and per interface, for `rnfs peers`,
-  `rnfs stats` and `rnfs status`, with each peer's last link round-trip time and the last sign it was up, from
-  which online() tells whether it is online.
+  `rnfs stats` and `rnfs status`, with each peer's last link round-trip time and rate estimate and the last sign it
+  was up, from which online() tells whether it is online.
+- Slow paths (SlowPaths, specification section 6): a node that isn't slow asks servers behind a slow path last in its
+  lookups, so LoRa islands carry little of the internet's lookup traffic. A path of more than SLOW_PATH_HOPS hops is
+  slow, and so is a server whose last link from this node, within SLOW_LINK_MEMORY, had a round trip above
+  SLOW_PATH_RTT and a rate estimate below slow_bitrate (RTT alone would catch I2P, which costs no radio airtime).
 
 Pure policy with injected clocks; nothing here imports RNS (or rnfs.log, which does) at module level, since
 the CLI imports the peers feature, which uses this module.
@@ -40,6 +44,11 @@ ONLINE_WINDOW = 900.0
 # Seconds an announce's emission time (its sender's clock) may be off from ours and still count as now
 # (Traffic.announced): nodes on a mesh without NTP drift by minutes
 EMISSION_SKEW = 300.0
+# Slow paths (SlowPaths). Backbone paths take at most 3 hops in the topology study (a node, its hub, the other node's
+# hub, the other node); a server behind a gateway and LoRa hops takes more. Deeper backbones need the link signal
+SLOW_PATH_HOPS = 3  # a path of more hops is slow
+SLOW_PATH_RTT = 1.0  # seconds: a link with a longer round trip and a rate estimate below slow_bitrate is slow
+SLOW_LINK_MEMORY = 24 * HOUR  # a link established longer ago says nothing about the path now
 
 # Why a /blocks request was refused by an airtime control (Traffic.refused keys)
 REFUSED_BUDGET = "budget"
@@ -105,14 +114,23 @@ class RnsPaths:
         # RNS failing to answer is a bug or an RNS change, asked about per provider and per peer: a line a minute
         self._failure_log = ThrottledLog()
 
+    def hops(self, node_id: bytes) -> int | None:
+        """Hops of the path to node_id, or None if RNS has none (or fails). Local, even attached to a shared instance:
+        no RPC, so lookups may ask it for every node they learn of."""
+        import RNS
+        try:
+            return _hops(RNS.Transport, node_id) if RNS.Transport.has_path(node_id) else None
+        except Exception as e:  # noqa: BLE001 - RNS internals: no path known if they fail; logged
+            self._failure_log(f"couldn't read the path to {RNS.prettyhexrep(node_id)} from RNS: {e!r}", RNS.LOG_WARNING)
+            return None
+
     def info(self, node_id: bytes) -> PathInfo:
         """Hops and next-hop interface of the path to node_id; NO_PATH if RNS has none or fails."""
         import RNS
         try:
             if not RNS.Transport.has_path(node_id):
                 return NO_PATH
-            hops = RNS.Transport.hops_to(node_id)
-            hops = hops if isinstance(hops, int) and 0 <= hops < PATHFINDER_M else None
+            hops = _hops(RNS.Transport, node_id)
             reticulum = self._shared_instance()
             if reticulum is not None:
                 name, bitrate = self._shared_interface(reticulum, self._next_hop_name(reticulum, node_id))
@@ -198,6 +216,37 @@ class RnsPaths:
                                                       _bitrate(entry.get("bitrate")))
                 self._stats_at = self.clock()
             return self._stats.get(full_name, (full_name, None))
+
+
+def _hops(transport, node_id: bytes) -> int | None:
+    """transport.hops_to(node_id) (RNS.Transport's) if it is a hop count, else None (PATHFINDER_M: no path)."""
+    hops = transport.hops_to(node_id)
+    return hops if isinstance(hops, int) and 0 <= hops < PATHFINDER_M else None
+
+
+class SlowPaths:
+    """Whether a server is behind a slow path (specification section 6): its path has more than SLOW_PATH_HOPS hops
+    (hops(node_id): RnsPaths.hops, None without a path), or this node's last link to it, established within
+    SLOW_LINK_MEMORY, had a round trip above SLOW_PATH_RTT and a rate estimate below slow_bitrate (traffic's,
+    Traffic.slow_link). Neither known: not slow. Called with a node ID; lookups call it once per node they learn of.
+
+    Only an RNS transport node on the path can raise its hop count (announce signatures don't cover hops) or delay a
+    link to inflate its round trip, and such a node could already drop the traffic; a lookup only asks such servers
+    later, so a hub that makes the servers behind it look slow can't hide them."""
+
+    def __init__(self, traffic: "Traffic | None", slow_bitrate: float,
+                 hops: Callable[[bytes], int | None] = lambda node_id: None):
+        """Slow paths judged from hops (the node sets RnsPaths.hops once Reticulum runs) and traffic's links."""
+        self.traffic = traffic
+        self.slow_bitrate = slow_bitrate
+        self.hops = hops
+
+    def __call__(self, node_id: bytes) -> bool:
+        """True if node_id is behind a slow path."""
+        hops = self.hops(node_id)
+        if hops is not None and hops > SLOW_PATH_HOPS:
+            return True
+        return self.traffic is not None and self.traffic.slow_link(node_id, self.slow_bitrate)
 
 
 def _bitrate(value) -> float | None:
@@ -443,7 +492,8 @@ class _Peer:
     first_counted) are Traffic.monotonic's, so a step of the wall clock can't turn peers online, offline or new."""
 
     __slots__ = ("sent", "received", "requests", "answered", "refused", "failed", "bad", "mode", "last_heard",
-                 "last_active", "first_heard", "first_counted", "last_seen", "last_emitted", "rtt", "rtt_at")
+                 "last_active", "first_heard", "first_counted", "last_seen", "last_emitted", "rtt", "rtt_at",
+                 "link_at", "link_rate")
 
     def __init__(self, now: float, monotonic: float):
         """Nothing counted yet; first counted at now (wall time), monotonic (Traffic.monotonic)."""
@@ -460,6 +510,8 @@ class _Peer:
         self.last_emitted: float | None = None  # emission time (its clock) of the newest announce counted
         self.rtt: float | None = None  # seconds: the round trip RNS measured on the last link established to it
         self.rtt_at: float | None = None  # wall time it was measured
+        self.link_at: float | None = None  # monotonic time that link was established (slow_link)
+        self.link_rate: float | None = None  # bits/s: that link's rate estimate (section 2), None until measured
 
     def as_dict(self) -> dict:
         """JSON-ready counters."""
@@ -572,12 +624,30 @@ class Traffic:
             return True
 
     def measured(self, node_id: bytes, rtt: float):
-        """A link to node_id was established, RNS measuring a round trip of rtt seconds."""
+        """A link to node_id was established, RNS measuring a round trip of rtt seconds. It has no rate estimate
+        yet."""
         with self._lock:
             peer = self._peer(node_id)
             peer.rtt = float(rtt)
             peer.rtt_at = self.clock()
-            peer.last_seen = self.monotonic()
+            peer.last_seen = peer.link_at = self.monotonic()
+            peer.link_rate = None
+
+    def rated(self, node_id: bytes, rate: float):
+        """The link to node_id got a rate estimate of rate bits/s (section 2): the last link's, for slow_link."""
+        with self._lock:
+            self._peer(node_id).link_rate = float(rate)
+
+    def slow_link(self, node_id: bytes, slow_bitrate: float) -> bool:
+        """True if the last link to node_id, established within SLOW_LINK_MEMORY, had a round trip above
+        SLOW_PATH_RTT and a rate estimate below slow_bitrate (SlowPaths). Doesn't make the peer more recent."""
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if peer is None or peer.rtt is None or peer.link_rate is None or peer.link_at is None:
+                return False
+            if not 0 <= self.monotonic() - peer.link_at <= SLOW_LINK_MEMORY:
+                return False
+            return peer.rtt > SLOW_PATH_RTT and peer.link_rate < slow_bitrate
 
     def refused(self, reason: str):
         """A /blocks request was refused by an airtime control (one of REFUSALS)."""

@@ -296,6 +296,67 @@ class RnsPathsTest(unittest.TestCase):
                                                          P2: mesh.PathInfo(3, "LoRa", 1200.0)})
         self.assertEqual(self.instance.calls, {"next_hop": 0, "path_table": 0, "stats": 0})
 
+    def test_hops_are_local(self):
+        """hops() reads the local path table only: no RPC to the instance, for every node a lookup learns of."""
+        self.assertEqual([self.paths.hops(node_id) for node_id in (P1, P2, P3, P4)], [1, 3, 2, None])
+        self.local[P1] = mesh.PATHFINDER_M  # not a hop count
+        self.assertIsNone(self.paths.hops(P1))
+        self.assertEqual(self.instance.calls, {"next_hop": 0, "path_table": 0, "stats": 0})
+        with mock.patch.object(RNS.Transport, "has_path", side_effect=TypeError("renamed")), \
+                mock.patch("rnfs.log.log", recorder([])):
+            self.assertIsNone(self.paths.hops(P2))  # RNS failing: no path known
+
+
+class SlowPathsTest(unittest.TestCase):
+    """mesh.SlowPaths and Traffic.slow_link: which servers a node that isn't slow asks last in its lookups."""
+
+    def setUp(self):
+        """Traffic on fake clocks, and SlowPaths over it and a hop table."""
+        self.wall, self.mono = FakeClock(50000.0), FakeClock(100.0)
+        self.traffic = mesh.Traffic(clock=self.wall, monotonic=self.mono)
+        self.hops: dict[bytes, int] = {}
+        self.slow = mesh.SlowPaths(self.traffic, Config().slow_bitrate, self.hops.get)
+
+    def test_more_than_three_hops(self):
+        self.hops.update({P1: 3, P2: 4})
+        self.assertEqual([self.slow(n) for n in (P1, P2, P3)], [False, True, False])  # P3: no path, nothing known
+
+    def test_slow_link_needs_both_rtt_and_rate(self):
+        """A round trip above 1 s and a rate estimate below slow_bitrate: LoRa. A long round trip at a fast rate (I2P)
+        isn't slow, nor one without a rate estimate yet, nor a short round trip at a low rate."""
+        for node_id, rtt, rate in ((P1, 2.5, 1200.0), (P2, 2.5, 500_000.0), (P3, 2.5, None), (P4, 0.3, 1200.0)):
+            self.traffic.measured(node_id, rtt)
+            if rate is not None:
+                self.traffic.rated(node_id, rate)
+        self.assertEqual([self.slow(n) for n in (P1, P2, P3, P4)], [True, False, False, False])
+
+    def test_only_the_last_link_within_a_day(self):
+        self.traffic.measured(P1, 2.5)
+        self.traffic.rated(P1, 1200.0)
+        self.mono.now += mesh.SLOW_LINK_MEMORY
+        self.assertTrue(self.slow(P1))
+        self.mono.now += 1
+        self.assertFalse(self.slow(P1))  # measured over a day ago: says nothing now
+        self.traffic.measured(P1, 2.5)  # a new link: no rate estimate yet
+        self.assertFalse(self.slow(P1))
+        self.traffic.rated(P1, 1200.0)
+        self.assertTrue(self.slow(P1))
+        self.traffic.measured(P1, 0.2)
+        self.traffic.rated(P1, 1200.0)
+        self.assertFalse(self.slow(P1))
+
+    def test_asking_doesnt_make_a_peer_recent(self):
+        traffic = mesh.Traffic(max_peers=2)
+        traffic.heard(P1, "server")
+        traffic.heard(P2, "server")
+        self.assertFalse(traffic.slow_link(P1, 100_000))
+        self.assertFalse(traffic.slow_link(P3, 100_000))  # unknown: not counted either
+        traffic.heard(P3, "server")
+        self.assertEqual(list(traffic.peers()), [P2, P3])
+
+    def test_without_traffic_or_hops(self):
+        self.assertFalse(mesh.SlowPaths(None, 100_000)(P1))
+
 
 # Airtime policy
 

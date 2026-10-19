@@ -18,6 +18,13 @@ lookup asks and waits for them only when it has too few others. One whose retry 
 again on top of the `alpha` queries if it would otherwise rank among the closest, and nothing waits for that
 answer: a node that never establishes a link costs a lookup no time, yet one that comes back is found.
 
+Nodes behind a slow path (`slow_path`, specification section 6: on nodes that aren't slow, servers on LoRa islands)
+rank after every other but the unreliable ones, so a lookup leaves LoRa airtime alone while it has enough others; it
+still asks them, and stores to them, when it hasn't. Ordering only: they are asked like any node then, nothing counts
+against them, and one that answers ranks first for the rest of the lookup. A node whose path was unknown when it was
+ranked is checked again once the query's path request is answered (`check_path`): one found slow is ranked again
+before its link is opened, and asked at once only if it still ranks among the nodes to query.
+
 Identities generated next to a key (specification section 6) can answer for it with each other only. Two local
 rules make a run wait for more than the beta closest, so they can't hide what honest servers near the key hold:
 - **Senior servers** (`seniors`: the servers closest to the key that the announce first-seen log heard at least
@@ -51,12 +58,14 @@ NodeCallback = Callable[[bytes], object]  # return value ignored
 # Rank tiers: a run queries, and find_closest and candidates() rank, the nodes of a lower tier first, by distance within
 # each. Nodes that answered are always FIRST
 FIRST = 0  # answered, or nothing against it
-UNRELIABLE = 1  # unreliable (the routing table's) and not answered
+SLOW_PATH = 1  # behind a slow path (slow_path) and not answered
+UNRELIABLE = 2  # unreliable (the routing table's) and not answered
 _POLL_INTERVAL = 0.5  # seconds between should_stop() checks while waiting for replies
 MAX_QUERIES = 8 * K  # queries a run sends at most (section 6)
 STALL_WINDOWS = 3  # a run ends after this many query windows of answers in a row that bring the key no nearer
 _FAR = ID_LENGTH * 8 + 1  # _reach with fewer than beta nodes known: farther than any distance
 _STOP = object()  # queued by stop() to wake the waiting caller
+_SLOWER = object()  # a worker's outcome: check_path found the node's path slow, so it wasn't asked
 
 
 def _ignore(node_id: bytes) -> None:
@@ -110,6 +119,10 @@ class Lookup:
     - `claim(id)`, `taken(id)`: a disjoint lookup's paths' shared node ownership (see above).
     - `on_complete(key, kth)`: told, at the end of each run that completed with at least k nodes known, the
       distance from the key to the k-th closest (the network size estimate's sample).
+    - `slow_path(id)`: nodes behind a slow path (see above), asked once per node per lookup; `check_path(id)`: called
+      on the query's thread before a node of the first tier that hasn't answered is asked (once per node per lookup):
+      None to ask it, True if its path turned out slow (it is ranked again instead), False if it can't be reached
+      (a failed query, not sent). Nodes that aren't slow give both; slow nodes neither.
 
     After find_closest, candidates() gives every node it chose from and ask() sends one more /find about a nearby
     key, so one lookup serves the keys of a region (sweep providing, rnfs.publisher).
@@ -128,7 +141,9 @@ class Lookup:
                  may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES,
                  on_useful: NodeCallback = _ignore, size: float | None = None, seniors: Iterable[bytes] = (),
                  claim: Callable[[bytes], bool] = _always, taken: Callable[[bytes], bool] = _never,
-                 on_complete: Callable[[bytes, int], object] = _unsampled, unknowns: int | None = None):
+                 on_complete: Callable[[bytes, int], object] = _unsampled, unknowns: int | None = None,
+                 slow_path: Callable[[bytes], bool] = _never,
+                 check_path: Callable[[bytes], bool | None] | None = None):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -153,6 +168,10 @@ class Lookup:
         self.claim = claim
         self.taken = taken
         self.on_complete = on_complete
+        self.slow_path = slow_path
+        self.check_path = check_path
+        self._slow: dict[bytes, bool] = {}  # slow_path's answers, asked once per node (and check_path's True)
+        self._checked: set[bytes] = set()  # nodes check_path was asked about
         self.ended = ""  # how the last run ended ("complete", "no progress", ...; "" before the first)
         self.sent = 0  # queries the runs sent, in all (retries included)
         self.dense = False  # the density check fired in a run
@@ -168,6 +187,7 @@ class Lookup:
         self._last_known: dict[bytes, int] = {}  # the nodes the last run knew of and hadn't seen fail
         self._last_queried: set[bytes] = set()  # the nodes the last run queried
         self._last_doubtful: set[bytes] = set()  # the nodes the last run knew of as unreliable and not answered
+        self._last_slow: set[bytes] = set()  # the nodes the last run knew of as behind a slow path and not answered
         self._out: set[bytes] = set()  # nodes ask() sent to that haven't answered (still out at its deadline)
         # node -> the nodes it named, for every answer about the key, also those that came after the run that asked
         # stopped waiting (it completes with queries still out)
@@ -194,7 +214,8 @@ class Lookup:
 
     def candidates(self) -> dict[bytes, int]:
         """Every node find_closest chooses from, after a run (and ask()), with its rank tier: UNRELIABLE for an
-        unreliable node that hasn't answered, else FIRST. Sweep providing ranks them for other keys near this one.
+        unreliable node that hasn't answered, SLOW_PATH for one behind a slow path that hasn't, else FIRST. Sweep
+        providing ranks them for other keys near this one.
 
         The nodes the last run knew of that answered, or that it didn't query and whose identity is known; not
         those that failed or were still not answering when it ended. Unlike find_closest, also the answers that came
@@ -209,6 +230,7 @@ class Lookup:
             answered = set(self._answered)
             replies = dict(self._replies) if late else {}
         known = dict(self._last_known)
+        slow = set(self._last_slow)
         for node_id, nodes in replies.items():
             if node_id in self._failed:
                 continue
@@ -216,8 +238,17 @@ class Lookup:
             for n in [node_id] + nodes:
                 if n not in known and self._usable(n):
                     known[n] = self._distance(n)
+                    if self._is_slow(n):  # named after the run ended: slow paths still rank after the rest
+                        slow.add(n)
         doubtful, queried, out = self._last_doubtful, self._last_queried, self._out
-        return {n: UNRELIABLE if n in doubtful and n not in answered else FIRST for n in known
+
+        def tier(n: bytes) -> int:
+            """n's rank tier: nodes that answered first."""
+            if n in answered:
+                return FIRST
+            return UNRELIABLE if n in doubtful else SLOW_PATH if n in slow else FIRST
+
+        return {n: tier(n) for n in known
                 if n in answered or (n not in out and n not in queried and self.is_known(n))}
 
     def ask(self, node_id: bytes, key: bytes) -> list[bytes] | None:
@@ -257,6 +288,7 @@ class Lookup:
         with self._lock:
             self._answered.add(node_id)
         self._last_doubtful.discard(node_id)
+        self._last_slow.discard(node_id)
         known.setdefault(node_id, self._distance(node_id))
         nodes = reply[1]
         for new_id in nodes:
@@ -264,6 +296,8 @@ class Lookup:
                 known[new_id] = self._distance(new_id)
                 if self.unreliable(new_id):
                     self._last_doubtful.add(new_id)
+                if self._is_slow(new_id):
+                    self._last_slow.add(new_id)
         return list(nodes)
 
     def find_providers(self, on_provider: NodeCallback, should_stop: Callable[[], bool] = lambda: False
@@ -334,6 +368,16 @@ class Lookup:
             return _FAR
         return heapq.nsmallest(self.beta, known.values())[-1].bit_length()
 
+    def _is_slow(self, node_id: bytes) -> bool:
+        """slow_path(node_id), asked once per lookup (it reads RNS's path table and the traffic counters)."""
+        with self._lock:
+            cached = self._slow.get(node_id)
+        if cached is None:
+            cached = bool(self.slow_path(node_id))
+            with self._lock:
+                cached = self._slow.setdefault(node_id, cached)
+        return cached
+
     def _usable(self, node_id) -> bool:
         """True if node_id may be queried in this lookup."""
         return (is_id(node_id) and node_id != self.own_id and node_id not in self._failed
@@ -362,8 +406,10 @@ class Lookup:
             if self._usable(node_id) and not self.taken(node_id):
                 known[node_id] = self._distance(node_id)
         seniors = [node_id for node_id in self._seniors if node_id in known]
-        # Known nodes that were unreliable when found and haven't answered: ranked after every other
+        # Known nodes that were unreliable when found and haven't answered: ranked after every other; and those behind
+        # a slow path that haven't answered in this lookup, ranked after every other but those
         doubtful = {node_id for node_id in known if self.unreliable(node_id)}
+        slow = {node_id for node_id in known if node_id not in self._answered and self._is_slow(node_id)}
         queried: set[bytes] = set()
         answered: set[bytes] = set()
         retrying: set[bytes] = set()  # unreliable nodes asked again on top of alpha, which nothing waits for
@@ -381,11 +427,12 @@ class Lookup:
         self._last_known = known  # live: find_closest reads them once the run ends
         self._last_queried = queried
         self._last_doubtful = doubtful
+        self._last_slow = slow
         self._out = set()
 
         def tier(node_id: bytes) -> int:
-            """node_id's rank tier: reliable nodes (and those that answered) first."""
-            return UNRELIABLE if node_id in doubtful else FIRST
+            """node_id's rank tier: reliable nodes on fast paths (and those that answered) first, then slow paths."""
+            return UNRELIABLE if node_id in doubtful else SLOW_PATH if node_id in slow else FIRST
 
         def rank(node_id: bytes) -> tuple[int, int]:
             """Sort key: by tier, then by distance."""
@@ -445,7 +492,12 @@ class Lookup:
                     continue
                 if node_id not in ranked:
                     extras.add(node_id)
-                self._send(node_id, results)
+                # A first-tier node whose path is unknown may turn out slow once its path request is answered
+                check = (self.check_path is not None and tier(node_id) == FIRST and node_id not in self._answered
+                         and node_id not in self._checked)
+                if check:
+                    self._checked.add(node_id)
+                self._send(node_id, results, check=check)
                 sent += 1
                 self.sent += 1
                 in_flight += 1
@@ -489,6 +541,16 @@ class Lookup:
                 retrying.discard(node_id)
             else:
                 in_flight -= 1
+            if reply is _SLOWER:
+                # Not asked: ranked again, now behind a slow path, and queried again (without checking) only if it
+                # still ranks among the nodes to query. Nothing was sent, so nothing counts
+                queried.discard(node_id)
+                extras.discard(node_id)
+                sent -= 1
+                self.sent -= 1
+                if node_id in known:
+                    slow.add(node_id)
+                continue
             if reply is None:
                 with self._lock:
                     self._failed.add(node_id)
@@ -497,6 +559,7 @@ class Lookup:
 
             answered.add(node_id)
             doubtful.discard(node_id)
+            slow.discard(node_id)
             with self._lock:
                 self._answered.add(node_id)
             self._credit(introduced.get(node_id), node_id)
@@ -512,6 +575,8 @@ class Lookup:
                     introduced.setdefault(new_id, node_id)
                     if self.unreliable(new_id):
                         doubtful.add(new_id)
+                    if self._is_slow(new_id):
+                        slow.add(new_id)
             nearer = self._reach(known)
             if nearer < reach:
                 reach, stalled = nearer, 0
@@ -554,9 +619,9 @@ class Lookup:
             log(f"lookup for {self.key.hex()}: the useful-answer callback for {_name(introducer)} raised {e!r}",
                 LOG_WARNING)
 
-    def _send(self, node_id: bytes, results: queue.Queue, key: bytes | None = None):
+    def _send(self, node_id: bytes, results: queue.Queue, key: bytes | None = None, check: bool = False):
         """Query node_id about key (the lookup's own by default) on a worker thread, which reports the outcome
-        and queues it for the run."""
+        and queues it for the run. check: ask check_path first, and queue _SLOWER instead if the path is slow."""
         key = self.key if key is None else key
         about = "" if key == self.key else f" about {key.hex()}"
 
@@ -564,7 +629,14 @@ class Lookup:
             """Run the blocking query, report it, and hand the cleaned reply to the run."""
             started = self.clock()
             try:
-                reply = self._clean(self.query(node_id, key))
+                path = self.check_path(node_id) if check else None
+                if path:
+                    with self._lock:
+                        self._slow[node_id] = True
+                    self.report(f"lookup for {self.key.hex()}: the path to {_name(node_id)} is slow; ranked again")
+                    results.put((node_id, _SLOWER))
+                    return
+                reply = None if path is False else self._clean(self.query(node_id, key))
             except Exception as e:  # noqa: BLE001 - one broken node must not abort the lookup
                 reply = None  # one broken node must not abort the lookup
                 self.report(f"lookup for {self.key.hex()}: asking {_name(node_id)}{about} raised {e!r}")
