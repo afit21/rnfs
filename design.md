@@ -1964,7 +1964,9 @@ Everything in the specification is implemented, with these simplifications and a
   `_wired_lookup` adds `allowed=partition.allows`, and `_start_nodes` puts the K closest local servers first while it
   is active. `check_local` probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
   `rnfs-local` thread; an answer goes to `routing.answered`, a failure isn't counted there). `_partition_changed` logs
-  the change; `status()` adds `state()`.
+  the change and, on leaving, calls `Publisher.heal()`; `_contact` (an off-island answer, fresh announce or probe
+  answer outside partition mode) calls it once after a start too (`_heal_at_contact`), for marks a restart kept after
+  the partition ended. `status()` adds `state()`.
 - Joining (`RnfsNode._join`, `join`): the join's candidates (`join_candidates`: up to `SAVED_JOIN_TRIES` (6)
   servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
   first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with

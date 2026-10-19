@@ -673,6 +673,9 @@ class RnfsNode:
         self._scanned_at: float | None = None  # monotonic time of the last scan
         # Partition mode: fed only on a node with local servers (local_on), so never entered on another
         self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed)
+        # Keys marked for the heal republish before a restart are republished at the first off-island contact after
+        # it (the partition may have ended while the node was down, and then no partition mode ends to start it)
+        self._heal_at_contact = local
         # Which lookups searching and publishing run (section 6): density-checked searches with the senior rule,
         # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths.
         # Slow nodes may make more path requests per lookup than alpha, most when publishing: they hear few announces
@@ -1074,6 +1077,7 @@ class RnfsNode:
         answered = self.client.find(target, self.node_id) is not None
         if answered:
             self.routing.answered(target)
+            self._contact(target)
         self.partition.probed(target, answered)
         return answered
 
@@ -1112,6 +1116,7 @@ class RnfsNode:
         if self.routing.answered(node_id):
             self.publisher.wake()  # a CID that found no nodes may now be publishable
         if self.local_on:
+            self._contact(node_id)
             self.partition.answered(node_id)  # an off-island answer ends partition mode
 
     def _query_failed(self, node_id: bytes):
@@ -1197,7 +1202,15 @@ class RnfsNode:
         _heard_server, which runs first), a sample of the usual gap and the end of partition mode. A path answer
         from an island node's cache, or a client's announce, says nothing about the way off the island."""
         if self.local_on and self.local.judged(node_id) is False:
+            self._contact(node_id)
             self.partition.announced(node_id)
+
+    def _contact(self, node_id: bytes):
+        """node_id answered or announced itself: if it is off-island and the node isn't in partition mode, the first
+        such contact since the start republishes the keys still marked for the heal republish (Publisher.heal)."""
+        if self._heal_at_contact and not self.partition.active and not self.local.is_local(node_id):
+            self._heal_at_contact = False
+            self.publisher.heal()
 
     def _is_member_node(self, node_id: bytes) -> bool:
         """Private mode's routing table admission: node_id's identity is a member."""

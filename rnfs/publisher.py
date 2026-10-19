@@ -48,10 +48,9 @@ whose round was stopped before every node was sent its keys stays due. Times are
   store set's off-island servers count as not stored to), and each server's answer or failure is told to it.
 - **The heal republish.** An item whose round reached no off-island server, in partition mode or after trying, is
   marked (persisted with its published row, in published_heal, so a restart during a partition keeps it); heal(),
-  when partition mode
-  ends, makes every marked item due, so the rounds that follow (paced as ever on slow nodes) put its records beyond
-  the island within hours rather than at its next republish (3 days on a slow node). A round reaching an off-island
-  server clears the mark.
+  when partition mode ends (or at the first off-island contact after a restart), makes every marked item due, so the
+  rounds that follow (paced as ever on slow nodes) put its records beyond the island within hours rather than at its
+  next republish (3 days on a slow node). A round reaching an off-island server clears the mark.
 """
 import hashlib
 import math

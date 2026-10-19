@@ -489,14 +489,32 @@ class PartitionWiringTest(IslandCase):
         self.assertTrue(self.stored_beyond(key))
         self.assertEqual(self.node.publisher.heal_marked(), 0)
 
-    def test_marks_survive_a_restart(self):
+    def restarted(self) -> RnfsNode:
+        """The island node, restarted after publishing while cut off."""
         self.partitioned_publish()
         self.node.stop()
         node = self.make_node(slow="yes", local_interfaces=["LoRa"])
         self.assertEqual(node.publisher.heal_marked(), 1)
-        node._heard_server(self.backbone[0])
-        node.partition.active = True  # still cut off after the restart, say
+        self.assertGreater(node.publisher.next_due(), 3600)
+        for n in self.islanders + self.backbone:
+            node._heard_server(n)
+        return node
+
+    def test_marks_survive_a_restart_during_the_partition(self):
+        node = self.restarted()
+        node.partition.active = True  # still cut off after the restart, and found so
+        node._fresh_announce(self.islanders[0])
+        self.assertGreater(node.publisher.next_due(), 3600)
         node._fresh_announce(self.backbone[0])
+        self.assertLess(node.publisher.next_due(), 3600)
+
+    def test_marks_healed_at_the_first_contact_after_a_restart(self):
+        """The partition ended while the node was down: no partition mode ends after the restart, so its first
+        off-island contact republishes what is marked."""
+        node = self.restarted()
+        node._answered(self.islanders[0])  # local: nothing
+        self.assertGreater(node.publisher.next_due(), 3600)
+        node._answered(self.backbone[0])
         self.assertLess(node.publisher.next_due(), 3600)
 
     def test_rounds_reaching_beyond_the_island_mark_nothing(self):
