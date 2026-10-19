@@ -247,6 +247,15 @@ class LocalFacadeTest(NodeTest):
         self.assertNotIn(Cid.parse(published["cid"]), self.a.publisher.provided() - self.a.publisher.provided_entries())
         self.assertIn(Cid.parse(published["cid"]), self.a.publisher.provided_entries())
 
+    def test_known_servers_takes_the_larger_estimate(self):
+        """provide_entries' airtime estimate on slow nodes is given the routing table's size, or the density
+        check's network size estimate once it has one and it is larger."""
+        self.assertEqual(self.a._known_servers(), self.a.routing.node_count())
+        with mock.patch.object(self.a.sizes, "estimate", return_value=5000.4):
+            self.assertEqual(self.a._known_servers(), 5000)
+        with mock.patch.object(self.a.sizes, "estimate", return_value=None):
+            self.assertEqual(self.a._known_servers(), self.a.routing.node_count())
+
     def test_needs_reach(self):
         """A client keeps announcing only while something needs others to reach it: providing, a name, remote
         pins, private mode."""

@@ -658,9 +658,10 @@ are equal, so a refresh caused by a fetch or a block stored walks and chooses no
 entries are dropped whole when `republish_airtime(roots + keys + entries, network_size(...), bitrate) /
 interval` exceeds `ENTRY_AIRTIME_ON` (2%), or `ENTRY_AIRTIME_OFF` (2.5%) while they are on (`_entries_on`); the
 reason is kept in `_entries_off` and logged when it starts or stops applying. `bitrate` is the slowest counted
-interface's (`rates.slowest_bitrate`, read once at start; the node passes it and `routing.node_count`), and the
+interface's (`rates.slowest_bitrate`, read once at start; the node passes it and `_known_servers`, the larger of
+the routing table's size and the density check's estimate `sizes.estimate()`), and the
 network size `network_size(_region_bits_mean, known)`: a running mean (weight 1/16) of the prefix length of the
-regions each round found (`_learn_network_size`, in `publish_due`), at least the routing table's size, at least
+regions each round found (`_learn_network_size`, in `publish_due`), at least `known_servers()`, at least
 `UNKNOWN_NETWORK` (1000) before any. Because that changes without any pin, `_entries_input()` holds the network
 size and interval on such a node, and its `run()` loop refreshes at every wake (a no-op unless they moved). The mean
 and `_entries_on` are the publish state's meta values (`publisher`, `region_bits` and `entries_on`), so a restart

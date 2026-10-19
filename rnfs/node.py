@@ -566,6 +566,13 @@ class RnfsNode:
         self.announcer.start()
         self._start_threads()
 
+    def _known_servers(self) -> int:
+        """At least how many DHT servers there are, for provide_entries' airtime estimate on slow nodes (the
+        publisher's network_size): the routing table's, or the density check's estimate if larger (rnfs.dht.density;
+        None until enough lookups completed). The larger is the cautious choice: it leaves entries off sooner."""
+        estimate = self.sizes.estimate()
+        return max(self.routing.node_count(), 0 if estimate is None else round(estimate))
+
     def _needs_reach(self) -> bool:
         """True if other nodes need to reach this node, so a client keeps announcing (DhtAnnouncer): it provides
         something (CIDs, kept names' keys), owns names (it answers /name for them), accepts remote pins, or is in
@@ -695,7 +702,7 @@ class RnfsNode:
                                                    self.lookups.publish, slow, config.state_dir,
                                                    cached_eligible=self._eligible_targets,
                                                    generation=self._provide_generation, bitrate=bitrate,
-                                                   known_servers=self.routing.node_count), batched=False)
+                                                   known_servers=self._known_servers), batched=False)
         # A key the density check flags on its region's servers gets a widened lookup and K more stores per ring
         self.publisher.set_widening(self.lookups.flags, self.lookups.widen)
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)

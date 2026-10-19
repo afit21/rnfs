@@ -914,7 +914,7 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     link to each server contacted. That is about 1,300 keys on a 100-server network and about 40 at 1,000 servers
     or more at 1 kbit/s, with the default 3-day republish interval. N is estimated from the regions sweep providing
     found (a running mean of their prefix length p over about 16: N ≈ 10 × 2^(p + 0.5)), at least the routing
-    table's size, and taken as 1,000 or more until a region has been found (past about 500 servers the answer no
+    table's size and the density check's estimate (below), and taken as 1,000 or more until a region has been found (past about 500 servers the answer no
     longer changes). One mid-size folder already exceeds what a 1 kbit/s node can republish: past that, remote
     pinning on a fast node (the existing `/pin`) shares it instead.
   - `provide_entries = true` provides entries whatever the estimate (still up to the cap); `false` provides none.
