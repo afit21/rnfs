@@ -536,6 +536,16 @@ the fetcher (`Fetcher(scores=)`, in memory only if not given) calls `served` for
 blocks and `useful_answer` once per fetch for each of its lookup's `listers` of that provider (`Fetch._served`),
 `failed` in `_fail` and `bad_block` with the ban.
 
+`local.py` — local servers (specification section 6, "LoRa islands"), no RNS. `LocalServers(max_servers=1024,
+max_judged=4096)`: `note(id, local)` (a judgement from the path to a server; an `OrderedDict` of judgements and one of
+the local servers, least recently judged first, each capped), `replace(judged)` (a scan's judgements: the local set
+becomes exactly those it found local, and earlier local ones it didn't see are judged not local), `forget(id)`,
+`clear()`, `is_local(id)` (a dict lookup, no lock), `judged(id)` (True, False, or None if never judged),
+`closest(key, count, exclude)`, `nodes()`, `len()`. `judge_all(paths, is_server, is_local)` judges a scan's
+`PathInfo`s of the destinations that are known servers. `first_count(named)`: `LOCAL_FIRST` (1) when
+`local_interfaces` names the island, else `LOCAL_FIRST_RADIUS` (3). `Lookups(local_first=)` passes those nodes as a
+search's first lookup's `first`.
+
 `firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
 `heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
 table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
@@ -653,7 +663,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -697,7 +707,9 @@ withdrawals as due only once the pacing allows; other nodes send them all at onc
 region's p to the next round. Each item's store set (`_store_set`) is its K closest from its region
 (`Region.closest_to`), then each part added by `add_store_part(part)`, a `(key, region) -> servers` called without
 the lock after the lookups (the node adds `_senior_servers`: `first_seen.closest(key, K, min_age=provider_seniority,
-exclude=banned or, in private mode, not a member, heard_within=2 × announce_interval)`), without duplicates; an item
+exclude=banned or, in private mode, not a member, heard_within=2 × announce_interval)`, and on a node that may have
+local servers with `local_replicas` above 0, `_local_replicas`: `local.closest(key, local_replicas)`, the same
+exclusions), without duplicates; an item
 whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The store set also takes each
 disjoint path's K closest (`Region.path_closest`) and the ring servers of a widened lookup (`Region.rings`):
 `set_widening(flags, widen)` (the node passes `Lookups.flags` and `Lookups.widen`) has each lookup thread, once its
@@ -1059,7 +1071,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending`, then `deprecated` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `features: dict` (every other field) | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `local_servers`, `features: dict` (every other field) | — |
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
@@ -1409,6 +1421,14 @@ the names of many nodes from one `get_path_table` RPC, for `rnfs peers`);
 the airtime policy (`TokenBucket`, `AirtimePolicy`, interface matching, quiet-hours parsing, all with
 injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 1000), per interface (at most 64)
 and in total, never persisted.
+- `is_local_path(path, interfaces, max_hops, slow_bitrate)` judges a local server (spec section 6, "LoRa islands"):
+  `matches(path.names, interfaces)` when interfaces are named, else hops at most `max_hops` and a known bitrate below
+  `slow_bitrate`. `PathInfo.names` (not compared) holds every name a rule may match: `interface_names` of RNS's
+  next-hop interface, or through a shared instance its short name and `str()`. `RnsPaths.scan(max_hops)` reads every
+  path within `max_hops` at once: `RNS.Transport.path_table` (hops at index 2, the interface at 5), or through a shared
+  instance one `get_path_table(max_hops=)` RPC named and rated from the cached interface stats; it raises what they
+  raise. `rates.has_slow_interface(reticulum, slow_bitrate)`: one of `counted_bitrates` is below it (False if the
+  stats can't be read).
 - `SlowPaths(traffic, slow_bitrate, hops)` is the slow-path predicate lookups rank by (spec section 6): `hops(id)`
   (`RnsPaths.hops`: `has_path` and `hops_to` only, no RPC even through a shared instance) above `SLOW_PATH_HOPS` (3),
   or `Traffic.slow_link(id, slow_bitrate)`: the last link to the peer, established within `SLOW_LINK_MEMORY` (24 h,
@@ -1708,6 +1728,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | Thread | Owner | Does |
 |---|---|---|
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
+| `rnfs-local` | node (`_run_local`), only on a node that may have local servers | every 30 s: the path table read for the local servers every 10 minutes (`check_local`) |
 | `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-lookup-path`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, a disjoint lookup's paths (all but the first, which runs in the caller's thread; every path for `find_providers`), fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
@@ -1903,6 +1924,18 @@ Everything in the specification is implemented, with these simplifications and a
   `PeerClient.await_path`, and is judged again). Slow nodes' `Lookups` get `SLOW_PUBLISH_UNKNOWNS` and
   `SLOW_SEARCH_UNKNOWNS`. `RnfsNode.sizes` is the size estimate (`SizeEstimate`, a batched store); every complete
   lookup's run feeds it.
+- Local servers (specification section 6, "LoRa islands"): `RnfsNode.local` is a `LocalServers`, used only when
+  `local_on` (set at start: `local_interfaces` named, or `rates.has_slow_interface`; offline nodes take `local=`).
+  `_heard_server` judges each server heard (`_judge_local`: with no interface named, a path longer than
+  `local_hops` by `_path_hops` alone, so no RPC; else `mesh.is_local_path(_path_of(id), ...)`), `_heard_client`
+  forgets one. The `rnfs-local` thread (`_run_local`, every `LOCAL_CHECK`, 30 s; only when `local_on`) runs
+  `check_local`, which calls `scan_local` every `SCAN_INTERVAL` (600 s): `_scan_paths(max_hops)` (`RnsPaths.scan`,
+  `max_hops` = `local_hops` unless `local_interfaces` is set) judged by `judge_all` over the servers the routing table
+  or the first-seen log know (`_is_server`), replacing the set; a scan that raises clears it (nothing is local).
+  `_path_of`, `_path_hops` and `_scan_paths` are `RnsPaths.info`, `hops` and `scan` once Reticulum runs
+  (`_start_network`), nothing before (tests replace them). `_local_first(key)` (`Lookups`' `local_first`) gives a
+  search's first nodes: `local.closest(key, first_count(bool(local_interfaces)))`, leaving out what `_not_for_us`
+  rejects (banned, or in private mode not a member: the senior servers' rule too).
 - Joining (`RnfsNode._join`, `join`): the join's candidates (`join_candidates`: up to `SAVED_JOIN_TRIES` (6)
   servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
   first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with

@@ -50,6 +50,7 @@ from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, 
                                   remote_source)
 from rnfs.dht.density import SizeEstimate
 from rnfs.dht.firstseen import FirstSeenLog
+from rnfs.dht.local import SCAN_INTERVAL, LocalServers, first_count, judge_all
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.lookups import (DISJOINT_PATHS, SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups,
                               Search)
@@ -59,7 +60,7 @@ from rnfs.dht.routing_state import RoutingState
 from rnfs.dht.scores import Scores
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
-from rnfs.mesh import RnsPaths, SlowPaths
+from rnfs.mesh import PathInfo, RnsPaths, SlowPaths, is_local_path, no_path_info
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
 from rnfs.name_sync import NameSync
 from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
@@ -87,6 +88,7 @@ DEFAULT_CHECKS = 2
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 DENY_RETRY = 60.0  # seconds before maintenance applies a deny-list change again after applying it failed
+LOCAL_CHECK = 30.0  # seconds between the local-servers thread's checks (scans of the path table every SCAN_INTERVAL)
 HASH_NOTICES = 1024  # files whose denied-hash NOTICE was logged, kept so it isn't repeated (then forgotten)
 # Resolved targets found not to be sealed files, so reading one again needn't read its first bytes to tell (a CID's
 # content never changes); least recently used forgotten first, about 2 MB when full
@@ -530,12 +532,14 @@ class RnfsNode:
         self.destination = RNS.Destination(self.identity, RNS.Destination.IN, RNS.Destination.SINGLE,
                                            APP_NAME, DHT_ASPECT)
         slow = rates.is_slow_node(config, self.reticulum)
+        # Local servers (section 6, "LoRa islands") only on a node naming local_interfaces or with a slow interface
+        local = bool(config.local_interfaces) or rates.has_slow_interface(self.reticulum, config.slow_bitrate)
         self.links = LinkPool(self.identity, config)
         self.server = self.announcer = self.announce_handler = None  # made below; stop() skips those not made
         try:
             self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
                                  names_network=None, is_known=_rns_is_known,
-                                 bitrate=rates.slowest_bitrate(self.reticulum))
+                                 bitrate=rates.slowest_bitrate(self.reticulum), local=local)
         except BaseException:
             if embedded:
                 self._release_destination()  # the host's Reticulum runs on: a later node registers it again
@@ -557,6 +561,10 @@ class RnfsNode:
         # Lookups judge slow paths by hops too, and check a path once a query's path request is answered
         self.slow_paths.hops = self.paths.hops
         self._check_path = self._path_check
+        # Local servers are judged from the paths to them: the next-hop interface needs RPC through a shared instance
+        self._path_of = self.paths.info
+        self._path_hops = self.paths.hops
+        self._scan_paths = self.paths.scan
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
@@ -587,9 +595,10 @@ class RnfsNode:
 
     @classmethod
     def offline(cls, config: Config, node_id: bytes, client, names_network, slow: bool = False,
-                bitrate: float | None = None) -> "RnfsNode":
+                bitrate: float | None = None, local: bool = False) -> "RnfsNode":
         """A node without Reticulum, for tests: client and names_network stand in for the network (bitrate: its
-        slowest interface's, as Reticulum would say).
+        slowest interface's, as Reticulum would say; local: whether it may have local servers, as a slow interface
+        or local_interfaces would make it).
 
         No background thread runs; tests call publisher.publish_due(), maintain() etc. themselves.
         """
@@ -597,7 +606,7 @@ class RnfsNode:
         node.reticulum = node.links = node.server = node.announcer = node.announce_handler = None
         node.embedded = False
         node._setup_or_close(config, node_id, client, slow, names_network=names_network, bitrate=bitrate,
-                             is_known=lambda node_id: True)
+                             is_known=lambda node_id: True, local=local)
         node.joined.set()
         return node
 
@@ -611,8 +620,9 @@ class RnfsNode:
             raise
 
     def _setup(self, config: Config, node_id: bytes, client, slow: bool, names_network, is_known,
-               bitrate: float | None = None):
-        """Everything that doesn't need Reticulum itself. bitrate: the slowest interface's (bits/s), or None."""
+               bitrate: float | None = None, local: bool = False):
+        """Everything that doesn't need Reticulum itself. bitrate: the slowest interface's (bits/s), or None; local:
+        whether the node may have local servers (local_interfaces named, or a slow interface)."""
         self.config = config
         self.node_id = node_id
         self.client = client
@@ -652,6 +662,15 @@ class RnfsNode:
         # The network size estimate of the density check (section 6), from recent complete lookups; saved with the
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))
+        # The servers on this node's island (section 6, "LoRa islands"): judged from the path to each, as its announces
+        # arrive and from a read of the path table every SCAN_INTERVAL (the paths are RNS's once Reticulum runs:
+        # _start_network); none on a node with neither local_interfaces nor a slow interface
+        self.local_on = local
+        self.local = LocalServers()
+        self._path_of: Callable[[bytes], PathInfo] = no_path_info
+        self._path_hops: Callable[[bytes], int | None] = lambda node_id: None
+        self._scan_paths: Callable[[int | None], dict[bytes, PathInfo]] = lambda max_hops: {}
+        self._scanned_at: float | None = None  # monotonic time of the last scan
         # Which lookups searching and publishing run (section 6): density-checked searches with the senior rule,
         # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths.
         # Slow nodes may make more path requests per lookup than alpha, most when publishing: they hear few announces
@@ -660,7 +679,8 @@ class RnfsNode:
                                SLOW_DISJOINT_PATHS if slow else DISJOINT_PATHS,
                                pace=self._pace_fallback if slow else None,
                                publish_unknowns=SLOW_PUBLISH_UNKNOWNS if slow else None,
-                               search_unknowns=SLOW_SEARCH_UNKNOWNS if slow else None)
+                               search_unknowns=SLOW_SEARCH_UNKNOWNS if slow else None,
+                               local_first=self._local_first)
         # Servers behind a slow path (section 6): a node that isn't slow asks them last in its lookups. Judged from the
         # links this node opened until Reticulum runs (_start_network adds hops, and the path check of _check_path)
         self.slow_paths = SlowPaths(getattr(client, "traffic", None), config.slow_bitrate)
@@ -718,6 +738,9 @@ class RnfsNode:
         self.publisher.set_widening(self.lookups.flags, self.lookups.widen)
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)
         self.publisher.add_store_part(self._senior_servers)
+        # Two-level records: and on its closest local servers (section 6, "LoRa islands")
+        if local and config.local_replicas:
+            self.publisher.add_store_part(self._local_replicas)
         # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
         self.names.held_listener = self._name_event
@@ -810,11 +833,14 @@ class RnfsNode:
 
     def _start_threads(self):
         """Start the background loops."""
-        for name, target in (("rnfs-join", self._join), ("rnfs-publisher", self._run_publisher),
-                             ("rnfs-names", lambda: self.names.run(self.stop_event)),
-                             ("rnfs-maintenance", self._maintenance_loop),
-                             ("rnfs-name-sync", lambda: self.folder_syncs.run(self.stop_event)),
-                             ("rnfs-remote-pin-checks", lambda: self.asked_pins.run(self.stop_event, self.joined))):
+        loops = [("rnfs-join", self._join), ("rnfs-publisher", self._run_publisher),
+                 ("rnfs-names", lambda: self.names.run(self.stop_event)),
+                 ("rnfs-maintenance", self._maintenance_loop),
+                 ("rnfs-name-sync", lambda: self.folder_syncs.run(self.stop_event)),
+                 ("rnfs-remote-pin-checks", lambda: self.asked_pins.run(self.stop_event, self.joined))]
+        if self.local_on:
+            loops.append(("rnfs-local", self._run_local))
+        for name, target in loops:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -960,10 +986,76 @@ class RnfsNode:
         leave out servers silent that long), not banned, and in private mode members. Identities generated next to
         a key can't be old ones, so these were there before any such identity was made for it; without an attack
         they are mostly among the key's K closest already. region (the sweep's) isn't needed."""
-        banned = self.routing.is_banned
-        exclude = banned if not self.config.private else (lambda n: banned(n) or not self._is_member_node(n))
-        return self.first_seen.closest(key, K, min_age=self.config.provider_seniority, exclude=exclude,
+        return self.first_seen.closest(key, K, min_age=self.config.provider_seniority, exclude=self._not_for_us,
                                        heard_within=2 * self.config.announce_interval)
+
+    def _not_for_us(self, node_id: bytes) -> bool:
+        """True for a server this node mustn't store to or ask on its own initiative: banned, or in private mode not a
+        member."""
+        return self.routing.is_banned(node_id) or (self.config.private and not self._is_member_node(node_id))
+
+    # Local servers (section 6, "LoRa islands")
+
+    def _local_first(self, key: bytes) -> list[bytes]:
+        """The local servers a search for key asks first (Lookups' local_first): the closest one, or 3 when local is
+        a hop radius; none on a node without local servers."""
+        if not self.local_on:
+            return []
+        return self.local.closest(key, first_count(bool(self.config.local_interfaces)), exclude=self._not_for_us)
+
+    def _local_replicas(self, key: bytes, region) -> list[bytes]:
+        """The publisher's store part of two-level records: the local_replicas local servers closest to key. region
+        (the sweep's) isn't needed."""
+        return self.local.closest(key, self.config.local_replicas, exclude=self._not_for_us)
+
+    def _judge_local(self, node_id: bytes):
+        """Judge whether node_id, a server just heard, is local, from the path to it (mesh.is_local_path). With a hop
+        radius, a path too long is judged from its hop count alone (local even through a shared instance), so most
+        announces cost no RPC to the instance."""
+        config = self.config
+        if not config.local_interfaces:
+            hops = self._path_hops(node_id)
+            if hops is None or hops > config.local_hops:
+                self.local.note(node_id, False)
+                return
+        path = self._path_of(node_id)
+        self.local.note(node_id, is_local_path(path, config.local_interfaces, config.local_hops, config.slow_bitrate))
+
+    def _is_server(self, node_id: bytes) -> bool:
+        """True if node_id is a DHT server this node knows of (in its routing table or announce first-seen log)."""
+        return self.routing.contains(node_id) or self.first_seen.first_heard(node_id) is not None
+
+    def scan_local(self):
+        """Judge every server known with a path from one read of the path table (RnsPaths.scan: through a shared
+        instance one RPC, within local_hops unless local_interfaces names the interfaces): the local servers are then
+        those it finds local. If the table can't be read, nothing is local."""
+        config = self.config
+        self._scanned_at = time.monotonic()
+        try:
+            paths = self._scan_paths(None if config.local_interfaces else config.local_hops)
+        except Exception as e:  # noqa: BLE001 - RNS internals or the instance's RPC: then nothing is local; logged
+            log(f"couldn't read the path table for the local servers: {e!r}", LOG_WARNING)
+            self.local.clear()
+            return
+        before = len(self.local)
+        self.local.replace(judge_all(paths, self._is_server, lambda path: is_local_path(
+            path, config.local_interfaces, config.local_hops, config.slow_bitrate)))
+        if len(self.local) != before:
+            log(f"{plural(len(self.local), 'local server')}", LOG_VERBOSE)
+
+    def check_local(self):
+        """The local-servers thread's work, every LOCAL_CHECK: scan the path table every SCAN_INTERVAL."""
+        if self._scanned_at is None or time.monotonic() - self._scanned_at >= SCAN_INTERVAL:
+            self.scan_local()
+
+    def _run_local(self):
+        """The local-servers loop (only on a node that may have local servers)."""
+        while not self.stop_event.is_set():
+            try:
+                self.check_local()
+            except Exception as e:  # noqa: BLE001 - the loop keeps running; logged
+                log(f"checking the local servers failed: {e!r}", LOG_ERROR)
+            self.stop_event.wait(LOCAL_CHECK)
 
     def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool], **options) -> Lookup:
         """A Lookup for key from start, wired to the routing table (answers, failures, unreliable nodes and
@@ -1019,6 +1111,8 @@ class RnfsNode:
         """A server-mode announce (or path response) from node_id."""
         self._count_heard(node_id, "server")
         self.first_seen.heard(node_id)
+        if self.local_on:
+            self._judge_local(node_id)
         if self.routing.heard(node_id):
             log(f"heard DHT server {node_name(node_id)} ({self.routing.node_count()} known)", LOG_VERBOSE)
             self.publisher.wake()
@@ -1028,6 +1122,7 @@ class RnfsNode:
         self._count_heard(node_id, "client")
         self.routing.remove(node_id)
         self.first_seen.forget(node_id)
+        self.local.forget(node_id)
 
     def _count_heard(self, node_id: bytes, mode: str):
         """Count node_id's announce in the traffic counters, which `rnfs peers` reads its DHT mode and last-heard
@@ -2676,5 +2771,6 @@ class RnfsNode:
                 "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
+                "local_servers": len(self.local),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}
 

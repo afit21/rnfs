@@ -435,6 +435,8 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `upload_budget` | none | Bytes per hour your node uploads in total |
 | `serve_interfaces`, `no_serve_interfaces` | all, none | Reticulum interfaces to upload on, or never upload on (names or prefixes) |
 | `quiet_hours` | off | Local times with no uploads, e.g. `"22:00-06:00"` |
+| `local_interfaces` | `[]` | On a LoRa island: the Reticulum interfaces (names or prefixes; with `rnsd`, as its config names them) whose servers are your island's. Empty: servers within `local_hops` (3) over a slow interface. Set it on a gateway, or behind a big public hub |
+| `local_hops`, `local_replicas` | `3`, `3` | How far a slow interface's servers count as local when `local_interfaces` is empty; and how many of them also store each thing you share (0 to 5), so your island finds it while cut off |
 | `remote_pin_identities`, `remote_pin_quota` | `[]`, 1 GiB | Identities allowed to ask this node to pin (`pin remote add`), and the storage each may use |
 | `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
 | `keep_max_names` | `100` | Names you keep or follow for others |

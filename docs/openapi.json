@@ -7814,6 +7814,10 @@
               "type": "string"
             },
             "description": "Aliases of name keys never exported (or imported): losing one loses the name."
+          },
+          "local_servers": {
+            "type": "integer",
+            "description": "The DHT servers on this node's own island it knows of (spec section 6, \"LoRa islands\"); 0 on a node without a slow interface or local_interfaces."
           }
         },
         "required": [
@@ -7834,7 +7838,8 @@
           "used_bytes",
           "max_storage",
           "names",
-          "unexported_names"
+          "unexported_names",
+          "local_servers"
         ],
         "description": "The node's own fields (RnfsNode.status)."
       },

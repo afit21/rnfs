@@ -58,12 +58,14 @@ SECTIONS = (("core", "reticulum_dir"), ("transfers", "max_jobs"), ("mesh", "uplo
             ("names", "keep_max_names"), ("lxmf", "lxmf_enabled"), ("deny lists", "deny_lists"))
 # Feature settings' limits (their features check them): name -> (minimum, maximum or None)
 FEATURE_LIMITS = {"max_jobs": (1, None), "max_finished_jobs": (1, None), "upload_budget": (1, None),
+                  "local_hops": (1, None), "local_replicas": (0, 5),
                   "keep_max_names": (0, None), "follow_quota": (0, None), "lxmf_auto_fetch_quota": (0, None),
                   "lxmf_sync_interval": (0, None)}
 # Units of what the tables don't give one (DURATIONS are seconds, RATES bits/s)
 UNITS = {"min_rate_sample": "bytes", "record_budget": "bytes", "max_storage": "bytes", "max_download_size": "bytes",
          "remote_pin_quota": "bytes", "follow_quota": "bytes", "lxmf_auto_fetch_quota": "bytes",
-         "upload_budget": "bytes/hour", "lxmf_sync_interval": "seconds"}
+         "upload_budget": "bytes/hour", "lxmf_sync_interval": "seconds", "local_hops": "hops",
+         "local_replicas": "servers"}
 # Settings a running node applies at once when changed through the API (rnfs/features/settings.py, whose LIVE table
 # must name exactly these); every other one applies at the next start
 LIVE_SETTINGS = frozenset({
@@ -126,6 +128,10 @@ DESCRIPTIONS = {
     "serve_interfaces": "Serve /blocks only on these RNS interfaces (names or prefixes); empty: all",
     "no_serve_interfaces": "Never serve /blocks on these RNS interfaces (names or prefixes)",
     "quiet_hours": "Local times when /blocks is refused, e.g. 22:00-06:00; empty: none",
+    "local_interfaces": "Servers reached through these RNS interfaces (names or prefixes) are local; empty: those "
+                        "within local_hops over a slow interface",
+    "local_hops": "With local_interfaces empty, servers within this many hops over a slow interface are local",
+    "local_replicas": "Local servers each provided key is also stored on (at most 5); 0: none",
     "keep_max_names": "Names kept (keep and follow) for others; this node's own names don't count",
     "keeper_query": "fallback: ask keepers when a path request heard nothing; always: on every network resolve",
     "follow_quota": "Bytes a followed name's new target may hold; 0: followed names aren't fetched",
@@ -242,6 +248,12 @@ class Config:
     serve_interfaces: list[str] = field(default_factory=list)  # serve /blocks only on these (names or prefixes)
     no_serve_interfaces: list[str] = field(default_factory=list)  # never serve /blocks on these
     quiet_hours: str = ""  # local time, e.g. "22:00-06:00": /blocks is refused then; "" for none
+    # Local servers (spec section 6, "LoRa islands"): those whose path's next-hop interface is named here (names or
+    # prefixes; through a shared instance, its interfaces as rnsd's config names them), or with none named, those
+    # within local_hops over an interface below slow_bitrate. Each key is also stored on local_replicas of them
+    local_interfaces: list[str] = field(default_factory=list)
+    local_hops: int = 3
+    local_replicas: int = 3  # at most mesh.MAX_LOCAL_REPLICAS (5); 0: none
     # --- names (keepers, follow, contacts) ---
     # Names kept (keep and follow) for others; this node's own names don't count. Each is a DHT key republished
     # (at least every 3 days) and, if followed, a pin: 100 keeps a slow channel's republish airtime small

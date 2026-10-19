@@ -370,6 +370,17 @@ The DHT (local behaviour: nothing on the wire changes):
   servers, and internet nodes found island content 68–91% of the time; with the larger budget 3.7–4.4 and 99%, for
   11–19% more airtime per publish. Over the fake network of `tests/test_topology.py` (1,000 servers): 3.6 to 6.9 of
   the 10 closest. Nodes that aren't slow are unchanged (`alpha` per lookup), as is the keeper query's own budget.
+- **LoRa islands keep their own content findable** (spec section 6, "LoRa islands"; nothing on the wire changes): a
+  node with a slow interface, or naming `local_interfaces`, keeps a set of *local* servers, those whose RNS path goes
+  out on a named interface, or (none named) within `local_hops` (3) hops over an interface below `slow_bitrate`,
+  judged from the path to each server as its announces arrive and from one read of the path table every 10 minutes
+  (through `rnsd`, one RPC: a client's own path table starts empty). It also stores each key it provides on its
+  `local_replicas` (3, at most 5) closest local servers (*two-level records*: ordinary `/provide`s, withdrawn like
+  the rest), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
+  rest of the lookup. In the topology simulation an island neighbour found content during a partition 100% of the
+  time instead of 55–72%, and island-to-island lookups took 42% less airtime, for 12% more publish airtime. Fast
+  nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
+  `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
