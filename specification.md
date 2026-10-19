@@ -751,25 +751,42 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   naming closer ones until the first lookup's cap leave no fallback. A slow node paces the fallback like its
   publish lookups (rnfs: it counts as d of a round's lookups, 30 s each, and waits for that pacing only if it fits
   in the time left, else the search ends without it).
-- **Cost.** In the eclipse simulation (fast nodes, alpha 3): +0.33 `/find` per search on average (false
-  positives); a search for content nobody provides pays the fallback, about 2.5–3 times a normal lookup on top of it
-  (10,000 servers: 8.1 + 24.3 `/find`; slow nodes 5.0 + 14.4).
+- **Publishing.** A region's lookup (sweep providing, below) always runs as d disjoint paths, and each key is also
+  stored on each path's `K` closest. Each key of the region is then checked for a dense core over every server the
+  region learned; a key it flags gets a *widened lookup* of its own (with both checks, as a search), and is also
+  stored on `K` servers of each ring (from what that lookup and the region learned). The widened lookup counts as
+  one of the round's lookups: on a slow node one of its 10, a flagged key that doesn't fit waiting for a later round.
+- **Cost.** In the eclipse simulation (fast nodes, alpha 3): +0.33 `/find` per search on average (false positives),
+  about +25 messages per publish (+8 on slow nodes, d = 2), once per republish; a search for content nobody provides
+  pays the fallback, about 2.5–3 times a normal lookup on top of it (10,000 servers: 8.1 + 24.3 `/find`; slow
+  nodes 5.0 + 14.4).
+- **What it buys.** In the eclipse simulation (10–50 identities a key, fresh or pre-aged, placed tight, in the
+  `K`-th closest's radius or diluted under T): found 98.9% of the time on fast nodes (worst case 93%) and 90.8% on
+  slow ones (worst 59%), against 35–42% for 0.1.x nodes. A publisher's upgrade matters most: popular content, which
+  many provide, is protected once one of its publishers has upgraded; a 0.1.x searcher finds what such a publisher
+  stored beyond the identities only when its lookup happens to pass those servers (simulation: 60–80% against new
+  identities, which got into routing tables only where buckets had room, 14–25% against pre-aged ones). The
+  announce first-seen log beats identities generated after its servers were heard even for 0.1.x searchers
+  (simulation: 88% against 61%), and nothing against identities made long before.
 
 **Publishing.**
 - For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node
   the keys it should store, in as few `/provide` requests as the batch size allows (section 3), one at a time
   over a separate identified link closed afterwards. A publisher MAY send to several nodes at once, each over its
   own link and in its own order (rnfs: up to 16 on nodes that aren't slow; a slow node one at a time).
-- **The store set.** A node SHOULD store each key on its `K` closest found as above, and also on the `K` servers
-  closest to the key in its announce first-seen log that it first heard at least `provider_seniority` ago (rnfs:
-  and has heard within 2 × `announce_interval`, as `/find` replies leave out servers silent that long; not banned;
-  in private mode, members only). Without an attack these are mostly the same servers, so it costs little; against
-  identities generated next to a key it keeps the record where they can't take its place. A key's store set is the
-  union, without duplicates; every server stored to is recorded, so withdrawals reach all of them. A key whose
-  lookup found no server isn't stored this round (rnfs: retried 30 s later).
+- **The store set.** A node SHOULD store each key on its `K` closest found as above (rnfs: and on each disjoint
+  path's `K` closest, and when the density check flags the key, on `K` servers of each ring: above), and also on
+  the `K` servers closest to the key in its announce first-seen log that it first heard at least
+  `provider_seniority` ago (rnfs: and has heard within 2 × `announce_interval`, as `/find` replies leave out servers
+  silent that long; not banned; in private mode, members only). Without an attack these are mostly the same
+  servers, so it costs little; against identities generated next to a key it keeps the record where they can't
+  take its place. A key's store set is the union, without duplicates; every server stored to is recorded, so
+  withdrawals reach all of them. A key whose lookup found no server isn't stored this round (rnfs: retried 30 s
+  later).
 - **Sweep providing** finds the `K` closest of many keys with one lookup per *region*. It is local behaviour:
   only which `/find` queries a publisher sends changes, and how it groups its `/provide`s. Take the due keys in
-  turn; for the first not yet covered, x, run the closest-nodes lookup. Let p be the length of the prefix x shares
+  turn; for the first not yet covered, x, run the closest-nodes lookup (rnfs: as disjoint paths, all they learn
+  counting). Let p be the length of the prefix x shares
   with the farthest of the `K` closest found (of all found with fewer; 0 with none): the region is every due key
   sharing x's first p bits. Every server closer to x than that one shares those bits, so a region holds at least
   `K` servers and each of its keys has its `K` closest inside it. The lookup knows the half of the region holding
@@ -799,9 +816,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   is providing to that node in the same round, and cancels the withdrawals still queued for a key when it
   provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
-  (rnfs: at most 10 region lookups per publish round, each publishing every due key of its region, and after a
-  round of n lookups the next waits 30 × n s, as does a search's fallback; items never published go first, then
-  those unpublished longest).
+  (rnfs: at most 10 region and widened lookups per publish round, each region lookup publishing every due key of
+  its region, and after a round of n lookups the next waits 30 × n s, as does a search's fallback; items never
+  published go first, then those unpublished longest).
   It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
   unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
   rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server

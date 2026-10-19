@@ -637,8 +637,8 @@ class RnfsNode:
         # The network size estimate of the density check (section 6), from recent complete lookups; saved with the
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))
-        # Which lookups searching runs (section 6): density-checked searches with the senior rule, falling back to
-        # disjoint paths (paced like publish lookups on slow nodes)
+        # Which lookups searching and publishing run (section 6): density-checked searches with the senior rule,
+        # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths
         self.lookups = Lookups(self._wired_lookup, self._start_nodes, self.sizes,
                                lambda key: self._senior_servers(key, None),
                                SLOW_DISJOINT_PATHS if slow else DISJOINT_PATHS,
@@ -688,9 +688,11 @@ class RnfsNode:
                                                make_room=self._make_room, scores=self.scores))
         # Saved by its own refreshes and publish loop
         self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client,
-                                                   self._closest_lookup, slow, config.state_dir,
+                                                   self.lookups.publish, slow, config.state_dir,
                                                    cached_eligible=self._eligible_targets,
                                                    generation=self._provide_generation), batched=False)
+        # A key the density check flags on its region's servers gets a widened lookup and K more stores per ring
+        self.publisher.set_widening(self.lookups.flags, self.lookups.widen)
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)
         self.publisher.add_store_part(self._senior_servers)
         # Saves its state itself, and at stop (names.stop)
@@ -905,10 +907,6 @@ class RnfsNode:
         nearest = fresh + [n for n in self.routing.closest(key, 2 * K) if n not in fresh]
         reliable = [n for n in nearest if not self.routing.unreliable(n)]
         return (reliable + [n for n in nearest if n not in reliable])[:K]
-
-    def _closest_lookup(self, key: bytes) -> Lookup:
-        """A closest-nodes lookup for key from the routing table (publishing's)."""
-        return self._wired_lookup(key, self._start_nodes(key))
 
     def _wired_lookup(self, key: bytes, start: list[bytes], **options) -> Lookup:
         """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths)."""

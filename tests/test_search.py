@@ -1,4 +1,5 @@
-"""Tests for the lookups a node runs (rnfs/dht/lookups.py): the provider search's fallback to disjoint paths."""
+"""Tests for the lookups a node runs (rnfs/dht/lookups.py): the provider search's fallback to disjoint paths, and the
+publisher's disjoint region lookups and widened lookups."""
 import os
 import random
 import tempfile
@@ -12,6 +13,7 @@ from rnfs.dht.lookup import Lookup
 from rnfs.dht.lookups import Lookups, Search
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
+from rnfs.dht.sweep import Region
 from rnfs.publisher import SLOW_LOOKUP_PACE, Publisher
 from tests.fakes.client import FakeClient
 from tests.fakes.log import quiet_log
@@ -119,7 +121,7 @@ class SearchTest(unittest.TestCase):
 
 
 class LookupsTest(LookupTestCase):
-    """Lookups: what a node runs for searching."""
+    """Lookups: what a node runs for searching, publishing and widening."""
 
     def setUp(self):
         """An attacked network and a node's table and size estimate over it."""
@@ -158,9 +160,32 @@ class LookupsTest(LookupTestCase):
         self.assertLessEqual(search.first.sent + search.second.sent, search.first.max_queries)
         self.assertEqual(search.second.paths[0].max_queries, (search.first.max_queries - search.first.sent) // 3)
 
+    def test_publish_flags_and_widens(self):
+        lookup = self.lookups.publish(self.key)
+        self.assertEqual(len(lookup.paths), 3)
+        self.assertIsNone(lookup.paths[0].size)  # the region's lookup isn't checked itself
+        closest = lookup.find_closest()
+        region = Region(self.key, 0, closest, lookup.candidates(), paths=lookup.path_candidates())
+        self.assertTrue(self.lookups.flags(self.key, region))
+        ring = self.lookups.widen(self.key, region)
+        self.assertGreaterEqual(len(ring), K)
+        self.assertFalse(set(ring) & self.net.liars)
+        self.assertTrue(set(ring) & set(self.net.honest_closest(self.key, 3 * K)))
+        # An honest key elsewhere isn't flagged
+        other = random.Random(44).randbytes(ID_LENGTH)
+        lookup = self.lookups.publish(other)
+        region = Region(other, 0, lookup.find_closest(), lookup.candidates())
+        self.assertFalse(self.lookups.flags(other, region))
+
     def test_no_check_before_the_estimate_warms_up(self):
         lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), SizeEstimate(), lambda key: [])
         self.assertIsNone(lookups.search(self.key).first.size)
+        self.assertFalse(lookups.flags(self.key, Region(self.key, 0, [], {n: False for n in self.net.liars})))
+
+    def test_one_path_is_a_plain_lookup(self):
+        lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes, lambda key: [], 1)
+        self.assertIsInstance(lookups.publish(self.key), Lookup)
+
 
 
 class PacingTest(unittest.TestCase):

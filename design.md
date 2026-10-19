@@ -138,7 +138,7 @@ rnfs/
                       density check's rings (section 6)
     density.py        SizeEstimate: the network size from recent lookups; the density check and its rings (6)
     disjoint.py       DisjointLookup: one lookup over paths that share no node (section 6)
-    lookups.py        Lookups: which lookups searching runs; Search: the fallback to disjoint paths (section 6)
+    lookups.py        Lookups: which lookups searching and publishing run; Search: the fallback to disjoint paths (6)
     sweep.py          sweep providing: regions of due keys, the far half's extra /find, Sweep (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
@@ -474,13 +474,16 @@ the node; `remaining`, `allow_unknown` (the first path's budget), `listing_nodes
 
 `lookups.py` — `Lookups(new_lookup, start, sizes, seniors, paths=DISJOINT_PATHS, pace=None)`: the node's recipe.
 `search(key)` is a `Search` whose first lookup has `size=sizes.estimate(key)` and `seniors=seniors(key)` and whose
-fallback is `_disjoint(key, size, seniors, time left, queries left)` (a plain Lookup for one path; the queries
-left, the first lookup's `max_queries` less what it sent (`Lookup.sent`), split among the paths, and no fallback
-when that leaves a path none). `Search(first, fallback, pace)` quacks like a Lookup: `find_providers` runs the first
-lookup (the fallback once escalated), then, if no provider was ever reported, time and queries are left and
-`should_stop` is False, waits for `pace()` (slow nodes: `Publisher.pace_lookups`) only while the wait fits in the
-time left, and runs the fallback; providers are passed on once each across both. So a search sends at most
-`MAX_QUERIES` `/find` in all, as before (DHT-1). `DISJOINT_PATHS` 3, `SLOW_DISJOINT_PATHS` 2.
+fallback is `_disjoint(key, size, seniors, time left, queries left)` (the queries left, the first lookup's
+`max_queries` less what it sent (`Lookup.sent`), split among the paths, and no fallback when that leaves a path
+none); `publish(key)` is `_disjoint(key)` (no checks: the region's keys are checked one by one afterwards);
+`flags(key, region)` runs `dense_core` over the region's nodes; `widen(key, region)` runs a `Lookup` with both checks
+for the key and returns `K` of each ring from its candidates and the region's. `_disjoint` gives a plain Lookup for
+one path. `Search(first, fallback, pace)` quacks like a Lookup: `find_providers` runs the first lookup (the fallback
+once escalated), then, if no provider was ever reported, time and queries are left and `should_stop` is False,
+waits for `pace()` (slow nodes: `Publisher.pace_lookups`) only while the wait fits in the time left, and runs the
+fallback; providers are passed on once each across both. So a search sends at most `MAX_QUERIES` `/find` in all, as
+before (DHT-1). `DISJOINT_PATHS` 3, `SLOW_DISJOINT_PATHS` 2.
 
 `sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
 the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when
@@ -495,7 +498,10 @@ estimate)` is one round's bookkeeping, under a condition: `take()` gives the nex
 neither covered nor inside a claim and claims the keys sharing `estimate − 1` of its bits (everything before any
 region is known, so the first lookup runs alone), waiting while every key left is claimed; `cover(region)` covers
 the region's uncovered keys (a bisect over the sorted keys), releases the claim and updates `estimate`;
-`members`, `release`, `stop`.
+`members`, `release`, `stop`. With disjoint paths, `find_region` also keeps each path's candidates
+(`Region.paths`, from `path_candidates()`), and `Region.path_closest(key)` gives each path's K closest together; the
+publisher fills `Region.rings` (key -> ring servers of its widened lookup) and `Region.deferred`. `Sweep.spend(limit)`
+counts a widened lookup if the round's lookups (`lookups`: regions plus `widened`) are under `limit`.
 
 `scores.py` — `Scores(state_dir=None, seeded=(), clock=time.time, max_rows=MAX_SCORES)`, a `node.Store`:
 `score(node_id)` (0 without a row), `band(node_id)`, `bands()`, and `served`, `useful_answer`, `failed`,
@@ -652,9 +658,14 @@ region's p to the next round. Each item's store set (`_store_set`) is its K clos
 (`Region.closest_to`), then each part added by `add_store_part(part)`, a `(key, region) -> servers` called without
 the lock after the lookups (the node adds `_senior_servers`: `first_seen.closest(key, K, min_age=provider_seniority,
 exclude=banned or, in private mode, not a member, heard_within=2 × announce_interval)`), without duplicates; an item
-whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The round's result counts `lookups`
-and `finds` (extra `/find`). `pace_lookups(count)` lets lookups outside publishing (a slow node's search fallback)
-take their share of the slow-node pacing: 0.0 and `_next_lookup` moved on by `count` × `SLOW_LOOKUP_PACE`, or the
+whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The store set also takes each
+disjoint path's K closest (`Region.path_closest`) and the ring servers of a widened lookup (`Region.rings`):
+`set_widening(flags, widen)` (the node passes `Lookups.flags` and `Lookups.widen`) has each lookup thread, once its
+region is covered, check the keys it covered (`_widen`) and run the widened lookup of each flagged one within the
+round's limit (`Sweep.spend`; a key over it goes in `Region.deferred` and isn't published this round, so it stays
+due). The round's result counts `lookups`, `finds` (extra `/find`) and `widened`; slow nodes' pacing counts the
+widened lookups with the regions. `pace_lookups(count)` lets lookups outside publishing (a slow node's search
+fallback) take their share of that pacing: 0.0 and `_next_lookup` moved on by `count` × `SLOW_LOOKUP_PACE`, or the
 seconds to wait. The `/provide`s go to up to `PROVIDE_PARALLEL` (16) servers at once on
 `rnfs-publish-provide` threads (one at a time, in the publishing thread, on slow nodes): `_in_order` runs `send`
 (which reads the withdrawals still queued for the server under the lock, then calls `client.provide`, one identified
@@ -1813,12 +1824,13 @@ Everything in the specification is implemented, with these simplifications and a
   saved.
 - Lookups (`RnfsNode._start_nodes`) start from the closest nodes `/find` replies would give, then others to make
   up K, then unreliable ones if still short; answers go to `RoutingTable.answered`, failures to `failed`, and the
-  join's lookup is wired the same way. A failed `/provide` or `/blocks` isn't counted there. Provider searches
-  (`_lookup`: the fetcher, keeper queries, `providers`, remote pin checks) are `RnfsNode.lookups.search`es
-  (`Lookups`, wired through `_wired_lookup`) with the density check and the senior rule (`_senior_servers`),
-  falling back to disjoint paths when they find no provider (on slow nodes paced by `_pace_fallback`,
-  `Publisher.pace_lookups`); publishing's lookups (`_closest_lookup`) have neither. `RnfsNode.sizes` is the size
-  estimate (`SizeEstimate`, a batched store); every complete lookup's run feeds it.
+  join's lookup is wired the same way. A failed `/provide` or `/blocks` isn't counted there. Which lookups run is
+  `RnfsNode.lookups` (`Lookups`, wired through `_wired_lookup`): provider searches (`_lookup`: the fetcher, keeper
+  queries, `providers`, remote pin checks) are `Search`es with the density check and the senior rule
+  (`_senior_servers`), falling back to disjoint paths when they find no provider (on slow nodes paced by
+  `_pace_fallback`, `Publisher.pace_lookups`); publishing's region lookups are `Lookups.publish`, and
+  `Lookups.flags`/`widen` its widening. `RnfsNode.sizes` is the size estimate (`SizeEstimate`, a batched store);
+  every complete lookup's run feeds it.
 - Joining (`RnfsNode._join`, `join`): the join's candidates (`join_candidates`: up to `SAVED_JOIN_TRIES` (6)
   servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
   first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with
@@ -1831,7 +1843,8 @@ Everything in the specification is implemented, with these simplifications and a
   checks `RoutingTable.live_count()` every `REJOIN_DELAY` (300 s) and joins again while it is under
   `MIN_SERVERS` (3), doubling the wait up to `announce_interval`. `DEFAULT_BOOTSTRAP_NODES` lives in
   `rnfs/constants.py` and changes only with a release; the e2e test turns it off (`default_bootstrap = false`).
-- Publishing runs one closest-nodes lookup per region of due keys (sweep providing), up to 4 at once
+- Publishing runs one closest-nodes lookup per region of due keys (sweep providing; each over 3 disjoint paths, 2 on
+  slow nodes, plus a widened lookup for each key the density check flags), up to 4 at once
   (`PUBLISH_LOOKUPS`, on `rnfs-publish-lookup` threads), and sends `/provide` to up to 16 servers at once
   (`PROVIDE_PARALLEL`); slow nodes do both one at a time. `/provide` requests are batched per node, in the same
   batches one at a time would build. The airtime controls apply to `/blocks` only. Slow nodes pace region lookups

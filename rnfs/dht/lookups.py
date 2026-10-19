@@ -11,16 +11,20 @@ No RNS dependency: the node gives Lookups (its routing table, client and callbac
   waits for the pacing (pace) if that fits in the time left, and is skipped otherwise. In the eclipse simulation
   this kept a normal search's cost at +0.36 /find while content was found 98.9% of the time under attack; a search
   for content nobody provides pays the fallback, about 2.5-3 times a normal lookup.
+- **Publishing** (Lookups.publish: a region's lookup, rnfs.dht.sweep): always disjoint paths, without the checks;
+  then each key of the region is checked (flags) over the servers the paths learned, and a key flagged gets a
+  widened lookup of its own (widen: one Lookup with both checks), whose ring servers it is stored on too.
 """
 import threading
 from collections.abc import Callable
 
+from rnfs.constants import K
 from rnfs.dht import density
 from rnfs.dht.disjoint import DisjointLookup
 from rnfs.dht.lookup import Lookup, NodeCallback
 from rnfs.dht.routing import distance
 
-DISJOINT_PATHS = 3  # paths of a search's fallback (eclipse simulation: 4 added under 1 point)
+DISJOINT_PATHS = 3  # paths of a publisher's lookups and a search's fallback (eclipse simulation: 4 added under 1 point)
 SLOW_DISJOINT_PATHS = 2  # on slow nodes, whose every /find costs seconds of airtime
 
 # new_lookup(key, start nodes, **Lookup options) -> a Lookup wired to the node (routing table, client, callbacks)
@@ -138,7 +142,7 @@ class Search:
 class Lookups:
     """The node's recipe for lookups: new_lookup makes a Lookup wired to it, start(key) gives the start nodes,
     seniors(key) the senior servers (the announce first-seen log's), sizes the size estimate (fed by every complete
-    lookup); paths disjoint paths per fallback; pace (slow nodes) paces the fallback."""
+    lookup); paths disjoint paths per publish lookup and fallback; pace (slow nodes) paces the fallback."""
 
     def __init__(self, new_lookup: NewLookup, start: Callable[[bytes], list[bytes]], sizes: density.SizeEstimate,
                  seniors: Callable[[bytes], list[bytes]], paths: int = DISJOINT_PATHS,
@@ -156,6 +160,31 @@ class Lookups:
         size, seniors = self.sizes.estimate(key), self.seniors(key)
         first = self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note)
         return Search(first, lambda left, queries: self._disjoint(key, size, seniors, left, queries), self.pace)
+
+    def publish(self, key: bytes) -> Lookup | DisjointLookup:
+        """A region's closest-nodes lookup for key, over disjoint paths."""
+        return self._disjoint(key)
+
+    def flags(self, key: bytes, region) -> bool:
+        """The density check for key over what its region's lookup learned (a sweep.Region)."""
+        size = self.sizes.estimate(key)
+        if size is None:
+            return False
+        distances = sorted(distance(node_id, key) for node_id in region.nodes)
+        return density.dense_core(distances, size) > 0
+
+    def widen(self, key: bytes, region) -> list[bytes]:
+        """The widened lookup of a key that flags() flagged: a Lookup with both checks, so it finds and asks the
+        servers beyond the dense core. Returns K servers of each ring, from what it and the region learned."""
+        size = self.sizes.estimate(key)
+        lookup = self.new_lookup(key, self.start(key), size=size, seniors=self.seniors(key),
+                                 on_complete=self.sizes.note)
+        lookup.find_closest()
+        nodes = dict(region.nodes)
+        for node_id, last in lookup.candidates().items():
+            nodes[node_id] = nodes.get(node_id, True) and last
+        ranked = sorted(nodes, key=lambda n: distance(n, key))
+        return density.rings(ranked, [distance(n, key) for n in ranked], size, K, later=nodes.__getitem__)
 
     def _disjoint(self, key: bytes, size: float | None = None, seniors: list[bytes] | tuple = (),
                   timeout: float | None = None, queries: int | None = None) -> Lookup | DisjointLookup | None:
