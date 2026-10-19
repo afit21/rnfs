@@ -134,7 +134,9 @@ rnfs/
     scores.py         Scores: local scores per peer, decay, bootstrap seeds, the capped saved table (section 6)
     firstseen.py      FirstSeenLog: when each server's announce was first heard; closest old servers (section 6)
     providers.py      ProviderStore: records on disk, TTL, record budget and storage tiers, /find replies (section 6)
-    lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
+    lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget, the senior rule and the
+                      density check's rings (section 6)
+    density.py        SizeEstimate: the network size from recent lookups; the density check and its rings (6)
     sweep.py          sweep providing: regions of due keys, the far half's extra /find, Sweep (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
@@ -417,8 +419,8 @@ after every test.
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
-unreliable, may_retry, max_queries, on_useful)` with `find_closest() -> list[bytes]` and
-`find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run (`_iterate`)
+unreliable, may_retry, max_queries, on_useful, size, seniors, on_complete)` with `find_closest() -> list[bytes]`
+and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run (`_iterate`)
 ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"), or after
 `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit length of the beta-th closest known
 distance (`_reach`) unchanged ("no progress"). A run ranks the nodes `unreliable` named when it learnt of them
@@ -436,6 +438,24 @@ whether it ranks last, plus the answers that came after the run ended (a run tha
 the workers keep every answer about the key in `_replies`), and `ask(node, key)` sends one more `/find` about a
 nearby key within the deadline, counted through `on_answer`/`on_failure` (a node still out at the deadline stays
 out of the candidates, `_out`) and merging the nodes it names.
+The checks against identities placed next to a key (section 6) live in the run too: `seniors` (the announce
+first-seen log's senior servers, added to the known nodes) and `size` (the size estimate, which turns the density
+check on) make `required()` name the nodes that must answer besides the `beta` closest: the `beta` closest seniors
+known, and `RING_ANSWERS` of each ring beyond a dense core (`density.rings` over the known nodes by distance,
+unreliable ones last; `dense` notes that it fired). They are queried among the window's nodes in rank order; those
+sent outside the window (`extras`) count towards `max_queries` but never against the stall rule.
+`on_complete(key, kth)` is told the K-th closest known distance after each run that ended "complete" (`ended`
+holds how the last run ended); the size estimate samples it.
+
+`density.py` — `SizeEstimate(state_dir=None, samples=16, minimum=8)`, a `node.Store`: `note(key, kth)` keeps the
+latest sample per key, at most `samples` (an `OrderedDict`, least recent first); `estimate(key=None)` is (K − 1/3)
+× 2^128 over the median of the samples of other keys, None below `minimum`. Saved as one blob (key and d_K, 32 bytes
+a sample) in the `meta` table (`size_estimate`, `samples`) with the batched saves, only when changed; a malformed
+blob is ignored. It imports the state database only when given a state directory, since lookups import this module
+and `rnfs.statedb` loads RNS. `dense_core(distances, size)` (last rank j >= K closer than j × 2^128 / (T × size),
+stopping past 2K once a rank lies 4 times further out), `radius(size)` and `rings(nodes, distances, size, count,
+later)`: `count` from the rank after the core and from the first node beyond the radius, each ring reordered so
+`later` nodes come last, without duplicates. `DENSITY_THRESHOLD` (2), `RING_ANSWERS` (5).
 
 `sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
 the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when
@@ -1706,7 +1726,8 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   token itself is never stored) and when it was added; FULL, each change written at once; a row that doesn't
   parse is deleted at load);
 - `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
-  requires; each box's `next_id`) and `migrated` (JSON files imported).
+  requires; each box's `next_id`; 0.2.0: `size_estimate`'s `samples`, the density check's last 16 size samples,
+  written with the batched saves when changed) and `migrated` (JSON files imported).
 - Schema steps of 0.2.0 that rewrite rows: `lxmf_app_pins` turns every valid `lxmf:<address>` pin into
   `app:lxmf:<address>` (a case-sensitive `GLOB` spelt out, so an invalid one is still deleted at load;
   `storage.import_pins` does the same to an older `pins.json`, imported after the steps).
