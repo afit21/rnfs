@@ -572,9 +572,8 @@ def _routes(values) -> tuple[tuple[str, str], ...]:
 @dataclass(frozen=True)
 class Capabilities(_Object):
     """What the node offers (capabilities()): its version, its capabilities (api.CAPABILITIES: "events",
-    "pin_label", "config", ...), the API routes ((method, path)), the features loaded, the event kinds, the
-    error codes and the deprecated features (they still work, but a later release removes them: "lxmf"). Empty
-    from a daemon before 0.2.0, which can't say: every has() is False."""
+    "pin_label", "config", ...), the API routes ((method, path)), the features loaded, the event kinds and the
+    error codes. Empty from a daemon before 0.2.0, which can't say: every has() is False."""
 
     version: str | None = None
     capabilities: frozenset[str] = _field(frozenset, frozenset())
@@ -582,15 +581,10 @@ class Capabilities(_Object):
     features: tuple[str, ...] = _field(tuple, ())
     event_kinds: tuple[str, ...] = _field(tuple, ())
     error_codes: tuple[str, ...] = _field(tuple, ())
-    deprecated: tuple[str, ...] = _field(tuple, ())
 
     def has(self, capability: str) -> bool:
         """Whether the node offers capability."""
         return capability in self.capabilities
-
-    def is_deprecated(self, feature: str) -> bool:
-        """Whether feature is deprecated: it still works, but a later release removes it."""
-        return feature in self.deprecated
 
 
 def _frozen(value):
@@ -606,8 +600,7 @@ class Setting(_Object):
     """One setting (config()): its schema (rnfs.config.settings_schema: name, group, type, choices, nullable,
     default, unit, minimum, maximum, exclusive_minimum, description, live: a change applies without a restart),
     the running value, rnfs.toml's (file; None where it doesn't set it), whether the command line (a Node's
-    settings) overrides rnfs.toml, and whether a restart would run another value (pending); deprecated: why the
-    setting is going away though it still works (the lxmf_* settings), else None. Lists are tuples."""
+    settings) overrides rnfs.toml, and whether a restart would run another value (pending). Lists are tuples."""
 
     name: str
     group: str | None = None
@@ -625,7 +618,6 @@ class Setting(_Object):
     file: object = _field(_frozen, None)
     overridden: bool = False
     pending: bool = False
-    deprecated: str | None = None  # last, after the fields a caller may give by position
 
     def __str__(self) -> str:
         """The setting's name."""
