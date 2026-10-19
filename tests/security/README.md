@@ -97,6 +97,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | L6 | `test_l6_gateway_storage_oracle.py` | `rnfs/gateway.py`, `rnfs/gateway_formats.py` (`?format=`) | `a678443`, `3265621`, `4a765d4` (documented limit) |
 | NEW-7 | `test_new7_api_status_open.py` | `rnfs/api.py` (`GET /api/status`), `rnfs/cli.py` | `863f0b7` |
 | none (CORS) | `test_gateway_cors.py` | `rnfs/gateway.py`, `rnfs/gateway_formats.py` | `d77be66` |
+| none (site hosts) | `test_gateway_site_hosts.py`; also `tests/test_gateway_sites.py` | `rnfs/gateway.py` (`parse_host`, `serve_site`, the site CSP), `rnfs/content/cid.py` (`from_base36`) | `1883af2` (built with the subdomain gateway, 0.2.0) |
 | none (headers) | `test_response_headers.py` | `rnfs/gateway.py` (`?filename=`), `rnfs/api.py` (`no-store`, `nosniff`) | `bfe9bc7` (test; pins existing behaviour) |
 | API-2 | `test_api2_proof_first.py` | `rnfs/apiclient.py` (`verify_daemon`, `PROOF_TIMEOUT`) | `dda4603` |
 | API-3 | none: documented only (the proof keep-open, specification section 11) | none | `feba0f0` (docs) |

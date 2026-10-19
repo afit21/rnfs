@@ -347,7 +347,9 @@ rnfs get <cid> --from <node ID>         # ask a node you know has it, without th
 ```
 
 In a browser, `http://127.0.0.1:8789/rnfs/<cid>/` shows a directory's listing or its `index.html`, so a folder
-with a website in it works as a site.
+with a website in it works as a site. `rnfs url <cid>` prints its address on a subdomain of its own,
+`http://k….rnfs.localhost:8789/`, where its pages can also read its files with `fetch()` (names:
+`http://<name>.name.localhost:8789/`).
 
 ### 3. Share files
 
@@ -461,8 +463,8 @@ fixed limits; set `lxmf_accept_from` if strangers' messages aren't wanted.
 
 # Commands
 
-Every command except `daemon` talks to the running daemon, so run them as the daemon's user. `--dir DIR` and
-`--api-port N` pick another daemon; `rnfs <command> --help` shows every option. A **target** is
+Every command except `daemon` and `url` talks to the running daemon, so run them as the daemon's user.
+`--dir DIR` and `--api-port N` pick another daemon; `rnfs <command> --help` shows every option. A **target** is
 `<cid>[/path]` or `<contact>/path`; where a node ID is expected, a node contact's nick works too.
 
 | Command | Description |
@@ -474,6 +476,7 @@ Every command except `daemon` talks to the running daemon, so run them as the da
 | `rnfs get TARGET [-o OUT] [--from NODE_ID] [--background]` | Fetch and write out a file or directory |
 | `rnfs cat TARGET [--offset N] [--length N]` | Write a file, or part of one, to stdout |
 | `rnfs ls TARGET` / `stat TARGET` | List a directory / size and how much is stored locally |
+| `rnfs url TARGET` | The target's gateway site URL (`http://k….rnfs.localhost:8789/`; a name's too); needs no daemon |
 | `rnfs dir set TARGET NAME CID` / `dir rm TARGET/NAME` | Make a copy of a directory with an entry added, replaced or removed |
 | `rnfs export TARGET -o FILE` / `import FILE` | Write or import an archive (USB sticks, sneakernet) |
 | `rnfs pin add TARGET` / `pin rm CID` / `pin ls` | Fetch and pin / unpin / list pins, their sources and where they came from |
@@ -502,7 +505,9 @@ you can open; `--raw` gives the stored bytes, which is what scripts that show co
 **Gateway** (`http://127.0.0.1:8789`): `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and
 directories; `?filename=` sets the type and download name; `?format=raw` and `?format=archive` return data you
 can check against the CID. Pages are sandboxed and can't read the gateway's responses, and sealed files are
-never decrypted there.
+never decrypted there. Each CID and name also has a site of its own, `http://<k-cid>.rnfs.localhost:8789/[path]`
+(`rnfs url <cid>` prints it) and `http://<name>.name.localhost:8789/[path]`, whose pages can read their own
+files; browsers resolve `*.localhost` themselves, other tools should use the paths above.
 
 # Building apps on rnfs
 

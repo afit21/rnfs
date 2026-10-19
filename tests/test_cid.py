@@ -10,7 +10,7 @@ from RNS.vendor import umsgpack
 
 from rnfs.constants import ID_LENGTH
 from rnfs.content import cid as cid_module
-from rnfs.content.cid import DAG, EMPTY_DIRECTORY, EMPTY_DIRECTORY_BLOCK, EMPTY_FILE, RAW, Cid
+from rnfs.content.cid import DAG, EMPTY_DIRECTORY, EMPTY_DIRECTORY_BLOCK, EMPTY_FILE, RAW, Cid, from_base36, to_base36
 
 HELLO_WORLD = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
 EMPTY = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
@@ -164,6 +164,94 @@ class CidTest(unittest.TestCase):
     def test_ordering(self):
         a, b = sorted([Cid.for_block(RAW, b"1"), Cid.for_block(RAW, b"2")])
         self.assertLess(a.binary, b.binary)
+
+
+def base36(binary: bytes) -> str:
+    """binary as "k" + lowercase base36, as IPFS's multibase base36 writes it (base-x: one "0" per leading zero
+    byte), computed digit by digit from the bytes, independently of rnfs.content.cid."""
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    digits = []  # least significant first
+    for byte in binary:
+        carry = byte
+        for i, digit in enumerate(digits):
+            carry += digit * 256
+            digits[i], carry = carry % 36, carry // 36
+        while carry:
+            digits.append(carry % 36)
+            carry //= 36
+    zeros = len(binary) - len(binary.lstrip(b"\0"))
+    return "k" + "0" * zeros + "".join(alphabet[d] for d in reversed(digits))
+
+
+class Base36Test(unittest.TestCase):
+    """The gateway's host-only form: "k" + base36, exact length and canonical, never accepted by Cid.parse."""
+
+    def test_round_trips_and_lengths(self):
+        rng = random.Random(36)
+        for codec, length in ((RAW, 56), (DAG, 60)):
+            for block in [b"", b"a"] + [rng.randbytes(20) for _ in range(200)]:
+                value = Cid.for_block(codec, block)
+                text = to_base36(value)
+                self.assertEqual(text, base36(value.binary))
+                self.assertEqual(len(text), length)
+                self.assertLessEqual(len(text), 63)  # one DNS label
+                parsed = from_base36(text)
+                self.assertEqual(parsed, value)
+                self.assertEqual(str(parsed), str(value))  # the written form is base32, as always
+
+    def test_every_digest_takes_the_same_length(self):
+        # The smallest and largest digest of each prefix: the prefix alone fixes the number of digits
+        for prefix, length in ((bytes.fromhex("01551220"), 56), (bytes.fromhex("018080c0011220"), 60)):
+            for digest in (bytes(32), b"\xff" * 32):
+                self.assertEqual(len(to_base36(Cid.from_bytes(prefix + digest))), length)
+                self.assertEqual(from_base36(base36(prefix + digest)).binary, prefix + digest)
+
+    def test_parse_never_takes_the_host_form(self):
+        for codec in (RAW, DAG):
+            text = to_base36(Cid.for_block(codec, b"x"))
+            with self.assertRaises(ValueError):
+                Cid.parse(text)
+            self.assertFalse(cid_module.is_valid(text))
+            with self.assertRaises(ValueError):
+                Cid.from_block_name(text)
+
+    def test_rejects_everything_else(self):
+        raw = to_base36(Cid.for_block(RAW, b"x"))
+        node = to_base36(Cid.for_block(DAG, b"x"))
+        digest = bytes(32)
+        bad = {
+            "not a string": raw.encode(), "none": None, "empty": "", "k alone": "k",
+            "base32 CID": HELLO_WORLD, "uppercase": raw.upper(), "uppercase body": "k" + raw[1:].upper(),
+            "uppercase K": "K" + raw[1:], "one uppercase digit": raw[:10] + raw[10].upper() + raw[11:],
+            "wrong multibase": "b" + raw[1:], "no multibase": raw[1:],
+            "one short": raw[:-1], "one long": raw + "0", "dag one short": node[:-1], "dag one long": node + "0",
+            "leading zero": "k0" + raw[1:-1], "leading zeros, dag": "k00" + node[1:-2],
+            "underscore": raw[:20] + "_" + raw[21:], "plus sign": "k+" + raw[2:], "minus sign": "k-" + raw[2:],
+            "space": raw[:-1] + " ", "leading space": " " + raw, "trailing newline": raw + "\n",
+            "non-ascii digit": raw[:-1] + "\u0663", "fullwidth digit": raw[:-1] + "\uff11",
+            "dot": raw[:-1] + ".", "too large": "k" + "z" * 55, "too large, dag": "k" + "z" * 59,
+            "dag-pb codec": base36(bytes([1, 0x70, 0x12, 0x20]) + digest),
+            "wrong hash": base36(bytes([1, 0x55, 0x13, 0x20]) + digest),
+            "short digest": base36(bytes([1, 0x55, 0x12, 0x20]) + digest[:31]),
+            "long digest": base36(bytes([1, 0x55, 0x12, 0x20]) + digest + b"\0"),
+            "CIDv0-like": base36(bytes([0, 0x55, 0x12, 0x20]) + digest),
+            "leading zero byte": base36(b"\0" + bytes([1, 0x55, 0x12, 0x20]) + digest[:31]),
+        }
+        for reason, value in bad.items():
+            with self.subTest(reason):
+                with self.assertRaises(ValueError):
+                    from_base36(value)
+        # Every one-digit change of a valid form: accepted only if it is canonical and another CID's form
+        rng = random.Random(5)
+        for text in (raw, node):
+            for _ in range(300):
+                i = rng.randrange(1, len(text))
+                changed = text[:i] + rng.choice("0123456789abcdefghijklmnopqrstuvwxyzK_ .") + text[i + 1:]
+                try:
+                    value = from_base36(changed)
+                except ValueError:
+                    continue
+                self.assertEqual(to_base36(value), changed)
 
 
 if __name__ == "__main__":

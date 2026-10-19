@@ -84,6 +84,16 @@ Added, for apps:
   labels, the cache, settings, streams). A Node raises what a Client gets back.
 - **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
+- **Gateway sites, an origin per root:** `http://<k-cid>.rnfs.localhost:8789/<path>` serves `<cid>/<path>` and
+  `http://<name>.name.localhost:8789/<path>` the name's target, so a page can `fetch()` files of its own DAG.
+  `<k-cid>` is the CID as `k` + base36 (56 or 60 characters: an rnfs-dag CID's usual form is too long for a
+  DNS label), accepted in these hosts only (`rnfs.content.cid.to_base36`); ETags, listings and logs still show
+  the usual base32 CID. Site responses keep the page's origin (`sandbox allow-same-origin …`), can be framed
+  only by their own origin, and carry `Origin-Agent-Cluster: ?1`; service worker scripts (403) and `?format=`
+  (400) are refused there, and paths are DAG paths only. Browsers resolve `*.localhost` themselves; other tools
+  should keep using the path gateway, which is unchanged. All `*.rnfs.localhost` sites share cookies (as do all
+  `*.name.localhost` sites): neither the gateway nor the API uses them. `rnfs url <cid>|<name>[/path]` prints a
+  target's site URL.
 
 Added:
 - **Name key backups:** losing a name's key loses the name for good. `rnfs name create` and `rnfs name import`

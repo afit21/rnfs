@@ -240,6 +240,38 @@ class OtherCommandTest(CliTestCase):
         code, _, err = self.run_cli("cache", "rm", cid)
         self.assertEqual((code, err.strip()), (1, f"rnfs: {cid} is not in the cache"))
 
+    def test_url(self):
+        """url prints a target's site URL, from the base32 CID or a name, for the running daemon's gateway port
+        or else rnfs.toml's; nicks and invalid targets are refused. It never calls the daemon."""
+        from rnfs.content.cid import to_base36
+        raw = str(Cid.for_block(RAW, b"x"))
+        node = self.node.put_dir({"a b": raw})
+        label, dag_label = to_base36(Cid.parse(raw)), to_base36(Cid.parse(node))
+        self.assertEqual(self.ok("url", raw), f"http://{label}.rnfs.localhost:8789/\n")
+        self.assertEqual(self.ok("url", f"{node}/a b/c?#%"),
+                         f"http://{dag_label}.rnfs.localhost:8789/a%20b/c%3F%23%25\n")
+        self.assertEqual(self.ok("url", f"{node}/sub/"), f"http://{dag_label}.rnfs.localhost:8789/sub/\n")
+        self.assertEqual(self.ok("url", "AB" * 16 + "/index.html"),
+                         f"http://{'ab' * 16}.name.localhost:8789/index.html\n")
+        for target in ("mysite", "b", label, f"{raw}//x", "ab" * 15):
+            code, out, err = self.run_cli("url", target)
+            self.assertEqual((code, out), (1, b""), target)
+            self.assertTrue(err.startswith("rnfs: "), err)
+        # rnfs.toml's port, then a running daemon's (daemon.json)
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w") as f:
+            f.write("gateway_port = 9000\n")
+        self.assertEqual(self.ok("url", raw), f"http://{label}.rnfs.localhost:9000/\n")
+        cli.write_daemon_info(os.path.join(self.tmp, "daemon.json"), {"pid": os.getpid(), "api_port": 9001,
+                                                                       "gateway_port": 9002})
+        self.assertEqual(self.ok("url", raw), f"http://{label}.rnfs.localhost:9002/\n")
+        os.remove(os.path.join(self.tmp, "daemon.json"))
+        with open(os.path.join(self.tmp, "rnfs.toml"), "w") as f:
+            f.write("gateway_port = 0\n")
+        code, _, err = self.run_cli("url", raw)
+        self.assertEqual(code, 1)
+        self.assertIn("gateway_port is 0", err)
+        self.assertEqual(self.node.calls, [])
+
     def test_stop(self):
         """stop asks the daemon to stop and waits until its API no longer answers; a daemon that can't be
         stopped through its API is reported."""

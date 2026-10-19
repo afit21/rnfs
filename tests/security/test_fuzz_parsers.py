@@ -23,13 +23,13 @@ from RNS.vendor import umsgpack
 
 from rnfs.constants import ID_LENGTH, K, MAX_BLOCK_SIZE
 from rnfs.content import archive, builder, dag, seal, walker
-from rnfs.content.cid import DAG, RAW, Cid
+from rnfs.content.cid import DAG, RAW, Cid, from_base36, to_base36
 from rnfs.content.dag import Child, DirectoryNode, Entry, FileNode, IndexChild, IndexNode
 from rnfs.content.storage import Storage
 from rnfs.errors import InvalidDag, StorageFull
 from rnfs.features import keepers, lxmf
 from rnfs.features.lxmf import Incoming, Link
-from rnfs.gateway import parse_range
+from rnfs.gateway import GatewayError, parse_host, parse_range
 from rnfs.names import encode_record, name_for_identity, parse_name, parse_record
 from rnfs.network import protocol
 from rnfs.network.announces import MODE_CLIENT, MODE_SERVER, parse_mode
@@ -607,7 +607,7 @@ class _NotSealed(Exception):
 
 @needs_hypothesis
 class SmallParsersFuzzTest(unittest.TestCase):
-    """Announce app_data, CIDs, targets and HTTP Range headers."""
+    """Announce app_data, CIDs (and their gateway host form), targets, gateway hosts and HTTP Range headers."""
 
     @fuzz()
     @given(st.binary(max_size=16) | msgpack_values.map(umsgpack.packb))
@@ -631,6 +631,40 @@ class SmallParsersFuzzTest(unittest.TestCase):
             self.assertEqual(str(Cid.parse(text)), text)
         except ValueError:
             pass
+
+    @fuzz()
+    @given(st.text(max_size=70) | cids.map(to_base36) | cids.map(lambda cid: to_base36(cid).upper())
+           | st.text(alphabet="0123456789abcdefghijklmnopqrstuvwxyzK_ +-\u0663", min_size=53, max_size=61).map(
+               lambda digits: "k" + digits)
+           | st.tuples(cids.map(to_base36), st.integers(1, 59), st.characters()).map(
+               lambda t: t[0][:t[1]] + t[2] + t[0][t[1] + 1:]))
+    def test_cid_host_form(self, text):
+        try:
+            cid = from_base36(text)
+        except ValueError:
+            return
+        self.assertEqual(to_base36(cid), text)  # canonical: the one host form of this CID
+        self.assertEqual(Cid.parse(str(cid)), cid)
+        self.assertNotEqual(str(cid), text)
+
+    @fuzz()
+    @given(st.none() | st.text(max_size=90)
+           | st.tuples(st.text(max_size=8) | cids.map(to_base36) | ids.map(bytes.hex),
+                       st.sampled_from([".rnfs.localhost:8789", ".name.localhost:8789", ".rnfs.localhost:8788",
+                                        ".RNFS.localhost:8789", ".rnfs.localhost.:8789", ".rnfs.localhost", ""]),
+                       st.sampled_from(["", " ", ".", "x"])).map("".join))
+    def test_gateway_host(self, host):
+        try:
+            site = parse_host(host, 8789)
+        except GatewayError as e:
+            self.assertIn(e.status, (400, 403))
+            return
+        if site is None:
+            self.assertIn(host.lower(), ("127.0.0.1:8789", "localhost:8789"))
+            return
+        kind, value = site
+        label = value.hex() if kind == "name" else to_base36(value)
+        self.assertEqual(host.lower(), f"{label}.{kind}.localhost:8789")
 
     @fuzz()
     @given(st.text(max_size=40) | st.tuples(cids.map(str), st.lists(uri_segments, max_size=3)).map(
