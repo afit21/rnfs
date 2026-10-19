@@ -538,7 +538,8 @@ with `resolve()`, `fetch_dag()`, `fetch_listing()`, `read_range()`; `publisher.p
 sources' keys and the strategy are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the
 first `refresh()` only after the features have registered their key sources, so a restart doesn't withdraw
 kept names' keys. `publish_due` republishes `DhtKey`s every max(effective `republish_interval`, 3 days)
-with a per-key ±10% jitter (capped below `PROVIDER_TTL / 2`), drops a withdrawal of any key it provides to
+with a ±10% jitter fixed by the key's first byte (`key_interval`: 256 slots, so a region's keys come due
+together; capped below `PROVIDER_TTL / 2`), drops a withdrawal of any key it provides to
 the same node in that round, runs up to `PUBLISH_LOOKUPS` (4) lookups at once, keeping the batches one at a
 time would build, and on slow nodes runs one lookup at a time, at most 10 per round, waiting 30 s × the
 round's lookups before the next (never-published items first, then the longest unpublished). When

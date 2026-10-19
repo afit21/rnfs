@@ -23,8 +23,8 @@ whose round was stopped before every node was sent its keys stays due. Times are
 (the clock was corrected) count as now.
 
 - **Feature keys** (DhtKey, e.g. kept names) are republished at max(republish interval, KEY_MIN_INTERVAL),
-  each with its own fixed jitter of up to +-KEY_JITTER, so they don't all come due in one burst; always
-  below PROVIDER_TTL / 2.
+  with a fixed jitter of up to +-KEY_JITTER from the key's first byte, so they don't all come due in one burst
+  but a region's keys come due together; always below PROVIDER_TTL / 2.
 - **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS per round and on average one per SLOW_LOOKUP_PACE
   seconds; never-published items go first, then the longest unpublished.
 - A key both withdrawn from and provided to a node in one round is only provided (a restart may queue
@@ -50,7 +50,7 @@ KEY_PREFIX = "key:"  # how a DhtKey is written as a published item (str())
 # A kept name's record changes rarely and keepers answer for years-old ones; its provider record lives
 # PROVIDER_TTL (7 days), so republishing every 3 days still survives a missed round
 KEY_MIN_INTERVAL = 3 * DAY
-KEY_JITTER = 0.1  # +-10% of the interval, fixed per key
+KEY_JITTER = 0.1  # +-10% of the interval, fixed per first byte of the key (256 slots)
 # While a round sends, where it stored is saved after this many nodes or seconds, whichever comes first, so a
 # crash loses at most that much of it (a record no saved state lists can't be withdrawn: it lives PROVIDER_TTL)
 SAVE_EVERY_NODES = 10
@@ -106,10 +106,14 @@ ProvidedItem = Cid | DhtKey
 
 
 def key_interval(key: bytes, base: float) -> float:
-    """The republish interval of DhtKey key: max(base, KEY_MIN_INTERVAL) with key's fixed jitter, below
-    PROVIDER_TTL / 2 (base is already below it: Config.validate)."""
+    """The republish interval of DhtKey key: max(base, KEY_MIN_INTERVAL) with a fixed jitter, below
+    PROVIDER_TTL / 2 (base is already below it: Config.validate).
+
+    The jitter comes from the key's first byte, not the whole key: keys of one region share their leading bits, so
+    they come due together and one lookup republishes them all (sweep providing), while the 256 slots still keep
+    many keys from coming due at once."""
     interval = max(base, KEY_MIN_INTERVAL)
-    fraction = int.from_bytes(hashlib.sha256(b"rnfs-republish-jitter" + key).digest()[:8], "big") / 2**64
+    fraction = int.from_bytes(hashlib.sha256(b"rnfs-republish-jitter" + key[:1]).digest()[:8], "big") / 2**64
     jittered = interval * (1 + KEY_JITTER * (2 * fraction - 1))
     # Jitter upward never reaches PROVIDER_TTL / 2: a record must survive one missed republish
     return min(jittered, max(interval, PROVIDER_TTL / 2 - HOUR))

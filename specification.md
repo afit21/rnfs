@@ -770,8 +770,9 @@ silent longer than every one of them; announces are recorded in memory and writt
   record out of its own store.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
-  max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
-  don't come due at once; the jittered interval stays below `PROVIDER_TTL / 2`.
+  max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key's first byte, so
+  many keys don't come due at once (256 slots) while keys sharing their leading bits come due together (the
+  same servers are closest to them); the jittered interval stays below `PROVIDER_TTL / 2`.
 - **Provide strategy** (`provide_strategy`):
   - `roots` (default) provides every complete pin, and every complete fetched target while it is cached
     (so at most `max_storage` of downloads at a time). That is every complete download, whatever the command:

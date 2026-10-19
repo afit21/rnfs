@@ -5,6 +5,7 @@ validation (BG-L7) and nicks for `name resolve`.
 """
 import io
 import os
+import random
 import tempfile
 import time
 import types
@@ -197,6 +198,18 @@ class KeyCadenceTest(unittest.TestCase):
         intervals = [key_interval(key, DAY) for key in keys]
         self.assertGreater(max(intervals) - min(intervals), 0.15 * KEY_MIN_INTERVAL)  # spread out
         self.assertEqual(key_interval(keys[0], DAY), key_interval(keys[0], DAY))  # fixed per key
+
+    def test_jitter_comes_from_the_first_byte(self):
+        """Keys sharing their first byte (as a region's keys share their leading bits) come due together; the 256
+        first bytes give 256 slots, spread over the whole +-10%."""
+        rng = random.Random(5)
+        for first in (0, 0x7F, 0xFF):
+            keys = [bytes([first]) + rng.randbytes(15) for _ in range(20)]
+            self.assertEqual(len({key_interval(key, DAY) for key in keys}), 1)
+        slots = sorted({key_interval(bytes([first]) + bytes(15), DAY) for first in range(256)})
+        self.assertEqual(len(slots), 256)
+        self.assertLess(slots[0], 0.91 * KEY_MIN_INTERVAL)
+        self.assertGreater(slots[-1], 1.09 * KEY_MIN_INTERVAL)
 
     def test_keys_republished_every_three_days_not_daily(self):
         key = os.urandom(16)
