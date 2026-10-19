@@ -35,6 +35,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from rnfs import ids
+from rnfs.config import LXMF_DEPRECATION
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
 from rnfs.events import EVENT_KINDS
@@ -1455,11 +1456,21 @@ class Fetched:
                 "cid": str(self.cid) if self.cid else None, "warnings": list(self.warnings), "error": self.error}
 
 
+def _lxmf_deprecated(method: str):
+    """Warn that Lxmf's method is deprecated (DeprecationWarning, at the line calling it: stacklevel 3, past this
+    and the method). Python's warning filters decide how often it shows: by default once per calling line, and
+    only for code run as __main__ unless the program or -W shows DeprecationWarning."""
+    warnings.warn(f"lxmf.{method}() is deprecated: {LXMF_DEPRECATION}", DeprecationWarning, stacklevel=3)
+
+
 class Lxmf:
     """A node's LXMF messaging (Rnfs.lxmf; rnfs/features/lxmf.py): rnfs links sent to and received from LXMF
     addresses (Sideband, NomadNet, MeshChat, other rnfs nodes). A Node runs it only with settings
     {"lxmf_enabled": True}; while it is off, address, send and sync raise ValueError saying why (inbox and outbox
-    list what is stored). Every method raises NotFound without the lxmf feature."""
+    list what is stored). Every method raises NotFound without the lxmf feature.
+
+    Deprecated since 0.2.0 (config.LXMF_DEPRECATION): each method works as before, but first warns
+    (DeprecationWarning). rnfs: URIs stay rnfs's: a target may still be one, and the inbox events are unchanged."""
 
     def __init__(self, owner: Rnfs):
         """The LXMF messaging of owner."""
@@ -1467,6 +1478,7 @@ class Lxmf:
 
     def address(self) -> LxmfAddress:
         """This node's LXMF address and display name, the propagation node set and the nearest one heard."""
+        _lxmf_deprecated("address")
         self._owner._check()
         return LxmfAddress.from_dict(self._owner._backend.lxmf_address())
 
@@ -1479,6 +1491,7 @@ class Lxmf:
         through the propagation node, if one is set. Returns once queued: outbox() says how it went. Raises
         ValueError (LXMF off, recipient or target invalid, no propagation node), NotFound (no announce heard
         from the recipient yet: a path request was sent, try again shortly)."""
+        _lxmf_deprecated("send")
         self._owner._check()
         if isinstance(target, Cid):
             target = str(target)
@@ -1489,6 +1502,7 @@ class Lxmf:
 
     def inbox(self) -> list[Message]:
         """The messages received with rnfs links, oldest first."""
+        _lxmf_deprecated("inbox")
         self._owner._check()
         return [Message.from_dict(entry) for entry in self._owner._backend.lxmf_inbox()]
 
@@ -1500,6 +1514,7 @@ class Lxmf:
         A name link whose name can't be resolved raises NotFound before anything starts, unless use_sent_cid:
         then the CID it was sent with is fetched (nothing ties it to the name), with a warning. Raises NotFound (no
         such message), ValueError (id or link invalid, neither or a clashing output)."""
+        _lxmf_deprecated("get")
         self._owner._check()
         results = self._owner._backend.lxmf_inbox_get(
             id, link, _abspath(output) if output is not None else None,
@@ -1509,22 +1524,26 @@ class Lxmf:
     def remove(self, id: int) -> int:
         """Remove inbox message id, releasing the pins its links were auto-fetched under; 1. Raises NotFound (no
         such message), ValueError."""
+        _lxmf_deprecated("remove")
         self._owner._check()
         return self._owner._backend.lxmf_inbox_rm(id, False)
 
     def remove_all(self) -> int:
         """Remove every inbox message, releasing their auto-fetched pins; how many."""
+        _lxmf_deprecated("remove_all")
         self._owner._check()
         return self._owner._backend.lxmf_inbox_rm(None, True)
 
     def outbox(self) -> list[Outgoing]:
         """The messages sent, oldest first, with their delivery state."""
+        _lxmf_deprecated("outbox")
         self._owner._check()
         return [Outgoing.from_dict(entry) for entry in self._owner._backend.lxmf_outbox()]
 
     def sync(self, nearest: bool = False) -> Synced:
         """Start downloading the messages waiting at the propagation node (nearest: without lxmf_propagation_node
         set, the nearest heard). Raises ValueError (LXMF off)."""
+        _lxmf_deprecated("sync")
         self._owner._check()
         return Synced.from_dict(self._owner._backend.lxmf_sync(bool(nearest)))
 

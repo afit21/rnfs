@@ -61,6 +61,9 @@ Deprecated:
   one line on stderr saying they are deprecated and why; their stdout and exit status are unchanged, and
   `RNFS_NO_DEPRECATION_WARNINGS=1` (anything but empty or `0`) silences the line. `rnfs --help` marks them
   `(deprecated)`, and each one's `--help` says why.
+- `rnfs.Node` and `rnfs.Client`: each `lxmf` method (`address`, `send`, `inbox`, `get`, `remove`, `remove_all`,
+  `outbox`, `sync`) warns `DeprecationWarning` at the calling line, then works as before; Python's filters decide
+  when it shows (by default for code run as `__main__`). The `inbox` events are unchanged.
 
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
