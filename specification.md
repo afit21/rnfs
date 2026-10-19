@@ -695,14 +695,14 @@ differently. A score can be earned quickly by serving popular blocks, so it neve
   before any raised); a peer without a score scores 0, so forgetting is always safe;
 - saves them, with wall-clock times, a time in the future when loaded counting as now.
 
-**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in
-server mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock
-times; one in the future when loaded counts as now). Identities generated next to a key can't be old ones, so
-among the servers near a key, those first heard at least `provider_seniority` ago were there before any such
-identity was made for it; the log gives the `K` closest of them to a key, which publishers also store to
-(below). It is local state: nothing about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting the least
-recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only servers
-silent longer than every one of them; announces are recorded in memory and written together every 30 s.
+**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in server
+mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock times; one
+in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
+near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
+the log gives the `K` closest of them to a key, which publishers also store to (below). It is local state: nothing
+about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting
+the least recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only
+servers silent longer than every one of them; announces are recorded in memory and written together every 30 s.
 
 **Publishing.**
 - For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node

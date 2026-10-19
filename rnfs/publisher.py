@@ -13,8 +13,8 @@
   withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed store
   isn't retried until the next republish. The node also records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
-  from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or of a round cut
-  short) whose record may not have expired yet: the closest set changes as nodes come and go.
+  from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or
+  of a round cut short) whose record may not have expired yet: the closest set changes as nodes come and go.
 
 Last-published nodes and times, earlier rounds' nodes and pending withdrawals are persisted in the state
 database (rnfs.statedb: the published, published_earlier and withdrawals tables), each save writing only the
