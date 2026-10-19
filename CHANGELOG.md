@@ -45,7 +45,9 @@ Deprecated:
   into a separate app built on the local API and the library, and a later release removes it from rnfs. Nothing
   else changes: the network sees the same messages, `rnfs:` URIs and the LXMF link-map field stay rnfs's
   (specification section 13) for that app and other clients, and the pins of auto-fetched links already became
-  `app:lxmf:<address>` (upgrade notes above), the source the app will own.
+  `app:lxmf:<address>` (upgrade notes above), the source the app will own. Use instead: that app once it is
+  released; until then, rnfs's LXMF as before. Nodes that don't use LXMF can turn it off now with
+  `lxmf_enabled = false`.
 - The `/api/lxmf/` routes' responses, errors included, carry `Deprecation: @1792368000` (RFC 9745: deprecated since
   2026-10-19); their bodies are unchanged. `GET /api/capabilities` gains `"deprecated": ["lxmf"]`
   (`Capabilities.deprecated`, `is_deprecated("lxmf")`).

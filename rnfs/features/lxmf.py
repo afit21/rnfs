@@ -1,5 +1,12 @@
 """LXMF integration: rnfs links sent and received as LXMF messages (Sideband, NomadNet, MeshChat, lxmd).
 
+Deprecated since rnfs 0.2.0 (config.LXMF_DEPRECATION): LXMF moves to a separate app built on the local API and the
+library, and a later release removes this feature. Until then it works as before and says so wherever it is used:
+its routes' responses carry a Deprecation header and capabilities list it (Feature.deprecated, rnfs.api), its
+commands warn on stderr (_deprecated_command), the library's lxmf methods warn DeprecationWarning, the settings
+schema marks the lxmf_* settings, and start() logs a notice while it runs or an lxmf_* setting was given. The rnfs:
+URIs and the link-map field below stay rnfs's (specification section 13), for that app and other clients.
+
 The node gets an LXMF delivery identity of its own (<rnfs dir>/storage/lxmf_identity, separate from the
 rnfs.dht identity, so the two can't be linked by key), announced with a display name at startup, after
 startup_announce_delay and every announce_interval. LXMF keeps its router state in <rnfs dir>/lxmf/.

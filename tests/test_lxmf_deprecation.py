@@ -1,7 +1,8 @@
 """Tests for LXMF's deprecation in 0.2.0 (rnfs/features/lxmf.py moves to an app of its own; roadmap "LXMF moves out
 of core"): LXMF keeps working exactly as before, and says it is deprecated wherever it is used. The API's routes
-carry a Deprecation header and capabilities list the feature. No Reticulum: offline nodes and a stand-in for
-LxmfNetwork, as in tests/test_lxmf.py."""
+carry a Deprecation header and capabilities list the feature; the commands warn on stderr unless silenced; the node
+logs it at start. The settings schema's part is in tests/test_settings.py, the library's DeprecationWarning in
+tests/test_public.py. No Reticulum: offline nodes and a stand-in for LxmfNetwork, as in tests/test_lxmf.py."""
 import argparse
 import contextlib
 import io
