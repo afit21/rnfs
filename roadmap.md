@@ -209,7 +209,7 @@ servers, and 10 of them hide content completely today (found 0–4% of the time)
   first, before the defaults. A node behind an RNS access-point interface hears no announces from beyond it,
   so its first join needs one reachable node ID (a default or its user's)
 
-## LoRa meshes and the backbone
+## LoRa meshes and the backbone (done)
 
 Kademlia ignores where nodes are. Internet nodes' lookups route through LoRa islands, a mesh cut off from the
 internet can't find its own content, and records published while it was cut off sit on the wrong nodes after it
@@ -390,7 +390,7 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   and the jobs that replay them) takes the caller's source. `storage.check_source` accepts `app:` sources before
   anything writes one (pin rows failing it are deleted at load)
 
-## API reference
+## API reference (done)
 
 * No API stability is promised until 1.0.0: `rnfs.API_STATUS` stays provisional, and the local API and the
   library may change in 0.2.x releases (`/api/capabilities` says what a daemon has)
