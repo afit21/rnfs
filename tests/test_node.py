@@ -25,8 +25,11 @@ from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module, statedb
+from rnfs.dht.density import MIN_SIZE_SAMPLES, SPACE
+from rnfs.dht.lookup import FIRST
 from rnfs.dht.routing import distance
 from rnfs.dht.scores import BOOTSTRAP_SEED, band
+from rnfs.dht.sweep import Region
 from rnfs.node import RnfsNode
 from tests.support import POSIX_MODES, failing_commits, pinned_entries, state_execute, state_rows, wait_for
 from tests.test_names import FakeNetwork
@@ -392,6 +395,60 @@ class NetworkFacadeTest(NodeTest):
         self.b.fetcher.mark_invalid(Cid.for_block(RAW, b"bad"))
         with self.assertRaises(InvalidDag):
             self.b.info(str(Cid.for_block(RAW, b"bad")))
+
+
+class NetworkStatusTest(NodeTest):
+    """status()'s view of the network (specification section 11): the size estimate, the density check's recent
+    counts and the record store, all from state kept in memory."""
+
+    def warm_up(self, servers: int):
+        """Feed A's size estimate the d_K of MIN_SIZE_SAMPLES lookups on a network of servers servers."""
+        for n in range(MIN_SIZE_SAMPLES):
+            self.a.sizes.note(bytes([n + 1]) * 16, round(K * SPACE / servers))
+
+    def test_size_estimate_absent_then_present(self):
+        network = self.a.status()["network"]
+        self.assertEqual(network, {"size_estimate": None, "size_samples": 0, "density_checked_hour": 0,
+                                   "density_flagged_hour": 0, "density_checked_day": 0, "density_flagged_day": 0})
+        self.warm_up(1000)
+        network = self.a.status()["network"]
+        self.assertEqual(network["size_samples"], MIN_SIZE_SAMPLES)
+        self.assertEqual(network["size_estimate"], round(self.a.sizes.estimate()))
+        self.assertAlmostEqual(network["size_estimate"], 1000 * (K - 1 / 3) / K, delta=1)
+
+    def test_a_flagged_check_is_counted(self):
+        self.warm_up(1000)
+        key = bytes(16)
+        packed = {key[:-1] + bytes([n]): FIRST for n in range(1, 3 * K)}  # identities right next to the key
+        spread = {(n << 120).to_bytes(16, "big"): FIRST for n in range(1, 3 * K)}
+        self.assertTrue(self.a.lookups.flags(key, Region(key, 0, [], packed)))
+        self.assertFalse(self.a.lookups.flags(key, Region(key, 0, [], spread)))
+        network = self.a.status()["network"]
+        self.assertEqual((network["density_checked_hour"], network["density_flagged_hour"]), (2, 1))
+        self.assertEqual((network["density_checked_day"], network["density_flagged_day"]), (2, 1))
+
+    def test_record_store(self):
+        self.a.records.store(bytes([1] * 16), B_ID)
+        self.a.records.store(bytes([2] * 16), A_ID)  # its own
+        status = self.a.status()
+        store = status["record_store"]
+        self.assertEqual(status["records"], 2)
+        self.assertEqual((store["publishers"], store["own_records"], store["full"]), (2, 1, False))
+        self.assertEqual(store["budget"], self.a.config.record_budget)
+        self.assertEqual(store["tiers"]["newcomer"]["records"], 1)
+        self.assertEqual(sum(tier["records"] for tier in store["tiers"].values()) + store["own_records"], 2)
+
+    def test_status_reads_no_records_and_no_samples(self):
+        """Apps call status often: the new fields come from counts in memory, not from the state database."""
+        self.warm_up(1000)
+        self.a.records.store(bytes([1] * 16), B_ID)
+        self.a.records.save()
+        refuse = mock.Mock(side_effect=AssertionError("status read the state database"))
+        with mock.patch.object(self.a.records._db, "query", refuse), \
+                mock.patch.object(self.a.sizes._db, "query", refuse):
+            status = self.a.status()
+        self.assertEqual((status["records"], status["record_store"]["publishers"]), (1, 1))
+        self.assertIsNotNone(status["network"]["size_estimate"])
 
 
 class SealedCheckTest(NodeTest):

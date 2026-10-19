@@ -333,7 +333,8 @@ talks to it. Your node needs Reticulum interfaces that reach other nodes:
 - **Radio:** add an `RNodeInterface` for LoRa ([Reticulum manual](https://reticulum.network/manual/interfaces.html)).
 
 Your node then joins the DHT through the project's built-in bootstrap nodes and the rnfs nodes it hears
-announcing. `rnfs status` shows your node ID and `known_nodes`; `rnfs peers` lists the nodes it knows. To also
+announcing. `rnfs status` shows your node ID and `known_nodes`, and once a few lookups have completed, about how
+many DHT servers the whole network has (`network_size`); `rnfs peers` lists the nodes it knows. To also
 join through a node you choose, run `rnfs daemon --bootstrap <NODE_ID>` (or set `bootstrap_nodes`);
 `default_bootstrap = false` stops it contacting the built-in ones.
 
@@ -486,7 +487,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | Command | Description |
 |---|---|
 | `rnfs daemon` | Run a node with its API and gateway (`--bootstrap`, `--rnsconfig`, `--private`, `--debug-log`, `-v`…) |
-| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address / known nodes, their round-trip time and whether each is online / traffic |
+| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address, and what it sees of the network (estimated size, density-check alarms, partition mode, provider records against `record_budget` by tier, refusals and evictions) / known nodes, their round-trip time and whether each is online / traffic |
 | `rnfs ping NODE_ID` / `providers CID` | Round-trip time to a node / nodes providing a CID |
 | `rnfs add PATH\|-` | Add a file, directory or stdin, pin it and print its CID (options below) |
 | `rnfs add DEST:/page/PATH` / `add DEST:/file/PATH` | Add a snapshot of a NomadNet page or file (`DEST` is the NomadNet node's 32-hex address), pin it and print its CID |

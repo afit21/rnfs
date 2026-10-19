@@ -656,6 +656,90 @@ class OwnRecordsTest(StoreTestCase):
         self.assertTrue(store.store(KEY, OWN))
 
 
+class UsageTest(StoreTestCase):
+    """usage(), the node's status of the store: the budget's fill, each tier's against its floor, and the records
+    refused and evicted over the last hour and day, by tier. The store holds 100 records."""
+
+    capacity = 100
+
+    def setUp(self):
+        """A store recording OWN as this node, its recent counts on a monotonic clock of their own."""
+        super().setUp()
+        self.monotonic = FakeClock(1000.0)
+        self.store = self.new_store(own_id=OWN, monotonic=self.monotonic)
+
+    def tier(self, name: str) -> dict:
+        """usage()'s entry for the tier name."""
+        return self.store.usage()["tiers"][name]
+
+    def recent(self, what: str) -> dict[str, tuple[int, int]]:
+        """what ("refused", "evicted") per tier: (last hour, last day)."""
+        return {name: (tier[f"{what}_hour"], tier[f"{what}_day"])
+                for name, tier in self.store.usage()["tiers"].items()}
+
+    def test_fill_against_the_budget_and_the_floors(self):
+        empty = self.store.usage()
+        self.assertEqual({key: value for key, value in empty.items() if key != "tiers"},
+                         {"bytes": 0, "budget": 100 * SIZE, "capacity": 100, "full": False, "publishers": 0,
+                          "own_records": 0})
+        self.assertEqual(list(empty["tiers"]), ["known", "earned", "newcomer"])
+        self.earn(self.store, ident(2), 50, 2000)
+        self.known.add(ident(1))
+        self.fill(self.store, ident(1), 30, 1000)
+        self.fill(self.store, ident(3), 15, 3000)
+        self.fill(self.store, OWN, 5, 4000)
+        usage = self.store.usage()
+        self.assertEqual({key: value for key, value in usage.items() if key != "tiers"},
+                         {"bytes": 100 * SIZE, "budget": 100 * SIZE, "capacity": 100, "full": True, "publishers": 4,
+                          "own_records": 5})
+        fill = {name: (tier["records"], tier["share"], tier["floor"]) for name, tier in usage["tiers"].items()}
+        self.assertEqual(fill, {"known": (30, 0.3, 0.3), "earned": (50, 0.5, 0.6), "newcomer": (15, 0.15, 0.1)})
+        self.assertEqual(self.recent("refused"), {"known": (0, 0), "earned": (0, 0), "newcomer": (0, 0)})
+
+    def test_refusals_and_evictions_by_tier_age_out(self):
+        self.earn(self.store, ident(2), 50, 2000)
+        self.known.add(ident(1))
+        self.fill(self.store, ident(1), 30, 1000)
+        self.fill(self.store, ident(3), 15, 3000)
+        self.fill(self.store, OWN, 5, 4000)
+        self.assertTrue(self.store.store(ident(5000), ident(4)))  # a Newcomer evicts the largest Newcomer's record
+        for n in range(5):  # Earned takes from the Newcomers down to their floor ...
+            self.assertTrue(self.store.store(ident(6000 + n), ident(2)))
+        self.assertFalse(self.store.store(ident(6999), ident(2)))  # ... and then may not: refused
+        self.assertFalse(self.store.store(ident(3999), ident(3)))  # the largest Newcomer can't churn: refused
+        self.assertEqual(self.tier("newcomer")["records"], 10)
+        self.assertEqual(self.recent("evicted"), {"known": (0, 0), "earned": (0, 0), "newcomer": (6, 6)})
+        self.assertEqual(self.recent("refused"), {"known": (0, 0), "earned": (1, 1), "newcomer": (1, 1)})
+        # provide() counts each key of a batch refused for room, also those refused without looking again
+        self.assertEqual(self.store.provide(ident(3), keys(7000, 3)), 0)
+        self.assertEqual(self.recent("refused")["newcomer"], (4, 4))
+        # Refreshes and this node's records are never refused
+        self.assertTrue(self.store.store(ident(3010), ident(3)))
+        self.assertTrue(self.store.store(ident(8000), OWN))
+        self.assertEqual(self.recent("refused")["newcomer"], (4, 4))
+        self.monotonic.now += 2 * HOUR
+        self.assertEqual(self.recent("evicted")["newcomer"], (0, 6))
+        self.assertEqual(self.recent("refused"), {"known": (0, 0), "earned": (0, 1), "newcomer": (0, 4)})
+        self.monotonic.now += DAY
+        self.assertEqual(self.recent("evicted")["newcomer"], (0, 0))
+        self.assertEqual(self.recent("refused")["newcomer"], (0, 0))
+
+    def test_evictions_from_a_full_key_count(self):
+        store = self.store = self.new_store(max_per_key=2, monotonic=self.monotonic)
+        self.assertTrue(store.store(KEY, ident(1)))
+        self.assertTrue(store.store(KEY, ident(2)))
+        self.assertTrue(store.store(KEY, ident(3)))  # evicts ident(2), the oldest record staying
+        self.assertEqual(self.recent("evicted")["newcomer"], (1, 1))
+        self.assertFalse(store.is_full())  # not the budget: the key's cap
+
+    def test_usage_reads_nothing_from_the_database(self):
+        """The status is called often by apps: it reports counts kept in memory, with no read of the records."""
+        self.fill(self.store, ident(1), 100, 1000)
+        self.store.save()
+        with mock.patch.object(self.store._db, "query", side_effect=AssertionError("read the database")):
+            self.assertTrue(self.store.usage()["full"])
+
+
 class BudgetTest(StoreTestCase):
     """The budget's measure: bytes per record from the database, and the free disk."""
 

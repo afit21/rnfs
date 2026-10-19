@@ -854,7 +854,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   depend on how many identities a node happened to learn of, so publisher and searcher agree on it). Unreliable
   servers come last within a ring. In simulation it fired on about 4% of lookups without an attack (2–6% over the
   fake network of `tests/test_eclipse.py`), and on nearly every one next to identities placed closer than every
-  honest server.
+  honest server. rnfs counts the searches and published keys it checks, and those it flags, over the last hour and
+  day, and its status reports them with the size estimate (section 11, "Network status"): a node's cheapest view of
+  how big the network is and of keys under attack.
 - **Disjoint paths** (S/Kademlia). d lookups for one key that share no node: the start nodes (and senior servers)
   are dealt to the paths in turn, a path claims each node before querying it, drops one another path claimed first,
   and ignores such nodes in replies. Identities that answer with each other can steer one path, but once it has
@@ -975,7 +977,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     else from the storer's own tier, unless the storer already holds as many records as that tier's largest
     holder (so it can't churn its records), or the tier is Earned: Earned publishers never evict each other.
     Otherwise the store is refused. Floors hold in both directions: a lower tier can't take a higher one's
-    floor, nor a higher one the lower one's for good.
+    floor, nor a higher one the lower one's for good. rnfs counts the new records it refuses, by the storer's tier,
+    and the records it evicts (here and from a full key, below), by the evicted publisher's, over the last hour and
+    day; its status reports them with each tier's fill against its floor (section 11, "Network status").
   - **Expiry while full.** While the store is full, a Newcomer's record last stored 4.5 days ago counts as
     expired: one more way a full store makes room. The longest honest gap between republishes is just under
     3.5 days (kept names, below), so a record republished on time never lapses this way. A store that isn't
@@ -1723,7 +1727,31 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+
+**Network status** (rnfs 0.2.0). `status` (`GET /api/status`, the library's `Status`) also reports what the node can
+see of the network from its own state, with nothing sent to learn it: the cheapest way to learn how big the network
+is, and to notice a flood of stores or an attack on a key. Apps call it often, so it reads only counts kept in memory.
+The counts of recent events are kept per minute over the last day, in memory only: a restart starts them afresh.
+- `network`: `size_estimate`, the number of DHT servers the density check estimates (section 6, "Network size
+  estimate"; null until it pools 8 complete lookups), and `size_samples`, the lookups it pools (at most 16); to
+  compare, `known_nodes` is the routing table's servers. `density_checked_hour`, `density_flagged_hour`,
+  `density_checked_day`, `density_flagged_day`: the searches and published keys the density check ran on, and those
+  it fired on, over the last hour and day (a search counts once, flagged if the check fired in any of its lookups; a
+  published key once per round it is checked, flagged when it gets a widened lookup). Without an attack a few percent
+  fire (section 6); many more point at identities placed next to keys, or an estimate gone wrong. The local servers
+  and partition mode are `local_servers`, `partition` and `partition_since`.
+- `record_store`: the provider records stored for others (section 6, "Provider records"): `bytes`, what they count for
+  against `record_budget` (the records held times the bytes a record takes, as last measured), `budget`, `capacity`
+  (the records the store holds when full: fewer than the budget allows while the free disk is short), `full`,
+  `publishers` and `own_records` (this node's own; `records` is every record held), and `tiers`: for each of `known`,
+  `earned` and `newcomer`, its `records`, their `share` of the capacity and its `floor`, and the new records of its
+  publishers refused and the records of its publishers evicted to make room (from a full budget or a key's 1000
+  publishers) over the last hour and day (`refused_hour`, `refused_day`, `evicted_hour`, `evicted_day`). A flood of
+  fresh identities shows as Newcomers refused or evicted; expiry, early or not, isn't counted.
+
+`rnfs status` sums these up in a few lines after the other fields: `network_size`, `density_check`, `partition_for`
+(while in partition mode), `record_store`, `record_tiers`, `records_refused` and `records_evicted`.
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.

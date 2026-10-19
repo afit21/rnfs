@@ -9,7 +9,7 @@ from unittest import mock
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
 from rnfs.content.storage import Storage
-from rnfs.dht.density import SIZE_SAMPLES, SizeEstimate
+from rnfs.dht.density import SIZE_SAMPLES, CheckCounts, SizeEstimate
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.lookups import (SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups, Search,
                               split_budget)
@@ -183,6 +183,51 @@ class LookupsTest(LookupTestCase):
         lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), SizeEstimate(), lambda key: [])
         self.assertIsNone(lookups.search(self.key).first.size)
         self.assertFalse(lookups.flags(self.key, Region(self.key, 0, [], {n: False for n in self.net.liars})))
+
+    def test_density_checks_are_counted(self):
+        """Each search the check ran on counts once, and once more if it fired in any of its lookups (a run again
+        counts nothing more); so does each published key checked over its region. Nothing counts before the estimate
+        warms up, and the counts age out after a day."""
+        clock = FakeClock()
+        checks = CheckCounts(clock)
+        lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes, lambda key: [], 3,
+                          checks=checks)
+
+        def counted() -> tuple[int, int, int, int]:
+            """(checked, flagged) in the last hour, then in the last day."""
+            status = checks.status()
+            return (status["density_checked_hour"], status["density_flagged_hour"], status["density_checked_day"],
+                    status["density_flagged_day"])
+
+        search = lookups.search(self.key)
+        search.find_providers(lambda p: None)
+        self.assertTrue(search.dense)
+        self.assertEqual(counted(), (1, 1, 1, 1))
+        search.find_providers(lambda p: None)
+        self.assertEqual(counted(), (1, 1, 1, 1))
+        other = random.Random(44).randbytes(ID_LENGTH)
+        honest = lookups.search(other)
+        honest.find_closest()
+        self.assertFalse(honest.dense)
+        self.assertEqual(counted(), (2, 1, 2, 1))
+        lookup = lookups.publish(self.key)
+        region = Region(self.key, 0, lookup.find_closest(), lookup.candidates(), paths=lookup.path_candidates())
+        self.assertTrue(lookups.flags(self.key, region))
+        self.assertFalse(lookups.flags(other, region))
+        self.assertEqual(counted(), (4, 2, 4, 2))
+        clock.now += 2 * 3600
+        self.assertEqual(counted(), (0, 0, 4, 2))
+        clock.now += 24 * 3600
+        self.assertEqual(counted(), (0, 0, 0, 0))
+        # Without an estimate the check doesn't run, so nothing counts
+        cold = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), SizeEstimate(), lambda key: [],
+                       checks=checks)
+        cold.search(self.key).find_closest()
+        cold.flags(self.key, region)
+        self.assertEqual(counted(), (0, 0, 0, 0))
+        # Lookups made without checks keep counts of their own
+        self.assertIsInstance(self.lookups.checks, CheckCounts)
+        self.assertGreater(self.lookups.checks.status()["density_checked_day"], 0)  # setUp's searches, once warm
 
     def test_one_path_is_a_plain_lookup(self):
         lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes, lambda key: [], 1)

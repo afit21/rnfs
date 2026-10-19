@@ -140,6 +140,7 @@ rnfs/
     disjoint.py       DisjointLookup: one lookup over paths that share no node (section 6)
     lookups.py        Lookups: which lookups searching and publishing run; Search: the fallback to disjoint paths (6)
     sweep.py          sweep providing: regions of due keys, the far half's extra /find, Sweep (section 6)
+    recent.py         RecentCounts: events per minute over the last day, for the network status (section 11)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2); the /blocks size rules both
@@ -368,7 +369,7 @@ state database; None: a private in-memory one, `statedb.connect_memory`, so test
 `retain(keep) -> int` (drops every record and the standing of publishers `keep` rejects: private mode's
 non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `providers(key, exclude) -> list[bytes]`,
 `record(key, publisher)`, `expire()`, `maintain()`, `is_full()`, `record_count()`, `publisher_count()`,
-`tier_counts()`, `first_seen(publisher)`, `standing(publisher)`, `save()`, `close()`.
+`tier_counts()`, `usage()`, `first_seen(publisher)`, `standing(publisher)`, `save()`, `close()`.
 
 Records live on disk and are read per key. Nothing in memory grows with the records or publishers:
 - `_cache`: the records of recently used keys (publisher -> (first stored, last stored)), LRU, at most
@@ -417,6 +418,14 @@ store notes the latest clock reading any time it holds came from (`_latest`, via
 with the clock not behind it skips the clamping pass. `_check_consistency()` recomputes the counts and standings
 from the records on disk and in memory (`_merged`) and checks the caches against them; test_providers runs it
 after every test.
+
+For the node's status (`usage()`, specification section 11 "Network status"): `_refused` and `_evicted` are a
+`recent.RecentCounts` per tier (on `monotonic`, `time.monotonic` unless given), fed by `_refuse` (every `_FULL` or
+`_REFUSED` `_store` returns for another's new record, by the storer's tier; also the keys of a batch refused without
+looking for room again) and `_count_eviction` (`_evict_from`'s record and a full key's victim, by the evicted
+publisher's tier as last worked out). `usage()` takes `_count()`, `_capacity()`, the bytes a record takes,
+`_tier_records` and `_publishers` under the lock and reads nothing from the database: `bytes` is the records times
+the bytes a record takes, `capacity` `_capacity()` rounded down, each tier's `share` its records over it.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
@@ -471,6 +480,8 @@ and `rnfs.statedb` loads RNS. `dense_core(distances, size)` (last rank j >= K cl
 stopping past 2K once a rank lies 4 times further out), `radius(size)` and `rings(nodes, distances, size, count,
 later)`: `count` from the rank after the core and from the first node beyond the radius, each ring ordered by
 `later` (a lookup's tier), stably, without duplicates. `DENSITY_THRESHOLD` (2), `RING_ANSWERS` (5).
+`CheckCounts(clock=time.monotonic)`: `checked` and `flagged`, two `recent.RecentCounts`; `note(flagged)` counts one
+check, `status()` gives the four `density_*` fields of the node's status.
 
 `disjoint.py` — `DisjointLookup(key, start_nodes, make_path, paths, seniors=(), on_complete)`: `make_path(start,
 seniors, claim, taken)` builds each path's `Lookup` (the node's `_new_lookup`, so answers and failures still reach
@@ -496,7 +507,10 @@ one path. `Search(first, fallback, pace)` quacks like a Lookup: `find_providers`
 once escalated), then, if no provider was ever reported, time and queries are left and `should_stop` is False,
 waits for `pace()` (slow nodes: `Publisher.pace_lookups`) only while the wait fits in the time left, and runs the
 fallback; providers are passed on once each across both. So a search sends at most `MAX_QUERIES` `/find` in all, as
-before (DHT-1). `DISJOINT_PATHS` 3, `SLOW_DISJOINT_PATHS` 2. The unknown-ID budgets: `publish_unknowns` for
+before (DHT-1). `Lookups.checks` (a `density.CheckCounts`, its own unless given) counts how often the density check
+ran and fired: `Search(..., checks)` counts itself once as checked after a `find_providers` or `find_closest` if its
+first lookup has a `size`, and once as flagged once `dense` (any of its lookups' `dense`); `flags` counts every key it
+checks. `DISJOINT_PATHS` 3, `SLOW_DISJOINT_PATHS` 2. The unknown-ID budgets: `publish_unknowns` for
 `publish` (split among its paths) and `widen`, `search_unknowns` for a search's first lookup and again for its
 fallback (split among its paths); `split_budget(total, paths)` deals a budget out, the first paths taking the
 remainder, and `DisjointLookup` makes its paths in order, so `_disjoint`'s `make_path` takes the next share from an
@@ -673,7 +687,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers", "partition", "partition_since"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).

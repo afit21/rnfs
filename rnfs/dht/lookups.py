@@ -61,18 +61,37 @@ class Search:
     fallback(time left, queries left) when needed) in the rest of the same time budget and of the first lookup's
     max_queries, so the search sends at most that many /find in all (a security bound: DHT-1). Quacks like a Lookup
     where its callers need it. pace() (slow nodes): 0.0 if the fallback may start now (and is counted), else the
-    seconds to wait."""
+    seconds to wait. checks (the node's density.CheckCounts) counts the search once if its first lookup has the
+    density check (a size estimate), and once more if the check fired in any of its lookups."""
 
     def __init__(self, first: Lookup, fallback: Callable[[float, int], Lookup | DisjointLookup | None] | None = None,
-                 pace: Callable[[], float] | None = None):
+                 pace: Callable[[], float] | None = None, checks: density.CheckCounts | None = None):
         """A search that starts with first."""
         self.first = first
         self.second: Lookup | DisjointLookup | None = None  # the fallback, once escalated
         self.key = first.key
         self._fallback = fallback
         self._pace = pace
+        self._checks = checks
+        self._counted = self._counted_dense = False  # whether checks has this search, and that it fired
         self._reported: set[bytes] = set()  # providers passed to on_provider, in any run
         self._wake = threading.Event()
+
+    @property
+    def dense(self) -> bool:
+        """True once the density check fired in any of the search's lookups."""
+        return any(lookup.dense for lookup in self._lookups())
+
+    def _count(self):
+        """Count the search's density check in checks, once, and that it fired, once (a later run may make it)."""
+        if self._checks is None or self.first.size is None:
+            return
+        if not self._counted:
+            self._counted = True
+            self._checks.checked.add()
+        if not self._counted_dense and self.dense:
+            self._counted_dense = True
+            self._checks.flagged.add()
 
     @property
     def escalated(self) -> bool:
@@ -98,6 +117,7 @@ class Search:
             self.second = self._escalate(should_stop)
             if self.second is not None:
                 self.second.find_providers(report, should_stop)
+        self._count()
         return found
 
     def _escalate(self, should_stop: Callable[[], bool]) -> Lookup | DisjointLookup | None:
@@ -132,7 +152,9 @@ class Search:
 
     def find_closest(self) -> list[bytes]:
         """The first lookup's find_closest (closest-nodes lookups never fall back)."""
-        return self.first.find_closest()
+        closest = self.first.find_closest()
+        self._count()
+        return closest
 
     def candidates(self) -> dict[bytes, bool]:
         """The first lookup's candidates."""
@@ -170,13 +192,16 @@ class Lookups:
     lookup); paths disjoint paths per publish lookup and fallback; pace (slow nodes) paces the fallback;
     publish_unknowns and search_unknowns the budgets of unknown IDs of a publishing lookup and of a search (and of its
     fallback), split among disjoint paths (None: alpha per Lookup, as on nodes that aren't slow); local_first(key) the
-    local servers a search asks first."""
+    local servers a search asks first. checks counts how often the density check ran and fired, for the status (a
+    density.CheckCounts of its own if None)."""
 
     def __init__(self, new_lookup: NewLookup, start: Callable[[bytes], list[bytes]], sizes: density.SizeEstimate,
                  seniors: Callable[[bytes], list[bytes]], paths: int = DISJOINT_PATHS,
                  pace: Callable[[], float] | None = None, publish_unknowns: int | None = None,
-                 search_unknowns: int | None = None, local_first: Callable[[bytes], list[bytes]] = lambda key: []):
+                 search_unknowns: int | None = None, local_first: Callable[[bytes], list[bytes]] = lambda key: [],
+                 checks: density.CheckCounts | None = None):
         """Lookups made with new_lookup."""
+        self.checks = checks if checks is not None else density.CheckCounts()
         self.new_lookup = new_lookup
         self.start = start
         self.sizes = sizes
@@ -195,19 +220,21 @@ class Lookups:
         first = self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note,
                                 **({"first": local} if local else {}), **_budget(self.search_unknowns))
         return Search(first, lambda left, queries: self._disjoint(key, size, seniors, left, queries,
-                                                                  self.search_unknowns), self.pace)
+                                                                  self.search_unknowns), self.pace, self.checks)
 
     def publish(self, key: bytes) -> Lookup | DisjointLookup:
         """A region's closest-nodes lookup for key, over disjoint paths."""
         return self._disjoint(key, unknowns=self.publish_unknowns)
 
     def flags(self, key: bytes, region) -> bool:
-        """The density check for key over what its region's lookup learned (a sweep.Region)."""
+        """The density check for key over what its region's lookup learned (a sweep.Region), counted in checks."""
         size = self.sizes.estimate(key)
         if size is None:
             return False
         distances = sorted(distance(node_id, key) for node_id in region.nodes)
-        return density.dense_core(distances, size) > 0
+        flagged = density.dense_core(distances, size) > 0
+        self.checks.note(flagged)
+        return flagged
 
     def widen(self, key: bytes, region) -> list[bytes]:
         """The widened lookup of a key that flags() flagged: a Lookup with both checks, so it finds and asks the
