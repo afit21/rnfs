@@ -32,6 +32,10 @@ one of the K/2 oldest records, which /find replies list first. Otherwise it is r
 This node's own records (own_id) are always accepted, never evicted, and not counted toward max_per_key: they are
 what the node provides, and its /find replies list it as a provider from them. They take room in the budget.
 
+For the node's status (usage()), the store counts in memory the new records it refused and the records it evicted to
+make room (from a full budget or a full key), by tier, over the last hour and day (rnfs.dht.recent): a flood shows as
+Newcomers refused or evicted. Expiry, early or not, isn't counted.
+
 Times are wall clock and persisted, so a time in the future (the clock ran ahead, then was corrected) is clamped to
 now on load and at the first expire() after the clock went backwards; otherwise such records would outlive their TTL.
 """
@@ -47,6 +51,7 @@ from collections.abc import Callable, Iterable
 
 from rnfs import statedb
 from rnfs.constants import DAY, GIB, HOUR, K, PROVIDER_TTL
+from rnfs.dht.recent import RecentCounts
 from rnfs.dht.routing import check_id, is_id
 from rnfs.log import LOG_ERROR, LOG_WARNING, log
 
@@ -220,13 +225,14 @@ class ProviderStore:
     seconds, since times are persisted. `rng` picks the random half of /find replies and the publisher a full key
     evicts. `known(publisher)` tells the Known tier; `free_space()` gives the bytes free on the state database's disk
     beyond the blocks' reserve (None: not checked); `record_bytes` fixes the bytes a record takes (None: measured).
+    `monotonic` is the clock of the recent refusals and evictions usage() reports.
     """
 
     def __init__(self, state_dir: str | None, record_budget: int = DEFAULT_RECORD_BUDGET, *,
                  ttl: float = PROVIDER_TTL, clock: Callable[[], float] = time.time, rng: random.Random = random,
                  max_per_key: int = MAX_PUBLISHERS_PER_KEY, own_id: bytes | None = None,
                  known: Callable[[bytes], bool] = _never, free_space: Callable[[], int] | None = None,
-                 record_bytes: float | None = None):
+                 record_bytes: float | None = None, monotonic: Callable[[], float] = time.monotonic):
         """A store of records taking up to record_budget bytes, on the state database in state_dir if given."""
         self.record_budget = record_budget
         self.ttl = ttl
@@ -259,6 +265,9 @@ class ProviderStore:
         self._db_holders: list[dict] = [{} for _ in TIERS]
         self._victim_after: dict[bytes, tuple] = {}  # publisher -> its records on disk passed over until a save
         self._tier_records = [0, 0, 0, 0]  # records held, by tier (OWN: this node's)
+        # New records refused, and records evicted to make room, by tier (the storer's, the evicted publisher's)
+        self._refused = [RecentCounts(monotonic) for _ in TIERS]
+        self._evicted = [RecentCounts(monotonic) for _ in TIERS]
         self._publishers = 0  # publishers holding a record
         self._record_bytes = 1.0  # measured (_measure) unless fixed
         self._room: int | None = None  # bytes free beyond the reserve when last measured (None: not checked)
@@ -320,6 +329,13 @@ class ProviderStore:
                 room = room and result != _FULL
             return stored
 
+    def _refuse(self, publisher: bytes, result: str) -> str:
+        """Count a refused new record of publisher (not this node's) in its tier's refusals; result. Lock held."""
+        tier = self._tier_of(publisher, self._get_standing(publisher))
+        if tier in TIERS:
+            self._refused[tier].add()
+        return result
+
     def retain(self, keep: Callable[[bytes], bool]) -> int:
         """Remove every record of publishers for which keep(publisher) is False (own_id's are always kept), and
         their standing, as private mode does with non-members' records. Returns how many records were removed.
@@ -354,22 +370,23 @@ class ProviderStore:
             self._refresh(key, publisher, record, now)
             return _STORED
         if not room:
-            return _FULL
+            return self._refuse(publisher, _FULL)
         victim = None
         if publisher != self.own_id:
             if self._changes() >= MAX_CHANGES and not (self._save_due() and self._try_save()):
-                return _REFUSED
+                return self._refuse(publisher, _REFUSED)
             standing = self._get_standing(publisher)
             tier = self._tier_of(publisher, standing)
             allowed, victim = self._key_room(records, tier, now)
             if not allowed:
-                return _REFUSED
+                return self._refuse(publisher, _REFUSED)
             # A record evicted from the key leaves room for this one; else the budget may have to make some
             if victim is None and self._full(now) and not self._reclaim(publisher, tier):
-                return _FULL
+                return self._refuse(publisher, _FULL)
         if record is not None:
             self._remove(key, publisher)  # expired: replaced by a new record, with a new first-stored time
         if victim is not None:
+            self._count_eviction(victim)
             self._remove(key, victim)
         self._add(key, publisher, now)
         if self._save_due():
@@ -466,7 +483,16 @@ class ProviderStore:
     def _evict_from(self, publisher: bytes) -> bool:
         """Evict the record publisher refreshed least recently; False if it has none. Lock held."""
         key = self._oldest_key(publisher)
-        return key is not None and self._remove(key, publisher)
+        if key is None or publisher not in self._key_records(key):
+            return False
+        self._count_eviction(publisher)
+        return self._remove(key, publisher)
+
+    def _count_eviction(self, publisher: bytes):
+        """Count an evicted record of publisher in its tier's evictions (its tier as last worked out). Lock held."""
+        standing = self._get_standing(publisher)
+        if standing is not None and standing.tier in TIERS:
+            self._evicted[standing.tier].add()
 
     # Records and standings, read through the caches
 
@@ -997,6 +1023,29 @@ class ProviderStore:
         """Records held by tier name ("own": this node's), as each publisher's tier was last worked out."""
         with self._lock:
             return dict(zip(TIER_NAMES, self._tier_records, strict=True))
+
+    def usage(self) -> dict:
+        """The store against its budget, for the node's status, from counts kept in memory (no read of the records):
+        {"bytes": what the records count for against record_budget (records held × the bytes a record takes, as
+        measured at the last save), "budget": record_budget, "capacity": the records it holds when full (fewer than
+        the budget allows while the free disk is short), "full", "publishers": publishers holding records here
+        (this node too, if it does), "own_records": this node's, "tiers": {"known"|"earned"|"newcomer": {"records",
+        "share" (of the capacity), "floor" (the share a full store keeps for it), "refused_hour", "refused_day" (new
+        records refused), "evicted_hour", "evicted_day" (records evicted to make room)}}}."""
+        with self._lock:
+            count, capacity = self._count(), self._capacity()
+            size = self.fixed_record_bytes or self._record_bytes
+            records, publishers = list(self._tier_records), self._publishers
+        tiers = {}
+        for tier in reversed(TIERS):  # highest first, as rnfs status lists them
+            refused_hour, refused_day = self._refused[tier].hour_and_day()
+            evicted_hour, evicted_day = self._evicted[tier].hour_and_day()
+            tiers[TIER_NAMES[tier]] = {"records": records[tier],
+                                       "share": round(records[tier] / capacity, 4) if capacity > 0 else 0.0,
+                                       "floor": FLOORS[tier], "refused_hour": refused_hour, "refused_day": refused_day,
+                                       "evicted_hour": evicted_hour, "evicted_day": evicted_day}
+        return {"bytes": round(count * size), "budget": self.record_budget, "capacity": math.floor(capacity),
+                "full": count >= capacity, "publishers": publishers, "own_records": records[OWN], "tiers": tiers}
 
     def publisher_count(self) -> int:
         """Number of publishers with records here."""
