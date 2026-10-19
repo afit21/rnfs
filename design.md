@@ -121,7 +121,7 @@ rnfs/
     seal.py           sealed files: SealingReader, open_sealed/SealedFile, recipients (section 5, Sealed files)
     walker.py         Expect, reader checks, path lookup, byte ranges, listing, writing out (sections 5, 7)
     edit.py           dir set / dir rm (section 11)
-    blockstore.py     one file per CID, atomic, verified (section 8)
+    blockstore.py     one file per CID in 1,024 subdirectories, atomic, verified (section 8)
     storage.py        Storage: blocks + pins (sources) + cached fetches + protection + eviction/GC (section 8)
     archive.py        export/import stream; archive_size for an exact Content-Length (section 8)
     tarstream.py      directories as tar streams: build_tar (an upload), plan/length/chunks (a download),
@@ -230,8 +230,20 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   `used_bytes()`. Adds, the shared folder and archive import store through `with session.writer() as put:`,
   which writes blocks on up to 16 threads (`WRITE_THREADS`, at most 32 queued) so their fsyncs overlap, and
   has stored every one, or raised the first error, before the block exits: nothing is pinned before its blocks
-  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
-  cache records, so they never refer to block names a power loss could undo.
+  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the
+  subdirectories blocks were renamed into since the last sync (16 at a time, `SYNC_THREADS`: they share the
+  filesystem's journal commits), and `blocks/` itself when a subdirectory was made; `Storage` calls it before
+  saving pins or cache records, so they never refer to block names a power loss could undo.
+- block layout (`blockstore.py`): `blocks/<xy>/<cid>`, `xy = shard_of(name)`, the written CID's `[-3:-1]`. `put`
+  writes its temporary file in the block's subdirectory, made 0700 on first use (`_shard_dir`, under a small
+  lock, since writers run in parallel). Opening the store lists `blocks/` itself only: `.partial-` files there
+  are deleted, each subdirectory is checked (`_check_shard`: `lstat`, then on POSIX an `O_NOFOLLOW` descriptor's
+  `fstat` for the owner and an `fchmod` to 0700; a link, non-directory or another user's raises RnfsError and
+  stops the start), and every canonical-CID file there (0.1.6's flat layout) is moved into its subdirectory
+  (`fsutil.replace`; if the target exists, the flat copy is deleted) before the subdirectories and `blocks/` are
+  synced. A move that fails leaves the CID in `_flat`, where `path()` looks first, until a start moves it, or
+  `delete` removes it. `scan(tidy)` lists every subdirectory (no links followed; a CID in another block's
+  subdirectory is ignored) and with `tidy` deletes the `.partial-` files it meets, which only a start may do.
 - pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
   `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]` (a copy), `pinned_cids() -> frozenset[Cid]` (the
   same set until pins change: the publisher's refresh reads it after every add), `has_pin(cid, source)`,
@@ -266,6 +278,21 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   since the last `save()`; those still cached are always the most recently used, so a save writes them with
   new `used` values (the table's LRU order) and deletes the others.
 - `verify() -> stats` re-checks every block, deleting bad ones.
+- The block index, `_sizes` (CID -> size), is also the `block_sizes` table (schema step `block_sizes`). `_put`
+  and `_delete` note each change in `_sizes_dirty` (a size, or None); `_save_pins` writes them in the pin's durable
+  transaction and `save()` with the cache records, each taking and writing them under the lock (`save()` syncs
+  the blocks first, outside it), so an older batch never lands after a newer one. The table is trusted only after
+  a clean stop: `close()` marks the store closed (`_put` raises `Closed`, `_delete` deletes nothing), syncs the
+  blocks, writes what is left and sets the meta value `(block_sizes, clean)` to 1 in one durable transaction,
+  unless a put is still writing (`_writing`, a thread that outlived the node's stop) or `BlockStore.untidy` (a
+  partial file it couldn't delete). At the next start `_index` clears the mark durably before the block store
+  is opened (so the move of flat blocks, or anything after, can't be trusted to a stale table), then loads the
+  table, adding the flat blocks `BlockStore` found (`found_flat`: an older rnfs may have stored some since); with
+  no mark, a 0, or a row that doesn't parse, it lists every block (`scan(tidy=True)`) and writes the rows that
+  differ from the table (all of them after a bad row). A row whose file is missing is found when the block is
+  read, as a damaged block is (`get` deletes it from the index). A million small blocks (NVMe, warm cache) are
+  indexed in 1.2 s from the table against 5.4 s for 0.1.6's listing; a start after an unclean stop takes 7.2 s
+  (1,024 directories listed, the table read and compared).
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.
@@ -576,7 +603,12 @@ prints the version and says why). The daemon writes a new random token to `<rnfs
 local users and processes can't drive the API. Before anything else uses the rnfs dir (the debug log, the
 node), the daemon locks `<rnfs dir>/daemon.lock` (`fsutil.lock_exclusive`: `flock`, or `msvcrt.locking` of a byte
 past the text on Windows; the file holds its process ID) and keeps the lock until it exits, so a second daemon
-on the same dir stops at once, naming the first (`lock_holder`). A start runs in this order, in the daemon
+on the same dir stops at once, naming the first (`lock_holder`). The lock is taken before the node opens its block
+store, and the API listens only after, so a client whose connection is refused checks the lock
+(`apiclient.dir_holder`: the process `lock_holder` names, if `_process_alive`, and then `fsutil.lock_held`, a
+shared `flock` (or the byte's lock on Windows) taken and released at once, writing nothing) and raises
+`DaemonStarting(pid)`, a `DaemonNotRunning`, in place of "no daemon is running": `rnfs status` and every other
+command say the daemon is starting. The CLI's `ApiClient` is given `--dir` for it. A start runs in this order, in the daemon
 (`cli.run_daemon`) and in `rnfs.Node` alike: the root (`node.make_private_root`), then the settings
 (`Config.load`), then the subdirectories and the lock (`lock_rnfs_dir`: `_make_private_dirs(root)`, then
 `lock_exclusive`), so each step relies only on what an earlier one secured. `make_private_root` refuses to start
@@ -936,7 +968,8 @@ before submitting, as the CLI resolves a nick. Jobs are persisted, resumed at th
 `NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`, and
 `BlockMismatch` and `SealError` (a sealed file malformed or tampered with), which are `ValueError`s too, as is
 `NotRecipient` (this node can't open a sealed file).
-`ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning`, `ConnectionFailed`, `TokenError`,
+`ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning` (⊃ `DaemonStarting`, with `.pid`: a process holds the
+rnfs dir's lock, as a daemon does while it opens its block store), `ConnectionFailed`, `TokenError`,
 `AuthFailed`, `SettingsError`, `ServerError` (500, or another 5xx), and the API statuses, each also a subclass
 of the node's class: `apiclient.NotFound(ApiError, errors.NotFound)` and so on, `BadRequest(ApiError,
 ValueError)`. So `except rnfs.NotFound` and `except ValueError` catch both classes' errors. A Node raises

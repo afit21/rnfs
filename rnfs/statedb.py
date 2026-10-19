@@ -219,6 +219,11 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # the token), when it was added
         "CREATE TABLE apps (name TEXT PRIMARY KEY, verifier BLOB NOT NULL, created REAL NOT NULL) WITHOUT ROWID",
     )),
+    ("block_sizes", (
+        # Every stored block's size (rnfs 0.2.0), so a start needn't list them all: trusted only while the meta
+        # value (block_sizes, clean) is 1, which Storage.close() sets once it has written the table whole
+        "CREATE TABLE block_sizes (cid BLOB PRIMARY KEY, size INTEGER NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

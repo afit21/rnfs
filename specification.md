@@ -878,9 +878,23 @@ silent longer than every one of them; announces are recorded in memory and writt
 
 ## 8. Storage
 
-- Blocks are stored in `<rnfs dir>/blocks/`, one file per CID, written atomically after verification, and
-  synced to disk before any pin or cache record that refers to them is saved, so a power loss can't leave a
-  pin without its blocks or an empty file under a CID name.
+- Blocks are stored in `<rnfs dir>/blocks/<xy>/<cid>`, one file per CID, written atomically after
+  verification, and synced to disk before any pin or cache record that refers to them is saved, so a power loss
+  can't leave a pin without its blocks or an empty file under a CID name. `<xy>` is the CID's third- and
+  second-to-last characters, in that order: 1,024 subdirectories, named in lowercase base32 for both codecs (a
+  CID's leading characters are the same for every CID of its codec, and its last carries only 2 or 3 bits).
+- Blocks rnfs 0.1.6 and earlier stored directly in `blocks/` are moved into their subdirectories at the start
+  (a rename within the filesystem; one already there makes the flat copy redundant, and it is deleted), and the
+  directories synced. Every start moves what is left, so an interrupted move loses nothing, and a block whose
+  move fails (on Windows, a file another program holds open) stays readable where it is until a later start.
+- rnfs stores blocks only in real directories of its own: a subdirectory of `blocks/` that is a link (or a
+  Windows junction), isn't a directory or belongs to another user stops the start; a loose one is made 0700.
+  Links inside `blocks/` are never followed.
+- Every stored block's size is kept in the state database too, written whenever pins or cache records are saved,
+  so a start needn't list every block: after a clean stop rnfs reads them from there. After a stop that wasn't
+  clean (a crash, a power loss, or the first start of 0.2.0) it lists every block, deleting partial files a crash
+  left, and writes the sizes again. A block whose file turns out to be missing counts as a damaged block: deleted
+  from the index once read, and fetched again if needed.
 - rnfs keeps the rest of its state (pins, cache records, names, provider records, jobs, ...) in one SQLite
   database, `<rnfs dir>/state/rnfs.db`, readable by its owner only. The JSON state files earlier versions wrote
   under `<rnfs dir>/state/` are imported into it at the first start, each once and whole, and kept as
@@ -1391,7 +1405,7 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1483,6 +1497,13 @@ gateway can never reach the API.
   Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
   app's token; they can read the CLI's token already.
 - The API never sends CORS headers.
+- **Starting** (rnfs 0.2.0). The daemon locks `<rnfs dir>/daemon.lock`, which holds its process ID, before it
+  opens its block store, and its API listens only once that is done, which takes a while for a large store after
+  an unclean stop or at the upgrade (section 8). When nothing answers on the API port but a running process holds
+  that lock, a client reports the daemon as starting, naming that process, rather than as not running (it may
+  also be stopping, or an app's own node, which serves no API). The lock is tested only while the process the file
+  names runs, by taking a shared lock for an instant: a daemon trying to lock the dir at that very instant would
+  fail as if another held it.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
   gateway ports, version, start time, rnfs directory, Reticulum config directory, whether it attached to a shared

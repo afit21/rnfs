@@ -15,6 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 
+from rnfs.content.blockstore import shard_of
 from tests import support
 from tests.support import free_port
 
@@ -337,7 +338,7 @@ class NetworkTest(unittest.TestCase):
 
         # A damaged block on A: A re-checks before serving, so it answers None rather than bad data; B then
         # fails over to the hub, which imported the archive and provides it too
-        with open(os.path.join(a.dir, "blocks", index_cid), "wb") as f:
+        with open(os.path.join(a.dir, "blocks", shard_of(index_cid), index_cid), "wb") as f:
             f.write(b"damaged on disk")
         b.cli("gc")  # B cached index.txt through its gateway above
         failed = b.cli("get", f"{dir_cid}/index.txt", "-o", self.path("b-index-a"), "--from", a.node_id, check=False)

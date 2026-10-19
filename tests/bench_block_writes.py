@@ -6,11 +6,11 @@ hand on the disks that matter. It stores blocks through the real builder, Storag
 BlockStore for one of four variants defined here (subclasses; no rnfs module is changed):
 
 - today            rnfs as it is: BlockStore.put fsyncs each block's temporary file before renaming it, and
-                   BlockStore.sync() (run before every pin and cache save) fsyncs the directory.
+                   BlockStore.sync() (run before every pin and cache save) fsyncs the subdirectories written to.
 - fdatasync        the same, with fdatasync in place of fsync (fsync where the OS has no fdatasync).
 - deferred-fsync   put writes and renames without syncing, remembering the path; the durability point (sync(),
                    and a Session writer's close, outside the storage lock) fdatasyncs every remembered file, at
-                   most WRITE_THREADS at a time, then the directory. Includes the plan's blocks/.dirty marker
+                   most WRITE_THREADS at a time, then the directories. Includes the plan's blocks/.dirty marker
                    (created and synced before the first unsynced write, removed after sync()), but not the
                    startup check that would read it.
 - deferred-syncfs  the same, with one Linux syncfs() of the blocks' filesystem in place of the per-file loop.
@@ -76,7 +76,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 from rnfs import fsutil
 from rnfs.constants import KIB, MAX_BLOCK_SIZE, MIB
 from rnfs.content import builder
-from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore
+from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore, shard_of
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER, WRITE_THREADS, Storage
 
@@ -103,7 +103,8 @@ class _ReplicaStore(BlockStore):
         path = self.path(cid)
         if os.path.isfile(path):
             return
-        fd, partial_path = tempfile.mkstemp(prefix=PARTIAL_PREFIX, dir=self.directory)
+        name = str(cid)
+        fd, partial_path = tempfile.mkstemp(prefix=PARTIAL_PREFIX, dir=self._shard_dir(name))
         try:
             with os.fdopen(fd, "wb") as out:
                 out.write(block)
@@ -116,7 +117,8 @@ class _ReplicaStore(BlockStore):
                     raise
                 fsutil.remove(partial_path)
                 return
-            self._unsynced = True
+            with self._lock:
+                self._dirty.add(shard_of(name))
             self._renamed(path)
         except BaseException:
             try:
@@ -167,14 +169,13 @@ class DeferredStore(_ReplicaStore):
         self._marked = True
 
     def sync(self):
-        """Sync every block renamed since the last sync, then the directory, then remove the marker."""
+        """Sync every block renamed since the last sync, then the directories, then remove the marker."""
         with self._paths_lock:
             paths, self._paths = self._paths, set()
-            self._unsynced = False
         if not paths:
             return
         self._flush(paths)
-        fsutil.sync_directory(self.directory)
+        super().sync()
         with self._paths_lock:
             if not self._paths and self._marked:  # nothing renamed meanwhile, so nothing is left unsynced
                 os.remove(os.path.join(self.directory, DIRTY_MARKER))

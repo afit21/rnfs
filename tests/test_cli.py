@@ -17,6 +17,7 @@ from rnfs.api import ApiServer
 from rnfs.content.cid import RAW, Cid
 from tests.support import CAN_SYMLINK, POSIX_MODES, free_port, real
 from tests.test_api import FakeNode
+from tests.test_fsutil import hold_lock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -348,6 +349,21 @@ class OtherCommandTest(CliTestCase):
         code, _, err = self.run_cli("status", port=free_port())
         self.assertEqual(code, 1)
         self.assertIn("no daemon is running", err)
+
+    def test_daemon_starting(self):
+        # The daemon locks its rnfs dir before opening the block store, and its API listens only after
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            for command in (("status",), ("pin", "ls")):
+                with self.subTest(command=command):
+                    code, _, err = self.run_cli(*command, port=free_port())
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"the daemon (process {holder.pid}) is starting", err)
+                    self.assertNotIn("no daemon is running", err)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
 
     def test_sends_api_header_and_host(self):
         # The server would answer 403 otherwise; check the exact header anyway
