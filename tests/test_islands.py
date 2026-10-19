@@ -11,6 +11,7 @@ from rnfs.config import Config
 from rnfs.dht.local import (FAILURES_TO_ENTER, GAP_SAMPLES, LOCAL_FIRST, LOCAL_FIRST_RADIUS, MAX_JUDGED, MIN_GAPS,
                             MIN_SILENCE, PROBE_INTERVAL, SILENCE_FACTOR, SLOW_PROBE_INTERVAL, SLOW_PROBE_MAX,
                             LocalServers, PartitionMode, judge_all)
+from rnfs.dht.lookups import SLOW_DISJOINT_PATHS
 from rnfs.dht.routing import distance
 from rnfs.mesh import NO_PATH, PathInfo
 from rnfs.node import RnfsNode
@@ -400,7 +401,9 @@ class PartitionWiringTest(IslandCase):
         self.cut()
         self.node.lookups.search(ident(0x4444)).find_providers(lambda provider: None)
         self.assertTrue(self.node.partition.active)
-        self.assertEqual(self.off_island(), FAILURES_TO_ENTER)  # then no more were asked
+        # Then no more were asked, but those already out on the fallback's paths when it began (they run at once)
+        self.assertGreaterEqual(self.off_island(), FAILURES_TO_ENTER)
+        self.assertLessEqual(self.off_island(), FAILURES_TO_ENTER + SLOW_DISJOINT_PATHS)
         status = self.node.status()
         self.assertTrue(status["partition"])
         self.assertIsNotNone(status["partition_since"])
@@ -453,6 +456,53 @@ class PartitionWiringTest(IslandCase):
         self.node._fresh_announce(ident(0x7777))  # not a server it judged
         self.assertTrue(self.node.partition.active)
         self.node._fresh_announce(self.backbone[3])
+        self.assertFalse(self.node.partition.active)
+
+    def partitioned_publish(self) -> bytes:
+        """Enter partition mode, then add and publish a file: its key."""
+        self.cut()
+        self.node.lookups.search(ident(0x4444)).find_providers(lambda provider: None)
+        self.assertTrue(self.node.partition.active)
+        self.node.add_path(self.write(b"published while cut off"))
+        self.net.provide_calls.clear()
+        self.node.publisher.publish_due()
+        key = next(iter(self.node.publisher.provided())).key
+        self.assertEqual(self.node.publisher.heal_marked(), 1)
+        return key
+
+    def stored_beyond(self, key: bytes) -> set[bytes]:
+        """The servers behind the gateway sent key since provide_calls was cleared."""
+        return {node_id for node_id, keys, _ in self.net.provide_calls if key in keys and node_id in self.backbone}
+
+    def test_heal_republish(self):
+        """Keys whose round reached only the island are republished as soon as partition mode ends, not at their next
+        republish (3 days on a slow node); then the mark is gone."""
+        key = self.partitioned_publish()
+        self.assertEqual(self.stored_beyond(key), set())
+        self.assertGreater(self.node.publisher.next_due(), 3600)  # published: not due for days
+        self.heal()
+        self.node._fresh_announce(self.backbone[0])  # the gateway is back: an announce from beyond it
+        self.assertFalse(self.node.partition.active)
+        self.node.publisher._next_lookup = 0  # past the slow node's pacing of the round before
+        self.assertEqual(self.node.publisher.next_due(), 0)
+        self.node.publisher.publish_due()
+        self.assertTrue(self.stored_beyond(key))
+        self.assertEqual(self.node.publisher.heal_marked(), 0)
+
+    def test_marks_survive_a_restart(self):
+        self.partitioned_publish()
+        self.node.stop()
+        node = self.make_node(slow="yes", local_interfaces=["LoRa"])
+        self.assertEqual(node.publisher.heal_marked(), 1)
+        node._heard_server(self.backbone[0])
+        node.partition.active = True  # still cut off after the restart, say
+        node._fresh_announce(self.backbone[0])
+        self.assertLess(node.publisher.next_due(), 3600)
+
+    def test_rounds_reaching_beyond_the_island_mark_nothing(self):
+        self.node.add_path(self.write(b"connected"))
+        self.node.publisher.publish_due()
+        self.assertEqual(self.node.publisher.heal_marked(), 0)
         self.assertFalse(self.node.partition.active)
 
     def test_a_node_without_local_servers_never_enters_it(self):

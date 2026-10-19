@@ -1084,6 +1084,7 @@ class RnfsNode:
                 LOG_NOTICE)
         else:
             log("partition mode ended: off-island servers answer again", LOG_NOTICE)
+            self.publisher.heal()  # what was stored only on the island goes beyond it now, paced as ever
 
     def _run_local(self):
         """The local-servers loop (only on a node that may have local servers)."""

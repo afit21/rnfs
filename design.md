@@ -725,7 +725,13 @@ disjoint path's K closest (`Region.path_closest`) and the ring servers of a wide
 `set_islands(islands)` (the node's `PartitionMode`, on a node with local servers): while it is active `_store_set`
 keeps only the servers `allows` takes, the round's withdrawal snapshot leaves out the others (they stay queued), and
 `send` skips a server it no longer allows (as if refused, nothing recorded) without opening a link; each `/provide`
-of keys reports `answered` (keys possibly recorded) or `failed` (none: no link). `set_widening(flags, widen)` (the
+of keys reports `answered` (keys possibly recorded) or `failed` (none: no link). At a round's end `_mark_heal` marks
+each item it published (`_heal`) whose accepted servers are all local, if partition mode was on at its start or end
+or its store set held an off-island server, and clears the mark of one that reached an off-island server;
+`heal()` (the node's `_partition_changed` on leaving partition mode) sets `_retry_at` to now for every marked item
+still provided, so it is due at once (and paced on slow nodes as any round); an item marked by a round that began in
+partition mode and ended out of it is made due again the same way. `_heal_rows` (items ever marked, so possibly with
+a row) bounds the `published_heal` deletes a save sends. `heal_marked()` counts them. `set_widening(flags, widen)` (the
 node passes `Lookups.flags` and `Lookups.widen`) has each lookup thread, once its
 region is covered, check the keys it covered (`_widen`) and run the widened lookup of each flagged one within the
 round's limit (`Sweep.spend`; a key over it goes in `Region.deferred` and isn't published this round, so it stays
@@ -1825,7 +1831,8 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only), with the meta values
   `(publisher, region_bits)` and `(publisher, entries_on)` (0.2.0: the network size estimate and whether entries
-  were provided, saved with them);
+  were provided, saved with them), and `published_heal` (0.2.0: the published items marked for the heal republish,
+  written and deleted with their published rows; a mark without a published row is deleted at load);
 - `provider_records` (read per key; indexed by publisher and last-stored time for eviction and expiry; `pooled` is
   always 0 since 0.2.0), `provider_publishers` (first-seen times) and `provider_standing` (0.2.0: each publisher's
   record count, tier, refresh days and last refresh day; indexed by tier and count), NORMAL every 30 s, when 20 000

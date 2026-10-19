@@ -249,6 +249,11 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "CREATE TABLE name_sync_files (name TEXT NOT NULL, state TEXT NOT NULL, cid BLOB NOT NULL,"
         " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
     )),
+    ("publisher_heal", (
+        # The published items (published.item) whose last round reached no server beyond the node's island (rnfs
+        # 0.2.0, section 6 "LoRa islands"): republished when partition mode ends, also after a restart
+        "CREATE TABLE published_heal (item TEXT PRIMARY KEY) WITHOUT ROWID",
+    )),
 )
 
 

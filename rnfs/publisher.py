@@ -46,6 +46,12 @@ whose round was stopped before every node was sent its keys stays due. Times are
 - **Partition mode** (set_islands; specification section 6, "LoRa islands"): while the node is cut off from the
   servers beyond its island, a round stores to and withdraws from local servers only (the rest stay queued, and a
   store set's off-island servers count as not stored to), and each server's answer or failure is told to it.
+- **The heal republish.** An item whose round reached no off-island server, in partition mode or after trying, is
+  marked (persisted with its published row, in published_heal, so a restart during a partition keeps it); heal(),
+  when partition mode
+  ends, makes every marked item due, so the rounds that follow (paced as ever on slow nodes) put its records beyond
+  the island within hours rather than at its next republish (3 days on a slow node). A round reaching an off-island
+  server clears the mark.
 """
 import hashlib
 import math
@@ -354,9 +360,9 @@ _ITEM, _NODE, _META = "item", "node", "meta"  # the kinds of key _PublishState w
 
 
 class _PublishState(statedb.RowStore):
-    """The publisher's three tables and its meta values, saved together (not durably: NORMAL) in one transaction. A
-    key is (_ITEM, item), whose published row and published_earlier rows are written again, (_NODE, node ID), whose
-    withdrawals rows are, or (_META, name), the meta value name (META_STORE)."""
+    """The publisher's tables and its meta values, saved together (not durably: NORMAL) in one transaction. A key is
+    (_ITEM, item), whose published, published_earlier and published_heal rows are written again, (_NODE, node ID),
+    whose withdrawals rows are, or (_META, name), the meta value name (META_STORE)."""
 
     def __init__(self, db: statedb.StateDb, publisher: "Publisher"):
         """The saves of publisher's state, whose lock guards it."""
@@ -372,14 +378,18 @@ class _PublishState(statedb.RowStore):
         texts = {item: str(item) for item in items}
         published = [(texts[item], publisher._published[item][0], b"".join(publisher._published[item][1]))
                      for item in items if item in publisher._published]
+        marked = {item for item in items if item in publisher._published and item in publisher._heal}
+        heal = [(texts[item],) for item in marked]
+        # Only an item ever marked may have a published_heal row to delete
+        unmarked = [(texts[item],) for item in items if item in publisher._heal_rows and item not in marked]
         earlier = [(texts[item], node, at) for item in items for node, at in publisher._earlier.get(item, {}).items()]
         withdrawals = [(node, key) for node in nodes for key in publisher._withdrawals.get(node, ())]
         meta = [(name, publisher._meta_value(name)) for kind, name in keys if kind == _META]
-        return list(texts.values()), published, earlier, nodes, withdrawals, meta
+        return list(texts.values()), published, earlier, nodes, withdrawals, meta, heal, unmarked
 
     def write_rows(self, tx, snapshot: tuple):
         """Replace the rows of the snapshot's items and nodes, and its meta values, inside transaction tx."""
-        texts, published, earlier, nodes, withdrawals, meta = snapshot
+        texts, published, earlier, nodes, withdrawals, meta, heal, unmarked = snapshot
         for name, value in meta:
             if value is None:
                 tx.execute("DELETE FROM meta WHERE store = ? AND key = ?", (META_STORE, name))
@@ -387,7 +397,9 @@ class _PublishState(statedb.RowStore):
                 statedb.set_meta(tx, META_STORE, name, value)
         tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in texts])
         tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in texts])
+        tx.executemany("DELETE FROM published_heal WHERE item = ?", unmarked)
         tx.executemany("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", published)
+        tx.executemany("INSERT OR REPLACE INTO published_heal (item) VALUES (?)", heal)
         tx.executemany("INSERT OR REPLACE INTO published_earlier (item, node, at) VALUES (?, ?, ?)", earlier)
         tx.executemany("DELETE FROM withdrawals WHERE node = ?", [(node,) for node in nodes])
         tx.executemany("INSERT OR REPLACE INTO withdrawals (node, key) VALUES (?, ?)", withdrawals)
@@ -460,6 +472,8 @@ class Publisher:
         self._store_parts: list[StorePart] = []  # add_store_part
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
         self._islands = None  # set_islands: the node's partition mode (rnfs.dht.local.PartitionMode), if any
+        self._heal: set[ProvidedItem] = set()  # items whose last round reached no off-island server (persisted)
+        self._heal_rows: set[ProvidedItem] = set()  # items that may have a published_heal row (ever marked)
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
         # Writes what changed since the last save (_touch_item, _touch_node), when persisted
@@ -513,6 +527,7 @@ class Publisher:
                 self._touch_item(item)
             return item
 
+        marked = {text for (text,) in db.query("SELECT item FROM published_heal")}
         for text, at, nodes in db.query("SELECT item, at, nodes FROM published"):
             item = item_of(text)
             if item is None:
@@ -523,6 +538,10 @@ class Publisher:
                 malformed += 1
                 self._touch_item(item)
                 continue
+            if text in marked:
+                self._heal.add(item)
+                self._heal_rows.add(item)
+                marked.discard(text)
             if self._published[item][0] != at:
                 self._touch_item(item)
         for text, node, stored in db.query("SELECT item, node, at FROM published_earlier"):
@@ -557,6 +576,11 @@ class Publisher:
             with db.transaction() as tx:
                 tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in doomed])
                 tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in doomed])
+        # Marks of items without a published row (or one doomed) mean nothing
+        marked |= doomed & {text for (text,) in db.query("SELECT item FROM published_heal")}
+        if marked:
+            with db.transaction() as tx:
+                tx.executemany("DELETE FROM published_heal WHERE item = ?", [(text,) for text in marked])
 
     def save(self):
         """Persist the publish state changed since the last save, if any. Called without the lock: it is written
@@ -816,6 +840,7 @@ class Publisher:
             self._provided, self._served = provided, served
             for cid in removed:
                 self._retry_at.pop(cid, None)
+                self._heal.discard(cid)
                 self.providers.withdraw(cid.key, self.own_id)
                 record = self._published.pop(cid, None)
                 earlier = self._earlier.pop(cid, {})
@@ -932,6 +957,8 @@ class Publisher:
         density check flagged}.
         """
         now = self.clock()
+        islands = self._islands
+        partitioned = islands is not None and islands.active  # at the round's start (or its end, below)
         with self._lock:
             self._clamp(now)
             # Never published first, then the longest unpublished: what pacing defers is the least urgent
@@ -963,7 +990,6 @@ class Publisher:
         with self._lock:
             # Taken after the lookups, which can be long, so withdrawals queued meanwhile go in this round. In
             # partition mode those for servers off the island wait (they can't be reached)
-            islands = self._islands
             withdrawals = {node: set(keys) for node, keys in self._withdrawals.items()
                            if keys and (islands is None or islands.allows(node))}
             for cid in [cid for cid in closest if cid not in self._provided]:
@@ -1072,6 +1098,11 @@ class Publisher:
                     continue
                 self._retry_at.pop(cid, None)
                 self._touch_item(cid)
+                if islands is not None:
+                    marked = self._mark_heal(cid, nodes, accepted[cid], partitioned or islands.active)
+                    if marked and partitioned and not islands.active:
+                        # Partition mode ended while this round ran, after heal() made the marks due: due again
+                        self._retry_at[cid] = now
                 # Nodes this round didn't store it on may still hold an earlier record: withdrawn from too
                 earlier = {n: t for n, t in self._earlier.pop(cid, {}).items() if now - t < PROVIDER_TTL}
                 previous = self._published.pop(cid, None)
@@ -1101,6 +1132,39 @@ class Publisher:
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds,
                 "widened": sweep.widened}
+
+    def _mark_heal(self, item: ProvidedItem, nodes: list[bytes], accepted: list[bytes], partitioned: bool) -> bool:
+        """Mark item for the heal republish if its round (store set nodes, accepted those that may hold it) reached
+        no off-island server, in partition mode or after trying one; clear the mark if it reached one. True if it is
+        marked now. Lock held."""
+        islands = self._islands
+        if any(not islands.is_local(node_id) for node_id in accepted):
+            self._heal.discard(item)
+            return False
+        if partitioned or any(not islands.is_local(node_id) for node_id in nodes):
+            self._heal.add(item)
+            self._heal_rows.add(item)
+            return True
+        return item in self._heal
+
+    def heal(self) -> int:
+        """Partition mode ended: every item marked (its last round reached no off-island server) is due now, so the
+        rounds that follow (paced on slow nodes as ever) republish it beyond the island. Returns how many."""
+        now = self.clock()
+        with self._lock:
+            marked = [item for item in self._heal if item in self._provided]
+            for item in marked:
+                self._retry_at[item] = now
+        if marked:
+            log(f"partition mode ended: republishing {plural(len(marked), 'key')} stored only on the island",
+                LOG_NOTICE)
+            self.wake()
+        return len(marked)
+
+    def heal_marked(self) -> int:
+        """How many provided items are marked for the heal republish."""
+        with self._lock:
+            return sum(1 for item in self._heal if item in self._provided)
 
     def _learn_network_size(self, regions: list[Region]):
         """Fold the prefix lengths of regions a round found (those that found a server) into the running mean the

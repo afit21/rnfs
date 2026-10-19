@@ -10,8 +10,8 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
-  `remote_pins_asked`, `remote_pins_served`, `name_syncs`, `name_sync_files`); an older rnfs can't open it
-  afterwards. Pins made before the upgrade
+  `remote_pins_asked`, `remote_pins_served`, `name_syncs`, `name_sync_files`, `published_heal`); an older rnfs can't
+  open it afterwards. Pins made before the upgrade
   have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
@@ -389,6 +389,10 @@ The DHT (local behaviour: nothing on the wire changes):
   minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never enters
   it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
   `partition_since`.
+- **The heal republish:** keys whose last publish round reached no server beyond the island (during a partition) are
+  marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
+  network finds them within hours instead of after their next republish (3 days on a slow node). The marks are kept
+  across restarts (a new table, `published_heal`).
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

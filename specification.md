@@ -784,6 +784,13 @@ or protocol constant changes.
   status says whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops`
   count as off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands
   set `local_interfaces`.
+- **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
+  network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
+  the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
+  or after trying one), and republish the marked keys when partition mode ends, paced as its rounds are (a slow node's
+  10 lookups a round). rnfs keeps the marks across restarts (in the state database) and clears a key's mark when a
+  round reaches an off-island server. In the simulation this found such records in hours instead of days while about
+  5 keys or fewer per node were affected on a 30-node island (more queue behind the channel).
 - **What it buys.** In the simulation (islands of 10–50 servers, all nodes upgraded) a neighbour on the island found
   content published there 100% of the time during a partition, in about 28 s instead of 300, and island-to-island
   lookups took 42% less airtime while connected; asking only the one closest local server first costs nothing
