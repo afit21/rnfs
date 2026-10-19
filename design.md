@@ -1358,7 +1358,8 @@ Locks are taken in this order, never the reverse: `names._lock` → `publisher._
 → the state database's lock (`statedb`, innermost: a store opens a transaction only once it holds every lock the
 change needs, and inside it takes no other lock and does no network I/O). `node._deny_lock` (one deny-list change
 applied at a time, `_apply_deny`) is taken before the publisher's lock and never with the names lock;
-`DenyList._lock` holds only the state database's. Feature locks held across `storage.pin`/`unpin`/`protect` and
+`DenyList._lock` holds only the state database's, as does `AppRegistry._lock` (`app_rm`'s release of the app's
+pins runs without it). Feature locks held across `storage.pin`/`unpin`/`protect` and
 `publisher.refresh()` (`JobsFeature._lock`, `FollowFeature._lock`, `LxmfFeature._lock`) come before the publisher's
 and storage's. The public API's locks come after these: `Rnfs._watch_lock` after the names lock (NameManager's
 record listeners run under it, and only queue), the event and job-watch conditions innermost; callbacks into the

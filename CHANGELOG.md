@@ -9,9 +9,9 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`); an older rnfs can't
-  open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count as
-  never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`); an older rnfs
+  can't open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count
+  as never exported (`rnfs status` lists them until `rnfs name export` is run).
 - **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
   `app:lxmf:<address>` (`pin ls` shows the new one), the source the LXMF wrapper app will own once LXMF leaves
   core; the LXMF built into rnfs uses it from now on, so nothing is released by the change. An older

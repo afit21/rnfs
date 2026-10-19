@@ -1379,10 +1379,10 @@ gateway can never reach the API.
   change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
   that far. Removing an app revokes its token at once, cancels its queued and running jobs and releases every
   pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
-  CLI's token manages apps (rnfs: `GET /api/apps`,
-  `POST /api/apps/add {"name"}`, which answers the token, the only time it is given, and `POST /api/apps/rm
-  {"name"}`); an app's token gets `403` with code `forbidden` there. While the LXMF built into rnfs is on, rnfs
-  refuses an app called `lxmf`, whose pins (`app:lxmf:`) it would share (section 13).
+  CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token, the
+  only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden`
+  there. While the LXMF built into rnfs is on, rnfs refuses an app called `lxmf`, whose pins (`app:lxmf:`) it
+  would share (section 13).
 - **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
   `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
   `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of
@@ -1391,11 +1391,7 @@ gateway can never reach the API.
   across a restart. With the CLI's token a pin key is refused (400): its pins are always `user`'s. `pin ls`
   shows every pin's sources to every caller.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
-  `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's. With
-  `X-Rnfs-App: <name>` the key is the app's verifier written as 64 lowercase hex digits instead of the token
-  (an app computes it from its token), and no proof is sent for an app the node doesn't have. Whoever can read
-  the node's state could answer an app's proof while the daemon is down, and so be sent that app's token; they
-  can read the CLI's token already.
+  `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it sends the token, a client SHOULD check this proof with a `GET /api/status` on the connection
   that will carry the request (the CLI and `rnfs.apiclient` do, for every request), so a program another user
   runs on the port while the daemon is down learns neither the token nor a name key being imported, nor can
@@ -1405,7 +1401,11 @@ gateway can never reach the API.
   this (the proof needs no token), and the second request gets a new read deadline, so one connection can hold
   a connection slot (below) about twice as long as a single request could (rnfs: about 2 × 15 s). This is
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
-  exactly one more request.
+  exactly one more request. A request carrying `X-Rnfs-App: <name>` gets its proof keyed by that app's verifier
+  (above), written as 64 lowercase hex digits, instead of the token: an app computes it from its own token, and
+  checks the proof the same way before sending that token. No proof is sent for an app the node doesn't have.
+  Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
+  app's token; they can read the CLI's token already.
 - The API never sends CORS headers.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
