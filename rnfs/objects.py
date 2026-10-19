@@ -228,6 +228,8 @@ class Status(_Object):
     names: int | None = None
     unexported_names: list | None = None  # aliases whose key was never exported or imported (rnfs 0.2.0)
     local_servers: int | None = None  # the servers on this node's island it knows of (rnfs 0.2.0)
+    partition: bool | None = None  # cut off from the servers beyond its island: local ones only (rnfs 0.2.0)
+    partition_since: float | None = None  # Unix time partition mode began, while in it
     features: dict = field(default_factory=dict, repr=False, metadata={"json": False})
 
     def to_dict(self) -> dict:

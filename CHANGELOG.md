@@ -381,6 +381,14 @@ The DHT (local behaviour: nothing on the wire changes):
   time instead of 55–72%, and island-to-island lookups took 42% less airtime, for 12% more publish airtime. Fast
   nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
   `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
+- **Partition mode** (spec section 6, "LoRa islands"): a node with local servers that fails 3 times in a row to reach
+  off-island servers, or hears no off-island announce or answer for over 4 times the usual gap between off-island
+  announces (at least 10 minutes) and then gets no answer from one it probes, uses its local servers only for
+  lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of minutes
+  of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server every 5
+  minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never enters
+  it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
+  `partition_since`.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

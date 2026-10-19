@@ -50,7 +50,7 @@ from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, 
                                   remote_source)
 from rnfs.dht.density import SizeEstimate
 from rnfs.dht.firstseen import FirstSeenLog
-from rnfs.dht.local import SCAN_INTERVAL, LocalServers, first_count, judge_all
+from rnfs.dht.local import SCAN_INTERVAL, LocalServers, PartitionMode, first_count, judge_all
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.lookups import (DISJOINT_PATHS, SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups,
                               Search)
@@ -671,6 +671,8 @@ class RnfsNode:
         self._path_hops: Callable[[bytes], int | None] = lambda node_id: None
         self._scan_paths: Callable[[int | None], dict[bytes, PathInfo]] = lambda max_hops: {}
         self._scanned_at: float | None = None  # monotonic time of the last scan
+        # Partition mode: fed only on a node with local servers (local_on), so never entered on another
+        self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed)
         # Which lookups searching and publishing run (section 6): density-checked searches with the senior rule,
         # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths.
         # Slow nodes may make more path requests per lookup than alpha, most when publishing: they hear few announces
@@ -741,6 +743,8 @@ class RnfsNode:
         # Two-level records: and on its closest local servers (section 6, "LoRa islands")
         if local and config.local_replicas:
             self.publisher.add_store_part(self._local_replicas)
+        if local:
+            self.publisher.set_islands(self.partition)  # in partition mode, rounds reach local servers only
         # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
         self.names.held_listener = self._name_event
@@ -955,7 +959,12 @@ class RnfsNode:
         fresh = self.routing.closest(key, 2 * K, for_reply=True)
         nearest = fresh + [n for n in self.routing.closest(key, 2 * K) if n not in fresh]
         reliable = [n for n in nearest if not self.routing.unreliable(n)]
-        return (reliable + [n for n in nearest if n not in reliable])[:K]
+        start = (reliable + [n for n in nearest if n not in reliable])[:K]
+        if self.partition.active:
+            # Partition mode: lookups use local servers only (_wired_lookup), of which the routing table may hold few
+            local = self.local.closest(key, K, exclude=self._not_for_us)
+            start = list(dict.fromkeys(local + [n for n in start if self.local.is_local(n)]))
+        return start
 
     def _wired_lookup(self, key: bytes, start: list[bytes], **options) -> Lookup:
         """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths). On a node
@@ -964,6 +973,9 @@ class RnfsNode:
         if not self.slow:
             options.setdefault("slow_path", self.slow_paths)
             options.setdefault("check_path", self._check_path)
+        if self.local_on:
+            # Partition mode (section 6, "LoRa islands"): local servers only, also for a lookup running when it begins
+            options.setdefault("allowed", self.partition.allows)
         return self._new_lookup(key, start, self.routing.is_banned, **options)
 
     def _path_check(self, node_id: bytes) -> bool | None:
@@ -1044,9 +1056,34 @@ class RnfsNode:
             log(f"{plural(len(self.local), 'local server')}", LOG_VERBOSE)
 
     def check_local(self):
-        """The local-servers thread's work, every LOCAL_CHECK: scan the path table every SCAN_INTERVAL."""
+        """The local-servers thread's work, every LOCAL_CHECK: scan the path table every SCAN_INTERVAL, and probe an
+        off-island server when partition mode wants one (silence, or the periodic probe in it)."""
         if self._scanned_at is None or time.monotonic() - self._scanned_at >= SCAN_INTERVAL:
             self.scan_local()
+        if self.partition.probe_due():
+            self.probe_off_island()
+
+    def probe_off_island(self) -> bool | None:
+        """One /find (for this node's own ID) to an off-island server (PartitionMode.probe_target), its outcome told
+        to partition mode: True if answered, False if not, None if there was none to probe. Not counted in the
+        routing table if it fails: a partition isn't the server's failure."""
+        target = self.partition.probe_target()
+        if target is None:
+            self.partition.no_target()
+            return None
+        answered = self.client.find(target, self.node_id) is not None
+        if answered:
+            self.routing.answered(target)
+        self.partition.probed(target, answered)
+        return answered
+
+    def _partition_changed(self, active: bool):
+        """Partition mode began or ended (PartitionMode's on_change, from whichever thread noticed)."""
+        if active:
+            log("partition mode: off-island servers can't be reached; lookups and publishes use local servers only",
+                LOG_NOTICE)
+        else:
+            log("partition mode ended: off-island servers answer again", LOG_NOTICE)
 
     def _run_local(self):
         """The local-servers loop (only on a node that may have local servers)."""
@@ -1073,11 +1110,16 @@ class RnfsNode:
         """A node answered /find, proving it is a reachable server."""
         if self.routing.answered(node_id):
             self.publisher.wake()  # a CID that found no nodes may now be publishable
+        if self.local_on:
+            self.partition.answered(node_id)  # an off-island answer ends partition mode
 
     def _query_failed(self, node_id: bytes):
-        """A /find to node_id went unanswered: counted in the routing table, and lowering its score."""
+        """A /find to node_id went unanswered: counted in the routing table, and lowering its score (and towards
+        partition mode, if it is off-island)."""
         self.routing.failed(node_id)
         self.scores.failed(node_id)
+        if self.local_on:
+            self.partition.failed(node_id)
 
     def _pin_event(self, change: str, cids: list[Cid], source: str):
         """Storage's pin_listener (storage lock held): pins of source added or removed, as a "pin" event; a CID
@@ -1146,8 +1188,15 @@ class RnfsNode:
         announce cache, which a shared instance's client doesn't write and whose packet hash a path answer passed on
         as an announce doesn't match."""
         traffic = getattr(self.client, "traffic", None)
-        if traffic is not None:
-            traffic.announced(node_id, RnsNetwork().emitted_time(node_id))
+        if traffic is not None and traffic.announced(node_id, RnsNetwork().emitted_time(node_id)):
+            self._fresh_announce(node_id)
+
+    def _fresh_announce(self, node_id: bytes):
+        """node_id's own announce, emitted within minutes, arrived: from an off-island server (judged so by
+        _heard_server, which runs first), a sample of the usual gap and the end of partition mode. A path answer
+        from an island node's cache, or a client's announce, says nothing about the way off the island."""
+        if self.local_on and self.local.judged(node_id) is False:
+            self.partition.announced(node_id)
 
     def _is_member_node(self, node_id: bytes) -> bool:
         """Private mode's routing table admission: node_id's identity is a member."""
@@ -2771,6 +2820,6 @@ class RnfsNode:
                 "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
-                "local_servers": len(self.local),
+                "local_servers": len(self.local), **self.partition.state(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}
 

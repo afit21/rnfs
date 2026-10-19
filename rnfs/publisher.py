@@ -43,6 +43,9 @@ whose round was stopped before every node was sent its keys stays due. Times are
   lookup. Other nodes send every withdrawal at once.
 - A key both withdrawn from and provided to a node in one round is only provided (a restart may queue
   withdrawals of keys that are still provided).
+- **Partition mode** (set_islands; specification section 6, "LoRa islands"): while the node is cut off from the
+  servers beyond its island, a round stores to and withdraws from local servers only (the rest stay queued, and a
+  store set's off-island servers count as not stored to), and each server's answer or failure is told to it.
 """
 import hashlib
 import math
@@ -456,6 +459,7 @@ class Publisher:
         self._region_bits: int | None = None  # the prefix length of a recent region (sweep providing), or None
         self._store_parts: list[StorePart] = []  # add_store_part
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
+        self._islands = None  # set_islands: the node's partition mode (rnfs.dht.local.PartitionMode), if any
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
         # Writes what changed since the last save (_touch_item, _touch_node), when persisted
@@ -957,8 +961,11 @@ class Publisher:
         # Built without the lock: a part may take other locks (the first-seen log's)
         closest = {cid: self._store_set(cid, region) for cid, region in regions.items()}
         with self._lock:
-            # Taken after the lookups, which can be long, so withdrawals queued meanwhile go in this round
-            withdrawals = {node: set(keys) for node, keys in self._withdrawals.items() if keys}
+            # Taken after the lookups, which can be long, so withdrawals queued meanwhile go in this round. In
+            # partition mode those for servers off the island wait (they can't be reached)
+            islands = self._islands
+            withdrawals = {node: set(keys) for node, keys in self._withdrawals.items()
+                           if keys and (islands is None or islands.allows(node))}
             for cid in [cid for cid in closest if cid not in self._provided]:
                 # Stopped being provided during its lookup: refresh() has withdrawn it, so don't store it
                 del closest[cid]
@@ -1003,9 +1010,16 @@ class Publisher:
                 withdrawn = withdrawals.get(node_id, set()) & self._withdrawals.get(node_id, set())
             if not cids and not withdrawn:
                 return None
+            if islands is not None and not islands.allows(node_id):
+                # Partition mode began during the round: nothing is sent to a server off the island (as if refused,
+                # withdrawals kept queued), which would only cost a link timeout
+                return cids, set(), set(), self.clock()
             # Not retried until the next republish whatever the outcome, so it counts as sent either way.
             # The node may hold records of the keys it got before any refusal: those are withdrawn later
             recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
+            if islands is not None and cids:
+                # No key recorded: no identified link could be opened (a refusal still names the batch's keys)
+                (islands.answered if recorded else islands.failed)(node_id)
             return cids, withdrawn, recorded, self.clock()
 
         parallel = 1 if self.slow_node else PROVIDE_PARALLEL
@@ -1106,6 +1120,12 @@ class Publisher:
         with self._lock:
             self._store_parts.append(part)
 
+    def set_islands(self, islands):
+        """Publish under islands, the node's partition mode (rnfs.dht.local.PartitionMode): only to the servers its
+        allows() takes, telling it each server's answer (answered) or failure (failed) to a /provide."""
+        with self._lock:
+            self._islands = islands
+
     def set_widening(self, flags: Flags, widen: Widen):
         """Check each key of a region found for a dense core: flags(key, region) says whether it needs a widened lookup
         (the density check, rnfs.dht.density), which widen(key, region) runs, returning the ring servers to store the
@@ -1150,6 +1170,10 @@ class Publisher:
                 if node_id != self.own_id and node_id not in chosen:
                     chosen.add(node_id)
                     nodes.append(node_id)
+        islands = self._islands
+        if islands is not None and islands.active:
+            # Partition mode: the store parts may name off-island servers (senior ones), which can't be reached
+            nodes = [node_id for node_id in nodes if islands.allows(node_id)]
         return nodes
 
     def _sweep(self, due: list[ProvidedItem], should_stop: Callable[[], bool], limit: int | None) -> Sweep:
