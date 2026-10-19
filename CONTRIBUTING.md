@@ -74,6 +74,32 @@ Tests that guard compatibility, and must stay green:
 Never weaken or delete a test to make a change pass. If a change deliberately alters behaviour a test encodes,
 change the test in the same commit and say why in the commit message.
 
+### Tests on every OS
+
+CI runs every test on Linux, macOS and Windows, and nearly every CI failure so far was a test written and run only
+on Linux. So:
+- **Paths.** Compare a path the code resolved with one the test built through `tests.support.real()`: macOS
+  reaches the temp directory through `/private/var`, and Windows may name it `RUNNER~1`. Write `/` in an expected
+  path only where the code does.
+- **POSIX-only APIs** (`os.geteuid`, `os.fchmod`, `os.mkfifo`, `resource`, `fcntl`, signals Windows lacks, and the
+  rest of the list in `pyproject.toml`) fail ruff (TID251) unless the line says what guards it: `# noqa: TID251 -
+  <the guard>`. Skip a test with `tests/support.py`'s `POSIX_MODES`, `PERMISSION_CHECKS`, `IS_ROOT`, `HAS_FIFO` or
+  `CAN_SYMLINK`.
+- **Files.** Windows keeps no execute bit, can't remove or replace a file another handle has open (close stores,
+  databases and nodes before the temporary directory is removed), and reads `\` or `C:` in a name as a path; a link
+  to a directory needs `target_is_directory=True` and is removed with `os.rmdir` there. macOS refuses names that
+  aren't UTF-8, and paths over 1024 bytes.
+- **Time.** Wait for a condition with `support.wait_for(..., what=...)`, never a fixed sleep: without `what=` its
+  result is all that can fail, so a call that ignores it must name what it waits for (`tests/test_suite_rules.py`
+  checks). Leave upper bounds a wide margin (CI's macOS runners are several times slower than a desktop) and lower
+  bounds a tick of slack (Windows' clock ticks every 15.6 ms before Python 3.13).
+
+CI runs each test that failed once more, alone, in a fresh process (`tests/ci_run.py`, up to 5 of them): one that
+then passes doesn't fail the run, but is named in a warning on the run's page and summary. Fix it: it will fail
+again. To run CI on a branch before a pull request, use Actions > tests > Run workflow. Every push to any branch
+runs it too, so push work in progress often: a release that brings weeks of commits to macOS and Windows for the
+first time is what has made releases fail.
+
 ### Security regression tests
 
 Every security fix comes with a regression test in `tests/security/test_<id>_<what>.py` (for example
