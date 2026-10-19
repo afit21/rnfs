@@ -308,7 +308,7 @@ The DHT (local behaviour: nothing on the wire changes):
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
   servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
-  next to a key can't be. Publishing uses it (below); searching will.
+  next to a key can't be. Publishing and searching use it (below).
 - **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
   due key of its region (the keys sharing as many leading bits as the key looked up shares with its 10th-closest
   server), with about 1.6 more `/find` a region to fill in its far half; each key still gets its own 10 closest
@@ -320,6 +320,32 @@ The DHT (local behaviour: nothing on the wire changes):
   node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
   Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
   next to a key can't push the record off them. Withdrawals reach them too.
+- **Content is far harder to hide by placing identities next to its key** (spec section 6, "Identities placed next
+  to a key"). Ten identities generated closer to a key than every honest server (about 4 s of one core each among
+  10,000 servers) hid it almost completely from 0.1.x nodes (found 0–4% of the time); with an upgraded publisher
+  and searcher it is found 99–100% of the time over the fake network of `tests/test_eclipse.py` (98.9% on fast
+  nodes and 90.8% on slow ones across every attack of the eclipse simulation). Four local mechanisms, nothing on
+  the wire changed:
+  - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
+    lookups for other keys, kept in the state database's `meta` table so a restart has it at once (the density
+    check waits for 8);
+  - the density check: when the servers found near a key are packed more than twice as densely as the estimate
+    allows (from the 10th on), a search waits until 5 servers of each of two rings beyond them have answered (those
+    ranked after the dense core, and those beyond where 10 honest servers would be expected), and a publisher gives
+    the key a widened lookup of its own and stores it on 10 servers of each ring too;
+  - disjoint lookup paths: a publisher's region lookup runs as 3 lookups that share no node (2 on slow nodes) and
+    stores each key on each path's 10 closest too; a search that finds no provider at all falls back to them, in
+    what is left of the same `lookup_timeout` and of its 80 `/find` (a search still sends at most 80 in all);
+  - searches also wait for the 3 closest of the 10 servers nearest the key that the announce first-seen log heard
+    at least `provider_seniority` ago (none extra without an attack: they are the closest anyway).
+
+  The cost: a little more traffic per publish (over the fake network of 2,000 servers, +17 `/find` and +3 stores
+  to publish one key, once per republish; with sweep providing about 0.65 `/find` and 13 stores a key instead of
+  0.22 and 10), +0.2 to +0.5 `/find` per search on average (the density check fires on 2–6% of searches without an
+  attack), and a search for content nobody provides now costs about 4 times as much (30 `/find` instead of 7: the
+  fallback). A slow node paces that fallback like its publish lookups (it counts as 2 of a round's lookups and runs
+  only if the pacing allows within the lookup's time), and counts widened lookups among its round's 10 (a flagged
+  key that doesn't fit waits for the next round).
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

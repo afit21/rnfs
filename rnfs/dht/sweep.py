@@ -12,6 +12,12 @@ region rather than one per key. No RNS dependency: the lookups are made by the c
   about in turn, at most MAX_REGION_FINDS in all. Every key of the region then takes its K closest from every
   server learned (Region.closest_to), ranked as find_closest ranks them: unreliable servers that haven't answered
   last. In the load study this placed 100% of records on their true K closest for about 1.6 extra /find a region.
+- **Disjoint paths and the density check.** A region's lookup may run as disjoint paths (rnfs.dht.disjoint): its
+  servers are all the paths learned, and each key is also stored on each path's K closest (Region.path_closest).
+  The publisher then checks each key of the region for a dense core (rnfs.dht.density) over those servers; a key
+  flagged gets a widened lookup of its own, counted in the round's lookups (Sweep.spend), whose ring servers it is
+  stored on too (Region.rings). A key whose widened lookup the round can't afford is left for a later round
+  (Region.deferred).
 - **Running lookups at once.** Each lookup running claims the keys it will probably cover (those sharing one bit
   fewer than the last region's p), so the next takes a key outside every claim, and the regions of lookups run
   at once seldom overlap; a key two regions cover keeps the first. Until a region has been found there is no
@@ -46,17 +52,23 @@ def _shares(value: int, prefix: int, bits: int) -> bool:
 class Region:
     """What one region's lookup learned: the region is the keys sharing the first `bits` bits of `key`, the key looked
     up; `closest` is that lookup's result for it; `nodes` every server learned, each with whether it ranks last
-    (unreliable and not answered); `finds` the extra /find sent."""
+    (unreliable and not answered); `paths` each disjoint path's own (none for a single lookup); `finds` the extra
+    /find sent. The publisher adds `rings` (key -> the ring servers its widened lookup found) and `deferred` (keys
+    flagged whose widened lookup the round couldn't afford)."""
 
-    __slots__ = ("key", "bits", "closest", "nodes", "finds")
+    __slots__ = ("key", "bits", "closest", "nodes", "finds", "paths", "rings", "deferred")
 
-    def __init__(self, key: bytes, bits: int, closest: list[bytes], nodes: dict[bytes, bool], finds: int = 0):
+    def __init__(self, key: bytes, bits: int, closest: list[bytes], nodes: dict[bytes, bool], finds: int = 0,
+                 paths: list[dict[bytes, bool]] | None = None):
         """A region found by a lookup for key."""
         self.key = key
         self.bits = bits
         self.closest = closest
         self.nodes = nodes
         self.finds = finds
+        self.paths = paths or []
+        self.rings: dict[bytes, list[bytes]] = {}
+        self.deferred: set[bytes] = set()
 
     def __contains__(self, key: bytes) -> bool:
         """True if key is in the region (shares its first bits with the key looked up)."""
@@ -71,6 +83,14 @@ class Region:
         nodes = self.nodes
         return heapq.nsmallest(count, nodes, key=lambda n: (nodes[n], distance(n, key)))
 
+    def path_closest(self, key: bytes, count: int = K) -> list[bytes]:
+        """The count servers each disjoint path learned closest to key (ranked as closest_to ranks them), together and
+        without duplicates, each path's in turn; none for a single lookup."""
+        chosen: dict[bytes, None] = {}
+        for nodes in self.paths:
+            chosen.update(dict.fromkeys(heapq.nsmallest(count, nodes, key=lambda n: (nodes[n], distance(n, key)))))
+        return list(chosen)
+
 
 def find_region(lookup, key: bytes, own_id: bytes, members: Callable[[int], int]) -> Region:
     """Run lookup (a dht.lookup.Lookup for key) and find key's region; members(bits) is how many due keys share key's
@@ -83,7 +103,10 @@ def find_region(lookup, key: bytes, own_id: bytes, members: Callable[[int], int]
     nodes = {n: doubtful for n, doubtful in lookup.candidates().items() if n != own_id}
     for n in closest:
         nodes.setdefault(n, False)
-    return Region(key, bits, closest, nodes, finds)
+    # A disjoint lookup's paths (rnfs.dht.disjoint), each storing to its own K closest too
+    paths = [{n: doubtful for n, doubtful in path.items() if n != own_id}
+             for path in getattr(lookup, "path_candidates", list)()]
+    return Region(key, bits, closest, nodes, finds, paths)
 
 
 def explore(lookup, key: bytes, bits: int, own_id: bytes) -> int:
@@ -150,6 +173,7 @@ class Sweep:
         self.estimate = estimate
         self.covered: dict[bytes, Region] = {}
         self.regions: list[Region] = []
+        self.widened = 0  # widened lookups run for keys the density check flagged (spend)
         self._claims: dict[bytes, int] = {}  # key being looked up -> the bits of the keys its region will probably hold
         self._cursor = 0  # keys before it in order are covered
         self._stopped = False
@@ -196,6 +220,21 @@ class Sweep:
                 self.estimate = region.bits
             self._cond.notify_all()
             return keys
+
+    @property
+    def lookups(self) -> int:
+        """Lookups the round has run: one per region, and the widened ones."""
+        with self._cond:
+            return len(self.regions) + self.widened
+
+    def spend(self, limit: int | None) -> bool:
+        """Count a widened lookup if the round may run one more (limit: its lookups at most, None for no limit); False
+        if it may not."""
+        with self._cond:
+            if limit is not None and len(self.regions) + self.widened >= limit:
+                return False
+            self.widened += 1
+            return True
 
     def release(self, key: bytes):
         """The lookup for key ended without a region (it raised, or the round stopped)."""

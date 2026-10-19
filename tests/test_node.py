@@ -1154,12 +1154,12 @@ class LookupStartTest(NodeTest):
             self.assertTrue(self.b.routing.heard(node_id))
         failed = others[0]
         self.b.routing.failed(failed)  # the closest node to its own ID, but no longer answering
-        start = self.b._lookup(failed)._start_nodes
+        start = self.b._lookup(failed).first._start_nodes
         self.assertNotIn(failed, start)
         self.assertEqual(len(start), K)  # A and the others that haven't failed
         self.b.routing.remove(others[1])
         self.b.routing.remove(others[2])
-        start = self.b._lookup(failed)._start_nodes
+        start = self.b._lookup(failed).first._start_nodes
         self.assertIn(failed, start)  # fewer than K healthy: made up from the rest
         self.assertEqual(len(start), K - 1)
 
@@ -1174,13 +1174,13 @@ class LookupStartTest(NodeTest):
             self.b.routing.heard(dead)  # announces don't clear its failures
             self.b.routing.failed(dead)
         self.b.routing.heard(dead)
-        lookup = self.b._lookup(dead)
+        lookup = self.b._lookup(dead).first  # the search's first lookup
         self.assertNotIn(dead, lookup._start_nodes)
         self.assertEqual(len(lookup._start_nodes), K)
         self.assertTrue(lookup.unreliable(dead))
         for node_id in others[1:4]:
             self.b.routing.remove(node_id)
-        start = self.b._lookup(dead)._start_nodes
+        start = self.b._lookup(dead).first._start_nodes
         self.assertEqual(start[-1], dead)  # fewer than K others: made up with it, last
         self.assertEqual(len(start), K - 1)
         self.b._answered(dead)

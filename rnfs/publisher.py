@@ -15,10 +15,12 @@
   pin's, so the served set doesn't change.
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. The due
   CIDs' K closest nodes are found by sweep providing (rnfs.dht.sweep): one lookup per region of due keys,
-  PUBLISH_LOOKUPS at once (one at a time on slow nodes). Each key is stored on its store set: its K closest, and
-  the servers of the parts add_store_part added. Keys are grouped by node, and each node gets its keys (and any
-  withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed store
-  isn't retried until the next republish. The node also records itself locally.
+  PUBLISH_LOOKUPS at once (one at a time on slow nodes). Each key is stored on its store set: its K closest (and
+  each disjoint path's, when the region's lookup ran as disjoint paths), the ring servers of its widened lookup when
+  the density check flags it on its region's servers (set_widening; the widened lookup counts as one of the round's
+  lookups), and the servers of the parts add_store_part added. Keys are grouped by node, and each node gets its
+  keys (and any withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or
+  failed store isn't retried until the next republish. The node also records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
   from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or
   of a round cut short) whose record may not have expired yet: the closest set changes as nodes come and go.
@@ -33,10 +35,12 @@ whose round was stopped before every node was sent its keys stays due. Times are
 - **Feature keys** (DhtKey, e.g. kept names) are republished at max(republish interval, KEY_MIN_INTERVAL),
   with a fixed jitter of up to +-KEY_JITTER from the key's first byte, so they don't all come due in one burst
   but a region's keys come due together; always below PROVIDER_TTL / 2.
-- **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS region lookups per round and on average one per
-  SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished. Withdrawals are paced
-  too: they ride along to the servers a round stores to, and each server only withdrawals reach costs one lookup.
-  Other nodes send every withdrawal at once.
+- **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS region and widened lookups per round and on average one
+  per SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished. A flagged key whose
+  widened lookup doesn't fit in the round is left due for a later one. Lookups outside publishing that the node
+  paces the same way (a search's fallback over disjoint paths) take their share through pace_lookups. Withdrawals
+  are paced too: they ride along to the servers a round stores to, and each server only withdrawals reach costs one
+  lookup. Other nodes send every withdrawal at once.
 - A key both withdrawn from and provided to a node in one round is only provided (a restart may queue
   withdrawals of keys that are still provided).
 """
@@ -212,6 +216,10 @@ class DhtKey:
 
 # A part of each key's store set besides its K closest (add_store_part): (key, its region) -> servers
 StorePart = Callable[[bytes, Region], Iterable[bytes]]
+# The density check over a key's region (set_widening): (key, its region) -> True if the key needs a widened lookup
+Flags = Callable[[bytes, Region], bool]
+# The widened lookup of a key flagged: (key, its region) -> the ring servers to store it on too
+Widen = Callable[[bytes, Region], list[bytes]]
 
 # What the publisher provides: a CID, or a feature's DhtKey. Both have .key, hashing, str() and parse(), but only a
 # Cid has .binary or is served, so code that needs those must check (provided() does)
@@ -447,6 +455,7 @@ class Publisher:
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
         self._region_bits: int | None = None  # the prefix length of a recent region (sweep providing), or None
         self._store_parts: list[StorePart] = []  # add_store_part
+        self._widening: tuple[Flags, Widen] | None = None  # set_widening
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
         # Writes what changed since the last save (_touch_item, _touch_node), when persisted
@@ -874,6 +883,19 @@ class Publisher:
             self._retry_at[cid] = min(retry, now + self.retry_interval)
         self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
 
+    def pace_lookups(self, count: int) -> float:
+        """Slow nodes: may count lookups outside publishing (a search's fallback over disjoint paths) start now? 0.0 if
+        the round pacing allows it, and the next round then waits for them as for its own lookups (SLOW_LOOKUP_PACE
+        each); otherwise the seconds until it would, and nothing is counted."""
+        now = self.clock()
+        with self._lock:
+            self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)  # as _clamp
+            wait = self._next_lookup - now
+            if wait > 0:
+                return wait
+            self._next_lookup = now + SLOW_LOOKUP_PACE * max(0, count)
+            return 0.0
+
     def next_due(self) -> float:
         """Seconds until something is due (0 if now); withdrawals pending count as due (paced on slow nodes)."""
         now = self.clock()
@@ -902,7 +924,8 @@ class Publisher:
         """One publishing round: provide every due CID and send pending withdrawals, batched per node.
 
         Returns {"published": CIDs published, "nodes": nodes contacted, "withdrawn": keys withdrawn, "lookups":
-        region lookups run, "finds": extra /find their regions sent}.
+        region lookups run, "finds": extra /find their regions sent, "widened": widened lookups run for keys the
+        density check flagged}.
         """
         now = self.clock()
         with self._lock:
@@ -925,8 +948,10 @@ class Publisher:
         if sweep.regions:
             with self._lock:
                 self._learn_network_size(sweep.regions)
-        # In due's order, so a round's batches are the same however the lookups were run
-        regions = {item: sweep.covered[item.key] for item in due if item.key in sweep.covered}
+        # In due's order, so a round's batches are the same however the lookups were run. A key whose widened lookup
+        # the round couldn't afford waits for a later round (it stays due)
+        regions = {item: sweep.covered[item.key] for item in due
+                   if item.key in sweep.covered and item.key not in sweep.covered[item.key].deferred}
         for cid in regions:
             self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
         # Built without the lock: a part may take other locks (the first-seen log's)
@@ -959,10 +984,10 @@ class Publisher:
                 # round's lookups left, those with the most keys queued first, the rest waiting for a later round
                 alone = sorted((node_id for node_id, keys in withdrawals.items() if keys and node_id not in by_node),
                                key=lambda node_id: (-len(withdrawals[node_id]), node_id))
-                room = 0 if paced else max(0, SLOW_ROUND_LOOKUPS - lookups)
+                room = 0 if paced else max(0, SLOW_ROUND_LOOKUPS - lookups - sweep.widened)
                 for node_id in alone[room:]:
                     del withdrawals[node_id]
-                spent = lookups + min(room, len(alone))
+                spent = lookups + sweep.widened + min(room, len(alone))
                 if spent:
                     self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * spent
         accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
@@ -1054,12 +1079,14 @@ class Publisher:
             self.save()
             stored = sum(len(nodes) for nodes in accepted.values())
             log(f"published {plural(len(published), 'CID')} ({stored} records on "
-                f"{plural(len(by_node), 'node')}; {plural(lookups, 'region lookup')}, {finds} extra /find), "
+                f"{plural(len(by_node), 'node')}; {plural(lookups, 'region lookup')}, {finds} extra /find"
+                + (f", {plural(sweep.widened, 'widened lookup')}" if sweep.widened else "") + "), "
                 f"withdrew {sum(len(k) for k in sent_withdrawals.values())}"
                 + (f"; stopped before sending {plural(len(unfinished), 'CID')} to every node" if unfinished else ""),
                 LOG_VERBOSE)
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
-                "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds}
+                "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds,
+                "widened": sweep.widened}
 
     def _learn_network_size(self, regions: list[Region]):
         """Fold the prefix lengths of regions a round found (those that found a server) into the running mean the
@@ -1079,13 +1106,40 @@ class Publisher:
         with self._lock:
             self._store_parts.append(part)
 
+    def set_widening(self, flags: Flags, widen: Widen):
+        """Check each key of a region found for a dense core: flags(key, region) says whether it needs a widened lookup
+        (the density check, rnfs.dht.density), which widen(key, region) runs, returning the ring servers to store the
+        key on too. Called by the lookup threads once a region is found, without the lock."""
+        with self._lock:
+            self._widening = (flags, widen)
+
+    def _widen(self, sweep: Sweep, region: Region, keys: list[bytes], limit: int | None):
+        """Run the widened lookups of region's keys (those its lookup covered) that the density check flags, within
+        the round's limit of lookups; those over it are deferred. Called without the lock."""
+        widening = self._widening
+        if widening is None:
+            return
+        flags, widen = widening
+        for key in keys:
+            if not flags(key, region):
+                continue
+            if not sweep.spend(limit):
+                region.deferred.add(key)
+                continue
+            region.rings[key] = list(widen(key, region))
+
     def _store_set(self, cid: ProvidedItem, region: Region) -> list[bytes]:
-        """The servers cid is stored on this round: its K closest from region, then each store part's servers, without
-        duplicates or this node; none if the region found no server. Called without the lock."""
+        """The servers cid is stored on this round: its K closest from region, each disjoint path's K closest, the
+        ring servers of its widened lookup, then each store part's servers, without duplicates or this node; none if
+        the region found no server. Called without the lock."""
         nodes = [n for n in region.closest_to(cid.key) if n != self.own_id]
         if not nodes:
             return []
         chosen = set(nodes)
+        for node_id in region.path_closest(cid.key) + region.rings.get(cid.key, []):
+            if node_id != self.own_id and node_id not in chosen:
+                chosen.add(node_id)
+                nodes.append(node_id)
         for part in list(self._store_parts):
             try:
                 extra = list(part(cid.key, region))
@@ -1100,7 +1154,7 @@ class Publisher:
 
     def _sweep(self, due: list[ProvidedItem], should_stop: Callable[[], bool], limit: int | None) -> Sweep:
         """The regions of due's keys whose lookups ran (dht.sweep), taking keys in due's order: at most limit
-        lookups (None: no limit). Called without the lock: refresh() may run meanwhile.
+        lookups, widened ones included (None: no limit). Called without the lock: refresh() may run meanwhile.
 
         should_stop() is checked before each lookup starts; one running isn't interrupted. Slow nodes (and a
         single item) look up one at a time; other nodes run up to PUBLISH_LOOKUPS at once on
@@ -1110,12 +1164,12 @@ class Publisher:
         sweep = Sweep([item.key for item in due], self._region_bits)
 
         def look_up(key: bytes):
-            """Run the lookup for key and cover its region."""
+            """Run the lookup for key, cover its region and widen the lookups of the keys the density check flags."""
             region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits))
-            sweep.cover(region)
+            self._widen(sweep, region, sweep.cover(region), limit)
 
         if self.slow_node or len(due) < 2 or PUBLISH_LOOKUPS < 2:
-            while (limit is None or len(sweep.regions) < limit) and not should_stop():
+            while (limit is None or sweep.lookups < limit) and not should_stop():
                 key = sweep.take()
                 if key is None:
                     break

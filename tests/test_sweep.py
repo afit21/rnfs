@@ -14,7 +14,7 @@ from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable, distance
 from rnfs.dht.sweep import (ID_BITS, MAX_REGION_FINDS, REGION_FIND_TRIES, Region, Sweep, explore, find_region,
                             prefix_length)
-from rnfs.publisher import DhtKey, Publisher
+from rnfs.publisher import SLOW_ROUND_LOOKUPS, DhtKey, Publisher
 from tests.fakes.client import FakeClient
 from tests.fakes.log import quiet_log
 from tests.support import FakeClock
@@ -319,6 +319,84 @@ class SimulatedNetworkTest(unittest.TestCase):
         exact = sum(1 for item in result["published"] if sent[item.key] == set(self.net.true_closest(item.key)))
         self.assertGreaterEqual(exact, 0.99 * len(result["published"]))
         self.assertTrue(all(isinstance(item, DhtKey) for item in result["published"]))
+
+
+class RegionPathsTest(unittest.TestCase):
+    """Region.path_closest."""
+
+    def test_each_paths_closest(self):
+        a, b, c, d = (ident(n) for n in (1, 2, 3, 4))
+        region = Region(ident(0), 0, [a], {a: False, b: False, c: False, d: False},
+                        paths=[{a: False, c: False}, {b: True, d: False}])
+        self.assertEqual(region.path_closest(ident(0), 1), [a, d])  # b ranks last on its path
+        self.assertEqual(Region(ident(0), 0, [a], {a: False}).path_closest(ident(0)), [])
+
+
+class WideningPublisherTest(unittest.TestCase):
+    """The publisher's widened lookups and their stores."""
+
+    def publisher(self, nodes, slow=False, flagged=lambda key: True):
+        """A publisher whose lookups find nodes, whose density check flags the keys flagged() says, and whose widened
+        lookups give one ring server per key: (publisher, client, widened keys)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        storage = Storage(os.path.join(tmp.name, "blocks"), os.path.join(tmp.name, "state"), 10**9)
+        self.addCleanup(storage.close)
+        client = FakeClient()
+        publisher = Publisher(ident(0), Config(rnfs_dir=tmp.name), storage, ProviderStore(None), client,
+                              lambda key: FakeLookup(nodes), slow, clock=FakeClock(1_000_000.0))
+        widened: list[bytes] = []
+        publisher.set_widening(lambda key, region: flagged(key),
+                               lambda key, region: (widened.append(key), [key[:15] + b"\xff"])[1])
+        return publisher, client, widened
+
+    def test_flagged_keys_stored_on_their_rings_too(self):
+        nodes = [ident(n) for n in range(1, K + 1)]
+        keys = [bytes([n]) * ID_LENGTH for n in (0x40, 0x80)]
+        publisher, client, widened = self.publisher(nodes, flagged=lambda key: key == keys[0])
+        publisher.add_key_source(lambda: set(keys))
+        publisher.refresh()
+        result = publisher.publish_due()
+        self.assertEqual(widened, [keys[0]])
+        self.assertEqual(result["widened"], 1)
+        ring = keys[0][:15] + b"\xff"
+        stored = {node_id: set(stored) for node_id, stored, _ in client.calls}
+        self.assertEqual(stored[ring], {keys[0]})
+        self.assertEqual(len(result["published"]), 2)
+        published = publisher._published[next(item for item in result["published"] if item.key == keys[0])][1]
+        self.assertIn(ring, published)  # withdrawn from too, when it stops being provided
+
+    def test_slow_node_counts_widened_lookups_and_defers_the_rest(self):
+        """Each key its own region here: half the round's lookups are regions, the other half widened; the keys whose
+        widened lookup didn't fit stay due."""
+        keys = [bytes([n]) + bytes(ID_LENGTH - 1) for n in range(0, 256, 8)]
+
+        def lookup(key):
+            """A lookup finding K servers next to key: a region of its own."""
+            return FakeLookup([key[:15] + bytes([key[15] + 1 + i]) for i in range(K)])
+        publisher, client, widened = self.publisher([], slow=True)
+        publisher.make_lookup = lookup
+        publisher.add_key_source(lambda: set(keys))
+        publisher.refresh()
+        result = publisher.publish_due()
+        self.assertEqual(result["lookups"] + result["widened"], SLOW_ROUND_LOOKUPS)
+        self.assertEqual(len(result["published"]), result["widened"])
+        self.assertEqual(sorted(widened), sorted(item.key for item in result["published"]))
+        self.assertTrue(all(publisher._is_due(item, publisher.clock()) for item in publisher._provided
+                            if item not in result["published"]))
+
+
+class SweepSpendTest(unittest.TestCase):
+    """Sweep.spend and lookups."""
+
+    def test_spend_within_the_limit(self):
+        sweep = Sweep([ident(1), ident(2)])
+        sweep.cover(Region(sweep.take(), 0, [ident(9)], {}))
+        self.assertEqual(sweep.lookups, 1)
+        self.assertTrue(sweep.spend(2))
+        self.assertFalse(sweep.spend(2))
+        self.assertTrue(sweep.spend(None))
+        self.assertEqual((sweep.lookups, sweep.widened), (3, 2))
 
 
 if __name__ == "__main__":
