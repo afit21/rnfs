@@ -35,7 +35,8 @@ version = {attr = "rnfs.__init__.__version__"}  # not "rnfs": setuptools would f
 
 [tool.ruff]
 target-version = "py311"
-extend-exclude = ["packaging/flatpak"]
+# docs/simulations: the research scripts behind the 0.2.0 plan, kept as they were run, not rnfs code
+extend-exclude = ["packaging/flatpak", "docs/simulations"]
 # The companion NomadNet pages are Python scripts named index.mu
 extension = { mu = "python" }
 extend-include = ["companion-nomadnet-sites/*/index.mu"]
