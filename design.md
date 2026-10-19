@@ -1045,7 +1045,8 @@ and in total, never persisted.
   first counted after it, so the start and the routing table seeded from RNS's cache publish nothing; a peer
   online that is no longer counted nor linked gets `offline`.
 - `Fetcher.path_info` (default: nothing known) is set by the node to `RnsPaths.info`; `Fetch._rank` orders
-  both providers and open-link probes, and each provider caches its `PathInfo`.
+  both providers and open-link probes (`mesh.provider_rank`: seniority, then the local score band,
+  `Scores.band`, then hops, bitrate and order), and each provider caches its `PathInfo`.
 - `ResponsePools` has `max_blocks_responses // 2` slow-link slots and `fast_blocks_responses` (or the rest, if
   more) for others. It protects a response from displacement only while it is within a grace it measures from
   the link's path (`link_path`, `fast_path`, `response_grace`, never from `link.rtt`), or moving at or above a

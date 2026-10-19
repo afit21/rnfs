@@ -189,6 +189,19 @@ class ProviderDiscoveryTest(FetcherTest):
                 fetch._add_provider(node_id)
             self.assertEqual([p.node_id for p in fetch._usable()], [P2, P1, P3])
 
+    def test_scores_order_providers_within_seniority_groups(self):
+        self.routing.heard(P2)
+        self.config.provider_seniority = 0  # everything in the routing table counts as long-known
+        for _ in range(8):
+            self.fetcher.scores.served(P3)  # well scored, but new: still after P2
+        self.fetcher.scores.served(P1)
+        self.fetcher.scores.served(P1)
+        four = bytes([4] * 16)
+        with self.fetcher.open(self.file(b"y").cid) as fetch:
+            for node_id in (four, P1, P2, P3):
+                fetch._add_provider(node_id)
+            self.assertEqual([p.node_id for p in fetch._usable()], [P2, P3, P1, four])
+
 
 class FailureRuleTest(FetcherTest):
     """When providers fail, are banned, and are retried."""

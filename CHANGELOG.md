@@ -108,6 +108,8 @@ The DHT (local behaviour: nothing on the wire changes):
   first, best scored first, and bootstrap nodes only if fewer than two of those answer: a node that has joined
   once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. A node
   whose saved servers answer no longer contacts the default bootstrap nodes at every start.
+- Choosing providers: within each seniority group (seniority stays first), providers with a better local score
+  are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
 
 ## 0.1.6
 

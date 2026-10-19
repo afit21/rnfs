@@ -582,16 +582,18 @@ and repeat.
   near the key can't hide content.
 - **Choosing providers.** A node SHOULD rank providers by these keys, in this order:
   1. **Seniority.** Providers that have been in the routing table for over `provider_seniority` come first.
-     This key MUST stay first: an attacker can create fresh identities that sit close in hops, but can't make
-     them old.
-  2. **Hops.** Fewer hops (`RNS.Transport.hops_to`) first; a provider whose path is unknown goes after every
+     This key MUST stay first: an attacker can create fresh identities that sit close in hops, or earn a score
+     quickly by serving popular blocks, but can't make them old.
+  2. **Local score.** Within each seniority group, a provider with a better local score (below) first (rnfs: by
+     score band; a provider without a score counts as 0).
+  3. **Hops.** Fewer hops (`RNS.Transport.hops_to`) first; a provider whose path is unknown goes after every
      provider with a known path.
-  3. **Next-hop interface bitrate.** A faster outbound interface on the path first
+  4. **Next-hop interface bitrate.** A faster outbound interface on the path first
      (`RNS.Transport.next_hop_interface(id).bitrate`; through a shared instance, the bitrate of the interface
      `Reticulum.get_next_hop_if_name` names); an unknown bitrate goes last.
-  4. **Reply order.**
+  5. **Reply order.**
 
-  With no hops or bitrates known, this is seniority, then reply order. Path information is read once per
+  With no scores, hops or bitrates known, this is seniority, then reply order. Path information is read once per
   provider per fetch, when the provider is found. Through a shared instance, a node MAY reuse the instance's
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
@@ -1826,7 +1828,7 @@ unreserved, pct-encoded: as in RFC 3986
 | DHT routing table refresh, IP diversity filter | Replaced by RNS announces and failure counting; no IP addresses exist to diversify on, so Sybil resistance rests on seniority (section 6) |
 | DHT key (SHA-256 of the multihash) | SHA-256 of the whole binary CID, truncated to 128 bits, so a raw block and a DAG node with identical bytes stay apart |
 | Reprovider strategies | `roots` (default), `pinned`; `all` dropped to save airtime |
-| Bitswap, multi-source and resumable download | Section 7; providers ranked by seniority, then hops and next-hop bitrate (section 6) |
+| Bitswap, multi-source and resumable download | Section 7; providers ranked by seniority, then local score, hops and next-hop bitrate (section 6) |
 | Bandwidth limits | Upload budget, interface rules and quiet hours for `/blocks` (section 3) |
 | `swarm peers`, `stats bw` | `peers`, `stats` |
 | Pinning, remote pinning, GC, `add --pin=false` | Section 8 (`add --no-pin`) |

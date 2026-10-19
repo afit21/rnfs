@@ -11,9 +11,10 @@ Providers, in the order they are tried:
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
-   for over provider_seniority are tried first, the rest after them; within each group, fewer hops first,
-   then a faster next-hop interface (rnfs.mesh.provider_rank), then reply order. Open links are ranked
-   the same way. Hops and bitrates come from path_info (the node passes RNS's; by default none are known).
+   for over provider_seniority are tried first, the rest after them; within each group, a better local score
+   first (by band), then fewer hops, then a faster next-hop interface (rnfs.mesh.provider_rank), then reply
+   order. Open links are ranked the same way. Hops and bitrates come from path_info (the node passes RNS's;
+   by default none are known).
 `get --from` uses only the given node.
 
 A provider fails, and isn't used again during the fetch, when its link fails, it answers None for a block
@@ -1121,15 +1122,16 @@ class Fetch:
 
     def _usable(self) -> list[_Provider]:
         """Providers not failed, in the order they're tried: long-known ones first, then the rest; within
-        each, nearest and fastest first, then as found (section 6)."""
+        each, best scored, then nearest and fastest first, then as found (section 6)."""
         return sorted((p for p in self._providers.values() if not p.failed),
                       key=lambda p: self._rank(p.node_id, p.path, p.order))
 
     def _rank(self, node_id: bytes, path: mesh.PathInfo, order: int) -> tuple:
         """Sort key for a provider: seniority stays first (an attacker's fresh identities can't jump the
-        queue by being near), then hops and next-hop bitrate, then order."""
+        queue by being near, or by serving popular blocks), then local score band, then hops and next-hop
+        bitrate, then order."""
         senior = self.fetcher.routing.is_senior(node_id, self.config.provider_seniority)
-        return mesh.provider_rank(senior, path, order)
+        return mesh.provider_rank(senior, path, order, self.fetcher.scores.band(node_id))
 
     def _path(self, node_id: bytes) -> mesh.PathInfo:
         """What RNS knows about the path to node_id (nothing if the lookup fails)."""
