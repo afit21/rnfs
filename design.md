@@ -23,9 +23,8 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   hashes, LXMF addresses). `parse_hex16(text, what, *, brackets=False, upper=True)` takes whitespace around the
   digits, RNS's `<angle brackets>` only where `brackets`, and nothing between them (`bytes.fromhex` alone would skip
   whitespace there); `is_hex16` is its check and `normal_hex16` the lowercase form. `api.parse_hex_id`,
-  `names.parse_name`, `identity.parse_node_id`, `contacts.parse_hex`, `lxmf.parse_address` and `Config.validate`
-  use it. Persisted rows are checked against its patterns (`HEX16`, `HEX16_LOWER`) as they are, unstripped, so
-  what loaded before still loads.
+  `names.parse_name`, `identity.parse_node_id`, `contacts.parse_hex` and `Config.validate` use it. Persisted rows are
+  checked against its patterns (`HEX16`, `HEX16_LOWER`) as they are, unstripped, so what loaded before still loads.
 - `rnfs/errors.py` — `RnfsError` and subclasses `InvalidDag`, `NotFound`, `TooLarge`, `StorageFull`, `Busy`,
   `Denied`, `Cancelled` (a fetch stopped by its observer), `Closed` (an `rnfs.Node` or `rnfs.Client` used after
   `close()`).
@@ -59,13 +58,13 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   `sync_directory` (fsync a directory after a rename into it); `printable` (Python escapes for non-printables,
   used by the log, the API's log lines and the CLI); `unsafe_name_reason` (one plain path component on this OS;
   `walker` uses it) and `safe_default_name(name, fallback)`, which every default output name chosen by someone
-  else goes through (DAG last names, sealed names, LXMF link names): printable, no leading `.` or `-`, no `\`,
+  else goes through (DAG last names, sealed names): printable, no leading `.` or `-`, no `\`,
   a safe component, else the fallback (the CID). Text files are opened with `encoding="utf-8"`.
 
 Node IDs, DHT keys and names are 16-byte `bytes`. Identity hashes (for `members`, `remote_pin_identities`,
-pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lxmf_*` settings, pin source
-`app:lxmf:<address>`, `storage.LXMF_PREFIX`) are `lxmf.delivery` destination hashes, all written as 32 hex
-characters.
+pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (contacts of kind `lxmf`, the pin
+source `app:lxmf:<address>` rnfs's own LXMF left, `storage.LXMF_PREFIX`) are `lxmf.delivery` destination hashes,
+all written as 32 hex characters.
 
 - `rnfs/statedb.py` — the state database, `<rnfs dir>/state/rnfs.db` (standard `sqlite3`, WAL mode,
   `busy_timeout`; created 0600, which SQLite copies to its `-wal` and `-shm` files; on Windows the state
@@ -166,6 +165,10 @@ rnfs/
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
   apps.py             AppRegistry: the apps rnfs app add issued tokens to, their verifiers (section 11)
+  uris.py             rnfs: URIs and the LXMF link map (Link, parse_uri, format_uri, encode_field,
+                      decode_field): the interop contract LXMF apps use; no RNS (section 13)
+  lxmf_messages.py    the lxmf_messages table rnfs's LXMF left (before 0.2.0) for an LXMF app: only the import of
+                      0.1.4's lxmf_inbox.json and lxmf_outbox.json into it (section 13)
   api.py              local API, 127.0.0.1:8788 (section 11)
   apiclient.py        the local API's protocol layer (ApiConnection) under rnfs.Client and the CLI: token, proof
                       check, typed errors (section 11)
@@ -183,7 +186,6 @@ rnfs/
     keepers.py        /name, kept names (section 9)
     follow.py         followed names (section 9)
     contacts.py       address book (section 11)
-    lxmf.py           rnfs: URIs, LXMF send/inbox/outbox/auto-fetch (section 13)
     deny.py           deny_lists sources: fetched, checked, followed; rnfs deny (section 8)
 examples/             rnfs_share.py: the public API with either class
 install.sh            Linux installer of the latest release (or --main): venv, command, optional systemd user
@@ -686,8 +688,8 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
-| `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
+| `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -805,14 +807,14 @@ command say the daemon is starting. The CLI's `ApiClient` is given `--dir` for i
 (`Config.load`), then the subdirectories and the lock (`lock_rnfs_dir`: `_make_private_dirs(root)`, then
 `lock_exclusive`), so each step relies only on what an earlier one secured. `make_private_root` refuses to start
 (RnfsError) if the rnfs dir belongs to another user or can't be made 0700. `_make_private_dirs` (audit API-1)
-opens each of `node.PRIVATE_SUBDIRS` (`state`, `blocks`, `storage`, `names`, `lxmf`) with `O_DIRECTORY |
-O_NOFOLLOW`, creating it 0700 if missing: a symlink, a non-directory or one another user owns is refused with an
-RnfsError naming `chown`, before Reticulum starts; a loose one is `fchmod`ed to 0700 with a notice, and if its old
-mode let others write, one `lstat` pass (`_warn_foreign_entries`) warns about entries another user owns (a
-planted raw block would be trusted by its length). `rnfs.toml`, and RNS's `config` when `reticulum_dir` is the
-rnfs dir, are opened by `config.open_checked` (`O_NOFOLLOW | O_NONBLOCK`, so a symlink is refused and a FIFO
-never waited on) and checked through the descriptor: a regular file, the user's own, and if group or other bits
-are set `fchmod`ed to 0600 (`fsutil.check_owned_fd`, which the identity's check shares); at most
+opens each of `node.PRIVATE_SUBDIRS` (`state`, `blocks`, `storage`, `names`; not `lxmf`, the LXMF state of rnfs
+before 0.2.0, left as it is for an LXMF app) with `O_DIRECTORY | O_NOFOLLOW`, creating it 0700 if missing: a symlink, a
+non-directory or one another user owns is refused with an RnfsError naming `chown`, before Reticulum starts; a loose one
+is `fchmod`ed to 0700 with a notice, and if its old mode let others write, one `lstat` pass (`_warn_foreign_entries`)
+warns about entries another user owns (a planted raw block would be trusted by its length). `rnfs.toml`, and RNS's
+`config` when `reticulum_dir` is the rnfs dir, are opened by `config.open_checked` (`O_NOFOLLOW | O_NONBLOCK`, so a
+symlink is refused and a FIFO never waited on) and checked through the descriptor: a regular file, the user's own, and
+if group or other bits are set `fchmod`ed to 0600 (`fsutil.check_owned_fd`, which the identity's check shares); at most
 `MAX_SETTINGS_SIZE` (1 MiB) is read. What was changed goes to `config.warnings` (a plain attribute, not a field,
 so `rnfs.toml` can't set it), never to `rnfs.log`, which imports RNS: the daemon prints them (`cli.warn`),
 `rnfs.Node` logs them, the CLI client prints them and `rnfs.Client` (`apiclient.api_port`) raises them as
@@ -919,12 +921,7 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
 - **Capabilities.** `GET /api/capabilities`: `api.CAPABILITIES` (what a route list can't say: `events`,
   `pin_details`, `sealed_folders` (add seals a folder, get unpacks one and takes `no_extract`), ...), every core
   and feature route, the loaded features, `events.EVENT_KINDS`,
-  `errors.CODES` and `deprecated` (`features.deprecated_features()`, below). `ApiConnection.capabilities()` answers
-  `{}` from an older daemon.
-- **Deprecated routes.** `dispatch` sets `ApiHandler.deprecated_since` for a route of a deprecated feature
-  (`api.deprecated_routes()`, loaded once from `features.deprecated_routes()`), and `send_common_headers` then adds
-  `Deprecation: @<deprecated_since>` (RFC 9745, `DEPRECATION_HEADER`) to whatever the route answers, errors too.
-  Bodies don't change: the CLI and the library warn by their own means.
+  `errors.CODES`. `ApiConnection.capabilities()` answers `{}` from an older daemon.
 - **Events.** `rnfs/events.py`: `EventLog`, one per node (`RnfsNode.events`, made first in `_setup`), holding the
   last `MAX_EVENTS` (1024) events, each `{"seq", "kind", "time", ...}` numbered from 1 per run, with a random
   `epoch` per run. `publish()` appends under the log's condition (the innermost lock: callers hold the names lock
@@ -939,21 +936,20 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   (`name`, `cid`, `sequence`: `NameManager.held_listener`, for a newer record accepted for a name held — this
   node's own, kept, followed or resolved — or watched), `remote_pin` (`side` "asked": `node`, `cid`, `state`, as
   a remote pin this node asked for is recorded or a check changes its state; `side` "served": `identity`, `cid`,
-  `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`,
-  `inbox` and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once (`ApiHandler.event_waiters`, a
-  semaphore per server; 503 beyond).
+  `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`
+  and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once
+  (`ApiHandler.event_waiters`, a semaphore per server; 503 beyond).
 - **Reference.** `docs/openapi.json`, an OpenAPI 3.1 document (JSON, so the standard library can read it; no
   runtime use): every core and feature route with its parameters, bodies (streamed ones too), answers, error codes
-  (`ErrorCode`), security (`X-Rnfs-Api`, `X-Rnfs-App`, `X-Rnfs-Pin-Key`, the challenge and proof), the
-  `Deprecation` header and the event kinds. Its `info` gives `rnfs.__version__` and `API_STATUS`. The status schema
+  (`ErrorCode`), security (`X-Rnfs-Api`, `X-Rnfs-App`, `X-Rnfs-Pin-Key`, the challenge and proof) and
+  the event kinds. Its `info` gives `rnfs.__version__` and `API_STATUS`. The status schema
   is `allOf` one part per producer (`StatusCore`, then `Status<Feature>`), so a new status field goes into its
   part. `tests/test_openapi.py` checks it: exactly the routes of `ApiHandler.ROUTES` and the features, each
   feature's route marked `x-rnfs-feature`, the security of `OPEN_ROUTES` and `CLI_ROUTES`, `X-Rnfs-Pin-Key` on
-  exactly the routes whose handler calls `pin_source()`, `deprecated` and the header on exactly the deprecated
-  routes, `errors.CODES`, `events.EVENT_KINDS`, `api.CAPABILITIES`; and, over an offline node behind an
-  `ApiServer`, that status, capabilities, pin ls, name list, peers, stats, config, apps, remote pins, events and
-  the calls making them answer exactly the documented fields (no undocumented field, every required one) with
-  the documented JSON types, in list items too.
+  exactly the routes whose handler calls `pin_source()`, `errors.CODES`, `events.EVENT_KINDS`, `api.CAPABILITIES`; and,
+  over an offline node behind an `ApiServer`, that status, capabilities, pin ls, name list, peers, stats, config, apps,
+  remote pins, events and the calls making them answer exactly the documented fields (no undocumented field, every
+  required one) with the documented JSON types, in list items too.
 - **Shutdown.** `ApiServer(shutdown=)`: the daemon passes its `stopping.set`, the event its signal handlers set,
   so `POST /api/shutdown` answers `{"stopping": true}`, flushes, then stops the daemon exactly as SIGTERM does
   (the servers stop, `daemon.json` and the token are removed, the node saves and stops). Without one (tests) it is
@@ -1001,7 +997,7 @@ with rnfs.Node("~/.myapp/rnfs") as node:           # or: rnfs.Client() for the u
 rnfs/__init__.py   __version__, API_STATUS; every public name loaded on first use (PEP 562 __getattr__, __all__,
                    __dir__), so `import rnfs` imports nothing more and the CLI's start-up is unchanged
 rnfs/objects.py    the typed objects (Cid re-exported from rnfs.content.cid); no RNS
-rnfs/interface.py  Rnfs, Names, Name, Jobs, Job, Deny, Contacts, Lxmf, Fetched, Events, Watch, File, the event
+rnfs/interface.py  Rnfs, Names, Name, Jobs, Job, Deny, Contacts, Events, Watch, File, the event
                    thread: shared by both; no RNS
 rnfs/embedded.py   Node: imports rnfs.node, so RNS, only when rnfs.Node is first used
 rnfs/remote.py     Client, over rnfs.apiclient; no RNS
@@ -1014,11 +1010,11 @@ local API's argument and result forms (JSON-ready dicts; CIDs written out, node 
 `Node`, `embedded._Backend`, an adapter over the `RnfsNode`; for `Client`, `remote._Backend(api)`, over
 an `ApiConnection` whose methods already mirror the facade (`add_path`, `ls`, `info`, `pin_add`, …). Both turn the
 same dicts into the same objects (`Entry.from_dict`), so they can't drift apart; only lifecycle, how name records
-are heard, timeouts and the escape hatches differ per class. A feature's methods (peers, contacts, keep, follow,
-LXMF) go, in a Node, through the feature as its API route calls it: the route's own lookup (each feature module's
+are heard, timeouts and the escape hatches differ per class. A feature's methods (peers, contacts, keep, follow)
+go, in a Node, through the feature as its API route calls it: the route's own lookup (each feature module's
 `_feature(handler)`, or `_common.feature`, given the backend, which has the handler's `node` attribute), so a
 feature that isn't loaded is the route's `NotFound`, with its message, then the route's checks of its arguments
-(`check_kind`, `parse_name_arg`, lxmf's `_int`), in its order. `rnfs.Client`, its objects
+(`check_kind`, `parse_name_arg`), in its order. `rnfs.Client`, its objects
 and errors import neither RNS nor anything that does (tested, as the CLI's start-up is). The CLI keeps using
 `apiclient` directly (its `ApiClient` subclasses `ApiConnection`), so its output can't change.
 
@@ -1036,10 +1032,10 @@ and errors import neither RNS nor anything that does (tested, as the CLI's start
 - `settings`: `Config` fields as a dict, over `rnfs.toml`'s (`Config.load(rnfs_dir, defaults=EMBEDDED_DEFAULTS,
   **settings)`), validated (ValueError naming the setting). Defaults for an embedded node where neither sets them
   (`embedded.EMBEDDED_DEFAULTS`, which `Config.load`'s `defaults` puts under the file): `dht_mode = "client"`
-  (an app's node is often short-lived; section 6 says such nodes SHOULD be clients) and `lxmf_enabled = false`.
-  `{"dht_mode": "server"}` and `{"lxmf_enabled": True}` turn them on. `api_port`, `gateway_port` and
-  `debug_log` belong to the daemon and are ignored (no API, gateway or debug log runs in the app);
-  `verbosity` applies only when the node starts Reticulum.
+  (an app's node is often short-lived; section 6 says such nodes SHOULD be clients). `{"dht_mode": "server"}`
+  turns it off. A retired setting given here (`lxmf_enabled`, say) is left out with a warning, as in
+  `rnfs.toml`. `api_port`, `gateway_port` and `debug_log` belong to the daemon and are ignored (no API, gateway or debug
+  log runs in the app); `verbosity` applies only when the node starts Reticulum.
 - The identity is the rnfs dir's (`storage/identity`); an app's identity can't be handed in (decision 4).
 - The constructor starts the node (state loaded, threads running, join in the background) and raises if it
   can't: `RnfsError` for the dir in use or not private, `ValueError` for settings, `OSError`, `StateDbError`.
@@ -1101,8 +1097,8 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Cached` / `Uncached` | `cid`, `root`, `path: tuple[str]`, `pinned`, `complete`, `type`, `size`, `provided` / `removed_records`, `removed_blocks`, `freed_bytes` | the CID / — |
 | `Event` | `seq`, `kind` (`EVENT_KINDS`, or "lost": `lost` True), `time`, `fields: dict` (the kind's own; merged back by `to_dict`) | — |
 | `EventBatch` | `events: tuple[Event]`, `next`, `lost`, `epoch` | — |
-| `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`, `deprecated` (`is_deprecated(feature)`); empty from a daemon before 0.2.0 | — |
-| `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending`, then `deprecated` (lists as tuples) | the name |
+| `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`; empty from a daemon before 0.2.0 | — |
+| `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
 | `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
@@ -1114,17 +1110,11 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Contact` | `nick`, `kind` ("name", "node", "lxmf"), `id: bytes` | the nick |
 | `Kept` | `name: bytes`, `reasons: tuple[str]` ("user", "follow", "own"), `sequence`, `cid`, `emitted` (the record held, or None) | name hex |
 | `Followed` | `name: bytes`, `pinned`, `latest` (CIDs or None), `sequence`, `state` | name hex |
-| `LxmfAddress` | `address: bytes`, `display_name`, `propagation_node`, `nearest_propagation_node` | address hex |
-| `MessageLink` | `uri`, `cid`, `name`, `path: tuple[str]`, `size`, `from_node` (JSON `"from"`) | the URI |
-| `Message` (inbox) | `id`, `hash`, `sender` (JSON `"from"`), `display_name`, `sent`, `received`, `title`, `text`, `method`, `links: tuple[MessageLink]`, `auto: tuple[dict] \| None`, `trusted`, `contact` | — |
-| `Outgoing` (outbox) | `id`, `hash`, `to`, `time`, `links`, `text`, `method`, `state`, `progress`, `error`, `direct_hash`, `fallback` | — |
-| `Sent` / `Synced` | `id`, `hash`, `to`, `method` / `propagation_node`, `started` | — |
 
 A JSON key that is a Python keyword is a field of another name (`_field(key="from")`); `from_dict` ignores keys
 it doesn't know, so a newer daemon's additions don't break an older library.
 
-`Name`, `Job`, `Fetched` (`lxmf.get`'s per link: `target`, `output`, `job: Job | None`, `cid`, `warnings`,
-`error`), `Watch` and `File` are bound to the `Node` or `Client` that made them (below).
+`Name`, `Job`, `Watch` and `File` are bound to the `Node` or `Client` that made them (below).
 
 ### Methods
 
@@ -1180,8 +1170,6 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `contacts.list() -> list[Contact]`, `contacts.get(nick) -> Contact`, `contacts.add(nick, id, kind=None) -> Contact` (id: bytes, hex or a `Name`; kind None: the node tells), `contacts.remove(nick)` | `ValueError` (nick, id or kind invalid, a kind it can't tell, full), `NotFound` (no such contact; no contacts feature) | `ContactsFeature.list`, `get`, `add`, `remove` / `GET /api/contacts`, `/api/contacts/get`, `POST /api/contacts/add`, `/api/contacts/rm` |
 | `names.keep(name) -> Kept`, `names.unkeep(name)`, `names.kept() -> list[Kept]` (name: bytes, hex, `Name` or a name contact's nick) | `ValueError` (malformed, unknown nick, `keep_max_names`), `NotFound` (unkeep: not kept by the user; no keepers feature) | `KeepersFeature.keep`, `unkeep`, `kept` / `POST /api/name/keep`, `/api/name/unkeep`, `GET /api/name/kept` |
 | `names.follow(name) -> Followed`, `names.unfollow(name)`, `names.following() -> list[Followed]` | as keep; `NotFound` (unfollow: not followed; no follow feature) | `FollowFeature.follow`, `unfollow`, `following` / `POST /api/name/follow`, `/api/name/unfollow`, `GET /api/name/following` |
-| (deprecated in 0.2.0: each `lxmf` method first warns `DeprecationWarning`) `lxmf.address() -> LxmfAddress`, `lxmf.send(to, target, message=None, *, propagate=False, nearest=False) -> Sent` (to: bytes, hex or an LXMF contact's nick; target a Cid, path or `rnfs:` URI, a name URI sent as a name link), `lxmf.sync(nearest=False) -> Synced` | `ValueError` (LXMF off, as by default in a Node; recipient or target invalid; no propagation node), `NotFound` (send: recipient never heard; no lxmf feature) | `LxmfFeature.address`, `send`, `sync` / `GET /api/lxmf/address`, `POST /api/lxmf/send`, `/api/lxmf/sync` |
-| `lxmf.inbox() -> list[Message]`, `lxmf.outbox() -> list[Outgoing]`, `lxmf.get(id, *, link=None, output=None, directory=None, use_sent_cid=False) -> list[Fetched]`, `lxmf.remove(id) -> int`, `lxmf.remove_all() -> int` | get: `NotFound` (no such message; a name unresolved without `use_sent_cid`), `ValueError` (id or link not a positive integer, no or a clashing output); remove: `NotFound` | `LxmfFeature.inbox_list`, `outbox_list`, `inbox_get`, `inbox_rm` / `GET /api/lxmf/inbox`, `/api/lxmf/outbox`, `POST /api/lxmf/inbox/get`, `/api/lxmf/inbox/rm` |
 
 `File` (from `open`, an `io.BufferedIOBase`): `read`, `read1`, `readinto`, `readline`, iteration, `seek`, `tell`,
 `seekable()`/`readable()` True, `size`, `cid` (the file's own CID), `info`, `close()`, context manager;
@@ -1223,7 +1211,6 @@ ValueError)`. So `except rnfs.NotFound` and `except ValueError` catch both class
 | `names.watch(name, callback)` | `Record`, each time a record of `name` newer than the last delivered (or than the one held when `watch` was called) is accepted under the sequence rules (section 9): announces, path responses, keepers' answers, this node's own publishes | `NameManager.watch(name)` (its announces count as asked in `_heard`, so a full name table never refuses them) and a record listener (`add_record_listener`), which `_offer` calls when it accepts a record and `publish` when it commits one, for watched names, with the names lock held; it only queues the record. Records heard before the watch knows its baseline wait and are compared with it (`_NameWatch.begin`). The keepers listener (`KeepersFeature.add_listener`) isn't used: its records reach `NameManager.offer` too | the `GET /api/name/watch` long poll, on the thread `rnfs-client-name-watch` |
 | `on_progress` / `Job.watch(callback)` | `Job`, at most twice a second (Node) or once a second (Client) while it changes, and once at its final state | the job-watch thread (`rnfs-job-watch`) polls `JobsFeature.get(id)` (a snapshot made under the jobs lock) every `fetcher.POLL` (0.5 s); `fetcher.observing` and the `Observer` (the `Job`, on the job's thread) stay the jobs feature's | `rnfs-client-job-watch` polls `GET /api/jobs/get?id=` once a second; `wait()` loops `GET /api/jobs/get?id=&wait=30` |
 | `events.watch(callback, kinds=None)` | `Event`, one call per event of `kinds` published after `watch()`, in order and never coalesced (an event says what changed, not a state); a "lost" `Event` (`event.lost`) where events were missed, after which the app reads again what it shows | the event log's listener (`EventLog.add_listener`, added at the first watch, removed at `close()`), called after `publish` releases the log's condition, perhaps under the names or storage lock: it only queues. The baseline is the log's `last` and `epoch`; a Node never misses events | `GET /api/events` long-polled for every kind on `rnfs-client-event-watch`, from the first watch's baseline (`after` absent, inside `watch()`, so an older daemon raises `NoSuchEndpoint` there), passing back `next` and `epoch`; on `lost` (fell over 1024 events behind, or the daemon restarted) each watch gets the marker and polling goes on from `next`. Idle, forgetting its position, while no watch is left; a failed poll is reported and retried after 5 s |
-| LXMF links received | not offered in 0.2 (decision 5); `events.watch(kinds="inbox")` says when the inbox changes | | |
 
 Rules, the same for both:
 - Every callback runs on the instance's event thread (`rnfs-events` in a Node, `rnfs-client-events` in a
@@ -1269,11 +1256,10 @@ Rules, the same for both:
 | A Node's events come from in-process hooks; a Client's from polling (jobs, 1 s) and the long poll (names) | Documented; the same callbacks and rules. A daemon older than the endpoint can't watch names (`NotFound` at `watch()`) |
 | Paths (`add`, `get`, `export`, `import_archive`, a job's output) are opened by the daemon for a Client | Same machine and user (the token requires it); made absolute on the app's side, as now |
 | `open()` costs one API request per buffer refill for a Client | Accepted; the 64 KiB buffer bounds the requests, and sequential reads read ahead up to 4 MiB a request |
-| Settings, DHT mode, LXMF, lifecycle: a Node's own; the daemon's for a Client | Documented: a Client can't change them; `close()` only ends the Client |
+| Settings, DHT mode, lifecycle: a Node's own; the daemon's for a Client | Documented: a Client can't change them; `close()` only ends the Client |
 | No gateway or API in a Node | Not offered in 0.2 (decision 6) |
 | The API's `GET /api/info` has no `raw` | A Client's `info(raw=True)` (and `open(raw=True)`) takes a sealed file's `stored_size` as its size |
 | A Client's requests can be bounded (`timeout`, `timeout()`); a Node's calls make none | A Node's `timeout()` checks its argument and does nothing; `Job.wait(timeout)` bounds a wait on both |
-| LXMF is off in a Node unless `lxmf_enabled` | `lxmf.address`, `send` and `sync` raise `ValueError` saying so, as a daemon with it off answers (400) |
 | `OSError` in a Node is `ServerError` from a Client | Documented |
 | A Client can be an app's (`app=`), its pins `app:<name>[:<key>]` (`pin_key()`); a Node's are always `user`'s | Client only: an embedded node is its app's own node, with no token to tell callers apart |
 | A Client's connection errors (`DaemonNotRunning`, …) | Client only, all `ApiError` |
@@ -1286,8 +1272,8 @@ proof and version check, and its dict-returning methods, which become `rnfs.Clie
 re-based as above. Its module docstring and README point apps to `rnfs.Client`. The CLI's output can't change:
 it calls the same methods with the same parameters. It gained `name_watch` and `cat(from_node=)`, and in 0.2.0
 the feature methods `rnfs.Client` uses (`peers`, `stats`, `contacts`, `contact_get`/`_add`/`_rm`,
-`name_keep`/`_unkeep`/`_kept`/`_follow`/`_unfollow`/`_following`, `lxmf_address`/`_send`/`_inbox`/`_inbox_get`/
-`_inbox_rm`/`_outbox`/`_sync`) and per-call timeouts (`timeout=`, `using_timeout`, `effective_timeout`).
+`name_keep`/`_unkeep`/`_kept`/`_follow`/`_unfollow`/`_following`) and per-call timeouts (`timeout=`, `using_timeout`,
+`effective_timeout`).
 
 ### Example app
 
@@ -1314,9 +1300,8 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 - Guards: `guards.install(scope)` with `"process"` (the daemon: as today) or `"dht"` (a Node: the request,
   transfer-size and segment checks apply only where `is_dht_link`). `guarded_receive` and
   `guarded_response_resource_concluded` are already scoped; the host's links reach RNS's own methods.
-- LXMF off by default: no `LXMRouter`, no LXMF identity, no `LXMF` import. With it on, the router is rnfs's own,
-  and its links (not rnfs.dht) get RNS's stock compression, bounded on receipt by the feature's per-Resource
-  limits; LXMF can't shut its router down, so it runs until the process ends.
+- No LXMF: rnfs has none since 0.2.0 (no `LXMRouter`, no LXMF identity, no `LXMF` import), so a program running
+  LXMF itself, beside an embedded node, owns it alone.
 - The lock, as above. Not done in a Node: the debug log, `threading.excepthook`, `faulthandler`, signal
   handlers, `RNS.logdest`, `RNS.exit()`.
 - Threads added: `rnfs-events` and `rnfs-job-watch` (Node), `rnfs-client-events`, `rnfs-client-job-watch`,
@@ -1338,9 +1323,9 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
 2. `close()` on both classes, not the sketch's `stop()`.
 3. `add()` returns `Added`, which carries a directory add's warnings.
 4. A Node uses its rnfs dir's identity; the app's can't be handed in (0.2).
-5. No LXMF callback and no handing over the app's `LXMRouter` (later).
+5. No LXMF callback and no handing over the app's `LXMRouter` (moot since 0.2.0, which removed rnfs's LXMF).
 6. A Node serves neither the API nor the gateway (0.2).
-7. A Node defaults to `dht_mode = "client"` and `lxmf_enabled = false`.
+7. A Node defaults to `dht_mode = "client"`.
 8. `apiclient.Client` becomes `ApiConnection`, so `rnfs.Client` is the only client.
 
 ## Content additions
@@ -1579,12 +1564,12 @@ and in total, never persisted.
   instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
   RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in
   `destination.links` on the interface holding the most until fewer than `limit` remain. `RequestServer`
-  applies it to `rnfs.dht` and the LXMF feature to its delivery destination, both at `max_incoming_links`.
+  applies it to `rnfs.dht`, at `max_incoming_links`.
 
 ## Features
 
 `rnfs/features/__init__.py` defines `Feature` and `FEATURE_MODULES` (in start order: peers, jobs, keepers, follow,
-contacts, lxmf, deny, settings). The node builds every feature in its constructor (`node.feature(name)`), starts them after
+contacts, deny, settings). The node builds every feature in its constructor (`node.feature(name)`), starts them after
 its own threads and stops them, in reverse, before its own services. A feature may override: `start()`,
 `stop(deadline=None)` (asks its threads to end, then waits for them until `deadline`, a `time.monotonic()` value:
 the node passes its stop budget's, so `STOP_TIMEOUT`, 5 s, bounds the features' threads and its own together;
@@ -1603,24 +1588,14 @@ A feature declares the features it uses: `requires` (it can't work without them;
 `FEATURE_MODULES`) and `optional` (used when loaded). The node loads them through `features.checked_classes()`,
 which raises `features.FeatureError` before making any if a required feature is missing or later, or two features
 share a name; a feature reaches another only with `self.dependency(name)`, which raises `FeatureError` for a name it
-didn't declare and returns `None` for an optional one not loaded. Today follow requires keepers; jobs, keepers,
-follow and lxmf use contacts, contacts uses keepers, lxmf uses jobs, and settings uses jobs, keepers and lxmf (to
-hand them live settings), all optionally. What the others call on
+didn't declare and returns `None` for an optional one not loaded. Today follow requires keepers; jobs, keepers
+and follow use contacts, contacts uses keepers, and settings uses jobs and keepers (to hand them live settings),
+all optionally. What the others call on
 contacts is the `features.ContactsApi` Protocol (`lookup`, `has`, `nick_of`, `resolve_id`, `expand_target`), which
 types `node.feature("contacts")`, `self.dependency("contacts")` and `features.find(node, "contacts")`;
 `tests/test_contacts.py` checks `ContactsFeature` against it, so a renamed method fails there instead of silently
-turning off LXMF's contact trust. LXMF resolves a recipient's nick with `ContactsFeature.resolve_id(nick, "lxmf")`.
-
-A feature that still works but is going away sets `deprecated` (the reason) and `deprecated_since` (a Unix time,
-checked by `checked_classes()`): its routes' responses carry a `Deprecation` header and capabilities list it
-(above, "Deprecated routes"). In 0.2.0 that is lxmf (`config.LXMF_DEPRECATION`, the one reason every warning
-gives), which also says so itself: `LxmfFeature.start()` logs it once, a notice while it runs, naming the
-`lxmf_*` settings given (`config.deprecated_given`: neither the default nor an embedded node's own default) as a
-warning while it runs as configured; its commands are wrapped (`lxmf._deprecated_command`) to print
-`cli.warn_deprecated`'s line on stderr first (unless `RNFS_NO_DEPRECATION_WARNINGS` is set) and to say
-"(deprecated)" in their help; the settings schema's `deprecated` comes from `config.DEPRECATED_GROUPS`, and
-`config.deprecation_warnings` makes the settings feature's warnings; `interface.Lxmf`'s methods warn
-`DeprecationWarning` at the caller (`_lxmf_deprecated`, stacklevel 3).
+turning off what uses it. Contacts of kind `lxmf` stay for apps (an LXMF app reads them through `GET /api/contacts`
+to decide which senders it trusts); nothing in rnfs uses that kind but `contact_hash` (sealing for a contact).
 
 The node checks the features' names too when it loads them, with one error style (`FeatureError`, "feature
 <name>: <problem>"), so nothing is shadowed or dropped silently: `checked_classes()` checks every API route
@@ -1638,7 +1613,6 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
 | `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
-| `lxmf` | `lxmf.py` | deprecated in 0.2.0 (moves to an app; above); pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `storage.LXMF_PREFIX` (`app:lxmf:`, an app source to `storage.check_source`) |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 | `settings` | `settings.py` | `rnfs config`, `GET /api/config`, `POST /api/config/set`: rnfs.toml read and rewritten, `LIVE` settings applied to the running node | `config.settings_schema`, `Config.combine`, `config.edit_settings`; `Config.overrides`/`given_defaults` (set by `Config.load`); the live hooks below |
 
@@ -1646,9 +1620,8 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 read it without a daemon): one entry per `Config` field but `rnfs_dir`, its type and nullability from the field's
 annotation, ranges from the tables `Config.validate` checks (`WHOLE_NUMBERS`, `OPTIONAL_WHOLE_NUMBERS`, `RATES`,
 `DURATIONS`, `CHOICES`, and `FEATURE_LIMITS` for what features check), units, groups (`SECTIONS`, the markers in
-`Config`), a one-line `DESCRIPTIONS` entry, `live` (`LIVE_SETTINGS`) and `deprecated` (`DEPRECATED_GROUPS`, by
-group); `tests/test_settings.py` fails for a field without one, and checks each entry against `validate`.
-`Config.load` records what it was given over
+`Config`), a one-line `DESCRIPTIONS` entry and `live` (`LIVE_SETTINGS`); `tests/test_settings.py` fails for a field
+without one, and checks each entry against `validate`. `Config.load` records what it was given over
 rnfs.toml (`overrides`: the daemon's command line, an embedded node's settings) and under it (`given_defaults`),
 so `GET /api/config` can say for each setting the running value, rnfs.toml's (`file`, null where it isn't set:
 TOML has no null), `overridden` and `pending` (a restart with the same command line would run another value),
@@ -1667,68 +1640,21 @@ result is checked to parse to exactly the intended values and to fit `MAX_SETTIN
 at the path replaced, not followed). Last, each `LIVE` setting not overridden is assigned on `node.config`, the one
 `Config` the node's parts share, and its hook, if any, hands it to what copied it at start: `Storage.max_storage`
 (then `_enforce_storage` at once), `JobsFeature._schedule` (queued jobs a higher `max_jobs` allows),
-`RequestServer.airtime`'s `serve`/`no_serve`/`quiet` (each replaced whole), `KeeperStore.max_names`, and
-`LxmfFeature.accept_from`/`auto_fetch_from` (sets replaced whole). The others in `LIVE` are read from
-`node.config` at each use. Not live, deliberately: identity, ports, Reticulum, `dht_mode`, private mode and
-`members`, and `remote_pin_identities` (a removed identity's waiting remote pins are dropped only at a start),
+`RequestServer.airtime`'s `serve`/`no_serve`/`quiet` (each replaced whole) and `KeeperStore.max_names`. The others in
+`LIVE` are read from `node.config` at each use. Not live, deliberately: identity, ports, Reticulum, `dht_mode`, private
+mode and `members`, and `remote_pin_identities` (a removed identity's waiting remote pins are dropped only at a start),
 `upload_budget` (its token bucket holds charges of responses in flight), `gateway_fetches` (the gateway isn't the
-node's), `verbosity` (RNS clamps its loglevel, so a change can't be undone exactly) and `lxmf_sync_interval`
-(read only after each download).
-
-`LxmfNetwork` makes an `LXMF.LXMRouter` with storage `<rnfs dir>/lxmf/` and `signal.signal` stubbed (LXMRouter
-installs SIGINT/SIGTERM handlers that exit at once), a 256 kB delivery limit, announce data without
-`SF_COMPRESSION`, and incoming delivery Resources (and propagation-node downloads) allowed to decompress up to
-that limit, since the daemon sets RNS's global limit to 0 (an embedded node leaves it, and the limit bounds them
-all the same). `delivery_resource_advertised` is wrapped to refuse a delivery Resource of more than one segment
-(LXMF checks only each segment's own size). It keeps a table of up to 64 propagation nodes from
-announces (forgotten after 7 days unheard), but uses one automatically only if it is `lxmf_propagation_node`;
-the nearest heard is used only for a request with `nearest`, and without a configured node the feature logs
-once (notice) that downloads and the fallback are off. On a propagation-node link it cancels any response
-Resource over 1 MB (4 × `DELIVERY_LIMIT_KB`) or of more than one segment and tears the link down, and asks for
-at most 64 messages per download. `LxmfFeature.trusted()` is true for senders in `lxmf_accept_from` or
-`lxmf_auto_fetch_from` and LXMF contacts (`ContactsFeature.has(address, "lxmf")`, an index kept beside the
-address book). Messages from unknown senders are held (`_hold`: at most 32, 8 per claimed sender, a ninth
-claiming one taking the place of its oldest; further ones dropped, and none from senders `accepts()` would
-ignore, but a trusted sender's takes the place of the newest held for the untrusted sender holding the most) while their identity is requested: one path request per sender
-per 2 minutes, from a node-wide token bucket (burst 3, then one per 10 s), trusted senders' held messages
-retried first. A held message is dropped 30 s (`HOLD_PATH_WAIT`) after its sender's path request, or its own
-arrival if later, with no identity known, and after 2 minutes in any case. A held message stays in the queue
-while it is retried, so it still counts as a duplicate and against the limit. The inbox (`MessageLog`) holds at
-most 500 records and 4 MiB as JSON, 50 per sender not in `lxmf_auto_fetch_from`, 16 KiB per record (links
-beyond it dropped, then text cut), and never evicts a record holding auto-fetched pins for one that holds none,
-nor for another sender's (when all others hold pins, the new record's sender's own goes, or it is refused). An
-auto-fetch sender's record is added with `share=` 1/n of the record and byte limits (`_auto_share`, n senders in
-`lxmf_auto_fetch_from`, at least one record and 16 KiB), counting its protected records; past it, `_own_victim`
-drops its own unprotected records first, then those whose holdings (`holds=_held`: pinned CIDs, queued links)
-another of its records also holds, then the oldest;
-`add(reserved=)` keeps trusted senders' records from being evicted except for each other's (untrusted ones go
-first), so free identities can't push them out, and untrusted senders' new records come from a per-sender
-allowance (`SENDER_BURST` 4, then one per `SENDER_INTERVAL` 15 min; `_sender_tokens`, the last
-`SENDER_ALLOWANCES` 256 senders) and then a node-wide token bucket (`UNTRUSTED_BURST` 32, then one per
-`UNTRUSTED_INTERVAL` 60 s), both on `LxmfFeature.clock`; a message refused by either takes from neither. The pin's
-"pinned" state is recorded in the same locked section that pins. Auto-fetched `name/` links resolve with
-`persist=False`; each auto-fetch runs under a `fetcher.observing` observer cancelled when the node stops or the
-message is removed, and links still "queued" in the inbox are queued again at `start()`
-(`_requeue_auto_fetches`, within the 64-entry queue). The queue (`_RoundRobin`) keeps one FIFO per sender and
-takes senders in turn; when it is full, a sender with at least two fewer waiting than the busiest takes the
-busiest one's newest place (that link is marked skipped). Links without the field are read from the first
-`MAX_SCAN_CHARS` (16 384) characters of the content. `inbox get` (through the jobs feature) checks every output
-before starting any (two links with one output are refused), then submits a get job per link with its `from`
-and `fallback_dht`; once one has started, a later link's failure is reported in its result (`error`) rather
-than raised. Names are resolved while planning: `_resolve(link, persist, allow_sent_cid)` returns
-`(cid, names, fell_back)` and raises NotFound (naming `--use-sent-cid`) for an unresolvable name unless
-`allow_sent_cid`, so without `use_sent_cid` nothing is written and no job submitted; with it, a link that fell
-back to its sent CID gets a `warnings` entry in its result. Auto-fetch passes `allow_sent_cid=True` (its senders
-are trusted) and records `"sent_cid": true` with such a pin; `_print_links` shows it, and a name link's sent CID.
-An output without `-o` is named with `fsutil.safe_default_name`. Sent links carry `from` only with
-`lxmf_send_from_hint`. The inbox and outbox are rows of the `lxmf_messages` table, saved in batches (NORMAL).
+node's) and `verbosity` (RNS clamps its loglevel, so a change can't be undone exactly). Retired settings
+(`config.RETIRED_SETTINGS`: `max_records`, and since 0.2.0, which moved LXMF out of rnfs, the eight `lxmf_*`) are
+left out by `Config.combine` with a warning wherever they come from (rnfs.toml, the command line, an embedded
+node's settings; silently from an embedded node's own defaults), so an older rnfs.toml still starts the node; the
+settings API and `rnfs config set` know them no more than any other name that isn't a setting.
 
 **Feature API routes** (all need the token): `POST /api/jobs`, `GET /api/jobs`, `GET /api/jobs/get?id=&wait=`,
 `POST /api/jobs/cancel`, `POST /api/jobs/clear`; `GET /api/peers`, `GET /api/stats`; `POST /api/name/keep`,
 `/api/name/unkeep`, `GET /api/name/kept`; `POST /api/name/follow`, `/api/name/unfollow`,
 `GET /api/name/following`; `GET /api/contacts`, `GET /api/contacts/get?nick=`, `POST /api/contacts/add`,
-`/api/contacts/rm`; `GET /api/lxmf/address`, `POST /api/lxmf/send`, `GET /api/lxmf/inbox`,
-`POST /api/lxmf/inbox/get`, `/api/lxmf/inbox/rm`, `GET /api/lxmf/outbox`, `POST /api/lxmf/sync`; `GET /api/deny`,
+`/api/contacts/rm`; `GET /api/deny`,
 `POST /api/deny/add`, `/api/deny/rm` (`{"entries": [...]}`); `GET /api/config`, `POST /api/config/set`
 (`{"settings": {name: value or null}}`). `POST /api/jobs`
 takes, for a get, the JSON booleans `sealed_name` (write a sealed file this node opens under its safe sealed
@@ -1745,14 +1671,7 @@ rate, of bytes read) and raises `Cancelled` once cancelled or stopping; their `t
 nothing) and an interrupted one runs again from the start. Every job state change, removal and,
 at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job` event (`Job.event`: `id`,
 `job_kind`, `state`, `error` and the progress fields; never the result; a removal's carries only `id`, `job_kind`,
-`state` and `removed`: true). `POST /api/lxmf/send` and `/api/lxmf/sync` take
-`nearest`; `POST /api/lxmf/inbox/get` takes `use_sent_cid` (without it, an unresolvable name link is 404);
-`GET /api/lxmf/address` returns `propagation_node` (the configured one only) and `nearest_propagation_node`.
-`GET /api/lxmf/inbox` adds to each record, computed when listed, `trusted` (`LxmfFeature._trusted_hex`) and
-`contact` (`ContactsFeature.nick_of(address, "lxmf")`, the first nick naming it, or null); `rnfs inbox` prints the
-address, then `contact <nick>`, `trusted` or `untrusted` (`?` without the fields), the method, and last the
-display name quoted and escaped with `fsutil.printable_label`.
-Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
+`state` and `removed`: true). Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 `chunker` (and the same as query parameters on `/api/add/stream`), and (0.2.0) `nomadnet` instead of `path`, with
 `name` and `identify`; `POST /api/get` `raw`, `no_extract`; `GET /api/cat` `raw=1`, `block=1`; `GET /api/info`
 `from`.
@@ -1775,7 +1694,6 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | `rnfs-deny` | deny | every deny-list source's check and fetch, one at a time, once joined |
 | `rnfs-events`, `rnfs-job-watch` | rnfs.Node | callbacks into the program, one at a time; polling watched jobs (both started on first use) |
 | `rnfs-client-events`, `rnfs-client-job-watch`, `rnfs-client-name-watch`, `rnfs-client-event-watch` | rnfs.Client (in the program) | callbacks; polling watched jobs; the `GET /api/name/watch` and `GET /api/events` long polls |
-| `rnfs-lxmf`, `rnfs-lxmf-fetch` | lxmf | announces, propagation-node downloads, polling outbound states each second while a message is followed or held or a download runs (otherwise it sleeps until the next announce or download; `LxmfNetwork.send`, `_hold` and `sync` wake it); auto-fetch, one at a time, senders in turn (LXMF runs its own job thread) |
 
 The API and gateway run one thread per connection, capped (32 and 64). The daemon's main thread waits for
 SIGINT, SIGTERM or SIGBREAK (`cli.wait_until_stopping`): on POSIX a signal interrupts the wait, so it has no
@@ -1788,7 +1706,7 @@ change needs, and inside it takes no other lock and does no network I/O). `node.
 applied at a time, `_apply_deny`) is taken before the publisher's lock and never with the names lock;
 `DenyList._lock` holds only the state database's, as does `AppRegistry._lock` (`app_rm`'s release of the app's
 pins runs without it). Feature locks held across `storage.pin`/`unpin`/`protect` and
-`publisher.refresh()` (`JobsFeature._lock`, `FollowFeature._lock`, `LxmfFeature._lock`) come before the publisher's
+`publisher.refresh()` (`JobsFeature._lock`, `FollowFeature._lock`) come before the publisher's
 and storage's. The public API's locks come after these: `Rnfs._watch_lock` after the names lock (NameManager's
 record listeners run under it, and only queue), the event and job-watch conditions innermost; callbacks into the
 program run with none of them held. `NameSync._publish_lock` (held from a scan's decision to publish to the
@@ -1871,9 +1789,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   periodic saves and at stop, changed rows only: a power loss costs at most reading some files again);
 - `jobs` (record per job in creation order; FULL, including progress saves; results keep
   at most 100 warnings plus `warnings_total`, older results capped at load); `keepers` (records re-verified at
-  load; NORMAL); `follow` (FULL); `contacts` (FULL); `lxmf_messages` (inbox: 500 messages, 4 MiB, 50 per
-  non-auto-fetch sender, 16 KiB per record; outbox 200, unfinished messages marked failed at a restart; NORMAL,
-  changed messages only; ids and `next_id` stay below 2^63);
+  load; NORMAL); `follow` (FULL); `contacts` (FULL); `lxmf_messages` (the inbox and outbox of rnfs's LXMF
+  before 0.2.0, kept for an LXMF app to import: nothing reads, changes or deletes them; `rnfs/lxmf_messages.py`
+  only imports 0.1.4's `lxmf_inbox.json` and `lxmf_outbox.json` into it, bounded as that LXMF loaded them);
 - `deny_entries` (the local deny list, canonical text; FULL), `deny_lists` (each source as `dump()`ed text, the
   CID of the version it last accepted; FULL) and `deny_hashes` (the content SHA-256 of files checked against
   `sha256:` entries, by binary CID, LRU order in `used`, at most 10 000; NORMAL with the periodic saves and at
@@ -1886,9 +1804,10 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - `apps` (0.2.0, rnfs/apps.py: each app's name, the SHA-256 verifier of its token (`apiclient.app_verifier`; the
   token itself is never stored) and when it was added; FULL, each change written at once; a row that doesn't
   parse is deleted at load);
-- `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
-  requires; each box's `next_id`; 0.2.0: `size_estimate`'s `samples`, the density check's last 16 size samples,
-  written with the batched saves when changed) and `migrated` (JSON files imported).
+- `meta` (per-store values: follow's `clean`, set by every save, which the reconcile at start requires; each
+  LXMF box's `clean` and `next_id`, as the import or rnfs before 0.2.0 left them; 0.2.0: `size_estimate`'s
+  `samples`, the density check's last 16 size samples, written with the batched saves when changed) and `migrated` (JSON
+  files imported).
 - Schema steps of 0.2.0 that rewrite rows: `lxmf_app_pins` turns every valid `lxmf:<address>` pin into
   `app:lxmf:<address>` (a case-sensitive `GLOB` spelt out, so an invalid one is still deleted at load;
   `storage.import_pins` does the same to an older `pins.json`, imported after the steps).
@@ -1901,12 +1820,11 @@ write-through stores); the features are stores too, batched. Stop saves every st
 `_close_state` closes them in reverse, the node's own reference last; after a `_setup` that failed, only those it
 made. A new store needs only its `_add_store` call.
 
-Free text that may hold lone surrogates (file names, LXMF records, cache paths) is stored as JSON text
+Free text that may hold lone surrogates (file names, cache paths) is stored as JSON text
 (`statedb.dump`). Rows that fail the checks the JSON loaders applied are dropped at load with a warning and
 deleted. The JSON files of 0.1.4 and earlier, once imported, stay as `<name>.migrated`. Elsewhere:
-`storage/identity`, `storage/lxmf_identity` (0600), `names/<alias>` (name keys), `lxmf/` (LXMF's ratchets,
-delivered-message IDs, stamp costs), `api_token` (while the daemon runs), `daemon.lock` (locked while the daemon, or an embedded `rnfs.Node`, uses the
-dir: `node.lock_rnfs_dir`).
+`storage/identity` (0600), `names/<alias>` (name keys), `api_token` (while the daemon runs), `daemon.lock` (locked while
+the daemon, or an embedded `rnfs.Node`, uses the dir: `node.lock_rnfs_dir`).
 Outputs being written live beside the output as `.rnfs-get-<random>.partial` (`RnfsNode.get`) or `.rnfs-job-<id>.partial` (get jobs) until renamed; a failed, cancelled or shut-down job removes its partial,
 and a resumed job removes one left by a crash. A get job runs `RnfsNode.get` with its `.rnfs-job-<id>.partial` as
 the output, so it is written in a `.rnfs-get-<random>.partial` beside that and renamed twice.
@@ -1926,7 +1844,7 @@ the rename.
 
 The commands CI runs the tests with are in `.github/workflows/tests.yml`. Feature tests live in their own files
 (`test_jobs.py`, `test_mesh.py`, `test_names_keep.py`, `test_contacts.py`, `test_seal.py`, `test_chunker.py`,
-`test_pin_false.py`, `test_gateway_formats.py`, `test_lxmf.py`), and `test_e2e.py` has a marked block per
+`test_pin_false.py`, `test_gateway_formats.py`), and `test_e2e.py` has a marked block per
 feature. The public API has `test_public.py` (every interface test run on an embedded node and on a Client of an
 ApiServer, the name-watch endpoint, the objects, `import rnfs`'s weight) and `test_embedded.py` (the guards'
 scopes, the dir lock, and with `RNFS_E2E=1` a host program over real RNS beside an embedded node). The state database has `test_statedb.py`, each store's migration a `test_migrate_*.py`, and
@@ -2021,11 +1939,11 @@ Everything in the specification is implemented, with these simplifications and a
   (64) per `DAG_GRANULE` (4 KiB, `SmallLeaves`' threshold) of the declared size + `DAG_SLACK` (1 KiB), plus
   what the counted directory and index nodes bring (`node_credit`): a directory node its own bytes and
   `DAG_ENTRY_OVERHEAD` (16) per entry, an index node its own bytes and 16 per child less `INDEX_NODE_COST`
-  (64), never below 0; and `max_dag_bytes` (a remote pin's, auto-fetch's or follow's quota) if lower. Over it is
+  (64), never below 0; and `max_dag_bytes` (a remote pin's or follow's quota) if lower. Over it is
   `TooLarge`, not `InvalidDag`. Every caller gets it, since it lives in `fetch_dag`: `get`, `pin_add`,
-  `dir_set`/`dir_rm`, `export`, `export_stream`, follow, remote pins and LXMF auto-fetches. A target whose DAG
+  `dir_set`/`dir_rm`, `export`, `export_stream`, follow and remote pins. A target whose DAG
   is stored complete already isn't walked: it is checked whole against the deny list and, with
-  `max_dag_bytes`, against the quota (`Storage.dag_bytes`), so a remote pin or auto-fetch of a DAG held already
+  `max_dag_bytes`, against the quota (`Storage.dag_bytes`), so a remote pin of a DAG held already
   meets the same quota as one fetched. Why the builder's
   output never comes near it: a file node child is at most 51 bytes (`[cid, size]`: 39-byte CID, 9-byte size)
   and a node header at most 7; fixed chunks are 64 KiB and FastCDC chunks over 16 KiB except a file's last,
@@ -2181,7 +2099,8 @@ Everything in the specification is implemented, with these simplifications and a
 - Each scan resolves the shared folder it opened (`shared_folder.opened_path`: `fsutil.final_path` of its
   descriptor, the path walk's checked root, or else its real path with the same device and inode) and refuses one
   that is the rnfs dir (`SharedFolder`'s `rnfs_dir`, `config.root` in the node), a directory holding it, or inside
-  one of `PRIVATE_SUBDIRS` (`storage`, `names`, `state`, `blocks`, `lxmf`, each resolved): a warning while it
+  one of `PRIVATE_SUBDIRS` (`storage`, `names`, `state`, `blocks`, and `lxmf`, which may still hold the LXMF state
+  of rnfs before 0.2.0; each resolved): a warning while it
   stays refused, and the scan treats it as empty (`current = {}`): nothing imported, every `folder` pin released
   and the shared_folder table emptied, so pins a 0.1.5 node made from such a folder go at the first scan after the
   upgrade. The walk then reads that descriptor, so a link retargeted after
@@ -2247,26 +2166,26 @@ Everything in the specification is implemented, with these simplifications and a
   records; a key without a saved record keeps its pins until its next publish or removal (`_stale`, where a release
   that failed with `OSError` also waits). A key file that is there but can't be loaded is `_unreadable`: its pins
   are kept and its row is never touched by saves. `Storage.pin`/`pin_many`/`unpin` undo their change in memory if
-  the commit fails. Follow and LXMF do the same for their sources at start (`FollowFeature._reconcile`,
-  `_release_unrecorded`), but release only if their state loaded whole (the `clean` meta value, set by every save;
-  `MessageLog.clean`); otherwise unrecorded pins are recorded again (the name followed again, or an inbox message
-  per sender listing them), so a later start keeps them too. The name table marks entries that were only heard
-  (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with no waiting resolve, of a name
-  neither kept nor watched, may only evict one of those (`watch()` takes a name out of `_heard_only`). A name
-  resolved for the user, or published here, leaves the table and the floor (`_hold`). A resolve with `persist=False`
-  (gateway, LXMF auto-fetch) raises the name's floor (`_floor`, a `_NameFloor`: name -> (sequence, wall time last
-  resolved, used), in resolve order, `used` being its row's place; it owns its trim, load, save snapshot and timer, and
-  reads as name -> (sequence, resolved)), which `_offer` checks. A raise (or a new name) saves the floor at once if the
-  last save was `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`; a raise by a record heard for a
-  name in the table (`_store`: an announce, a keeper's record, or one a resolve's refresh heard) is always the timer's,
-  started at once when a save is due, since its callers hold the lock; renewing only the time marks it for the next save
-  after an hour. `_NameFloor.trim` drops the least recently resolved past `FLOOR_FACTOR` × `name_table_size`, but stops
-  at one resolved within `FLOOR_KEEP_AGE` (7 days) until the floor holds `FLOOR_HARD_FACTOR` (2) times that. A resolve's
-  network refresh (`_shared_refresh` around `_refresh_name`) is remembered per name (`_refreshed`: when it ended,
-  monotonic, and whether it left a record; at most `REFRESHED_SIZE`, least recent dropped), so a resolve within its
-  `max_age` skips it unless that record has left the table or the refresh left a suspected replay (`_absorb_recalled`);
-  resolves of a name being refreshed wait on the leader's `Event` in `_refreshing`, then each runs only the local step
-  (persist, floor).
+  the commit fails. Follow does the same for its source at start (`FollowFeature._reconcile`), but releases only
+  if its state loaded whole (the `clean` meta value, set by every save); otherwise unrecorded pins are recorded
+  again (the name followed again), so a later start keeps them too. The `app:lxmf:` pins rnfs's LXMF left are an
+  app's: nothing reconciles them, and only removing an app called `lxmf` releases them. The name table marks
+  entries that were only heard (`_heard_only`, its own LRU, so finding one to evict is O(1)); an announce with no
+  waiting resolve, of a name neither kept nor watched, may only evict one of those (`watch()` takes a name out of
+  `_heard_only`). A name resolved for the user, or published here, leaves the table and the floor (`_hold`). A resolve
+  with `persist=False` (the gateway) raises the name's floor (`_floor`, a `_NameFloor`: name -> (sequence, wall time
+  last resolved, used), in resolve order, `used` being its row's place; it owns its trim, load, save snapshot and timer,
+  and reads as name -> (sequence, resolved)), which `_offer` checks. A raise (or a new name) saves the floor at once if
+  the last save was `FLOOR_SAVE_INTERVAL` (5 s) ago, else from a one-shot `threading.Timer`; a raise by a record heard
+  for a name in the table (`_store`: an announce, a keeper's record, or one a resolve's refresh heard) is always the
+  timer's, started at once when a save is due, since its callers hold the lock; renewing only the time marks it for the
+  next save after an hour. `_NameFloor.trim` drops the least recently resolved past `FLOOR_FACTOR` × `name_table_size`,
+  but stops at one resolved within `FLOOR_KEEP_AGE` (7 days) until the floor holds `FLOOR_HARD_FACTOR` (2) times that. A
+  resolve's network refresh (`_shared_refresh` around `_refresh_name`) is remembered per name (`_refreshed`: when it
+  ended, monotonic, and whether it left a record; at most `REFRESHED_SIZE`, least recent dropped), so a resolve within
+  its `max_age` skips it unless that record has left the table or the refresh left a suspected replay
+  (`_absorb_recalled`); resolves of a name being refreshed wait on the leader's `Event` in `_refreshing`, then each runs
+  only the local step (persist, floor).
 - **Deny lists.** `RnfsNode._setup` makes the `DenyList` right after storage, gives it to storage (`storage.deny`),
   and `reload`s the accepted lists from their pinned blocks (`_read_deny_list`), so the publisher's first refresh
   already leaves out denied content. Fetches check every expectation in `_ensure` and the root in `Fetcher.open`,
@@ -2289,7 +2208,7 @@ Everything in the specification is implemented, with these simplifications and a
   once, never reading a raw block (a size over `MAX_BLOCK_SIZE` is `InvalidDag`), and stops at the bytes needed,
   so the check costs the DAG's nodes at most and the hash at most 16 × the distinct chunks plus 64 MiB. A failed `_apply_deny` leaves
   `_deny_applied` as it was, so maintenance tries again after `DENY_RETRY` (60 s). `remote_pin` refuses a denied
-  CID; jobs don't fall back to the DHT on `Denied`, and LXMF auto-fetch records it as refused.
+  CID; jobs don't fall back to the DHT on `Denied`.
 - **Follow** isn't built on jobs (job pins use source `user`); `pin add --follow` doesn't exist. Checks use
   the record held unless nothing was heard for 2 × `announce_interval`; a failed check (any exception) is
   retried after 300 s, doubling up to `announce_interval`, and a failed fetch is retried with the record held
@@ -2316,28 +2235,16 @@ Everything in the specification is implemented, with these simplifications and a
 - **Mesh.** Attached to a shared `rnsd` instance, every incoming link arrives on the local shared-instance
   interface, so `serve_interfaces`/`no_serve_interfaces` can't tell radios apart (a warning is logged); run
   rnfs as the instance to use them. Traffic counters aren't persisted.
-- **LXMF.** Propagation delivery and downloads aren't covered by the e2e test (it has no propagation node).
-  Stamps a recipient demands are computed by LXMF (CPU, in subprocesses). Messages over 256 kB are refused.
-  The outbound queue is lost at a restart (LXMF doesn't keep it). A message from a sender whose identity
-  can't be found within 2 minutes (30 s after an unanswered path request) is lost, as is one the hold queue
-  or the rate limit on untrusted senders has no room for: LXMF has already recorded it as delivered and the
-  sender has its delivery proof. A steady stream of forged messages can still crowd a first message from an
-  untrusted sender out of the hold queue, and messages with rnfs links from new identities can use up the
-  untrusted senders' rate limit; trusted senders (contacts, `lxmf_accept_from`, `lxmf_auto_fetch_from`) are
-  not held back by either, though forgeries claiming one of them can take its 8 hold places until its
-  identity is known. One auto-fetch runs at a time, so a long one still delays every sender's next. Links
-  sent carry the node ID as `from` unless `lxmf_send_from_hint = false`; the default display name
-  (`rnfs node`) doesn't. No propagation node is used unless configured (or asked for with `--nearest`).
 - **Packaging.** Release artifacts (`.deb` for amd64/arm64, x86_64 Flatpak, Windows x64 exe, wheel and sdist)
   are built by `.github/workflows/release.yml`. Only a pushed `vX.Y.Z` tag matching `rnfs/__init__.py`'s
   `__version__` publishes them, once the whole of `tests.yml` (which release.yml calls) has passed, with
   `SHA256SUMS` and signed build provenance (`gh attestation verify`), never replacing files already attached;
   a manual run only builds, as do the runs for a pull request touching `packaging/**`, `pyproject.toml` or
   `.github/**` and the weekly scheduled run. The Windows exe isn't code-signed, and unpacks itself on each start.
-  - `lxmf>=1.2.0,<1.3` is a regular dependency next to `rns>=1.5.6,<1.6` (`pyproject.toml`), so every
-    install includes LXMF; the PyInstaller spec fails the build without it. The upper bounds keep unpinned
-    installs off RNS and LXMF releases rnfs hasn't been tested with, since it relies on some of their internals.
-  - `packaging/requirements.lock` pins the tested versions (rns 1.5.6, lxmf 1.2.0, cryptography 50.0.2,
+  - `rns>=1.5.6,<1.6` is the one dependency (`pyproject.toml`; LXMF was one too until 0.2.0 moved it out of rnfs).
+    The upper bound keeps unpinned installs off RNS releases rnfs hasn't been tested with, since it relies on
+    some of its internals.
+  - `packaging/requirements.lock` pins the tested versions (rns 1.5.6, cryptography 50.0.2,
     cffi 2.1.1, pycparser 3.0, pyserial 3.5) with the sha256 of every file PyPI has for each.
     `python3 -I packaging/update-lock.py [pkg==ver …]` regenerates it (no arguments: the newest versions
     `pyproject.toml` allows), then `packaging/flatpak/generate-sources.py` regenerates the Flatpak's

@@ -9,10 +9,11 @@ providing, provider records on disk within a byte budget, storage tiers against 
 identities are generated next to its key (the density check, disjoint lookup paths, the announce first-seen
 log); LoRa islands (fast nodes sparing them, two-level records, partition mode); and new features (per-app API
 tokens, encrypted folders, NomadNet add, gateway sites, name sync, name key backups, remote pin status, network
-status, files inside folders provided by their own CIDs). No wire-format or CID changes: these nodes, 0.1.6,
-0.1.5, 0.1.4 and 0.1.3 nodes work together (`tests/interop.py` against 0.1.6 passes). The local API stays
-compatible: every route, field and status of 0.1.6 is unchanged, error bodies gain a field, and LXMF's routes
-gain a `Deprecation` header. The upgrade of an `<rnfs dir>` is automatic and one-way.
+status, files inside folders provided by their own CIDs). LXMF messaging moved out of rnfs into an app of its own
+(Removed, below). No wire-format or CID changes: these nodes, 0.1.6, 0.1.5, 0.1.4 and 0.1.3 nodes work together
+(`tests/interop.py` against 0.1.6 passes). The local API stays compatible but for LXMF: every route, field and
+status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a field. The upgrade of an
+`<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
@@ -20,10 +21,12 @@ Upgrade notes:
   `name_syncs`, `name_sync_files`, `published_heal`); an older rnfs can't open it afterwards. Pins made before the
   upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
-- **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
-  `app:lxmf:<address>` (`pin ls` shows the new one), the source the LXMF wrapper app will own once LXMF leaves
-  core; the LXMF built into rnfs uses it from now on, so nothing is released by the change. An older
-  `pins.json` imported at the upgrade gets the same rewrite.
+- **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
+  source from `lxmf:<address>` to `app:lxmf:<address>` (`pin ls` shows the new one), an app called `lxmf`'s, so
+  they stay pinned for an LXMF app to take over; nothing is released by the change, and an older `pins.json`
+  imported at the upgrade gets the same rewrite. `storage/lxmf_identity`, `lxmf/` and the inbox and outbox in
+  `rnfs.db` are kept, untouched. `lxmf_*` settings in `rnfs.toml` are ignored with a warning. If you rely on
+  `rnfs send` and `rnfs inbox`, don't upgrade before an LXMF app is there: the upgrade can't be undone.
 - **Provider records:** the upgrade gives each publisher of the records a node stores a standing
   (`provider_standing`, and indexes on `provider_records`): Earned if it was first seen at least 3 days before its
   latest store and refreshed a record outside the newcomer pool a day or more after storing it, else Newcomer. The
@@ -58,33 +61,38 @@ Security:
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
 
-Deprecated:
-- **LXMF** (`send`, `inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `/api/lxmf/` routes, the library's `lxmf`
-  methods, the `lxmf_*` settings and the `inbox` events) still works exactly as in 0.1.6, but is moving out of rnfs
-  into a separate app built on the local API and the library, and a later release removes it from rnfs. Nothing
-  else changes: the network sees the same messages, `rnfs:` URIs and the LXMF link-map field stay rnfs's
-  (specification section 13) for that app and other clients, and the pins of auto-fetched links already became
-  `app:lxmf:<address>` (upgrade notes above), the source the app will own. Use instead: that app once it is
-  released; until then, rnfs's LXMF as before. Nodes that don't use LXMF can turn it off now with
-  `lxmf_enabled = false`.
-- The `/api/lxmf/` routes' responses, errors included, carry `Deprecation: @1792368000` (RFC 9745: deprecated since
-  2026-10-19); their bodies are unchanged. `GET /api/capabilities` gains `"deprecated": ["lxmf"]`
-  (`Capabilities.deprecated`, `is_deprecated("lxmf")`).
-- The settings schema (`GET /api/config`, `rnfs.config.settings_schema()`, `Setting.deprecated`) gains
-  `deprecated`: for each `lxmf_*` setting why it is going away, `null` for the others; `rnfs config get` shows it.
-  `GET /api/config` warns about the `lxmf_*` settings `rnfs.toml` sets, and `POST /api/config/set` (`rnfs config
-  set`, printed on stderr) about those a change sets; removing one isn't warned about.
-- A node running LXMF (on by default where the LXMF package is installed: every package includes it) logs at start
-  that it is deprecated, as a notice, saying `lxmf_enabled = false` turns it off; given `lxmf_*` settings (in
-  `rnfs.toml`, on the command line or as an `rnfs.Node`'s settings), it names them, as a warning while LXMF runs.
-  A node that neither runs it nor was given such a setting, an `rnfs.Node` by default, says nothing.
-- `rnfs send`, `inbox`, `inbox get`, `inbox rm`, `outbox`, `lxmf address` and `lxmf sync` print, each time they run,
-  one line on stderr saying they are deprecated and why; their stdout and exit status are unchanged, and
-  `RNFS_NO_DEPRECATION_WARNINGS=1` (anything but empty or `0`) silences the line. `rnfs --help` marks them
-  `(deprecated)`, and each one's `--help` says why.
-- `rnfs.Node` and `rnfs.Client`: each `lxmf` method (`address`, `send`, `inbox`, `get`, `remove`, `remove_all`,
-  `outbox`, `sync`) warns `DeprecationWarning` at the calling line, then works as before; Python's filters decide
-  when it shows (by default for code run as `__main__`). The `inbox` events are unchanged.
+Removed:
+- **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
+  out of core"): rnfs is the core (content, the DHT, names, pinning, the local API, the library), and messaging is
+  a companion app's. Gone: the commands `rnfs send`, `inbox` (`inbox get`, `inbox rm`), `outbox`, `lxmf address` and
+  `lxmf sync`; the routes `GET /api/lxmf/address`, `POST /api/lxmf/send`, `GET /api/lxmf/inbox`,
+  `POST /api/lxmf/inbox/get`, `/api/lxmf/inbox/rm`, `GET /api/lxmf/outbox` and `POST /api/lxmf/sync` (now 404
+  `no_such_endpoint`); `lxmf` among `GET /api/capabilities`' features; the `lxmf_address`, `lxmf_inbox` and
+  `untrusted_dropped` fields of `GET /api/status` and `rnfs status`; the `lxmf` dependency, from `pyproject.toml`,
+  the lock and every package (the `.deb`, the Flatpak, the Windows exe, the install script). This is a deliberate
+  break of the local API for LXMF only: every other route, field and status of 0.1.6 is unchanged. The
+  library's `lxmf` methods, their objects and the `inbox` events, added during 0.2.0's development, never shipped,
+  nor did the deprecation path first planned for this release (warnings, a `Deprecation` header).
+- **What stays:** nothing on the network changes, and `rnfs:` URIs and the LXMF link map (the field an LXMF message
+  carries rnfs links in) stay part of the specification (section 13) as the contract an LXMF app and other clients
+  use; `rnfs.Node` and `rnfs.Client` still take an `rnfs:` URI as a target (`rnfs/uris.py`). Contacts of kind
+  `lxmf` stay in the address book, for an app to read which senders are trusted. On disk, nothing is deleted:
+  `storage/lxmf_identity` and `lxmf/` are left as they are (rnfs no longer creates or checks `lxmf/`), so an LXMF
+  app can adopt them and keep the node's LXMF address; the inbox and outbox stay in `rnfs.db`'s `lxmf_messages`
+  table (0.1.4's `lxmf_inbox.json` and `lxmf_outbox.json` are still imported into it), which nothing reads,
+  changes or deletes, for the app to import.
+- **Pins of links fetched automatically over LXMF** stay pinned, as `app:lxmf:<address>` (upgrade notes, above):
+  an app called `lxmf` holds them, and nothing else releases them. An LXMF app registered under that name
+  (`rnfs app add lxmf`) takes them over; to release them without one, run `rnfs app add lxmf` then
+  `rnfs app rm lxmf`.
+- **Retired settings:** `lxmf_enabled`, `lxmf_display_name`, `lxmf_propagation_node`, `lxmf_send_from_hint`,
+  `lxmf_sync_interval`, `lxmf_accept_from`, `lxmf_auto_fetch_from` and `lxmf_auto_fetch_quota`. One left in
+  `rnfs.toml` (or given to `rnfs.Node`) is ignored with a warning, as `max_records` is, instead of stopping the
+  daemon; `rnfs config set` refuses one as unknown, and `rnfs config unset` removes it.
+- **If you used `rnfs send` or `rnfs inbox`:** use an LXMF app built on rnfs once one is released. Meanwhile an
+  `rnfs:` link can go through any LXMF client (Sideband, NomadNet, MeshChat) as text, and the recipient fetches
+  `rnfs:<cid>/<path>?from=<node>` with `rnfs get <cid>/<path> --from <node>`. If you rely on rnfs's own inbox
+  and auto-fetch, stay on 0.1.6 until then: an `<rnfs dir>` 0.2.0 has upgraded can't go back to it.
 
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
@@ -97,8 +105,8 @@ Added, for apps:
   can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
   `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
   `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
-  `forbidden`); capability `apps`. `rnfs app add lxmf` is refused while rnfs's own LXMF is on, and while an app
-  called `lxmf` exists rnfs's own LXMF stays off (an LXMF wrapper app owns its pins and identity).
+  `forbidden`); capability `apps`. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF left
+  (Removed, below).
 - **An app's pins:** what an app adds, pins, imports or makes with `dir set`/`dir rm` (and its pin, add and import
   jobs) is pinned with the source `app:<name>`, or `app:<name>:<key>` with `X-Rnfs-Pin-Key: <key>`
   (`client.pin_key(key)`), shown by `pin ls`. Its `pin rm` releases only its own source; the CLI's still
@@ -120,15 +128,14 @@ Added, for apps:
 - **No API stability until 1.0.0:** the library (`rnfs.Node`, `rnfs.Client`) and the local API stay provisional
   (`rnfs.API_STATUS`), and may change in 0.2.x releases; `GET /api/capabilities` says what a daemon offers.
 - **An OpenAPI reference for the local API:** `docs/openapi.json` (OpenAPI 3.1) describes every route, its
-  parameters and bodies (streamed ones too), its answers, the error codes, the token headers, the `Deprecation`
-  header and the event kinds, for apps in any language; tests check it against the code (routes, codes, kinds,
+  parameters and bodies (streamed ones too), its answers, the error codes, the token headers and the event
+  kinds, for apps in any language; tests check it against the code (routes, codes, kinds,
   capabilities, and the fields that live answers carry). It is in the sdist too.
 - **Capabilities:** `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
   capabilities (`events`, `pin_details`, `cache`, `config`, `jobs_add`, `add_tar`, ...).
 - **Events:** `GET /api/events?after=&kinds=&epoch=&wait=`, a long poll on the node's events (`rnfs/events.py`),
   replacing an app's polling of each list: `job` (every state change, and a running job's progress at most once
-  a second), `pin` (added, removed, labelled), `cache` (added, removed), `inbox` (messages received, removed and
-  auto-fetched; outbox messages queued and their delivery state), `name` (a newer record of a name the node holds
+  a second), `pin` (added, removed, labelled), `cache` (added, removed), `name` (a newer record of a name the node holds
   or watches) and `peer` (a peer first heard, coming online, going offline). Events are numbered within a run;
   the last 1024 are kept, and a client that falls behind, or asks of an earlier run (`epoch`), is told `lost`
   and reloads. At most 8 polls wait at once.
@@ -146,10 +153,9 @@ Added, for apps:
   (validated as a start would, nothing written otherwise; `null` removes a setting), keeping its comments and
   other lines, and applies at once what can be. `rnfs config [list|get|set|unset]`. `rnfs.config.settings_schema()`
   needs no daemon. Settings that now apply without a restart: `max_storage` (enforced at once),
-  `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`, `follow_quota`,
-  `lxmf_auto_fetch_quota`, `max_jobs` (queued jobs start if the new limit allows), `max_finished_jobs`,
-  `serve_interfaces`, `no_serve_interfaces`, `quiet_hours`, `keep_max_names`, `keeper_query`,
-  `lxmf_accept_from`, `lxmf_auto_fetch_from`, `lxmf_send_from_hint` and `scan_interval`.
+  `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`, `follow_quota`, `max_jobs`
+  (queued jobs start if the new limit allows), `max_finished_jobs`, `serve_interfaces`, `no_serve_interfaces`,
+  `quiet_hours`, `keep_max_names`, `keeper_query` and `scan_interval`.
 - **Add and import as jobs:** `POST /api/jobs` takes `kind` `add` (`path` and `POST /api/add`'s options) and
   `import` (`path`), with progress (`total_bytes` to read, `done_bytes` read, `rate`, `eta`), cancellation at
   the next read, and the result `POST /api/add` / `/api/import` would give; persisted, and run again from the
@@ -169,10 +175,9 @@ Added, for apps:
   wall-clock step changes nothing.
   `rnfs peers` gains RTT and ONLINE columns.
 - **rnfs.Client and rnfs.Node:** typed methods for what was only reachable through `Client.api`: `peers()`,
-  `stats()`, `contacts.*`, `names.keep/unkeep/kept`, `names.follow/unfollow/following` and `lxmf.*` (address,
-  send, inbox, get, remove, outbox, sync), with objects (`Peer`, `Stats`, `Contact`, `Kept`, `Followed`,
-  `Message`, ...); `jobs.add` and `jobs.import_archive`; and the additions above (events, capabilities, pin
-  labels, the cache, settings, streams). A Node raises what a Client gets back.
+  `stats()`, `contacts.*`, `names.keep/unkeep/kept` and `names.follow/unfollow/following`, with objects (`Peer`,
+  `Stats`, `Contact`, `Kept`, `Followed`); `jobs.add` and `jobs.import_archive`; and the additions above (events,
+  capabilities, pin labels, the cache, settings, streams). A Node raises what a Client gets back.
 - **Starting:** while a daemon opens its block store, before its API listens, `rnfs status` and the other commands
   say it is starting, naming its process, rather than that no daemon is running; the library raises
   `DaemonStarting` (`.pid`), a `DaemonNotRunning`, so code catching that is unchanged. Told by the rnfs dir's

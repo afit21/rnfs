@@ -122,7 +122,7 @@ links that can change, sharing in the background), and [Commands](#commands) lis
 
 # Install
 
-rnfs runs on Linux, macOS and Windows. Every package includes Reticulum and LXMF and gives you one `rnfs`
+rnfs runs on Linux, macOS and Windows. Every package includes Reticulum and gives you one `rnfs`
 command. Your data in `~/.rnfs` is never touched by an update or uninstall.
 
 | System | Download |
@@ -138,7 +138,7 @@ These links are for 0.1.6; for a newer version, take the same files from the
 
 ## Windows
 
-The exe is a single file with Python, Reticulum and LXMF inside. In PowerShell, from your download folder:
+The exe is a single file with Python and Reticulum inside. In PowerShell, from your download folder:
 
 ```powershell
 $bin = "$env:USERPROFILE\.local\bin"
@@ -205,7 +205,7 @@ rnfs daemon
     https://raw.githubusercontent.com/afit21/rnfs/main/contrib/io.github.afit21.rnfs.plist
   launchctl load -w ~/Library/LaunchAgents/io.github.afit21.rnfs.plist
   ```
-- pipx (and plain `pip install`) resolves rnfs's dependencies unpinned, at the newest Reticulum, LXMF and
+- pipx (and plain `pip install`) resolves rnfs's dependencies unpinned, at the newest Reticulum and
   cryptography rnfs allows, not at the tested versions and hashes in `packaging/requirements.lock` that the
   other packages and the install script use.
 
@@ -252,7 +252,7 @@ release workflow. On Windows, `Get-FileHash .\rnfs-0.1.6-windows-x64.exe` gives 
 
 ```sh
 git clone https://github.com/afit21/rnfs && cd rnfs
-pip install --require-hashes -r packaging/requirements.lock   # the tested Reticulum and LXMF (optional)
+pip install --require-hashes -r packaging/requirements.lock   # the tested Reticulum (optional)
 pip install -e .
 rnfs daemon
 python3 -m unittest discover tests                             # the tests
@@ -275,9 +275,9 @@ Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`), which on
 | Path | Contents |
 |---|---|
 | `rnfs.toml` | your [settings](#settings) |
-| `storage/identity`, `storage/lxmf_identity` | the node's identity (your node ID comes from it) and your LXMF identity |
+| `storage/identity` | the node's identity (your node ID comes from it); `storage/lxmf_identity` and `lxmf/`, if there, are what rnfs's own LXMF left before 0.2.0 ([LXMF moved out](#lxmf-moved-out)) |
 | `blocks/` | stored blocks, one file per block in 1,024 subdirectories (`blocks/<xy>/<cid>`) |
-| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists, the stored blocks' sizes (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
+| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, deny lists, the stored blocks' sizes (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
 | `names/` | name keys: back them up with `rnfs name export` |
 | `files/` | the shared folder: anything put here is added, pinned and shared |
 | `api_token`, `daemon.lock` | the running daemon's API token and lock |
@@ -397,10 +397,10 @@ IP networks. It is **not** compatible with IPFS. The full comparison is in
 | Kademlia DHT | For provider records only, `K` = 10, server and client modes, Sybil resistance from seniority |
 | Bitswap | Multi-source, resumable, verified `/blocks` requests over Reticulum, sized to each link's measured rate |
 | IPNS | Signed records in Reticulum announces, re-served by **keepers** so a name outlives its owner's announces |
-| Pinning, remote pinning, GC | The same, with pin sources (user, folder, name, remote, follow, LXMF) |
+| Pinning, remote pinning, GC | The same, with pin sources (user, folder, name, remote, follow, apps) |
 | CAR files, HTTP gateway | `export` / `import` archives; a local gateway with sandboxed pages and trustless `?format=raw` / `archive` |
 | MFS | `dir set` / `dir rm` make edited copies; a name is the mutable root |
-| Pubsub, DNSLink | Dropped (floods are unaffordable on radio; Reticulum has no DNS). Use `name follow` and LXMF links |
+| Pubsub, DNSLink | Dropped (floods are unaffordable on radio; Reticulum has no DNS). Use `name follow` and `rnfs:` links |
 | Private networks | Reticulum interface access codes, plus rnfs private mode (members only) |
 
 # Settings
@@ -418,7 +418,6 @@ provide_strategy = "pinned"       # don't share your downloads
 upload_budget = 5_000_000         # upload at most ~5 MB per hour
 no_serve_interfaces = ["RNode"]   # don't upload over the LoRa radio
 quiet_hours = "22:00-06:00"
-lxmf_accept_from = ["<a friend's LXMF address>"]
 ```
 
 | Setting | Default | What it does |
@@ -442,10 +441,6 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
 | `keep_max_names` | `100` | Names you keep or follow for others |
 | `follow_quota` | 1 GiB | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned (up to twice this while it changes). `0` stops fetching followed names |
-| `lxmf_accept_from` | everyone | Only keep LXMF messages from these addresses (recommended if you only expect links from people you know). Every `lxmf_*` setting is deprecated: [LXMF is moving to its own app](#lxmf-is-moving-out) |
-| `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota` | `[]`, 1 GiB | Senders whose links are fetched and pinned automatically, and the storage each may use |
-| `lxmf_propagation_node` | none | Propagation node for offline delivery (`send --propagate`) and periodic downloads |
-| `lxmf_send_from_hint` | `true` | Links you send carry your node ID, so recipients can fetch from you; this links your LXMF address to your node |
 | `api_port`, `gateway_port` | `8788`, `8789` | Local API and gateway ports (127.0.0.1 only) |
 | `gateway_scripts` | `true` | Let gateway pages run scripts |
 | `debug_log` | `false` | Write `~/.rnfs/debug.log` (readable by you only) for diagnosing problems (`daemon --debug-log`) |
@@ -456,27 +451,26 @@ with (`*` set in `rnfs.toml`, `!` changed there but waiting for a restart, `^` s
 which wins); `rnfs config get <name>` describes one. `rnfs config set <name> <value>` (a TOML value: `true`,
 `10`, `"text"`, `["a", "b"]`; a bare word is text) and `rnfs config unset <name>` edit `rnfs.toml` in place,
 keeping your comments, after checking the whole file as a start would. Some apply at once: `max_storage` (enforced
-then), `max_download_size`, `max_jobs`, `quiet_hours`, the serve interfaces, the quotas, the LXMF sender lists
-and a few more (`config get` says which); the rest at the next start. Apps do
-the same through `GET /api/config` and `POST /api/config/set`, which carry each setting's type, range, unit,
-default and description.
+then), `max_download_size`, `max_jobs`, `quiet_hours`, the serve interfaces, the quotas and a few more (`config get`
+says which); the rest at the next start. Apps do the same through `GET /api/config` and `POST /api/config/set`, which
+carry each setting's type, range, unit, default and description.
 
 <a id="privacy"></a>**Private mode.** `private = true` with a `members` list (identity hashes, from each
 node's `rnfs status`) makes the node link to, serve and keep records for members only. A name's announce still
 reaches everyone, so outsiders can see which CID it points at and when it changes (not fetch it), and
 `rnfs name publish` warns of this in private mode.
 
-LXMF senders you've named (in `lxmf_accept_from`, `lxmf_auto_fetch_from`, or as an LXMF contact) are trusted.
-Anyone can make new LXMF addresses for free, so messages from everyone else only push out each other's, within
-fixed limits; set `lxmf_accept_from` if strangers' messages aren't wanted.
-
-<a id="lxmf-is-moving-out"></a>**LXMF is moving out of rnfs.** Sending and receiving links over LXMF (`send`,
-`inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `lxmf_*` settings, the `/api/lxmf/` routes and the library's
-`lxmf` methods) is deprecated since 0.2.0: it moves to a separate app built on rnfs's local API and library, and a
-later release removes it from rnfs. It works as before until then, and says so each time: the commands print a
-warning on stderr (`RNFS_NO_DEPRECATION_WARNINGS=1` hides it; stdout is unchanged), and the daemon logs it at
-start. `rnfs:` links stay part of rnfs, and the pins of links fetched automatically already belong to the app
-(`app:lxmf:<address>`). Don't use LXMF? `lxmf_enabled = false` turns it off now.
+<a id="lxmf-moved-out"></a>**LXMF moved out of rnfs.** Until 0.2.0 rnfs could send and receive links over LXMF
+itself (`rnfs send`, `inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `lxmf_*` settings and the
+`/api/lxmf/` routes). That is now a separate app built on rnfs's local API and library, and
+rnfs 0.2.0 no longer has any of it; `rnfs:` links stay rnfs's (`rnfs.Node` and `rnfs.Client` take one as a
+target). An upgrade keeps what your node's LXMF had: its identity (`storage/lxmf_identity`) and state
+(`lxmf/`) are left untouched, so an LXMF app can adopt them and keep your LXMF address; your inbox and outbox stay
+in `state/rnfs.db` for it to import; your LXMF contacts stay in `rnfs contacts`; and `lxmf_*` settings left in
+`rnfs.toml` are ignored with a warning (remove them with `rnfs config unset`). Files fetched automatically from
+LXMF senders stay pinned, as the pins of an app called `lxmf` (`app:lxmf:<address>` in `rnfs pin ls`): an LXMF app
+registered under that name takes them over, and if you don't want them, `rnfs app add lxmf` then
+`rnfs app rm lxmf` releases them.
 
 # Commands
 
@@ -487,7 +481,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | Command | Description |
 |---|---|
 | `rnfs daemon` | Run a node with its API and gateway (`--bootstrap`, `--rnsconfig`, `--private`, `--debug-log`, `-v`…) |
-| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address, and what it sees of the network (estimated size, density-check alarms, partition mode, provider records against `record_budget` by tier, refusals and evictions) / known nodes, their round-trip time and whether each is online / traffic |
+| `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, and what it sees of the network (estimated size, density-check alarms, partition mode, provider records against `record_budget` by tier, refusals and evictions) / known nodes, their round-trip time and whether each is online / traffic |
 | `rnfs ping NODE_ID` / `providers CID` | Round-trip time to a node / nodes providing a CID |
 | `rnfs add PATH\|-` | Add a file, directory or stdin, pin it and print its CID (options below) |
 | `rnfs add DEST:/page/PATH` / `add DEST:/file/PATH` | Add a snapshot of a NomadNet page or file (`DEST` is the NomadNet node's 32-hex address), pin it and print its CID |
@@ -508,10 +502,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs name keep\|unkeep\|kept NAME` | Store and serve someone's name record, so it resolves while they're offline |
 | `rnfs name follow\|unfollow\|following NAME` | Keep the latest version a name points at pinned |
 | `rnfs name sync ALIAS FOLDER` / `name unsync ALIAS` / `name syncs` | Keep your name pointing at a folder's current content: published when it changes, once unchanged a minute, at most once an hour / stop (the name keeps its target) / list the syncs and how they stand |
-| `rnfs contacts add NICK HEX` / `rm` / `ls` | Nicknames for names, node IDs and LXMF addresses |
-| `rnfs lxmf address` / `lxmf sync` | (deprecated: [moving to its own app](#lxmf-is-moving-out)) Your LXMF address / download waiting messages now |
-| `rnfs send ADDRESS TARGET [-m TEXT] [--propagate]` | (deprecated) Send an `rnfs:` link over LXMF |
-| `rnfs inbox` / `inbox get N` / `inbox rm N` / `outbox` | (deprecated) Received links (each line starts with the sender's address and whether it is `untrusted`, `trusted` or a contact; the display name the sender chose comes last, quoted), fetching them (a name link whose name can't be resolved needs `--use-sent-cid`), sent messages |
+| `rnfs contacts add NICK HEX` / `rm` / `ls` | Nicknames for names, node IDs and LXMF addresses (an LXMF app reads them) |
 
 `add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
@@ -564,17 +555,14 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
     node.jobs.get(f"rnfs:name/{site.hex}", "/tmp/copy").wait()
 ```
 
-- An embedded node is a DHT client with LXMF off unless you pass `settings={"dht_mode": "server", ...}`. It
+- An embedded node is a DHT client unless you pass `settings={"dht_mode": "server", ...}`. It
   never stops your Reticulum. Never point it at the daemon's `~/.rnfs/`: a directory is used by one node at a
   time.
 - Callbacks run on one event thread; keep them short.
 - Beyond content, pins, names and jobs: `peers()` and `stats()`, the address book (`contacts.add/get/list/remove`),
-  keeping and following names (`names.keep/unkeep/kept`, `names.follow/unfollow/following`), and LXMF
-  (`lxmf.address/send/inbox/get/remove/remove_all/outbox/sync`; off in an embedded node unless
-  `settings={"lxmf_enabled": True}`; deprecated: each warns `DeprecationWarning`, as
-  [LXMF is moving to its own app](#lxmf-is-moving-out)).
-- To follow what changes instead of polling lists: `events.watch(callback, kinds=...)` (jobs, pins, the cache, the
-  inbox, names, peers; an event with `event.lost` means "read everything again"), or `events.since(...)`. Also
+  and keeping and following names (`names.keep/unkeep/kept`, `names.follow/unfollow/following`).
+- To follow what changes instead of polling lists: `events.watch(callback, kinds=...)` (jobs, pins, the cache, names,
+  peers, remote pins; an event with `event.lost` means "read everything again"), or `events.since(...)`. Also
   `capabilities()`, pin labels (`label_pin`), the cache (`cache()`, `uncache(cid)`), settings (`config()`,
   `config_set({...})`), tars and archives as streams (`add_tar`, `get_tar`, `export_stream`, `import_stream`), and
   for a `Client` `shutdown()` and `daemon_info()`.
@@ -618,10 +606,9 @@ cheaply.
 with `dir set` and `name publish`. Library nodes `rnfs name follow` it, so each always holds the latest
 edition, and readers `rnfs get library/maps/region.pdf`.
 
-**Sharing with a friend over LXMF.** `rnfs send <their LXMF address> <cid>/report.pdf -m "as promised"`.
-Sideband, NomadNet and MeshChat show the link as text; their rnfs node lists it in `rnfs inbox` and fetches it
-with `rnfs inbox get 1`, asking your node first. Add friends to `lxmf_auto_fetch_from` to fetch their links
-automatically. (Deprecated: [LXMF is moving to its own app](#lxmf-is-moving-out).)
+**Sharing with a friend.** Send them `rnfs:<cid>/report.pdf?from=<your node ID>` any way you like (Sideband,
+NomadNet and MeshChat show it as text, and an LXMF app built on rnfs sends and fetches such links for you); they
+fetch it with `rnfs get <cid>/report.pdf --from <your node ID>`, asking your node first.
 
 <a id="private-group"></a>**Private group.** `rnfs add minutes.pdf --to <alice's node ID> bob --to-self` seals
 a file so only those people can read it, while any node can carry it. For a fully closed group, run every
@@ -666,6 +653,3 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 - Under the default `provide_strategy = "roots"`, anyone can learn what your node downloaded. With
   `provide_entries` (on by default), anyone can learn which files your pinned folders hold by looking up each
   file's CID, without knowing the folder.
-- LXMF messages over 256 kB are refused, unsent messages are lost if the daemon restarts, and offline delivery
-  needs `lxmf_propagation_node`. A message rnfs can't keep (a stranger's during a flood) is lost, though the
-  sender's app shows it as delivered.
