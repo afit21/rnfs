@@ -87,7 +87,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | NET-3 | `test_net3_outgoing_requests.py`, `test_l1_response_precheck.py` | `rnfs/network/guards.py` (`guarded_receive`) | `81afb98` |
 | NET-4 | `test_net4_dripping_provider.py`; also `tests/test_fetcher.py` (`ReadAheadLinkTest`) | `rnfs/fetcher.py` (end-game duplication of a batch in flight past `deadline_slack`), `rnfs/network/client.py` and `rnfs/network/links.py` (`close_unless_used`) | `afa3820`, `ac9ed4f` |
 | NET-5 | `test_net5_proof_wait.py` | `rnfs/network/server.py` (`RequestServer._proof_wait`) | `db27b8b` |
-| none (NomadNet links) | `test_nomadnet_link_bounds.py`; also `tests/test_nomadnet.py` | `rnfs/network/nomadnet.py` (`Transfer`, `segment_refusal`), `rnfs/network/guards.py` (`mark_nomadnet`, the page check), `rnfs/network/protocol.py` (`page_response_refusal`, `metadata_refusal`) | `4e9c97b` (built with NomadNet add, 0.2.0) |
+| none (NomadNet links) | `test_nomadnet_link_bounds.py`; also `tests/test_nomadnet.py`, `tests/test_nomadnet_e2e.py` (`RNFS_E2E`) | `rnfs/network/nomadnet.py` (`Transfer`, `segment_refusal`), `rnfs/network/guards.py` (`mark_nomadnet`, the page check), `rnfs/network/protocol.py` (`page_response_refusal`, `metadata_refusal`) | `4e9c97b`, `2b2beb4` (built with NomadNet add, 0.2.0) |
 | none (RNS internals) | `test_rns_compat_security.py` | the RNS attributes `rnfs/network/server.py` and `rnfs/network/guards.py` rely on (H1, M1, L1, L17) | `dbd1144`, `09c6324`, `73041a7`, `42aadca`, `90a2952` (test) |
 
 ## Local API, client and gateway
