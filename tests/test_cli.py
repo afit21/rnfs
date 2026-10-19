@@ -301,6 +301,23 @@ class OtherCommandTest(CliTestCase):
                          [(bytes.fromhex("ab" * 16), cid, True), (bytes.fromhex("ab" * 16), cid, False)])
         self.assertEqual(self.run_cli("pin", "remote", "add", "ff" * 16, cid)[0], 1)
 
+    def test_remote_pin_status(self):
+        """pin remote ls lists the pins asked for (filtered, --check passed on, --json), --served those served and
+        each identity's usage."""
+        cid = self.node.put_file(b"abc")
+        out = self.ok("pin", "remote", "ls")
+        self.assertRegex(out, rf"^{'ab' * 16}  bafkreie  waiting  asked \d+d ago\n$")
+        out = self.ok("pin", "remote", "ls", "ab" * 16, cid, "--check")
+        self.assertRegex(out, rf"^{'ab' * 16}  {cid}  done  asked \d+d ago, checked \d+d ago\n$")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(json.loads(self.ok("pin", "remote", "ls", "--json"))[0]["state"], "waiting")
+        out = self.ok("pin", "remote", "ls", "--served").splitlines()
+        self.assertEqual(out[0], f"{'cd' * 16}: 5 B of 100 B used, 1 pinned, 0 waiting")
+        self.assertRegex(out[1], rf"^{'cd' * 16}  bafkreie  dropped \(quota\)  \d+d ago: too big$")
+        self.assertEqual(json.loads(self.ok("pin", "remote", "ls", "--served", "--json"))["quota"], 100)
+        self.assertEqual(self.run_cli("pin", "remote", "ls", "--served", "--check")[0], 1)
+
     def test_maintenance_and_network(self):
         cid = self.node.put_file(b"abc")
         self.assertEqual(self.ok("gc"), "removed 3 blocks, freed 300 bytes\n")

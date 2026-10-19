@@ -28,6 +28,8 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | POST | /api/pin/add | JSON `target` | `pin_add(target)` |
 | POST | /api/pin/rm | JSON `cid` | `{}` after `pin_rm(cid)` |
 | POST | /api/pin/remote | JSON `node`, `cid`, `pin` | `{"accepted": bool}` |
+| GET  | /api/pin/remote | `node`, `cid` (both optional), `check` | `{"pins": pin_remote_ls(...)}`: the remote pins this node asked for, most recently asked first (`node`, `cid`, `pin`, `accepted`, `asked`, `state`, `done`, `checked`, `seen`); `check=1` checks them first (provider lookups, paced) |
+| GET  | /api/pin/remote/served | | `pin_remote_served()`: `{"pins": [{"identity", "cid", "state", "reason", "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | POST | /api/pin/label | JSON `cid`, `label` (null or "" clears it) | `pin_label(cid, label)`: the pin's `pin_ls` entry |
 | GET  | /api/cache/ls | | `{"cache": cache_ls()}`: the cached fetches, most recently used first |
 | POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes"}` |
@@ -156,7 +158,7 @@ MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream", "sealed_folders")
+                "import_stream", "sealed_folders", "remote_pin_status")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -706,6 +708,8 @@ class ApiHandler(TimedHandler):
         ("POST", "/api/pin/add"): "api_pin_add",
         ("POST", "/api/pin/rm"): "api_pin_rm",
         ("POST", "/api/pin/remote"): "api_pin_remote",
+        ("GET", "/api/pin/remote"): "api_pin_remote_ls",
+        ("GET", "/api/pin/remote/served"): "api_pin_remote_served",
         ("POST", "/api/gc"): "api_gc",
         ("POST", "/api/verify"): "api_verify",
         ("POST", "/api/name/create"): "api_name_create",
@@ -1175,6 +1179,18 @@ class ApiHandler(TimedHandler):
             raise ValueError("pin must be true or false")
         accepted = self.node.pin_remote(parse_hex_id(body.get("node")), parse_cid(body.get("cid")), body["pin"])
         self.send_json(200, {"accepted": bool(accepted)})
+
+    def api_pin_remote_ls(self):
+        """GET /api/pin/remote[?node=&cid=&check=1]: the remote pins this node asked for, and whether each is done;
+        check=1 checks them first (lookups, which change no pin)."""
+        node, cid = self.param("node", False), self.param("cid", False)
+        pins = self.node.pin_remote_ls(parse_hex_id(node) if node else None, parse_cid(cid) if cid else None,
+                                       check=parse_bool(self.param("check", False) or ""))
+        self.send_json(200, {"pins": pins})
+
+    def api_pin_remote_served(self):
+        """GET /api/pin/remote/served: the remote pins other identities asked of this node, and their quota use."""
+        self.send_json(200, self.node.pin_remote_served())
 
     def api_gc(self):
         """POST /api/gc: evict every cached fetch."""

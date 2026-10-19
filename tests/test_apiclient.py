@@ -464,6 +464,21 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.ping("cd" * 16), 0.25)
         self.assertIsNone(self.api.ping("ff" * 16))
 
+    def test_remote_pin_status(self):
+        """pin_remote_ls sends only the parameters given; pin_remote_served; a daemon with only the POST (before
+        0.2.0) answers the GET 405, which is NoSuchEndpoint here."""
+        cid = self.node.put_file(b"abc")
+        self.assertEqual(self.api.pin_remote_ls()[0]["state"], "waiting")
+        self.assertEqual(self.api.pin_remote_ls("ab" * 16, cid, check=True)[0]["state"], "done")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(self.api.pin_remote_served()["usage"][0]["quota"], 100)
+        with mock.patch.dict(ApiHandler.ROUTES):
+            del ApiHandler.ROUTES[("GET", "/api/pin/remote")]
+            with self.assertRaises(apiclient.NoSuchEndpoint) as raised:
+                self.api.pin_remote_ls()
+        self.assertEqual(raised.exception.code, "no_such_endpoint")
+
     def test_name_keys(self):
         """name_export, name_rm and name_import (the key as the body) (ND4)."""
         name = self.api.name_create("site")["name"]

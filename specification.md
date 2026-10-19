@@ -900,7 +900,8 @@ a directory above the folder can be changed by other users, who could replace th
 - `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
-- `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
+- `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link; `rnfs pin remote ls`
+  shows their status (below, and section 11).
 - **Status** (rnfs 0.2.0; local only: `/pin` and every other message are unchanged).
   - A node records each `/pin` it sends: the node, the CID, pin or release, when, and whether the node accepted
     it, one entry per (node, CID), replaced by a later request. An accepted pin is *done* once the node is among
@@ -1315,7 +1316,7 @@ are local conveniences, not part of the protocol.
 | `dir set <cid>[/path] <name> <cid> [--exec]`, `dir rm <cid>/<path>` | Make a new directory with an entry added, replaced or removed, and pin it with source `user` (fetching the complete directory, file contents included) |
 | `pin add <cid>[/path] [--background]`, `pin rm <cid>`, `pin ls [<cid>] [--json]`, `pin label <cid> [<label>]` | Manage pins; `ls` shows their sources, whether each is a sealed file (`sealed`: true, false, or null when its stored blocks can't tell), and a local name: the pin's label if it has one, else where it was added from on this machine (recorded locally, never sent; for a sealed file too), the shared-folder entry, or what a stored directory holds. `--json` also gives each pin's `label`, `origin` (where it was added from, kept apart from the label), `size` (as its root block states it), `entries` (a directory's entry count) and `added` (when first pinned, by any source; null for pins made before rnfs 0.2.0). `label` sets a pin's label (local only, lasting while the CID is pinned); without a label it clears it |
 | `cache ls [--json]`, `cache rm <cid>…` | The cached fetches (downloads not pinned, section 8), most recently used first, with their size, completeness and whether the same content is pinned; `rm` evicts those leading to a CID now, deleting the blocks nothing else needs, as `gc` does for all of them |
-| `pin remote add\|rm <node ID> <cid>` | Remote pinning |
+| `pin remote add\|rm <node ID> <cid>`, `pin remote ls [<node ID>] [<cid>] [--check] [--json]`, `pin remote ls --served [--json]` | Remote pinning; `ls` lists the remote pins this node asked for (rnfs 0.2.0: node, CID, state, when asked and last checked; section 8, Status), `--check` checking them first, and `--served` those other identities asked of it, with each identity's use of `remote_pin_quota` |
 | `gc`, `verify` | Evict all cached fetches; re-check every stored block against its CID |
 | `providers <cid>` | Find nodes providing a CID |
 | `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
@@ -1409,7 +1410,8 @@ gateway can never reach the API.
   both `404`; `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
   capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does, after answering (Windows has no other
   clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
-  node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds and peers — numbered within a run:
+  node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds, peers and remote pins (those it asked
+  for and those it serves, section 8) — numbered within a run:
   answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
   level-triggered like the name watch below, so a client asking again with what it was given loses nothing. A
   node keeps a bounded number of events (rnfs: 1024) and says `lost` when the client asks for some it no longer

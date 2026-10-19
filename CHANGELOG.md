@@ -137,6 +137,12 @@ Added:
   the DHT. A node serving remote pins records what became of each (waiting, fetching, pinned, dropped with why:
   quota, not found, denied, ...; refused because denied or its queue was full; released), which was only logged.
   At most 10 000 asked entries and 1 000 served outcomes are kept. `remote_pin` events report both.
+  `rnfs pin remote ls [NODE_ID] [CID] [--check] [--json]` lists the pins asked for (`--check` looks them up now:
+  one lookup each, at most 32 a call, 4 on a slow node); `rnfs pin remote ls --served [--json]` lists those served
+  and each identity's use of `remote_pin_quota`. `GET /api/pin/remote?node=&cid=&check=1` and
+  `GET /api/pin/remote/served`; `ApiConnection.pin_remote_ls` / `pin_remote_served`; `Node/Client.remote_pins()`
+  and `served_pins()` (`RemotePin`, `ServedPins`, `ServedPin`, `RemotePinUsage`); capability
+  `remote_pin_status`.
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

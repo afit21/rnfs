@@ -864,6 +864,23 @@ class ApiConnection:
         """Ask node (hex) to pin cid for this node, or (pin=False) to release that pin; True if it accepted."""
         return self.post("/api/pin/remote", node=node, cid=cid, pin=pin)["accepted"]
 
+    def pin_remote_ls(self, node: str | None = None, cid: str | None = None, check: bool = False) -> list[dict]:
+        """The remote pins this node asked for (node's, cid's, or every one), most recently asked first: [{"node",
+        "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]; check: check them first (provider
+        lookups, paced). NoSuchEndpoint from a daemon before 0.2.0."""
+        try:
+            return self.get("/api/pin/remote", node=node, cid=cid, check=_flag(check))["pins"]
+        except ApiError as e:
+            if e.status == 405:  # a daemon before 0.2.0 has only POST /api/pin/remote
+                raise NoSuchEndpoint("this daemon doesn't list remote pins (rnfs 0.2.0 does)", 404,
+                                     "no_such_endpoint") from None
+            raise
+
+    def pin_remote_served(self) -> dict:
+        """The remote pins other identities asked of this node: {"pins": [{"identity", "cid", "state", "reason",
+        "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}."""
+        return self.get("/api/pin/remote/served")
+
     # The network
 
     def providers(self, cid: str) -> list[str]:

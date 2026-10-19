@@ -395,7 +395,7 @@ failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `er
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
 `ls`, `stat`, `dir_set`, `dir_rm`, `export`, `import_archive`, `add_tar`, `get_tar`, `export_stream`,
 `import_stream` (uploads bytes or a binary file, chunked when their length is unknown; downloads a `Stream`), `gc`,
-`verify`, `pin_*` (with `pin_remote`),
+`verify`, `pin_*` (with `pin_remote`, `pin_remote_ls`, `pin_remote_served`),
 `providers`, `ping`, `name_*` (with `name_watch`, `name_import`, `name_export`, `name_rm`), `submit_job`, `job`,
 `jobs`, `cancel_job`, `clear_jobs`, `deny*`) cover every core route (`ApiHandler.ROUTES`; checked by
 test_apiclient), so `remote.py` writes no path itself, and send only the parameters given; `ApiError` is an `RnfsError`, and each status's error a subclass of the
@@ -425,7 +425,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `pin_add(target)` | `{"cid"}` once complete |
 | `pin_rm(cid)` | `None`; NotFound if no `user` source |
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
-| `pin_remote(node_id, cid, pin)` | `bool` accepted |
+| `pin_remote(node_id, cid, pin)` | `bool` accepted; recorded (`AskedPins.record`) |
+| `pin_remote_ls(node_id=None, cid=None, check=False)` | `[{"node", "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]`, most recently asked first; `check` runs `AskedPins.check_now` first (Remote pin status, below) |
+| `pin_remote_served()` | `{"pins": [{"identity", "cid", "state", "reason", "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
 | `ping(node_id)` | round-trip seconds, or None |
@@ -464,7 +466,8 @@ handed the store not matching its CID: a bug, not a bad request) as a warning. P
 as a request body.
 
 **Core API routes** (`rnfs/api.py` `ROUTES`): `GET /api/status` (open), `/api/info`, `/api/cat`, `/api/ls`,
-`/api/stat`, `/api/pin/ls`, `/api/providers`, `/api/ping`, `/api/name/list`, `/api/name/resolve`,
+`/api/stat`, `/api/pin/ls`, `/api/pin/remote` (`node`, `cid`, `check`), `/api/pin/remote/served`,
+`/api/providers`, `/api/ping`, `/api/name/list`, `/api/name/resolve`,
 `/api/name/watch` (a long poll for newer records: Public API, API additions);
 `POST /api/add`, `/api/add/stream`, `/api/get`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`,
 `/api/pin/remote`, `/api/gc`, `/api/verify`, `/api/name/create`, `/api/name/rm`, `/api/name/export`,
@@ -776,6 +779,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `unpin(cid)` | `NotFound` (no `user` pin) | `pin_rm` / `POST /api/pin/rm` |
 | `pins(cid=None) -> list[Pin]` | | `pin_ls` / `GET /api/pin/ls` |
 | `pin_remote(node_id, cid, pin=True) -> bool` | | `pin_remote` / `POST /api/pin/remote` |
+| `remote_pins(node_id=None, cid=None, *, check=False) -> list[RemotePin]`, `served_pins() -> ServedPins` (`pins: tuple[ServedPin]`, `usage: tuple[RemotePinUsage]`, `quota`) | `ValueError`; a Client: `NoSuchEndpoint` (an older daemon: its 405 for the GET is turned into it) | `pin_remote_ls`, `pin_remote_served` / `GET /api/pin/remote`, `GET /api/pin/remote/served` |
 | `providers(cid) -> list[bytes]`, `ping(node_id) -> float \| None` | | `providers`, `ping` / `GET /api/providers`, `/api/ping` |
 | `export(target, output) -> Exported`, `import_archive(path) -> Imported` | fetch errors, `ValueError`, `OSError` | `export`, `import_archive` / `POST /api/export`, `/api/import` |
 | `add_tar(source, *, name=None, pin=True, only_hash=False, chunker=None) -> Added` (bytes or a binary file, read up to the tar's end; `Added.warnings_total`) | `ValueError` (a malformed tar, a chunker), `Denied`, `TooLarge`, `StorageFull` | `add_tar` / `POST /api/add/stream?format=tar` |

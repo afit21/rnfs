@@ -319,6 +319,19 @@ class FakeNode:
         self.record("pin_remote", node_id, cid, pin)
         return node_id != b"\xff" * 16
 
+    def pin_remote_ls(self, node_id=None, cid=None, check=False):
+        self.record("pin_remote_ls", node_id, cid, **self._given("pin_remote_ls", check=check))
+        return [{"node": "ab" * 16, "cid": cid or "bafkreie", "pin": True, "accepted": True, "asked": 1000.0,
+                 "state": "done" if check else "waiting", "done": check, "checked": 1000.0 if check else None,
+                 "seen": None}]
+
+    def pin_remote_served(self):
+        self.record("pin_remote_served")
+        return {"pins": [{"identity": "cd" * 16, "cid": "bafkreie", "state": "dropped", "reason": "quota",
+                          "at": 1000.0, "detail": "too big"}],
+                "usage": [{"identity": "cd" * 16, "used": 5, "quota": 100, "pinned": 1, "waiting": 0,
+                           "allowed": True}], "quota": 100}
+
     def pin_label(self, cid, label):
         self.record("pin_label", cid, label)
         if cid not in self.pins:
@@ -1089,6 +1102,32 @@ class AppSupportTest(ApiTestCase):
         self.assertEqual(self.ok("POST", "/api/cache/rm", {"cid": cid})["removed_records"], 1)
         self.assertEqual(self.error("POST", "/api/cache/rm", {"cid": cid}), (404, {"error": mock.ANY,
                                                                                    "code": "not_found"}))
+
+
+class RemotePinStatusTest(ApiTestCase):
+    """GET /api/pin/remote and /api/pin/remote/served (remote pin status): parameters passed on, refusals."""
+
+    def test_asked(self):
+        """The remote pins asked for, filtered by node and CID as given; check=1 is passed on; a GET beside the POST
+        of the same path."""
+        file_cid = self.node.put_file(b"abc")
+        pins = self.ok("GET", "/api/pin/remote")["pins"]
+        self.assertEqual((pins[0]["node"], pins[0]["state"]), ("ab" * 16, "waiting"))
+        self.ok("GET", f"/api/pin/remote?node={'ab' * 16}&cid={file_cid}&check=1")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), file_cid), {"check": True})])
+        self.assertEqual(self.call("GET", "/api/pin/remote?node=nope")[0], 400)
+        self.assertEqual(self.call("GET", "/api/pin/remote?cid=nope")[0], 400)
+        self.assertEqual(self.call("PUT", "/api/pin/remote")[0], 405)
+        self.assertEqual(len(self.node.called("pin_remote_ls")), 2)
+        self.assertEqual(len(self.node.called("pin_remote")), 0)  # a GET never asks a node to pin
+
+    def test_served(self):
+        """The pins served and each identity's usage, as the node gives them; the capability is listed."""
+        served = self.ok("GET", "/api/pin/remote/served")
+        self.assertEqual((served["pins"][0]["reason"], served["usage"][0]["used"], served["quota"]), ("quota", 5, 100))
+        self.assertIn("remote_pin_status", self.ok("GET", "/api/capabilities")["capabilities"])
+        self.assertEqual(self.call("POST", "/api/pin/remote/served", {})[0], 405)
 
 
 class RouteTableTest(unittest.TestCase):

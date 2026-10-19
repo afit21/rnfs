@@ -42,7 +42,8 @@ from rnfs.events import EVENT_KINDS
 from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
 from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
                           Exported, Followed, Imported, Info, Kept, LxmfAddress, Message, Outgoing, Peer, Pin, Record,
-                          Sent, Settings, SettingsChange, Stat, Stats, Status, Synced, Uncached, Verified, Written)
+                          RemotePin, Sent, ServedPins, Settings, SettingsChange, Stat, Stats, Status, Synced,
+                          Uncached, Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
@@ -688,9 +689,25 @@ class Rnfs:
         return Pin.from_dict(self._backend.pin_label(str(cid), label))
 
     def pin_remote(self, node_id, cid, pin: bool = True) -> bool:
-        """Ask node_id to pin (or release this node's pin of) cid; True if it accepted."""
+        """Ask node_id to pin (or release this node's pin of) cid; True if it accepted. Recorded for remote_pins()."""
         self._check()
         return bool(self._backend.pin_remote(node_hex(node_id), str(cid), pin))
+
+    def remote_pins(self, node_id=None, cid=None, *, check: bool = False) -> list[RemotePin]:
+        """The remote pins this node asked for (node_id's, cid's, or every one), most recently asked first, and
+        whether each is done: inferred from provider records, so it lags the node's publishing. check: check them
+        first, a provider lookup each (paced: at most 32 a call, 4 on a slow node, none checked in the last minute).
+        Pins asked before rnfs 0.2.0 aren't listed. Raises NoSuchEndpoint from an older daemon."""
+        self._check()
+        entries = self._backend.pin_remote_ls(node_hex(node_id), str(cid) if cid is not None else None, check)
+        return [RemotePin.from_dict(entry) for entry in entries]
+
+    def served_pins(self) -> ServedPins:
+        """The remote pins other identities asked of this node (pinned, waiting, fetching, and the latest outcomes
+        of the others: dropped and why, refused, released) and each identity's use of remote_pin_quota. Raises
+        NoSuchEndpoint from an older daemon."""
+        self._check()
+        return ServedPins.from_dict(self._backend.pin_remote_served())
 
     def gc(self) -> Collected:
         """Evict every cached fetch and delete unreachable blocks."""

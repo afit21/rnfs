@@ -12,7 +12,8 @@ from rnfs.content.cid import Cid
 __all__ = ["Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record", "Status", "Collected", "Verified",
            "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "LxmfAddress",
            "MessageLink", "Message", "Outgoing", "Sent", "Synced", "Cached", "Uncached", "Event", "EventBatch",
-           "Capabilities", "Setting", "Settings", "SettingsChange"]
+           "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
+           "ServedPins"]
 
 
 def _cid(text) -> Cid:
@@ -501,6 +502,78 @@ class Cached(_Object):
     def __str__(self) -> str:
         """The CID's written form."""
         return str(self.cid)
+
+
+@dataclass(frozen=True)
+class RemotePin(_Object):
+    """A remote pin this node asked for (remote_pins()): the node asked (16 bytes) and the CID; whether it asked to pin
+    it (False: to release it) and whether the node accepted; when (Unix time); its state ("waiting", "done",
+    "missing", "refused", "released") and done; when last checked conclusively and when the node was last found
+    providing it (None if never)."""
+
+    node: bytes = _field(_hex)
+    cid: Cid = _field(_cid)
+    pin: bool = True
+    accepted: bool = False
+    asked: float | None = None
+    state: str = "waiting"
+    done: bool = False
+    checked: float | None = None
+    seen: float | None = None
+
+    def __str__(self) -> str:
+        """The CID's written form."""
+        return str(self.cid)
+
+
+@dataclass(frozen=True)
+class ServedPin(_Object):
+    """A remote pin another identity asked of this node (served_pins()): the identity hash (16 bytes), the CID, its
+    state ("waiting", "fetching", "pinned", "dropped", "refused", "released"), why for one dropped or refused
+    ("quota", "not_found", "denied", "queue_full", ...), when (Unix time; None where not recorded) and a detail."""
+
+    identity: bytes = _field(_hex)
+    cid: Cid = _field(_cid)
+    state: str = "waiting"
+    reason: str | None = None
+    at: float | None = None
+    detail: str | None = None
+
+    def __str__(self) -> str:
+        """The CID's written form."""
+        return str(self.cid)
+
+
+@dataclass(frozen=True)
+class RemotePinUsage(_Object):
+    """An identity's remote pins on this node: bytes used against its quota (remote_pin_quota), how many are pinned
+    and waiting, and whether it is still on remote_pin_identities."""
+
+    identity: bytes = _field(_hex)
+    used: int = 0
+    quota: int = 0
+    pinned: int = 0
+    waiting: int = 0
+    allowed: bool = False
+
+
+def _served(values) -> tuple[ServedPin, ...]:
+    """ServedPins from their JSON form."""
+    return tuple(ServedPin.from_dict(value) for value in values)
+
+
+def _usage(values) -> tuple[RemotePinUsage, ...]:
+    """RemotePinUsages from their JSON form."""
+    return tuple(RemotePinUsage.from_dict(value) for value in values)
+
+
+@dataclass(frozen=True)
+class ServedPins(_Object):
+    """served_pins(): the remote pins served, most recent first, each identity's usage, and remote_pin_quota."""
+
+    pins: tuple[ServedPin, ...] = _field(_served, ())
+    usage: tuple[RemotePinUsage, ...] = _field(_usage, ())
+    quota: int = 0
 
 
 @dataclass(frozen=True)
