@@ -30,6 +30,9 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   strings only at the user edge (CLI, API, gateway, logs) and binary only on the wire. `Cid.from_block_name` is the
   block store's scan at startup: it accepts exactly what `parse` accepts, but checks the canonical form with one
   regular expression and decodes with `int(..., 32)` instead of re-encoding, keeping the name as the written form.
+  `to_base36` and `from_base36` are the gateway's host form (`k` + base36, section 4), which only the gateway's
+  host parser (`gateway.parse_host`) reads: exact length and digits by a regular expression (`int(..., 36)` alone
+  would also take `_`, signs, whitespace and non-ASCII digits), then `Cid.from_bytes`, then the canonical check.
 - `rnfs/log.py` — logging through RNS's logger. `log()` escapes non-printable characters in every message
   (remote names can't inject terminal escapes or fake lines); `cap_warnings` keeps a result's first
   `MAX_WARNINGS` (100) warnings plus a count line and `warnings_total`. With a debug sink set

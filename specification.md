@@ -337,6 +337,13 @@ gateway, logs). On the wire CIDs are always binary.
   rnfs CIDs can't be mistaken for an IPFS codec.
 - Nothing else is a valid CID. A string is valid only if it equals `encode(decode(string))`, so every CID has
   exactly one written form.
+- **Gateway host form.** DNS labels hold at most 63 characters and an rnfs-dag CID's written form has 64, so the
+  gateway's subdomain hosts (section 11) write a CID as `k` + lowercase base36 of the binary CID (big-endian,
+  no padding), as IPFS does for subdomains: 56 characters for a raw CID, 60 for an rnfs-dag one, the same for
+  every digest. It is a host-only encoding: only the gateway's host parser accepts it, with exactly one of
+  those lengths, digits `0-9a-z` only, and canonical (`encode(decode(label)) == label`, the decoded bytes a
+  valid CID as above). The CID is converted to its written form at once, before any other use; responses
+  (`ETag`, `Location`, listings, errors) and logs show the written form. Everywhere else, `k…` is not a CID.
 - A file of at most `CHUNK_SIZE` bytes is a single raw block; its CID is byte-for-byte the IPFS CID of that
   raw block.
 - **DHT key** of a CID: `SHA-256(binary CID)[0:16]`, in the node ID space. Hashing the whole CID keeps a raw
@@ -1785,7 +1792,7 @@ unreserved, pct-encoded: as in RFC 3986
 
 | IPFS feature | rnfs |
 |---|---|
-| CIDs | Section 4. One DAG codec (plus raw) instead of several; base32 only |
+| CIDs | Section 4. One DAG codec (plus raw) instead of several; base32 only, except base36 (`k`) in gateway subdomain hosts |
 | UnixFS files and directories | Section 5. Fixed-size chunks and balanced trees, sorted index instead of HAMT sharding; executable bit kept, mtimes and symlinks dropped |
 | Chunkers (`--chunker rabin`, `buzhash`) | Fixed (default) or one fully specified FastCDC (section 5), so every writer cuts the same content alike |
 | No built-in encryption | Sealed files: a content convention encrypting a file for chosen RNS identities (section 5) |

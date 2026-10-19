@@ -6,7 +6,8 @@
 
 The digest is the SHA-256 of the block. Written for people as "b" + lowercase unpadded base32 of the
 binary CID; on the wire CIDs are always binary. Nothing else is a valid CID, and every CID has exactly
-one written form.
+one written form. The one exception is the gateway's subdomain hosts, where a CID is "k" + lowercase base36
+(to_base36, from_base36: a host-only form, which Cid.parse never accepts).
 """
 import base64
 import hashlib
@@ -24,6 +25,11 @@ _PREFIXES = {
 _DIGEST_LENGTH = 32
 _BASE32 = "abcdefghijklmnopqrstuvwxyz234567"  # RFC 4648, lowercase as written
 _TO_INT_DIGITS = str.maketrans(_BASE32, "0123456789abcdefghijklmnopqrstuv")  # the same values as int(..., 32) reads
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+# Digits after the "k" -> binary length: 55 for raw CIDs (56 characters), 59 for rnfs-dag (60), both within DNS's
+# 63-character label limit. Each codec's prefix fixes the count for every digest (tests/test_cid.py checks)
+_HOST_LENGTHS = {55: 36, 59: 39}
+_HOST_FORM = re.compile("k(?:" + "|".join(f"[0-9a-z]{{{n}}}" for n in sorted(_HOST_LENGTHS)) + ")")
 
 
 def _written_form(prefix: bytes) -> tuple[int, int, str]:
@@ -144,6 +150,35 @@ class Cid:
 
     def __lt__(self, other: "Cid") -> bool:
         return self.binary < other.binary
+
+
+def to_base36(cid: Cid) -> str:
+    """cid's gateway host form: "k" + lowercase base36 of the binary CID (specification section 4). Only the
+    gateway's subdomain hosts use it; everywhere else a CID is written as str(cid)."""
+    value = int.from_bytes(cid.binary, "big")  # never 0, and no leading zero byte: every prefix starts 01
+    digits = []
+    while value:
+        value, digit = divmod(value, 36)
+        digits.append(_BASE36[digit])
+    return "k" + "".join(reversed(digits))
+
+
+def from_base36(text) -> Cid:
+    """The CID whose gateway host form is text, as to_base36 writes it, and nothing else: the exact length for
+    a raw or rnfs-dag CID, lowercase base36 digits only, and canonical (to_base36 of the result is text).
+    Raises ValueError. Cid.parse never accepts this form; callers turn the result into str() before any other
+    use, so the written form stays the one everywhere else."""
+    if not isinstance(text, str) or not _HOST_FORM.fullmatch(text):
+        raise ValueError(f"invalid CID {text!r} in host: must be k + {' or '.join(map(str, _HOST_LENGTHS))} "
+                         "lowercase base36 digits")
+    length = _HOST_LENGTHS[len(text) - 1]
+    # int() would also take "_", signs, whitespace and non-ASCII digits: the regular expression has ruled them
+    # out. 36 ** digits < 256 ** length for both lengths, so to_bytes can't overflow
+    value = int(text[1:], 36)
+    cid = Cid.from_bytes(value.to_bytes(length, "big"))
+    if to_base36(cid) != text:
+        raise ValueError(f"invalid CID {text!r} in host: not in canonical form")
+    return cid
 
 
 def is_valid(text) -> bool:
