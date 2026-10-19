@@ -25,8 +25,10 @@ from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module, statedb
+from rnfs.dht.routing import distance
+from rnfs.dht.scores import BOOTSTRAP_SEED, band
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES, failing_commits, state_rows, wait_for
+from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, wait_for
 from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
@@ -936,6 +938,41 @@ class RestartTest(NodeTest):
         self.assertEqual(self.b._eligible_targets(), {Cid.parse(cid)})
         self.assertIn(Cid.parse(cid), self.b.publisher.provided())
 
+    def test_routing_table_is_kept_at_a_restart(self):
+        """Saved at stop and loaded at start, with wall-clock times: seniority is kept, and /find replies still
+        leave out a node silent for over 2 × announce_interval before the restart."""
+        quiet, banned = bytes([0x21] * 16), bytes([0x22] * 16)
+        self.b.routing.heard(quiet)
+        self.b.routing.ban(banned)
+        senior_for = self.b.routing.seniority(A_ID)
+        self.b.stop()
+        silent_since = time.time() - 2 * self.b.config.announce_interval - 60
+        state_execute(self.b.config.state_dir, "UPDATE routing SET first_seen = ?, at = ? WHERE node = ?",
+                      (silent_since, silent_since, quiet))
+        self.b = self.make_node("b", B_ID)
+        self.assertEqual(sorted(self.b.routing.nodes()), sorted([A_ID, quiet]))
+        self.assertGreaterEqual(self.b.routing.seniority(A_ID), senior_for)
+        self.assertGreater(self.b.routing.seniority(quiet), 2 * self.b.config.announce_interval)
+        self.assertTrue(self.b.routing.is_banned(banned))
+        self.assertEqual(self.b.backend.find(quiet)[1], [A_ID])
+
+    def test_announce_first_seen_log_is_kept_at_a_restart(self):
+        """Server announces are logged when first heard, client announces forget, and the log is saved with the
+        batched stores."""
+        server, client = bytes([0x31] * 16), bytes([0x32] * 16)
+        self.b._heard_server(server)
+        heard = self.b.first_seen.first_heard(server)
+        self.assertIsNotNone(heard)
+        self.b._heard_server(client)
+        self.b._heard_client(client)
+        self.assertIsNone(self.b.first_seen.first_heard(client))
+        self.b._save_state()
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT node, first_heard FROM announce_first_seen"),
+                         [(server, heard)])
+        self.b = self.restart(self.b, "b", B_ID)
+        self.assertEqual(self.b.first_seen.first_heard(server), heard)
+        self.assertEqual(self.b.first_seen.closest(server, min_age=0), [server])
+
     def test_failed_fetched_save_is_tried_again(self):
         target = Cid.for_block(RAW, b"target")
         self.b._note_fetched(target)
@@ -1156,6 +1193,132 @@ class JoinTest(NodeTest):
         private = self.make_node("p", bytes([0xF] * 16), bootstrap_nodes=user, private=True)
         self.assertEqual(private.bootstrap_ids(), [self.DEAD[0]])
         self.assertEqual(sorted(self.make_node("d", bytes([0xC] * 16)).bootstrap_ids()), sorted(self.SERVERS[1:]))
+
+    def test_bootstrap_nodes_are_seeded_a_score(self):
+        user = self.DEAD[0]
+        x = self.joiner(bootstrap_nodes=[user.hex()])
+        self.assertEqual({n: x.scores.band(n) for n in [user, *self.SERVERS]},
+                         {user: band(BOOTSTRAP_SEED), self.SERVERS[0]: 0,
+                          **{n: band(BOOTSTRAP_SEED) for n in self.SERVERS[1:]}})
+        x.stop()
+        x = self.joiner(bootstrap_nodes=[user.hex()], default_bootstrap=False)  # their seeds are dropped
+        self.assertEqual({n for n in [user, *self.SERVERS] if x.scores.score(n) > 0}, {user})
+        private = self.make_node("p", bytes([0xF] * 16), bootstrap_nodes=[user.hex()], private=True)
+        self.assertEqual({n for n in [user, *self.SERVERS] if private.scores.score(n) > 0}, {user})
+
+    def test_unanswered_queries_lower_scores_and_useful_answers_raise_them(self):
+        x = self.joiner(bootstrap_nodes=[n.hex() for n in self.DEAD], default_bootstrap=False)
+        x.join()  # no server answers
+        for dead in self.DEAD:
+            self.assertLess(x.scores.score(dead), BOOTSTRAP_SEED)
+        # A lookup from SERVERS[0]: it names the others, two of them nearer to x's ID, which then answer
+        x.routing.heard(self.SERVERS[0])
+        x._lookup(self.X_ID).find_closest()
+        self.assertLess(min(distance(n, self.X_ID) for n in self.SERVERS[1:]), distance(self.SERVERS[0], self.X_ID))
+        self.assertGreater(x.scores.score(self.SERVERS[0]), 0)
+
+    def test_saved_servers_are_asked_first_best_scored_first(self):
+        x = self.joiner(bootstrap_nodes=[self.DEAD[0].hex()], default_bootstrap=False)
+        for server_id in self.SERVERS:  # longest known first, between equal scores
+            x.routing.heard(server_id)
+        for _ in range(4):
+            x.scores.served(self.SERVERS[2])
+        x.scores.bad_block(self.SERVERS[1])  # after those scoring 0 (a ban would keep it out of the table)
+        self.assertEqual(x.join_candidates(),
+                         [self.SERVERS[2], self.SERVERS[0], self.SERVERS[3], self.SERVERS[1], self.DEAD[0]])
+        x.join()
+        self.assertEqual(self.finds[:2], [self.SERVERS[2], self.SERVERS[0]])
+        self.assertNotIn(self.DEAD[0], self.finds)  # two saved servers answered: no bootstrap node needed
+        self.assertEqual(len(self.finds), len(set(self.finds)))
+
+    def test_a_restart_rejoins_from_the_saved_table(self):
+        x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
+        x.join()
+        self.assertGreaterEqual(x.routing.live_count(), 3)
+        x.stop()
+        self.finds.clear()
+        x = self.joiner(bootstrap_nodes=[self.DEAD[0].hex()])  # the defaults are servers too: not needed either
+        x.join()
+        self.assertTrue(set(self.finds) <= set(self.SERVERS))
+        self.assertGreaterEqual(x.routing.live_count(), 3)
+
+    def test_saved_servers_that_failed_are_skipped_and_few_are_tried(self):
+        x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
+        gone = [bytes([0x60 + i] * 16) for i in range(node_module.SAVED_JOIN_TRIES + 2)]
+        for node_id in gone:
+            x.routing.heard(node_id)
+        x.routing.failed(gone[0])  # failed since last heard: not asked
+        x.join()
+        self.assertEqual(self.finds[:node_module.SAVED_JOIN_TRIES + 1],
+                         gone[1:node_module.SAVED_JOIN_TRIES + 1] + [self.SERVERS[0]])
+
+    ISLAND = [bytes([0x40 + i] * 16) for i in range(2)]  # servers that know only each other
+
+    def island_joiner(self, **settings) -> RnfsNode:
+        """The joining node, its saved routing table holding only the two island servers (which answer)."""
+        for server_id in self.ISLAND:
+            self.make_node(f"i{server_id[0]}", server_id)
+        for server_id in self.ISLAND:
+            for other in self.ISLAND:
+                self.net.nodes[server_id].routing.heard(other)
+        x = self.joiner(**settings)
+        for server_id in self.ISLAND:
+            x.routing.heard(server_id)
+        return x
+
+    def defaults_asked(self) -> list[bytes]:
+        """The default bootstrap nodes (SERVERS[1:], as patched) asked so far."""
+        return [node_id for node_id in self.finds if node_id in self.SERVERS[1:]]
+
+    def test_a_fast_node_still_asks_the_defaults_after_its_saved_servers_answered(self):
+        x = self.island_joiner()
+        joined_when_asked = []
+        find = self.net.find
+
+        def note(node_id, key):
+            """Note whether the join was done when a default bootstrap node was asked."""
+            if node_id in self.SERVERS[1:]:
+                joined_when_asked.append(x.joined.is_set())
+            return find(node_id, key)
+
+        self.net.find = note
+        thread = threading.Thread(target=x._join, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(x.stop_event.set)
+        wait_for(lambda: x.routing.contains(self.SERVERS[0]), what="the network beyond the island")
+        self.assertEqual(self.finds[:2], self.ISLAND)  # the saved servers answered the join itself
+        # The first default asked answered, and the lookup from the servers it listed asked the others too
+        self.assertTrue(self.defaults_asked())
+        self.assertTrue(joined_when_asked and all(joined_when_asked))  # after the join, so it isn't delayed
+
+    def test_at_most_two_defaults_are_asked_until_one_answers(self):
+        x = self.island_joiner()
+        for server_id in self.SERVERS[1:]:
+            self.net.nodes.pop(server_id)  # unreachable
+        x._check_defaults_after(x.join())
+        self.assertEqual(len(self.defaults_asked()), node_module.DEFAULT_CHECKS)
+
+    def test_a_slow_node_doesnt_ask_the_defaults_after_its_saved_servers_answered(self):
+        x = self.island_joiner()
+        x.slow = True  # every path request on radio is flooded
+        contacted = x.join()
+        self.assertEqual(contacted, set(self.ISLAND))  # due, but skipped by a slow node
+        x._check_defaults_after(contacted)
+        self.assertEqual(self.defaults_asked(), [])
+        self.assertFalse(x.routing.contains(self.SERVERS[1]))
+
+    def test_without_defaults_none_are_asked(self):
+        x = self.island_joiner(default_bootstrap=False)
+        x._check_defaults_after(x.join())
+        private = self.make_node("p", bytes([0xF] * 16), private=True)
+        private.check_defaults(set())
+        self.assertEqual(self.defaults_asked(), [])
+
+    def test_not_due_when_the_join_asked_the_defaults_or_no_saved_server_answered(self):
+        x = self.joiner()
+        self.assertIsNone(x.join())  # no saved servers: the join asked the defaults itself
+        self.assertTrue(self.defaults_asked())
 
     def test_joins_again_while_too_few_servers_are_known(self):
         x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)

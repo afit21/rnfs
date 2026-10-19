@@ -11,9 +11,10 @@ Providers, in the order they are tried:
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
-   for over provider_seniority are tried first, the rest after them; within each group, fewer hops first,
-   then a faster next-hop interface (rnfs.mesh.provider_rank), then reply order. Open links are ranked
-   the same way. Hops and bitrates come from path_info (the node passes RNS's; by default none are known).
+   for over provider_seniority are tried first, the rest after them; within each group, a better local score
+   first (by band), then fewer hops, then a faster next-hop interface (rnfs.mesh.provider_rank), then reply
+   order. Open links are ranked the same way. Hops and bitrates come from path_info (the node passes RNS's;
+   by default none are known).
 `get --from` uses only the given node.
 
 A provider fails, and isn't used again during the fetch, when its link fails, it answers None for a block
@@ -23,6 +24,10 @@ within the same lookup_timeout. A block not matching its CID bans the provider; 
 that isn't a valid DAG node marks the root invalid locally and fails the fetch (a stored block that no
 longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
 block and no response progress for lookup_timeout + stall_timeout fails, so a hung one ends.
+
+Local scores (rnfs.dht.scores, section 6): a response with verified blocks raises its provider's score, and, once
+per fetch, the scores of the nodes whose /find answers listed it; a provider that fails falls, one sending a block
+not matching its CID much further.
 
 End-game duplication (NET-4; section 7): once nothing is left to ask for, an idle provider is also asked for a
 batch another has had in flight for longer than deadline_slack, so a response dripping in (never stalling, its
@@ -96,6 +101,7 @@ from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
 from rnfs.content.walker import Expect
+from rnfs.dht.scores import Scores
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 from rnfs.network import client as peer_client
@@ -472,8 +478,11 @@ class Fetcher:
     def __init__(self, storage: Storage, client, config: Config, own_id: bytes, routing,
                  make_lookup: Callable[[bytes], object], slow_node: bool = False, state_dir: str | None = None,
                  after_store: Callable[[], None] | None = None, clock: Callable[[], float] = time.monotonic,
-                 busy_delay: float = BUSY_DELAY, make_room: Callable[[int], None] | None = None):
-        """Fetch into storage with client (PeerClient); routing is the RoutingTable (bans, seniority).
+                 busy_delay: float = BUSY_DELAY, make_room: Callable[[int], None] | None = None,
+                 scores: Scores | None = None):
+        """Fetch into storage with client (PeerClient); routing is the RoutingTable (bans, seniority), and scores the
+        local scores, raised by verified blocks and the answers that led to them, lowered by failures and bad blocks
+        (in memory only unless given).
 
         make_lookup(key) returns a dht.lookup.Lookup for key; after_store() runs after each batch of stored
         blocks, so the node can enforce max_storage; make_room(nbytes) evicts cache so an unpinned fetch can
@@ -485,6 +494,7 @@ class Fetcher:
         self.config = config
         self.own_id = own_id
         self.routing = routing
+        self.scores = scores if scores is not None else Scores()
         self.make_lookup = make_lookup
         self.slow_node = slow_node
         self.after_store = after_store or (lambda: None)
@@ -634,6 +644,7 @@ class Fetch:
         # a link another fetch has a request on isn't closed (PeerClient.close_unless_used)
         self._threads: set[int] = set()
         self._links_closed: set[bytes] = set()
+        self._credited: set[bytes] = set()  # nodes whose /find answers led to a provider that served this fetch
         if from_node is not None:
             self._new_provider(from_node)
 
@@ -1111,15 +1122,16 @@ class Fetch:
 
     def _usable(self) -> list[_Provider]:
         """Providers not failed, in the order they're tried: long-known ones first, then the rest; within
-        each, nearest and fastest first, then as found (section 6)."""
+        each, best scored, then nearest and fastest first, then as found (section 6)."""
         return sorted((p for p in self._providers.values() if not p.failed),
                       key=lambda p: self._rank(p.node_id, p.path, p.order))
 
     def _rank(self, node_id: bytes, path: mesh.PathInfo, order: int) -> tuple:
         """Sort key for a provider: seniority stays first (an attacker's fresh identities can't jump the
-        queue by being near), then hops and next-hop bitrate, then order."""
+        queue by being near, or by serving popular blocks), then local score band, then hops and next-hop
+        bitrate, then order."""
         senior = self.fetcher.routing.is_senior(node_id, self.config.provider_seniority)
-        return mesh.provider_rank(senior, path, order)
+        return mesh.provider_rank(senior, path, order, self.fetcher.scores.band(node_id))
 
     def _path(self, node_id: bytes) -> mesh.PathInfo:
         """What RNS knows about the path to node_id (nothing if the lookup fails)."""
@@ -1380,10 +1392,22 @@ class Fetch:
         self._live += 1
         return provider
 
+    def _served(self, node_id: bytes):
+        """node_id delivered verified blocks: its score rises, and so, once per fetch, do those of the nodes whose
+        /find answers listed it (local scores, section 6)."""
+        scores = self.fetcher.scores
+        scores.served(node_id)
+        if self._lookup is None:
+            return
+        for lister in self._lookup.listers(node_id) - self._credited:
+            self._credited.add(lister)
+            scores.useful_answer(lister)
+
     def _fail(self, provider: _Provider, why: str):
-        """A provider failed: it isn't used again during this fetch."""
+        """A provider failed: it isn't used again during this fetch, and its score falls."""
         if not provider.failed:
             provider.failed = True
+            self.fetcher.scores.failed(provider.node_id)
             self._live -= 1
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
@@ -1403,6 +1427,7 @@ class Fetch:
             log(f"banning {node_name(node_id)}: it sent {plural(len(result.bad), 'block')} not matching "
                 "the CID requested", LOG_WARNING)
             self.fetcher.routing.ban(node_id)
+            self.fetcher.scores.bad_block(node_id)
             if provider is None:
                 provider = self._new_provider(node_id)
             self._fail(provider, "sent a block not matching its CID")
@@ -1417,6 +1442,8 @@ class Fetch:
             outstanding.discard(cid)
         for cid, block in late.items():
             self._accept(cid, block, self._expects, {}, self.budget)
+        if result.blocks:
+            self._served(node_id)
         if probe:
             # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised
             if result.blocks and provider is None:

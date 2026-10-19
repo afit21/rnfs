@@ -16,6 +16,7 @@ from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content import storage as storage_module
 from rnfs.content.storage import Storage
+from rnfs.dht import scores as scoring
 from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs import fetcher as fetcher_module
@@ -35,10 +36,12 @@ setUpModule, tearDownModule = quiet_log()
 class FakeLookup:
     """A provider lookup whose runs report fixed providers."""
 
-    def __init__(self, runs: list[list[bytes]]):
-        """runs[i] is what the i-th run of find_providers reports."""
+    def __init__(self, runs: list[list[bytes]], listed: dict[bytes, set[bytes]] | None = None):
+        """runs[i] is what the i-th run of find_providers reports; listed[provider], the nodes whose answers listed
+        it (none by default)."""
         self.runs = runs
         self.count = 0
+        self.listed = listed or {}
 
     def find_providers(self, on_provider, should_stop=lambda: False):
         """Report this run's providers."""
@@ -50,6 +53,10 @@ class FakeLookup:
 
     def stop(self):
         """Nothing to wake."""
+
+    def listers(self, provider: bytes) -> set[bytes]:
+        """The nodes said to have listed provider."""
+        return set(self.listed.get(provider, ()))
 
     def allow_unknown(self, node_id: bytes) -> bool:
         """Every identity is known."""
@@ -75,13 +82,14 @@ class FetcherTest(unittest.TestCase):
         self.network: dict[Cid, bytes] = {}
         self.lookups: list[FakeLookup] = []
         self.runs: list[list[bytes]] = []
+        self.listed: dict[bytes, set[bytes]] = {}  # provider -> the nodes the lookups say listed it
         self.fetcher = self.make_fetcher()
 
     def make_fetcher(self, slow: bool = False) -> Fetcher:
         """A fetcher whose lookups report self.runs."""
         def make_lookup(key):
             """A new FakeLookup, remembered."""
-            lookup = FakeLookup(self.runs)
+            lookup = FakeLookup(self.runs, self.listed)
             self.lookups.append(lookup)
             return lookup
         fetcher = Fetcher(self.storage, self.client, self.config, OWN, self.routing, make_lookup, slow,
@@ -181,6 +189,19 @@ class ProviderDiscoveryTest(FetcherTest):
                 fetch._add_provider(node_id)
             self.assertEqual([p.node_id for p in fetch._usable()], [P2, P1, P3])
 
+    def test_scores_order_providers_within_seniority_groups(self):
+        self.routing.heard(P2)
+        self.config.provider_seniority = 0  # everything in the routing table counts as long-known
+        for _ in range(8):
+            self.fetcher.scores.served(P3)  # well scored, but new: still after P2
+        self.fetcher.scores.served(P1)
+        self.fetcher.scores.served(P1)
+        four = bytes([4] * 16)
+        with self.fetcher.open(self.file(b"y").cid) as fetch:
+            for node_id in (four, P1, P2, P3):
+                fetch._add_provider(node_id)
+            self.assertEqual([p.node_id for p in fetch._usable()], [P2, P3, P1, four])
+
 
 class FailureRuleTest(FetcherTest):
     """When providers fail, are banned, and are retried."""
@@ -258,6 +279,45 @@ class FailureRuleTest(FetcherTest):
         self.client.requests.clear()
         self.fetch_all(other.cid)
         self.assertEqual(self.client.asked(P1), [])
+
+
+class ScoreTest(FetcherTest):
+    """Local scores (section 6): raised by verified blocks and the answers that led to them, lowered by failures."""
+
+    def test_verified_blocks_raise_the_provider_and_once_per_fetch_its_listers(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(os.urandom(5 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.listed[P1] = {P2, P3}
+        self.fetch_all(built.cid)
+        responses = len([n for n, _ in self.client.requests if n == P1])
+        self.assertGreater(responses, 1)
+        scores = self.fetcher.scores
+        # Scores decay on the wall clock, by a hair during the test
+        self.assertAlmostEqual(scores.score(P1), responses * scoring.SERVED, places=4)
+        self.assertAlmostEqual(scores.score(P2), scoring.USEFUL_ANSWER, places=4)
+        self.assertAlmostEqual(scores.score(P3), scoring.USEFUL_ANSWER, places=4)
+
+    def test_failing_providers_and_bad_blocks_lower_scores(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(b"f" * 3000)
+        self.hold(P3)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(FAILED, unsent=list(cids), reason="unreachable")
+        self.client.behaviour[P2] = lambda cids: BlocksResult(OK, bad=[cids[0]], unsent=list(cids[1:]))
+        self.runs.append([P1, P2, P3])
+        self.listed[P2] = {P1}  # P1 listed P2, which sent nothing verified: no credit for that
+        self.fetch_all(built.cid)
+        scores = self.fetcher.scores
+        self.assertAlmostEqual(scores.score(P1), scoring.FAILED, places=4)
+        self.assertAlmostEqual(scores.score(P2), scoring.BAD_BLOCK + scoring.FAILED, places=4)
+        self.assertAlmostEqual(scores.score(P3), scoring.SERVED, places=4)
+
+    def test_scores_given_are_used(self):
+        scores = scoring.Scores()
+        fetcher = Fetcher(self.storage, self.client, self.config, OWN, self.routing, lambda key: None, False, None,
+                          scores=scores)
+        self.assertIs(fetcher.scores, scores)
 
 
 class PacingTest(FetcherTest):

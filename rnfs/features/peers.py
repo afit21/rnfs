@@ -7,8 +7,8 @@ so the DHT mode and the last-heard time of client-mode nodes (which never enter 
 
 Per peer the listing also gives:
 - first_heard: the earliest of when this run first counted the peer, when it entered the routing table (kept
-  across a short absence) and when RNS's announce cache (Identity.known_destinations, which RNS persists) last
-  heard it; null if none knows.
+  across a short absence, and across restarts) and when RNS's announce cache (Identity.known_destinations, which
+  RNS persists) last heard it; null if none knows.
 - rtt, rtt_at: the round trip RNS measured on the last link established to it (a shared link, ping's, or an
   identified one for /provide or /pin; LinkPool.on_rtt), in seconds, and when; null if none was.
 - online: mesh.online(), the one rule: an rnfs link to it is open, or it showed it was up within

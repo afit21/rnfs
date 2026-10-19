@@ -122,6 +122,9 @@ rnfs/
     shared_folder.py  importing <rnfs dir>/files/ with pin source "folder" (section 8)
   dht/                no RNS dependency
     routing.py        RoutingTable: buckets, seniority, failures, unreliable nodes, bans (section 6)
+    routing_state.py  RoutingState: the routing table saved in the state database (section 6)
+    scores.py         Scores: local scores per peer, decay, bootstrap seeds, the capped saved table (section 6)
+    firstseen.py      FirstSeenLog: when each server's announce was first heard; closest old servers (section 6)
     providers.py      ProviderStore: records, TTL, max_records eviction, /find reply selection (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
@@ -284,9 +287,9 @@ before they are pinned.
 
 ## DHT layer interfaces
 
-`routing.py` — `RoutingTable(own_id, config, clock=time.monotonic, admit=None)` (`admit(node_id)`: private mode's
-member check, asked only for a node not in the table and without the table's lock held, since it may block on
-RNS; the table is checked again once it answers):
+`routing.py` — `RoutingTable(own_id, config, clock=time.monotonic, admit=None, wall_clock=time.time)`
+(`admit(node_id)`: private mode's member check, asked only for a node not in the table and without the table's
+lock held, since it may block on RNS; the table is checked again once it answers):
 `heard(node_id) -> bool` (proven server: announce in server mode, or answered `/find`), `answered(node_id) -> bool`
 (`heard`, and reliable again), `failed(node_id) -> bool` (True if dropped), `unreliable(node_id)` (its last
 `max_failures` queries or more failed, in the table or not; announces don't clear it: `_unanswered`, at most
@@ -294,13 +297,24 @@ RNS; the table is checked again once it answers):
 `AVOID_AFTER` (300 s), doubling per further failure up to `AVOID_MAX` (3600 s); True claims the retry, pushing
 the next one back a further backoff, so concurrent lookups don't all retry it), `remove(node_id)`, `ban(node_id)`,
 `is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
-`seniority(node_id) -> float | None` (seconds in the table), `is_senior(node_id, min_age)`, `standing(node_id,
+`seniority(node_id) -> float | None` (seconds in the table), `join_order()` (the servers a join asks first, before
+the node orders them by score), `is_senior(node_id, min_age)`, `standing(node_id,
 min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
 dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
 `nodes()`, `node_count()`, `live_count()` (nodes `/find` replies would include).
 Every `heard` forgets expired bans and dropped nodes' seniority, looking only at the front of each: both are kept
 in expiry order (an entry set again is moved to the end), and their readers check expiry too, so an entry out of
 order (after a clock step or a changed setting) only lingers in memory.
+Persistence (0.2.0): the table runs on the monotonic clock and converts to wall clock (`wall_clock() - clock()` as
+the offset) only for saved rows. `row(node_id)` gives `(node, IN_TABLE, first seen, last heard, failures)`,
+`(node, DROPPED, first seen, when dropped, 0)` or `(node, BANNED, None, ban end, 0)`, or None; `track(changed)`
+sets the listener told, under the table's lock (`lock`, an RLock), each node whose row changed; `restore(rows)`
+loads saved rows into an unused table (times in the future clamped to now, a ban to at most `ban_time` ahead;
+expired drops and bans, malformed rows, our own ID, nodes `admit` now rejects and a full bucket's youngest left
+out) and returns the nodes whose saved rows must be written again or deleted. `routing_state.py` —
+`RoutingState(table, state_dir)`, a `node.Store`: loads the `routing` table into the table, then saves the rows
+changed through a SNAPSHOT `RowStore` taking the table's lock; it imports the state database so `routing.py`,
+which lookups import, needn't.
 
 `providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
 max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
@@ -332,18 +346,50 @@ outside the pool, the counts, `_pooled`, `_holders`, `_newest`) are kept in step
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
-unreliable, may_retry, max_queries)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop)
--> list[bytes]`. Besides completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries`
-(`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha,
-beta) answers in a row that leave the bit length of the beta-th closest known distance (`_reach`) unchanged ("no
-progress"). A run ranks the nodes `unreliable` named when it learnt of them (`doubtful`) after every other, for
-its queries, its termination and `find_closest`'s result; one that distance alone would rank within the query
-window is asked again when `may_retry` says so, as a query beyond `alpha` (`retrying`) that the run waits for
-only if the node comes to rank within the window by `rank` (it is then counted in flight). `is_known(id)`
-says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup (`allow_unknown(id)`, also
-used by the fetcher for provider IDs). `listing_nodes()` is the nodes that have answered with at least one
-provider, and `listers(provider)` those that listed a given provider, so the keeper search can tell who vouches
-for its candidates.
+unreliable, may_retry, max_queries, on_useful)` with `find_closest() -> list[bytes]` and
+`find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run (`_iterate`)
+ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"), or after
+`STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit length of the beta-th closest known
+distance (`_reach`) unchanged ("no progress"). A run ranks the nodes `unreliable` named when it learnt of them
+(`doubtful`) after every other, for its queries, its termination and `find_closest`'s result; one that distance
+alone would rank within the query window is asked again when `may_retry` says so, as a query beyond `alpha`
+(`retrying`) that the run waits for only if the node comes to rank within the window by `rank` (it is then counted
+in flight). `is_known(id)` says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup
+(`allow_unknown(id)`, also used by the fetcher for provider IDs). `listing_nodes()` is the nodes that have answered
+with at least one provider, and `listers(provider)` those that listed a given provider, so the keeper search can
+tell who vouches for its candidates (and the fetcher whose answers led to a provider that served). `on_useful(id)`
+(local scores): a run notes which node's answer first named each node (`introduced`); when a node answers that is
+closer to the key than the node that named it, that node is passed to `on_useful`, once per lookup (`_useful`,
+`_credit`).
+
+`scores.py` — `Scores(state_dir=None, seeded=(), clock=time.time, max_rows=MAX_SCORES)`, a `node.Store`:
+`score(node_id)` (0 without a row), `band(node_id)`, `bands()`, and `served`, `useful_answer`, `failed`,
+`bad_block` adding `SERVED` (1), `USEFUL_ANSWER` (0.5), `FAILED` (−1) and `BAD_BLOCK` (−32). A row holds the score
+as of `updated` (it decays by half each `SCORE_HALF_LIFE`, 7 days, computed when read or changed: nothing runs
+on a timer), `useful` (last raised) and `seeded`. Rows sit in an `OrderedDict`, least recently useful first: a
+raise moves a row to the end, a row made by lowering goes to the front, and past `MAX_SCORES` (4096) the front is
+forgotten. `seeded` (the node's `_bootstrap_set()`: `bootstrap_nodes` and the defaults in use) gives each without a
+row `BOOTSTRAP_SEED` (6); a row seeded before whose node isn't a bootstrap node any more has the seed's decayed
+share taken off (exact, as every contribution decays alike). Saved in `peer_scores` through a SNAPSHOT `RowStore`.
+The node wires it: lookups' `on_failure` is `_query_failed` (the routing table's `failed`, then `scores.failed`),
+`on_useful` is `scores.useful_answer`, and the join's unanswered bootstrap nodes go through `_query_failed` too;
+the fetcher (`Fetcher(scores=)`, in memory only if not given) calls `served` for each response with verified
+blocks and `useful_answer` once per fetch for each of its lookup's `listers` of that provider (`Fetch._served`),
+`failed` in `_fail` and `bad_block` with the ban.
+
+`firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
+`heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
+table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
+exclude)`: the count closest to key of the servers first heard at least min_age ago (publishers and searchers will
+pass `provider_seniority`), not excluded (`exclude` runs under the log's lock). Memory: an `OrderedDict` node ID ->
+first heard, least recently heard first (a heard moves to the end; past `MAX_FIRST_SEEN`, 65,536, the front is
+forgotten), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a new server at
+65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a contiguous run
+of the sorted list, all closer to the key than any outside it: `closest` binary-searches the narrowest run holding
+count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old enough, and ranks only that
+run (about 20 µs at 65,536). Saved in `announce_first_seen` through a SNAPSHOT `RowStore`: an announce only marks
+its row, and a row's `last_heard` is the time of the save writing it (within 30 s of the announce), which only
+orders forgetting after a restart.
 
 ## Network layer interfaces
 
@@ -1074,7 +1120,8 @@ and in total, never persisted.
   first counted after it, so the start and the routing table seeded from RNS's cache publish nothing; a peer
   online that is no longer counted nor linked gets `offline`.
 - `Fetcher.path_info` (default: nothing known) is set by the node to `RnsPaths.info`; `Fetch._rank` orders
-  both providers and open-link probes, and each provider caches its `PathInfo`.
+  both providers and open-link probes (`mesh.provider_rank`: seniority, then the local score band,
+  `Scores.band`, then hops, bitrate and order), and each provider caches its `PathInfo`.
 - `ResponsePools` has `max_blocks_responses // 2` slow-link slots and `fast_blocks_responses` (or the rest, if
   more) for others. It protects a response from displacement only while it is within a grace it measures from
   the link's path (`link_path`, `fast_path`, `response_grace`, never from `link.rtt`), or moving at or above a
@@ -1385,6 +1432,12 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
 - `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
   stop, changed rows only);
+- `routing` (0.2.0: the routing table, `RoutingState`: one row per node in the table, dropped with its seniority
+  kept, or banned, times as Unix time; NORMAL with the periodic saves and at stop, changed rows only) and
+  `peer_scores` (0.2.0: local scores, `Scores`: score, when it was set, last raised, seeded; at most 4096 rows;
+  NORMAL with the periodic saves and at stop, changed rows only) and `announce_first_seen` (0.2.0: the announce
+  first-seen log, `FirstSeenLog`: first heard and about when last heard; at most 65,536 rows; NORMAL with the
+  periodic saves and at stop, changed rows only);
 - `names_published`, `names_held` (sequences as decimal text, up to 2^64 − 1; FULL, changed rows only; a
   malformed row stops startup, as a malformed `names.json` did, since skipping it could allow rollback) and
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at
@@ -1456,13 +1509,22 @@ against `server.Backend`), so production code needn't look up with `getattr` a m
 ## Status
 
 Everything in the specification is implemented, with these simplifications and additions:
-- The routing table isn't persisted. At startup it is seeded from the rnfs.dht server announces that RNS
-  cached within 2 × `announce_interval` (`Identity.known_destinations`, an RNS internal), then the join runs.
+- The routing table is saved in the state database (`routing_state.RoutingState`) and loaded at start. Before
+  the join it is also seeded from the rnfs.dht server announces that RNS cached within 2 × `announce_interval`
+  (`Identity.known_destinations`, an RNS internal). The nodes' failed queries in a row (`unreliable`) aren't
+  saved.
 - Lookups (`RnfsNode._lookup`) start from the closest nodes `/find` replies would give, then others to make up K,
   then unreliable ones if still short; answers go to `RoutingTable.answered`, failures to `failed`, and the
   join's lookup is wired the same way. A failed `/provide` or `/blocks` isn't counted there.
-- Joining (`RnfsNode._join`, `join`): bootstrap nodes are asked one at a time with `PeerClient.find`, outside
-  any `Lookup`, until `BOOTSTRAP_ANSWERS` (2) answer; the lookup that follows excludes them. The thread then
+- Joining (`RnfsNode._join`, `join`): the join's candidates (`join_candidates`: up to `SAVED_JOIN_TRIES` (6)
+  servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
+  first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with
+  `PeerClient.find`, outside any `Lookup`, until `BOOTSTRAP_ANSWERS` (2) answer; the lookup that follows excludes
+  them. `join()` returns the nodes contacted when a saved server answered and no default bootstrap node was asked;
+  `_join` then calls `check_defaults` (after `joined` is set, and after each rejoin): unless the node is slow, it
+  asks the defaults (`bootstrap_ids()`'s, not contacted yet) one at a time until one answers, at most
+  `DEFAULT_CHECKS` (2), and runs a lookup for its own ID from the servers that one listed. With
+  `default_bootstrap` off or in private mode there are none. The thread then
   checks `RoutingTable.live_count()` every `REJOIN_DELAY` (300 s) and joins again while it is under
   `MIN_SERVERS` (3), doubling the wait up to `announce_interval`. `DEFAULT_BOOTSTRAP_NODES` lives in
   `rnfs/constants.py` and changes only with a release; the e2e test turns it off (`default_bootstrap = false`).

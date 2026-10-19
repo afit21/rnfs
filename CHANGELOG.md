@@ -17,6 +17,8 @@ Upgrade notes:
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
   assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
+- **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
+  restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
 Added, for apps:
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
@@ -135,6 +137,26 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+
+The DHT (local behaviour: nothing on the wire changes):
+- The routing table is saved and loaded at start, so a restart doesn't make every server new again: servers keep
+  their seniority (which ranks providers and keepers), bans last their time, and `/find` replies still leave out
+  servers silent for over 2 × `announce_interval`, the time the node was down included.
+- Local scores: each node keeps a private score per peer, earned by work it checks itself (blocks served that
+  verified, `/find` answers that led to providers who served or to closer servers that answered) and lost by
+  failures, bad blocks and silence (scores halve each week). Bootstrap nodes start with a small seed they keep
+  only by earning it. Nothing is sent; at most 4096 peers are scored.
+- A join (at start, and again while too few servers are live) asks up to 6 servers of the saved routing table
+  first, best scored first, and bootstrap nodes only if fewer than two of those answer: a node that has joined
+  once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. After
+  such a join, a node that isn't slow still asks the default bootstrap nodes (until one answers, at most 2), so
+  one that saved only an island of servers reaches the rest of the network; a slow node no longer does.
+- Choosing providers: within each seniority group (seniority stays first), providers with a better local score
+  are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
+- The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
+  servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
+  the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
+  next to a key can't be. Publishing and searching will use it.
 
 ## 0.1.6
 

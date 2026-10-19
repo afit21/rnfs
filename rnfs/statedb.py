@@ -155,6 +155,25 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # or imported from such a file (how "import"), when it last happened. A key made before 0.2.0 has no row
         "CREATE TABLE name_exports (name BLOB PRIMARY KEY, at REAL NOT NULL, how TEXT NOT NULL) WITHOUT ROWID",
     )),
+    ("routing", (
+        # The routing table (rnfs 0.2.0; rnfs.dht.routing_state), one row per node: state 0 in the table (first_seen,
+        # at = last heard, failures = failed queries since), 1 dropped with its seniority kept (first_seen, at = when
+        # dropped), 2 banned (at = when the ban ends). Times are Unix time
+        "CREATE TABLE routing (node BLOB PRIMARY KEY, state INTEGER NOT NULL, first_seen REAL, at REAL NOT NULL,"
+        " failures INTEGER NOT NULL) WITHOUT ROWID",
+    )),
+    ("scores", (
+        # Local scores (rnfs 0.2.0; rnfs.dht.scores): a peer's score as of updated, when it was last raised (NULL:
+        # never) and when it was seeded as a bootstrap node (NULL: not). Times are Unix time
+        "CREATE TABLE peer_scores (node BLOB PRIMARY KEY, score REAL NOT NULL, updated REAL NOT NULL, useful REAL,"
+        " seeded REAL) WITHOUT ROWID",
+    )),
+    ("first_seen", (
+        # The announce first-seen log (rnfs 0.2.0; rnfs.dht.firstseen): when each server's rnfs.dht announce was
+        # first heard, and about when last (it orders forgetting). Times are Unix time
+        "CREATE TABLE announce_first_seen (node BLOB PRIMARY KEY, first_heard REAL NOT NULL, last_heard REAL NOT NULL)"
+        " WITHOUT ROWID",
+    )),
 )
 
 

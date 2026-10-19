@@ -557,20 +557,38 @@ big-endian integer; "closest" means smallest distance.
 - A node is dropped after `max_failures` queries in a row go unanswered; hearing from it resets the count.
   Lossy links can drop a live server this way, so a dropped node's first-seen time is kept for
   `2 × announce_interval`, and it regains its seniority if it comes back within that time.
-- **Joining.** At startup a node sends `/find` for its own node ID to bootstrap nodes, one at a time, until
-  two have answered: first those it was given (`bootstrap_nodes`, `daemon --bootstrap`) in their order,
-  then, unless `default_bootstrap` is off or it is in private mode, the implementation's default bootstrap
-  nodes (rnfs: `DEFAULT_BOOTSTRAP_NODES`) in random order. It adds those that answer, then runs a lookup for
-  its own ID from the servers they listed and its routing table, without asking the contacted nodes again;
-  this fills its table with its neighbours.
-  - Bootstrap nodes are contacted outside the lookup's budget of `alpha` unknown IDs, so unreachable ones
-    don't stop the rest being tried.
+- **Saved across restarts.** A node SHOULD save its routing table: each entry's first-seen and last-heard times
+  and whether it failed a query since, the first-seen times of dropped nodes until they expire, and bans until
+  they end. Times are saved as wall clock; one later than the current time when loaded (a clock since corrected
+  backwards) counts as now, and a loaded ban ends at most `ban_time` from now. A loaded entry keeps its
+  seniority, and `/find` replies leave it out while it has been silent for over `2 × announce_interval`, the
+  time the node was down included, until it is heard again. So a restart doesn't make every server new again,
+  nor send path requests to find servers it already knew (rnfs: in the state database, the rows changed written
+  every 30 s and at stop).
+- **Joining.** At startup a node sends `/find` for its own node ID, one node at a time, until two have answered:
+  first servers of its saved routing table, then bootstrap nodes: those it was given (`bootstrap_nodes`,
+  `daemon --bootstrap`) in their order, then, unless `default_bootstrap` is off or it is in private mode, the
+  implementation's default bootstrap nodes (rnfs: `DEFAULT_BOOTSTRAP_NODES`) in random order. It adds those that
+  answer, then runs a lookup for its own ID from the servers they listed and its routing table, without asking
+  the contacted nodes again; this fills its table with its neighbours.
+  - Saved servers are asked best scored first (local scores, below), the longest known first between equals
+    (rnfs: by score band, at most 6 of them, leaving out those that failed a query since they were last heard;
+    those silent for long are asked too, as after a long downtime all are). A node that has joined once is its
+    own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio.
+  - Saved servers and bootstrap nodes are contacted outside the lookup's budget of `alpha` unknown IDs, so
+    unreachable ones don't stop the rest being tried.
   - A node behind an RNS access-point interface hears no announces from beyond it, so bootstrap nodes are
     its only way in.
   - While fewer than 3 servers are known that `/find` replies would include (not failed since last heard,
     nor silent for over `2 × announce_interval`), the node joins again, 5 minutes after the last join and
-    doubling up to `announce_interval`: on radio every path request is flooded. A node that knows only a
-    small island of servers still contacts the defaults at every start.
+    doubling up to `announce_interval`: on radio every path request is flooded.
+  - After a join that saved servers answered (so no default bootstrap node was asked), a node that isn't slow
+    SHOULD still ask the default bootstrap nodes, one at a time in random order until one answers (rnfs: at
+    most 2), and look up its own ID from the servers it lists, once the join is done so it isn't delayed: a node
+    that saved only a small island of servers still reaches the rest of the network. A slow node skips them, as
+    every path request on radio is flooded, and stays on such an island until it hears announces from beyond
+    it, or joins again with too few servers left. With `default_bootstrap` off or in private mode there are no
+    defaults to ask.
   - Bootstrap nodes get no special trust: once answered, they are ordinary routing-table entries.
 - Because RNS floods announces, on small meshes (a few dozen nodes) the routing table holds most of the
   network, so lookups usually finish in one or two rounds.
@@ -624,16 +642,18 @@ and repeat.
   near the key can't hide content.
 - **Choosing providers.** A node SHOULD rank providers by these keys, in this order:
   1. **Seniority.** Providers that have been in the routing table for over `provider_seniority` come first.
-     This key MUST stay first: an attacker can create fresh identities that sit close in hops, but can't make
-     them old.
-  2. **Hops.** Fewer hops (`RNS.Transport.hops_to`) first; a provider whose path is unknown goes after every
+     This key MUST stay first: an attacker can create fresh identities that sit close in hops, or earn a score
+     quickly by serving popular blocks, but can't make them old.
+  2. **Local score.** Within each seniority group, a provider with a better local score (below) first (rnfs: by
+     score band; a provider without a score counts as 0).
+  3. **Hops.** Fewer hops (`RNS.Transport.hops_to`) first; a provider whose path is unknown goes after every
      provider with a known path.
-  3. **Next-hop interface bitrate.** A faster outbound interface on the path first
+  4. **Next-hop interface bitrate.** A faster outbound interface on the path first
      (`RNS.Transport.next_hop_interface(id).bitrate`; through a shared instance, the bitrate of the interface
      `Reticulum.get_next_hop_if_name` names); an unknown bitrate goes last.
-  4. **Reply order.**
+  5. **Reply order.**
 
-  With no hops or bitrates known, this is seniority, then reply order. Path information is read once per
+  With no scores, hops or bitrates known, this is seniority, then reply order. Path information is read once per
   provider per fetch, when the provider is found. Through a shared instance, a node MAY reuse the instance's
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
@@ -645,6 +665,35 @@ and repeat.
   after an eighth of that round trip, or the usual delay if longer. Failed providers are removed and not
   retried during that fetch. When no providers are left, `/find` runs again for a fresh random half, within the
   same `lookup_timeout`.
+
+**Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
+Scores are local state: they are never sent or published, nothing on the wire changes, and nodes may score
+differently. A score can be earned quickly by serving popular blocks, so it never outranks seniority. rnfs:
+- raises a peer's score by 1 for each `/blocks` response that delivered blocks verified against their CIDs, and
+  by 0.5 for a `/find` answer that proved useful, once per fetch or lookup: it listed a provider that then
+  served verified blocks, or named a server closer to the key than the answering node that then answered;
+- lowers it by 1 for a failed query or provider (a `/find` unanswered, a provider failing in a fetch) and by 32
+  for a block not matching its CID (besides the ban);
+- halves every score each 7 days without new work, towards 0 from either side (silence lowers standing, and a bad
+  score is forgiven in time), and keeps it within ±64;
+- starts bootstrap nodes (`bootstrap_nodes`, and the defaults unless `default_bootstrap` is off or in private
+  mode) at 6 when they have no score, so a fresh node has someone to lean on. The seed decays like any score, so
+  they keep standing only by earning it; a node no longer a bootstrap node loses what is left of its seed at the
+  next start; bans apply to them as to anyone;
+- compares scores in bands a power of two wide (0 within ±1, else ±(1 + ⌊log₂ |score|⌋)), so peers of about the
+  same standing are ordered by the next key;
+- keeps scores for at most 4096 peers, forgetting the least recently raised first (a peer only ever lowered goes
+  before any raised); a peer without a score scores 0, so forgetting is always safe;
+- saves them, with wall-clock times, a time in the future when loaded counting as now.
+
+**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in
+server mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock
+times; one in the future when loaded counts as now). Identities generated next to a key can't be old ones, so
+among the servers near a key, those first heard at least `provider_seniority` ago were there before any such
+identity was made for it; the log gives the `K` closest of them to a key. It is local state: nothing about it is
+sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting the least
+recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only servers
+silent longer than every one of them; announces are recorded in memory and written together every 30 s.
 
 **Publishing.**
 - For each key, find the `K` closest nodes. Then send each node the keys it should store, in as few `/provide`
@@ -1886,7 +1935,7 @@ unreserved, pct-encoded: as in RFC 3986
 | DHT routing table refresh, IP diversity filter | Replaced by RNS announces and failure counting; no IP addresses exist to diversify on, so Sybil resistance rests on seniority (section 6) |
 | DHT key (SHA-256 of the multihash) | SHA-256 of the whole binary CID, truncated to 128 bits, so a raw block and a DAG node with identical bytes stay apart |
 | Reprovider strategies | `roots` (default), `pinned`; `all` dropped to save airtime |
-| Bitswap, multi-source and resumable download | Section 7; providers ranked by seniority, then hops and next-hop bitrate (section 6) |
+| Bitswap, multi-source and resumable download | Section 7; providers ranked by seniority, then local score, hops and next-hop bitrate (section 6) |
 | Bandwidth limits | Upload budget, interface rules and quiet hours for `/blocks` (section 3) |
 | `swarm peers`, `stats bw` | `peers`, `stats` |
 | Pinning, remote pinning, GC, `add --pin=false` | Section 8 (`add --no-pin`) |

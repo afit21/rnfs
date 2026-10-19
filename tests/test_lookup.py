@@ -3,6 +3,7 @@ import random
 import threading
 import time
 import unittest
+from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
@@ -303,6 +304,52 @@ class FailureTest(LookupTestCase):
         net.add(banned)
         self.lookup(net, ident(3), [a], exclude=lambda n: n == banned).find_closest()
         self.assertEqual(net.queried, [a])
+
+
+class UsefulAnswerTest(LookupTestCase):
+    """on_useful (local scores): an answer naming a node closer to the key that then answers proved useful."""
+
+    def test_answers_leading_closer_are_useful_once_per_lookup(self):
+        net = self.network()
+        key = ident(0x100)
+        far, mid, near, made_up = ident(0xF000), ident(0x1F00), ident(0x101), ident(0x102)
+        net.add(far, knows=[mid, made_up])
+        net.add(mid, knows=[near, far])
+        net.add(near)
+        useful = []
+        lookup = self.lookup(net, key, [far], own_id=ident(1), on_useful=useful.append, alpha=1)
+        lookup.find_closest()
+        # far named mid and made_up: mid answered and is closer, so far counts (once, though it named two);
+        # mid named near, which answered. made_up never answered, and near named nobody
+        self.assertEqual(sorted(useful), sorted([far, mid]))
+        lookup.find_closest()  # a second run of the same lookup credits nobody again
+        self.assertEqual(sorted(useful), sorted([far, mid]))
+
+    def test_naming_only_farther_nodes_is_not_useful(self):
+        net = self.network()
+        key = ident(0x100)
+        near, farther = ident(0x101), ident(0xF000)
+        net.add(near, knows=[farther])
+        net.add(farther)
+        useful = []
+        self.lookup(net, key, [near], own_id=ident(1), on_useful=useful.append).find_closest()
+        self.assertEqual(useful, [])
+
+    def test_a_failing_callback_does_not_end_the_lookup(self):
+        net = self.network()
+        key = ident(0x100)
+        far, near = ident(0xF000), ident(0x101)
+        net.add(far, knows=[near])
+        net.add(near)
+
+        def broken(node_id: bytes):
+            """A callback with a bug."""
+            raise RuntimeError("boom")
+
+        with mock.patch("rnfs.log.log") as log:
+            result = self.lookup(net, key, [far], own_id=ident(1), on_useful=broken).find_closest()
+        self.assertEqual(result, [near, far])
+        self.assertIn("RuntimeError('boom')", log.call_args.args[0])
 
 
 class UnknownIdTest(LookupTestCase):
