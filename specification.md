@@ -733,8 +733,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   When it fires, two *rings* count: the servers ranked after the core's last rank, and the servers beyond the radius
   rho = K × 2^128 / (T × N), where `K` honest servers would be expected whatever was placed (the radius doesn't
   depend on how many identities a node happened to learn of, so publisher and searcher agree on it). Unreliable
-  servers come last within a ring. In simulation it fired on about 4% of lookups without an attack, and on nearly
-  every one next to identities placed closer than every honest server.
+  servers come last within a ring. In simulation it fired on about 4% of lookups without an attack (2–6% over the
+  fake network of `tests/test_eclipse.py`), and on nearly every one next to identities placed closer than every
+  honest server.
 - **Disjoint paths** (S/Kademlia). d lookups for one key that share no node: the start nodes (and senior servers)
   are dealt to the paths in turn, a path claims each node before querying it, drops one another path claimed first,
   and ignores such nodes in replies. Identities that answer with each other can steer one path, but once it has
@@ -759,11 +760,15 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 - **Cost.** In the eclipse simulation (fast nodes, alpha 3): +0.33 `/find` per search on average (false positives),
   about +25 messages per publish (+8 on slow nodes, d = 2), once per republish; a search for content nobody provides
   pays the fallback, about 2.5–3 times a normal lookup on top of it (10,000 servers: 8.1 + 24.3 `/find`; slow
-  nodes 5.0 + 14.4).
+  nodes 5.0 + 14.4). Over the fake network of `tests/test_eclipse.py` (2,000 servers): +0.51 `/find` per search
+  (+0.16 slow), +17.3 `/find` and +3.2 stores per publish of one key (+5.4 and +2.5 slow), 29.6 `/find` against 6.9
+  for a search for content nobody provides (13.5 against 4.2 slow); with sweep providing, 3,000 keys on 1,000
+  servers took 0.65 `/find` and 13.0 stores a key against 0.22 and 10, and 18 widened lookups beside 82 regions.
 - **What it buys.** In the eclipse simulation (10–50 identities a key, fresh or pre-aged, placed tight, in the
   `K`-th closest's radius or diluted under T): found 98.9% of the time on fast nodes (worst case 93%) and 90.8% on
-  slow ones (worst 59%), against 35–42% for 0.1.x nodes. A publisher's upgrade matters most: popular content, which
-  many provide, is protected once one of its publishers has upgraded; a 0.1.x searcher finds what such a publisher
+  slow ones (worst 59%), against 35–42% for 0.1.x nodes; over the fake network, 10 or 20 identities closer than
+  every honest server: 99–100% against 0%. A publisher's upgrade matters most: popular content, which many
+  provide, is protected once one of its publishers has upgraded; a 0.1.x searcher finds what such a publisher
   stored beyond the identities only when its lookup happens to pass those servers (simulation: 60–80% against new
   identities, which got into routing tables only where buckets had room, 14–25% against pre-aged ones). The
   announce first-seen log beats identities generated after its servers were heard even for 0.1.x searchers

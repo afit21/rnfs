@@ -320,8 +320,9 @@ The DHT (local behaviour: nothing on the wire changes):
 - **Content is far harder to hide by placing identities next to its key** (spec section 6, "Identities placed next
   to a key"). Ten identities generated closer to a key than every honest server (about 4 s of one core each among
   10,000 servers) hid it almost completely from 0.1.x nodes (found 0–4% of the time); with an upgraded publisher
-  and searcher it is found 98.9% of the time on fast nodes and 90.8% on slow ones across every attack of the
-  eclipse simulation. Four local mechanisms, nothing on the wire changed:
+  and searcher it is found 99–100% of the time over the fake network of `tests/test_eclipse.py` (98.9% on fast
+  nodes and 90.8% on slow ones across every attack of the eclipse simulation). Four local mechanisms, nothing on
+  the wire changed:
   - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
     lookups for other keys, kept in the state database's `meta` table so a restart has it at once (the density
     check waits for 8);
@@ -335,12 +336,13 @@ The DHT (local behaviour: nothing on the wire changes):
   - searches also wait for the 3 closest of the 10 servers nearest the key that the announce first-seen log heard
     at least `provider_seniority` ago (none extra without an attack: they are the closest anyway).
 
-  The cost (eclipse simulation): a little more traffic per publish (about 25 more messages on fast nodes, 8 on slow
-  ones, once per republish), +0.3 `/find` per search on average (the density check fires on about 4% of searches
-  without an attack), and a search for content nobody provides pays the fallback, about 2.5–3 times a normal
-  lookup more. A slow node paces that fallback like its publish lookups (it counts as 2 of a round's lookups and
-  runs only if the pacing allows within the lookup's time), and counts widened lookups among its round's 10 (a
-  flagged key that doesn't fit waits for the next round).
+  The cost: a little more traffic per publish (over the fake network of 2,000 servers, +17 `/find` and +3 stores
+  to publish one key, once per republish; with sweep providing about 0.65 `/find` and 13 stores a key instead of
+  0.22 and 10), +0.2 to +0.5 `/find` per search on average (the density check fires on 2–6% of searches without an
+  attack), and a search for content nobody provides now costs about 4 times as much (30 `/find` instead of 7: the
+  fallback). A slow node paces that fallback like its publish lookups (it counts as 2 of a round's lookups and runs
+  only if the pacing allows within the lookup's time), and counts widened lookups among its round's 10 (a flagged
+  key that doesn't fit waits for the next round).
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
