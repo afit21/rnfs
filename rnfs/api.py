@@ -118,7 +118,10 @@ Security:
   pass); its proof is keyed by the app's verifier (apiclient.app_proof_key), and none is sent for an app there
   isn't. ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal.
   An app's token does everything the API token does but manage apps: the /api/apps routes (CLI_ROUTES) answer it
-  403 `forbidden`.
+  403 `forbidden`. The routes that pin or release for the caller (add, add/stream, dir/set, dir/rm, pin/add,
+  pin/rm, import, import/stream, and the pin, add and import jobs) use source "user" for the CLI and
+  "app:<name>" for an app, "app:<name>:<key>" with `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a
+  pin key is refused, 400): an app's pin rm releases only its own.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
   error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
@@ -146,9 +149,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from rnfs import __version__, events, fsutil, ids
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
-from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PIN_KEY_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
-from rnfs.content.storage import APP_PREFIX, check_app_name
+from rnfs.content.storage import APP_PREFIX, app_source, check_app_name
 from rnfs.errors import CODES, STATUSES, BlockMismatch, Busy, Unsupported, error_code
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_WARNING, log
 
@@ -785,6 +788,18 @@ class ApiHandler(TimedHandler):
         apps = getattr(self.node, "apps", None)
         return apps.proof_key(app.strip()) if apps is not None else None
 
+    def pin_source(self) -> dict:
+        """The source the routes that pin or release for the caller use, as the facade's keyword argument: {} for
+        the CLI (the facade's "user"), {"source": "app:<name>"} for an app, or "app:<name>:<key>" with
+        X-Rnfs-Pin-Key. ValueError for a pin key with the CLI's token, or one that isn't valid."""
+        key = self.headers.get(PIN_KEY_HEADER)
+        key = None if key is None else key.strip()
+        if self.principal is None or not self.principal.startswith(APP_PREFIX):
+            if key is not None:
+                raise ValueError(f"{PIN_KEY_HEADER} is for apps: the CLI's pins are always user's")
+            return {}
+        return {"source": app_source(self.principal[len(APP_PREFIX):], key)}
+
     # Responses
 
     def send_common_headers(self):
@@ -1146,19 +1161,22 @@ class ApiHandler(TimedHandler):
 
     def api_add(self):
         """POST /api/add: import a file or directory on this machine (parameters: the module docstring's table)."""
+        source = self.pin_source()
         body = self.json_body()
         self.send_json(200, self.node.add_path(parse_path(body.get("path")), wrap=parse_bool(body.get("wrap")),
                                                only_hash=parse_bool(body.get("only_hash")),
-                                               **node_content.add_options(body.get)))  # pin, to, chunker…
+                                               **node_content.add_options(body.get), **source))  # pin, to, chunker…
 
     def api_add_stream(self):
         """POST /api/add/stream: import the request body, wrapped as name if given (parameters: the module
         docstring's table)."""
+        source = self.pin_source()  # refused before the body is read
         reader = self.stream_reader()
         size = None if reader.chunked else reader.remaining
         name = self.param("name", False) or None
         only_hash = parse_bool(self.param("only_hash", False) or "")
         options = node_content.add_options(lambda key: self.param(key, False), stream=True)  # pin, to, seal_name…
+        options.update(source)
         stream_format = self.param("format", False)
         if stream_format is None:
             self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
@@ -1181,25 +1199,32 @@ class ApiHandler(TimedHandler):
                                           from_node=from_node, **options))
 
     def api_dir_set(self):
-        """POST /api/dir/set {"target", "name", "cid", "executable"}: a new directory with an entry set."""
+        """POST /api/dir/set {"target", "name", "cid", "executable"}: a new directory with an entry set, pinned
+        with the caller's source."""
+        source = self.pin_source()
         body = self.json_body()
         name = body.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("an entry name is required")
         self.send_json(200, self.node.dir_set(parse_target(body.get("target")), name, parse_cid(body.get("cid")),
-                                              executable=parse_bool(body.get("executable"))))
+                                              executable=parse_bool(body.get("executable")), **source))
 
     def api_dir_rm(self):
-        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one)."""
-        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target"))))
+        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one),
+        pinned with the caller's source."""
+        source = self.pin_source()
+        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target")), **source))
 
     def api_pin_add(self):
-        """POST /api/pin/add {"target"}: fetch and pin with source user; answers once complete."""
-        self.send_json(200, self.node.pin_add(parse_target(self.json_body().get("target"))))
+        """POST /api/pin/add {"target"}: fetch and pin with the caller's source (user, or an app's); answers once
+        complete."""
+        source = self.pin_source()
+        self.send_json(200, self.node.pin_add(parse_target(self.json_body().get("target")), **source))
 
     def api_pin_rm(self):
-        """POST /api/pin/rm {"cid"}: remove the user source."""
-        self.node.pin_rm(parse_cid(self.json_body().get("cid")))
+        """POST /api/pin/rm {"cid"}: remove the caller's source (user, or an app's own)."""
+        source = self.pin_source()
+        self.node.pin_rm(parse_cid(self.json_body().get("cid")), **source)
         self.send_json(200, {})
 
     def api_pin_label(self):
@@ -1265,12 +1290,16 @@ class ApiHandler(TimedHandler):
         self.send_json(200, self.node.export(parse_target(body.get("target")), parse_path(body.get("output"))))
 
     def api_import(self):
-        """POST /api/import {"path"}: import an archive from a path on this machine."""
-        self.send_json(200, self.node.import_archive(parse_path(self.json_body().get("path"))))
+        """POST /api/import {"path"}: import an archive from a path on this machine, its roots pinned with the
+        caller's source."""
+        source = self.pin_source()
+        self.send_json(200, self.node.import_archive(parse_path(self.json_body().get("path")), **source))
 
     def api_import_stream(self):
-        """POST /api/import/stream: import the archive the request body holds, read to its end."""
-        self.send_json(200, self.node.import_stream(self.stream_reader()))
+        """POST /api/import/stream: import the archive the request body holds, read to its end, its roots pinned
+        with the caller's source."""
+        source = self.pin_source()  # refused before the body is read
+        self.send_json(200, self.node.import_stream(self.stream_reader(), **source))
 
     # Capabilities, events, shutdown
 

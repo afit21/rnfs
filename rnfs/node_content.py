@@ -1,6 +1,6 @@
 """The node's side of the "content" features (rnfs/node.py calls these; logic kept out of the shared file):
 
-- `add --no-pin`: what was added is kept as a cached fetch instead of a "user" pin (keep_added).
+- `add --no-pin`: what was added is kept as a cached fetch instead of a pin (keep_added; "user", or an app's).
 - Sealed files (rnfs/content/seal.py): resolving recipients to public keys, sealing a file being added,
   and opening a sealed target with the node's identity for get, cat and info. Sealed folders: a folder being
   added is sealed as one tar named `<folder>.tar`, marked as a sealed folder (add_sealed_path), and get unpacks a
@@ -23,11 +23,12 @@ from rnfs.content.storage import USER
 from rnfs.errors import Denied, InvalidDag, NotFound
 
 
-def keep_added(node, cid: Cid, pin: bool):
-    """Keep what was just added (inside the add's protection session): a "user" pin, or for add --no-pin a
-    cached fetch of it, evicted LRU like any other and, under the roots strategy, provided while cached."""
+def keep_added(node, cid: Cid, pin: bool, source: str = USER):
+    """Keep what was just added (inside the add's protection session): a pin with source ("user", or the app's
+    whose token added it), or for add --no-pin a cached fetch of it, evicted LRU like any other and, under the
+    roots strategy, provided while cached."""
     if pin:
-        node.storage.pin(cid, USER)
+        node.storage.pin(cid, source)
         return
     dropped = node.storage.record_fetch(cid, [], cid)
     node._note_fetched(cid)

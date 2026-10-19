@@ -394,7 +394,10 @@ class _JobPoller:
 
 class Rnfs:
     """What rnfs.Node and rnfs.Client both offer (design.md, "Public API"). Subclasses supply the backend and how
-    name records are heard; see the module docstring for targets and callbacks. Thread-safe."""
+    name records are heard; see the module docstring for targets and callbacks. Thread-safe.
+
+    Pins made and released here are "user"'s, but those of an app's Client (rnfs.Client(app=...)), which are the
+    app's own: app:<app>, or app:<app>:<key> inside its pin_key(key)."""
 
     events_thread = "rnfs-events"
     jobs_thread = "rnfs-job-watch"

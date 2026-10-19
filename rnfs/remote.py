@@ -56,7 +56,9 @@ class Client(interface.Rnfs):
     Raises SettingsError if rnfs.toml can't be read for the port.
 
     As an app (rnfs 0.2.0): app is the name `rnfs app add` was given, and its token is token, or in token_file.
-    ValueError for an app without its token."""
+    Pins it makes are then app:<app>'s (add, pin, dir_set, dir_rm, import_archive, import_stream, add_tar and
+    those jobs), and unpin releases only those; pin_key(key) makes them app:<app>:<key>'s for one thread's calls
+    inside it. ValueError for an app without its token."""
 
     events_thread = "rnfs-client-events"
     jobs_thread = "rnfs-client-job-watch"
@@ -85,6 +87,13 @@ class Client(interface.Rnfs):
         """The API connection underneath, whose get(path, **params) and post(path, **fields) reach every endpoint.
         Unsupported: it changes with any release."""
         return self._api
+
+    def pin_key(self, key: str | None):
+        """A context manager: the pins this app makes and releases in this thread's calls inside it are
+        app:<app>:<key>'s, a group of its own it can hold and release apart (None: app:<app>'s). ValueError for a
+        client that isn't an app's (app=); the daemon refuses a key that isn't 1-128 of A-Z, a-z, 0-9, ".", "_",
+        ":" and "-" (BadRequest). rnfs.Node has none: its pins are the user's."""
+        return self._api.pin_key(key)
 
     def _report(self, message: str):
         """Log through Python's logging (logger "rnfs"), escaped: the daemon's message can quote names from

@@ -10,7 +10,8 @@ Standard library only, and it never imports RNS, so a program using it starts qu
 - An app (rnfs app add; 0.2.0) uses its own token instead, given (token=) or in a file it names (token_file=,
   checked as api_token is), and names itself (app=) in `X-Rnfs-App` on every request: the proof is then keyed
   by its token's verifier (app_proof_key), which is what the daemon keeps of it. An app's token is not scoped:
-  it does all the CLI's does but manage apps.
+  it does all the CLI's does but manage apps. Its pins get the source app:<app>, or app:<app>:<key> for the
+  requests made inside pin_key(key) (PIN_KEY_HEADER).
 - Before sending the token, the client makes whatever listens on the API port prove it knows it (api_proof,
   verify_daemon), since while the daemon is down any local user could listen there. Nothing else is sent to a
   listener that fails: neither the token nor a request's body. Nor is anything it answers believed: whatever its
@@ -70,6 +71,8 @@ API_HEADER = "X-Rnfs-Api"
 # An app's requests (rnfs app add; rnfs 0.2.0) name it, and carry its token in API_HEADER: the daemon then checks
 # that token, keys the proof with it (app_proof_key) and gives the app's pins its source (rnfs.apps)
 APP_HEADER = "X-Rnfs-App"
+# An app's request may name a group of its pins: they are then pinned and released as app:<app>:<key>
+PIN_KEY_HEADER = "X-Rnfs-Pin-Key"
 # Before sending the token, a client makes whatever listens on the API port prove it knows it (api_proof)
 CHALLENGE_HEADER = "X-Rnfs-Challenge"
 PROOF_HEADER = "X-Rnfs-Proof"
@@ -467,7 +470,7 @@ class ApiConnection:
         self._given_token = token.strip() if token is not None else None  # never read again from a file
         self.token_file = token_path(rnfs_dir) if token_file is None and token is None else token_file
         self.timeout = timeout  # each request's, unless the thread or the call gives another
-        self._local = threading.local()  # .timeout: this thread's, inside using_timeout()
+        self._local = threading.local()  # .timeout: this thread's, inside using_timeout(); .pin_key, pin_key()
         self.token: str | None = None  # the token read last, once a daemon has proved it knows it
         self.daemon_version: str | None = None  # what the daemon said in the last proof request
 
@@ -494,9 +497,30 @@ class ApiConnection:
         finally:
             self._local.timeout = previous
 
+    @contextlib.contextmanager
+    def pin_key(self, key: str | None):
+        """A context manager: requests this thread makes inside it carry key as X-Rnfs-Pin-Key, so the pins this
+        app makes and releases in them (add, pin, dir set/rm, import, and those jobs) are app:<app>:<key>'s, a group
+        of its own (None: app:<app>'s, as outside). Thread-local and nesting, as using_timeout. ValueError unless
+        this connection is an app's, or for a key that isn't a non-empty string (the daemon checks its characters:
+        BadRequest)."""
+        if self.app is None:
+            raise ValueError("a pin key is for apps (app=): the CLI's pins are always user's")
+        if key is not None and (not isinstance(key, str) or not key):
+            raise ValueError(f"a pin key is a non-empty string, not {key!r}")
+        previous = getattr(self._local, "pin_key", None)
+        self._local.pin_key = key
+        try:
+            yield self
+        finally:
+            self._local.pin_key = previous
+
     def _identity_headers(self) -> dict:
-        """The headers naming who calls: X-Rnfs-App for an app."""
-        return {APP_HEADER: self.app} if self.app is not None else {}
+        """The headers naming who calls: X-Rnfs-App for an app, with its pin key inside pin_key()."""
+        if self.app is None:
+            return {}
+        key = getattr(self._local, "pin_key", None)
+        return {APP_HEADER: self.app, **({PIN_KEY_HEADER: key} if key is not None else {})}
 
     # The protocol
 
@@ -899,7 +923,7 @@ class ApiConnection:
         return self.post("/api/pin/add", target=target)
 
     def pin_rm(self, cid: str):
-        """Remove the user pin of cid (NotFound if it has none)."""
+        """Remove the user pin of cid, or an app's own (app:<app>, or its pin_key's): NotFound if it has none."""
         self.post("/api/pin/rm", cid=cid)
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:

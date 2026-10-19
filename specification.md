@@ -825,9 +825,11 @@ and repeat.
   `app:lxmf:<address>` (and those of an older version's `pins.json` as it is imported). An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
   starting with a letter or digit (so never `:`), and a key 1–128 of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
   A pin lasts while any source holds it.
-- `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
+- `pin rm` removes only its caller's source: `user` for the CLI, and for an app only its own (`app:<app>`, or
+  `app:<app>:<key>` with its pin key; section 11). Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
-  a followed name's newer target once that is complete; removing the LXMF messages that hold it.
+  a followed name's newer target once that is complete; removing the LXMF messages that hold it; removing the
+  app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
 - Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
   names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
   `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
@@ -1375,10 +1377,19 @@ gateway can never reach the API.
   `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
   a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
   change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
-  that far. Removing an app revokes its token at once. Only the CLI's token manages apps (rnfs: `GET /api/apps`,
+  that far. Removing an app revokes its token at once, cancels its queued and running jobs and releases every
+  pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
+  CLI's token manages apps (rnfs: `GET /api/apps`,
   `POST /api/apps/add {"name"}`, which answers the token, the only time it is given, and `POST /api/apps/rm
   {"name"}`); an app's token gets `403` with code `forbidden` there. While the LXMF built into rnfs is on, rnfs
   refuses an app called `lxmf`, whose pins (`app:lxmf:`) it would share (section 13).
+- **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
+  `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
+  `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of
+  `user`, or `app:<app>:<key>` when the request carries `X-Rnfs-Pin-Key: <key>` (section 8's key rule; 400
+  otherwise), so an app can hold and release groups of its own. A job keeps the source it was queued with, also
+  across a restart. With the CLI's token a pin key is refused (400): its pins are always `user`'s. `pin ls`
+  shows every pin's sources to every caller.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's. With
   `X-Rnfs-App: <name>` the key is the app's verifier written as 64 lowercase hex digits instead of the token
@@ -1516,7 +1527,8 @@ gateway can never reach the API.
 
 **Background jobs.** A node MAY run long transfers as *jobs* it owns, so a transfer doesn't depend on one API
 request or terminal staying open. A job has a kind — `get` (fetch a target and write it to an output path,
-optionally from one node), `pin` (fetch a target completely and pin it with source `user`), `export`
+optionally from one node), `pin` (fetch a target completely and pin it with source `user`, or the app's that
+queued it: App tokens, above), `export`
 (write an archive of a target to an output path), `add` (add a file or directory at a path on the node's
 machine, with `POST /api/add`'s options) or `import` (import an archive at such a path) — and a state: `queued`,
 `running`, `done`, `failed` or `cancelled`. Its result, when done, MUST be what the equivalent API call returns
