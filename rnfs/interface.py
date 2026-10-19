@@ -42,7 +42,8 @@ from rnfs.events import EVENT_KINDS
 from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
 from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
                           Exported, Followed, Imported, Info, Kept, LxmfAddress, Message, Outgoing, Peer, Pin, Record,
-                          Sent, Settings, SettingsChange, Stat, Stats, Status, Synced, Uncached, Verified, Written)
+                          RemotePin, Sent, ServedPins, Settings, SettingsChange, Stat, Stats, Status, Synced,
+                          Uncached, Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
@@ -394,7 +395,10 @@ class _JobPoller:
 
 class Rnfs:
     """What rnfs.Node and rnfs.Client both offer (design.md, "Public API"). Subclasses supply the backend and how
-    name records are heard; see the module docstring for targets and callbacks. Thread-safe."""
+    name records are heard; see the module docstring for targets and callbacks. Thread-safe.
+
+    Pins made and released here are "user"'s, but those of an app's Client (rnfs.Client(app=...)), which are the
+    app's own: app:<app>, or app:<app>:<key> inside its pin_key(key)."""
 
     events_thread = "rnfs-events"
     jobs_thread = "rnfs-job-watch"
@@ -617,14 +621,16 @@ class Rnfs:
                    "identify": bool(identify)}
         return Added.from_dict(self._backend.add_nomadnet(link, **options))
 
-    def get(self, target, output, *, from_node=None, raw: bool = False) -> Written:
+    def get(self, target, output, *, from_node=None, raw: bool = False, no_extract: bool = False) -> Written:
         """Fetch a file or directory and write it to output (a path that must not exist), all in this call. A
-        sealed file this node can open is decrypted unless raw. Raises the fetch errors (NotFound, TooLarge,
-        InvalidDag, Denied, StorageFull, Busy), ValueError (output exists), OSError."""
+        sealed file this node can open is decrypted unless raw, and a sealed folder (as add seals a folder; a tar
+        sealed as a file stays one) unpacked to a directory unless no_extract (Written.extracted; a daemon older than 0.2.0 never unpacks).
+        Raises the fetch errors (NotFound, TooLarge, InvalidDag, Denied, StorageFull, Busy), ValueError (output
+        exists), OSError."""
         self._check()
         text, hint = self._target(target)
         output = _abspath(output)
-        result = self._backend.get(text, output, self._from(from_node, hint), raw)
+        result = self._backend.get(text, output, self._from(from_node, hint), raw, no_extract)
         return Written.from_dict({**result, "output": output})
 
     def open(self, target, *, from_node=None, raw: bool = False) -> "File":
@@ -705,9 +711,25 @@ class Rnfs:
         return Pin.from_dict(self._backend.pin_label(str(cid), label))
 
     def pin_remote(self, node_id, cid, pin: bool = True) -> bool:
-        """Ask node_id to pin (or release this node's pin of) cid; True if it accepted."""
+        """Ask node_id to pin (or release this node's pin of) cid; True if it accepted. Recorded for remote_pins()."""
         self._check()
         return bool(self._backend.pin_remote(node_hex(node_id), str(cid), pin))
+
+    def remote_pins(self, node_id=None, cid=None, *, check: bool = False) -> list[RemotePin]:
+        """The remote pins this node asked for (node_id's, cid's, or every one), most recently asked first, and
+        whether each is done: inferred from provider records, so it lags the node's publishing. check: check them
+        first, a provider lookup each (paced: at most 32 a call, 4 on a slow node, none checked in the last minute).
+        Pins asked before rnfs 0.2.0 aren't listed. Raises NoSuchEndpoint from an older daemon."""
+        self._check()
+        entries = self._backend.pin_remote_ls(node_hex(node_id), str(cid) if cid is not None else None, check)
+        return [RemotePin.from_dict(entry) for entry in entries]
+
+    def served_pins(self) -> ServedPins:
+        """The remote pins other identities asked of this node (pinned, waiting, fetching, and the latest outcomes
+        of the others: dropped and why, refused, released) and each identity's use of remote_pin_quota. Raises
+        NoSuchEndpoint from an older daemon."""
+        self._check()
+        return ServedPins.from_dict(self._backend.pin_remote_served())
 
     def gc(self) -> Collected:
         """Evict every cached fetch and delete unreachable blocks."""
@@ -1211,7 +1233,7 @@ class Job:
     its record as of the last refresh(), wait() or callback. done is True once it has finished (state "done",
     "failed" or "cancelled"); result is what the matching call returns, error why it failed. An add or import job
     has a path (and an add its options) instead of a target; an add of a NomadNet link has that link (nomadnet)
-    instead of a path."""
+    instead of a path. source is what a pin, add or import job pins with ("user", or the app's that queued it)."""
 
     id: str
     kind: str
@@ -1222,6 +1244,8 @@ class Job:
     fallback_dht: bool = False
     path: str | None = None
     options: dict | None = None
+    no_extract: bool = False
+    source: str = "user"
     nomadnet: str | None = None
     state: str = "queued"
     created: float | None = None
@@ -1239,8 +1263,8 @@ class Job:
     eta: float | None = None
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
-    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "nomadnet", "state",
-              "created", "started",
+    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "no_extract",
+              "source", "nomadnet", "state", "created", "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
               "downloaded_bytes", "rate", "eta")
 
@@ -1297,12 +1321,14 @@ class Jobs:
         self._owner = owner
 
     def get(self, target, output, *, from_node=None, sealed_name: bool = False, fallback_dht: bool = False,
-            on_progress=None) -> Job:
+            on_progress=None, no_extract: bool = False) -> Job:
         """Fetch target and write it to output (which must not exist) as a job. sealed_name writes a sealed
-        file this node opens under its sealed name in output's directory; fallback_dht retries by DHT discovery
-        if from_node fails. on_progress(job) as Job.watch. Raises ValueError (output exists or in use), Busy."""
+        file this node opens under its sealed name in output's directory (a sealed folder unpacked: under the
+        name of the directory written); fallback_dht retries by DHT discovery if from_node fails; no_extract
+        writes a sealed folder as its tar instead of unpacking it. on_progress(job) as Job.watch. Raises
+        ValueError (output exists or in use), Busy."""
         return self._submit("get", target, _abspath(output), from_node, on_progress, sealed_name=sealed_name,
-                            fallback_dht=fallback_dht)
+                            fallback_dht=fallback_dht, no_extract=no_extract)
 
     def pin(self, target, *, on_progress=None) -> Job:
         """Fetch target completely and pin it "user", as a job."""

@@ -63,13 +63,13 @@ class RemovedAutoSenderTest(test_lxmf.FeatureTestCase):
         again = self.restart_without_sender()
         again.process_auto_fetches()
         # FEAT-4: fails until a removed sender's queued links are refused rather than fetched
-        self.assertNotIn(f"lxmf:{SENDER.hex()}", self.b.storage.pins().get(self.target, set()),
+        self.assertNotIn(f"app:lxmf:{SENDER.hex()}", self.b.storage.pins().get(self.target, set()),
                          "a removed sender's queued link was fetched and pinned after the restart")
         self.assertEqual(self.state(again, self.removed)["state"], "refused")
         self.assertIn("lxmf_auto_fetch_from", self.state(again, self.removed)["error"])
         # A sender still listed is fetched as before
         self.assertEqual(self.state(again, self.kept)["state"], "pinned")
-        self.assertIn(f"lxmf:{OTHER.hex()}", self.b.storage.pins()[self.target])
+        self.assertIn(f"app:lxmf:{OTHER.hex()}", self.b.storage.pins()[self.target])
 
     def test_refused_with_lxmf_off(self):
         # Nothing is fetched with LXMF off, but the record mustn't stay "queued" (protected like a pin)
@@ -93,7 +93,7 @@ class RemovedAutoSenderTest(test_lxmf.FeatureTestCase):
         self.feature.auto_fetch_from.discard(SENDER.hex())
         self.feature.process_auto_fetches()
         self.assertEqual(self.state(self.feature, self.removed)["state"], "refused")
-        self.assertNotIn(f"lxmf:{SENDER.hex()}", self.b.storage.pins().get(self.target, set()))
+        self.assertNotIn(f"app:lxmf:{SENDER.hex()}", self.b.storage.pins().get(self.target, set()))
         self.assertEqual(self.state(self.feature, self.kept)["state"], "pinned")
 
 

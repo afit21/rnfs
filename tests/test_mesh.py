@@ -63,7 +63,7 @@ def paths(table: dict) -> callable:
 # Provider choice
 
 class ProviderRankTest(unittest.TestCase):
-    """mesh.provider_rank: seniority, then hops, then bitrate (unknown last), then order."""
+    """mesh.provider_rank: seniority, then local score band, then hops, then bitrate (unknown last), then order."""
 
     def test_order(self):
         cases = {
@@ -76,6 +76,20 @@ class ProviderRankTest(unittest.TestCase):
         }
         ranked = sorted(cases, key=lambda name: mesh.provider_rank(*cases[name]))
         self.assertEqual(ranked, ["senior far", "near fast", "near slow", "near unknown bitrate", "far", "unknown"])
+
+    def test_score_orders_within_each_seniority_group_before_hops(self):
+        near, far = mesh.PathInfo(hops=1), mesh.PathInfo(hops=6)
+        cases = {
+            "senior far unscored": (True, far, 5, 0),
+            "senior near badly scored": (True, near, 0, -2),
+            "senior far well scored": (True, far, 4, 3),
+            "new near best scored": (False, near, 1, 7),
+            "new far scored": (False, far, 2, 1),
+            "new near unscored": (False, near, 3, 0),
+        }
+        ranked = sorted(cases, key=lambda name: mesh.provider_rank(*cases[name]))
+        self.assertEqual(ranked, ["senior far well scored", "senior far unscored", "senior near badly scored",
+                                  "new near best scored", "new far scored", "new near unscored"])
 
     def test_nothing_known_keeps_reply_order(self):
         self.assertLess(mesh.provider_rank(False, mesh.NO_PATH, 0), mesh.provider_rank(False, mesh.NO_PATH, 1))

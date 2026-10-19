@@ -1,8 +1,9 @@
 """Being considerate on shared radio meshes (the mesh feature: specification.md section 3, upload budget,
 interface rules and quiet hours; design.md, "Mesh").
 
-- Provider choice: within each seniority group, providers fewer hops away are tried first, then those whose
-  next hop goes out on a faster interface (provider_rank). RNS is reached only through RnsPaths, which the
+- Provider choice: within each seniority group, providers with a better local score (its band, rnfs.dht.scores)
+  are tried first, then those fewer hops away, then those whose next hop goes out on a faster interface
+  (provider_rank). RNS is reached only through RnsPaths, which the
   node hands to the fetcher as path_info, so the fetcher stays testable without RNS.
 - Airtime controls for /blocks (AirtimePolicy): a node-wide upload budget (a token bucket), interface rules
   and quiet hours. /find, /provide and /pin are tiny and never refused by them.
@@ -71,12 +72,13 @@ def no_path_info(node_id: bytes) -> PathInfo:
     return NO_PATH
 
 
-def provider_rank(senior: bool, path: PathInfo, order: int) -> tuple:
-    """Sort key for providers: senior first; then fewer hops, then a faster next-hop interface (unknown
-    last for both); then the order they were found in."""
+def provider_rank(senior: bool, path: PathInfo, order: int, score_band: int = 0) -> tuple:
+    """Sort key for providers: senior first (seniority stays the first key: a score can be earned quickly by
+    serving popular blocks, an age can't); then a higher local score band; then fewer hops, then a faster
+    next-hop interface (unknown last for both); then the order they were found in."""
     hops = path.hops if path.hops is not None else math.inf
     bitrate = -path.bitrate if path.bitrate else math.inf
-    return (0 if senior else 1, hops, bitrate, order)
+    return (0 if senior else 1, -score_band, hops, bitrate, order)
 
 
 class RnsPaths:

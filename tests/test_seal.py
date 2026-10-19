@@ -349,8 +349,11 @@ class NodeSealTest(unittest.TestCase):
     def test_refusals(self):
         directory = os.path.join(self.tmp.name, "dir")
         os.mkdir(directory)
-        with self.assertRaisesRegex(ValueError, "single files"):
-            self.a.add_path(directory, to_self=True)
+        # A folder is sealed as one tar (tests/test_sealed_folders.py), but only under its name
+        with self.assertRaisesRegex(ValueError, "no-sealed-name"):
+            self.a.add_path(directory, to_self=True, seal_name=False)
+        with self.assertRaisesRegex(ValueError, "only-hash"):
+            self.a.add_path(directory, to_self=True, only_hash=True)
         with self.assertRaisesRegex(ValueError, "only-hash"):
             self.a.add_stream(io.BytesIO(b"x"), to_self=True, only_hash=True)
 

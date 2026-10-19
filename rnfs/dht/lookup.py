@@ -78,6 +78,8 @@ class Lookup:
     - `unreliable(id)`: nodes to avoid, checked when a run learns of them; `may_retry(id)`: True if an
       unreliable node is due to be asked again, claiming that retry (both the routing table's).
     - `max_queries`: queries one run sends at most, retries included.
+    - `on_useful(id)`: a node whose answer proved useful: it named a node closer to the key than itself that then
+      answered (local scores, section 6). Called from the running thread, at most once per node per lookup.
 
     A Lookup may be run again (find_providers after every provider failed): each run re-queries the nodes,
     so /find replies give a fresh random half of providers, within the same deadline and unknown-ID budget.
@@ -90,7 +92,8 @@ class Lookup:
                  on_failure: NodeCallback = _ignore, exclude: Callable[[bytes], bool] = _never,
                  clock: Callable[[], float] = time.monotonic, poll_interval: float = _POLL_INTERVAL,
                  report: Callable[[str], None] = _quiet, unreliable: Callable[[bytes], bool] = _never,
-                 may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES):
+                 may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES,
+                 on_useful: NodeCallback = _ignore):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -109,6 +112,8 @@ class Lookup:
         self.unreliable = unreliable
         self.may_retry = may_retry
         self.max_queries = max(1, max_queries)
+        self.on_useful = on_useful
+        self._useful: set[bytes] = set()  # nodes passed to on_useful, in any run
         self.deadline: float | None = None
         self._failed: set[bytes] = set()  # didn't answer: dropped for the rest of the lookup
         self._answered: set[bytes] = set()  # answered in any run
@@ -243,6 +248,7 @@ class Lookup:
         retrying: set[bytes] = set()  # unreliable nodes asked again on top of alpha, which nothing waits for
         passed: set[bytes] = set()  # unreliable nodes whose retry wasn't due (or needs a path request)
         found: list[bytes] = []
+        introduced: dict[bytes, bytes] = {}  # node -> the node whose answer first named it, in this run
         in_flight = 0
         retried = 0
         sent = 0  # queries sent by this run, retries included: at most max_queries
@@ -340,6 +346,7 @@ class Lookup:
             doubtful.discard(node_id)
             with self._lock:
                 self._answered.add(node_id)
+            self._credit(introduced.get(node_id), node_id)
             providers, nodes = reply
             if providers:
                 with self._lock:
@@ -349,6 +356,7 @@ class Lookup:
             for new_id in nodes:
                 if new_id not in known and new_id not in queried and self._usable(new_id):
                     known[new_id] = self._distance(new_id)
+                    introduced.setdefault(new_id, node_id)
                     if self.unreliable(new_id):
                         doubtful.add(new_id)
             nearer = self._reach(known)
@@ -369,6 +377,19 @@ class Lookup:
                     + (f", retried {retried} unreliable ({len(retrying)} still out)" if retried else "")
                     + (f"; {len(found)} new providers" if on_provider is not None else ""))
         return found
+
+    def _credit(self, introducer: bytes | None, node_id: bytes):
+        """node_id answered: if introducer named it and it is closer to the key, introducer's answer was useful
+        (an answer of made-up IDs never is, as they don't answer). Once per introducer per lookup."""
+        if introducer is None or introducer in self._useful or self._distance(node_id) >= self._distance(introducer):
+            return
+        self._useful.add(introducer)
+        try:
+            self.on_useful(introducer)
+        except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged
+            from rnfs.log import LOG_WARNING, log
+            log(f"lookup for {self.key.hex()}: the useful-answer callback for {_name(introducer)} raised {e!r}",
+                LOG_WARNING)
 
     def _send(self, node_id: bytes, results: queue.Queue):
         """Query node_id on a worker thread, which reports the outcome and queues it for the run."""

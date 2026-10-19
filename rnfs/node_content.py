@@ -1,13 +1,16 @@
 """The node's side of the "content" features (rnfs/node.py calls these; logic kept out of the shared file):
 
-- `add --no-pin`: what was added is kept as a cached fetch instead of a "user" pin (keep_added).
+- `add --no-pin`: what was added is kept as a cached fetch instead of a pin (keep_added; "user", or an app's).
 - Sealed files (rnfs/content/seal.py): resolving recipients to public keys, sealing a file being added,
-  and opening a sealed target with the node's identity for get, cat and info.
+  and opening a sealed target with the node's identity for get, cat and info. Sealed folders: a folder being
+  added is sealed as one tar named `<folder>.tar`, marked as a sealed folder (add_sealed_path), and get unpacks a
+  sealed `.tar` only with that mark (is_sealed_folder, get_sealed, unpack_sealed).
 - Gateway formats: a CID's own block (?format=raw) and a target's archive streamed with its exact length
   (?format=archive, and GET /api/export/stream); a target as a tar streamed the same way (GET /api/get/stream).
 
 Functions take the RnfsNode first. RNS is imported inside functions: the daemon has loaded it already.
 """
+import itertools
 import os
 import stat
 import time
@@ -20,11 +23,12 @@ from rnfs.content.storage import USER
 from rnfs.errors import Denied, InvalidDag, NotFound
 
 
-def keep_added(node, cid: Cid, pin: bool):
-    """Keep what was just added (inside the add's protection session): a "user" pin, or for add --no-pin a
-    cached fetch of it, evicted LRU like any other and, under the roots strategy, provided while cached."""
+def keep_added(node, cid: Cid, pin: bool, source: str = USER):
+    """Keep what was just added (inside the add's protection session): a pin with source ("user", or the app's
+    whose token added it), or for add --no-pin a cached fetch of it, evicted LRU like any other and, under the
+    roots strategy, provided while cached."""
     if pin:
-        node.storage.pin(cid, USER)
+        node.storage.pin(cid, source)
         return
     dropped = node.storage.record_fetch(cid, [], cid)
     node._note_fetched(cid)
@@ -82,20 +86,61 @@ def sealing_stream(stream: BinaryIO, size: int | None, recipients: list[bytes],
     return seal.SealingReader(stream, recipients, seal_name, size), None
 
 
+TAR_SUFFIX = ".tar"  # a sealed folder's sealed name is the folder's name and this
+
+
+def folder_sealed_name(name: str, seal_name: bool) -> str:
+    """The sealed name of a folder called name: name + TAR_SUFFIX. Raises ValueError if the folder can't be sealed
+    under it, rather than sealing it unnamed as a file with an invalid name is (the name is what makes a recipient's
+    get unpack it): a name that isn't a valid entry name, one over 251 bytes (the sealed name would break the name
+    rules), and seal_name False (--no-sealed-name)."""
+    if not seal_name:
+        raise ValueError(f"--no-sealed-name can't be used with a folder: its sealed name (the folder's name and "
+                         f"{TAR_SUFFIX}) is what tells a recipient's get to unpack it; rename the folder to change it")
+    if not dag.is_valid_name(name):
+        raise ValueError(f"the folder's name {builder.display_path(name)!r} is not valid UTF-8 or breaks the name "
+                         f"rules, so it can't be sealed under it")
+    sealed = name + TAR_SUFFIX
+    if not dag.is_valid_name(sealed):
+        raise ValueError(f"the folder's name is {len(name.encode('utf-8'))} bytes: a sealed folder's name may have "
+                         f"at most {dag.MAX_NAME_BYTES - len(TAR_SUFFIX)} (with {TAR_SUFFIX}, {dag.MAX_NAME_BYTES}); "
+                         f"rename it")
+    return sealed
+
+
 def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes], seal_name: bool,
-                    options: builder.BuildOptions | None = None) -> builder.Built:
-    """Seal the regular file at path and build it (wrapped under its visible name if wrap), with options (the
-    chunker, the deny check of the sealed bytes, builder.build_file; and progress, given the plaintext read)."""
+                    options: builder.BuildOptions | None = None,
+                    max_entries: int = 100_000) -> tuple[builder.Built, list[str]]:
+    """Seal the regular file or folder at path and build it (wrapped under its visible name if wrap), with options
+    (the chunker, the deny check of the sealed bytes, builder.build_file; and progress, given the plaintext read).
+    Returns it and the warnings for what was skipped.
+
+    A folder is packed as one tar (tarstream.folder_chunks: add's rules, everything under the folder's name, at
+    most max_entries files and directories) and sealed as `<folder>.tar` (folder_sealed_name), which is also its
+    visible name with wrap."""
+    from rnfs.content import tarstream
+
     handle, st = builder.open_path(path)
     try:
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError("--to seals single files: put a directory in an archive (e.g. tar) and add that")
         name = os.path.basename(os.path.normpath(os.path.abspath(path)))
+        progress = options.progress if options is not None else None
+        warnings: list[str] = []
+        if stat.S_ISDIR(st.st_mode):
+            sealed_name = folder_sealed_name(name, seal_name)
+            tar = tarstream.IteratorReader(tarstream.folder_chunks(handle, path, name, max_entries, warnings.append,
+                                                                   progress))
+            try:
+                built = builder.add_stream(seal.SealingReader(tar, recipients, sealed_name), put, None,
+                                           sealed_name if wrap else None, options=options)
+            finally:
+                tar.close()
+            return built, warnings
         sealed_name = name if seal_name and dag.is_valid_name(name) else None
         with os.fdopen(handle, "rb", closefd=False) as f:
-            plain = builder.counted(f, options.progress if options is not None else None)
-            return builder.add_stream(seal.SealingReader(plain, recipients, sealed_name), put, None,
-                                      name if wrap else None, options=options)
+            plain = builder.counted(f, progress)
+            built = builder.add_stream(seal.SealingReader(plain, recipients, sealed_name), put, None,
+                                       name if wrap else None, options=options)
+        return built, warnings
     finally:
         builder.close(handle)
 
@@ -136,15 +181,15 @@ def is_recipient(node, sealed: seal.SealedFile) -> bool:
 
 def sealed_info(node, info: dict, sealed: seal.SealedFile | None) -> dict:
     """A file's info, plus when it is sealed (sealed, as open_sealed opened it without unlocking) "sealed",
-    "recipient" and "stored_size", and when this node is a recipient its plaintext "size" and sealed "name"
-    (sealed is then unlocked)."""
+    "recipient" and "stored_size", and when this node is a recipient its plaintext "size", sealed "name" and
+    "sealed_folder" (is_sealed_folder: get would unpack it) (sealed is then unlocked)."""
     if sealed is None:
         return info
     recipient = is_recipient(node, sealed)
     info = {**info, "sealed": True, "recipient": recipient, "stored_size": info["size"]}
     if recipient:
         unlock_sealed(node, sealed)
-        info.update(size=sealed.size, name=sealed_name(sealed))
+        info.update(size=sealed.size, name=sealed_name(sealed), sealed_folder=is_sealed_folder(sealed))
     return info
 
 
@@ -181,6 +226,108 @@ def write_sealed(sealed: seal.SealedFile, output: str, blocks_dir: str | None = 
         _remove_created(output, created)
         raise
     return {"sealed": True, "name": name}
+
+
+class NotATar(Exception):
+    """A sealed file named as a tar holds something else (unpack_sealed): it is written as a file instead."""
+
+
+def is_tar_name(name: str | None) -> bool:
+    """True if a sealed name says the file is a tar to unpack: it ends in TAR_SUFFIX, after at least one character."""
+    return isinstance(name, str) and len(name) > len(TAR_SUFFIX) and name.endswith(TAR_SUFFIX)
+
+
+def is_sealed_folder(sealed: seal.SealedFile) -> bool:
+    """True if an unlocked sealed file is a sealed folder, as add --to of a folder makes one: its sealed name ends in
+    .tar and its plaintext starts with the sealed-folder marker (tarstream.is_marked; decrypting its first segment
+    only). A tar sealed as a file (by 0.1.x, or anyone) has no marker: it stays a file."""
+    from rnfs.content import tarstream
+
+    if not is_tar_name(sealed.name):
+        return False
+    return tarstream.is_marked(b"".join(sealed.read(0, tarstream.MARKER_PEEK)))
+
+
+def get_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
+               created: list[walker.Identity] | None = None, extract: bool = True) -> dict:
+    """Write a sealed file the node opened (unlocked) to output, which must not exist: unpacked (unpack_sealed) if
+    extract and it is a sealed folder (is_sealed_folder) whose plaintext is a valid tar; otherwise decrypted as the
+    file (write_sealed), as rnfs 0.1.6 writes any sealed file, with a warning only for a marked tar that isn't valid.
+    get's {"sealed", "name", "warnings"} (+ "warnings_total"; "extracted" True when unpacked). to_fetch and
+    created as for unpack_sealed."""
+    warnings = []
+    if extract and is_sealed_folder(sealed):
+        try:
+            return unpack_sealed(node, sealed, output, to_fetch, created)
+        except NotATar as e:
+            warnings.append(f"not unpacked, written as the file: its content isn't a valid tar ({e})")
+    return {**write_sealed(sealed, output, node.config.blocks_dir, to_fetch), "warnings": warnings}
+
+
+def unpack_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
+                  created: list[walker.Identity] | None = None) -> dict:
+    """Unpack a sealed tar to the directory output (which must not exist), reusing both existing rule sets as they
+    are: its plaintext is built into the block store by tarstream.build_tar (POST /api/add/stream?format=tar's
+    reader: regular files and directories only, no absolute or .. paths, links and devices skipped with warnings,
+    max_output_entries and MAX_DEPTH, the deny list's file hashes), then written out by walker.write_out (get's
+    rules: unsafe names skipped, the same limits); created gets the output directory's identity, as write_out
+    gives it. Everything happens inside a protection session, so no collection takes the blocks meanwhile, and they
+    are never pinned, recorded as a fetch or provided: once it ends (unpacked or not) they are collected.
+
+    The output is the tar's one top directory (`<folder>/`, as add packs a folder), or, for a tar holding anything
+    else, the whole tar as a directory; "name" is that directory's name (the top one's, or the sealed name without
+    .tar), only if safe_default_name accepts it. Raises NotATar (having written nothing) if the plaintext isn't a
+    valid tar, TooLarge past a limit or if the disk can't hold both the plaintext's blocks and the files written
+    (they may be on one filesystem: counted twice then, with the to_fetch bytes still to fetch), and what the
+    decryption raises (SealError, NotRecipient)."""
+    from rnfs import fsutil
+    from rnfs.content import tarstream
+    from rnfs.errors import BlockMismatch, TooLarge
+    from rnfs.log import LOG_ERROR, log
+    from rnfs.node import _check_free_space  # rnfs.node imports this module
+
+    plain = sealed.size
+    blocks_dir = node.config.blocks_dir
+    # The blocks and the files: the second is counted on the output's filesystem only if the blocks are there too
+    _check_free_space(output, plain, blocks_dir, to_fetch + plain)
+    node.storage.check_disk(plain + to_fetch)
+    max_entries = node.config.max_output_entries
+    warnings = tarstream.Warnings()
+    tar = tarstream.IteratorReader(sealed.read())
+    try:
+        with node.storage.protect() as session:
+            try:
+                with session.writer() as put:
+                    built = tarstream.build_tar(tar, put, warnings, max_entries,
+                                                builder.BuildOptions(check=node._hash_check()))
+            except (seal.SealError, BlockMismatch):
+                raise  # ValueErrors, but a damaged sealed file or a bug, not a plaintext that isn't a tar
+            except TooLarge as e:
+                raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
+            except ValueError as e:
+                raise NotATar(str(e)) from None
+            get = node.storage.getter()
+            root = walker.root_expect(built.cid)
+            first = list(itertools.islice(walker.directory_entries(root, get), 2))
+            if len(first) == 1 and first[0][0].kind == dag.KIND_DIRECTORY:
+                entry, target = first[0]
+                name = entry.name
+            else:
+                target, name = root, sealed.name[:-len(TAR_SUFFIX)]
+            try:
+                written = walker.write_out(target, get, output, max_entries, created=created)
+            except TooLarge as e:
+                raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
+    finally:
+        tar.close()
+        # Nothing reaches the plaintext's blocks now (unless the same blocks are kept for another reason)
+        try:
+            node.storage.collect()
+        except Exception as e:  # noqa: BLE001 - never hide the get's own outcome; the next collection retries
+            log(f"get: collecting an unpacked tar's blocks failed: {e!r}", LOG_ERROR)
+    for warning in written:
+        warnings(warning)
+    return {"sealed": True, "name": fsutil.safe_default_name(name, None), "extracted": True, **warnings.result()}
 
 
 def stored_head(node, target: str, length: int, deny: bool = True) -> bytes | None:
@@ -334,10 +481,10 @@ def nomadnet_room(node) -> int:
 def add_nomadnet(node, link: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
                  to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
                  chunker: str | None = None, name: str | None = None, identify: bool = False,
-                 progress: Callable[[int, int | None], None] | None = None) -> dict:
+                 progress: Callable[[int, int | None], None] | None = None, source: str = USER) -> dict:
     """Fetch what a NomadNet node serves at link (rnfs/network/nomadnet.py: its own bounded link, anonymous unless
-    identify) and add it as add_stream adds data: chunked, checked against the deny list, pinned "user" (cache if
-    not pin) unless only_hash, sealed for to/to_self. It is a file named by nomadnet.snapshot_name (the node's name
+    identify) and add it as add_stream adds data: chunked, checked against the deny list, pinned with source (cache
+    if not pin) unless only_hash, sealed for to/to_self. It is a file named by nomadnet.snapshot_name (the node's name
     for a file, the path's last component for a page), wrapped under that name with wrap or under name if given (as
     `add - --name`; sealing seals that name inside instead, unless wrap), unless not seal_name; pin ls names the
     link as its origin. Each call takes a new
@@ -366,7 +513,7 @@ def add_nomadnet(node, link: str, wrap: bool = False, only_hash: bool = False, p
         with open(snapshot.path, "rb") as stream:
             result = node.add_stream(stream, size=snapshot.size, name=wrapper, only_hash=only_hash, pin=pin, to=to,
                                      to_self=to_self, seal_name=entry if sealing and seal_name else None,
-                                     chunker=chunker, origin=str(target))
+                                     chunker=chunker, origin=str(target), source=source)
     finally:
         try:
             os.unlink(snapshot.path)

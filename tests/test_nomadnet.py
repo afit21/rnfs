@@ -16,6 +16,9 @@ from unittest import mock
 import RNS
 
 from rnfs import api, cli, nomadnet
+from rnfs.api import ApiServer
+from rnfs.apiclient import ApiConnection
+from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.content.storage import USER
 from rnfs.errors import Denied, NotFound, TooLarge
@@ -23,8 +26,10 @@ from rnfs.features import jobs
 from rnfs.network import nomadnet as fetching
 from rnfs.network.identity import load_or_create_identity
 from rnfs.node_content import nomadnet_identity_path
+from rnfs.node import RnfsNode
 from tests.test_jobs import ApiBase, JobsBase
-from tests.test_node import NodeTest
+from tests.test_names import FakeNetwork
+from tests.test_node import NetClient, NodeTest
 
 DEST = "e166ecdbc405bcc9762b6767617fc949"
 PAGE = f"{DEST}:/page/index.mu"
@@ -421,6 +426,48 @@ class CliTest(ApiBase):
     def test_job_progress_line(self):
         job = {"state": "running", "kind": "add", "nomadnet": PAGE, "total_bytes": None, "done_bytes": 0}
         self.assertIn("NomadNet", jobs.format_progress(job))
+
+
+class AppSourceTest(unittest.TestCase):
+    """A NomadNet add made with an app's token pins with that app's source, as every other add does (app:<name>,
+    app:<name>:<key> inside pin_key), in one request or as a job; the CLI's pins user."""
+
+    def setUp(self):
+        """An offline node behind its API, its jobs started; connections with the CLI's token and as app "wiki"."""
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+        config = Config(rnfs_dir=os.path.join(self.tmp, "node"), slow="no", max_jobs=2)
+        config.validate()
+        self.node = RnfsNode.offline(config, bytes(range(16)), NetClient(), FakeNetwork())
+        self.addCleanup(self.node.stop)
+        self.node.feature("jobs").start()
+        self.server = ApiServer(self.node, 0)
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        token_file = os.path.join(self.tmp, "api_token")
+        cli.write_token(token_file, self.server.token)
+        self.cli = ApiConnection(self.tmp, port=self.server.port, token_file=token_file)
+        self.app = ApiConnection(self.tmp, port=self.server.port, app="wiki", token=self.node.app_add("wiki")["token"])
+        self.enterContext(FakeNomadnet().installed())
+
+    def sources(self, cid: str) -> set[str]:
+        """The sources pinning cid now."""
+        return self.node.storage.pins().get(Cid.parse(cid), set())
+
+    def test_app_pins_with_its_source(self):
+        self.assertEqual(self.sources(self.app.add_nomadnet(PAGE)["cid"]), {"app:wiki"})
+        with self.app.pin_key("pages"):
+            keyed = self.app.add_nomadnet(FILE)["cid"]
+        self.assertEqual(self.sources(keyed), {"app:wiki:pages"})
+        self.assertEqual(self.sources(self.cli.add_nomadnet(FILE, wrap=True)["cid"]), {USER})
+
+    def test_app_job_pins_with_its_source(self):
+        job = self.app.submit_job("add", nomadnet=FILE, options={"wrap": True})
+        self.assertEqual(job["source"], "app:wiki")
+        job = self.app.job(job["id"], wait=10)
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(self.sources(job["result"]["cid"]), {"app:wiki"})
+        self.node.app_rm("wiki")  # removing the app releases what its NomadNet add pinned too
+        self.assertEqual(self.sources(job["result"]["cid"]), set())
 
 
 class LocalOnlyTest(JobsBase):

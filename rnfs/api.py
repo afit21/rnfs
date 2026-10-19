@@ -22,12 +22,14 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/get/stream | `target`, `format` (`tar`) | the target as a tar stream (`get_tar`), fetched first, Content-Length set |
 | GET  | /api/export/stream | `target` | the target's archive (`export_chunks`), byte-identical to `export`, Content-Length set |
 | POST | /api/import/stream | body is an archive | `import_stream(body)`, as `/api/import` answers |
-| POST | /api/get | JSON `target`, `output`, `from`, `raw` | `get(...)` |
+| POST | /api/get | JSON `target`, `output`, `from`, `raw`, `no_extract` | `get(...)`; a sealed folder is unpacked unless `no_extract` |
 | POST | /api/dir/set | JSON `target`, `name`, `cid`, `executable` | `dir_set(...)` |
 | POST | /api/dir/rm | JSON `target` | `dir_rm(target)` |
 | POST | /api/pin/add | JSON `target` | `pin_add(target)` |
 | POST | /api/pin/rm | JSON `cid` | `{}` after `pin_rm(cid)` |
 | POST | /api/pin/remote | JSON `node`, `cid`, `pin` | `{"accepted": bool}` |
+| GET  | /api/pin/remote | `node`, `cid` (both optional), `check` | `{"pins": pin_remote_ls(...)}`: the remote pins this node asked for, most recently asked first (`node`, `cid`, `pin`, `accepted`, `asked`, `state`, `done`, `checked`, `seen`); `check=1` checks them first (provider lookups, paced) |
+| GET  | /api/pin/remote/served | | `pin_remote_served()`: `{"pins": [{"identity", "cid", "state", "reason", "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | POST | /api/pin/label | JSON `cid`, `label` (null or "" clears it) | `pin_label(cid, label)`: the pin's `pin_ls` entry |
 | GET  | /api/cache/ls | | `{"cache": cache_ls()}`: the cached fetches, most recently used first |
 | POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes"}` |
@@ -42,13 +44,16 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...]}` (below) |
 | GET  | /api/events | `after` (a sequence; absent: none, only `next`), `kinds` (comma-separated), `epoch`, `wait` (≤ 30 s) | `{"events": [event], "next", "lost", "epoch"}` (rnfs.events): the events after `after`, as soon as there is one or after `wait` |
 | POST | /api/shutdown | | `{"stopping": true}`, then the daemon stops as on SIGTERM (`unsupported` 404 where nothing can stop it) |
+| GET  | /api/apps | | `{"apps": app_ls()}`: `[{"name", "created"}]` (the CLI's token only, below) |
+| POST | /api/apps/add | JSON `name` | `app_add(name)`: `{"name", "created", "token"}`, the only time the token is given |
+| POST | /api/apps/rm | JSON `name` | `app_rm(name)`: `{"released"}`, the app's token revoked and its pins released |
 
 The features (rnfs.features, each's `api_routes()`) add these; `name` is a name or a name contact's nick:
 
 | Method | Path | Parameters | Response |
 |---|---|---|---|
 | GET  | /api/jobs | | `{"jobs": [job]}`, oldest first |
-| POST | /api/jobs | JSON `kind` (get, pin, export), `target`, `output`, `from`, `sealed_name`, `fallback_dht` | the job queued |
+| POST | /api/jobs | JSON `kind` (get, pin, export), `target`, `output`, `from`, `sealed_name`, `fallback_dht`, `no_extract` | the job queued |
 | GET  | /api/jobs/get | `id`, `wait` (≤ 30 s) | the job, once it ends or after `wait` |
 | POST | /api/jobs/cancel | JSON `id` | the job |
 | POST | /api/jobs/clear | JSON `id` (optional) | `{"removed": count}` of the finished jobs forgotten |
@@ -110,6 +115,15 @@ Security:
   (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
   so another local user listening there while the daemon is down learns neither the token nor a name key being
   imported.
+- App tokens (rnfs.apps; 0.2.0): a request naming an app in `X-Rnfs-App: <name>` passes with that app's token in
+  `X-Rnfs-Api` instead, and only with it (an app's token without its name, or the API token with one, doesn't
+  pass); its proof is keyed by the app's verifier (apiclient.app_proof_key), and none is sent for an app there
+  isn't. ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal.
+  An app's token does everything the API token does but manage apps: the /api/apps routes (CLI_ROUTES) answer it
+  403 `forbidden`. The routes that pin or release for the caller (add, add/stream, dir/set, dir/rm, pin/add,
+  pin/rm, import, import/stream, and the pin, add and import jobs) use source "user" for the CLI and
+  "app:<name>" for an app, "app:<name>:<key>" with `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a
+  pin key is refused, 400): an app's pin rm releases only its own.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
   error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
@@ -137,14 +151,16 @@ from urllib.parse import parse_qs, urlsplit
 
 from rnfs import __version__, events, fsutil, ids, nomadnet
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
-from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PIN_KEY_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
+from rnfs.content.storage import APP_PREFIX, app_source, check_app_name
 from rnfs.errors import CODES, STATUSES, BlockMismatch, Busy, Unsupported, error_code
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_WARNING, log
 
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
 CHALLENGE = re.compile(r"[0-9a-f]{32}")  # what the CLI sends in X-Rnfs-Challenge
+CLI = "cli"  # ApiHandler.caller() for the CLI's token (api_token); an app's is "app:<name>"
 CHUNK_SIZE_LINE = re.compile(rb"[0-9A-Fa-f]{1,16}")  # a chunk size: hex digits only (no 0x, +, _ or spaces)
 MAX_TRAILER_LINES = 32
 MAX_WATCH_NAMES = 64  # names one GET /api/name/watch may list
@@ -156,7 +172,7 @@ MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream", "add_nomadnet")
+                "import_stream", "sealed_folders", "apps", "remote_pin_status", "add_nomadnet")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -720,6 +736,8 @@ class ApiHandler(TimedHandler):
         ("POST", "/api/pin/add"): "api_pin_add",
         ("POST", "/api/pin/rm"): "api_pin_rm",
         ("POST", "/api/pin/remote"): "api_pin_remote",
+        ("GET", "/api/pin/remote"): "api_pin_remote_ls",
+        ("GET", "/api/pin/remote/served"): "api_pin_remote_served",
         ("POST", "/api/gc"): "api_gc",
         ("POST", "/api/verify"): "api_verify",
         ("POST", "/api/name/create"): "api_name_create",
@@ -735,10 +753,16 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/capabilities"): "api_capabilities",
         ("GET", "/api/events"): "api_events",
         ("POST", "/api/shutdown"): "api_shutdown",
+        ("GET", "/api/apps"): "api_apps",
+        ("POST", "/api/apps/add"): "api_app_add",
+        ("POST", "/api/apps/rm"): "api_app_rm",
     }
     OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
+    # Only the CLI's token (api_token) may use these: an app can't issue itself or another app a token, nor revoke one
+    CLI_ROUTES = {("GET", "/api/apps"), ("POST", "/api/apps/add"), ("POST", "/api/apps/rm")}
     PROOF_ROUTE = ("GET", "/api/status")
     proved = False  # this connection had its proof request kept open: it is closed after the next request
+    principal: str | None = None  # caller() of the request being answered, set by dispatch
     keep_open = False  # the request being answered is a proof request whose connection stays open
 
     def log_message(self, format, *args):
@@ -753,21 +777,55 @@ class ApiHandler(TimedHandler):
                                                         "Cache-Control": "no-store",
                                                         "X-Content-Type-Options": "nosniff"}, body)
 
-    def token_valid(self) -> bool:
-        """True if the request carries this server's token in X-Rnfs-Api (compared in constant time)."""
+    def caller(self) -> str | None:
+        """Who sent the request: CLI ("cli") for this server's token in X-Rnfs-Api; "app:<name>" (the app's pin
+        source) for app name's token with X-Rnfs-App naming it; None for neither. Tokens are compared in constant
+        time. Without X-Rnfs-App only the API token passes, so a request is never read as an app's by mistake."""
         value = self.headers.get(API_HEADER)
         if value is None:
-            return False
-        # Bytes, since compare_digest refuses non-ASCII str and a header may hold any Latin-1 text
-        return hmac.compare_digest(value.strip().encode("utf-8", "replace"), self.token.encode())
+            return None
+        app = self.headers.get(APP_HEADER)
+        if app is None:
+            # Bytes, since compare_digest refuses non-ASCII str and a header may hold any Latin-1 text
+            return CLI if hmac.compare_digest(value.strip().encode("utf-8", "replace"), self.token.encode()) else None
+        apps, name = getattr(self.node, "apps", None), app.strip()
+        if apps is None or not apps.verify(name, value.strip()):
+            return None
+        return APP_PREFIX + name
+
+    def token_valid(self) -> bool:
+        """True if the request carries a token that passes (the API token, or an app's with X-Rnfs-App)."""
+        return self.caller() is not None
+
+    def proof_key(self) -> str | None:
+        """What keys this response's proof: the API token, or (X-Rnfs-App) that app's verifier (rnfs.apps), None
+        for an app there isn't (no proof is sent then)."""
+        app = self.headers.get(APP_HEADER)
+        if app is None:
+            return self.token
+        apps = getattr(self.node, "apps", None)
+        return apps.proof_key(app.strip()) if apps is not None else None
+
+    def pin_source(self) -> dict:
+        """The source the routes that pin or release for the caller use, as the facade's keyword argument: {} for
+        the CLI (the facade's "user"), {"source": "app:<name>"} for an app, or "app:<name>:<key>" with
+        X-Rnfs-Pin-Key. ValueError for a pin key with the CLI's token, or one that isn't valid."""
+        key = self.headers.get(PIN_KEY_HEADER)
+        key = None if key is None else key.strip()
+        if self.principal is None or not self.principal.startswith(APP_PREFIX):
+            if key is not None:
+                raise ValueError(f"{PIN_KEY_HEADER} is for apps: the CLI's pins are always user's")
+            return {}
+        return {"source": app_source(self.principal[len(APP_PREFIX):], key)}
 
     # Responses
 
     def send_common_headers(self):
         """The proof, on every response of the API's own (end_headers adds the headers every response carries)."""
         challenge = (self.headers.get(CHALLENGE_HEADER) or "").strip()
-        if CHALLENGE.fullmatch(challenge):
-            self.send_header(PROOF_HEADER, api_proof(self.token, self.server.server_address[1], challenge))
+        key = self.proof_key() if CHALLENGE.fullmatch(challenge) else None
+        if key is not None:
+            self.send_header(PROOF_HEADER, api_proof(key, self.server.server_address[1], challenge))
         if self.keep_open:
             self.send_header("Connection", "keep-alive")
 
@@ -845,9 +903,17 @@ class ApiHandler(TimedHandler):
                     return self.send_error_json(405, f"use {' or '.join(allowed)}", "method_not_allowed",
                                                 {"Allow": ", ".join(allowed)})
                 raise ApiRequestError(404, f"no such API endpoint: {url.path}", "no_such_endpoint")
-            if route not in self.OPEN_ROUTES and not self.token_valid():
+            self.principal = self.caller()
+            if route not in self.OPEN_ROUTES and self.principal is None:
+                if self.headers.get(APP_HEADER) is not None:
+                    raise ApiRequestError(403, f"an app's requests must carry the header {API_HEADER}: <its token>, "
+                                               f"as rnfs app add gave it, for the app {APP_HEADER} names",
+                                          "unauthorized")
                 raise ApiRequestError(403, f"API requests must carry the header {API_HEADER}: <token>, with the "
                                            f"token the daemon wrote to <rnfs dir>/api_token", "unauthorized")
+            if route in self.CLI_ROUTES and self.principal != CLI:
+                raise ApiRequestError(403, "only the CLI's token (<rnfs dir>/api_token) manages apps; an app's token "
+                                           "can't", "forbidden")
             if self.command != "POST":
                 self.request_read()  # no body; POST endpoints call it once they have read theirs
             self.keep_open = (route == self.PROOF_ROUTE and not self.proved
@@ -960,7 +1026,7 @@ class ApiHandler(TimedHandler):
 
     def api_status(self):
         """GET /api/status: the node's summary with the token; without it, only the version (a health check)."""
-        if not self.token_valid():
+        if self.principal is None:
             self.send_json(200, {"version": __version__})
             return
         self.send_json(200, self.node.status())
@@ -1114,6 +1180,7 @@ class ApiHandler(TimedHandler):
     def api_add(self):
         """POST /api/add: import a file or directory on this machine, or (nomadnet) a snapshot of what a NomadNet node
         serves (parameters: the module docstring's table)."""
+        source = self.pin_source()
         body = self.json_body()
         if body.get("nomadnet") is not None:
             if body.get("path") is not None:
@@ -1123,20 +1190,22 @@ class ApiHandler(TimedHandler):
                                                        only_hash=parse_bool(body.get("only_hash")),
                                                        name=parse_entry_name(body.get("name")),
                                                        identify=parse_bool(body.get("identify")),
-                                                       **node_content.add_options(body.get)))
+                                                       **node_content.add_options(body.get), **source))
             return
         self.send_json(200, self.node.add_path(parse_path(body.get("path")), wrap=parse_bool(body.get("wrap")),
                                                only_hash=parse_bool(body.get("only_hash")),
-                                               **node_content.add_options(body.get)))  # pin, to, chunker…
+                                               **node_content.add_options(body.get), **source))  # pin, to, chunker…
 
     def api_add_stream(self):
         """POST /api/add/stream: import the request body, wrapped as name if given (parameters: the module
         docstring's table)."""
+        source = self.pin_source()  # refused before the body is read
         reader = self.stream_reader()
         size = None if reader.chunked else reader.remaining
         name = self.param("name", False) or None
         only_hash = parse_bool(self.param("only_hash", False) or "")
         options = node_content.add_options(lambda key: self.param(key, False), stream=True)  # pin, to, seal_name…
+        options.update(source)
         stream_format = self.param("format", False)
         if stream_format is None:
             self.send_json(200, self.node.add_stream(reader, size=size, name=name, only_hash=only_hash, **options))
@@ -1144,7 +1213,7 @@ class ApiHandler(TimedHandler):
         if stream_format != "tar":
             raise ValueError("format must be tar")
         if {"to", "to_self", "seal_name"} & options.keys():
-            raise ValueError("a tar stream can't be sealed: sealing is for single files")
+            raise ValueError("a tar stream can't be sealed: seal a folder by its path (POST /api/add with to)")
         # add_tar reads the body to its end, checking that only zeros follow the tar's (its padding)
         self.send_json(200, self.node.add_tar(reader, name=name, only_hash=only_hash, **options))
 
@@ -1152,30 +1221,39 @@ class ApiHandler(TimedHandler):
         """POST /api/get: fetch and write out to a path on this machine (parameters: the module docstring's table)."""
         body = self.json_body()
         from_node = parse_hex_id(body["from"]) if body.get("from") else None
-        raw = {"raw": True} if parse_bool(body.get("raw")) else {}  # sealed files: the ciphertext
+        options = {"raw": True} if parse_bool(body.get("raw")) else {}  # sealed files: the ciphertext
+        if parse_bool(body.get("no_extract")):
+            options["no_extract"] = True  # a sealed folder written as its tar
         self.send_json(200, self.node.get(parse_target(body.get("target")), parse_path(body.get("output")),
-                                          from_node=from_node, **raw))
+                                          from_node=from_node, **options))
 
     def api_dir_set(self):
-        """POST /api/dir/set {"target", "name", "cid", "executable"}: a new directory with an entry set."""
+        """POST /api/dir/set {"target", "name", "cid", "executable"}: a new directory with an entry set, pinned
+        with the caller's source."""
+        source = self.pin_source()
         body = self.json_body()
         name = body.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("an entry name is required")
         self.send_json(200, self.node.dir_set(parse_target(body.get("target")), name, parse_cid(body.get("cid")),
-                                              executable=parse_bool(body.get("executable"))))
+                                              executable=parse_bool(body.get("executable")), **source))
 
     def api_dir_rm(self):
-        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one)."""
-        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target"))))
+        """POST /api/dir/rm {"target"}: a new directory without the target's entry (the node checks it names one),
+        pinned with the caller's source."""
+        source = self.pin_source()
+        self.send_json(200, self.node.dir_rm(parse_target(self.json_body().get("target")), **source))
 
     def api_pin_add(self):
-        """POST /api/pin/add {"target"}: fetch and pin with source user; answers once complete."""
-        self.send_json(200, self.node.pin_add(parse_target(self.json_body().get("target"))))
+        """POST /api/pin/add {"target"}: fetch and pin with the caller's source (user, or an app's); answers once
+        complete."""
+        source = self.pin_source()
+        self.send_json(200, self.node.pin_add(parse_target(self.json_body().get("target")), **source))
 
     def api_pin_rm(self):
-        """POST /api/pin/rm {"cid"}: remove the user source."""
-        self.node.pin_rm(parse_cid(self.json_body().get("cid")))
+        """POST /api/pin/rm {"cid"}: remove the caller's source (user, or an app's own)."""
+        source = self.pin_source()
+        self.node.pin_rm(parse_cid(self.json_body().get("cid")), **source)
         self.send_json(200, {})
 
     def api_pin_label(self):
@@ -1198,6 +1276,18 @@ class ApiHandler(TimedHandler):
             raise ValueError("pin must be true or false")
         accepted = self.node.pin_remote(parse_hex_id(body.get("node")), parse_cid(body.get("cid")), body["pin"])
         self.send_json(200, {"accepted": bool(accepted)})
+
+    def api_pin_remote_ls(self):
+        """GET /api/pin/remote[?node=&cid=&check=1]: the remote pins this node asked for, and whether each is done;
+        check=1 checks them first (lookups, which change no pin)."""
+        node, cid = self.param("node", False), self.param("cid", False)
+        pins = self.node.pin_remote_ls(parse_hex_id(node) if node else None, parse_cid(cid) if cid else None,
+                                       check=parse_bool(self.param("check", False) or ""))
+        self.send_json(200, {"pins": pins})
+
+    def api_pin_remote_served(self):
+        """GET /api/pin/remote/served: the remote pins other identities asked of this node, and their quota use."""
+        self.send_json(200, self.node.pin_remote_served())
 
     def api_gc(self):
         """POST /api/gc: evict every cached fetch."""
@@ -1241,12 +1331,16 @@ class ApiHandler(TimedHandler):
         self.send_json(200, self.node.export(parse_target(body.get("target")), parse_path(body.get("output"))))
 
     def api_import(self):
-        """POST /api/import {"path"}: import an archive from a path on this machine."""
-        self.send_json(200, self.node.import_archive(parse_path(self.json_body().get("path"))))
+        """POST /api/import {"path"}: import an archive from a path on this machine, its roots pinned with the
+        caller's source."""
+        source = self.pin_source()
+        self.send_json(200, self.node.import_archive(parse_path(self.json_body().get("path")), **source))
 
     def api_import_stream(self):
-        """POST /api/import/stream: import the archive the request body holds, read to its end."""
-        self.send_json(200, self.node.import_stream(self.stream_reader()))
+        """POST /api/import/stream: import the archive the request body holds, read to its end, its roots pinned
+        with the caller's source."""
+        source = self.pin_source()  # refused before the body is read
+        self.send_json(200, self.node.import_stream(self.stream_reader(), **source))
 
     # Capabilities, events, shutdown
 
@@ -1279,6 +1373,20 @@ class ApiHandler(TimedHandler):
         else:
             result = event_log.since(after, kinds, 0, epoch)
         self.send_json(200, result)
+
+    # Apps (rnfs app; the CLI's token only: CLI_ROUTES)
+
+    def api_apps(self):
+        """GET /api/apps: every app, by name, without its token."""
+        self.send_json(200, {"apps": self.node.app_ls()})
+
+    def api_app_add(self):
+        """POST /api/apps/add {"name"}: a new app and its token, given only this once."""
+        self.send_json(200, self.node.app_add(check_app_name(self.json_body().get("name"))))
+
+    def api_app_rm(self):
+        """POST /api/apps/rm {"name"}: revoke an app's token and release its pins; {"released"}."""
+        self.send_json(200, self.node.app_rm(check_app_name(self.json_body().get("name"))))
 
     def api_shutdown(self):
         """POST /api/shutdown: answer, then stop the daemon as SIGTERM does (ApiServer's shutdown)."""

@@ -389,6 +389,26 @@ class LockTest(unittest.TestCase):
         close.assert_called_once_with(fd)
         self.lock()
 
+    def test_lock_held_tells_without_taking_it_or_writing(self):
+        """lock_held is True while another process holds the lock, False before and after; it changes nothing in
+        the file (the holder's process ID stays) and leaves the lock free for the next lock_exclusive."""
+        self.assertFalse(fsutil.lock_held(self.path))  # no file at all
+        self.assertFalse(os.path.exists(self.path))  # and none made
+        holder = hold_lock(self.path)
+        try:
+            with open(self.path, "rb") as f:
+                written = f.read()
+            self.assertTrue(fsutil.lock_held(self.path))
+            with open(self.path, "rb") as f:
+                self.assertEqual(f.read(), written)
+            self.assertEqual(fsutil.lock_holder(self.path), holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        self.assertFalse(fsutil.lock_held(self.path))
+        self.lock()  # testing it left nothing held
+
     def test_holder_of_a_file_without_a_process_id_is_unknown(self):
         """lock_holder gives None for a missing or unreadable lock file."""
         self.assertIsNone(fsutil.lock_holder(self.path))

@@ -102,14 +102,15 @@ class PinsTest(MigrateTest):
         return self.storage().pins()
 
     def test_valid_file_imports_exactly(self):
-        """Every pin and source is imported; the file is kept as pins.json.migrated."""
+        """Every pin and source is imported, an lxmf: source as rnfs 0.2.0's app:lxmf: (the schema step rewrote the
+        pins table's before this import); the file is kept as pins.json.migrated."""
         write_legacy(self.state, "pins.json", self.VALUE)
         self.assertEqual(self.load(), {A: {"user", "folder"}, B: {"name:photos", "remote:" + IDENTITY},
-                                       D: {"follow:" + IDENTITY, "lxmf:" + OTHER}})
+                                       D: {"follow:" + IDENTITY, "app:lxmf:" + OTHER}})
         self.assertEqual(len(state_rows(self.state, "SELECT * FROM pins")), 6)
         self.assertTrue(os.path.exists(os.path.join(self.state, "pins.json.migrated")))
         self.assertEqual(self.load(), {A: {"user", "folder"}, B: {"name:photos", "remote:" + IDENTITY},
-                                       D: {"follow:" + IDENTITY, "lxmf:" + OTHER}})  # a second start: no change
+                                       D: {"follow:" + IDENTITY, "app:lxmf:" + OTHER}})  # a second start: no change
 
     def test_invalid_records_are_skipped(self):
         """Records that don't parse, with sources that aren't a list or aren't valid (or that SQLite can't
@@ -118,6 +119,13 @@ class PinsTest(MigrateTest):
             "not a cid": ["user"], str(A): "user", str(B): ["users"], str(C): ["name:\udc80"], str(D): [],
             Cid.for_block(RAW, b"ok").__str__(): ["user"]}})
         self.assertEqual(self.load(), {Cid.for_block(RAW, b"ok"): {"user"}})
+
+    def test_invalid_lxmf_sources_stay_invalid(self):
+        """Only a valid lxmf: source is rewritten as app:lxmf:: one rnfs 0.1.4 skipped is skipped still, never
+        turned into a valid app: source."""
+        write_legacy(self.state, "pins.json", {"pins": {str(A): ["lxmf:xyz"], str(B): ["lxmf:" + OTHER.upper()],
+                                                        str(C): ["lxmf:" + OTHER]}})
+        self.assertEqual(self.load(), {C: {"app:lxmf:" + OTHER}})
 
     def test_damaged_file_is_moved_aside(self):
         """A file that isn't JSON or has the wrong shape is moved to .damaged and storage starts without it."""

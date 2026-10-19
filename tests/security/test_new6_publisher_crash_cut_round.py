@@ -78,7 +78,7 @@ class CrashCutRoundTest(unittest.TestCase):
 
     def publisher(self, client, nodes) -> Publisher:
         """A publisher on the shared state directory whose lookups find nodes (closed when the test ends)."""
-        publisher = Publisher(OWN, self.config, self.storage, ProviderStore(1000, None), client,
+        publisher = Publisher(OWN, self.config, self.storage, ProviderStore(None), client,
                               lambda key: FakeLookup(nodes), False, self.state, clock=self.clock)
         self.addCleanup(publisher.close)
         return publisher

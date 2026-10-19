@@ -7,6 +7,11 @@ Standard library only, and it never imports RNS, so a program using it starts qu
 - The daemon writes a new random token to `<rnfs dir>/api_token` (mode 0600, or a private access list on
   Windows) at each start. The client reads it before its first request that needs it, and again
   when a proof with it fails, and sends it as `X-Rnfs-Api` with every request but the open status (version()).
+- An app (rnfs app add; 0.2.0) uses its own token instead, given (token=) or in a file it names (token_file=,
+  checked as api_token is), and names itself (app=) in `X-Rnfs-App` on every request: the proof is then keyed
+  by its token's verifier (app_proof_key), which is what the daemon keeps of it. An app's token is not scoped:
+  it does all the CLI's does but manage apps. Its pins get the source app:<app>, or app:<app>:<key> for the
+  requests made inside pin_key(key) (PIN_KEY_HEADER).
 - Before sending the token, the client makes whatever listens on the API port prove it knows it (api_proof,
   verify_daemon), since while the daemon is down any local user could listen there. Nothing else is sent to a
   listener that fails: neither the token nor a request's body. Nor is anything it answers believed: whatever its
@@ -24,7 +29,8 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   itself on so the request could only go on a new one, is refused before the token is sent (until 0.2.0 the
   client did send it on a new connection).
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
-  (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
+  (DaemonNotRunning; DaemonStarting when nothing answers but a process holds the rnfs dir's lock, as a daemon
+  does from before it opens its block store until it has stopped), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
   refused (AuthFailed), the settings (SettingsError), and the API's own error statuses (STATUS_ERRORS, from
   rnfs.errors.STATUSES: 400 BadRequest, 404 NotFound, 413 TooLarge, 422 InvalidDag, 451 Denied, 503 Busy, 507
   StorageFull, other 5xx ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a
@@ -56,13 +62,18 @@ import warnings
 from urllib.parse import urlencode
 
 from rnfs import errors, fsutil, winacl
-from rnfs.config import DEFAULT_API_PORT, Config
+from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
 
 DEFAULT_DIR = Config.rnfs_dir
 TOKEN_FILE = "api_token"  # in the rnfs directory; written by the daemon, read by every client
 DAEMON_FILE = "daemon.json"  # in the rnfs directory: the running daemon's PID, ports, version (read_daemon_info)
 MAX_DAEMON_FILE = 64 * 1024  # bytes of daemon.json read at most (the daemon's is a few hundred)
 API_HEADER = "X-Rnfs-Api"
+# An app's requests (rnfs app add; rnfs 0.2.0) name it, and carry its token in API_HEADER: the daemon then checks
+# that token, keys the proof with it (app_proof_key) and gives the app's pins its source (rnfs.apps)
+APP_HEADER = "X-Rnfs-App"
+# An app's request may name a group of its pins: they are then pinned and released as app:<app>:<key>
+PIN_KEY_HEADER = "X-Rnfs-Pin-Key"
 # Before sending the token, a client makes whatever listens on the API port prove it knows it (api_proof)
 CHALLENGE_HEADER = "X-Rnfs-Challenge"
 PROOF_HEADER = "X-Rnfs-Proof"
@@ -87,6 +98,18 @@ class ApiError(errors.RnfsError):
 
 class DaemonNotRunning(ApiError):
     """Nothing listens on the API port."""
+
+
+class DaemonStarting(DaemonNotRunning):
+    """Nothing listens on the API port, but a process holds the rnfs dir's lock (dir_holder), its process ID pid: a
+    daemon still starting (it locks the dir before opening the block store, which takes a while when large, and
+    listens only after), or stopping (it keeps the lock until it has saved its state), or an app's own rnfs.Node,
+    which serves no API. A DaemonNotRunning, so code catching that is unchanged."""
+
+    def __init__(self, message: str, pid: int):
+        """The error, naming the process pid."""
+        super().__init__(message)
+        self.pid = pid
 
 
 class ConnectionFailed(ApiError):
@@ -203,6 +226,21 @@ def daemon_info_path(rnfs_dir: str = DEFAULT_DIR) -> str:
     return os.path.join(os.path.expanduser(rnfs_dir), DAEMON_FILE)
 
 
+def dir_holder(rnfs_dir: str = DEFAULT_DIR) -> int | None:
+    """The process ID of the daemon or rnfs.Node holding rnfs_dir's lock (<rnfs dir>/daemon.lock), or None if none
+    does or it can't be told. The process the lock file names is checked first, and the lock tested only while it
+    runs: testing it could make a daemon starting at that very instant fail (fsutil.lock_held). This process is
+    never named (its own Node holds the lock, but this isn't a daemon for its Client to wait for)."""
+    path = os.path.join(os.path.expanduser(rnfs_dir), LOCK_FILE)
+    pid = fsutil.lock_holder(path)
+    if pid is None or pid <= 0 or pid == os.getpid() or not _process_alive(pid):
+        return None
+    try:
+        return pid if fsutil.lock_held(path) else None
+    except OSError:
+        return None
+
+
 def _process_alive(pid: int) -> bool:
     """False only if no process pid runs; True when it does, or when that can't be told."""
     if fsutil.IS_WINDOWS:
@@ -293,12 +331,26 @@ def api_proof(token: str, port: int, challenge: str) -> str:
     return hmac.new(token.encode(), f"rnfs api proof {port} {challenge}".encode(), hashlib.sha256).hexdigest()
 
 
-def read_token(path: str) -> str:
-    """The daemon's API token from path. Raises TokenError if it is missing, unreadable or empty, or if other
-    users can read it (so it can't be trusted)."""
+def app_verifier(token: str) -> bytes:
+    """What the daemon keeps of an app's token (rnfs.apps) instead of the token: SHA-256 of "rnfs app token " and
+    the token. It checks a token presented, and (in hex, app_proof_key) keys the proof the daemon gives the app."""
+    return hashlib.sha256(b"rnfs app token " + token.encode("utf-8", "replace")).digest()
+
+
+def app_proof_key(token: str) -> str:
+    """The key of the proof an app checks (api_proof's token, in place of the API token): its token's verifier in
+    hex, which the daemon has without keeping the token."""
+    return app_verifier(token).hex()
+
+
+def read_token(path: str, app: str | None = None) -> str:
+    """The daemon's API token from path, or (app) that app's token. Raises TokenError if it is missing, unreadable
+    or empty, or if other users can read it (so it can't be trusted)."""
     try:
         fd = os.open(path, os.O_RDONLY | fsutil.O_NOFOLLOW | fsutil.O_BINARY)
     except FileNotFoundError:
+        if app is not None:
+            raise TokenError(f"no token for app {app} at {path} (rnfs app add {app} -o {path} writes one)") from None
         raise TokenError(f"no API token at {path}: is the daemon running, with this --dir?") from None
     except PermissionError:
         raise TokenError(f"can't read the API token at {path}: permission denied. Is the daemon running as another "
@@ -418,7 +470,8 @@ def check_timeout(timeout) -> float | None:
 
 class ApiConnection:
     """The local API of the daemon using rnfs_dir (default ~/.rnfs/), on 127.0.0.1:port (default: the api_port in
-    its rnfs.toml). token_file defaults to <rnfs_dir>/api_token and is read on the first request needing it.
+    its rnfs.toml). token_file defaults to <rnfs_dir>/api_token and is read on the first request needing it. As an
+    app (app=, its name: rnfs app add), token (the app's token) or token_file (a file holding it) is needed.
 
     request() and call() are the whole protocol; get() and post() call any endpoint (features' too); the other
     methods are every core route (api.ApiHandler.ROUTES), jobs, the deny list and the features' routes rnfs.Client
@@ -428,15 +481,24 @@ class ApiConnection:
     """
 
     def __init__(self, rnfs_dir: str | None = None, port: int | None = None, token_file: str | None = None,
-                 timeout: float | None = None):
+                 timeout: float | None = None, *, app: str | None = None, token: str | None = None):
         """A client; nothing is sent until the first request. Raises SettingsError if port isn't given and
-        rnfs.toml can't be read."""
+        rnfs.toml can't be read, ValueError for an app without token or token_file, or a token that is empty or
+        given with a token_file."""
+        if token is not None and (not isinstance(token, str) or not token.strip() or token_file is not None):
+            raise ValueError("token is a non-empty string, given instead of token_file")
+        if app is not None and token is None and token_file is None:
+            raise ValueError(f"app {app} needs its token: token= or token_file= (rnfs app add {app} gives it)")
+        if app is not None and (not isinstance(app, str) or not app or not app.isprintable()):
+            raise ValueError(f"invalid app name {app!r}")
         rnfs_dir = DEFAULT_DIR if rnfs_dir is None else rnfs_dir
         self.rnfs_dir = rnfs_dir
         self.port = api_port(rnfs_dir) if port is None else port
-        self.token_file = token_path(rnfs_dir) if token_file is None else token_file
+        self.app = app  # sent as X-Rnfs-App with every request: the daemon checks the token as this app's
+        self._given_token = token.strip() if token is not None else None  # never read again from a file
+        self.token_file = token_path(rnfs_dir) if token_file is None and token is None else token_file
         self.timeout = timeout  # each request's, unless the thread or the call gives another
-        self._local = threading.local()  # .timeout: this thread's, inside using_timeout()
+        self._local = threading.local()  # .timeout: this thread's, inside using_timeout(); .pin_key, pin_key()
         self.token: str | None = None  # the token read last, once a daemon has proved it knows it
         self.daemon_version: str | None = None  # what the daemon said in the last proof request
 
@@ -463,6 +525,31 @@ class ApiConnection:
         finally:
             self._local.timeout = previous
 
+    @contextlib.contextmanager
+    def pin_key(self, key: str | None):
+        """A context manager: requests this thread makes inside it carry key as X-Rnfs-Pin-Key, so the pins this
+        app makes and releases in them (add, pin, dir set/rm, import, and those jobs) are app:<app>:<key>'s, a group
+        of its own (None: app:<app>'s, as outside). Thread-local and nesting, as using_timeout. ValueError unless
+        this connection is an app's, or for a key that isn't a non-empty string (the daemon checks its characters:
+        BadRequest)."""
+        if self.app is None:
+            raise ValueError("a pin key is for apps (app=): the CLI's pins are always user's")
+        if key is not None and (not isinstance(key, str) or not key):
+            raise ValueError(f"a pin key is a non-empty string, not {key!r}")
+        previous = getattr(self._local, "pin_key", None)
+        self._local.pin_key = key
+        try:
+            yield self
+        finally:
+            self._local.pin_key = previous
+
+    def _identity_headers(self) -> dict:
+        """The headers naming who calls: X-Rnfs-App for an app, with its pin key inside pin_key()."""
+        if self.app is None:
+            return {}
+        key = getattr(self._local, "pin_key", None)
+        return {APP_HEADER: self.app, **({PIN_KEY_HEADER: key} if key is not None else {})}
+
     # The protocol
 
     def request(self, method: str, path: str, params: dict | None = None, json_body: dict | None = None,
@@ -479,7 +566,8 @@ class ApiConnection:
         timeout = self.effective_timeout(timeout)
         url = path + ("?" + urlencode({k: v for k, v in params.items() if v is not None}) if params else "")
         # Host is set explicitly: the API only accepts 127.0.0.1:<port>, even for port 80
-        headers = {"Host": f"127.0.0.1:{self.port}", **(extra_headers or {})}
+        headers = {"Host": f"127.0.0.1:{self.port}", **(self._identity_headers() if authenticated else {}),
+                   **(extra_headers or {})}
         if json_body is not None:
             body = json.dumps(json_body).encode()
             headers["Content-Type"] = "application/json"
@@ -515,13 +603,20 @@ class ApiConnection:
     def _exchange(self, connection: http.client.HTTPConnection, method: str, url: str, body,
                   headers: dict) -> http.client.HTTPResponse:
         """Send one request on connection and return its response, whatever its status; a connection that fails
-        raises DaemonNotRunning or ConnectionFailed (also when the answer doesn't come within its timeout)."""
+        raises DaemonNotRunning (DaemonStarting while a process holds the rnfs dir) or ConnectionFailed (also when
+        the answer doesn't come within its timeout)."""
         try:
             connection.request(method, url, body=body, headers=headers)
             return connection.getresponse()
         except (http.client.HTTPException, OSError) as e:
             connection.close()
             if isinstance(e, ConnectionRefusedError):
+                holder = dir_holder(self.rnfs_dir)
+                if holder is not None:
+                    raise DaemonStarting(f"the daemon (process {holder}) is starting: it holds {self.rnfs_dir} but "
+                                         f"doesn't answer on API port {self.port} yet; try again in a moment. If "
+                                         f"this lasts, process {holder} may be stopping, or be an app's own rnfs "
+                                         f"node, which has no API", holder) from None
                 raise DaemonNotRunning(f"no daemon is running on API port {self.port}. Start one with: rnfs daemon") \
                     from None
             if isinstance(e, TimeoutError) and connection.timeout is not None:  # else the system's (ETIMEDOUT)
@@ -554,12 +649,15 @@ class ApiConnection:
         on another connection, would hold no longer than the daemon, and any local user can listen on its port
         once it stops. The token read is kept, and read again if the proof fails (a daemon restarted since
         wrote a new one). A daemon that closes the connection anyway gets nothing more: ConnectionFailed (one
-        before 0.1.5, which always does, was refused by check_daemon already)."""
-        token = self.token or read_token(self.token_file)
+        before 0.1.5, which always does, was refused by check_daemon already). A token given (token=) is never
+        read again."""
+        token = self._given_token or self.token or read_token(self.token_file, self.app)
         try:
             self.verify_daemon(token, connection)
         except AuthFailed:
-            fresh = read_token(self.token_file)
+            if self._given_token is not None:
+                raise
+            fresh = read_token(self.token_file, self.app)
             if fresh == token:
                 raise
             connection.close()
@@ -584,15 +682,24 @@ class ApiConnection:
         request; every other status AuthFailed) nor its text. A proved daemon's error status raises its ApiError."""
         challenge = secrets.token_hex(16)
         headers = {"Host": f"127.0.0.1:{self.port}", CHALLENGE_HEADER: challenge, "Connection": "keep-alive"}
+        if self.app is not None:
+            headers[APP_HEADER] = self.app  # the proof is then keyed by the app's token (its verifier)
         connection = connection or self._connect(self._proof_timeout(self.effective_timeout()))
         response = self._exchange(connection, "GET", "/api/status", None, headers)
         proof = (response.getheader(PROOF_HEADER) or "").strip().encode("ascii", "replace")
-        if not hmac.compare_digest(proof, api_proof(token, self.port, challenge).encode()):
+        key = app_proof_key(token) if self.app is not None else token
+        if not hmac.compare_digest(proof, api_proof(key, self.port, challenge).encode()):
             response.close()
             connection.close()
             if response.status == 503:
                 raise Busy(f"the daemon on API port {self.port} is too busy (or has too many connections); try "
                            f"again shortly", 503)
+            if self.app is not None:
+                where = f"in {self.token_file}" if self._given_token is None else "given"
+                raise AuthFailed(f"what listens on API port {self.port} couldn't prove it knows app {self.app}'s "
+                                 f"token ({where}), so nothing was sent to it: it may be another program, a daemon "
+                                 f"using another --dir or one before rnfs 0.2.0, or there is no app {self.app} "
+                                 f"there (rnfs app ls), or the token isn't its")
             raise AuthFailed(f"what listens on API port {self.port} couldn't prove it knows the API token in "
                              f"{self.token_file}, so nothing was sent to it: it may be another program, or a "
                              f"daemon using another --dir (or one started before an upgrade: restart it)")
@@ -724,6 +831,21 @@ class ApiConnection:
         """What the daemon wrote about itself (read_daemon_info) in this client's rnfs dir, or None."""
         return read_daemon_info(self.rnfs_dir)
 
+    # Apps (the CLI's token only: an app's is refused, AuthFailed)
+
+    def apps(self) -> list[dict]:
+        """Every app the daemon issued a token to: [{"name", "created"}], by name."""
+        return self.get("/api/apps")["apps"]
+
+    def app_add(self, name: str) -> dict:
+        """Issue a token to a new app called name: {"name", "created", "token"}, the only time the token is given.
+        BadRequest for an invalid name, one taken, or lxmf while the daemon's own LXMF is on."""
+        return self.post("/api/apps/add", name=name)
+
+    def app_rm(self, name: str) -> dict:
+        """Revoke app name's token and release every pin it made: {"released"}. NotFound for an app there isn't."""
+        return self.post("/api/apps/rm", name=name)
+
     # Content
 
     def add_path(self, path: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
@@ -786,11 +908,14 @@ class ApiConnection:
             length = len(data)
         return self.call("POST", "/api/import/stream", body=data, length=length)
 
-    def fetch(self, target: str, output: str, from_node: str | None = None, raw: bool = False) -> dict:
+    def fetch(self, target: str, output: str, from_node: str | None = None, raw: bool = False,
+              no_extract: bool = False) -> dict:
         """Fetch a file or directory and have the daemon write it to output (a path on this machine, which must
-        not exist), in one request: {"cid", "warnings"} (+ "sealed", "name"). For progress, use submit_job."""
+        not exist), in one request: {"cid", "warnings"} (+ "sealed", "name", "extracted"). A sealed folder is
+        unpacked unless no_extract (sent only when set: a daemon older than 0.2.0 ignores it, and never unpacks).
+        For progress, use submit_job."""
         return self._post("/api/get", target=target, output=os.path.abspath(os.path.expanduser(output)),
-                          raw=raw or None, **{"from": from_node})
+                          raw=raw or None, no_extract=no_extract or None, **{"from": from_node})
 
     def cat(self, target: str, offset: int | None = None, length: int | None = None, raw: bool = False,
             block: bool = False, from_node: str | None = None) -> Stream:
@@ -845,7 +970,7 @@ class ApiConnection:
         return self.post("/api/pin/add", target=target)
 
     def pin_rm(self, cid: str):
-        """Remove the user pin of cid (NotFound if it has none)."""
+        """Remove the user pin of cid, or an app's own (app:<app>, or its pin_key's): NotFound if it has none."""
         self.post("/api/pin/rm", cid=cid)
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
@@ -872,6 +997,23 @@ class ApiConnection:
     def pin_remote(self, node: str, cid: str, pin: bool = True) -> bool:
         """Ask node (hex) to pin cid for this node, or (pin=False) to release that pin; True if it accepted."""
         return self.post("/api/pin/remote", node=node, cid=cid, pin=pin)["accepted"]
+
+    def pin_remote_ls(self, node: str | None = None, cid: str | None = None, check: bool = False) -> list[dict]:
+        """The remote pins this node asked for (node's, cid's, or every one), most recently asked first: [{"node",
+        "cid", "pin", "accepted", "asked", "state", "done", "checked", "seen"}]; check: check them first (provider
+        lookups, paced). NoSuchEndpoint from a daemon before 0.2.0."""
+        try:
+            return self.get("/api/pin/remote", node=node, cid=cid, check=_flag(check))["pins"]
+        except ApiError as e:
+            if e.status == 405:  # a daemon before 0.2.0 has only POST /api/pin/remote
+                raise NoSuchEndpoint("this daemon doesn't list remote pins (rnfs 0.2.0 does)", 404,
+                                     "no_such_endpoint") from None
+            raise
+
+    def pin_remote_served(self) -> dict:
+        """The remote pins other identities asked of this node: {"pins": [{"identity", "cid", "state", "reason",
+        "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}."""
+        return self.get("/api/pin/remote/served")
 
     # The network
 
@@ -959,9 +1101,9 @@ class ApiConnection:
                    from_node: str | None = None, path: str | None = None, options: dict | None = None,
                    **flags) -> dict:
         """Start a job: kind "get" (output needed), "pin" or "export" (output needed) of a target, or "add" or
-        "import" of a path on this machine. Its record, with its "id". flags: get's sealed_name and fallback_dht;
-        options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to, to_self, seal_name,
-        chunker; only those set)."""
+        "import" of a path on this machine. Its record, with its "id". flags: get's sealed_name, fallback_dht and
+        no_extract; options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to, to_self,
+        seal_name, chunker; only those set)."""
         output = os.path.abspath(os.path.expanduser(output)) if output is not None else None
         path = os.path.abspath(os.path.expanduser(path)) if path is not None else None
         return self._post("/api/jobs", kind=kind, target=target, output=output, path=path, **{"from": from_node},

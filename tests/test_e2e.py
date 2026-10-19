@@ -15,6 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 
+from rnfs.content.blockstore import shard_of
 from tests import support
 from tests.support import free_port
 
@@ -337,7 +338,7 @@ class NetworkTest(unittest.TestCase):
 
         # A damaged block on A: A re-checks before serving, so it answers None rather than bad data; B then
         # fails over to the hub, which imported the archive and provides it too
-        with open(os.path.join(a.dir, "blocks", index_cid), "wb") as f:
+        with open(os.path.join(a.dir, "blocks", shard_of(index_cid), index_cid), "wb") as f:
             f.write(b"damaged on disk")
         b.cli("gc")  # B cached index.txt through its gateway above
         failed = b.cli("get", f"{dir_cid}/index.txt", "-o", self.path("b-index-a"), "--from", a.node_id, check=False)
@@ -381,6 +382,21 @@ class NetworkTest(unittest.TestCase):
         self.assertIn("state: done", c.out("jobs", "show", job_id))
         self.assertIn("removed", c.out("jobs", "clear"))
         # --- end transfers ---
+
+        # --- apps: an app's own token (rnfs app add -o), its pins its own source, released when it is removed ---
+        import rnfs
+        token_file = self.path("app-token")
+        b.cli("app", "add", "e2e", "-o", token_file)
+        self.assertEqual(b.out("app", "ls").split()[0], "e2e")
+        with rnfs.Client(b.dir, port=b.api_port, app="e2e", token_file=token_file) as client:
+            client.pin(file_cid)
+            with client.pin_key("k"):
+                client.pin(file_cid)
+        sources = json.loads(b.out("pin", "ls", file_cid, "--json"))[0]["sources"]
+        self.assertLessEqual({"app:e2e", "app:e2e:k"}, set(sources))
+        self.assertEqual(b.out("app", "rm", "e2e"), "removed app e2e, releasing 2 pins")
+        self.assertNotIn("app:e2e", b.out("pin", "ls"))
+        # --- end apps ---
 
         # --- content: sealed files for B, FastCDC, --no-pin, trustless gateway formats ---
         secret = os.urandom(150 * 1024)

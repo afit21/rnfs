@@ -26,7 +26,8 @@ P1, P2, P3, P4, P5 = (bytes([n]) * ID_LENGTH for n in range(1, 6))
 K1, K2, K3 = (bytes([0xA0 + n]) * ID_LENGTH for n in range(1, 4))
 N1, N2, N3 = (bytes([0xB0 + n]) * ID_LENGTH for n in range(1, 4))
 A, B = (Cid.for_block(RAW, bytes([n])) for n in range(2))
-NO_ROWS = {"publishers": {}, "records": {}, "departed": {}, "evicted": {}}
+NO_ROWS = {"publishers": {}, "records": {}, "standing": {}, "departed": {}, "evicted": {}}
+DAY_T = int(T // DAY)  # the UTC day of T and of the times just before it
 
 _saved_loglevel = RNS.loglevel
 
@@ -80,23 +81,30 @@ class MigrateTest(unittest.TestCase):
 
 class ProvidersTest(MigrateTest):
     """providers.json: {"version": 1, "publishers": {id: first seen}, "records": [[key, publisher, first stored,
-    last stored, pooled], ...], "departed": [[publisher, first seen, when], ...], "evicted": [...]}."""
+    last stored, pooled], ...], "departed": [[publisher, first seen, when], ...], "evicted": [...]}.
+
+    rnfs 0.2.0 imports the publishers and records, with no pooled flag (the newcomer pool went), builds each
+    publisher's standing from them as its schema step does from 0.1.x's tables (statedb.PROVIDER_STANDING), and
+    leaves out the departures and evictions (it keeps no such memories)."""
 
     NAME = "providers.json"
     VALUE = {"version": 1,
-             "publishers": {P1.hex(): T - 3 * DAY, P2.hex(): T - 2 * DAY, P3.hex(): T},
+             "publishers": {P1.hex(): T - 3 * DAY, P2.hex(): T - 2 * DAY, P3.hex(): T, P4.hex(): T - 5 * DAY},
              "records": [[K1.hex(), P1.hex(), T - 3 * DAY, T - 1, 0], [K2.hex(), P2.hex(), T - 2 * DAY, T - 2, 1],
-                         [K1.hex(), P3.hex(), T, T, 0]],
-             "departed": [[P4.hex(), T - 5 * DAY, T - DAY]],
+                         [K1.hex(), P3.hex(), T, T, 0], [K2.hex(), P4.hex(), T - 5 * DAY, T - 3, 0],
+                         [K3.hex(), P4.hex(), T - 4 * DAY, T - 4 * DAY, 0]],
+             "departed": [[P5.hex(), T - 5 * DAY, T - DAY]],
              "evicted": [[P5.hex(), T - 60, T - 30]]}
-    ROWS = {"publishers": {P1: T - 3 * DAY, P2: T - 2 * DAY, P3: T},
-            "records": {(K1, P1): (T - 3 * DAY, T - 1, 0), (K2, P2): (T - 2 * DAY, T - 2, 1), (K1, P3): (T, T, 0)},
-            "departed": {P4: (T - 5 * DAY, T - DAY)},
-            "evicted": {P5: (T - 60, T - 30)}}
+    # P4, first seen 5 days before its latest store and refreshing records over days, is Earned (tier 1, 3 days)
+    ROWS = {"publishers": {P1: T - 3 * DAY, P2: T - 2 * DAY, P3: T, P4: T - 5 * DAY},
+            "records": {(K1, P1): (T - 3 * DAY, T - 1, 0), (K2, P2): (T - 2 * DAY, T - 2, 0), (K1, P3): (T, T, 0),
+                        (K2, P4): (T - 5 * DAY, T - 3, 0), (K3, P4): (T - 4 * DAY, T - 4 * DAY, 0)},
+            "standing": {P1: (1, 0, 0, DAY_T), P2: (1, 0, 0, DAY_T), P3: (1, 0, 0, DAY_T), P4: (2, 1, 3, DAY_T)},
+            "departed": {}, "evicted": {}}
 
     def store(self, **settings) -> ProviderStore:
         """A store on the state directory at T + 10 (closed before the directory is removed)."""
-        store = ProviderStore(100, self.state, clock=FakeClock(T + 10), seniority=DAY, **settings)
+        store = ProviderStore(self.state, clock=FakeClock(T + 10), **settings)
         self.addCleanup(store.close)
         return store
 
@@ -105,12 +113,12 @@ class ProvidersTest(MigrateTest):
         return held(self.store())
 
     def test_valid_file_imports_exactly(self):
-        """Every publisher, record (pooled or not), departure and eviction is imported as written and loaded;
+        """Every publisher and record is imported as written (but pooled) and loaded, with the standings built;
         the file is kept as providers.json.migrated, and a second start changes nothing."""
         write_legacy(self.state, self.NAME, self.VALUE)
         self.assertEqual(self.load(), self.ROWS)
         self.assertEqual(saved(self.state), self.ROWS)
-        self.assertEqual(self.migrated(), [(3,)])
+        self.assertEqual(self.migrated(), [(5,)])
         self.assertFalse(os.path.exists(self.path))
         self.assertTrue(os.path.exists(self.path + ".migrated"))
         self.assertEqual(self.load(), self.ROWS)
@@ -118,21 +126,24 @@ class ProvidersTest(MigrateTest):
         self.assertFalse(os.path.exists(self.path + ".migrated.1"))
 
     def test_file_from_before_the_newcomer_pool_imports(self):
-        """rnfs 0.1.3's file, four fields per record and no departures or evictions, imports every record outside
-        the pool."""
+        """rnfs 0.1.3's file, four fields per record and no departures or evictions, imports every record."""
         value = {"version": 1, "publishers": self.VALUE["publishers"],
                  "records": [record[:4] for record in self.VALUE["records"]]}
         write_legacy(self.state, self.NAME, value)
-        expected = {"publishers": self.ROWS["publishers"],
-                    "records": {pair: (first, last, 0) for pair, (first, last, _) in self.ROWS["records"].items()},
-                    "departed": {}, "evicted": {}}
-        self.assertEqual(self.load(), expected)
-        self.assertEqual(saved(self.state), expected)
+        self.assertEqual(self.load(), self.ROWS)
+        self.assertEqual(saved(self.state), self.ROWS)
+
+    def test_a_pooled_publisher_is_not_earned(self):
+        """A publisher whose records were all in 0.1.x's newcomer pool starts as a Newcomer, however old."""
+        value = dict(self.VALUE, records=[record[:4] + [1] for record in self.VALUE["records"]])
+        write_legacy(self.state, self.NAME, value)
+        self.assertEqual(self.load()["standing"][P4], (2, 0, 0, DAY_T))
 
     def test_what_any_load_drops_is_left_out(self):
         """NaN times, IDs of the wrong length and a repeated record (the first stored is kept) aren't imported;
-        expired records and those of a publisher without a first-seen time are, and the load drops them (the
-        next save deletes them). Numbers written as text convert as rnfs 0.1.4 converted them."""
+        expired records and those of a publisher without a first-seen time (so no standing) are, and the store drops
+        them as it meets them: expiry, and the first read of the key (the next save deletes them). Numbers written
+        as text convert as rnfs 0.1.4 converted them."""
         nan = float("nan")
         value = {"version": 1,
                  "publishers": {P1.hex(): "1699990000", P2.hex(): nan, "abcd": T},
@@ -143,15 +154,18 @@ class ProvidersTest(MigrateTest):
                  "departed": [[P4.hex(), nan, T], [P5.hex(), T, T], [P5.hex(), T - 9 * DAY, T - 1]]}
         write_legacy(self.state, self.NAME, value)
         rows = {"publishers": {P1: 1699990000.0},
-                "records": {(K1, P1): (T - 1, T - 1, 1), (K3, P1): (T - 30 * DAY, T - 30 * DAY, 0),
+                "records": {(K1, P1): (T - 1, T - 1, 0), (K3, P1): (T - 30 * DAY, T - 30 * DAY, 0),
                             (K3, P3): (T, T, 0)},
-                "departed": {P5: (T, T)}, "evicted": {}}  # the one that went last
+                "standing": {P1: (2, 0, 0, DAY_T)}, "departed": {}, "evicted": {}}
         store = self.store()
         self.assertEqual(saved(self.state), rows)
-        self.assertEqual(held(store), {"publishers": {P1: 1699990000.0}, "records": {(K1, P1): (T - 1, T - 1, 1)},
-                                       "departed": {}, "evicted": {}})  # P5 departed younger than seniority
+        self.assertEqual(store.expire(), 1)
+        self.assertEqual(store.providers(K3), [])
         store.save()
         self.assertEqual(saved(self.state), held(store))
+        self.assertEqual(saved(self.state), {"publishers": {P1: 1699990000.0}, "records": {(K1, P1): (T - 1, T - 1, 0)},
+                                             "standing": {P1: (1, 0, 0, DAY_T)}, "departed": {}, "evicted": {}})
+        store._check_consistency()
 
     def test_damaged_file_is_moved_aside(self):
         """A file that isn't JSON, is of another version or holds a malformed record (rnfs 0.1.4 started empty

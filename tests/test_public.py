@@ -312,6 +312,34 @@ class PublicTests:
         self.assertEqual(self.rnfs.ping(A_ID), 0.1)
         self.assertIsNone(self.rnfs.ping(OTHER))
 
+    def test_remote_pin_status(self):
+        """remote_pins() lists what was asked, a check finding the node among the providers (done); served_pins()
+        what other identities asked of this node, and their usage."""
+        cid = self.share(b"pinned for us")  # A provides it
+        other = Cid.for_block(RAW, b"nobody has it")
+        self.rnfs.pin_remote(A_ID, cid)
+        self.rnfs.pin_remote(A_ID.hex(), other, pin=False)
+        released, asked = self.rnfs.remote_pins()
+        self.assertIsInstance(asked, rnfs.RemotePin)
+        self.assertEqual((asked.node, asked.cid, asked.state, asked.done), (A_ID, cid, "waiting", False))
+        self.assertEqual((released.cid, released.pin, released.state), (other, False, "released"))
+        checked, = self.rnfs.remote_pins(A_ID, cid, check=True)
+        self.assertEqual((checked.state, checked.done, str(checked)), ("done", True, str(cid)))
+        self.assertIsInstance(checked.checked, float)
+        self.assertEqual(self.rnfs.remote_pins(cid=other)[0].state, "released")
+        identity = bytes(range(16))
+        self.b.config.remote_pin_identities = [identity.hex()]
+        self.assertTrue(self.b.backend.remote_pin(identity, cid, True))
+        wait_for(lambda: self.b.storage.has_pin(cid, f"remote:{identity.hex()}"), what="the remote pin")
+        served = self.rnfs.served_pins()
+        self.assertIsInstance(served, rnfs.ServedPins)
+        pin, = served.pins
+        self.assertEqual((pin.identity, pin.cid, pin.state, pin.reason), (identity, cid, "pinned", None))
+        usage, = served.usage
+        self.assertEqual((usage.identity, usage.pinned, usage.waiting, usage.allowed, usage.quota),
+                         (identity, 1, 0, True, served.quota))
+        self.assertGreater(usage.used, 0)
+
     def test_errors_are_one_hierarchy(self):
         """The same exception classes whichever class raises them."""
         data = os.urandom(1000)
@@ -726,6 +754,28 @@ class PublicTests:
                 self.rnfs.jobs.add(path, to=to)
             with self.subTest(to=to), self.assertRaisesRegex(ValueError, "to must be a list of recipients"):
                 self.rnfs.add(b"data", to=to)
+
+    def test_sealed_folder(self):
+        """add() of a folder with to_self seals it as one tar; get() unpacks it unless no_extract (Written.extracted),
+        and jobs.get takes no_extract too, alike on both classes."""
+        self.b.identity = RNS.Identity()  # B opens what it seals for itself
+        folder = self.out("photos")
+        os.makedirs(os.path.join(folder, "sub"))
+        with open(os.path.join(folder, "sub", "a.txt"), "wb") as f:
+            f.write(b"a")
+        added = self.rnfs.add(folder, to_self=True)
+        self.assertTrue(added.sealed)
+        written = self.rnfs.get(added.cid, self.out("unpacked"))
+        self.assertEqual((written.sealed, written.extracted, written.name), (True, True, "photos"))
+        with open(os.path.join(self.out("unpacked"), "sub", "a.txt"), "rb") as f:
+            self.assertEqual(f.read(), b"a")
+        written = self.rnfs.get(added.cid, self.out("tar"), no_extract=True)
+        self.assertEqual((written.sealed, written.extracted, written.name), (True, False, "photos.tar"))
+        self.assertTrue(tarfile.is_tarfile(self.out("tar")))
+        job = self.rnfs.jobs.get(added.cid, self.out("job.tar"), no_extract=True).wait(10)
+        self.assertEqual((job.state, job.no_extract), ("done", True))
+        self.assertTrue(tarfile.is_tarfile(self.out("job.tar")))
+        self.assertTrue(self.rnfs.capabilities().has("sealed_folders"))
 
     def test_streams(self):
         """add_tar, get_tar, export_stream and import_stream: a tar and an archive through the program."""

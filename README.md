@@ -276,8 +276,8 @@ Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`), which on
 |---|---|
 | `rnfs.toml` | your [settings](#settings) |
 | `storage/identity`, `storage/lxmf_identity` | the node's identity (your node ID comes from it) and your LXMF identity |
-| `blocks/` | stored blocks |
-| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
+| `blocks/` | stored blocks, one file per block in 1,024 subdirectories (`blocks/<xy>/<cid>`) |
+| `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists, the stored blocks' sizes (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
 | `names/` | name keys: back them up with `rnfs name export` |
 | `files/` | the shared folder: anything put here is added, pinned and shared |
 | `api_token`, `daemon.lock` | the running daemon's API token and lock |
@@ -402,7 +402,8 @@ IP networks. It is **not** compatible with IPFS. The full comparison is in
 # Settings
 
 Settings go in `~/.rnfs/rnfs.toml`; command-line options override them. Times are in seconds, sizes in bytes,
-rates in bits/s, and an unknown setting is an error. These are the ones you're most likely to change; every
+rates in bits/s, and an unknown setting is an error (one a newer version retired, such as `max_records`, is ignored
+with a warning). These are the ones you're most likely to change; every
 setting and its default is in [specification.md, section 12](specification.md#12-constants).
 
 ```toml
@@ -425,6 +426,7 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
 | `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
+| `record_budget` | 1 GiB | Disk the provider records your node stores for others (as a DHT server) may take; when full, your node contacts and publishers seen for days keep their place, and strangers share a small part |
 | `max_jobs` | 2; 1 on slow nodes | Transfers running at once |
 | `upload_budget` | none | Bytes per hour your node uploads in total |
 | `serve_interfaces`, `no_serve_interfaces` | all, none | Reticulum interfaces to upload on, or never upload on (names or prefixes) |
@@ -482,6 +484,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs export TARGET -o FILE` / `import FILE` | Write or import an archive (USB sticks, sneakernet) |
 | `rnfs pin add TARGET` / `pin rm CID` / `pin ls` | Fetch and pin / unpin / list pins, their sources and where they came from |
 | `rnfs pin remote add\|rm NODE_ID CID` | Ask another node to pin or unpin (it must list you in `remote_pin_identities`) |
+| `rnfs pin remote ls [NODE_ID] [CID] [--check]` / `pin remote ls --served` | The remote pins you asked for and whether each is done (the node found among the CID's providers; `--check` looks now) / those others asked of your node, what became of each and their use of `remote_pin_quota` |
 | `rnfs gc` / `verify` | Evict cached downloads / re-check every stored block |
 | `rnfs deny add\|rm ENTRY…` / `deny ls` | Edit your deny list / show it and the lists in use |
 | `rnfs jobs [list\|show\|wait\|cancel\|clear] [ID]` | Background transfers: progress, rate, time left |
@@ -497,7 +500,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 `add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
 `--to RECIPIENT…` (after the path) seals a file so only those node IDs, LXMF addresses or contacts can read it,
-and `--to-self` adds you.
+and `--to-self` adds you; a folder is sealed as one file, a tar named `<folder>.tar`, hiding its names too.
 
 A NomadNet link (`rnfs add e166ecdbc405bcc9762b6767617fc949:/page/index.mu`) is fetched from that node as it serves
 it now and added like a file, with the link shown in `pin ls`; run it again for a newer snapshot. The same options
@@ -507,7 +510,8 @@ lists. A local file whose name looks like such a link is added as `./NAME`.
 
 `get` without `-o` uses the target's name only if it is a safe file name (printable, not starting with `.`),
 otherwise its CID, and writes under a temporary name until the transfer is complete. It decrypts sealed files
-you can open; `--raw` gives the stored bytes, which is what scripts that show content to others should use.
+you can open, and unpacks a sealed folder to its directory (`--no-extract` keeps the `.tar`); `--raw` gives the
+stored bytes, which is what scripts that show content to others should use.
 
 **Gateway** (`http://127.0.0.1:8789`): `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and
 directories; `?filename=` sets the type and download name; `?format=raw` and `?format=archive` return data you
@@ -556,6 +560,12 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
   `capabilities()`, pin labels (`label_pin`), the cache (`cache()`, `uncache(cid)`), settings (`config()`,
   `config_set({...})`), tars and archives as streams (`add_tar`, `get_tar`, `export_stream`, `import_stream`), and
   for a `Client` `shutdown()` and `daemon_info()`.
+- A `Client` can have a token of its own, so the user sees and removes what your app pinned: the user runs
+  `rnfs app add myapp -o ~/.myapp/token`, and you use `rnfs.Client(app="myapp", token_file="~/.myapp/token")`.
+  Its pins get the source `app:myapp` (`with client.pin_key("inbox"): ...` makes them `app:myapp:inbox`'s, a group
+  your app can hold and release on its own); `client.unpin()` releases only your app's, and `rnfs app rm myapp`
+  revokes the token and releases them all. The token isn't scoped: your app can do anything the user's `rnfs`
+  command can, but manage apps.
 - A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
   just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the

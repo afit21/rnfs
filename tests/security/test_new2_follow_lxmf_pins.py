@@ -161,7 +161,7 @@ class LxmfCrashTest(FeatureTestCase):
         self.b.storage.pin(other, USER)  # another source's pin is never touched
         # Crash before the inbox is saved: the feature is built again from what is on disk
         again = self.reloaded()
-        source = f"lxmf:{SENDER.hex()}"
+        source = f"app:lxmf:{SENDER.hex()}"
         # NEW-2: fails until lxmf: pins the saved inbox doesn't record are released at start
         self.assertEqual(self.b.storage.pinned_by(source), {target})
         self.assertEqual(self.b.storage.pins()[other], {USER})

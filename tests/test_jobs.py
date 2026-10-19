@@ -859,10 +859,10 @@ class LocalJobsTest(JobsBase):
             self.b.import_archive(self.out("not-an-archive"))
         self.assertEqual(job["error"], str(raised.exception))
         top = self.tree()
-        job = self.finished(self.jobs.submit("add", path=top, options={"to_self": True})["id"])
-        self.assertEqual(job["state"], "failed")  # directories can't be sealed, as add says
+        job = self.finished(self.jobs.submit("add", path=top, options={"to_self": True, "seal_name": False})["id"])
+        self.assertEqual(job["state"], "failed")  # a folder is sealed only under its name, as add says
         with self.assertRaises(ValueError) as raised:
-            self.b.add_path(top, to_self=True)
+            self.b.add_path(top, to_self=True, seal_name=False)
         self.assertEqual(job["error"], str(raised.exception))
 
     def test_bad_add_and_import_submissions(self):

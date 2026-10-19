@@ -99,9 +99,9 @@ class ApiClient(apiclient.ApiConnection):
     request (status without the token says only the daemon's version, for health checks).
     """
 
-    def __init__(self, port: int, token_file: str):
-        """A client of the daemon on port whose token is in token_file."""
-        super().__init__(port=port, token_file=token_file)
+    def __init__(self, port: int, token_file: str, rnfs_dir: str | None = None):
+        """A client of the daemon using rnfs_dir (default ~/.rnfs/), on port, whose token is in token_file."""
+        super().__init__(rnfs_dir=rnfs_dir, port=port, token_file=token_file)
 
     def request(self, *args, **kwargs) -> http.client.HTTPResponse:
         """ApiConnection.request (the successful response), exiting on errors."""
@@ -158,7 +158,7 @@ def client(args) -> ApiClient:
     if port is None:
         running = apiclient.read_daemon_info(args.dir)
         if running is not None:
-            return ApiClient(running["api_port"], token_path(args.dir))
+            return ApiClient(running["api_port"], token_path(args.dir), args.dir)
         try:
             config = apiclient.load_settings(args.dir)
         except apiclient.ApiError as e:
@@ -166,7 +166,7 @@ def client(args) -> ApiClient:
         for warning in config.warnings:
             warn(warning)
         port = config.api_port
-    return ApiClient(port, token_path(args.dir))
+    return ApiClient(port, token_path(args.dir), args.dir)
 
 
 def port_number(text: str, minimum: int = 1) -> int:
@@ -390,14 +390,40 @@ def add_options(args, query: bool = False) -> dict:
     return options
 
 
+def extracting(args) -> bool:
+    """True if get unpacks a sealed folder it opens (neither --raw nor --no-extract)."""
+    return not getattr(args, "raw", False) and not getattr(args, "no_extract", False)
+
+
 def wants_sealed_name(args) -> bool:
     """True if get, without -o, should write a sealed file it opens under its sealed name: a bare CID's
     output name would be the CID, while a path's last name is already a name."""
     return not args.output and not getattr(args, "raw", False) and "/" not in args.target.strip("/")
 
 
+def folder_name(info: dict) -> str | None:
+    """The name a sealed folder GET /api/info describes is unpacked under (its sealed name without .tar, which add
+    gives its top directory), or None if it isn't one get unpacks ("sealed_folder", which a daemon before 0.2.0,
+    unpacking nothing, doesn't give)."""
+    name = info.get("name") if info.get("sealed_folder") else None
+    return name[:-4] if isinstance(name, str) and len(name) > 4 and name.endswith(".tar") else None
+
+
+def folder_output(args, output: str) -> str:
+    """get's default output for a path whose last name ends in .tar: when it is a sealed folder this node unpacks
+    (asked of GET /api/info first), the folder's name in output's directory, rather than a directory called
+    `<name>.tar`; output otherwise, a tar sealed as a file included (written as the file under the path's name)."""
+    target = args.target.strip("/")
+    if args.output or not extracting(args) or "/" not in target or not target.endswith(".tar"):
+        return output
+    name = folder_name(client(args).get("/api/info", target=args.target, **{"from": args.from_node}))
+    # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
+    return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
+
+
 def sealed_output(args, output: str) -> str:
-    """get's default output for a sealed file this node can open: its sealed name, if it has one.
+    """get's default output for a sealed file this node can open: its sealed name, if it has one (a sealed folder
+    unpacked: the folder's name).
 
     Only for a daemon without the job manager: a get job picks the sealed name itself (sealed_name), which
     doesn't cost a separate fetch of the root before the job, ignoring --from.
@@ -406,6 +432,8 @@ def sealed_output(args, output: str) -> str:
         return output
     info = client(args).get("/api/info", target=args.target, **{"from": getattr(args, "from_node", None)})
     name = info.get("name") if info.get("sealed") else None
+    if extracting(args) and folder_name(info) is not None:
+        name = folder_name(info)  # the top directory get unpacks it to, which add names after the folder
     # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
     return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
 
@@ -524,16 +552,24 @@ def run_get(args):
         print_warnings(result)
         print(printable(output))
         return
+    unpacked = folder_output(args, output)
+    if unpacked != output:
+        output = unpacked
+        if os.path.lexists(output):
+            fail(f"{output} already exists; remove it or choose another with -o")
+    # Sent only when set, so a daemon older than 0.2.0 (which never unpacks, and ignores it) is asked as before
+    no_extract = {"no_extract": True} if getattr(args, "no_extract", False) else {}
 
     def without_jobs(api) -> dict:
         """The get in one request, for a daemon without the job manager (asking for a sealed name first)."""
         final = sealed_output(args, output)
         if final != output and os.path.lexists(final):
             fail(f"{final} already exists; remove it or choose another with -o")
-        return {"output": final, **api.post("/api/get", target=args.target, output=final, **{"from": args.from_node})}
+        return {"output": final, **api.post("/api/get", target=args.target, output=final, **{"from": args.from_node},
+                                            **no_extract)}
 
     from rnfs.features import jobs
-    fields = {"kind": "get", "target": args.target, "output": output, "from": args.from_node}
+    fields = {"kind": "get", "target": args.target, "output": output, "from": args.from_node, **no_extract}
     if wants_sealed_name(args):
         fields["sealed_name"] = True  # the job renames a sealed file it opens to its sealed name
     result = jobs.run_transfer(args, fields, without_jobs)
@@ -708,10 +744,45 @@ def run_pin_remote(args):
     """Ask a node to pin or release a CID."""
     from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
     args.node = node_arg(args, args.node)
-    result = client(args).post("/api/pin/remote", node=args.node, cid=args.cid, pin=args.action == "add")
-    if not result["accepted"]:
+    if not client(args).pin_remote(args.node, args.cid, pin=args.action == "add"):
         fail(f"{args.node} refused the request")
     print("accepted")
+
+
+def run_pin_remote_ls(args):
+    """List the remote pins this node asked for and whether each is done, or (--served) those others asked of it."""
+    from rnfs.features.peers import human_age, human_size  # no RNS there
+    if args.served:
+        if args.node or args.cid or args.check:
+            fail("--served takes no node, CID or --check")
+        served = client(args).pin_remote_served()
+        if args.json:
+            print(json.dumps(served, indent=2))
+            return
+        now = time.time()
+        for usage in served["usage"]:
+            gone = "" if usage["allowed"] else " (no longer in remote_pin_identities)"
+            print(printable(f"{usage['identity']}: {human_size(usage['used'])} of {human_size(usage['quota'])} used, "
+                            f"{usage['pinned']} pinned, {usage['waiting']} waiting{gone}"))
+        for pin in served["pins"]:
+            state = pin["state"] + (f" ({pin['reason']})" if pin.get("reason") else "")
+            when = f"  {human_age(now - pin['at'])} ago" if pin.get("at") is not None else ""
+            detail = f": {pin['detail']}" if pin.get("detail") else ""  # may name what others' DAGs hold: escaped
+            print(printable(f"{pin['identity']}  {pin['cid']}  {state}{when}{detail}"))
+        return
+    from rnfs.features.contacts import node_arg  # a node contact's nick works as a node ID
+    node = node_arg(args, args.node) if args.node else None
+    pins = client(args).pin_remote_ls(node, args.cid, check=args.check)
+    if args.json:
+        print(json.dumps(pins, indent=2))
+        return
+    if not pins:
+        print("no remote pins asked for (those asked before rnfs 0.2.0 aren't listed)", file=sys.stderr)
+    now = time.time()
+    for pin in pins:
+        checked = f", checked {human_age(now - pin['checked'])} ago" if pin.get("checked") is not None else ""
+        print(printable(f"{pin['node']}  {pin['cid']}  {pin['state']}  asked {human_age(now - pin['asked'])} ago"
+                        f"{checked}"))
 
 
 def run_gc(args):
@@ -866,6 +937,48 @@ def run_stop(args):
     print("rnfs: the daemon stopped")
 
 
+def run_app_add(args):
+    """Issue a token to a new app: print it, or write it to -o (a new file, readable by this user only); say on
+    stderr what it lets the app do."""
+    if args.output and os.path.lexists(args.output):
+        fail(f"{args.output} already exists")
+    api = client(args)
+    added = api.app_add(args.name)
+    name, token = added["name"], added["token"]
+    if args.output:
+        try:
+            fsutil.write_atomic(args.output, (token + os.linesep).encode("ascii"), mode=0o600, private=True,
+                                exclusive=True)
+        except OSError as e:
+            api.app_rm(name)  # nobody has its token: don't leave the app behind
+            fail(f"can't write {args.output}: {e}; app {name} was not added")
+        print(printable(f"app {name}: its token is in {args.output}"))
+    else:
+        print(token)
+    print(printable(f"rnfs: app {name} can do anything this command line can (fetch and pin, read local files as "
+                    f"the daemon's user, export name keys, change settings, stop the daemon), except manage apps. "
+                    f"Its pins are app:{name}'s. Give its token only to an app you trust that far; `rnfs app rm "
+                    f"{name}` revokes it and releases its pins."), file=sys.stderr)
+
+
+def run_app_ls(args):
+    """List the apps: name and when each was added."""
+    apps = client(args).apps()
+    if args.json:
+        print(json.dumps(apps, indent=2))
+        return
+    for app in apps:
+        added = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(app["created"]))
+        print(f"{printable(app['name'])}\t{added}")
+
+
+def run_app_rm(args):
+    """Revoke an app's token and release its pins."""
+    result = client(args).app_rm(args.name)
+    print(printable(f"removed app {args.name}, releasing {result['released']} pin"
+                    f"{'' if result['released'] == 1 else 's'}"))
+
+
 def run_status(args):
     """Print the daemon's status, one "name: value" per line. Without a readable API token (a health check by
     another user), only the version the daemon says without it."""
@@ -932,10 +1045,11 @@ def build_parser() -> argparse.ArgumentParser:
     # --- content: unpinned adds, sealed files, chunkers ---
     add.add_argument("--no-pin", action="store_true", help="keep it as evictable cache instead of pinning it")
     add.add_argument("--to", nargs="+", action="extend", metavar="RECIPIENT",
-                     help="seal it so only these can read it: rnfs node IDs, LXMF addresses or identity hashes "
-                          "RNS has heard, 128-hex public keys, or contact nicks")
+                     help="seal it (a folder as one tar, <folder>.tar) so only these can read it: rnfs node IDs, "
+                          "LXMF addresses or identity hashes RNS has heard, 128-hex public keys, or contact nicks")
     add.add_argument("--to-self", action="store_true", help="seal it for this node's identity too")
-    add.add_argument("--no-sealed-name", action="store_true", help="with --to: don't seal the file name inside")
+    add.add_argument("--no-sealed-name", action="store_true",
+                     help="with --to: don't seal the file name inside (not for a folder)")
     add.add_argument("--chunker", choices=["fixed", "fastcdc"], help="fixed 64 KiB chunks (default) or FastCDC "
                      "content-defined chunks, which keep most chunks of an edited file unchanged")
 
@@ -945,6 +1059,8 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--from", dest="from_node", metavar="NODE_ID", help="fetch from this node, bypassing the DHT")
     get.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
     get.add_argument("--raw", action="store_true", help="a sealed file as stored (its ciphertext), not decrypted")
+    get.add_argument("--no-extract", action="store_true",
+                     help="write a sealed folder as its .tar instead of unpacking it")
 
     cat = command(commands, "cat", run_cat, "write a file, or part of one, to stdout")
     cat.add_argument("target", metavar="CID[/PATH]")
@@ -990,6 +1106,15 @@ def build_parser() -> argparse.ArgumentParser:
         sub = command(remote, action, run_pin_remote, f"ask a node to {'pin' if action == 'add' else 'unpin'} a CID")
         sub.add_argument("node", metavar="NODE_ID")
         sub.add_argument("cid")
+    remote_ls = command(remote, "ls", run_pin_remote_ls,
+                        "list the remote pins asked for and whether each is done (--served: those asked of this node)")
+    remote_ls.add_argument("node", metavar="NODE_ID", nargs="?", help="only those asked of this node")
+    remote_ls.add_argument("cid", nargs="?", help="only those of this CID")
+    remote_ls.add_argument("--check", action="store_true",
+                           help="look each up among its CID's providers first (paced; at most 32, 4 on a slow node)")
+    remote_ls.add_argument("--served", action="store_true",
+                           help="the pins other identities asked of this node, and their use of remote_pin_quota")
+    remote_ls.add_argument("--json", action="store_true", help="print the full listing as JSON")
 
     command(commands, "gc", run_gc, "evict all cached fetches")
     cache = commands.add_parser("cache", help="cached fetches (downloads not pinned)").add_subparsers(
@@ -1031,6 +1156,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_.add_argument("file")
     import_.add_argument("--background", action="store_true",
                          help="start an import job, print its ID and return (rnfs jobs)")
+
+    app_commands = commands.add_parser("app", help="tokens for apps that use the API").add_subparsers(
+        dest="app_command", required=True, metavar="command")
+    app_add = command(app_commands, "add", run_app_add,
+                      "issue a token to an app (it can do anything rnfs can, but manage apps): print it once")
+    app_add.add_argument("name", help="the app's name: a-z, 0-9, '.', '_', '-'")
+    app_add.add_argument("-o", "--output", metavar="FILE", help="write the token to FILE (a new file, mode 0600)")
+    app_ls = command(app_commands, "ls", run_app_ls, "list the apps")
+    app_ls.add_argument("--json", action="store_true")
+    command(app_commands, "rm", run_app_rm, "revoke an app's token and release its pins").add_argument("name")
 
     command(commands, "status", run_status, "node ID, known nodes, records held, storage use")
     stop = command(commands, "stop", run_stop, "stop the daemon (as Ctrl+C or SIGTERM would) and wait until it has")

@@ -9,16 +9,54 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`); an older rnfs can't
-  open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count as
-  never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
+  `remote_pins_asked`, `remote_pins_served`); an older rnfs can't open it afterwards. Pins made before the upgrade
+  have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
+  `rnfs name export` is run), and remote pins asked before it have no status entry.
+- **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
+  `app:lxmf:<address>` (`pin ls` shows the new one), the source the LXMF wrapper app will own once LXMF leaves
+  core; the LXMF built into rnfs uses it from now on, so nothing is released by the change. An older
+  `pins.json` imported at the upgrade gets the same rewrite.
+- **Provider records:** the upgrade gives each publisher of the records a node stores a standing
+  (`provider_standing`, and indexes on `provider_records`): Earned if it was first seen at least 3 days before its
+  latest store and refreshed a record outside the newcomer pool a day or more after storing it, else Newcomer. The
+  newcomer pool's records are no longer pooled, and the remembered departed and evicted publishers are dropped.
+- **`max_records` is retired:** a `max_records` left in `rnfs.toml` (or given to `rnfs.Node`) is ignored with a
+  warning instead of stopping the daemon; `record_budget` (bytes) replaces it. `rnfs config set max_records` is
+  refused as an unknown setting; `rnfs config unset max_records` removes it.
+- **Blocks:** they move from `blocks/<cid>` into 1,024 subdirectories, `blocks/<xy>/<cid>` (the CID's third- and
+  second-to-last characters), at the first start, which takes a while on a large store (a rename per block; the
+  API answers once it is done). Each start moves whatever is left, so an interrupted upgrade loses nothing, and
+  a block Windows won't let rnfs move stays readable until a later start moves it. An older rnfs doesn't find
+  the moved blocks. A subdirectory of `blocks/` that is a link, not a directory or another user's stops the
+  start. The state database gains a `block_sizes` table, every stored block's size, which the first start
+  fills by listing the blocks.
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
   assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
+- **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
+  restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
 Added, for apps:
+- **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
+  `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's
+  verifier, which is all the daemon keeps of it (`rnfs.db`'s new `apps` table). `rnfs.Client(app=..., token=...
+  or token_file=...)` and `ApiConnection(app=, token=)`. The `api_token` stays the CLI's, unchanged, and a
+  request without `X-Rnfs-App` is checked exactly as before.
+- **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
+  scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
+  can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
+  `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
+  `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
+  `forbidden`); capability `apps`. `rnfs app add lxmf` is refused while rnfs's own LXMF is on, and while an app
+  called `lxmf` exists rnfs's own LXMF stays off (an LXMF wrapper app owns its pins and identity).
+- **An app's pins:** what an app adds, pins, imports or makes with `dir set`/`dir rm` (and its pin, add and import
+  jobs) is pinned with the source `app:<name>`, or `app:<name>:<key>` with `X-Rnfs-Pin-Key: <key>`
+  (`client.pin_key(key)`), shown by `pin ls`. Its `pin rm` releases only its own source; the CLI's still
+  releases only `user`'s, and a pin key with the CLI's token is refused (400). Removing the app releases them all
+  and cancels its jobs.
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
   daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
   attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,
@@ -82,6 +120,10 @@ Added, for apps:
   send, inbox, get, remove, outbox, sync), with objects (`Peer`, `Stats`, `Contact`, `Kept`, `Followed`,
   `Message`, ...); `jobs.add` and `jobs.import_archive`; and the additions above (events, capabilities, pin
   labels, the cache, settings, streams). A Node raises what a Client gets back.
+- **Starting:** while a daemon opens its block store, before its API listens, `rnfs status` and the other commands
+  say it is starting, naming its process, rather than that no daemon is running; the library raises
+  `DaemonStarting` (`.pid`), a `DaemonNotRunning`, so code catching that is unchanged. Told by the rnfs dir's
+  lock, which the daemon takes first (`apiclient.dir_holder`).
 - **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
 - **Gateway sites, an origin per root:** `http://<k-cid>.rnfs.localhost:8789/<path>` serves `<cid>/<path>` and
@@ -103,9 +145,9 @@ Added:
   `exported`.
 - **Pin by NomadNet address:** `rnfs add <destination>:/page/<path>` (a page as the node renders it) or
   `<destination>:/file/<path>` (a file it serves) fetches it from that NomadNet node over a link of rnfs's own and
-  adds it like a file, pinned `user` with the link as its origin in `pin ls`; the usual `add` options apply
-  (`--no-pin`, `--wrap`, `--name`, `--to`, `--chunker`, `--only-hash`, `--background`), and it runs as an `add`
-  job with progress. Each run takes a new snapshot. The link is anonymous unless `--identify`, which identifies
+  adds it like a file, pinned `user` (with an app's token, that app's source) with the link as its origin in
+  `pin ls`; the usual `add` options apply (`--no-pin`, `--wrap`, `--name`, `--to`, `--chunker`, `--only-hash`,
+  `--background`), and it runs as an `add` job with progress. Each run takes a new snapshot. The link is anonymous unless `--identify`, which identifies
   with an identity of its own (`storage/nomadnet_identity`, made on first use), never the node's. A page the node
   answers with its "Request Not Allowed" page fails rather than being pinned. A local file named like such a link
   is added as `./<name>`. `POST /api/add` takes `nomadnet` (with `name` and `identify`) instead of `path`, as do add
@@ -121,7 +163,78 @@ Security:
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
 
+Added:
+- **Encrypted folders:** `rnfs add --to <recipient>… <folder>` (and `--to-self`, `--background`, `POST /api/add`
+  with `to`) seals a folder as one sealed file: the folder is packed as a tar, everything under one top directory
+  `<folder>/`, and sealed under the name `<folder>.tar`, so its file names and structure are hidden along with
+  its content (not its approximate total size). The sealed-file format is unchanged: a recipient on 0.1.x gets a
+  tar it can unpack itself. The tar starts with a marker, a pax global header holding only the POSIX `comment`
+  `rnfs sealed folder`, which extractors ignore. The folder is walked as `add` walks one (symlinks, devices and invalid names skipped
+  with warnings; names holding `\`, `＼` or `／`, or starting as a Windows drive does, skipped too); more than
+  `max_output_entries` entries or a tree deeper than `MAX_DEPTH` is refused, and so are a folder name over 251
+  bytes and `--no-sealed-name` with a folder (the name is what makes a recipient's `get` unpack it).
+- **Unpacking sealed folders:** `rnfs get` of a sealed folder (a sealed file whose sealed name ends in `.tar` and
+  whose content is a valid tar starting with the marker) unpacks it, by a recipient. A tar sealed as a file (by
+  0.1.x, or `rnfs add --to bob backup.tar` now) has no marker and is still written as that file, byte for byte;
+  `GET /api/info` gives a recipient `sealed_folder`. The decrypted tar is read with `POST /api/add/stream?format=tar`'s rules
+  (links, devices, absolute or `..` paths skipped; `max_output_entries` and `MAX_DEPTH`) and written with `get`'s
+  (temporary name, unsafe names skipped). Without `-o` the output is named after the tar's top directory. The
+  free-space check counts the content twice (its blocks, then the files), and the decrypted blocks are deleted
+  afterwards, never pinned or provided. A marked `.tar` whose content isn't a valid tar is written as the file,
+  with a warning; one past a limit is refused. `rnfs get --no-extract` writes the `.tar` instead; `POST /api/get`,
+  `POST /api/jobs` (kept with the job), `Node/Client.get` and `jobs.get` take `no_extract`, and `Written` gains
+  `extracted`. `POST /api/get` without `no_extract` unpacks a sealed folder; content sealed before 0.2.0 is
+  written as it always was.
+  `GET /api/capabilities` lists `sealed_folders`. `cat` still gives the decrypted tar, and the gateway and
+  `--raw` the sealed bytes. `POST /api/add/stream?format=tar` still can't seal (400).
+
+Provider records (DHT servers; spec section 6, all local policy: nothing on the wire changes):
+- **On disk:** records are read from the state database per `/find` through an index, with a small cache, instead
+  of all held in memory (about 500 bytes each before): memory no longer grows with the records or their publishers.
+  Changes are written together every 30 s; a republish is written only when it moves a record's last-stored time by
+  more than an hour, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
+  200 000 records cost about 70 µs a store and 112 transactions in all, on a desktop NVMe disk.
+- **A byte budget instead of a record count:** records may take `record_budget` of disk (new, default 1 GiB: about
+  7 million records at the 150 bytes a record takes, measured from the database), never the free disk the blocks'
+  reserve needs. `max_records` (100 000 records) goes.
+- **No per-publisher caps while there is room:** anyone stores freely until the budget is full, so a large
+  publisher (a mirror) is no longer held to 1% of the store, nor a new one to a tenth of that. The newcomer pool and
+  the memories of departed and evicted publishers go too.
+- **Storage tiers once the budget is full:** Known (contacts of kind `node`, private-mode members, bootstrap
+  nodes; 30% floor), Earned (publishers that refreshed a record on 3 distinct UTC days; 60%) and Newcomer (everyone
+  else; 10%). A store to a full node takes a record from a tier's largest holder: the lowest tier below the storer's
+  above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
+  within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
+  each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
+
+Added:
+- **Remote pin status** (local only; `/pin` and the wire are unchanged): a node records the remote pins it asks
+  for (node, CID, pin or release, when, whether accepted) and works out whether each accepted one is done by
+  looking the node up among the CID's providers: paced (in the background at most 60 lookups an hour, 4 at
+  once, each pin hourly while waiting and daily after; on slow nodes 4 an hour, one at a time), waiting for up
+  to 24 hours after asking, then missing if not found. So "done" lags the node's publishing and is only as good as
+  the DHT. A node serving remote pins records what became of each (waiting, fetching, pinned, dropped with why:
+  quota, not found, denied, ...; refused because denied or its queue was full; released), which was only logged.
+  At most 10 000 asked entries and 1 000 served outcomes are kept. `remote_pin` events report both.
+  `rnfs pin remote ls [NODE_ID] [CID] [--check] [--json]` lists the pins asked for (`--check` looks them up now:
+  one lookup each, at most 32 a call, 4 on a slow node); `rnfs pin remote ls --served [--json]` lists those served
+  and each identity's use of `remote_pin_quota`. `GET /api/pin/remote?node=&cid=&check=1` and
+  `GET /api/pin/remote/served`; `ApiConnection.pin_remote_ls` / `pin_remote_served`; `Node/Client.remote_pins()`
+  and `served_pins()` (`RemotePin`, `ServedPins`, `ServedPin`, `RemotePinUsage`); capability
+  `remote_pin_status`.
+
 Changed:
+- A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
+  mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
+  announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
+- Blocks are stored in subdirectories (`blocks/<xy>/<cid>`): one directory of millions of files is slow to list,
+  and FAT32, common on the USB drives added to a Raspberry Pi, holds only about 10,900 such names per directory
+  (a 59–64 character name takes 6 of its 65,536 entries). The cost is at the durability points: storing blocks
+  syncs each subdirectory written to (up to 1,024, 16 at a time) where it synced one directory. Adding 64 MiB
+  (1,029 blocks) to a new store on a desktop NVMe disk: 1.02 → 1.41 s; a tree of 1,024 8 KiB files 0.95 → 1.43 s;
+  fetching them (each block synced on its own) unchanged at about 13.5 s (`tests/bench_block_writes.py`,
+  `today`, median of 3). Raspberry Pi SD-card numbers are still to be measured.
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
   0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.
@@ -129,6 +242,36 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+
+The DHT (local behaviour: nothing on the wire changes):
+- The routing table is saved and loaded at start, so a restart doesn't make every server new again: servers keep
+  their seniority (which ranks providers and keepers), bans last their time, and `/find` replies still leave out
+  servers silent for over 2 × `announce_interval`, the time the node was down included.
+- Local scores: each node keeps a private score per peer, earned by work it checks itself (blocks served that
+  verified, `/find` answers that led to providers who served or to closer servers that answered) and lost by
+  failures, bad blocks and silence (scores halve each week). Bootstrap nodes start with a small seed they keep
+  only by earning it. Nothing is sent; at most 4096 peers are scored.
+- A join (at start, and again while too few servers are live) asks up to 6 servers of the saved routing table
+  first, best scored first, and bootstrap nodes only if fewer than two of those answer: a node that has joined
+  once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. After
+  such a join, a node that isn't slow still asks the default bootstrap nodes (until one answers, at most 2), so
+  one that saved only an island of servers reaches the rest of the network; a slow node no longer does.
+- Choosing providers: within each seniority group (seniority stays first), providers with a better local score
+  are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
+- The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
+  servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
+  the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
+  next to a key can't be. Publishing and searching will use it.
+
+Faster:
+- A start no longer lists every stored block before the API answers: their sizes are kept in the state database
+  (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
+  as before, and corrects the table. Opening storage on a desktop NVMe disk (warm cache), small blocks: 100 000
+  of them 0.50 → 0.13 s after a clean stop (0.65 s after an unclean one), a million 5.4 → 1.2 s (7.2 s after an
+  unclean one: 1,024 directories listed and the table compared). The first start, moving them out of 0.1.6's flat
+  layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
+  order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
+  dropped as after a reboot).
 
 ## 0.1.6
 

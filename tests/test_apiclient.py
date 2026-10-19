@@ -19,6 +19,7 @@ from rnfs.apiclient import (ApiConnection, ApiError, AuthFailed, BadRequest, Bus
 from rnfs.config import DEFAULT_API_PORT
 from rnfs import errors
 from tests.support import POSIX_MODES, free_port, real
+from tests.test_fsutil import hold_lock
 from tests.test_api import FakeNode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -407,6 +408,9 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.fetch(directory, output)["cid"], directory)
         with open(os.path.join(output, "a.txt"), "rb") as f:
             self.assertEqual(f.read(), b"abc")
+        self.assertEqual(self.node.called("get")[-1][1], {"from_node": None})  # no_extract only when set
+        self.api.fetch(directory, os.path.join(self.tmp, "tar"), no_extract=True)
+        self.assertEqual(self.node.called("get")[-1][1], {"from_node": None, "no_extract": True})
         self.assertEqual(self.api.info(directory)["type"], "directory")
         self.assertEqual(self.api.ls(directory), [{"name": "a.txt", "kind": "file", "size": 3, "cid": file_cid}])
         self.assertEqual(self.api.stat(f"{directory}/a.txt")["size"], 3)
@@ -460,6 +464,21 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.providers(cid), ["cd" * 16])
         self.assertEqual(self.api.ping("cd" * 16), 0.25)
         self.assertIsNone(self.api.ping("ff" * 16))
+
+    def test_remote_pin_status(self):
+        """pin_remote_ls sends only the parameters given; pin_remote_served; a daemon with only the POST (before
+        0.2.0) answers the GET 405, which is NoSuchEndpoint here."""
+        cid = self.node.put_file(b"abc")
+        self.assertEqual(self.api.pin_remote_ls()[0]["state"], "waiting")
+        self.assertEqual(self.api.pin_remote_ls("ab" * 16, cid, check=True)[0]["state"], "done")
+        self.assertEqual(self.node.called("pin_remote_ls"),
+                         [((None, None), {}), ((bytes.fromhex("ab" * 16), cid), {"check": True})])
+        self.assertEqual(self.api.pin_remote_served()["usage"][0]["quota"], 100)
+        with mock.patch.dict(ApiHandler.ROUTES):
+            del ApiHandler.ROUTES[("GET", "/api/pin/remote")]
+            with self.assertRaises(apiclient.NoSuchEndpoint) as raised:
+                self.api.pin_remote_ls()
+        self.assertEqual(raised.exception.code, "no_such_endpoint")
 
     def test_name_keys(self):
         """name_export, name_rm and name_import (the key as the body) (ND4)."""
@@ -655,6 +674,111 @@ class ProofTest(ClientTestCase):
         self.assertEqual(self.api.daemon_version, refused[0])
 
 
+class AppClientTest(ClientTestCase):
+    """An ApiConnection (and rnfs.Client) as an app: app= with token= or token_file=."""
+
+    def setUp(self):
+        """The node gets a real app registry holding app "wiki"; its token is also in <tmp>/wiki_token."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        self.node.apps = AppRegistry(os.path.join(self.tmp, "state"))
+        self.addCleanup(self.node.apps.close)
+        self.app_token = self.node.apps.add("wiki")["token"]
+        self.app_file = os.path.join(self.tmp, "wiki_token")
+        cli.write_token(self.app_file, self.app_token)
+
+    def app_headers_seen(self) -> list:
+        """A list collecting (path, X-Rnfs-App, X-Rnfs-Api) of every request the server handles from now on."""
+        seen = []
+        original = self.server.server.RequestHandlerClass.dispatch
+
+        def spy(handler):
+            """Record the request, then handle it."""
+            seen.append((handler.path.split("?")[0], handler.headers["X-Rnfs-App"], handler.headers["X-Rnfs-Api"]))
+            original(handler)
+        patcher = mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_app_with_its_token(self):
+        """Given or in a file, the app's token proves the daemon and passes; X-Rnfs-App names the app on the proof
+        and the request; the API token file isn't read."""
+        os.unlink(self.token_file)
+        seen = self.app_headers_seen()
+        for api in (ApiConnection(self.tmp, port=self.server.port, app="wiki", token=self.app_token),
+                    ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file)):
+            self.assertEqual(api.status()["node_id"], self.node.status()["node_id"])
+            self.assertEqual(api.token, self.app_token)
+        self.assertEqual(seen, [("/api/status", "wiki", None), ("/api/status", "wiki", self.app_token)] * 2)
+
+    def test_client_as_an_app(self):
+        """rnfs.Client takes app and token too."""
+        import rnfs
+        with rnfs.Client(self.tmp, port=self.server.port, app="wiki", token=self.app_token) as client:
+            self.assertEqual(client.node_id, self.node.node_id)
+            self.assertEqual(client.api.app, "wiki")
+
+    def test_wrong_or_removed_app_fails_the_proof(self):
+        """A token that isn't the app's, or an app there isn't (removed), fails the proof: AuthFailed naming the
+        app, and the token is never sent."""
+        seen = self.app_headers_seen()
+        for api in (ApiConnection(self.tmp, port=self.server.port, app="wiki", token="not its token"),
+                    ApiConnection(self.tmp, port=self.server.port, app="other", token=self.app_token)):
+            with self.assertRaises(AuthFailed) as raised:
+                api.post("/api/gc")
+            self.assertIn(f"app {api.app}'s token", str(raised.exception))
+        api = ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file)
+        api.status()
+        self.node.apps.remove("wiki")
+        with self.assertRaises(AuthFailed):
+            api.post("/api/gc")
+        self.assertEqual([token for path, _, token in seen if path != "/api/status"], [])
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_app_needs_its_token(self):
+        """An app without token or token_file, an empty token, or both, is refused before anything is sent; a
+        missing app token file says how to make one."""
+        for kwargs in ({"app": "wiki"}, {"app": "wiki", "token": ""}, {"app": "wiki", "token": " "},
+                       {"app": "wiki", "token": "t", "token_file": self.app_file}, {"token": 7}, {"app": "",
+                                                                                                "token": "t"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ApiConnection(self.tmp, port=self.server.port, **kwargs)
+        missing = ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file + ".gone")
+        with self.assertRaises(TokenError) as raised:
+            missing.status()
+        self.assertIn("rnfs app add wiki", str(raised.exception))
+
+    def test_managing_apps(self):
+        """apps, app_add and app_rm with the CLI's token; an app's connection is refused them (AuthFailed,
+        "forbidden")."""
+        self.assertEqual([app["name"] for app in self.api.apps()], ["wiki"])
+        added = self.api.app_add("gallery")
+        gallery = ApiConnection(self.tmp, port=self.server.port, app="gallery", token=added["token"])
+        self.assertEqual(gallery.status()["node_id"], self.node.status()["node_id"])
+        with self.assertRaises(BadRequest):
+            self.api.app_add("gallery")
+        for call in (gallery.apps, lambda: gallery.app_add("mine"), lambda: gallery.app_rm("wiki")):
+            with self.assertRaises(AuthFailed) as raised:
+                call()
+            self.assertEqual(raised.exception.code, "forbidden")
+        self.assertEqual(self.api.app_rm("gallery"), {"released": 0})
+        with self.assertRaises(NotFound):
+            self.api.app_rm("gallery")
+        self.assertEqual([app["name"] for app in self.api.apps()], ["wiki"])
+
+    def test_impostor_gets_no_app_token(self):
+        """A listener that can't prove it knows the app's token gets only the challenge (and the app's name)."""
+        received = []
+        impostor = ProofTest.impostor(self, received)
+        api = ApiConnection(self.tmp, port=impostor, app="wiki", token=self.app_token)
+        with self.assertRaises(AuthFailed):
+            api.post("/api/gc")
+        self.assertEqual(len(received), 1)
+        self.assertNotIn("X-Rnfs-Api", received[0][1])
+        self.assertEqual(received[0][1]["X-Rnfs-App"], "wiki")
+
+
 class TimeoutTest(ClientTestCase):
     """Timeouts per call (timeout=) and per thread (using_timeout), over the connection's own."""
 
@@ -756,6 +880,39 @@ class ErrorTest(ClientTestCase):
             ApiConnection(self.tmp, port=free_port()).version()
         self.assertIn("no daemon is running", str(raised.exception))
         self.assertIsNone(raised.exception.status)
+        self.assertNotIsInstance(raised.exception, apiclient.DaemonStarting)
+
+    def test_daemon_starting(self):
+        """Nothing on the port, but a process holds the rnfs dir's lock (a daemon opening a large block store
+        before its API listens): DaemonStarting, a DaemonNotRunning, naming that process."""
+        holder = hold_lock(os.path.join(self.tmp, "daemon.lock"))
+        try:
+            with self.assertRaises(apiclient.DaemonStarting) as raised:
+                ApiConnection(self.tmp, port=free_port()).version()
+            self.assertIsInstance(raised.exception, DaemonNotRunning)
+            self.assertEqual(raised.exception.pid, holder.pid)
+            self.assertIn(f"the daemon (process {holder.pid}) is starting", str(raised.exception))
+            self.assertEqual(apiclient.dir_holder(self.tmp), holder.pid)
+        finally:
+            holder.stdin.close()
+            holder.wait(30)
+            holder.stdout.close()
+        # Once it has gone, the lock file is left, naming it: no daemon is running
+        self.assertIsNone(apiclient.dir_holder(self.tmp))
+        with self.assertRaises(DaemonNotRunning) as raised:
+            ApiConnection(self.tmp, port=free_port()).version()
+        self.assertNotIsInstance(raised.exception, apiclient.DaemonStarting)
+
+    def test_lock_of_a_process_gone_isnt_tested(self):
+        """A lock file naming a process that has ended isn't tested (testing it could make a daemon starting at that
+        moment fail), nor is one naming this process (its own Node)."""
+        for pid in (os.getpid(), 2**22 + 12345):
+            with self.subTest(pid=pid):
+                with open(os.path.join(self.tmp, "daemon.lock"), "w", encoding="ascii") as f:
+                    f.write(f"{pid}\n")
+                with mock.patch.object(apiclient.fsutil, "lock_held", side_effect=AssertionError("tested")), \
+                        mock.patch.object(apiclient, "_process_alive", return_value=pid == os.getpid()):
+                    self.assertIsNone(apiclient.dir_holder(self.tmp))
 
     def test_missing_token(self):
         """No token file: TokenError, and the request isn't sent."""

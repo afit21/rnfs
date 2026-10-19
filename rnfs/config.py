@@ -26,7 +26,7 @@ LOCK_FILE = "daemon.lock"
 WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free port (printed at start)
     "api_port": (1, 65535), "gateway_port": (0, 65535), "verbosity": (0, None), "min_rate_sample": (1, None),
     "beta": (1, None), "max_failures": (1, None), "max_incoming_links": (1, None), "max_blocks_responses": (2, None),
-    "fast_blocks_responses": (1, None), "max_records": (0, None), "max_storage": (0, None),
+    "fast_blocks_responses": (1, None), "record_budget": (0, None), "max_storage": (0, None),
     "max_output_entries": (0, None), "name_table_size": (0, None), "remote_pin_quota": (0, None),
     "gateway_fetches": (0, None),
 }
@@ -60,7 +60,7 @@ FEATURE_LIMITS = {"max_jobs": (1, None), "max_finished_jobs": (1, None), "upload
                   "keep_max_names": (0, None), "follow_quota": (0, None), "lxmf_auto_fetch_quota": (0, None),
                   "lxmf_sync_interval": (0, None)}
 # Units of what the tables don't give one (DURATIONS are seconds, RATES bits/s)
-UNITS = {"min_rate_sample": "bytes", "max_storage": "bytes", "max_download_size": "bytes",
+UNITS = {"min_rate_sample": "bytes", "record_budget": "bytes", "max_storage": "bytes", "max_download_size": "bytes",
          "remote_pin_quota": "bytes", "follow_quota": "bytes", "lxmf_auto_fetch_quota": "bytes",
          "upload_budget": "bytes/hour", "lxmf_sync_interval": "seconds"}
 # Settings a running node applies at once when changed through the API (rnfs/features/settings.py, whose LIVE table
@@ -103,7 +103,7 @@ DESCRIPTIONS = {
     "max_blocks_responses": "/blocks responses in progress at once (half of them for slow links); at least 2",
     "fast_blocks_responses": "/blocks responses in progress on links that aren't slow, if more than the rest",
     "max_upload_rate": "Upload cap of every /blocks response; unset: half the rate estimate on slow links",
-    "max_records": "Provider records stored for others",
+    "record_budget": "Disk the provider records stored for others may take; past it, storage tiers decide who stays",
     "ban_time": "How long a misbehaving node is ignored",
     "max_storage": "Storage used before cached fetches are evicted (pins are never evicted)",
     "max_download_size": "Largest target fetched; unset: no limit",
@@ -136,6 +136,13 @@ DESCRIPTIONS = {
     "lxmf_auto_fetch_quota": "Storage the pins of one auto-fetch sender may use",
     "deny_lists": "Deny-list sources: <cid>[/path] or name/<name>[/path]",
 }
+# Settings earlier versions had and this one doesn't: name -> what took its place, for the warning. One left in
+# rnfs.toml (or given to an embedded node) is dropped with a warning instead of refused as unknown, so settings an
+# older version accepted still start the node. The settings API and `rnfs config set` know it no more than any other
+# name that isn't a setting (`rnfs config unset` removes it from rnfs.toml)
+RETIRED_SETTINGS: MappingProxyType = MappingProxyType({
+    "max_records": "since rnfs 0.2.0 provider records are bounded by record_budget, in bytes of disk",
+})
 _TYPE_NAMES = {int: "int", float: "float", bool: "bool", str: "string", list[str]: "list[string]"}
 MAX_TOML_INT = 2 ** 63 - 1  # TOML integers are 64-bit signed
 
@@ -149,10 +156,10 @@ def _is_number(value) -> bool:
 class Config:
     """Settings for an RnfsNode.
 
-    warnings: what Config.load changed to trust the settings, for the caller to show (a plain attribute, not a
-    field, so rnfs.toml can't set it). overrides and given_defaults: what Config.load was given over and under
-    rnfs.toml (the daemon's command line, an embedded node's settings and defaults), so the settings feature can
-    tell what a restart would run with.
+    warnings: what Config.load changed to trust the settings, and the retired settings it ignored, for the caller to
+    show (a plain attribute, not a field, so rnfs.toml can't set it). overrides and given_defaults: what Config.load
+    was given over and under rnfs.toml (the daemon's command line, an embedded node's settings and defaults), so the
+    settings feature can tell what a restart would run with.
     """
 
     # Unannotated, so not dataclass fields; Config.load sets them (never changed in place: a copy is shared)
@@ -197,7 +204,7 @@ class Config:
     # Responses in progress at once on links that aren't slow, if more than the rest of max_blocks_responses
     fast_blocks_responses: int = 16
     max_upload_rate: float | None = None  # none; half the rate estimate on slow links that have one
-    max_records: int = 100_000
+    record_budget: int = 1 * GIB  # bytes of the state database provider records may take (spec section 6)
     ban_time: float = 1 * HOUR
     max_storage: int = 10 * GIB
     max_download_size: int | None = None
@@ -404,6 +411,7 @@ class Config:
         path = settings_path(rnfs_dir)
         data, warnings = read_settings_file(path)
         config = cls.combine(rnfs_dir, parse_settings(data, path), defaults, overrides, path)
+        warnings.extend(config.warnings)  # the retired settings left out
         warnings.extend(config.check_reticulum_config())
         config.warnings = warnings
         return config
@@ -429,9 +437,16 @@ class Config:
                 path: str = SETTINGS_FILE) -> "Config":
         """The settings of rnfs_dir from rnfs.toml's values (file_values, as parse_settings gives them, read from
         path), over defaults and under overrides (None values ignored), validated as Config.load does, with
-        overrides and given_defaults recorded. Raises ValueError (TypeError for an override that isn't a field).
+        overrides and given_defaults recorded. Retired settings (RETIRED_SETTINGS) are left out, wherever they come
+        from, each with a warning in the result's warnings. Raises ValueError (TypeError for an override that isn't
+        a field).
         """
-        values: dict = dict(defaults or {})
+        # An embedded node's defaults are the app's, not the user's: left out without a word
+        retired = sorted((file_values.keys() | (overrides or {}).keys()) & RETIRED_SETTINGS.keys())
+        warnings = tuple(f"ignoring {name}{f' in {path}' if name in file_values else ''}: it is no longer a setting "
+                         f"({RETIRED_SETTINGS[name]}); remove it" for name in retired)
+        defaults, file_values, overrides = _current(defaults), _current(file_values), _current(overrides)
+        values: dict = dict(defaults)
         values.update(file_values)
         known = {f.name for f in fields(cls)}
         unknown = values.keys() - known
@@ -440,14 +455,20 @@ class Config:
         if "rnfs_dir" in values:
             # The file lives in the rnfs dir, so it can't move it; --dir does
             raise ValueError(f"rnfs_dir can't be set in {path}; use --dir")
-        given = {k: v for k, v in (overrides or {}).items() if v is not None}
+        given = {k: v for k, v in overrides.items() if v is not None}
         values.update(given)
         values["rnfs_dir"] = rnfs_dir
         config = cls(**values)
         config.validate()
         config.overrides = MappingProxyType(given)
-        config.given_defaults = MappingProxyType(dict(defaults or {}))
+        config.given_defaults = MappingProxyType(defaults)
+        config.warnings = warnings
         return config
+
+
+def _current(values: dict | None) -> dict:
+    """values (setting name -> value; None: none) without the retired settings."""
+    return {name: value for name, value in (values or {}).items() if name not in RETIRED_SETTINGS}
 
 
 def settings_path(rnfs_dir: str) -> str:

@@ -2,7 +2,9 @@
 GET /api/get/stream, GET /api/export/stream, POST /api/import/stream) and their ApiConnection methods."""
 import io
 import os
+import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -353,6 +355,207 @@ class WriteTarTest(unittest.TestCase):
         self.assertTrue(all(name.endswith("/" + "n" * 255) for name in files))
         with self.assertRaises(NodeTooLarge):
             self.tar(level.cid, max_entries=50)
+
+
+class FolderTarTest(unittest.TestCase):
+    """folder_chunks: a folder on this machine into a tar under one top directory (a sealed folder's plaintext)."""
+
+    def setUp(self):
+        """A temporary directory and an empty block store."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.store = Blocks()
+
+    def pack(self, path: str, top: str = "top", max_entries: int = 1000, **kwargs) -> tuple[bytes, list[str]]:
+        """(the tar of the folder at path, its warnings)."""
+        warnings: list[str] = []
+        handle, _ = builder.open_path(path)
+        try:
+            data = b"".join(tarstream.folder_chunks(handle, path, top, max_entries, warnings.append, **kwargs))
+        finally:
+            builder.close(handle)
+        self.assertEqual(len(data) % tarstream.RECORD, 0)
+        return data, warnings
+
+    def test_everything_is_under_one_top_directory(self):
+        """Every member is below top/ (so `tar xf` spills nothing), each directory before its contents, and the tar
+        builds into what `add --wrap` of the folder builds."""
+        top = tree(os.path.join(self.tmp, "folder"))
+        data, warnings = self.pack(top, "folder", mtime=1_700_000_000)
+        self.assertEqual(warnings, [f"skipped symlink {os.path.join(top, 'link')}"] if os.name != "nt" else [])
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            names = archive.getnames()
+            infos = archive.getmembers()
+        self.assertEqual(names[0], "folder")
+        self.assertTrue(all(name == "folder" or name.startswith("folder/") for name in names), names)
+        for info in infos:
+            self.assertTrue(info.isfile() or info.isdir(), info.name)
+            self.assertEqual((info.uid, info.gid, info.uname, info.gname, info.mtime), (0, 0, "", "", 1_700_000_000))
+        seen: set[str] = set()
+        for name in names:  # each directory before what it holds
+            self.assertIn(name.rpartition("/")[0] or "folder", seen | {"folder"})
+            seen.add(name)
+        out = os.path.join(self.tmp, "out")
+        os.makedirs(out)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            archive.extractall(out, filter="data")
+        self.assertEqual(os.listdir(out), ["folder"])
+        self.assertEqual(files_of(os.path.join(out, "folder")), files_of(top))
+        built = tarstream.build_tar(io.BytesIO(data), self.store.put, tarstream.Warnings(), 1000)
+        self.assertEqual(built.cid, builder.add_path(top, self.store.put, wrap_it=True)[0].cid)
+
+    def test_the_tar_starts_with_the_sealed_folder_marker(self):
+        """The first header is the marker (a pax global header of one comment), which tarfile, GNU tar and
+        build_tar take without a warning, an extra member or an extra file."""
+        top = tree(os.path.join(self.tmp, "folder"))
+        data, _ = self.pack(top, "folder")
+        self.assertTrue(data.startswith(tarstream.folder_marker()))
+        self.assertTrue(tarstream.is_marked(data[:tarstream.MARKER_PEEK]))
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            self.assertEqual(archive.getnames()[0], "folder")
+            self.assertEqual(archive.pax_headers, {"comment": tarstream.FOLDER_MARKER})
+        warnings = tarstream.Warnings()
+        tarstream.build_tar(io.BytesIO(data), self.store.put, warnings, 1000)  # within MAX_GLOBAL_BYTES
+        self.assertEqual(warnings.total, 0)
+        tar = shutil.which("tar")
+        if tar is not None and os.name != "nt":
+            path = os.path.join(self.tmp, "folder.tar")
+            with open(path, "wb") as f:
+                f.write(data)
+            out = os.path.join(self.tmp, "gnu")
+            os.makedirs(out)
+            run = subprocess.run([tar, "xf", path], cwd=out, capture_output=True, text=True, check=False)
+            self.assertEqual((run.returncode, run.stderr, os.listdir(out)), (0, "", ["folder"]))
+            self.assertEqual(files_of(os.path.join(out, "folder")), files_of(top))
+
+    def test_is_marked(self):
+        marker = tarstream.folder_marker()
+        good = member("f", b"x") + END
+        self.assertTrue(tarstream.is_marked((marker + good)[:tarstream.MARKER_PEEK]))
+        for head in (good, member("f", b"x") + marker + END, marker[:520], b"", bytes(2048),
+                     tarfile.TarInfo.create_pax_global_header({"comment": tarstream.FOLDER_MARKER, "a": "b"}) + good,
+                     tarfile.TarInfo.create_pax_global_header({"comment": "other"}) + good,
+                     member("x", b"30 comment=rnfs sealed folder\n", type=tarfile.XHDTYPE) + good):
+            self.assertFalse(tarstream.is_marked(head[:tarstream.MARKER_PEEK]), head[:600])
+
+    def test_skipped_entries(self):
+        """add's skips (invalid names, links, FIFOs), and names a tar shouldn't hold, are warnings; a file with other
+        hard links is an ordinary file (never a hard-link member, which an unpacker would drop)."""
+        top = os.path.join(self.tmp, "top")
+        os.makedirs(top)
+        for name in ("plain", "back\\slash", "C:drive"):
+            with open(os.path.join(top, name), "wb") as f:
+                f.write(name.encode())
+        if os.name != "nt":
+            os.link(os.path.join(top, "plain"), os.path.join(top, "linked"))
+            os.mkfifo(os.path.join(top, "fifo"))
+            os.symlink("/etc/passwd", os.path.join(top, "escape"))
+            with open(os.path.join(top.encode(), b"bad\xff"), "wb") as f:
+                f.write(b"x")
+        data, warnings = self.pack(top)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            members = {info.name: info for info in archive.getmembers()}
+            if os.name != "nt":
+                self.assertEqual(archive.extractfile(members["top/linked"]).read(), b"plain")
+        self.assertTrue(all(info.isfile() or info.isdir() for info in members.values()))
+        expected = {"top", "top/plain"} | ({"top/linked"} if os.name != "nt" else set())
+        self.assertEqual(set(members), expected)
+        self.assertEqual(len(warnings), 5 if os.name != "nt" else 2, warnings)
+        self.assertTrue(any("back\\slash" in text and "separator" in text for text in warnings), warnings)
+
+    def test_top_names_that_cant_be_used_are_refused(self):
+        top = os.path.join(self.tmp, "top")
+        os.makedirs(top)
+        for name in ("..", "a/b", "back\\slash", "C:x", "n" * 256):
+            with self.assertRaises(ValueError, msg=name):
+                self.pack(top, name)
+
+    def test_entry_limit(self):
+        top = os.path.join(self.tmp, "top")
+        os.makedirs(os.path.join(top, "sub"))
+        for i in range(3):
+            with open(os.path.join(top, "sub", f"f{i}"), "wb") as f:
+                f.write(b"x")
+        data, _ = self.pack(top, max_entries=5)  # top, sub and three files
+        tarstream.build_tar(io.BytesIO(data), self.store.put, tarstream.Warnings(), 5)
+        with self.assertRaisesRegex(NodeTooLarge, "max_output_entries"):
+            self.pack(top, max_entries=4)
+
+    def test_heights_match_the_builder(self):
+        """fixed_height and directory_height give what builder builds, so the packer's depth check is exact."""
+        for size in (0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 256 * CHUNK_SIZE, 256 * CHUNK_SIZE + 1):
+            built = builder.build_file(io.BytesIO(bytes(size)), builder.NO_PUT, size)
+            self.assertEqual(tarstream.fixed_height(size), built.height, size)
+        file = builder.build_bytes(b"x", builder.NO_PUT)
+        for count in (0, 1, 256, 257, 256 * 256 + 1):
+            for child_height in (0, 3):
+                entries = [Entry(f"{i:06}", file.cid, 1, dag.KIND_FILE) for i in range(count)]
+                built = builder.build_directory(entries, builder.NO_PUT, child_height)
+                self.assertEqual(tarstream.directory_height(count, child_height), built.height, (count, child_height))
+
+    def test_depth_limit_is_what_add_wrap_allows(self):
+        """A folder as deep as `add --wrap` takes packs; one level more, or a file whose own nodes make the tree too
+        deep, is refused, as add --wrap refuses it."""
+        top = os.path.join(self.tmp, "top")
+        deepest = os.path.join(top, *["d"] * (MAX_DEPTH - 2))  # top's DAG: MAX_DEPTH - 1 directory levels
+        os.makedirs(deepest)
+        data, _ = self.pack(top)
+        built = tarstream.build_tar(io.BytesIO(data), self.store.put, tarstream.Warnings(), 1000)
+        self.assertEqual(built.cid, builder.add_path(top, self.store.put, wrap_it=True)[0].cid)
+        with open(os.path.join(deepest, "big"), "wb") as f:
+            f.write(bytes(CHUNK_SIZE + 1))  # a file node: one level more
+        with self.assertRaises(NodeTooLarge):
+            builder.add_path(top, self.store.put, wrap_it=True)
+        with self.assertRaises(NodeTooLarge):
+            self.pack(top)
+        os.remove(os.path.join(deepest, "big"))
+        os.mkdir(os.path.join(deepest, "d"))
+        with self.assertRaises(NodeTooLarge):
+            self.pack(top)
+
+    def test_a_file_that_shrinks_is_an_error(self):
+        """Its header already gave its size, so a shorter file can't be written as a valid member."""
+        top = os.path.join(self.tmp, "top")
+        os.makedirs(top)
+        path = os.path.join(top, "shrinking")
+        with open(path, "wb") as f:
+            f.write(bytes(3 * tarstream.COPY_SIZE))
+        handle, _ = builder.open_path(top)
+        self.addCleanup(builder.close, handle)
+        chunks = tarstream.folder_chunks(handle, top, "top", 10, lambda text: None)
+        next(chunks)  # top's header
+        next(chunks)  # the file's header
+        next(chunks)  # its first read
+        os.truncate(path, 10)
+        with self.assertRaisesRegex(ValueError, "got shorter"):
+            list(chunks)
+
+    def test_progress_counts_the_bytes_read(self):
+        top = tree(os.path.join(self.tmp, "top"))
+        read: list[int] = []
+        self.pack(top, progress=read.append)
+        self.assertEqual(sum(read), builder.tree_size(top))
+        self.assertIn(0, read)  # every entry met is a cancel check
+
+    def test_iterator_reader(self):
+        chunks = [b"abc", b"", b"defgh", b"i"]
+        reader = tarstream.IteratorReader(iter(chunks))
+        self.assertEqual([reader.read(2), reader.read(4), reader.read(0), reader.read(), reader.read(5)],
+                         [b"ab", b"cdef", b"", b"ghi", b""])
+        closed = []
+
+        def generate():
+            """Yields once, noting when it is closed."""
+            try:
+                yield b"x"
+            finally:
+                closed.append(True)
+
+        reader = tarstream.IteratorReader(generate())
+        self.assertEqual(reader.read(1), b"x")
+        reader.close()
+        self.assertEqual(closed, [True])
 
 
 class TarApiTest(ApiBase):

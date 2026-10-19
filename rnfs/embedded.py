@@ -30,7 +30,7 @@ import RNS
 
 from rnfs import fetcher, fsutil, interface
 from rnfs.apiclient import check_timeout
-from rnfs.config import Config
+from rnfs.config import RETIRED_SETTINGS, Config
 from rnfs.errors import RnfsError, Unsupported
 from rnfs.log import LOG_ERROR, LOG_WARNING, log
 from rnfs.node import RnfsNode, lock_rnfs_dir, make_private_root
@@ -69,7 +69,8 @@ class Node(interface.Rnfs):
         if reticulum is not None and reticulum is not RNS.Reticulum.get_instance():
             raise ValueError("reticulum must be this process's running RNS.Reticulum (RNS.Reticulum.get_instance())")
         settings = dict(settings or {})
-        unknown = settings.keys() - ({f.name for f in fields(Config)} - {"rnfs_dir"})
+        # A retired one is left out with a warning (Config.combine), as in rnfs.toml
+        unknown = settings.keys() - ({f.name for f in fields(Config)} - {"rnfs_dir"}) - RETIRED_SETTINGS.keys()
         if unknown:
             raise ValueError(f"unknown settings: {', '.join(sorted(unknown))}")
         rnfs_dir = os.fspath(rnfs_dir)
@@ -201,9 +202,9 @@ class _Backend:
         stream = io.BytesIO(data) if isinstance(data, bytes) else data
         return self.node.add_stream(stream, size=length, name=name, **options)
 
-    def get(self, target: str, output: str, from_node: str | None, raw: bool) -> dict:
+    def get(self, target: str, output: str, from_node: str | None, raw: bool, no_extract: bool) -> dict:
         """RnfsNode.get."""
-        return self.node.get(target, output, from_node=_bytes(from_node), raw=raw)
+        return self.node.get(target, output, from_node=_bytes(from_node), raw=raw, no_extract=no_extract)
 
     def read(self, target: str, offset: int, length: int | None, raw: bool, from_node: str | None):
         """RnfsNode.read: a generator, fetching as it is read."""
@@ -248,6 +249,14 @@ class _Backend:
     def pin_remote(self, node_id: str, cid: str, pin: bool) -> bool:
         """RnfsNode.pin_remote."""
         return self.node.pin_remote(_bytes(node_id), cid, pin)
+
+    def pin_remote_ls(self, node_id: str | None, cid: str | None, check: bool) -> list[dict]:
+        """RnfsNode.pin_remote_ls."""
+        return self.node.pin_remote_ls(_bytes(node_id), cid, check=check)
+
+    def pin_remote_served(self) -> dict:
+        """RnfsNode.pin_remote_served."""
+        return self.node.pin_remote_served()
 
     def providers(self, cid: str) -> list[str]:
         """RnfsNode.providers, in hex."""
@@ -303,7 +312,8 @@ class _Backend:
         return self.node.name_resolve(parse_name_arg(self.node, name).hex())
 
     def submit_job(self, kind: str, target: str | None, output: str | None, from_node: str | None, **flags) -> dict:
-        """JobsFeature.submit (flags: get's sealed_name and fallback_dht, or an add's or import's path and options)."""
+        """JobsFeature.submit (flags: get's sealed_name, fallback_dht and no_extract, or an add's or import's path and
+        options)."""
         return self.node.feature("jobs").submit(kind, target, output, from_node, **flags)
 
     def job(self, job_id: str, wait: float) -> dict:
