@@ -92,7 +92,8 @@ class Lookup:
     - `start_nodes`: usually the routing table's closest nodes to key.
     - `query`: a FindQuery; exceptions count as no answer.
     - `is_known(id)`: whether RNS knows id's identity. Querying an unknown ID costs a path request, so at
-      most `alpha` unknown IDs are tried per lookup (allow_unknown, shared with the fetcher's providers).
+      most `unknowns` unknown IDs are tried per lookup (allow_unknown, shared with the fetcher's providers):
+      `alpha` if None, never fewer (slow nodes give publishing and provider lookups more, rnfs.dht.lookups).
     - `on_answer(id)` / `on_failure(id)`: called from worker threads when a query is answered or fails,
       even after the run that sent it has returned, so the node can update its routing table.
     - `exclude(id)`: IDs to ignore in replies, as nodes and as providers (banned nodes).
@@ -127,12 +128,13 @@ class Lookup:
                  may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES,
                  on_useful: NodeCallback = _ignore, size: float | None = None, seniors: Iterable[bytes] = (),
                  claim: Callable[[bytes], bool] = _always, taken: Callable[[bytes], bool] = _never,
-                 on_complete: Callable[[bytes, int], object] = _unsampled):
+                 on_complete: Callable[[bytes, int], object] = _unsampled, unknowns: int | None = None):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
         self.own_id = own_id
         self.alpha = max(1, alpha)
+        self.unknowns = max(self.alpha, unknowns or 0)
         self.beta = max(1, beta)
         self.k = k
         self.timeout = timeout
@@ -284,14 +286,14 @@ class Lookup:
             wake.put(_STOP)
 
     def allow_unknown(self, node_id: bytes) -> bool:
-        """True if node_id may be contacted: its identity is known, or the lookup's budget of alpha unknown
+        """True if node_id may be contacted: its identity is known, or the lookup's budget of `unknowns` unknown
         IDs (path requests) has room. Each unknown ID is charged once; later calls for it return True."""
         if self.is_known(node_id):
             return True
         with self._lock:
             if node_id in self._allowed_unknown:
                 return True
-            if len(self._allowed_unknown) >= self.alpha:
+            if len(self._allowed_unknown) >= self.unknowns:
                 self._refused_unknown.add(node_id)
                 return False
             self._allowed_unknown.add(node_id)

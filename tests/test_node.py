@@ -1196,6 +1196,18 @@ class LookupStartTest(NodeTest):
         self.assertFalse(self.b.routing.unreliable(dead))
 
 
+    def test_unknown_id_budgets(self):
+        """A slow node's lookups may try more unknown IDs than alpha: 10 per publish lookup over its 2 paths, 3 per
+        search; a node that isn't slow gives every Lookup alpha (3)."""
+        config = Config(rnfs_dir=os.path.join(self.tmp.name, "slow"), lookup_timeout=5, path_timeout=0.5)
+        slow = RnfsNode.offline(config, bytes(range(16)), self.net, FakeNetwork(), slow=True)
+        self.addCleanup(slow.stop)
+        self.assertEqual([path.unknowns for path in slow.lookups.publish(A_ID).paths], [5, 5])
+        self.assertEqual(slow._lookup(A_ID).first.unknowns, 3)
+        self.assertEqual([path.unknowns for path in self.b.lookups.publish(A_ID).paths], [3, 3, 3])
+        self.assertEqual(self.b._lookup(A_ID).first.unknowns, 3)
+
+
 class JoinTest(NodeTest):
     """Joining: bootstrap nodes first (the user's, then the defaults), then a lookup; again while too few."""
 

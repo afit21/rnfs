@@ -51,7 +51,8 @@ from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, 
 from rnfs.dht.density import SizeEstimate
 from rnfs.dht.firstseen import FirstSeenLog
 from rnfs.dht.lookup import Lookup
-from rnfs.dht.lookups import DISJOINT_PATHS, SLOW_DISJOINT_PATHS, Lookups, Search
+from rnfs.dht.lookups import (DISJOINT_PATHS, SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups,
+                              Search)
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
 from rnfs.dht.routing_state import RoutingState
@@ -649,11 +650,14 @@ class RnfsNode:
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))
         # Which lookups searching and publishing run (section 6): density-checked searches with the senior rule,
-        # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths
+        # falling back to disjoint paths (paced like publish lookups on slow nodes); publishing over disjoint paths.
+        # Slow nodes may make more path requests per lookup than alpha, most when publishing: they hear few announces
         self.lookups = Lookups(self._wired_lookup, self._start_nodes, self.sizes,
                                lambda key: self._senior_servers(key, None),
                                SLOW_DISJOINT_PATHS if slow else DISJOINT_PATHS,
-                               pace=self._pace_fallback if slow else None)
+                               pace=self._pace_fallback if slow else None,
+                               publish_unknowns=SLOW_PUBLISH_UNKNOWNS if slow else None,
+                               search_unknowns=SLOW_SEARCH_UNKNOWNS if slow else None)
         # The storage tiers' Known publishers besides contacts and members: the bootstrap nodes a join may contact
         defaults = DEFAULT_BOOTSTRAP_NODES if config.default_bootstrap and not config.private else ()
         self._known_bootstrap = frozenset(self._bootstrap_nodes + [bytes.fromhex(text) for text in defaults])

@@ -421,17 +421,17 @@ after every test.
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
-unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete)` with `find_closest() ->
-list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run
+unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns)` with
+`find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run
 (`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"),
 or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit length of the beta-th closest known
 distance (`_reach`) unchanged ("no progress"). A run ranks the nodes `unreliable` named when it learnt of them
 (`doubtful`) after every other, for its queries, its termination and `find_closest`'s result; one that distance
 alone would rank within the query window is asked again when `may_retry` says so, as a query beyond `alpha`
 (`retrying`) that the run waits for only if the node comes to rank within the window by `rank` (it is then counted
-in flight). `is_known(id)` says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup
-(`allow_unknown(id)`, also used by the fetcher for provider IDs). `listing_nodes()` is the nodes that have answered
-with at least one provider, and `listers(provider)` those that listed a given provider, so the keeper search can
+in flight). `is_known(id)` says whether RNS knows its identity; at most `unknowns` unknown IDs are tried per lookup
+(`allow_unknown(id)`, also used by the fetcher for provider IDs; `alpha` if not given, never fewer).
+`listing_nodes()` is the nodes that have answered with at least one provider, and `listers(provider)` those that listed a given provider, so the keeper search can
 tell who vouches for its candidates (and the fetcher whose answers led to a provider that served). `on_useful(id)`
 (local scores): a run notes which node's answer first named each node (`introduced`); when a node answers that is
 closer to the key than the node that named it, that node is passed to `on_useful`, once per lookup (`_useful`,
@@ -472,7 +472,8 @@ only if it does on every path knowing it); `path_candidates()` each path's own; 
 the node; `remaining`, `allow_unknown` (the first path's budget), `listing_nodes`, `listers`, `closest_answered`,
 `dense`, `ended`. It samples the size estimate once per call, from the merged candidates, if every path completed.
 
-`lookups.py` — `Lookups(new_lookup, start, sizes, seniors, paths=DISJOINT_PATHS, pace=None)`: the node's recipe.
+`lookups.py` — `Lookups(new_lookup, start, sizes, seniors, paths=DISJOINT_PATHS, pace=None, publish_unknowns=None,
+search_unknowns=None)`: the node's recipe.
 `search(key)` is a `Search` whose first lookup has `size=sizes.estimate(key)` and `seniors=seniors(key)` and whose
 fallback is `_disjoint(key, size, seniors, time left, queries left)` (the queries left, the first lookup's
 `max_queries` less what it sent (`Lookup.sent`), split among the paths, and no fallback when that leaves a path
@@ -483,7 +484,12 @@ one path. `Search(first, fallback, pace)` quacks like a Lookup: `find_providers`
 once escalated), then, if no provider was ever reported, time and queries are left and `should_stop` is False,
 waits for `pace()` (slow nodes: `Publisher.pace_lookups`) only while the wait fits in the time left, and runs the
 fallback; providers are passed on once each across both. So a search sends at most `MAX_QUERIES` `/find` in all, as
-before (DHT-1). `DISJOINT_PATHS` 3, `SLOW_DISJOINT_PATHS` 2.
+before (DHT-1). `DISJOINT_PATHS` 3, `SLOW_DISJOINT_PATHS` 2. The unknown-ID budgets: `publish_unknowns` for
+`publish` (split among its paths) and `widen`, `search_unknowns` for a search's first lookup and again for its
+fallback (split among its paths); `split_budget(total, paths)` deals a budget out, the first paths taking the
+remainder, and `DisjointLookup` makes its paths in order, so `_disjoint`'s `make_path` takes the next share from an
+iterator. `None` passes no `unknowns` (alpha per Lookup). The node passes `SLOW_PUBLISH_UNKNOWNS` (10) and
+`SLOW_SEARCH_UNKNOWNS` (3) on slow nodes, `None` otherwise.
 
 `sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
 the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when

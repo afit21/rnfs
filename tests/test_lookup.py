@@ -372,6 +372,22 @@ class UnknownIdTest(LookupTestCase):
         tried = [n for n in net.queried if n in fakes]
         self.assertEqual(len(tried), 3)
 
+    def test_budget_larger_than_alpha(self):
+        """unknowns sets the budget (slow nodes' publishing and provider lookups), never below alpha."""
+        fakes = [ident(0x100 + i) for i in range(20)]
+
+        def query(n, key):
+            """ident(1) lists 10 fake IDs; fakes are unreachable."""
+            tried.append(n)
+            return ([], fakes[:K]) if n == ident(1) else None
+
+        for alpha, unknowns, expected in ((1, 10, 10), (1, None, 1), (3, 2, 3)):
+            tried: list[bytes] = []
+            lookup = Lookup(ident(0x100), [ident(1)], query, ident(0), alpha=alpha, unknowns=unknowns,
+                            is_known=lambda n: n not in fakes, poll_interval=0.05)
+            lookup.find_closest()
+            self.assertEqual(len([n for n in tried if n in fakes]), expected, (alpha, unknowns))
+
     def test_budget_shared_with_providers(self):
         lookup = Lookup(ident(1), [], lambda n, k: None, ident(0), alpha=2, is_known=lambda n: n == ident(9))
         self.assertTrue(lookup.allow_unknown(ident(9)))  # known: free

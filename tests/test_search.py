@@ -4,13 +4,15 @@ import os
 import random
 import tempfile
 import unittest
+from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
 from rnfs.content.storage import Storage
 from rnfs.dht.density import SIZE_SAMPLES, SizeEstimate
 from rnfs.dht.lookup import Lookup
-from rnfs.dht.lookups import Lookups, Search
+from rnfs.dht.lookups import (SLOW_DISJOINT_PATHS, SLOW_PUBLISH_UNKNOWNS, SLOW_SEARCH_UNKNOWNS, Lookups, Search,
+                              split_budget)
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
 from rnfs.dht.sweep import Region
@@ -185,6 +187,40 @@ class LookupsTest(LookupTestCase):
     def test_one_path_is_a_plain_lookup(self):
         lookups = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes, lambda key: [], 1)
         self.assertIsInstance(lookups.publish(self.key), Lookup)
+
+    def test_unknown_id_budgets_by_purpose(self):
+        """A slow node's publishing lookup tries up to 10 unknown IDs, split among its paths; a search 3, and its
+        fallback 3 more split among the paths; a widened lookup 10. Without budgets each Lookup has alpha."""
+        def lookups(paths: int, **budgets) -> Lookups:
+            """Lookups of alpha 1 (a slow node's) over paths disjoint paths."""
+            return Lookups(lambda key, start, **options: self.new_lookup(key, start, alpha=1, **options),
+                           lambda key: self.table.closest(key, K), self.sizes, lambda key: [], paths, **budgets)
+
+        slow = lookups(SLOW_DISJOINT_PATHS, publish_unknowns=SLOW_PUBLISH_UNKNOWNS,
+                       search_unknowns=SLOW_SEARCH_UNKNOWNS)
+        self.assertEqual([path.unknowns for path in slow.publish(self.key).paths], [5, 5])
+        search = slow.search(self.key)
+        self.assertEqual(search.first.unknowns, 3)
+        search.find_providers(lambda p: None)  # nobody provides it: falls back
+        self.assertEqual([path.unknowns for path in search.second.paths], [2, 1])
+        region = Region(self.key, 0, [], {})
+        with mock.patch.object(Lookup, "find_closest", autospec=True, side_effect=lambda lookup: made.append(lookup)):
+            made: list[Lookup] = []
+            slow.widen(self.key, region)
+        self.assertEqual([lookup.unknowns for lookup in made], [10])
+        self.assertEqual(lookups(1, publish_unknowns=10).publish(self.key).unknowns, 10)
+        # Fast nodes: alpha per Lookup, paths included
+        fast = Lookups(self.new_lookup, lambda key: self.table.closest(key, K), self.sizes, lambda key: [], 3)
+        self.assertEqual([path.unknowns for path in fast.publish(self.key).paths], [3, 3, 3])
+        self.assertEqual(fast.search(self.key).first.unknowns, 3)
+
+    def test_split_budget(self):
+        self.assertEqual(split_budget(10, 2), [5, 5])
+        self.assertEqual(split_budget(10, 3), [4, 3, 3])
+        self.assertEqual(split_budget(3, 2), [2, 1])
+        self.assertEqual(split_budget(None, 2), [None, None])
+        # A share is never below the Lookup's alpha
+        self.assertEqual(Lookup(self.key, [], self.net.query, self.own, alpha=3, unknowns=1).unknowns, 3)
 
 
 
