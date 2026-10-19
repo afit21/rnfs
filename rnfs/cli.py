@@ -390,14 +390,40 @@ def add_options(args, query: bool = False) -> dict:
     return options
 
 
+def extracting(args) -> bool:
+    """True if get unpacks a sealed folder it opens (neither --raw nor --no-extract)."""
+    return not getattr(args, "raw", False) and not getattr(args, "no_extract", False)
+
+
 def wants_sealed_name(args) -> bool:
     """True if get, without -o, should write a sealed file it opens under its sealed name: a bare CID's
     output name would be the CID, while a path's last name is already a name."""
     return not args.output and not getattr(args, "raw", False) and "/" not in args.target.strip("/")
 
 
+def folder_name(info: dict) -> str | None:
+    """The name a sealed folder GET /api/info describes is unpacked under (its sealed name without .tar, which add
+    gives its top directory), or None if it isn't one get unpacks ("sealed_folder", which a daemon before 0.2.0,
+    unpacking nothing, doesn't give)."""
+    name = info.get("name") if info.get("sealed_folder") else None
+    return name[:-4] if isinstance(name, str) and len(name) > 4 and name.endswith(".tar") else None
+
+
+def folder_output(args, output: str) -> str:
+    """get's default output for a path whose last name ends in .tar: when it is a sealed folder this node unpacks
+    (asked of GET /api/info first), the folder's name in output's directory, rather than a directory called
+    `<name>.tar`; output otherwise, a tar sealed as a file included (written as the file under the path's name)."""
+    target = args.target.strip("/")
+    if args.output or not extracting(args) or "/" not in target or not target.endswith(".tar"):
+        return output
+    name = folder_name(client(args).get("/api/info", target=args.target, **{"from": args.from_node}))
+    # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
+    return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
+
+
 def sealed_output(args, output: str) -> str:
-    """get's default output for a sealed file this node can open: its sealed name, if it has one.
+    """get's default output for a sealed file this node can open: its sealed name, if it has one (a sealed folder
+    unpacked: the folder's name).
 
     Only for a daemon without the job manager: a get job picks the sealed name itself (sealed_name), which
     doesn't cost a separate fetch of the root before the job, ignoring --from.
@@ -406,6 +432,8 @@ def sealed_output(args, output: str) -> str:
         return output
     info = client(args).get("/api/info", target=args.target, **{"from": getattr(args, "from_node", None)})
     name = info.get("name") if info.get("sealed") else None
+    if extracting(args) and folder_name(info) is not None:
+        name = folder_name(info)  # the top directory get unpacks it to, which add names after the folder
     # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
     return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
 
@@ -487,16 +515,24 @@ def run_get(args):
         print_warnings(result)
         print(printable(output))
         return
+    unpacked = folder_output(args, output)
+    if unpacked != output:
+        output = unpacked
+        if os.path.lexists(output):
+            fail(f"{output} already exists; remove it or choose another with -o")
+    # Sent only when set, so a daemon older than 0.2.0 (which never unpacks, and ignores it) is asked as before
+    no_extract = {"no_extract": True} if getattr(args, "no_extract", False) else {}
 
     def without_jobs(api) -> dict:
         """The get in one request, for a daemon without the job manager (asking for a sealed name first)."""
         final = sealed_output(args, output)
         if final != output and os.path.lexists(final):
             fail(f"{final} already exists; remove it or choose another with -o")
-        return {"output": final, **api.post("/api/get", target=args.target, output=final, **{"from": args.from_node})}
+        return {"output": final, **api.post("/api/get", target=args.target, output=final, **{"from": args.from_node},
+                                            **no_extract)}
 
     from rnfs.features import jobs
-    fields = {"kind": "get", "target": args.target, "output": output, "from": args.from_node}
+    fields = {"kind": "get", "target": args.target, "output": output, "from": args.from_node, **no_extract}
     if wants_sealed_name(args):
         fields["sealed_name"] = True  # the job renames a sealed file it opens to its sealed name
     result = jobs.run_transfer(args, fields, without_jobs)
@@ -890,10 +926,11 @@ def build_parser() -> argparse.ArgumentParser:
     # --- content: unpinned adds, sealed files, chunkers ---
     add.add_argument("--no-pin", action="store_true", help="keep it as evictable cache instead of pinning it")
     add.add_argument("--to", nargs="+", action="extend", metavar="RECIPIENT",
-                     help="seal it so only these can read it: rnfs node IDs, LXMF addresses or identity hashes "
-                          "RNS has heard, 128-hex public keys, or contact nicks")
+                     help="seal it (a folder as one tar, <folder>.tar) so only these can read it: rnfs node IDs, "
+                          "LXMF addresses or identity hashes RNS has heard, 128-hex public keys, or contact nicks")
     add.add_argument("--to-self", action="store_true", help="seal it for this node's identity too")
-    add.add_argument("--no-sealed-name", action="store_true", help="with --to: don't seal the file name inside")
+    add.add_argument("--no-sealed-name", action="store_true",
+                     help="with --to: don't seal the file name inside (not for a folder)")
     add.add_argument("--chunker", choices=["fixed", "fastcdc"], help="fixed 64 KiB chunks (default) or FastCDC "
                      "content-defined chunks, which keep most chunks of an edited file unchanged")
 
@@ -903,6 +940,8 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--from", dest="from_node", metavar="NODE_ID", help="fetch from this node, bypassing the DHT")
     get.add_argument("--background", action="store_true", help="start a job, print its ID and return (rnfs jobs)")
     get.add_argument("--raw", action="store_true", help="a sealed file as stored (its ciphertext), not decrypted")
+    get.add_argument("--no-extract", action="store_true",
+                     help="write a sealed folder as its .tar instead of unpacking it")
 
     cat = command(commands, "cat", run_cat, "write a file, or part of one, to stdout")
     cat.add_argument("target", metavar="CID[/PATH]")

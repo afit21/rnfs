@@ -1,6 +1,8 @@
 """Directories as tar streams, for a client whose files the daemon can't open (a sandboxed app, such as a Flatpak's):
 POST /api/add/stream?format=tar builds a directory from an uploaded tar (build_tar), GET /api/get/stream?format=tar
-sends a target back as one (plan, length, chunks). No RNS beyond rnfs.log's, through walker.
+sends a target back as one (plan, length, chunks). Sealed folders use both ends too: `add --to <folder>` packs a
+folder on this machine as one tar (folder_chunks) and seals that, and a recipient's `get` builds the decrypted tar
+with build_tar before writing it out. No RNS beyond rnfs.log's, through walker.
 
 Reading treats the stream as untrusted input, read once, in order, never held whole (tarfile's stream mode):
 - Regular files and directories become the tree, under the name rules of `add` (builder._build_tree): a member
@@ -33,8 +35,16 @@ the small chunks its files would meet counted before the length is given, so wri
 a response has started. Files are their stored bytes: a sealed file stays sealed, as in a directory's `get` (GET
 /api/cat decrypts one). Directories are mode 0755, files 0644 (0755 if executable), every member dated mtime (the
 request's time), owned by uid and gid 0 with no names.
+
+Packing a folder (folder_chunks): the same members, written as the folder is walked with `add`'s rules, all under
+one top directory named after the folder, and bounded so that build_tar can unpack the result (entries, and the
+depth of the DAG it builds, computed as builder builds it with fixed chunks). A file's size is taken when it is
+opened, as its header must give it first.
 """
+import os
+import stat
 import tarfile
+import time
 from typing import BinaryIO, Callable, Iterator, NamedTuple
 
 from rnfs import constants, log
@@ -387,14 +397,20 @@ def plan(expect: walker.Expect, get: walker.Get, name: str, max_entries: int, sk
 
 def _header(member: Member, mtime: int) -> bytes:
     """A member's header blocks (a pax header first where its path or size needs one)."""
-    info = tarfile.TarInfo(member.path)
+    return _header_of(member.path, member.kind, member.size, mtime)
+
+
+def _header_of(path: str, kind: int, size: int, mtime: int) -> bytes:
+    """The header blocks of a member at path of kind (dag.KIND_*) and size (a pax header first where its path or
+    size needs one): directories 0755, files 0644 (0755 if executable), owned by uid and gid 0 with no names."""
+    info = tarfile.TarInfo(path)
     info.mtime = mtime
-    if member.kind == dag.KIND_DIRECTORY:
+    if kind == dag.KIND_DIRECTORY:
         info.type = tarfile.DIRTYPE
         info.mode = 0o755
     else:
-        info.size = member.size
-        info.mode = 0o755 if member.kind == dag.KIND_EXECUTABLE else 0o644
+        info.size = size
+        info.mode = 0o755 if kind == dag.KIND_EXECUTABLE else 0o644
     return info.tobuf(tarfile.PAX_FORMAT, "utf-8", "strict")
 
 
@@ -434,3 +450,234 @@ def chunks(members: list[Member], get: walker.Get, mtime: int, max_entries: int)
             written += _padding(sent, BLOCK)
     end = 2 * BLOCK + _padding(written + 2 * BLOCK, RECORD)
     yield bytes(end)
+
+
+# Packing a folder on this machine (a sealed folder: `rnfs add --to <recipient> <folder>`)
+
+# A sealed folder's tar starts with a pax global header holding only this POSIX `comment`, which extractors ignore
+# (so `tar xf` of 0.1.x recipients extracts nothing more). It tells a tar rnfs packed from a tar file someone
+# sealed: only a marked tar is unpacked by get, so a tar sealed as a file before 0.2.0 still comes back as one.
+FOLDER_MARKER = "rnfs sealed folder"
+MARKER_PEEK = 2 * BLOCK  # the plaintext bytes folder_marker takes, and is_marked reads
+
+
+def folder_marker() -> bytes:
+    """The sealed-folder marker: a pax global header (typeflag g) of one record, `comment=` FOLDER_MARKER."""
+    return tarfile.TarInfo.create_pax_global_header({"comment": FOLDER_MARKER})
+
+
+def is_marked(head: bytes) -> bool:
+    """True if a tar's first bytes (at least MARKER_PEEK of them) are the sealed-folder marker: its first header is a
+    pax global header whose records are exactly `comment=` FOLDER_MARKER. A marker anywhere else, or with other
+    records, doesn't count."""
+    if len(head) < BLOCK:
+        return False
+    try:
+        info = tarfile.TarInfo.frombuf(head[:BLOCK], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return False
+    if info.type != tarfile.XGLTYPE or not 0 < info.size <= len(head) - BLOCK:
+        return False
+    records, payload = [], head[BLOCK:BLOCK + info.size]
+    while payload:
+        # A pax record is "<length> <keyword>=<value>\n", length counting the whole record
+        length = payload.partition(b" ")[0]
+        if not length.isdigit() or not 0 < int(length) <= len(payload):
+            return False
+        record, payload = payload[:int(length)], payload[int(length):]
+        keyword, equals, value = record[len(length) + 1:].partition(b"=")
+        if not equals or not value.endswith(b"\n"):
+            return False
+        records.append((keyword, value[:-1]))
+    return records == [(b"comment", FOLDER_MARKER.encode())]
+
+
+def fixed_height(size: int) -> int:
+    """The height of the DAG fixed chunking builds for a file of size bytes (builder.build_file): 0 for one chunk or
+    none, else one per level of file nodes."""
+    count, height = -(-size // constants.CHUNK_SIZE), 0
+    while count > 1:
+        count = -(-count // constants.MAX_CHILDREN)
+        height += 1
+    return height
+
+
+def directory_height(entries: int, child_height: int) -> int:
+    """The height of the directory builder.build_directory builds over entries entries, the highest child_height
+    high: one directory node, and one more level per round of grouping past MAX_CHILDREN entries."""
+    height = 1 + child_height
+    while entries > constants.MAX_CHILDREN:
+        entries = -(-entries // constants.MAX_CHILDREN)
+        height += 1
+    return height
+
+
+class _Packing:
+    """What folder_chunks keeps while it walks: the entries met, the bytes written, and the options."""
+
+    def __init__(self, max_entries: int, warn: Callable[[str], None], progress: Callable[[int], None] | None,
+                 mtime: int):
+        """Nothing written yet."""
+        self.max_entries = max_entries
+        self.warn = warn
+        self.progress = progress
+        self.mtime = mtime
+        self.entries = 0
+        self.written = 0
+
+    def count(self):
+        """One more member. Raises TooLarge past max_entries."""
+        self.entries += 1
+        if self.entries > self.max_entries:
+            raise TooLarge(f"the folder has more than max_output_entries ({self.max_entries}) files and directories")
+
+    def header(self, path: str, kind: int, size: int) -> bytes:
+        """A member's header, counted as written."""
+        data = _header_of(path, kind, size, self.mtime)
+        self.written += len(data)
+        return data
+
+
+def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int, warn: Callable[[str], None],
+                  progress: Callable[[int], None] | None = None, mtime: int | None = None) -> Iterator[bytes]:
+    """The tar of the folder open as handle (builder.open_path of path), everything under one top directory top/, so
+    that `tar xf` puts nothing else in the directory it is run in. The folder is walked as `add` walks one
+    (builder._build_tree): hidden files included; symlinks, devices, sockets, FIFOs, names that aren't valid UTF-8 or
+    break the name rules, and entries that change while being opened skipped with a warning (warn(text)); a file
+    with other hard links read as any file (no hard-link members, which build_tar would skip). Names a tar
+    shouldn't hold (safe_name) are skipped with a warning too, as the writer of a stored DAG skips them. Members as
+    that writer makes them (_header_of: PAX, 0755/0644, dated mtime, now if None), after the sealed-folder marker
+    (folder_marker), which is how a recipient's get knows to unpack it.
+
+    The tar must unpack (build_tar) where it is sent, so it is refused (TooLarge, possibly once some of it has been
+    read) past max_entries files and directories, the top one included, or if the DAG of its tree, one level above
+    top, would be deeper than MAX_DEPTH (as `add --wrap` of the folder with fixed chunks). A file that gets shorter
+    while it is read is an error (ValueError): its header already gave its size. progress, if given, is told the
+    length of each read of a file, and 0 for each entry met; it may raise to stop (an add job's cancel). Raises
+    ValueError for a top name that isn't a valid entry name or is unsafe in a tar.
+    """
+    if not dag.is_valid_name(top):
+        raise ValueError(f"{builder.display_path(top)!r} isn't valid as an entry name")
+    if not safe_name(top):
+        raise ValueError(f"{builder.display_path(top)!r} holds a character some extractors read as a path separator")
+    packing = _Packing(max_entries, warn, progress, int(time.time()) if mtime is None else mtime)
+    listing = builder.list_directory(handle)
+    marker = folder_marker()
+    packing.written += len(marker)
+    yield marker
+    # The tar's root, made by whoever unpacks it, is depth 1: top is 2
+    yield from _pack_directory(handle, listing, path, top, 2, packing)
+    end = 2 * BLOCK + _padding(packing.written + 2 * BLOCK, RECORD)
+    yield bytes(end)
+
+
+def _pack_directory(handle: builder.Handle, listing: list, path: str, member: str, depth: int,
+                    packing: _Packing) -> Iterator[bytes]:
+    """The members of the directory open as handle (listed as listing), at path, as member (depth DAG levels from
+    the tar's root): its own first, then what it holds. Returns (as a generator's value) the directory's height."""
+    if depth > constants.MAX_DEPTH:
+        raise TooLarge(f"{builder.display_path(path)} is nested deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
+    packing.count()
+    yield packing.header(member, dag.KIND_DIRECTORY, 0)
+    included, child_height = 0, 0
+    for item in listing:
+        if packing.progress is not None:
+            packing.progress(0)  # a cancel check even where no file is read
+        child_path = os.path.join(path, item.name)
+        shown = builder.display_path(child_path)
+        if not dag.is_valid_name(item.name):
+            packing.warn(f"skipped {shown}: name is not valid UTF-8 or breaks the name rules")
+            continue
+        if not safe_name(item.name):
+            packing.warn(f"skipped {shown}: a character in its name could be read as a path separator")
+            continue
+        st = builder.listed_stat(item, child_path)
+        if builder.is_link(st):
+            packing.warn(f"skipped symlink {shown}")
+            continue
+        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+            packing.warn(f"skipped {shown}: not a regular file or directory")
+            continue
+        # Changed is raised only by opening and listing, before anything of the entry is written, so skipping it
+        # never leaves part of a member in the tar
+        try:
+            child = builder.open_child(handle, item.name, child_path, st)
+        except builder.Changed:
+            packing.warn(f"skipped {shown}: it changed while being added")
+            continue
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    below = builder.list_directory(child)
+                except builder.Changed:
+                    packing.warn(f"skipped {shown}: it changed while being added")
+                    continue
+                height = yield from _pack_directory(child, below, child_path, f"{member}/{item.name}", depth + 1,
+                                                    packing)
+            else:
+                height = yield from _pack_file(child, st, child_path, f"{member}/{item.name}", packing)
+        finally:
+            builder.close(child)
+        included += 1
+        child_height = max(child_height, height)
+    height = directory_height(included, child_height)
+    if depth - 1 + height > constants.MAX_DEPTH:
+        raise TooLarge(f"{builder.display_path(path)} makes a tree deeper than MAX_DEPTH ({constants.MAX_DEPTH}) "
+                       f"DAG nodes")
+    return height
+
+
+def _pack_file(handle: int, st: os.stat_result, path: str, member: str, packing: _Packing) -> Iterator[bytes]:
+    """The member of the regular file open as handle (listed as st) at path: its header, its bytes as its open
+    stat gives their number, and padding. Returns (as a generator's value) its height under fixed chunking."""
+    packing.count()
+    size = os.fstat(handle).st_size
+    kind = dag.KIND_EXECUTABLE if builder.is_executable(st.st_mode) else dag.KIND_FILE
+    yield packing.header(member, kind, size)
+    remaining = size
+    # Reading a regular file never blocks, so O_NONBLOCK can stay; the caller keeps the descriptor
+    with os.fdopen(handle, "rb", closefd=False) as f:
+        while remaining:
+            data = f.read(min(COPY_SIZE, remaining))
+            if not data:
+                raise ValueError(f"{builder.display_path(path)} got shorter while being added")
+            remaining -= len(data)
+            if packing.progress is not None:
+                packing.progress(len(data))
+            yield data
+    if _padding(size, BLOCK):
+        yield bytes(_padding(size, BLOCK))
+    packing.written += size + _padding(size, BLOCK)
+    return fixed_height(size)
+
+
+class IteratorReader:
+    """A binary reader over an iterator of bytes, for code that reads a stream (SealingReader, tarfile): a folder's
+    tar being written into the sealer, a sealed file decrypted into build_tar. Holds at most what one read asks for
+    plus one chunk. close() closes the iterator (a generator's open files with it)."""
+
+    def __init__(self, chunks):
+        """Read what chunks yields, in order."""
+        self._chunks = iter(chunks)
+        self._buffer = bytearray()
+
+    def read(self, size: int | None = -1) -> bytes:
+        """Up to size bytes (fewer only at the end; everything left if size is None or negative); b"" at the end."""
+        if size is None or size < 0:
+            data = bytes(self._buffer) + b"".join(self._chunks)
+            self._buffer.clear()
+            return data
+        while len(self._buffer) < size:
+            chunk = next(self._chunks, None)
+            if chunk is None:
+                break
+            self._buffer += chunk
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def close(self):
+        """Close the iterator, if it can be."""
+        close = getattr(self._chunks, "close", None)
+        if close is not None:
+            close()

@@ -774,11 +774,14 @@ class ApiConnection:
             length = len(data)
         return self.call("POST", "/api/import/stream", body=data, length=length)
 
-    def fetch(self, target: str, output: str, from_node: str | None = None, raw: bool = False) -> dict:
+    def fetch(self, target: str, output: str, from_node: str | None = None, raw: bool = False,
+              no_extract: bool = False) -> dict:
         """Fetch a file or directory and have the daemon write it to output (a path on this machine, which must
-        not exist), in one request: {"cid", "warnings"} (+ "sealed", "name"). For progress, use submit_job."""
+        not exist), in one request: {"cid", "warnings"} (+ "sealed", "name", "extracted"). A sealed folder is
+        unpacked unless no_extract (sent only when set: a daemon older than 0.2.0 ignores it, and never unpacks).
+        For progress, use submit_job."""
         return self._post("/api/get", target=target, output=os.path.abspath(os.path.expanduser(output)),
-                          raw=raw or None, **{"from": from_node})
+                          raw=raw or None, no_extract=no_extract or None, **{"from": from_node})
 
     def cat(self, target: str, offset: int | None = None, length: int | None = None, raw: bool = False,
             block: bool = False, from_node: str | None = None) -> Stream:
@@ -947,9 +950,9 @@ class ApiConnection:
                    from_node: str | None = None, path: str | None = None, options: dict | None = None,
                    **flags) -> dict:
         """Start a job: kind "get" (output needed), "pin" or "export" (output needed) of a target, or "add" or
-        "import" of a path on this machine. Its record, with its "id". flags: get's sealed_name and fallback_dht;
-        options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to, to_self, seal_name,
-        chunker; only those set)."""
+        "import" of a path on this machine. Its record, with its "id". flags: get's sealed_name, fallback_dht and
+        no_extract; options: an add's, as add_path takes them in the API's form (wrap, only_hash, pin, to, to_self,
+        seal_name, chunker; only those set)."""
         output = os.path.abspath(os.path.expanduser(output)) if output is not None else None
         path = os.path.abspath(os.path.expanduser(path)) if path is not None else None
         return self._post("/api/jobs", kind=kind, target=target, output=output, path=path, **{"from": from_node},

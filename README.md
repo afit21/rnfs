@@ -496,11 +496,12 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 `add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
 `--to RECIPIENT…` (after the path) seals a file so only those node IDs, LXMF addresses or contacts can read it,
-and `--to-self` adds you.
+and `--to-self` adds you; a folder is sealed as one file, a tar named `<folder>.tar`, hiding its names too.
 
 `get` without `-o` uses the target's name only if it is a safe file name (printable, not starting with `.`),
 otherwise its CID, and writes under a temporary name until the transfer is complete. It decrypts sealed files
-you can open; `--raw` gives the stored bytes, which is what scripts that show content to others should use.
+you can open, and unpacks a sealed folder to its directory (`--no-extract` keeps the `.tar`); `--raw` gives the
+stored bytes, which is what scripts that show content to others should use.
 
 **Gateway** (`http://127.0.0.1:8789`): `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and
 directories; `?filename=` sets the type and download name; `?format=raw` and `?format=archive` return data you

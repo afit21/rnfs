@@ -480,8 +480,56 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
   the recipients' identity hashes, the approximate size, or (with `--wrap`) the wrapper's entry name, and it
   says nothing about who sealed it: anyone with a recipient's public key can seal a file for them, and any
   recipient can seal different content for the others.
-- `add --to` seals single files only: sealing each file of a directory would leave its names and tree
-  visible. Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
+- **Folders.** `add --to` of a folder seals it as one sealed file, never file by file (which would leave its
+  names and tree visible): the folder is packed as one plain tar (POSIX pax) and that tar is sealed with the
+  sealed name `<folder>.tar`. The format above is unchanged, so a reader that only decrypts (rnfs 0.1.x) gets a
+  tar file it can unpack itself.
+  - **Marker.** The tar's first header MUST be a pax global extended header (typeflag `g`) holding exactly one
+    record, the POSIX keyword `comment` with the value `rnfs sealed folder` (the record
+    `30 comment=rnfs sealed folder\n`). This is how a sealed folder is recognised: a tar sealed as a file (by
+    rnfs 0.1.x, or `add --to backup.tar` now) has no such first header and stays a file. Extractors ignore
+    `comment`, so the marker adds no file and no warning (checked with GNU tar and Python's `tarfile`).
+  - Every member is under one top directory named after the folder (`<folder>/…`), so extracting the tar
+    creates nothing else in the directory it is extracted in. Each directory comes before what it holds.
+  - The folder is walked with `add`'s rules: hidden files included; symlinks, devices, sockets, FIFOs, names
+    that break the name rules and entries that change while being opened skipped with a warning; a file with
+    other hard links is an ordinary file (members are regular files and directories only, never links). Names
+    holding `\`, `＼` or `／`, or starting as a Windows drive does (`C:`), are skipped with a warning too, as
+    `GET /api/get/stream` skips them (section 11).
+  - Files are mode 0644 (0755 if executable), directories 0755, owned by uid and gid 0 without user or group
+    names, every member dated the time of packing.
+  - The tar must unpack where it is sent: more than `max_output_entries` files and directories (the top one
+    included), or a tree deeper than `MAX_DEPTH` once built as `add --wrap` builds the folder with fixed
+    chunks, is refused (rnfs: `TooLarge`, 413). A file that gets shorter while it is read is an error (its
+    member's size was already written).
+  - A folder whose name breaks the name rules, or is over 251 bytes (`<name>.tar` must pass them), is refused,
+    not sealed without a name, and so is `--no-sealed-name` with a folder: the name is what tells a recipient's
+    `get` to unpack it. With `--wrap` the wrapper's entry is `<folder>.tar`.
+  - What it hides: the folder's file names, its structure and each file's size. What it doesn't: the
+    recipients, and the approximate total size (the tar's: the files' sizes rounded up to 512 bytes, plus at
+    least 512 bytes per entry), which says roughly how much the folder holds.
+  - **Unpacking.** `get` by a recipient unpacks a sealed file only if its sealed name ends in `.tar` (after at
+    least one character), its plaintext starts with the marker (as its first header; a marker anywhere else,
+    or with other records, doesn't count) and its plaintext is a valid tar. Anything else is written as the
+    file, as rnfs 0.1.6 writes any sealed file, byte for byte: an unmarked tar (the normal case for a sealed tar
+    file) without a warning, a marked one that isn't a valid tar with one. `info` tells a recipient whether a
+    sealed file is a sealed folder (rnfs: `sealed_folder`). Unpacking
+    applies both existing rule sets unchanged: the plaintext is read as `POST /api/add/stream?format=tar` reads
+    an upload (regular files and directories only; symlinks, hard links, devices, FIFOs, absolute paths, `..`
+    components and invalid names skipped with a warning; a later member replacing an earlier one of the same
+    path; `max_output_entries`, `MAX_DEPTH` and the header bounds of section 11), then written as `get` writes a
+    directory (a temporary name renamed when complete, names the local filesystem would read as a path or can't
+    represent skipped). A file is executable only by its owner-execute bit; no other mode, owner or time is
+    taken from the tar. A tar past a limit is refused (rnfs: 413, naming `--no-extract`) rather than written in
+    part. The output is the tar's one top directory, or the whole tar as a directory when it holds anything else;
+    without `-o` it is named by `get`'s default-name rule (section 11) after that directory (or the sealed name
+    without `.tar`). The node MUST check that its free space holds the plaintext twice where its blocks and the
+    output share a filesystem (rnfs builds the tar into its block store, then writes the files), and MUST NOT
+    pin, cache or provide those plaintext blocks: rnfs holds them in a protection session (section 8) while
+    unpacking and collects them at once after, so none stays stored unless something else keeps the same block.
+    `--no-extract` writes the decrypted `.tar` instead, as `get` of a 0.1.x node does.
+
+  Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
 - **Gateways MUST NOT decrypt** sealed files (the gateway is reachable by web pages); they serve the stored
   bytes as `application/octet-stream`.
 
@@ -1235,9 +1283,9 @@ are local conveniences, not part of the protocol.
 
 | Command | Does |
 |---|---|
-| `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
-| `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; `--raw` writes the stored bytes |
-| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
+| `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files; a directory as one tar named `<directory>.tar`); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
+| `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw] [--no-extract]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; a sealed folder (a sealed `.tar` starting with the sealed-folder marker, section 5) is unpacked to a directory (section 5, Unpacking), named without `-o` (for a bare CID, or a path ending in `.tar`) after the folder by the same rule, while a tar sealed as a file is written as that file; `--no-extract` writes it as the decrypted `.tar` instead; `--raw` writes the stored bytes |
+| `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range), a sealed folder giving its tar (never unpacked); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
 | `stat <cid>[/path]` | Size, block count, and how much is held locally |
 | `url <cid>\|<name>[/path]` | Print the target's URL on its gateway site (`http://<k-cid>.rnfs.localhost:<port>/<path>` or `http://<name>.name.localhost:<port>/<path>`, below), for the running daemon's gateway port or else the configured one; needs no daemon |
@@ -1480,6 +1528,8 @@ message that call would have reported.
   temporary output is removed (a resumed job removes one left by a crash).
 - A `get` job MAY ask (`sealed_name`) that a sealed file this node opens be written under its sealed name, if
   that passes the `get` default-name rule, in the output's directory; the final path is then the job's output.
+  For a sealed folder unpacked that name is its top directory's (the result's `name`). A `get` job MAY ask
+  (`no_extract`, kept with the job) that a sealed folder be written as its tar rather than unpacked.
   A `get` job with a `from` node MAY ask (`fallback_dht`) to be retried once with ordinary DHT discovery if it
   fails for any reason other than cancellation, a size limit or a full disk.
 - A get's result (and a job's) keeps at most the first 100 warnings, then one saying how many more there were,
@@ -1504,7 +1554,8 @@ in its requests and responses (rnfs: these routes):
   component, or whose names break the entry-name rules are skipped with a warning; directories a path implies
   are made; a later file replaces an earlier one of the same path, and a member conflicting with what is
   there as the other type is skipped with a warning. A file is executable if its mode has the owner's execute
-  bit. Sealing is refused (400). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
+  bit. Sealing is refused (400): a sealed folder is added from a path (`POST /api/add` with `to`), where the node
+  packs the folder itself (section 5). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
   `max_output_entries` files and directories or nesting deeper than `MAX_DEPTH`, refuses (400) extended headers
   over 64 KiB, more than 8 in a row, global headers of more than 4 KiB in all, and sparse files, and keeps 100
   warnings (counting the rest), each naming at most 300 characters of the member. A malformed header anywhere,

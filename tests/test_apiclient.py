@@ -407,6 +407,9 @@ class OperationsTest(ClientTestCase):
         self.assertEqual(self.api.fetch(directory, output)["cid"], directory)
         with open(os.path.join(output, "a.txt"), "rb") as f:
             self.assertEqual(f.read(), b"abc")
+        self.assertEqual(self.node.called("get")[-1][1], {"from_node": None})  # no_extract only when set
+        self.api.fetch(directory, os.path.join(self.tmp, "tar"), no_extract=True)
+        self.assertEqual(self.node.called("get")[-1][1], {"from_node": None, "no_extract": True})
         self.assertEqual(self.api.info(directory)["type"], "directory")
         self.assertEqual(self.api.ls(directory), [{"name": "a.txt", "kind": "file", "size": 3, "cid": file_cid}])
         self.assertEqual(self.api.stat(f"{directory}/a.txt")["size"], 3)
