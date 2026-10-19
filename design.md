@@ -422,7 +422,7 @@ after every test.
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
 unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns, slow_path,
-check_path)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
+check_path, first, allowed)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
 completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and
 their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit
 length of the beta-th closest known distance (`_reach`) unchanged ("no progress"). A run ranks its nodes by `tier()`,
@@ -455,7 +455,12 @@ by distance, ordered by tier; `dense` notes that it fired). They are queried amo
 those sent outside the window (`extras`) count towards `max_queries` but never against the stall rule. `claim`/`taken`
 (a disjoint lookup's) drop a node another path owns before querying it and leave such nodes out of replies.
 `on_complete(key, kth)` is told the K-th closest known distance after each run that ended "complete" (`ended` holds how
-the last run ended); the size estimate samples it.
+the last run ended); the size estimate samples it. `first` (a search's closest local servers, specification section 6
+"LoRa islands") are added to the first run's known nodes and launched before the window's while any is left unqueried;
+a reply listing a provider empties them (`first.clear()`), and a later run doesn't have them (`_first` is emptied).
+They skip `check_path`, and count as `extras` when outside the window. `allowed(id)` (partition mode's local-only rule)
+is part of `_usable`, so nodes it rejects never join a run, and is asked again just before each query: a node rejected
+since it joined is dropped then, as a claimed one is; `_choices` leaves out unanswered nodes it rejects.
 
 `density.py` — `SizeEstimate(state_dir=None, samples=16, minimum=8)`, a `node.Store`: `note(key, kth)` keeps the
 latest sample per key, at most `samples` (an `OrderedDict`, least recent first); `estimate(key=None)` is (K − 1/3)
