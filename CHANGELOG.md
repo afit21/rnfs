@@ -10,8 +10,8 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
-  `remote_pins_asked`, `remote_pins_served`, `name_syncs`, `name_sync_files`); an older rnfs can't open it
-  afterwards. Pins made before the upgrade
+  `remote_pins_asked`, `remote_pins_served`, `name_syncs`, `name_sync_files`, `published_heal`); an older rnfs can't
+  open it afterwards. Pins made before the upgrade
   have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
@@ -370,6 +370,36 @@ The DHT (local behaviour: nothing on the wire changes):
   servers, and internet nodes found island content 68–91% of the time; with the larger budget 3.7–4.4 and 99%, for
   11–19% more airtime per publish. Over the fake network of `tests/test_topology.py` (1,000 servers): 3.6 to 6.9 of
   the 10 closest. Nodes that aren't slow are unchanged (`alpha` per lookup), as is the keeper query's own budget.
+- **LoRa islands keep their own content findable** (spec section 6, "LoRa islands"; nothing on the wire changes): a
+  node with a slow interface, or naming `local_interfaces`, keeps a set of *local* servers, those whose RNS path goes
+  out on a named interface, or (none named) within `local_hops` (3) hops over an interface below `slow_bitrate`,
+  judged from the path to each server as its announces arrive and from one read of the path table every 10 minutes
+  (through `rnsd`, one RPC: a client's own path table starts empty). It also stores each key it provides on its
+  `local_replicas` (3, at most 5) closest local servers (*two-level records*: ordinary `/provide`s, withdrawn like
+  the rest), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
+  rest of the lookup. In the topology simulation an island neighbour found content during a partition 100% of the
+  time instead of 55–72%, and island-to-island lookups took 42% less airtime, for 12% more publish airtime. Fast
+  nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
+  `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
+- **Partition mode** (spec section 6, "LoRa islands"): a node with local servers that fails 3 times in a row to reach
+  off-island servers, or hears no off-island announce or answer for over 4 times the usual gap between off-island
+  announces (at least 10 minutes) and then gets no answer from one it probes, uses its local servers only for
+  lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of minutes
+  of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server every 5
+  minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never enters
+  it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
+  `partition_since`.
+- **The heal republish:** keys whose last publish round reached no server beyond the island (during a partition) are
+  marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
+  network finds them within hours instead of after their next republish (3 days on a slow node). The marks are kept
+  across restarts (a new table, `published_heal`).
+
+  Together, over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands, an island's gateway
+  down): a neighbour found what an island node published before the partition 100% of the time instead of 67%, and
+  what it published during it 100% instead of 91%, with 0.15 timeouts and 31 s of simulated time per search instead
+  of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
+  republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
+  partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

@@ -7814,6 +7814,21 @@
               "type": "string"
             },
             "description": "Aliases of name keys never exported (or imported): losing one loses the name."
+          },
+          "local_servers": {
+            "type": "integer",
+            "description": "The DHT servers on this node's own island it knows of (spec section 6, \"LoRa islands\"); 0 on a node without a slow interface or local_interfaces."
+          },
+          "partition": {
+            "type": "boolean",
+            "description": "In partition mode: cut off from the servers beyond its island, lookups and publishes use local servers only."
+          },
+          "partition_since": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Unix time partition mode began; null when not in it."
           }
         },
         "required": [
@@ -7834,7 +7849,10 @@
           "used_bytes",
           "max_storage",
           "names",
-          "unexported_names"
+          "unexported_names",
+          "local_servers",
+          "partition",
+          "partition_since"
         ],
         "description": "The node's own fields (RnfsNode.status)."
       },

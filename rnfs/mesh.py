@@ -14,6 +14,10 @@ interface rules and quiet hours; design.md, "Mesh").
   lookups, so LoRa islands carry little of the internet's lookup traffic. A path of more than SLOW_PATH_HOPS hops is
   slow, and so is a server whose last link from this node, within SLOW_LINK_MEMORY, had a round trip above
   SLOW_PATH_RTT and a rate estimate below slow_bitrate (RTT alone would catch I2P, which costs no radio airtime).
+- Local servers (is_local_path, specification section 6, "LoRa islands"): a server is local when the next-hop interface
+  of the path to it is named in local_interfaces, or else (none named) when it is within local_hops over an interface
+  below slow_bitrate. RnsPaths.scan reads every path within a hop count at once (through a shared instance, one path
+  table RPC), for the node's local-server set.
 
 Pure policy with injected clocks; nothing here imports RNS (or rnfs.log, which does) at module level, since
 the CLI imports the peers feature, which uses this module.
@@ -22,7 +26,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from rnfs.constants import HOUR, RESPONSE_OVERHEAD
@@ -36,6 +40,10 @@ STATS_CACHE = 30.0  # seconds a shared instance's interface stats are reused for
 PATH_CACHE = 15.0
 MAX_CACHED_PATHS = 1024
 PATHFINDER_M = 128  # RNS.Transport.PATHFINDER_M: what hops_to returns for an unknown path
+# Where RNS.Transport.path_table entries keep the hop count and the interface the path came on (RNS's IDX_PT_HOPS,
+# IDX_PT_RVCD_IF), for RnsPaths.scan
+PATH_TABLE_HOPS = 2
+PATH_TABLE_INTERFACE = 5
 # Seconds a peer stays online after the last sign it was up (online()). Three link_idle_timeouts (300 s by
 # default): a peer just talked to doesn't turn offline the moment its idle link closes, nor between a fetch's
 # requests or a republish's. Far below announce_interval (6 h by default), so one announce doesn't keep a node
@@ -49,6 +57,9 @@ EMISSION_SKEW = 300.0
 SLOW_PATH_HOPS = 3  # a path of more hops is slow
 SLOW_PATH_RTT = 1.0  # seconds: a link with a longer round trip and a rate estimate below slow_bitrate is slow
 SLOW_LINK_MEMORY = 24 * HOUR  # a link established longer ago says nothing about the path now
+# Local servers each key is also stored on at most (local_replicas): the topology study's 5 cost +25% of an island
+# publisher's airtime, 3 (the default) +12%
+MAX_LOCAL_REPLICAS = 5
 
 # Why a /blocks request was refused by an airtime control (Traffic.refused keys)
 REFUSED_BUDGET = "budget"
@@ -71,6 +82,9 @@ class PathInfo:
     hops: int | None = None
     interface: str | None = None  # the next-hop interface's name
     bitrate: float | None = None  # the next-hop interface's bitrate in bits/s
+    # Every name of the next-hop interface an interface rule may match (local_interfaces); not compared, as a node's
+    # path is the same path whichever names were read for it
+    names: tuple[str, ...] = field(default=(), compare=False)
 
 
 NO_PATH = PathInfo()
@@ -133,11 +147,14 @@ class RnsPaths:
             hops = _hops(RNS.Transport, node_id)
             reticulum = self._shared_instance()
             if reticulum is not None:
-                name, bitrate = self._shared_interface(reticulum, self._next_hop_name(reticulum, node_id))
+                full_name = self._next_hop_name(reticulum, node_id)
+                name, bitrate = self._shared_interface(reticulum, full_name)
+                names = tuple(dict.fromkeys(n for n in (name, full_name) if isinstance(n, str) and n))
             else:
                 interface = RNS.Transport.next_hop_interface(node_id)
                 name, bitrate = interface_label(interface), _bitrate(getattr(interface, "bitrate", None))
-            return PathInfo(hops, name, bitrate)
+                names = tuple(interface_names(interface))
+            return PathInfo(hops, name, bitrate, names)
         except Exception as e:  # noqa: BLE001 - RNS internals: no path known if they fail; logged
             # Inside the except, so the debug log has the traceback
             self._failure_log(f"couldn't read the path to {RNS.prettyhexrep(node_id)} from RNS: {e!r}", RNS.LOG_WARNING)
@@ -167,6 +184,35 @@ class RnsPaths:
         except Exception:  # noqa: BLE001 - RNS internals: info() asks node by node if the table fails
             pass
         return {node_id: self.info(node_id) for node_id in node_ids}
+
+    def scan(self, max_hops: int | None = None) -> dict[bytes, PathInfo]:
+        """The PathInfo of every destination RNS has a path to of at most max_hops hops (None: any), from one read of
+        the path table: attached to a shared instance, the instance's (one get_path_table RPC, its interfaces named
+        and rated from its interface stats), whose paths a client's own table only learns as it uses them. Raises
+        what RNS or the RPC raises (the caller then takes nothing to be local)."""
+        import RNS
+        reticulum = self._shared_instance()
+        found: dict[bytes, PathInfo] = {}
+        if reticulum is not None:
+            for entry in reticulum.get_path_table(max_hops=max_hops) or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("hash"), bytes):
+                    continue
+                hops = entry.get("hops")
+                if not isinstance(hops, int) or isinstance(hops, bool) or not 0 <= hops < PATHFINDER_M:
+                    continue
+                full_name = entry.get("interface")
+                name, bitrate = self._shared_interface(reticulum, full_name)
+                names = tuple(dict.fromkeys(n for n in (name, full_name) if isinstance(n, str) and n))
+                found[bytes(entry["hash"])] = PathInfo(hops, name, bitrate, names)
+            return found
+        for node_id, entry in list(RNS.Transport.path_table.items()):
+            hops, interface = entry[PATH_TABLE_HOPS], entry[PATH_TABLE_INTERFACE]
+            if not isinstance(hops, int) or not 0 <= hops < PATHFINDER_M or (max_hops is not None and hops > max_hops):
+                continue
+            found[bytes(node_id)] = PathInfo(hops, interface_label(interface),
+                                             _bitrate(getattr(interface, "bitrate", None)),
+                                             tuple(interface_names(interface)))
+        return found
 
     def _shared_instance(self):
         """The Reticulum instance if it is attached to a shared instance (RPC answers paths), else None."""
@@ -247,6 +293,19 @@ class SlowPaths:
         if hops is not None and hops > SLOW_PATH_HOPS:
             return True
         return self.traffic is not None and self.traffic.slow_link(node_id, self.slow_bitrate)
+
+
+def is_local_path(path: PathInfo, interfaces: list[str], max_hops: int, slow_bitrate: float) -> bool:
+    """Whether a server whose path is path is local (specification section 6, "LoRa islands"): its next-hop interface
+    is named in interfaces (names or prefixes, matched as serve_interfaces is), or, if none are named, it is within
+    max_hops hops and that interface runs below slow_bitrate. Judged from the path to the server, never from the
+    interface a request of its arrived on. No path, or an unknown interface or bitrate: not local."""
+    if path.hops is None:
+        return False
+    if interfaces:
+        names = list(path.names) or ([path.interface] if path.interface else [])
+        return matches(names, interfaces)
+    return path.hops <= max_hops and path.bitrate is not None and path.bitrate < slow_bitrate
 
 
 def _bitrate(value) -> float | None:
@@ -459,11 +518,15 @@ def validate(config):
     budget = config.upload_budget
     if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0):
         raise ValueError("upload_budget must be a positive number of bytes per hour, or unset")
-    for name in ("serve_interfaces", "no_serve_interfaces"):
+    for name in ("serve_interfaces", "no_serve_interfaces", "local_interfaces"):
         value = getattr(config, name)
         if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
             raise ValueError(f"{name} must be a list of interface names or name prefixes")
     parse_quiet_hours(config.quiet_hours)
+    if type(config.local_hops) is not int or config.local_hops < 1:
+        raise ValueError("local_hops must be a whole number of at least 1")
+    if type(config.local_replicas) is not int or not 0 <= config.local_replicas <= MAX_LOCAL_REPLICAS:
+        raise ValueError(f"local_replicas must be a whole number, 0-{MAX_LOCAL_REPLICAS}")
 
 
 def shared_instance_warning(config, reticulum) -> str | None:

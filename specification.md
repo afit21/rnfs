@@ -80,7 +80,7 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 - Through a shared instance, every incoming link is attached to the local shared-instance interface, so the
   interface rules of the airtime controls (below) can't tell the real interfaces apart. A node SHOULD warn
   when interface rules are set while it is attached to a shared instance. Hops and next-hop interfaces for
-  provider ranking (section 6) are read through the instance's RPC.
+  provider ranking and for judging local servers (section 6) are read through the instance's RPC.
 - Each node has one RNS identity, kept at `<rnfs dir>/storage/identity`.
 - Each node has one IN/SINGLE destination, `rnfs.dht`, which receives every rnfs request.
 - A node's **node ID** is the hash of that destination: `Destination.hash(identity, "rnfs", "dht")`, 16 bytes.
@@ -726,6 +726,83 @@ and repeat.
   after an eighth of that round trip, or the usual delay if longer. Failed providers are removed and not
   retried during that fetch. When no providers are left, `/find` runs again for a fresh random half, within the
   same `lookup_timeout`.
+
+**LoRa islands.** A LoRa mesh joined to the internet through a gateway (an *island*) is part of one DHT with the
+rest, so its own content's records sit on servers anywhere: while the gateway is down (a *partition*) a node there
+found its neighbour's content 55–72% of the time in the topology simulation, after about 300 s of timeouts. A node
+MAY keep part of its records, and its searches, on its own island; rnfs does, as below. All of it is local
+behaviour: a local replica is an ordinary `/provide`, a local-first search an ordinary `/find`, and no message, check
+or protocol constant changes.
+- **Local servers.** A server is *local* when the next-hop interface of the RNS path to it is named in
+  `local_interfaces` (names or name prefixes, matched as `serve_interfaces` is, section 3), or else, with none named,
+  when it is within `local_hops` hops (3) over an interface below `slow_bitrate`. It is judged from the path to the
+  server, never from the interface a request of its arrived on (through a shared instance that is always the local
+  one). A node that names no `local_interfaces` and has no interface below `slow_bitrate` (a fast node) has no
+  local servers, and everything below is off. rnfs judges a server when its server-mode announce or a path response
+  for it arrives, and every server it knows of (in its routing table or announce first-seen log) from one read of the
+  path table at start and every 10 minutes; at most 1,024 local servers are kept.
+- **Through a shared instance**, hop counts are exact (RNS adds and removes the shared-instance hop symmetrically),
+  but the next-hop interface is the local one to the instance, so the real one comes from the instance's RPC:
+  `get_next_hop_if_name` and `get_interface_stats` (its name and bitrate) for a server heard, and one
+  `get_path_table` (with `max_hops` = `local_hops` unless `local_interfaces` is set) for the periodic read, since a
+  client's own path table starts empty and holds only the paths it used. `local_interfaces` names the instance's
+  interfaces as `rnsd`'s config names them. If the instance can't be asked, nothing is local.
+- **Limits of a hop radius.** A node one LoRa hop from its gateway reaches servers on the gateway's internet hub in 3
+  hops over a slow first hop, so behind a big public hub they can be most of its "local" servers (which, while
+  connected, still gives findability, not locality); and servers on a wide island beyond `local_hops` aren't local.
+  On such islands, and on gateways, set `local_interfaces` (or a lower `local_hops`). In the simulation a radius of
+  4 hops counted servers behind the gateway as local and found content during a partition only 63–81% of the time.
+- **Two-level records.** A publisher with local servers also stores each key on its `local_replicas` (3, at most 5)
+  local servers closest to the key: one more part of the key's store set (above), so a round records them and
+  withdrawals reach them. In the simulation 3 replicas cost an island publisher 12% more airtime (5: 25%).
+- **Local-first search.** A search first asks the local server closest to the key (the 3 closest when local is a hop
+  radius, which misses some of the island), one at a time on a slow node, before any other server, until one of
+  their replies lists a provider; their replies seed the rest of the lookup as any answer does (its start nodes),
+  and the lookup's bounds and checks are unchanged. Its fallback over disjoint paths doesn't ask them first again.
+- **Partition mode.** Servers that aren't local are *off-island*. A node with local servers SHOULD notice when it is
+  cut off from them and then use its local servers only. rnfs enters partition mode:
+  - after 3 failures in a row reaching off-island servers (a `/find` unanswered, or a `/provide` for which no
+    identified link could be opened; any off-island answer between resets the count; local ones don't count), or
+  - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the
+    off-island announces it heard (their mean over the last 32 gaps, counted once it has 8, and none that spanned
+    partition mode), and at least 10 minutes, if a probe (below) then goes unanswered. Silence alone doesn't enter
+    it: with servers announcing every 6 hours, an island hearing 20 of them hears one about every 18 minutes, and
+    such gaps vary, so a fixed silence would flap on a small connected network. A fresh announce is one RNS didn't
+    mark as a path response, emitted within the last 15 minutes (allowing 5 minutes of clock difference, as a peer's
+    online state is judged, section 11): an island node's cached answer for an off-island server says nothing about
+    the way off the island.
+
+  In partition mode, lookups (searches and their fallback, publishing's region and widened lookups) query local
+  servers only, starting from the local servers closest to the key, and a lookup running when it begins drops its
+  off-island nodes as their turn comes; a publish round stores to and withdraws from local servers only (the
+  withdrawals for others stay queued, and a store set's off-island servers are left out). So a search on the island
+  ends in about the time its local servers take instead of minutes of link timeouts. Any off-island answer or fresh
+  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to those
+  that failed and those heard most recently in turn; a failed probe isn't counted against the server in the routing
+  table) every 5 minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a
+  probe costs a path request and a link's airtime on radio, and every node of a cut-off island probes. The node's
+  status says whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops`
+  count as off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands
+  set `local_interfaces`.
+- **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
+  network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
+  the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
+  or after trying one), and republish the marked keys when partition mode ends, paced as its rounds are (a slow node's
+  10 lookups a round). rnfs keeps the marks across restarts (in the state database), republishes them at the first
+  off-island answer or fresh announce after a restart too (the partition may have ended while it was down), and clears
+  a key's mark when a round reaches an off-island server. In the simulation this found such records in hours instead of days while about
+  5 keys or fewer per node were affected on a 30-node island (more queue behind the channel).
+- **What it buys.** In the simulation (islands of 10–50 servers, all nodes upgraded) a neighbour on the island found
+  content published there 100% of the time during a partition, in about 28 s instead of 300, and island-to-island
+  lookups took 42% less airtime while connected; asking only the one closest local server first costs nothing
+  extra when the content is elsewhere. Two-level records need both the publisher and the searcher upgraded (an
+  older searcher still finds a local replica when its lookup passes that server); with half the nodes upgraded,
+  content published before a partition was found 78% of the time (55% with none). Over the fake network of
+  `tests/test_topology.py` (1,000 servers, 21% on 8 islands; a `/find` over LoRa taking 8 s, one to a server out of
+  reach 40 s), with partition mode and the heal republish (below): a neighbour found what an island node published
+  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.15
+  timeouts and 31 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
+  0% of the time until the heal republish, 99.5% after it.
 
 **Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
 Scores are local state: they are never sent or published, nothing on the wire changes, and nodes may score
@@ -1646,7 +1723,7 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -2129,6 +2206,9 @@ a restart.
 | `serve_interfaces` | empty (all) | Serve `/blocks` only on these RNS interfaces (names or prefixes, case-insensitive; a spawned interface also matches its parent's name) |
 | `no_serve_interfaces` | empty | Never serve `/blocks` on these interfaces; takes precedence over `serve_interfaces` |
 | `quiet_hours` | none | Local time ranges such as `22:00-06:00` or `01:00-05:00,12:00-13:00`, during which `/blocks` is refused |
+| `local_interfaces` | empty | Servers whose path's next-hop interface is one of these (names or prefixes, as `serve_interfaces`; through a shared instance, the instance's interfaces as `rnsd`'s config names them) are local (section 6, "LoRa islands"). Empty: those within `local_hops` over an interface below `slow_bitrate` |
+| `local_hops` | 3 | With `local_interfaces` empty, servers within this many hops over a slow interface are local (a whole number ≥ 1); lower it behind a big public hub |
+| `local_replicas` | 3 | Local servers each provided key is also stored on (two-level records, section 6), 0 to 5; 0: none |
 | `keep_max_names` | 100 | Names kept (keep and follow) for others; this node's own names don't count. A whole number |
 | `keeper_query` | `fallback` | `fallback`: ask keepers when a path request heard nothing; `always`: on every network resolve (about 10× the airtime) |
 | `follow_quota` | 1 GiB per followed name | Bytes a followed name's new target may hold, its size and its DAG's blocks; 0: followed names aren't fetched. A swap holds the old and new targets, so up to twice this (section 9) |

@@ -39,6 +39,13 @@ progress when they bring the key nearer, but never against the stall rule (they 
 Disjoint lookups (rnfs.dht.disjoint) run several Lookups that share no node: `claim(id)` is asked before each query
 (False: another path owns the node, which this one drops) and `taken(id)` leaves out nodes another path owns when a
 reply names them.
+
+Local servers (specification section 6, "LoRa islands"): `first` names nodes the first run asks before any other (a
+search asks the closest local servers first), until one of them lists a provider; their answers seed the rest of the
+run like any other. `allowed(id)` says which nodes the lookup may query at all (in partition mode, local servers only):
+asked as nodes are learned and again before each is queried, so a node that stops being allowed mid-lookup is dropped
+when its turn comes, and never in the result. Neither touches providers: a reply's providers are reported whoever they
+are.
 """
 import heapq
 import queue
@@ -123,6 +130,8 @@ class Lookup:
       on the query's thread before a node of the first tier that hasn't answered is asked (once per node per lookup):
       None to ask it, True if its path turned out slow (it is ranked again instead), False if it can't be reached
       (a failed query, not sent). Nodes that aren't slow give both; slow nodes neither.
+    - `first`: nodes the first run asks before any other, until a reply lists a provider (see above); `allowed(id)`:
+      whether a node may be queried at all (see above).
 
     After find_closest, candidates() gives every node it chose from and ask() sends one more /find about a nearby
     key, so one lookup serves the keys of a region (sweep providing, rnfs.publisher).
@@ -143,7 +152,8 @@ class Lookup:
                  claim: Callable[[bytes], bool] = _always, taken: Callable[[bytes], bool] = _never,
                  on_complete: Callable[[bytes, int], object] = _unsampled, unknowns: int | None = None,
                  slow_path: Callable[[bytes], bool] = _never,
-                 check_path: Callable[[bytes], bool | None] | None = None):
+                 check_path: Callable[[bytes], bool | None] | None = None, first: Iterable[bytes] = (),
+                 allowed: Callable[[bytes], bool] = _always):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -170,6 +180,7 @@ class Lookup:
         self.on_complete = on_complete
         self.slow_path = slow_path
         self.check_path = check_path
+        self.allowed = allowed
         self._slow: dict[bytes, bool] = {}  # slow_path's answers, asked once per node (and check_path's True)
         self._checked: set[bytes] = set()  # nodes check_path was asked about
         self.ended = ""  # how the last run ended ("complete", "no progress", ...; "" before the first)
@@ -196,6 +207,7 @@ class Lookup:
         self._lock = threading.Lock()
         self._start_nodes = [n for n in dict.fromkeys(start_nodes) if self._usable(n)]
         self._seniors = [n for n in dict.fromkeys(seniors) if self._usable(n)]
+        self._first = [n for n in dict.fromkeys(first) if self._usable(n)]  # asked first by the first run only
 
     # Public interface
 
@@ -249,7 +261,7 @@ class Lookup:
             return UNRELIABLE if n in doubtful else SLOW_PATH if n in slow else FIRST
 
         return {n: tier(n) for n in known
-                if n in answered or (n not in out and n not in queried and self.is_known(n))}
+                if n in answered or (n not in out and n not in queried and self.is_known(n) and self.allowed(n))}
 
     def ask(self, node_id: bytes, key: bytes) -> list[bytes] | None:
         """Send node_id one /find about key, a key near this lookup's (sweep providing asks about the far half of
@@ -381,7 +393,7 @@ class Lookup:
     def _usable(self, node_id) -> bool:
         """True if node_id may be queried in this lookup."""
         return (is_id(node_id) and node_id != self.own_id and node_id not in self._failed
-                and node_id not in self._refused_unknown and not self.exclude(node_id))
+                and node_id not in self._refused_unknown and not self.exclude(node_id) and self.allowed(node_id))
 
     def _run(self, on_provider: NodeCallback | None, should_stop: Callable[[], bool]) -> list[bytes]:
         """One pass of the iterative lookup; returns the providers it newly reported."""
@@ -402,7 +414,10 @@ class Lookup:
         # Nodes known to this run: the start nodes plus those that answered before, since they are
         # usually closer. Every run re-queries them, which is what gives a fresh random half of providers.
         known: dict[bytes, int] = {}  # node ID -> distance, for usable nodes
-        for node_id in list(self._start_nodes) + self.closest_answered() + self._seniors:
+        # The nodes asked before any other (local servers), in this run only; emptied once a reply lists a provider
+        first = [node_id for node_id in self._first if not self.taken(node_id)]
+        self._first = []
+        for node_id in list(self._start_nodes) + self.closest_answered() + self._seniors + first:
             if self._usable(node_id) and not self.taken(node_id):
                 known[node_id] = self._distance(node_id)
         seniors = [node_id for node_id in self._seniors if node_id in known]
@@ -481,20 +496,24 @@ class Lookup:
             # The nodes the checks need are queried the same way, in rank order among the window's.
             while in_flight < self.alpha and sent < self.max_queries:
                 ranked = sorted(known, key=rank)[:window]
-                targets = sorted(set(ranked).union(n for n in needed if n in known), key=rank) if needed else ranked
-                node_id = next((n for n in targets if n not in queried), None)
+                node_id = next((n for n in first if n in known and n not in queried), None)
+                if node_id is None:
+                    targets = sorted(set(ranked).union(n for n in needed if n in known), key=rank) if needed else ranked
+                    node_id = next((n for n in targets if n not in queried), None)
                 if node_id is None:
                     break
                 queried.add(node_id)
-                if not self.claim(node_id) or not self.allow_unknown(node_id):
-                    # Another path's (a disjoint lookup), or over the unknown-ID budget: dropped, but not a failure
+                if not self.allowed(node_id) or not self.claim(node_id) or not self.allow_unknown(node_id):
+                    # No longer allowed (partition mode began), another path's (a disjoint lookup), or over the
+                    # unknown-ID budget: dropped, but not a failure
                     del known[node_id]
                     continue
                 if node_id not in ranked:
                     extras.add(node_id)
-                # A first-tier node whose path is unknown may turn out slow once its path request is answered
+                # A first-tier node whose path is unknown may turn out slow once its path request is answered (a node
+                # asked first is asked whatever its path)
                 check = (self.check_path is not None and tier(node_id) == FIRST and node_id not in self._answered
-                         and node_id not in self._checked)
+                         and node_id not in self._checked and node_id not in first)
                 if check:
                     self._checked.add(node_id)
                 self._send(node_id, results, check=check)
@@ -508,8 +527,8 @@ class Lookup:
                     continue
                 if not self.is_known(node_id):
                     passed.add(node_id)
-                elif not self.claim(node_id):
-                    known.pop(node_id, None)  # another path's (a disjoint lookup)
+                elif not self.allowed(node_id) or not self.claim(node_id):
+                    known.pop(node_id, None)  # no longer allowed (partition mode), or another path's (disjoint)
                 elif self.may_retry(node_id):
                     queried.add(node_id)
                     retrying.add(node_id)
@@ -565,6 +584,7 @@ class Lookup:
             self._credit(introduced.get(node_id), node_id)
             providers, nodes = reply
             if providers:
+                first.clear()  # the nodes asked first found something: the rest are asked as any other
                 with self._lock:
                     self._listing.add(node_id)
                     for provider in providers:  # at most k per reply, from nodes that answered

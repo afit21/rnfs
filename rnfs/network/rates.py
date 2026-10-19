@@ -157,6 +157,18 @@ def slow_from_stats(stats: dict, slow_bitrate: float) -> bool:
     return bool(bitrates) and all(bitrate < slow_bitrate for bitrate in bitrates)
 
 
+def has_slow_interface(reticulum, slow_bitrate: float) -> bool:
+    """Whether one of the interfaces counted_bitrates counts runs below slow_bitrate: a node with one may have local
+    servers (specification section 6, "LoRa islands") without naming local_interfaces. False if the stats can't be
+    read (then nothing is local)."""
+    try:
+        bitrates = counted_bitrates(reticulum.get_interface_stats())
+    except Exception as e:  # noqa: BLE001 - then nothing is local; logged
+        log(f"could not read interface stats to look for a slow interface: {e}", LOG_WARNING)
+        return False
+    return any(bitrate < slow_bitrate for bitrate in bitrates)
+
+
 def slowest_bitrate(reticulum) -> float | None:
     """The bitrate of the slowest interface counted_bitrates counts (bits/s), or None if none reports one or the
     stats can't be read: what a slow node's republish airtime is estimated at (publisher.republish_airtime)."""

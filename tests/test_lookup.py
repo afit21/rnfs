@@ -451,6 +451,22 @@ class UnreliableNodeTest(LookupTestCase):
         self.assertEqual(sorted(retries), self.dead)
         wait_for(lambda: set(self.dead) <= set(self.net.queried), what="the retries")
 
+    def test_not_retried_once_disallowed(self):
+        """A due retry of a node the lookup may no longer query (partition mode began) isn't sent."""
+        allowed = set(self.dead + self.near)
+        retries = []
+
+        def may_retry(n: bytes) -> bool:
+            """Every unreliable node is due; partition mode begins as the first is asked."""
+            retries.append(n)
+            allowed.difference_update(self.dead)
+            return True
+
+        result = self.lookup(self.net, self.key, self.dead + self.near, alpha=1, unreliable=self.dead.__contains__,
+                             may_retry=may_retry, allowed=allowed.__contains__).find_closest()
+        self.assertEqual(result, self.near)
+        self.assertEqual(len(retries), 1)  # the second was dropped before its retry was claimed
+
     def test_asked_and_waited_for_when_needed(self):
         """With too few other nodes, unreliable ones are asked and waited for like any node."""
         self.net.hang.clear()
@@ -574,6 +590,74 @@ class SlowPathTest(LookupTestCase):
                     unreliable={self.near[0]}.__contains__, check_path=lambda n: checked.append(n)).find_closest()
         self.assertTrue(set(self.net.queried) & set(self.island))  # asked: too few others
         self.assertFalse(set(checked) & set(self.island + self.near[:1]))
+
+
+class LocalFirstTest(LookupTestCase):
+    """Nodes asked first (local servers) and nodes a lookup may not query (partition mode)."""
+
+    def world(self):
+        """A key, three servers near it, and a far local server that knows them and holds a provider."""
+        net = self.network()
+        key = ident(0x1000)
+        near = [ident(0x1001), ident(0x1002), ident(0x1003)]
+        local = ident(0x9000)
+        for n in near:
+            net.add(n)
+        net.add(local, knows=near).store.store(key, ident(0x7777))
+        return net, key, near, local
+
+    def test_first_nodes_asked_before_any_other_and_seed_the_run(self):
+        net, key, near, local = self.world()
+        found = []
+        lookup = self.lookup(net, key, [], alpha=1, first=[local])
+        lookup.find_providers(found.append)
+        self.assertEqual(net.queried[0], local)
+        self.assertEqual(found, [ident(0x7777)])
+        self.assertEqual(sorted(net.queried[1:]), near)  # its answer named them: the run went on from there
+
+    def test_first_nodes_dropped_once_a_reply_lists_a_provider(self):
+        net, key, near, local = self.world()
+        other = ident(0xa000)
+        net.add(other)
+        lookup = self.lookup(net, key, near, alpha=1, first=[local, other])
+        lookup.find_providers(lambda provider: None)
+        self.assertEqual(net.queried[0], local)
+        self.assertNotIn(other, net.queried)  # far from the key, and no longer asked first
+
+    def test_only_the_first_run(self):
+        net, key, near, local = self.world()
+        lookup = self.lookup(net, key, near, first=[local])
+        lookup.find_closest()
+        net.queried.clear()
+        lookup.find_providers(lambda provider: None)
+        self.assertEqual(sorted(net.queried), near)
+
+    def test_disallowed_nodes_never_queried_nor_in_the_result(self):
+        net, key, near, local = self.world()
+        allowed = {local, near[2]}
+        result = self.lookup(net, key, near + [local], allowed=allowed.__contains__).find_closest()
+        self.assertEqual(set(net.queried), allowed)
+        self.assertEqual(set(result), allowed)
+
+    def test_disallowed_mid_lookup_dropped_when_its_turn_comes(self):
+        net, key, near, local = self.world()
+        partitioned = threading.Event()
+
+        def allowed(node_id: bytes) -> bool:
+            """Everything until the first answer; then only local."""
+            return not partitioned.is_set() or node_id == local
+
+        lookup = self.lookup(net, key, [local] + near, alpha=1, allowed=allowed, first=[local],
+                             on_answer=lambda node_id: partitioned.set())
+        result = lookup.find_closest()
+        self.assertEqual(net.queried, [local])
+        self.assertEqual(result, [local])
+
+    def test_providers_reported_whoever_they_are(self):
+        net, key, near, local = self.world()
+        found = []
+        self.lookup(net, key, [local], allowed=lambda node_id: node_id == local).find_providers(found.append)
+        self.assertEqual(found, [ident(0x7777)])
 
 
 class UnreliableRoutingTest(LookupTestCase):

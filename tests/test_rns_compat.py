@@ -203,6 +203,15 @@ INTERNALS = [
                               "'interface': str(RNS.Transport.path_table[dst_hash][5])"),
                       _source(RNS.Reticulum.get_next_hop_if_name,
                               "return str(RNS.Transport.next_hop_interface(destination))"))),
+    Internal("mesh.py", "Transport.path_table entries holding the hop count at IDX_PT_HOPS and the interface at "
+             "IDX_PT_RVCD_IF; get_path_table(max_hops) entries {hash, hops, interface}, within max_hops (RnsPaths.scan)",
+             lambda: (_true(sys.modules["RNS.Transport"].IDX_PT_HOPS == mesh.PATH_TABLE_HOPS, "IDX_PT_HOPS moved"),
+                      _true(sys.modules["RNS.Transport"].IDX_PT_RVCD_IF == mesh.PATH_TABLE_INTERFACE,
+                            "IDX_PT_RVCD_IF moved"),
+                      _params(RNS.Reticulum.get_path_table, "max_hops"),
+                      _source(RNS.Reticulum.get_path_table, "'hops': path_hops",
+                              "if max_hops == None or path_hops <= max_hops:",
+                              "rpc_connection.send_bytes(mp.packb({'get': 'path_table', 'max_hops': max_hops}))"))),
     Internal("mesh.py, network/rates.py", "Reticulum.get_interface_stats() {\"interfaces\": [{name, short_name, "
              "type, status, bitrate}]}, with LocalServerInterface and LocalClientInterface types",
              lambda: (_source(RNS.Reticulum.get_interface_stats, "ifstats['name'] = str(interface)",

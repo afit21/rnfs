@@ -21,6 +21,9 @@ No RNS dependency: the node gives Lookups (its routing table, client and callbac
   the time instead of 68%). Disjoint paths split their lookup's budget (split_budget), each path never below alpha: a
   slow node's publish lookup sends at most 10 path requests over its 2 paths, and a search's fallback 3 (besides the
   first lookup's 3). The widened lookup of a flagged key is a publishing lookup of its own.
+- **Local first** (specification section 6, "LoRa islands"): a search's first lookup asks the closest local servers
+  (local_first(key), none on a node without them) before any other, and their answers seed the rest of it; its
+  fallback doesn't.
 """
 import threading
 from collections.abc import Callable
@@ -166,12 +169,13 @@ class Lookups:
     seniors(key) the senior servers (the announce first-seen log's), sizes the size estimate (fed by every complete
     lookup); paths disjoint paths per publish lookup and fallback; pace (slow nodes) paces the fallback;
     publish_unknowns and search_unknowns the budgets of unknown IDs of a publishing lookup and of a search (and of its
-    fallback), split among disjoint paths (None: alpha per Lookup, as on nodes that aren't slow)."""
+    fallback), split among disjoint paths (None: alpha per Lookup, as on nodes that aren't slow); local_first(key) the
+    local servers a search asks first."""
 
     def __init__(self, new_lookup: NewLookup, start: Callable[[bytes], list[bytes]], sizes: density.SizeEstimate,
                  seniors: Callable[[bytes], list[bytes]], paths: int = DISJOINT_PATHS,
                  pace: Callable[[], float] | None = None, publish_unknowns: int | None = None,
-                 search_unknowns: int | None = None):
+                 search_unknowns: int | None = None, local_first: Callable[[bytes], list[bytes]] = lambda key: []):
         """Lookups made with new_lookup."""
         self.new_lookup = new_lookup
         self.start = start
@@ -181,12 +185,15 @@ class Lookups:
         self.pace = pace
         self.publish_unknowns = publish_unknowns
         self.search_unknowns = search_unknowns
+        self.local_first = local_first
 
     def search(self, key: bytes) -> Search:
-        """A provider search for key: density-checked, the senior rule, and disjoint paths only as a fallback."""
+        """A provider search for key: the closest local servers asked first, density-checked, the senior rule, and
+        disjoint paths only as a fallback."""
         size, seniors = self.sizes.estimate(key), self.seniors(key)
+        local = self.local_first(key)
         first = self.new_lookup(key, self.start(key), size=size, seniors=seniors, on_complete=self.sizes.note,
-                                **_budget(self.search_unknowns))
+                                **({"first": local} if local else {}), **_budget(self.search_unknowns))
         return Search(first, lambda left, queries: self._disjoint(key, size, seniors, left, queries,
                                                                   self.search_unknowns), self.pace)
 

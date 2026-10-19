@@ -307,6 +307,65 @@ class RnsPathsTest(unittest.TestCase):
             self.assertIsNone(self.paths.hops(P2))  # RNS failing: no path known
 
 
+class LocalPathTest(unittest.TestCase):
+    """Local servers (spec section 6, "LoRa islands"): mesh.is_local_path and the path-table scan RnsPaths.scan."""
+
+    setUp = RnsPathsTest.setUp
+
+    def test_named_interfaces(self):
+        """A named interface (or prefix) makes a path local whatever its hops or bitrate; nothing else does."""
+        lora = mesh.PathInfo(7, "LoRa", 1200.0, ("LoRa", RADIO))
+        hub = mesh.PathInfo(1, "Hub", 10_000_000.0, ("Hub", HUB))
+        for patterns, expected in ((["LoRa"], (True, False)), (["rnode"], (True, False)), (["Hub"], (False, True))):
+            self.assertEqual((mesh.is_local_path(lora, patterns, 3, 100_000),
+                              mesh.is_local_path(hub, patterns, 3, 100_000)), expected)
+        self.assertFalse(mesh.is_local_path(mesh.NO_PATH, ["LoRa"], 3, 100_000))
+        # Without names (a path read before they were), the label still matches
+        self.assertTrue(mesh.is_local_path(mesh.PathInfo(2, "LoRa", None), ["LoRa"], 3, 100_000))
+
+    def test_hop_radius_over_a_slow_interface(self):
+        """With no interface named: within local_hops over an interface below slow_bitrate."""
+        cases = ((mesh.PathInfo(3, "LoRa", 1200.0), True), (mesh.PathInfo(4, "LoRa", 1200.0), False),
+                 (mesh.PathInfo(1, "Hub", 10_000_000.0), False), (mesh.PathInfo(1, "LoRa", None), False),
+                 (mesh.NO_PATH, False))
+        for path, expected in cases:
+            self.assertEqual(mesh.is_local_path(path, [], 3, 100_000), expected, path)
+
+    def test_info_gives_the_names_rules_match(self):
+        self.assertEqual(self.paths.info(P2).names, ("LoRa", RADIO))
+        interface = types.SimpleNamespace(name="LoRa 868", bitrate=1200, parent_interface=None)
+        self.instance.is_connected_to_shared_instance = False
+        with mock.patch.object(RNS.Transport, "next_hop_interface", lambda node_id: interface):
+            self.assertEqual(self.paths.info(P1).names[0], "LoRa 868")
+
+    def test_scan_through_a_shared_instance(self):
+        """One path table RPC and one interface stats RPC, whatever the number of nodes."""
+        found = self.paths.scan(3)
+        self.assertEqual(found, {P1: mesh.PathInfo(2, "Hub", 10_000_000.0), P2: mesh.PathInfo(2, "LoRa", 1200.0)})
+        self.assertEqual(found[P2].names, ("LoRa", RADIO))
+        self.assertEqual(self.instance.calls, {"next_hop": 0, "path_table": 1, "stats": 1})
+        self.instance.table_fails = True
+        with self.assertRaises(ConnectionError):
+            self.paths.scan(3)
+
+    def test_scan_of_its_own_transport(self):
+        lora = types.SimpleNamespace(name="LoRa", bitrate=1200, parent_interface=None)
+        table = {P1: [0, b"", 2, 0, [], lora, b""], P2: [0, b"", 5, 0, [], lora, b""],
+                 P3: [0, b"", mesh.PATHFINDER_M, 0, [], lora, b""]}
+        self.instance.is_connected_to_shared_instance = False
+        with mock.patch.object(RNS.Transport, "path_table", table):
+            self.assertEqual(self.paths.scan(3), {P1: mesh.PathInfo(2, "LoRa", 1200.0)})
+            self.assertEqual(set(self.paths.scan(None)), {P1, P2})
+        self.assertEqual(self.instance.calls, {"next_hop": 0, "path_table": 0, "stats": 0})
+
+    def test_settings_checked(self):
+        for name, value in (("local_interfaces", "LoRa"), ("local_interfaces", [""]), ("local_hops", 0),
+                            ("local_hops", True), ("local_replicas", 6), ("local_replicas", -1)):
+            with self.assertRaises(ValueError, msg=name):
+                Config(**{name: value}).validate()
+        Config(local_interfaces=["LoRa"], local_hops=1, local_replicas=0).validate()
+
+
 class SlowPathsTest(unittest.TestCase):
     """mesh.SlowPaths and Traffic.slow_link: which servers a node that isn't slow asks last in its lookups."""
 
