@@ -158,9 +158,10 @@ class FakeNode:
     # Facade
 
     def add_path(self, path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True,
-                 chunker=None, progress=None):
+                 chunker=None, progress=None, source="user"):
         self.record("add_path", path, wrap=wrap, only_hash=only_hash,
-                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  source=source))
         if not os.path.isabs(path):
             raise ValueError("path must be absolute")
         if not os.path.exists(path):
@@ -169,21 +170,22 @@ class FakeNode:
         if wrap:
             cid = self.put_dir({os.path.basename(path): cid})
         if pin and not only_hash:
-            self.pins.setdefault(cid, set()).add("user")
+            self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": self._size(cid), "warnings": ["skipped a symlink"] if wrap else []}
 
     def add_stream(self, stream, size=None, name=None, only_hash=False, pin=True, to=None, to_self=False,
-                   seal_name=None, chunker=None):
+                   seal_name=None, chunker=None, source="user"):
         data = stream.read()
         self.record("add_stream", data, size=size, name=name, only_hash=only_hash,
-                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  source=source))
         if size is not None and len(data) != size:
             raise ValueError("stream shorter than its size")
         cid = self.put_file(data)
         if name:
             cid = self.put_dir({name: cid})
         if pin and not only_hash:
-            self.pins.setdefault(cid, set()).add("user")
+            self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": len(data), "warnings": []}
 
     def get(self, target, output, from_node=None, raw=False, no_extract=False):  # nothing is sealed here, so raw
@@ -276,37 +278,37 @@ class FakeNode:
             return None
         return obj[1][:length]
 
-    def dir_set(self, target, name, child_cid, executable=False):
-        self.record("dir_set", target, name, child_cid, executable=executable)
+    def dir_set(self, target, name, child_cid, executable=False, source="user"):
+        self.record("dir_set", target, name, child_cid, executable=executable, **self._given("dir_set", source=source))
         obj = self._object(self._resolve(target))
         if obj[0] != "dir":
             raise ValueError("not a directory")
         cid = self.put_dir({**obj[1], name: child_cid})
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def dir_rm(self, target):
-        self.record("dir_rm", target)
+    def dir_rm(self, target, source="user"):
+        self.record("dir_rm", target, **self._given("dir_rm", source=source))
         edit.check_entry_target(target)  # as RnfsNode.dir_rm, before anything is fetched
         parent, name = target.rsplit("/", 1)
         obj = self._object(self._resolve(parent))
         if name not in obj[1]:
             raise NotFound(f"no such entry: {name}")
         cid = self.put_dir({k: v for k, v in obj[1].items() if k != name})
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def pin_add(self, target):
-        self.record("pin_add", target)
+    def pin_add(self, target, source="user"):
+        self.record("pin_add", target, **self._given("pin_add", source=source))
         cid = self._resolve(target)
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def pin_rm(self, cid):
-        self.record("pin_rm", cid)
-        if "user" not in self.pins.get(cid, set()):
+    def pin_rm(self, cid, source="user"):
+        self.record("pin_rm", cid, **self._given("pin_rm", source=source))
+        if source not in self.pins.get(cid, set()):
             raise NotFound(f"{cid} is not pinned")
-        self.pins[cid].discard("user")
+        self.pins[cid].discard(source)
         if not self.pins[cid]:
             del self.pins[cid]
 
@@ -415,8 +417,8 @@ class FakeNode:
             f.write(b"archive")
         return {"roots": [cid], "blocks": len(self._dag(cid))}
 
-    def import_archive(self, path, progress=None):
-        self.record("import_archive", path)
+    def import_archive(self, path, progress=None, source="user"):
+        self.record("import_archive", path, **self._given("import_archive", source=source))
         if not os.path.isfile(path):
             raise NotFound(f"no such file: {path}")
         return {"roots": [self.put_file(b"from archive")], "incomplete": []}
