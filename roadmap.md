@@ -35,9 +35,9 @@ The feature-complete release, shipped as one release after 0.1.6: the work plann
 there are no 0.1.x releases in between. Nodes of 0.1.3 and later keep working with 0.2.0 nodes: no CID changes,
 wire changes additive only, and every state change gets an upgrade migration from 0.1.6.
 
-## Local API and library for companion apps (done; planned as 0.1.7, which wasn't released)
+## Local API and library for companion apps (implemented)
 
-What companion apps need from the daemon, most impactful first.
+What companion apps need from the daemon, most impactful first. Planned as 0.1.7, which wasn't released.
 
 * Discovery file: the daemon writes `<rnfs dir>/daemon.json` at start with its PID, API ports, version, start time
   and the Reticulum config it uses, so a client finds the daemon without parsing `rnfs.toml` (an older client
@@ -57,9 +57,10 @@ What companion apps need from the daemon, most impactful first.
 * Peers: `first_heard`, the last link RTT the node already measured, and an online state worked out by the daemon
 * `rnfs.Client`: typed methods for peers, stats, contacts, follow, keep and LXMF, and timeouts per call instead
   of per connection
+* As implemented: everything above, planned as 0.1.7 (which wasn't released). The push endpoint's `inbox` events went
+  with LXMF's removal; `rnfs.Client`'s LXMF methods too.
 
-
-## Providing at scale (done, but the Gutenberg benchmark)
+## Providing at scale (implemented)
 
 Today a node can advertise about 1000 roots on a small network (100 while it is new): each server stores at most
 `max_records / 100` records per publisher, and with 10 or fewer servers every server holds every key. Each root
@@ -119,8 +120,23 @@ so it never finishes within a day. Every record is also held in memory (about 50
   (clamped like provider records'), so `/find` replies still leave out nodes silent for 2 × `announce_interval`
 * Benchmark: one node publishing a large collection (e.g. the ~70k-file Gutenberg mirror) over rnfs, kept
   findable through republishing
+* As implemented: sweep providing as designed (`rnfs/dht/sweep.py`): over a simulated network with real lookups, 100% of
+  keys got their true 10 closest (per-key lookups 97–98%), lookups per round level off at servers ÷ 12–13, and a region
+  costs 1.5–1.6 extra `/find`. A server outside a region that names one inside it is asked too, which took accuracy from
+  98.3–100% to 100%. `/provide` goes to 16 servers at once on fast nodes. Slow nodes run 10 region lookups a round; a
+  server only withdrawals reach counts as one of them, with up to 5 of the 10 kept for withdrawals while any are queued.
+  Kept names' jitter comes from the key's first byte, as planned; on networks of up to about 2,500 servers a region
+  still spans several slots, so its kept names come due in up to 256 rounds per interval. The store set is built from
+  parts (`add_store_part`): the region's 10 closest, each disjoint path's 10 closest, the density rings, the first-seen
+  log's senior servers (heard in the last 2 × `announce_interval` too, so departed ones cost nothing) and the local
+  servers. Provider records are on disk as planned; measured on disk they take about 150 bytes each, 240 when each has a
+  publisher of its own, so the default 1 GiB `record_budget` holds about 7 million. The budget is measured as the whole
+  state database's size (SQLite's per-table statistics are optional and read every page), so other state counts against
+  it too, mostly the block-size table: a node holding about 10M blocks may want a larger budget. A flood of 300,000
+  fresh identities into a full 200,000-record store cost about 70 µs a store. The routing table is persisted with
+  wall-clock times. Not done: the Gutenberg mirror benchmark, which needs the mirror and real hardware.
 
-## Resisting floods (done)
+## Resisting floods (implemented)
 
 RNS identities are free and RNS has no IP addresses, so no cap keyed on an identity bounds an attacker, and no
 deployed DHT's defence (IP diversity, a directory authority) carries over. The model: **share freely while there
@@ -176,8 +192,18 @@ simulated in [docs/simulations/storage](docs/simulations/storage/RESULTS.md).
   publishers leaving the network free (about 6–10% of large publishers' records over three weeks at 1% churn a
   day), and crowd honest newcomers. Recovery after a flood ends: at once for pre-aged floods on stores below
   ~85% use, 4.5–5.5 days for fresh floods on a full store, 7–9 days for identities already Earned
+* As implemented: the tiers as tabled. Earned counts refresh days after the day of a first store. The Known tier also
+  refuses a storer already holding as many records as its largest holder, so two Known publishers can't churn each
+  other. A full key evicts a random member of the lowest tier present, never one of the `K/2` oldest records. At the
+  upgrade, a 0.1.x publisher starts Earned only if it was first seen at least 3 days before its latest store and had
+  refreshed a record outside the old newcomer pool a day or more after storing it. Scores: +1 for a `/blocks` response
+  whose blocks verified, +0.5 for a useful `/find` answer, −1 for a failure, −32 for a block not matching its CID; they
+  halve every 7 days without new work, stay within ±64 and are compared in power-of-two bands; at most 4,096 peers are
+  scored. Bootstrap nodes are seeded with 6. A join asks up to 6 saved servers first; after such a join a fast node
+  still asks the default bootstrap nodes (at most 2), so one that saved only an island reaches the rest; a slow node
+  doesn't.
 
-## Finding content when identities are placed next to a key (done)
+## Finding content when identities are placed next to a key (implemented)
 
 Generating identities closer to a key than every honest server costs about 4 s of one core each, even with 10,000
 servers, and 10 of them hide content completely today (found 0–4% of the time). Simulated in
@@ -208,8 +234,17 @@ servers, and 10 of them hide content completely today (found 0–4% of the time)
   joined once, its saved routing table is its own bootstrap list: a join tries saved servers, best scored
   first, before the defaults. A node behind an RNS access-point interface hears no announces from beyond it,
   so its first join needs one reachable node ID (a default or its user's)
+* As implemented: all four mechanisms (`rnfs/dht/density.py`, `disjoint.py`, `lookups.py`). The size estimate is kept in
+  the state database, so a restart has it at once; the density check waits for 8 lookups. Searchers wait for the 3
+  closest of the log's senior servers rather than all 10 (all 10 cost about 5 more `/find` per search). A fallback
+  search gets what is left of the first lookup's time and of its 80 `/find`, so a search still sends at most 80. Over
+  the fake network of `tests/test_eclipse.py` (2,000 servers, 10 or 20 identities placed closer to a key than every
+  honest server): found 100% of the time by upgraded fast nodes and 99.2–100% by slow ones, 0% by 0.1.x nodes; 2–6%
+  false positives; +0.2 to +0.5 `/find` per search; about +17 `/find` and +3 stores to publish one key; a search for
+  content nobody provides about 4× a normal one. Over 1,000 servers with sweep providing, 0.6% of keys needed a widened
+  lookup. Fast nodes keep up to about 36 `/find` in flight while publishing.
 
-## LoRa meshes and the backbone (done)
+## LoRa meshes and the backbone (implemented)
 
 Kademlia ignores where nodes are. Internet nodes' lookups route through LoRa islands, a mesh cut off from the
 internet can't find its own content, and records published while it was cut off sit on the wrong nodes after it
@@ -257,8 +292,20 @@ reconnects. Simulated in [docs/simulations/topology](docs/simulations/topology/R
 * Upgrading helps in proportion: with half the nodes upgraded, content published before a partition is found 78%
   of the time (55% today). Two-level records need both publisher and searcher upgraded; the other changes help
   as soon as either side has
+* As implemented: as planned, with lookup candidates ranked in three tiers (first, slow path, unreliable). A server
+  whose path was unknown is judged again once its path request is answered, before a link is opened. On slow nodes a
+  publishing lookup's 10 path requests are split over its 2 disjoint paths, and a search gets 3, plus 3 over its
+  fallback. Silence alone only triggers a probe of an off-island server; partition mode starts only if that probe fails,
+  which is what keeps small connected networks from flapping. Probes go every 5 minutes, or on slow nodes from 15
+  minutes doubling up to 2 hours. A path-table scan runs at start and every 10 minutes, and at most 1,024 local servers
+  are kept. Heal marks are persisted (`published_heal`). Over the fake network of `tests/test_topology.py` (1,000
+  servers, 21% on 8 islands): island `/find` per internet search 0.76 → 0; island stores per internet publish 2.47 →
+  0.07; an island publisher's records on 6.9 of their true 10 closest instead of 3.6. During a partition, a neighbour
+  found what an island node published before it 100% of the time instead of 67%, in 31 s of simulated time per search
+  instead of 490 s. The internet found what was published during the partition 0% of the time until the heal republish,
+  99.5% after it. Not tested over a real island.
 
-## Less announce traffic (done)
+## Less announce traffic (implemented)
 
 Every node announces `rnfs.dht` every 6 hours and every name its own destination, and RNS floods announces across
 the network. A LoRa channel's 2% announce allowance carries about 1,150 a day at 1 kbit/s, enough for about 290
@@ -278,6 +325,8 @@ rnfs nodes; at 100k nodes announces approach RNS's per-interface ingress limit o
   announced only on change would add a keeper query to every resolve of an unchanged name (ten to twenty times
   a path-answered resolve's airtime), and transport nodes answer path requests from their cached, old announce
   anyway
+* As implemented: as written. Whether a client needs reaching is checked every minute, and it announces at once
+  when it starts to. Servers and names announce as before.
 
 ## Pacing path requests (to do)
 
@@ -356,7 +405,7 @@ Open (owner's decision):
   supported, at the cost of a timeout to each older node. Decompression must be bounded before any data is kept,
   as the NomadNet add's links are
 
-## Providing files inside folders (done)
+## Providing files inside folders (implemented)
 
 * A `provide_entries` setting that also provides the CID of every file and folder inside a complete pin, so
   each can be found by its own CID rather than only as `<root>/<path>`, and the same file in two folders can be
@@ -370,8 +419,14 @@ Open (owner's decision):
   1,500 keys on a 100-server network, about 50 at 1,000 servers or more): one mid-size folder already exceeds
   what a 1 kbit/s node can republish. `provide_entries = true` or `false` overrides the default either way
 * Unpinning a folder withdraws every entry it provided
+* As implemented: the 100,000-key cap takes pins oldest first, each pin's entries all or none, so a new pin never takes
+  entries from an older one. On a slow node the airtime estimate counts about 2 senior-server stores per key on top of
+  `K`, so the thresholds are about 1,300 keys at 100 servers and 40 from 1,000 servers at 1 kbit/s; once on, entries
+  stay on until the estimate passes 2.5%. The network size comes from the publish rounds' regions and the density
+  check's estimate, whichever is larger. `rnfs status` gains `provided_entries`, `provide_entries_off` and
+  `provide_entries_capped`, and `provided` counts entries.
 
-## Gateway: an origin per site (done)
+## Gateway: an origin per site (implemented)
 
 * Subdomain gateway: `<cid>.rnfs.localhost:8789` and `<name>.name.localhost:8789`, so a page can `fetch()`
   files of its own DAG; the path gateway (`/rnfs/<cid>`, `/name/<name>`) stays
@@ -391,8 +446,11 @@ Open (owner's decision):
 * Documented: `localhost` isn't a public suffix, so every `*.rnfs.localhost` site is one *site* and they share
   cookies (localStorage and IndexedDB are per origin); not every resolver maps `*.localhost` to loopback
   (browsers do), so the path gateway stays the fallback; links between sites must be absolute subdomain URLs
+* As implemented: as written, plus `rnfs url <cid>|<name>[/path]`, which prints a target's site URL. Every
+  `*.rnfs.localhost` site shares cookies, as does every `*.name.localhost` site; neither the gateway nor the API uses
+  cookies. Service workers stay refused.
 
-## Pin by NomadNet address (done)
+## Pin by NomadNet address (implemented)
 
 `rnfs add` recognises a NomadNet link and adds what the NomadNet node returns:
 
@@ -417,7 +475,7 @@ rnfs add e166ecdbc405bcc9762b6767617fc949:/file/song.mp3   # a file the node ser
 * Limits: `max_download_size` and the disk reserve apply. NomadNet compresses files up to 32 MB and may send
   multi-segment Resources, while the daemon sets RNS's decompression limit to 0 process-wide. That limit is
   copied into each Resource when it is created (`max_decompressed_size`, RNS 1.5.6) and a link's
-  `resource_started` callback runs before any data arrives (rnfs's LXMF feature already uses both), so these
+  `resource_started` callback runs before any data arrives (rnfs's LXMF feature used both), so these
   links are bounded per link, and `rnfs.dht` links keep every rule they have:
   * requests carry `max_response_size` = min(`max_download_size`, free space above the disk reserve)
   * each segment gets `max_decompressed_size` = one segment (`MAX_EFFICIENT_SIZE` + 1), and must carry the same
@@ -427,33 +485,35 @@ rnfs add e166ecdbc405bcc9762b6767617fc949:/file/song.mp3   # a file the node ser
   * the assembled file must be no larger than advertised, and is copied into storage inside the response
     callback (RNS deletes it after); a page response must be one byte string, checked from its msgpack headers
     before RNS decodes it, as `rnfs.dht` responses are
+* As implemented: as written, modelled on NomadNet 1.4.4's own `Node.py`. The link is recorded as the pin's origin,
+  which `pin ls` shows when the pin has no label, rather than as the label, so it never overwrites a label the user
+  chose. Through the API, `POST /api/add` takes `nomadnet` instead of `path`, and add jobs take it too. A pin made with
+  an app's token gets that app's source. A "Request Not Allowed" answer on an identified link is retried once after
+  identifying again.
 
-## LXMF moves out of core (done: removed in 0.2.0, before the wrapper's first release, by the owner's decision)
+## LXMF moves out of core (implemented)
 
-LXMF becomes a separate wrapper project built on the local API and the library.
-
-* Users are never without the feature: if the wrapper's first release is ready with 0.2.0, 0.2.0 removes LXMF;
-  if not, 0.2.0 keeps it, deprecated (a warning whenever LXMF features are used: CLI, API, settings), and the
-  release after the wrapper ships removes it
-* Contacts of kind `lxmf` stay in core's address book; the wrapper reads them through the API to decide which
-  senders it trusts
+LXMF becomes a separate wrapper project built on the local API and the library. The plan kept LXMF, deprecated,
+until the wrapper's first release; the owner decided to remove it in 0.2.0 without waiting for the wrapper.
 
 * Removed from rnfs: `rnfs/features/lxmf.py`, `send`, `inbox`, `outbox`, `lxmf address` and `lxmf sync`, their
   API routes and library methods, the LXMF inbox events, the `lxmf_*` settings, and the LXMF dependency in
-  every package
+  every package and lock
 * Kept: `rnfs:` URIs (section 13's syntax) and the LXMF link-map field definition, as the interop contract
-  the wrapper and other clients use; the message, receiving and auto-fetch rules move to the wrapper's spec
-* Upgrade: `lxmf:<address>` pins become `app:lxmf:<address>` pins (below), which the wrapper owns and releases;
-  `storage/lxmf_identity` and `lxmf/` are left on disk for the wrapper to adopt, so its LXMF address doesn't
-  change. `lxmf_*` settings left in `rnfs.toml` are ignored with a notice (an unknown setting stops the daemon
-  today)
-* The pin migration runs in 0.2.0 either way (a schema step), and in-core LXMF, while it remains, pins with
-  `app:lxmf:` itself: rewriting the pins under a feature that still released `lxmf:` would leak them. While
-  in-core LXMF is enabled, `rnfs app add lxmf` is refused; in-core LXMF's start-up release of pins its inbox
-  doesn't list is skipped once an app named `lxmf` exists, so it never releases the wrapper's pins. The
-  `lxmf_messages` inbox stays in rnfs.db (whether to export it for the wrapper is open)
+  the wrapper and other clients use (`rnfs/uris.py`); the message, receiving and auto-fetch rules move to the
+  wrapper's spec. Contacts of kind `lxmf` stay in core's address book; the wrapper reads them through the API to
+  decide which senders it trusts
+* Upgrade: `lxmf:<address>` pins become `app:lxmf:<address>` pins (a schema step), which the wrapper, as an app
+  named `lxmf`, owns and releases; until then `rnfs app add lxmf` followed by `rnfs app rm lxmf` releases them.
+  `storage/lxmf_identity`, `lxmf/` and the `lxmf_messages` table are left as they are for the wrapper to adopt,
+  so its LXMF address doesn't change; nothing in rnfs reads or deletes them. `lxmf_*` settings left in
+  `rnfs.toml` are ignored with a warning
+* As implemented: the deprecation path built first (warnings, a `Deprecation` header, schema and capability
+  fields) was never released and went with LXMF. 0.1.4's LXMF state files are still imported into
+  `lxmf_messages` at an upgrade (`rnfs/lxmf_messages.py`). `tests/interop.py` no longer tests LXMF between
+  versions
 
-## Per-app API tokens and pin sources (done)
+## Per-app API tokens and pin sources (implemented)
 
 * `rnfs app add <name>` issues a labelled token for an application; `rnfs app ls` and `rnfs app rm <name>`
   list and revoke them. The current `api_token` stays as the full-access token for the CLI
@@ -466,15 +526,23 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   challenge proof; every route that pins with source `user` today (add, keep, dir set/rm, pin add/rm, import,
   and the jobs that replay them) takes the caller's source. `storage.check_source` accepts `app:` sources before
   anything writes one (pin rows failing it are deleted at load)
+* As implemented: the daemon keeps only a verifier of each token (SHA-256 of "rnfs app token " + the token) in rnfs.db's
+  `apps` table, which also keys the app's proof. `rnfs app add` prints the token once (or writes it to a file with
+  `-o`). `X-Rnfs-Pin-Key: <key>` picks `app:<name>:<key>`. The `/api/apps` routes accept only the CLI's token; an app's
+  gets 403 `forbidden`. Removing an app cancels its jobs and releases all its pins.
 
-## API reference (done)
+## API reference (implemented)
 
 * No API stability is promised until 1.0.0: `rnfs.API_STATUS` stays provisional, and the local API and the
   library may change in 0.2.x releases (`/api/capabilities` says what a daemon has)
 * An OpenAPI reference for the local API (request and response shapes, error codes), checked against the
   code by tests as `rnfs/api.py`'s route list is today
+* As implemented: `docs/openapi.json` (OpenAPI 3.1, in the sdist too), checked by `tests/test_openapi.py` against the
+  routes, error codes, event kinds and capabilities, and against the fields live answers carry, over a real offline
+  node. Writing it turned up 7 places where the docs said something other than the code; the docs were fixed. The status
+  schema is split into one part per producer, so new status fields have an obvious home.
 
-## Block storage and startup (done)
+## Block storage and startup (implemented)
 
 * Startup lists every block (twice: once for leftover `.partial-` files, once for sizes) before the API binds,
   so `rnfs status` says "no daemon is running" while a large store is scanned. The directory lock is taken
@@ -491,16 +559,28 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   subdirectory (a rename within the filesystem; if the target exists, the flat copy is deleted, being the same
   content), then syncs the directories. A block whose rename fails (Windows antivirus) stays readable where it
   is until a later start moves it. Scans never follow symlinks in `blocks/`
+* As implemented: the layout is `blocks/<cid[-3:-1]>/<cid>`. A subdirectory that is a link, isn't a directory or belongs
+  to another user stops the start. The library raises `DaemonStarting`, a `DaemonNotRunning`, while the daemon starts.
+  On a desktop NVMe disk with a warm cache, opening 1M small blocks took 1.2 s after a clean stop (5.4 s in 0.1.6; 7.2 s
+  after an unclean stop), and the first start, which moves 0.1.6's flat layout, took 74 s. Adding blocks costs one
+  directory sync per subdirectory written (16 at a time), +40% for a 64 MiB add (1.02 → 1.41 s). Not measured yet: a
+  Raspberry Pi's SD card (`tests/bench_startup.py`, `tests/bench_block_writes.py`), the Windows paths, and FAT32 with
+  the private-directory checks.
 
-## Network status (done)
+## Network status (implemented)
 
 * `rnfs status` (and `GET /api/status`) reports what the node can see of the network: the estimated number of
   DHT servers (the density check's size estimate), how often the density check fired recently, partition mode
   and how long it has lasted, records stored against the record budget and how full each storage tier is, and
   how many newcomers were refused or evicted recently. It is the cheapest way to learn how big the network is
   and to notice a flood or an attack on a key, and needs nothing on the wire
+* As implemented: `status.network` gives `size_estimate` and how many searches and published keys the density check ran
+  on and fired on in the last hour and day. `status.record_store` gives the records' bytes against `record_budget`, the
+  capacity, whether it is full, and for each tier its records, share, floor, and the records refused and evicted in the
+  last hour and day. `rnfs status` sums these up in a few lines. The counts are kept in memory, per minute over the last
+  day, and `status()` reads nothing from the state database.
 
-## Encrypted folders (done)
+## Encrypted folders (implemented)
 
 * `add --to` accepts a folder: rnfs packs it as one tar stream and seals that as a single sealed file, so the
   folder's names and structure are hidden along with its content. Sealed files are unchanged: the sealed name
@@ -511,20 +591,27 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   rules, depth and entry limits), streams into the sealer (which already takes a stream of unknown length), and
   puts everything under one top directory `<folder>/`, so `tar xf` doesn't spill into the current directory
 * `get` of such a file, by a recipient, decrypts it and unpacks it only if the sealed name ends in `.tar` and the
-  content is a valid tar that starts with rnfs's sealed-folder marker (a pax global header holding only
-  `comment=rnfs sealed folder`, which extractors ignore), so a real `.tar` someone sealed as a file stays a file, reusing both rule sets as they are: the tar reader of `POST /api/add/stream` builds it
-  into the block store (regular files and directories only, no absolute or `..` paths, entry-count and depth
-  limits), `get`'s write-out writes it (temporary name, renamed when complete, unsafe names skipped), and the
-  plaintext blocks are collected afterwards; the free-space check counts both. `--no-extract` writes the `.tar`
-  instead. `cat` gives the decrypted tar, as for any sealed file; the gateway and `--raw` give the sealed bytes
+  content is a valid tar that starts with rnfs's sealed-folder marker (a pax global header holding only `comment=rnfs
+  sealed folder`, which extractors ignore), so a real `.tar` someone sealed as a file stays a file, reusing both rule
+  sets as they are: the tar reader of `POST /api/add/stream` builds it into the block store (regular files and
+  directories only, no absolute or `..` paths, entry-count and depth limits), `get`'s write-out writes it (temporary
+  name, renamed when complete, unsafe names skipped), and the plaintext blocks are collected afterwards; the free-space
+  check counts both. `--no-extract` writes the `.tar` instead. `cat` gives the decrypted tar, as for any sealed file;
+  the gateway and `--raw` give the sealed bytes
+* As implemented: as written. `--no-sealed-name` with a folder is refused, since the sealed name is what makes a
+  recipient's `get` unpack it. `GET /api/info` tells a recipient `sealed_folder`. `POST /api/add/stream?format=tar`
+  still can't seal.
 
-## Name key backups (done)
+## Name key backups (implemented)
 
 * Losing a name's key loses the name for good: nothing can move it to a new key. `name create` and `name import`
   say so and print the `name export` command; the node remembers which keys were exported since they were
   created, and `rnfs status` lists names whose key has never been exported
+* As implemented: a key imported from a file counts as backed up, and keys made before 0.2.0 count as never exported
+  until `rnfs name export` runs. A feature reading a key, as keepers do, doesn't count as an export. `name list` entries
+  and `rnfs.Name` gain `exported`; `rnfs status` lists `unexported_names`.
 
-## Publishing a folder to a name (done)
+## Publishing a folder to a name (implemented)
 
 * `rnfs name sync <alias> <folder>` keeps a name pointing at a folder's current content: every `scan_interval`
   the folder is imported as the shared folder is (unchanged files recognised by their metadata, not re-read;
@@ -536,8 +623,12 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   published. FastCDC is the default chunker for synced folders, so an edited file shares most of its blocks
   with the version before. `rnfs name unsync <alias>` stops it and keeps the name where it last pointed. Also
   through the API and the library
+* As implemented: the settle time is 60 s. The hourly limit follows RNS transport interfaces' default
+  `announce_rate_target` of 3600 s. A folder that is missing, unreadable, empty (an unmounted drive looks empty) or
+  fails to import pauses the sync, which never publishes it. `rnfs name syncs` lists the syncs and how they stand; `name
+  rm` stops a sync. Syncs resume after a restart.
 
-## Remote pin status (done)
+## Remote pin status (implemented)
 
 * `rnfs pin remote ls` lists the remote pins this node asked for: node, CID, when it asked, and whether it is
   done, worked out locally by looking up the CID's providers and finding that node among them (paced on slow
@@ -546,6 +637,11 @@ LXMF becomes a separate wrapper project built on the local API and the library.
 * `rnfs pin remote ls --served` lists the pins other identities asked of this node: identity, CID, state
   (waiting, fetching, pinned, dropped and why) and each identity's use of `remote_pin_quota`. Both through the
   API and the library
+* As implemented: asked pins are `waiting`, `done`, `missing` (not found 24 h after asking), `refused` (including no
+  answer) or `released`. Checks run in the background at most 60 an hour, 4 at once, or on slow nodes 4 an hour, one at
+  a time; `--check` checks at most 32 a call (4 on a slow node). At most 10,000 asked entries and 1,000 served outcomes
+  are kept. Served outcomes carry a reason (quota, not found, denied, queue full, ...). `remote_pin` events report both
+  sides.
 
 # After 0.2.0
 
