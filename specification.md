@@ -1218,8 +1218,15 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   RNS: no change, honest refusal 0.95–1.0 either way). The hold is not free: the attacker must keep
   downloading, or keep opening links. An operator under such an attack can raise `fast_blocks_responses`, or
   `blocks_cooldown`.
-- An outside web site can frame a gateway page and receive public content from it by `postMessage` (outside
-  private mode, only content public by CID).
+- An outside web site can frame a path gateway page and receive public content from it by `postMessage`
+  (outside private mode, only content public by CID). A site's pages (section 11) can be framed only by pages
+  of their own origin.
+- Gateway sites share cookies: `localhost` is not on the Public Suffix List, so a browser takes every
+  `*.rnfs.localhost` host as one *site* (`rnfs.localhost`), and every `*.name.localhost` host as another, and
+  cookies ignore ports. A site's script can read and set cookies for its whole domain, which every other site
+  of the same kind receives. Neither the gateway nor the API uses cookies, so this gives no access, but cookies
+  large enough can make a browser's requests to every site of that kind too big to be answered (`431`) until
+  the user clears them. Storage that matters (localStorage, IndexedDB, caches) is per origin, so per root.
 
 ## 11. Local interface
 
@@ -1276,7 +1283,8 @@ renamed. A single file is created directly in the output's directory.
 **API** (`127.0.0.1:8788`) and **gateway** (`127.0.0.1:8789`) are separate ports, so pages served by the
 gateway can never reach the API.
 - Both MUST reject requests whose `Host` header isn't `127.0.0.1:<port>` or `localhost:<port>`, which blocks
-  DNS rebinding.
+  DNS rebinding. The gateway also accepts its site hosts (below), matched as exactly; the API accepts nothing
+  else.
 - Every API request except `GET /api/status` MUST carry `X-Rnfs-Api: <token>`, compared in constant time.
   The token is random (at least 128 bits), made anew at each daemon start and written to
   `<rnfs dir>/api_token` with mode 0600 (on Windows, with a protected access list allowing only the user and
@@ -1342,7 +1350,33 @@ gateway can never reach the API.
 - Both refuse HTTP/0.9 requests with a `400` carrying the usual headers, since an HTTP/0.9 response has none.
 
 **Gateway:**
-- Paths are `/rnfs/<cid>[/path]` and `/name/<name>[/path]`.
+- Paths are `/rnfs/<cid>[/path]` and `/name/<name>[/path]` (the *path gateway*).
+- **Sites (subdomain hosts).** `http://<k-cid>.rnfs.localhost:<port>/[path]` serves `<cid>/[path]` and
+  `http://<name>.name.localhost:<port>/[path]` serves the name's target, so each root has an origin of its own
+  and its pages can read its own DAG with `fetch()`. The path gateway stays as it is, and is the fallback.
+  - `<k-cid>` is the CID's host form (section 4: `k` + base36), the only place it is accepted; it is converted
+    to the written form at once, so `ETag`, listings, errors and logs show that. `<name>` is 32 hex characters,
+    never a contact nick. Hosts are compared after lowercasing (browsers lowercase them), and must be exactly
+    `<label>.rnfs.localhost:<port>` or `<label>.name.localhost:<port>`: no other or further label, no trailing dot,
+    the gateway's port. Any other host gets `403` as before; an invalid CID or name in a site host gets `400`.
+  - The path is a path in the root's DAG and nothing else (no `/rnfs/` or `/name/` prefix), in origin form
+    (an absolute-form request target gets `400`); every segment must be a valid name, so an empty one gets `400`
+    and a redirect to the slash form, rebuilt from the decoded names, stays on the site.
+  - `?format=` gets `400` (formats are on the path gateway). A request carrying `Service-Worker` (the request
+    for a service worker script) gets `403`: a worker on a name's site could go on serving old content after
+    the name moves.
+  - Every response, errors included, carries `X-Content-Type-Options: nosniff`, `Origin-Agent-Cluster: ?1`
+    and `Content-Security-Policy: sandbox allow-same-origin allow-scripts allow-forms allow-popups; default-src
+    'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'; frame-ancestors 'self'`; with
+    `gateway_scripts` off, `allow-scripts` and `'unsafe-eval'` are dropped and `script-src 'none'` added, as on
+    the path gateway. `allow-same-origin` keeps the page's own origin (the sandbox still stops it navigating
+    its top window or opening unsandboxed popups), and only its own origin's pages may frame it.
+  - Everything else is as on the path gateway: no CORS headers (a page's `fetch()` of its own site is
+    same-origin and needs none, and every other origin is refused for want of one), sealed files never
+    decrypted, the deny list, sizes, `gateway_fetches` and the caching rules.
+  - Browsers map `*.localhost` to loopback themselves; other resolvers may not, so tools should use the path
+    gateway. Links between sites must be absolute (`http://<other>.rnfs.localhost:<port>/`), and the cookie
+    caveat of section 10 applies.
 - **Files.**
   - Content-Type comes from the path's file name or `?filename=`, or else from sniffing the content.
   - Range requests for one `bytes=` range are supported; another or malformed `Range` header is ignored and
@@ -1378,7 +1412,7 @@ gateway can never reach the API.
 - **Directories.**
   - A directory path without a trailing slash redirects to the slash form.
   - It is served as its `index.html` if present, otherwise as an HTML-escaped listing.
-- **Every response** carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox
+- **Every path gateway response** carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox
   allow-scripts allow-forms allow-popups; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:;
   form-action 'self'`. Pages run in an opaque origin and can't load resources from other servers;
   navigation and WebRTC can still reveal the viewer. A node MAY disable scripts (`gateway_scripts`).
@@ -1389,14 +1423,14 @@ gateway can never reach the API.
   opaque origin, so they can load files of their own DAG as subresources (images, scripts, style sheets,
   frames) but can't read gateway responses with `fetch()` or `XMLHttpRequest`, and neither can other web
   sites. A gateway MUST NOT allow `Origin: null`: every site's sandboxed frames and `data:` pages send it.
-  A separate origin per root (e.g. a subdomain per CID) would let pages read their own DAG; that is possible
-  future work.
+  Pages that need to read their own DAG are served on their site's host (above).
 - Content fetched for the gateway is cache and is never provided. Names it resolves go only into the capped
   table (section 9).
 - Requests that aren't the user's own navigation (`Sec-Fetch-Site` other than `none`) may start at most
   `gateway_fetches` network fetches or name resolutions at a time. Content already stored is served without
-  limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost`, and `none` only for a navigation the
-  user started (address bar, bookmark). A request without it is the user's own only if its `User-Agent`
+  limit. Browsers send `Sec-Fetch-Site` to `127.0.0.1` and `localhost` (and `*.localhost`, so to sites too: a
+  site page's own `fetch()` is `same-origin`, so limited), and `none` only for a navigation the user started
+  (address bar, bookmark). A request without it is the user's own only if its `User-Agent`
   doesn't start with `Mozilla/` (rnfs ignores case and leading spaces): then it comes from a local tool the
   user runs, such as curl. Every browser's `User-Agent` starts with `Mozilla/`, and browsers without Fetch
   Metadata (Safari before 16.4, Firefox before 90) send no `Sec-Fetch-Site` for a web page's requests either,

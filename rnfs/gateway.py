@@ -3,6 +3,10 @@
 GET/HEAD /rnfs/<cid>[/path]   content by CID: immutable, ETag "<cid>" of the target
 GET/HEAD /name/<name>[/path]  content a name points at, resolved with for_gateway=True
 
+Subdomain hosts (sites), an origin per root so a page can read its own DAG with fetch():
+GET/HEAD http://<k + base36 CID>.rnfs.localhost:<port>/[path]  as /rnfs/<cid>/[path]
+GET/HEAD http://<name>.name.localhost:<port>/[path]            as /name/<name>/[path]
+
 Behaviour:
 - Path segments are percent-decoded one by one; a decoded segment can't contain "/" or NUL, so every
   segment is exactly one name.
@@ -20,11 +24,18 @@ Behaviour:
 - Every response, errors and redirects included, carries X-Content-Type-Options: nosniff and the spec's
   sandboxing Content-Security-Policy. With gateway_scripts off, allow-scripts and 'unsafe-eval' are
   dropped and script-src 'none' added, so no script runs even if a browser ignores the sandbox.
-- No response carries Access-Control-* headers. Gateway pages run in a sandboxed, opaque origin, so they can
-  load files of their DAG as subresources (img, script, link…) but can't read gateway responses with fetch()
+- No response carries Access-Control-* headers. Path gateway pages run in a sandboxed, opaque origin, so they
+  can load files of their DAG as subresources (img, script, link…) but can't read gateway responses with fetch()
   or XMLHttpRequest, and neither can any other web page. Sending Access-Control-Allow-Origin for
-  `Origin: null` would let every site's sandboxed iframe or data: page read the gateway. Per-CID origins
-  (a subdomain per root) would be the way to let pages read their own DAG, and are possible future work.
+  `Origin: null` would let every site's sandboxed iframe or data: page read the gateway.
+- Sites: parse_host matches the Host header exactly (lowercased, as browsers send it), apart from the API's own
+  check (api.host_allowed, unchanged); the base36 CID becomes a Cid at once, so ETags, listings and logs show
+  base32. A site's page keeps its origin (CSP_SITE_SCRIPTS: sandbox with allow-same-origin, frame-ancestors
+  'self', plus Origin-Agent-Cluster), so its fetch() of its own files is same-origin and needs no CORS header;
+  every other origin is still refused by the browser for want of one. Its path is a DAG path and nothing else
+  (no /rnfs/ or /name/ prefix, no ?format=), every segment a valid name, and its redirects are rebuilt from
+  the decoded names. Requests for a service worker script (Service-Worker header) get 403: a worker on a
+  name's site could go on serving old content after the name moves. Everything else is as on the path gateway.
 - A GatewayError (the gateway's own refusals) or NotFound says what went wrong. Every other error (a 400,
   413, 422, 503 or 507 from the node, 451 for content the deny list blocks, or a 500) gets only a fixed
   message for its status: a node error's text
@@ -57,9 +68,9 @@ from collections import OrderedDict
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from rnfs.api import LocalServer, TimedHandler, error_status, host_allowed, loggable, parse_hex_id, raw_response
-from rnfs import debuglog
+from rnfs import debuglog, ids
 from rnfs import gateway_formats  # --- content ---
-from rnfs.content.cid import Cid
+from rnfs.content.cid import Cid, from_base36
 from rnfs.content.seal import is_sealed  # --- content ---
 from rnfs.errors import NotFound
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_VERBOSE, log
@@ -68,6 +79,17 @@ CSP_SCRIPTS = ("sandbox allow-scripts allow-forms allow-popups; "
                "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'")
 CSP_NO_SCRIPTS = ("sandbox allow-forms allow-popups; "
                   "default-src 'self' 'unsafe-inline' data: blob:; script-src 'none'; form-action 'self'")
+# On subdomain hosts (sites): the page keeps its own origin (allow-same-origin), so it can read its own DAG with
+# fetch(), and only pages of its own origin may frame it
+CSP_SITE_SCRIPTS = ("sandbox allow-same-origin allow-scripts allow-forms allow-popups; "
+                    "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; form-action 'self'; "
+                    "frame-ancestors 'self'")
+CSP_SITE_NO_SCRIPTS = ("sandbox allow-same-origin allow-forms allow-popups; "
+                       "default-src 'self' 'unsafe-inline' data: blob:; script-src 'none'; form-action 'self'; "
+                       "frame-ancestors 'self'")
+SITE_DOMAINS = {"rnfs": "rnfs.localhost", "name": "name.localhost"}  # site kind -> the domain its hosts are under
+HOST_REFUSED = ("Host header must be 127.0.0.1:<port> or localhost:<port>, or <k + base36 CID>.rnfs.localhost:<port> "
+                "or <name>.name.localhost:<port>")
 IMMUTABLE = "public, max-age=31536000, immutable"
 RETRY_AFTER = "10"  # seconds a limited request should wait before retrying
 SNIFF_SIZE = 512  # bytes read to guess a type, as in the WHATWG MIME sniffing standard
@@ -222,6 +244,34 @@ class GatewayError(Exception):
         self.headers = headers or {}
 
 
+def parse_host(host: str | None, port: int) -> tuple[str, Cid | bytes] | None:
+    """What a request's Host header names on the gateway listening on port.
+
+    None: the path gateway, 127.0.0.1:<port> or localhost:<port> exactly as the API allows (api.host_allowed).
+    ("rnfs", Cid): <k + base36 CID>.rnfs.localhost:<port>. ("name", 16 bytes): <32 hex>.name.localhost:<port>.
+    Hosts are compared lowercased, as browsers send them; nothing else matches: no other label, no IP address,
+    no trailing dot, no missing or other port. Raises GatewayError 403 for any other host (DNS rebinding) and 400
+    for a site host whose CID or name is invalid. The base36 CID is turned into a Cid here, so it is written in
+    base32 from then on (specification section 4).
+    """
+    if host_allowed(host, port):
+        return None
+    if host is None or not host.isascii():  # so lower() maps nothing outside ASCII onto it
+        raise GatewayError(403, HOST_REFUSED)
+    label, _, domain = host.lower().partition(".")
+    kind = next((kind for kind, name in SITE_DOMAINS.items() if domain == f"{name}:{port}"), None)
+    if kind is None:
+        raise GatewayError(403, HOST_REFUSED)
+    if kind == "rnfs":
+        try:
+            return kind, from_base36(label)
+        except ValueError as e:
+            raise GatewayError(400, str(e)) from None
+    if not ids.HEX16_LOWER.fullmatch(label):
+        raise GatewayError(400, f"invalid name {label!r} in host: must be 32 hex characters")
+    return kind, bytes.fromhex(label)
+
+
 class FetchLimiter:
     """At most `limit` concurrent network fetches or name resolutions for requests that aren't navigation."""
 
@@ -315,6 +365,7 @@ class GatewayHandler(TimedHandler):
     server_version = "rnfs"
     sys_version = ""
     status_sent: int | None = None  # the response's status, once sent (for the debug log)
+    site: tuple[str, Cid | bytes] | None = None  # the subdomain host's site (parse_host), or None
 
     def log_message(self, format, *args):
         """Log nothing: RNS does the node's logging, and per-request lines would drown it out."""
@@ -338,7 +389,13 @@ class GatewayHandler(TimedHandler):
     def end_headers(self):
         """Add the headers every response carries, then end the headers."""
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", CSP_SCRIPTS if self.config.gateway_scripts else CSP_NO_SCRIPTS)
+        if self.site is None:
+            self.send_header("Content-Security-Policy", CSP_SCRIPTS if self.config.gateway_scripts else CSP_NO_SCRIPTS)
+        else:
+            csp = CSP_SITE_SCRIPTS if self.config.gateway_scripts else CSP_SITE_NO_SCRIPTS
+            self.send_header("Content-Security-Policy", csp)
+            # Origin-keyed: document.domain can't be relaxed to rnfs.localhost, which every site's host shares
+            self.send_header("Origin-Agent-Cluster", "?1")
         # Deliberately no Access-Control-* headers, for any Origin or Referer (module docstring)
         self.headers_sent = True
         super().end_headers()
@@ -400,7 +457,8 @@ class GatewayHandler(TimedHandler):
         number = next(_request_numbers)
         started = time.monotonic()
         self.wfile = _CountingWriter(self.wfile)
-        shown = ", ".join(f"{name}: {self.headers[name]}" for name in DEBUG_HEADERS if self.headers.get(name) is not None)
+        shown = ", ".join(f"{name}: {self.host_for_log() if name == 'Host' else self.headers[name]}"
+                          for name in DEBUG_HEADERS if self.headers.get(name) is not None)
         with debug.tag(f"gateway #{number}"):
             debug.note(f"gateway {self.command} {self.path}" + (f" ({shown})" if shown else ""))
             try:
@@ -415,29 +473,48 @@ class GatewayHandler(TimedHandler):
         self.close_connection = True
         self.headers_sent = False
         self.slot = False
+        self.site = None
         try:
-            if not host_allowed(self.headers.get("Host"), self.server.server_address[1]):
-                raise GatewayError(403, "Host header must be 127.0.0.1:<port> or localhost:<port>")
+            self.site = parse_host(self.headers.get("Host"), self.server.server_address[1])
             if self.command not in ("GET", "HEAD"):
                 raise GatewayError(405, "the gateway only answers GET and HEAD", {"Allow": "GET, HEAD"})
             self.request_read()  # GET and HEAD have no body
             self.serve()
         except GatewayError as e:
-            log(f"gateway refused {loggable(self.path)} with {e.status}: {e}", LOG_DEBUG)
+            log(f"gateway refused {self.path_for_log()} with {e.status}: {e}", LOG_DEBUG)
             self.respond_error(e.status, str(e), e.headers)
         except NotFound as e:
-            log(f"gateway: {loggable(self.path)} not found: {e}", LOG_DEBUG)
+            log(f"gateway: {self.path_for_log()} not found: {e}", LOG_DEBUG)
             self.respond_error(404, str(e) or ERROR_MESSAGES[404], {})
         except Exception as e:  # noqa: BLE001 - every error becomes a response, never a dropped connection
             status = error_status(e)
             # str(e) may name local paths (a StorageFull's or an OSError's) or the node's limits: logged only
-            log(f"gateway {self.command} {loggable(self.path)} failed: {e!r}",
+            log(f"gateway {self.command} {self.path_for_log()} failed: {e!r}",
                 LOG_ERROR if status == 500 else LOG_VERBOSE)
             self.respond_error(status, ERROR_MESSAGES.get(status, ERROR_MESSAGES[500]),
                                {"Retry-After": RETRY_AFTER} if status == 503 else {})
         finally:
             if self.slot:
                 self.limiter.release()
+
+    def path_for_log(self) -> str:
+        """The request's path for the log, after its site on a subdomain host (the CID written in base32)."""
+        if self.site is None:
+            return loggable(self.path)
+        kind, value = self.site
+        return f"{kind} site {value if kind == 'rnfs' else value.hex()} {loggable(self.path)}"
+
+    def host_for_log(self) -> str:
+        """The Host header for the debug log: a subdomain host as its site, so a CID shows in base32."""
+        host = self.headers.get("Host")
+        try:
+            site = parse_host(host, self.server.server_address[1])
+        except GatewayError:
+            return host
+        if site is None:
+            return host
+        kind, value = site
+        return f"{value if kind == 'rnfs' else value.hex()}.{SITE_DOMAINS[kind]} (subdomain)"
 
     def respond_error(self, status: int, message: str, headers: dict):
         """Send an error, unless a response is already under way (then the connection is just closed)."""
@@ -471,9 +548,11 @@ class GatewayHandler(TimedHandler):
     # Serving
 
     def serve(self):
-        """Route /rnfs/ and /name/ requests."""
+        """Route /rnfs/ and /name/ requests, and every request on a subdomain host."""
         url = urlsplit(self.path)
         self.query = parse_qs(url.query, keep_blank_values=True)
+        if self.site is not None:
+            return self.serve_site(url)
         segments = url.path.split("/")  # "", "rnfs", <cid>, names…; a trailing "" means a trailing slash
         if len(segments) < 3 or segments[0] != "" or segments[1] not in ("rnfs", "name") or not segments[2]:
             raise GatewayError(404, "gateway paths are /rnfs/<cid>[/path] and /name/<name>[/path]")
@@ -492,6 +571,26 @@ class GatewayHandler(TimedHandler):
         # url.path starts with /rnfs/ or /name/, so this can't become a protocol-relative open redirect
         location = url.path + "/" + (f"?{url.query}" if url.query else "")
         self.serve_target(root, names, slash, segments[1] == "rnfs", f"/{segments[1]}/{segments[2]}", location)
+
+    def serve_site(self, url):
+        """Serve a request on a subdomain host: its path is a path in the site's root, nothing else."""
+        if self.headers.get("Service-Worker") is not None:
+            # A worker on a name's site could go on serving old content after the name moves
+            raise GatewayError(403, "service workers aren't allowed on the gateway")
+        if not self.path.startswith("/"):  # origin-form only: an absolute-form target could name another host
+            raise GatewayError(400, "the path must start with /")
+        segments = url.path[1:].split("/")  # names…; a trailing "" means a trailing slash ("/" is the root's)
+        slash = segments[-1] == ""
+        # Every segment is a valid name: an empty one ("//") is refused, so no redirect is protocol-relative
+        names = [self.decode_segment(segment) for segment in (segments[:-1] if slash else segments)]
+        if self.param("format") is not None:
+            raise GatewayError(400, "?format= is only answered on the path gateway: /rnfs/<cid>?format=raw|archive")
+        kind, value = self.site
+        root = str(value) if kind == "rnfs" else self.resolve_name(value.hex())
+        # Built from the decoded names, each percent-encoded whole, so the redirect stays a path on this site
+        location = "/" + "".join(quote(name, safe="") + "/" for name in names) + (f"?{url.query}" if url.query else "")
+        self.serve_target(root, names, slash, kind == "rnfs", f"/{kind}/{root if kind == 'rnfs' else value.hex()}",
+                          location)
 
     def serve_target(self, root: str, names: list[str], slash: bool, immutable: bool, title: str, location: str):
         """Serve root (a written CID) / names: slash if the URL ended with one, immutable for content named by
@@ -638,7 +737,7 @@ class GatewayHandler(TimedHandler):
                 raise
             # Too late for an error status; the short body (Content-Length) tells the client
             if not isinstance(e, OSError):
-                log(f"gateway {loggable(self.path)} failed mid-stream: {e!r}", LOG_ERROR)
+                log(f"gateway {self.path_for_log()} failed mid-stream: {e!r}", LOG_ERROR)
         finally:
             close = getattr(chunks, "close", None)
             if close:

@@ -522,8 +522,25 @@ malformed `Range` headers are ignored.
 Neither server sends CORS headers. Gateway pages run sandboxed in an opaque origin, so they load their DAG's
 files as subresources but can't read any gateway response with `fetch()`; an earlier rule allowing a gateway
 `Referer` never fired, as browsers send no `Referer` from an opaque origin, and allowing `Origin: null` instead
-would let any site's sandboxed frame read the gateway. A separate origin per root (a subdomain per CID) is the
-possible future way to let pages read their own DAG.
+would let any site's sandboxed frame read the gateway.
+
+**Gateway sites** (0.2.0) give each root an origin of its own, so its pages can read their own DAG.
+`GatewayHandler.handle_request` starts with `gateway.parse_host`, which takes the path gateway's hosts through
+`api.host_allowed` (unchanged: the API's check stays exact) and otherwise only `<label>.rnfs.localhost:<port>` and
+`<label>.name.localhost:<port>`, after lowercasing (ASCII hosts only, so no other character folds onto an ASCII
+one); it returns None, `("rnfs", Cid)` (`cid.from_base36`, so from then on the CID is a `Cid` written in base32)
+or `("name", bytes)` (`ids.HEX16_LOWER`), and raises a `GatewayError` (403 for other hosts, 400 for a bad label).
+The result is `handler.site`; `end_headers` picks the CSP by it (`CSP_SITE_SCRIPTS`/`CSP_SITE_NO_SCRIPTS`, with
+`allow-same-origin` and `frame-ancestors 'self'`, plus `Origin-Agent-Cluster: ?1`), so errors carry the site's
+headers too, and a host that fails to parse gets the path gateway's (as does the over-capacity 503, sent before
+the request is read). `serve` hands a site request to
+`serve_site`, which refuses `Service-Worker` (403), an absolute-form target (400) and `?format=` (400), decodes
+every segment with `decode_segment` (an empty one is 400), resolves a name through `resolve_name` (the same cache
+and `gateway_fetches` slot) and calls `serve_target`, the path gateway's own serving, with a redirect location
+rebuilt from the decoded names (`quote(name, safe="")`), so it is always a path on the site. Logs name the site
+by its base32 CID or name (`path_for_log`, and `host_for_log` for the debug log's Host). No Origin header is
+checked: a page's `fetch()` of its own site is same-origin and needs no CORS header, and every other origin is
+refused by the browser for want of one, as on the path gateway.
 
 ## Local API for apps (0.2.0)
 
