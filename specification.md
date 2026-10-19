@@ -1259,7 +1259,7 @@ are local conveniences, not part of the protocol.
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1325,6 +1325,13 @@ gateway can never reach the API.
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
   exactly one more request.
 - The API never sends CORS headers.
+- **Starting** (rnfs 0.2.0). The daemon locks `<rnfs dir>/daemon.lock`, which holds its process ID, before it
+  opens its block store, and its API listens only once that is done, which takes a while for a large store after
+  an unclean stop or at the upgrade (section 8). When nothing answers on the API port but a running process holds
+  that lock, a client reports the daemon as starting, naming that process, rather than as not running (it may
+  also be stopping, or an app's own node, which serves no API). The lock is tested only while the process the file
+  names runs, by taking a shared lock for an instant: a daemon trying to lock the dir at that very instant would
+  fail as if another held it.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
   gateway ports, version, start time, rnfs directory, Reticulum config directory, whether it attached to a shared

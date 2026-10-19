@@ -88,6 +88,10 @@ Added, for apps:
   send, inbox, get, remove, outbox, sync), with objects (`Peer`, `Stats`, `Contact`, `Kept`, `Followed`,
   `Message`, ...); `jobs.add` and `jobs.import_archive`; and the additions above (events, capabilities, pin
   labels, the cache, settings, streams). A Node raises what a Client gets back.
+- **Starting:** while a daemon opens its block store, before its API listens, `rnfs status` and the other commands
+  say it is starting, naming its process, rather than that no daemon is running; the library raises
+  `DaemonStarting` (`.pid`), a `DaemonNotRunning`, so code catching that is unchanged. Told by the rnfs dir's
+  lock, which the daemon takes first (`apiclient.dir_holder`).
 - **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
 

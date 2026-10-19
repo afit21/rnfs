@@ -38,8 +38,8 @@ _EXPORTS = {
     **{name: "rnfs.errors" for name in ("RnfsError", "NotFound", "TooLarge", "InvalidDag", "StorageFull", "Busy",
                                         "Denied", "Cancelled", "Closed", "BlockMismatch", "SealError",
                                         "NotRecipient", "Unsupported")},
-    **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "ConnectionFailed", "TokenError",
-                                           "AuthFailed", "SettingsError", "BadRequest", "ServerError",
+    **{name: "rnfs.apiclient" for name in ("ApiError", "DaemonNotRunning", "DaemonStarting", "ConnectionFailed",
+                                           "TokenError", "AuthFailed", "SettingsError", "BadRequest", "ServerError",
                                            "NoSuchEndpoint")},
 }
 __all__ = ["API_STATUS", "__version__", *_EXPORTS]

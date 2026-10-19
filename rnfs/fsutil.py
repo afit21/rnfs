@@ -109,6 +109,41 @@ def unlock(fd: int):
         os.close(fd)
 
 
+def lock_held(path: str) -> bool:
+    """True if a process holds lock_exclusive()'s lock on path; False if none does, or path is missing.
+
+    Found out by taking a shared lock (Windows: the same byte's lock) for an instant, writing nothing, where
+    lock_exclusive() would rewrite the holder's process ID. A lock_exclusive() at that same instant fails as if
+    the lock were held, so ask only when a holder is likely (lock_holder()'s process runs). Raises OSError if path
+    can't be opened or its lock tested."""
+    try:
+        fd = os.open(path, os.O_RDONLY | O_NOFOLLOW | O_BINARY)
+    except FileNotFoundError:
+        return False
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBRLCK, 1)
+            except OSError as e:
+                if e.errno in (errno.EACCES, errno.EDEADLK):  # as in lock_exclusive: another process holds it
+                    return True
+                raise
+            os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            return False
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def lock_holder(path: str) -> int | None:
     """The process ID lock_exclusive() wrote in path, or None if it can't be read."""
     try:

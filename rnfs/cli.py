@@ -98,9 +98,9 @@ class ApiClient(apiclient.ApiConnection):
     request (status without the token says only the daemon's version, for health checks).
     """
 
-    def __init__(self, port: int, token_file: str):
-        """A client of the daemon on port whose token is in token_file."""
-        super().__init__(port=port, token_file=token_file)
+    def __init__(self, port: int, token_file: str, rnfs_dir: str | None = None):
+        """A client of the daemon using rnfs_dir (default ~/.rnfs/), on port, whose token is in token_file."""
+        super().__init__(rnfs_dir=rnfs_dir, port=port, token_file=token_file)
 
     def request(self, *args, **kwargs) -> http.client.HTTPResponse:
         """ApiConnection.request (the successful response), exiting on errors."""
@@ -157,7 +157,7 @@ def client(args) -> ApiClient:
     if port is None:
         running = apiclient.read_daemon_info(args.dir)
         if running is not None:
-            return ApiClient(running["api_port"], token_path(args.dir))
+            return ApiClient(running["api_port"], token_path(args.dir), args.dir)
         try:
             config = apiclient.load_settings(args.dir)
         except apiclient.ApiError as e:
@@ -165,7 +165,7 @@ def client(args) -> ApiClient:
         for warning in config.warnings:
             warn(warning)
         port = config.api_port
-    return ApiClient(port, token_path(args.dir))
+    return ApiClient(port, token_path(args.dir), args.dir)
 
 
 def port_number(text: str, minimum: int = 1) -> int:

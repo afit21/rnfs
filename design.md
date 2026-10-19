@@ -504,7 +504,12 @@ prints the version and says why). The daemon writes a new random token to `<rnfs
 local users and processes can't drive the API. Before anything else uses the rnfs dir (the debug log, the
 node), the daemon locks `<rnfs dir>/daemon.lock` (`fsutil.lock_exclusive`: `flock`, or `msvcrt.locking` of a byte
 past the text on Windows; the file holds its process ID) and keeps the lock until it exits, so a second daemon
-on the same dir stops at once, naming the first (`lock_holder`). A start runs in this order, in the daemon
+on the same dir stops at once, naming the first (`lock_holder`). The lock is taken before the node opens its block
+store, and the API listens only after, so a client whose connection is refused checks the lock
+(`apiclient.dir_holder`: the process `lock_holder` names, if `_process_alive`, and then `fsutil.lock_held`, a
+shared `flock` (or the byte's lock on Windows) taken and released at once, writing nothing) and raises
+`DaemonStarting(pid)`, a `DaemonNotRunning`, in place of "no daemon is running": `rnfs status` and every other
+command say the daemon is starting. The CLI's `ApiClient` is given `--dir` for it. A start runs in this order, in the daemon
 (`cli.run_daemon`) and in `rnfs.Node` alike: the root (`node.make_private_root`), then the settings
 (`Config.load`), then the subdirectories and the lock (`lock_rnfs_dir`: `_make_private_dirs(root)`, then
 `lock_exclusive`), so each step relies only on what an earlier one secured. `make_private_root` refuses to start
@@ -834,7 +839,8 @@ before submitting, as the CLI resolves a nick. Jobs are persisted, resumed at th
 `NotFound`, `TooLarge`, `InvalidDag`, `StorageFull`, `Busy`, `Denied`, `Cancelled`, `Closed`, `ApiError`, and
 `BlockMismatch` and `SealError` (a sealed file malformed or tampered with), which are `ValueError`s too, as is
 `NotRecipient` (this node can't open a sealed file).
-`ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning`, `ConnectionFailed`, `TokenError`,
+`ApiError` (with `.status`) ⊃ the Client's own: `DaemonNotRunning` (⊃ `DaemonStarting`, with `.pid`: a process holds the
+rnfs dir's lock, as a daemon does while it opens its block store), `ConnectionFailed`, `TokenError`,
 `AuthFailed`, `SettingsError`, `ServerError` (500, or another 5xx), and the API statuses, each also a subclass
 of the node's class: `apiclient.NotFound(ApiError, errors.NotFound)` and so on, `BadRequest(ApiError,
 ValueError)`. So `except rnfs.NotFound` and `except ValueError` catch both classes' errors. A Node raises
