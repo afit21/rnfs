@@ -110,6 +110,10 @@ Security:
   (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),
   so another local user listening there while the daemon is down learns neither the token nor a name key being
   imported.
+- App tokens (rnfs.apps; 0.2.0): a request naming an app in `X-Rnfs-App: <name>` passes with that app's token in
+  `X-Rnfs-Api` instead, and only with it (an app's token without its name, or the API token with one, doesn't
+  pass); its proof is keyed by the app's verifier (apiclient.app_proof_key), and none is sent for an app there
+  isn't. ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
   error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
@@ -137,14 +141,16 @@ from urllib.parse import parse_qs, urlsplit
 
 from rnfs import __version__, events, fsutil, ids
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
-from rnfs.apiclient import API_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
+from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
+from rnfs.content.storage import APP_PREFIX
 from rnfs.errors import CODES, STATUSES, BlockMismatch, Busy, Unsupported, error_code
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_WARNING, log
 
 MAX_JSON_BODY = 1024 * 1024  # JSON parameters are tiny; this only stops a runaway body filling memory
 MAX_KEY_BODY = 64 * 1024  # an RNS identity file is 64 bytes
 CHALLENGE = re.compile(r"[0-9a-f]{32}")  # what the CLI sends in X-Rnfs-Challenge
+CLI = "cli"  # ApiHandler.caller() for the CLI's token (api_token); an app's is "app:<name>"
 CHUNK_SIZE_LINE = re.compile(rb"[0-9A-Fa-f]{1,16}")  # a chunk size: hex digits only (no 0x, +, _ or spaces)
 MAX_TRAILER_LINES = 32
 MAX_WATCH_NAMES = 64  # names one GET /api/name/watch may list
@@ -725,6 +731,7 @@ class ApiHandler(TimedHandler):
     OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
     PROOF_ROUTE = ("GET", "/api/status")
     proved = False  # this connection had its proof request kept open: it is closed after the next request
+    principal: str | None = None  # caller() of the request being answered, set by dispatch
     keep_open = False  # the request being answered is a proof request whose connection stays open
 
     def log_message(self, format, *args):
@@ -739,21 +746,43 @@ class ApiHandler(TimedHandler):
                                                         "Cache-Control": "no-store",
                                                         "X-Content-Type-Options": "nosniff"}, body)
 
-    def token_valid(self) -> bool:
-        """True if the request carries this server's token in X-Rnfs-Api (compared in constant time)."""
+    def caller(self) -> str | None:
+        """Who sent the request: CLI ("cli") for this server's token in X-Rnfs-Api; "app:<name>" (the app's pin
+        source) for app name's token with X-Rnfs-App naming it; None for neither. Tokens are compared in constant
+        time. Without X-Rnfs-App only the API token passes, so a request is never read as an app's by mistake."""
         value = self.headers.get(API_HEADER)
         if value is None:
-            return False
-        # Bytes, since compare_digest refuses non-ASCII str and a header may hold any Latin-1 text
-        return hmac.compare_digest(value.strip().encode("utf-8", "replace"), self.token.encode())
+            return None
+        app = self.headers.get(APP_HEADER)
+        if app is None:
+            # Bytes, since compare_digest refuses non-ASCII str and a header may hold any Latin-1 text
+            return CLI if hmac.compare_digest(value.strip().encode("utf-8", "replace"), self.token.encode()) else None
+        apps, name = getattr(self.node, "apps", None), app.strip()
+        if apps is None or not apps.verify(name, value.strip()):
+            return None
+        return APP_PREFIX + name
+
+    def token_valid(self) -> bool:
+        """True if the request carries a token that passes (the API token, or an app's with X-Rnfs-App)."""
+        return self.caller() is not None
+
+    def proof_key(self) -> str | None:
+        """What keys this response's proof: the API token, or (X-Rnfs-App) that app's verifier (rnfs.apps), None
+        for an app there isn't (no proof is sent then)."""
+        app = self.headers.get(APP_HEADER)
+        if app is None:
+            return self.token
+        apps = getattr(self.node, "apps", None)
+        return apps.proof_key(app.strip()) if apps is not None else None
 
     # Responses
 
     def send_common_headers(self):
         """The proof, on every response of the API's own (end_headers adds the headers every response carries)."""
         challenge = (self.headers.get(CHALLENGE_HEADER) or "").strip()
-        if CHALLENGE.fullmatch(challenge):
-            self.send_header(PROOF_HEADER, api_proof(self.token, self.server.server_address[1], challenge))
+        key = self.proof_key() if CHALLENGE.fullmatch(challenge) else None
+        if key is not None:
+            self.send_header(PROOF_HEADER, api_proof(key, self.server.server_address[1], challenge))
         if self.keep_open:
             self.send_header("Connection", "keep-alive")
 
@@ -831,7 +860,12 @@ class ApiHandler(TimedHandler):
                     return self.send_error_json(405, f"use {' or '.join(allowed)}", "method_not_allowed",
                                                 {"Allow": ", ".join(allowed)})
                 raise ApiRequestError(404, f"no such API endpoint: {url.path}", "no_such_endpoint")
-            if route not in self.OPEN_ROUTES and not self.token_valid():
+            self.principal = self.caller()
+            if route not in self.OPEN_ROUTES and self.principal is None:
+                if self.headers.get(APP_HEADER) is not None:
+                    raise ApiRequestError(403, f"an app's requests must carry the header {API_HEADER}: <its token>, "
+                                               f"as rnfs app add gave it, for the app {APP_HEADER} names",
+                                          "unauthorized")
                 raise ApiRequestError(403, f"API requests must carry the header {API_HEADER}: <token>, with the "
                                            f"token the daemon wrote to <rnfs dir>/api_token", "unauthorized")
             if self.command != "POST":
@@ -946,7 +980,7 @@ class ApiHandler(TimedHandler):
 
     def api_status(self):
         """GET /api/status: the node's summary with the token; without it, only the version (a health check)."""
-        if not self.token_valid():
+        if self.principal is None:
             self.send_json(200, {"version": __version__})
             return
         self.send_json(200, self.node.status())

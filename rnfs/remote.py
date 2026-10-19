@@ -53,16 +53,19 @@ class Client(interface.Rnfs):
     """The daemon using rnfs_dir (default ~/.rnfs/), on 127.0.0.1:port (default: the api_port in its rnfs.toml),
     with the token in token_file (default <rnfs_dir>/api_token). timeout bounds each request (default: none, as
     fetches can take hours; timeout() sets another for one thread's calls). Nothing is sent until the first call.
-    Raises SettingsError if rnfs.toml can't be read for the port."""
+    Raises SettingsError if rnfs.toml can't be read for the port.
+
+    As an app (rnfs 0.2.0): app is the name `rnfs app add` was given, and its token is token, or in token_file.
+    ValueError for an app without its token."""
 
     events_thread = "rnfs-client-events"
     jobs_thread = "rnfs-client-job-watch"
     job_poll = 1.0  # what the CLI's progress line polls at
 
     def __init__(self, rnfs_dir: str | None = None, *, port: int | None = None, token_file: str | None = None,
-                 timeout: float | None = None):
+                 timeout: float | None = None, app: str | None = None, token: str | None = None):
         """A client of the daemon (see the class)."""
-        self._api = ApiConnection(rnfs_dir, port=port, token_file=token_file, timeout=timeout)
+        self._api = ApiConnection(rnfs_dir, port=port, token_file=token_file, timeout=timeout, app=app, token=token)
         # The longest the name poller's long poll may wait within the client's timeout (its thread has no other)
         self._long_wait = long_poll_wait(timeout)
         super().__init__(_Backend(self._api))

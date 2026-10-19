@@ -23,6 +23,11 @@ Upgrade notes:
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
 
 Added, for apps:
+- **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
+  `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's
+  verifier, which is all the daemon keeps of it (`rnfs.db`'s new `apps` table). `rnfs.Client(app=..., token=...
+  or token_file=...)` and `ApiConnection(app=, token=)`. The `api_token` stays the CLI's, unchanged, and a
+  request without `X-Rnfs-App` is checked exactly as before.
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
   daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
   attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,

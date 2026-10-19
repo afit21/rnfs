@@ -658,6 +658,93 @@ class ProofTest(ClientTestCase):
         self.assertEqual(self.api.daemon_version, refused[0])
 
 
+class AppClientTest(ClientTestCase):
+    """An ApiConnection (and rnfs.Client) as an app: app= with token= or token_file=."""
+
+    def setUp(self):
+        """The node gets a real app registry holding app "wiki"; its token is also in <tmp>/wiki_token."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        self.node.apps = AppRegistry(os.path.join(self.tmp, "state"))
+        self.addCleanup(self.node.apps.close)
+        self.app_token = self.node.apps.add("wiki")["token"]
+        self.app_file = os.path.join(self.tmp, "wiki_token")
+        cli.write_token(self.app_file, self.app_token)
+
+    def app_headers_seen(self) -> list:
+        """A list collecting (path, X-Rnfs-App, X-Rnfs-Api) of every request the server handles from now on."""
+        seen = []
+        original = self.server.server.RequestHandlerClass.dispatch
+
+        def spy(handler):
+            """Record the request, then handle it."""
+            seen.append((handler.path.split("?")[0], handler.headers["X-Rnfs-App"], handler.headers["X-Rnfs-Api"]))
+            original(handler)
+        patcher = mock.patch.object(self.server.server.RequestHandlerClass, "dispatch", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_app_with_its_token(self):
+        """Given or in a file, the app's token proves the daemon and passes; X-Rnfs-App names the app on the proof
+        and the request; the API token file isn't read."""
+        os.unlink(self.token_file)
+        seen = self.app_headers_seen()
+        for api in (ApiConnection(self.tmp, port=self.server.port, app="wiki", token=self.app_token),
+                    ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file)):
+            self.assertEqual(api.status()["node_id"], self.node.status()["node_id"])
+            self.assertEqual(api.token, self.app_token)
+        self.assertEqual(seen, [("/api/status", "wiki", None), ("/api/status", "wiki", self.app_token)] * 2)
+
+    def test_client_as_an_app(self):
+        """rnfs.Client takes app and token too."""
+        import rnfs
+        with rnfs.Client(self.tmp, port=self.server.port, app="wiki", token=self.app_token) as client:
+            self.assertEqual(client.node_id, self.node.node_id)
+            self.assertEqual(client.api.app, "wiki")
+
+    def test_wrong_or_removed_app_fails_the_proof(self):
+        """A token that isn't the app's, or an app there isn't (removed), fails the proof: AuthFailed naming the
+        app, and the token is never sent."""
+        seen = self.app_headers_seen()
+        for api in (ApiConnection(self.tmp, port=self.server.port, app="wiki", token="not its token"),
+                    ApiConnection(self.tmp, port=self.server.port, app="other", token=self.app_token)):
+            with self.assertRaises(AuthFailed) as raised:
+                api.post("/api/gc")
+            self.assertIn(f"app {api.app}'s token", str(raised.exception))
+        api = ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file)
+        api.status()
+        self.node.apps.remove("wiki")
+        with self.assertRaises(AuthFailed):
+            api.post("/api/gc")
+        self.assertEqual([token for path, _, token in seen if path != "/api/status"], [])
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_app_needs_its_token(self):
+        """An app without token or token_file, an empty token, or both, is refused before anything is sent; a
+        missing app token file says how to make one."""
+        for kwargs in ({"app": "wiki"}, {"app": "wiki", "token": ""}, {"app": "wiki", "token": " "},
+                       {"app": "wiki", "token": "t", "token_file": self.app_file}, {"token": 7}, {"app": "",
+                                                                                                "token": "t"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ApiConnection(self.tmp, port=self.server.port, **kwargs)
+        missing = ApiConnection(self.tmp, port=self.server.port, app="wiki", token_file=self.app_file + ".gone")
+        with self.assertRaises(TokenError) as raised:
+            missing.status()
+        self.assertIn("rnfs app add wiki", str(raised.exception))
+
+    def test_impostor_gets_no_app_token(self):
+        """A listener that can't prove it knows the app's token gets only the challenge (and the app's name)."""
+        received = []
+        impostor = ProofTest.impostor(self, received)
+        api = ApiConnection(self.tmp, port=impostor, app="wiki", token=self.app_token)
+        with self.assertRaises(AuthFailed):
+            api.post("/api/gc")
+        self.assertEqual(len(received), 1)
+        self.assertNotIn("X-Rnfs-Api", received[0][1])
+        self.assertEqual(received[0][1]["X-Rnfs-App"], "wiki")
+
+
 class TimeoutTest(ClientTestCase):
     """Timeouts per call (timeout=) and per thread (using_timeout), over the connection's own."""
 

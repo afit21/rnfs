@@ -986,6 +986,101 @@ class ConnectionTest(ApiTestCase):
         self.assertEqual(loggable("plain/path"), "plain/path")
 
 
+class AppTokenTestCase(ApiTestCase):
+    """Base: the FakeNode with a real AppRegistry (rnfs/apps.py), holding apps "wiki" and "notes"."""
+
+    def setUp(self):
+        """The registry in a temporary state directory, and two apps."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.node.apps = AppRegistry(os.path.join(tmp.name, "state"))
+        self.addCleanup(self.node.apps.close)
+        self.wiki = self.node.apps.add("wiki")["token"]
+        self.notes = self.node.apps.add("notes")["token"]
+
+    def as_app(self, name: str, token: str, **headers) -> dict:
+        """The headers of app name's request with token."""
+        return {"X-Rnfs-Api": token, "X-Rnfs-App": name, **headers}
+
+
+class AppAuthTest(AppTokenTestCase):
+    """App tokens: X-Rnfs-App names the app whose token X-Rnfs-Api carries, and keys the proof."""
+
+    def test_app_token_passes_with_its_name(self):
+        """An app's token with X-Rnfs-App naming it is let through (the full status, every route); the caller is
+        "app:<name>"."""
+        status, _, data = self.call("GET", "/api/status", headers=self.as_app("wiki", f" {self.wiki} "), api=False)
+        self.assertEqual(status, 200)
+        self.assertIn("node_id", json.loads(data))
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("notes", self.notes), api=False)[0], 200)
+        seen = []
+        original = ApiHandler.api_gc
+
+        def gc(handler):
+            seen.append(handler.principal)
+            original(handler)
+
+        with mock.patch.object(ApiHandler, "api_gc", gc):
+            self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)
+            self.call("POST", "/api/gc", {})
+        self.assertEqual(seen, ["app:wiki", api.CLI])
+
+    def test_wrong_pairs_are_refused(self):
+        """Only the token of the app named passes: another app's, the API token, a wrong one, an unknown or
+        invalid name, or an app's token without its name, are all 403 unauthorized; nothing reaches the node."""
+        for headers in (self.as_app("wiki", self.notes), self.as_app("wiki", self.server.token),
+                        self.as_app("wiki", self.wiki + "x"), self.as_app("other", self.wiki),
+                        self.as_app("Wiki", self.wiki), self.as_app("", self.wiki), {"X-Rnfs-Api": self.wiki},
+                        {"X-Rnfs-App": "wiki"}):
+            with self.subTest(headers=headers):
+                status, _, data = self.call("POST", "/api/gc", {}, headers, api=False)
+                self.assertEqual(status, 403)
+                self.assertEqual(json.loads(data)["code"], "unauthorized")
+                status, _, data = self.call("GET", "/api/status", headers=headers, api=False)
+                self.assertEqual(json.loads(data), {"version": rnfs_version()})
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_removed_app_token_stops_passing(self):
+        """Once the app is removed its token is refused."""
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 200)
+        self.node.apps.remove("wiki")
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+    def test_proof_for_an_app(self):
+        """With X-Rnfs-App the proof is keyed by that app's verifier (app_proof_key of its token), which the daemon
+        has without the token; none for an app there isn't; without the header, by the API token as before."""
+        from rnfs.apiclient import app_proof_key
+        challenge = "0123456789abcdef" * 2
+        for name, token in (("wiki", self.wiki), ("notes", self.notes)):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                     "X-Rnfs-App": name}, api=False)
+            self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(app_proof_key(token), self.port, challenge))
+        for name in ("other", "Wiki", ""):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                     "X-Rnfs-App": name}, api=False)
+            self.assertIsNone(headers[cli.PROOF_HEADER], name)
+        _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge}, api=False)
+        self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(self.server.token, self.port, challenge))
+
+    def test_node_without_apps(self):
+        """A node with no app registry (a stand-in) lets no app in, and proves nothing for one."""
+        del self.node.apps
+        challenge = "ab" * 16
+        status, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                      "X-Rnfs-App": "wiki"}, api=False)
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers[cli.PROOF_HEADER])
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+
+def rnfs_version() -> str:
+    """The version the open status gives."""
+    from rnfs import __version__
+    return __version__
+
+
 class AppSupportTest(ApiTestCase):
     """What 0.2.0 added for apps: error codes, the capability list, events, shutdown, pin labels and the cache."""
 

@@ -1366,8 +1366,21 @@ gateway can never reach the API.
   settings, then checks the subdirectories, then takes the directory's lock, in the daemon and in an embedded
   node alike; clients (the CLI, `rnfs.Client`) check `rnfs.toml` the same way when they read it, and show
   what was changed (the CLI prints it, `rnfs.Client` raises a `RuntimeWarning`, an embedded node logs it).
+- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications
+  tokens of their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name
+  rule). A request naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes
+  only with it; a request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never
+  taken for another's. App tokens outlive restarts. The node needn't keep the token itself: rnfs keeps
+  `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
+  a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
+  change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
+  that far. Removing an app revokes its token at once.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
-  `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
+  `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's. With
+  `X-Rnfs-App: <name>` the key is the app's verifier written as 64 lowercase hex digits instead of the token
+  (an app computes it from its token), and no proof is sent for an app the node doesn't have. Whoever can read
+  the node's state could answer an app's proof while the daemon is down, and so be sent that app's token; they
+  can read the CLI's token already.
   Before it sends the token, a client SHOULD check this proof with a `GET /api/status` on the connection
   that will carry the request (the CLI and `rnfs.apiclient` do, for every request), so a program another user
   runs on the port while the daemon is down learns neither the token nor a name key being imported, nor can
