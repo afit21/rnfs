@@ -16,6 +16,7 @@ import RNS
 from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content.cid import RAW, Cid
+from rnfs import lxmf_messages
 from rnfs.features import lxmf
 from rnfs.features.keepers import FOLLOW, OWN, USER, KeeperStore, sign_record
 from rnfs.names import encode_record, name_for_identity
@@ -303,7 +304,7 @@ class LogTests:
         messages = [good, {**good, "id": "4"}, {**good, "id": 0}, {**good, "id": True}, "junk", {**good},
                     {**good, "id": 2 ** 63}, {**good, "id": 2 ** 70}, {**good, "id": 8, "links": "x"}]
         write_legacy(self.state, self.FILE, text=written({"next_id": "x", "messages": messages}))
-        with mock.patch.object(lxmf, "_log") as warned:
+        with mock.patch.object(lxmf_messages, "_log") as warned:
             entries, clean, next_id = self.load()
         self.assertEqual((entries, clean, next_id), ([good], False, good["id"] + 1))
         self.assertEqual(warned.call_args.args[0], f"dropped 8 malformed record(s) from {self.FILE}")
@@ -331,7 +332,7 @@ class LogTests:
         at load; that leaves the box clean."""
         messages = [{**self.RECORDS[0], "id": n, "text": "x" * 1000} for n in range(1, 6)]
         write_legacy(self.state, self.FILE, text=written({"next_id": 2, "messages": messages}))
-        with mock.patch.object(lxmf, self.LIMIT_NAME, 3):
+        with mock.patch.object(lxmf_messages, self.LIMIT_NAME, 3):
             self.start()
         self.assertEqual([row_id for row_id, _ in self.rows()[:-2]], [3, 4, 5])
         self.assertEqual(self.rows()[-2:], [("clean", 1), ("next_id", 6)])
@@ -368,7 +369,7 @@ class InboxTest(Common, LogTests, MigrateTest):
         """Past MAX_INBOX_BYTES the oldest records are dropped, one kept whatever its size."""
         messages = [{**self.RECORDS[1], "id": n, "text": "é" * 1000} for n in range(1, 4)]
         write_legacy(self.state, self.FILE, text=written({"messages": messages}))
-        with mock.patch.object(lxmf, "MAX_INBOX_BYTES", 5000):
+        with mock.patch.object(lxmf_messages, "MAX_INBOX_BYTES", 5000):
             self.start()
         self.assertEqual([row_id for row_id, _ in self.rows()[:-2]], [2, 3])
 

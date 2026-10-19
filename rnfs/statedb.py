@@ -807,8 +807,8 @@ LEGACY: tuple[Legacy, ...] = (
     Legacy("keepers.json", "rnfs.features.keepers:import_keepers"),
     Legacy("follow.json", "rnfs.features.follow:import_follow"),
     Legacy("contacts.json", "rnfs.features.contacts:import_contacts"),
-    Legacy("lxmf_inbox.json", "rnfs.features.lxmf:import_inbox"),
-    Legacy("lxmf_outbox.json", "rnfs.features.lxmf:import_outbox"),
+    Legacy("lxmf_inbox.json", "rnfs.lxmf_messages:import_inbox"),
+    Legacy("lxmf_outbox.json", "rnfs.lxmf_messages:import_outbox"),
 )
 
 

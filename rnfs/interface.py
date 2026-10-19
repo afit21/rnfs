@@ -539,7 +539,7 @@ class Rnfs:
             raise ValueError(f"a target is a Cid, <cid>[/path] or an rnfs: URI, not {type(target).__name__}")
         if target[:5].lower() != "rnfs:":
             return target, None
-        from rnfs.features.lxmf import parse_uri  # its pure part: no RNS
+        from rnfs.uris import parse_uri  # no RNS
         link = parse_uri(target)
         cid = link.cid
         if link.name is not None:

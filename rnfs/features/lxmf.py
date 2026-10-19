@@ -48,7 +48,6 @@ Nothing here imports RNS or LXMF at module level (CLI commands mustn't load them
 start(), holds every RNS and LXMF object, so the rest works on offline test nodes with a stand-in network.
 """
 import functools
-import json
 import math
 import os
 import re
@@ -59,34 +58,29 @@ import time
 from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from urllib.parse import quote, unquote_to_bytes
+from urllib.parse import quote
 
 from rnfs import events, features, fsutil, ids
 from rnfs.config import LXMF_DEPRECATION, deprecated_given
 from rnfs.features import _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
-from rnfs.constants import ID_LENGTH, MAX_DEPTH
+from rnfs.constants import ID_LENGTH
 from rnfs.content.cid import Cid
+# The rnfs: URIs and the link-map field (rnfs.uris), and the inbox and outbox records (rnfs.lxmf_messages)
+from rnfs.lxmf_messages import INBOX, INBOX_LIMIT, MAX_ID, MAX_INBOX_BYTES, OUTBOX, OUTBOX_LIMIT
+from rnfs.lxmf_messages import import_inbox, import_outbox  # noqa: F401
+from rnfs.lxmf_messages import json_bytes as _json_bytes, next_id as _next_id, records as _records
+from rnfs.lxmf_messages import valid_inbox_entry as _valid_inbox_entry, valid_outbox_entry as _valid_outbox_entry
+from rnfs.uris import CUSTOM_TYPE, FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE, MAX_LINK_KEYS, MAX_PATH_NAMES  # noqa: F401
+from rnfs.uris import MAX_URI_LENGTH, format_uri  # noqa: F401
+from rnfs.uris import MAX_LINKS, NAME_SEGMENT, URI_SCHEME, Link, decode_field, encode_field, parse_uri
 
 NAME = "lxmf"
 
-# LXMF's fields for embedding other protocols (LXMF/LXMF.py): a type identifier and its payload. LXMF reserves
-# the unallocated fields below 0x80 for its own future use and calls those above 0xFF unstable
-FIELD_CUSTOM_TYPE = 0xFB
-FIELD_CUSTOM_DATA = 0xFC
-CUSTOM_TYPE = "rnfs"  # FIELD_CUSTOM_TYPE value; an incompatible change of FIELD_CUSTOM_DATA uses a new one
-
-URI_SCHEME = "rnfs:"
-NAME_SEGMENT = "name"
-MAX_URI_LENGTH = 4096  # characters: 64 names of up to 255 bytes, percent-encoded, don't fit in a message anyway
-MAX_PATH_NAMES = MAX_DEPTH  # a path can't be deeper than the DAG it walks
-MAX_LINKS = 8  # links read from one message (field or text)
-MAX_LINK_KEYS = 16  # keys in one link map, known or not
 MAX_TEXT_CHARS = 4000  # message text kept (and accepted for sending)
 MAX_TITLE_CHARS = 256
 MAX_DISPLAY_NAME_CHARS = 64
 MAX_SCAN_CHARS = 16 * 1024  # message text searched for links
-INBOX_LIMIT = 500  # messages kept; the oldest holding no auto-fetched pins is dropped
 INBOX_PER_SENDER = 50  # messages kept from one sender not in lxmf_auto_fetch_from (senders' identities are free)
 # Senders the user named (lxmf_accept_from, lxmf_auto_fetch_from, LXMF contacts) are trusted: their records are
 # dropped only for each other's. Others' new records come from a node-wide token bucket, since identities are free
@@ -97,10 +91,6 @@ SENDER_INTERVAL = 900.0  # seconds per token
 SENDER_BURST = 4
 SENDER_ALLOWANCES = 256  # senders whose allowance is remembered, least recently seen forgotten (back to full)
 MAX_ENTRY_BYTES = 16 * 1024  # an inbox record as JSON: links beyond it are dropped, then text is cut
-MAX_INBOX_BYTES = 4 * 1024 * 1024  # every inbox record as JSON (held in memory; a save writes those changed)
-OUTBOX_LIMIT = 200
-INBOX, OUTBOX = "inbox", "outbox"  # the MessageLog boxes: the lxmf_messages table's box, and their meta store
-MAX_ID = 2 ** 63 - 2  # largest record id: the next id must still fit SQLite's integers
 AUTO_QUEUE_LIMIT = 64  # auto-fetches waiting (taken round-robin by sender); more are skipped
 DELIVERY_LIMIT_KB = 256  # largest LXMF message accepted (LXMF's delivery_limit, in kB); also caps PN downloads
 HOLD_LIMIT = 32  # messages from senders not known yet, held while their identity is requested; more are dropped
@@ -123,8 +113,6 @@ IDENTITY_WAIT = 15.0  # seconds `send` waits for an unknown recipient's identity
 TICK = 1.0  # seconds between polls of outbound message states (while any is followed, held or downloading)
 SYNC_TIMEOUT = 900.0  # a propagation node download still unfinished after this is abandoned
 
-_SEGMENT = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})+")
-_QUERY_VALUE = re.compile(r"(?:[A-Za-z0-9\-._~!$'()*+,;=:@/]|%[0-9A-Fa-f]{2})*")  # "&" separates parameters
 # An rnfs: link in free text: not glued to a preceding word, ending at whitespace or a character URIs never hold
 _TEXT_LINK = re.compile(r"(?<![A-Za-z0-9+.\-])[Rr][Nn][Ff][Ss]:[^\s<>\"'`{}|\\^\[\]]+")
 _TRAILING = ".,;:!?)]}'\""
@@ -142,12 +130,6 @@ def _log(message: str, level: int = LOG_INFO):
 
 _NO_PN_HELP = ("no LXMF propagation node is set: set lxmf_propagation_node, or use --nearest for the nearest "
                "one heard")
-
-
-def _check_name(name: str):
-    """dag.check_name, imported here because rnfs.content.dag loads RNS's msgpack."""
-    from rnfs.content import dag
-    dag.check_name(name)
 
 
 def parse_address(text) -> bytes:
@@ -199,112 +181,6 @@ def human_size(num_bytes: int) -> str:
 # Links
 
 
-@dataclass(frozen=True)
-class Link:
-    """One rnfs link: a CID or a name, a path below it, and optionally its size and a node that has it."""
-
-    cid: Cid | None = None  # with a name: the CID it pointed at when sent
-    name: bytes | None = None  # 16-byte rnfs name
-    path: tuple[str, ...] = ()
-    size: int | None = None  # content bytes, as the sender knew them (untrusted; fetches verify sizes)
-    from_node: bytes | None = None  # the sender's rnfs node ID: a provider hint, like `get --from`
-
-    def uri(self) -> str:
-        """The canonical rnfs: URI."""
-        return format_uri(self)
-
-    def to_json(self) -> dict:
-        """JSON-ready form (inbox, outbox and API)."""
-        return {"uri": format_uri(self), "cid": str(self.cid) if self.cid is not None else None,
-                "name": self.name.hex() if self.name is not None else None, "path": list(self.path),
-                "size": self.size, "from": self.from_node.hex() if self.from_node is not None else None}
-
-    @classmethod
-    def from_json(cls, value) -> "Link":
-        """A link from to_json's form; ValueError if it is malformed (e.g. a damaged state file)."""
-        if not isinstance(value, dict):
-            raise ValueError("a link must be an object")
-        link = parse_uri(value.get("uri"))
-        cid = Cid.parse(value["cid"]) if value.get("cid") is not None else link.cid
-        size = value.get("size")
-        if size is not None and (isinstance(size, bool) or not isinstance(size, int) or not 0 <= size < 2 ** 64):
-            raise ValueError("invalid size")
-        return Link(cid, link.name, link.path, size, link.from_node)
-
-
-def format_uri(link: Link) -> str:
-    """`rnfs:<cid>[/path]` or `rnfs:name/<name>[/path]`, then `?from=<node ID>` if known.
-
-    Path names are UTF-8 with every byte other than ASCII letters, digits and "-._~" percent-encoded
-    (upper-case hex), so each link has one written form.
-    """
-    if link.name is not None:
-        head = f"{NAME_SEGMENT}/{link.name.hex()}"
-    elif link.cid is not None:
-        head = str(link.cid)
-    else:
-        raise ValueError("a link needs a CID or a name")
-    path = "".join("/" + quote(name.encode("utf-8"), safe="") for name in link.path)
-    query = f"?from={link.from_node.hex()}" if link.from_node is not None else ""
-    return URI_SCHEME + head + path + query
-
-
-def parse_uri(text) -> Link:
-    """The link an rnfs: URI names. Raises ValueError for anything malformed.
-
-    The scheme and hex digits may be in either case; one trailing slash is allowed; path names must decode
-    to valid entry names (section 5); query parameters other than `from` are ignored, a repeated `from` is
-    malformed. Fragments, spaces, non-ASCII characters and empty path names are malformed.
-    """
-    if not isinstance(text, str) or not text or len(text) > MAX_URI_LENGTH:
-        raise ValueError("an rnfs: URI is required (at most 4096 characters)")
-    if text[:len(URI_SCHEME)].lower() != URI_SCHEME:
-        raise ValueError(f"not an rnfs: URI: {text!r}")
-    rest = text[len(URI_SCHEME):]
-    if not rest.isascii() or not rest.isprintable() or " " in rest or "#" in rest:
-        raise ValueError("an rnfs: URI may only hold printable ASCII, without spaces or a #fragment")
-    path_part, has_query, query = rest.partition("?")
-    segments = path_part.split("/")
-    if len(segments) > 1 and segments[-1] == "":
-        segments.pop()  # "<cid>/dir/" names the same directory as "<cid>/dir"
-    cid = name = None
-    if segments[0] == NAME_SEGMENT:
-        if len(segments) < 2 or not ids.HEX16.fullmatch(segments[1]):
-            raise ValueError("rnfs:name/ must be followed by a name: 32 hex characters")
-        name = bytes.fromhex(segments[1])
-        segments = segments[2:]
-    else:
-        cid = Cid.parse(segments[0])
-        segments = segments[1:]
-    if len(segments) > MAX_PATH_NAMES:
-        raise ValueError(f"a path has at most {MAX_PATH_NAMES} names")
-    names = []
-    for segment in segments:
-        if not _SEGMENT.fullmatch(segment):
-            raise ValueError(f"malformed path name {segment!r} (empty, or a character that must be %-encoded)")
-        try:
-            decoded = unquote_to_bytes(segment).decode("utf-8")
-        except UnicodeDecodeError:
-            raise ValueError(f"path name {segment!r} is not UTF-8") from None
-        _check_name(decoded)
-        names.append(decoded)
-    from_node = None
-    if has_query:
-        if not query:
-            raise ValueError("empty query after ?")
-        for pair in query.split("&"):
-            key, has_value, value = pair.partition("=")
-            if not key or not has_value or not _SEGMENT.fullmatch(key) or not _QUERY_VALUE.fullmatch(value):
-                raise ValueError(f"malformed query parameter {pair!r}")
-            if key == "from":
-                if from_node is not None:
-                    raise ValueError("from is given twice")
-                if not ids.HEX16.fullmatch(value):
-                    raise ValueError("from must be a node ID: 32 hex characters")
-                from_node = bytes.fromhex(value)
-    return Link(cid, name, tuple(names), None, from_node)
-
-
 def parse_target(text) -> Link:
     """What `send` accepts: an rnfs: URI, `name/<name>[/path]` or `<cid>[/path]`. Raises ValueError."""
     if not isinstance(text, str) or not text:
@@ -348,83 +224,6 @@ def find_links(text) -> list[Link]:
     return found
 
 
-def encode_field(links: list[Link]) -> dict:
-    """The LXMF fields carrying links: {FIELD_CUSTOM_TYPE: "rnfs", FIELD_CUSTOM_DATA: [link map, ...]}.
-
-    A link map has "cid" (binary CID) and/or "name" (16 bytes), "path" (list of names) if not empty, and
-    "size" (integer) and "from" (16-byte node ID) when known.
-    """
-    if not 1 <= len(links) <= MAX_LINKS:
-        raise ValueError(f"a message carries 1-{MAX_LINKS} links")
-    data = []
-    for link in links:
-        entry: dict = {}
-        if link.cid is not None:
-            entry["cid"] = link.cid.binary
-        if link.name is not None:
-            entry["name"] = link.name
-        if not entry:
-            raise ValueError("a link needs a CID or a name")
-        if link.path:
-            entry["path"] = list(link.path)
-        if link.size is not None:
-            entry["size"] = link.size
-        if link.from_node is not None:
-            entry["from"] = link.from_node
-        data.append(entry)
-    return {FIELD_CUSTOM_TYPE: CUSTOM_TYPE, FIELD_CUSTOM_DATA: data}
-
-
-def _id_field(value, what: str) -> bytes:
-    """A 16-byte binary field of a link map."""
-    if type(value) is not bytes or len(value) != ID_LENGTH:
-        raise ValueError(f"{what} must be {ID_LENGTH} bytes")
-    return value
-
-
-def decode_field(fields) -> list[Link] | None:
-    """The links in a received message's fields; None if it has no rnfs field. ValueError if it is malformed.
-
-    Strict: exact types (bin, str, non-negative integers that aren't booleans), sizes below 2^64, valid CIDs
-    and names, at most MAX_LINKS links of at most MAX_LINK_KEYS keys. Unknown keys are ignored, so later
-    versions can add some.
-    """
-    if not isinstance(fields, dict) or fields.get(FIELD_CUSTOM_TYPE) != CUSTOM_TYPE:
-        return None
-    data = fields.get(FIELD_CUSTOM_DATA)
-    if type(data) is not list or not 1 <= len(data) <= MAX_LINKS:
-        raise ValueError(f"the rnfs field must be a list of 1-{MAX_LINKS} links")
-    links = []
-    for entry in data:
-        if type(entry) is not dict or len(entry) > MAX_LINK_KEYS or not all(type(k) is str for k in entry):
-            raise ValueError("a link must be a map with string keys")
-        cid = name = size = from_node = None
-        if "cid" in entry:
-            if type(entry["cid"]) is not bytes:
-                raise ValueError("cid must be binary")
-            cid = Cid.from_bytes(entry["cid"])
-        if "name" in entry:
-            name = _id_field(entry["name"], "name")
-        if cid is None and name is None:
-            raise ValueError("a link needs a cid or a name")
-        path = entry.get("path", [])
-        if type(path) is not list or len(path) > MAX_PATH_NAMES or not all(type(n) is str for n in path):
-            raise ValueError(f"path must be a list of at most {MAX_PATH_NAMES} names")
-        for item in path:
-            _check_name(item)
-        if "size" in entry:
-            size = entry["size"]
-            if type(size) is not int or not 0 <= size < 2 ** 64:
-                raise ValueError("size must be a non-negative integer below 2^64")
-        if "from" in entry:
-            from_node = _id_field(entry["from"], "from")
-        link = Link(cid, name, tuple(path), size, from_node)
-        if len(format_uri(link)) > MAX_URI_LENGTH:  # parse_uri, and so the inbox, refuses it anyway
-            raise ValueError(f"a link is longer than {MAX_URI_LENGTH} characters as a URI")
-        links.append(link)
-    return links
-
-
 def message_text(text: str | None, links: list[Link]) -> str:
     """A message's content: the user's text, then each link's URI on a line of its own."""
     lines = [link.uri() for link in links]
@@ -432,69 +231,6 @@ def message_text(text: str | None, links: list[Link]) -> str:
 
 
 # Inbox and outbox
-
-
-def _json_bytes(value) -> int:
-    """Bytes value takes as UTF-8 JSON, as the state database stores a record (statedb.dump)."""
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8", "backslashreplace"))
-
-
-def _records(entries: list, limit: int, max_bytes: int | None, valid) -> tuple[list[dict], int]:
-    """The records a log keeps of entries (loaded from the database, or a JSON file), oldest first, and how many
-    were malformed: not a dict with an id (an int, 1 to MAX_ID) no earlier record has, that valid() accepts if
-    given. Of the others, the oldest past limit are dropped, then the oldest past max_bytes as JSON (one is kept
-    whatever its size)."""
-    kept, seen, bad = [], set(), 0
-    for entry in entries:
-        if isinstance(entry, dict) and type(entry.get("id")) is int and 0 < entry["id"] <= MAX_ID \
-                and entry["id"] not in seen and (valid is None or valid(entry)):
-            kept.append(entry)
-            seen.add(entry["id"])
-        else:
-            bad += 1
-    kept = kept[-limit:]
-    sizes = [_json_bytes(e) for e in kept]
-    total, first = sum(sizes), 0
-    while max_bytes is not None and len(kept) - first > 1 and total > max_bytes:
-        total -= sizes[first]
-        first += 1
-    return kept[first:], bad
-
-
-def _next_id(saved, entries: list[dict]) -> int:
-    """The id the next record gets: the saved next id (if it is an int that fits), past every record's."""
-    return max([saved if type(saved) is int and saved <= MAX_ID else 1] + [e["id"] + 1 for e in entries])
-
-
-def _import_log(box: str, value, tx, limit: int, max_bytes: int | None, valid, file: str) -> int:
-    """Import a message log file of rnfs 0.1.4 (statedb.migrate): its records replace box's, checked and bounded
-    as it loaded them, and it is clean only if every record was read. Returns the number of records imported."""
-    from rnfs import statedb
-    tx.execute("DELETE FROM lxmf_messages WHERE box = ?", (box,))
-    entries, clean, next_id = [], False, 1
-    if isinstance(value, dict):
-        messages = value.get("messages")
-        entries, bad = _records(messages if isinstance(messages, list) else [], limit, max_bytes, valid)
-        bad += not isinstance(messages, list)
-        if bad:
-            _log(f"dropped {bad} malformed record(s) from {file}", LOG_WARNING)
-        clean = not bad
-        next_id = _next_id(value.get("next_id"), entries)
-    tx.executemany("INSERT INTO lxmf_messages (box, id, record) VALUES (?, ?, ?)",
-                   [(box, entry["id"], statedb.dump(entry)) for entry in entries])
-    statedb.set_meta(tx, box, "next_id", next_id)
-    statedb.set_meta(tx, box, "clean", int(clean))
-    return len(entries)
-
-
-def import_inbox(value, tx) -> int:
-    """Import lxmf_inbox.json (statedb.migrate); the number of records imported."""
-    return _import_log(INBOX, value, tx, INBOX_LIMIT, MAX_INBOX_BYTES, _valid_inbox_entry, "lxmf_inbox.json")
-
-
-def import_outbox(value, tx) -> int:
-    """Import lxmf_outbox.json (statedb.migrate); the number of records imported."""
-    return _import_log(OUTBOX, value, tx, OUTBOX_LIMIT, None, _valid_outbox_entry, "lxmf_outbox.json")
 
 
 class MessageLog:
@@ -717,32 +453,6 @@ class MessageLog:
     def close(self):
         """Release the state database."""
         self._db.close()
-
-
-def _str_or_none(value) -> bool:
-    """Whether value is a string or None."""
-    return value is None or isinstance(value, str)
-
-
-def _valid_links(value) -> bool:
-    """Whether value is a list of link records (dicts; Link.from_json checks each when it is used)."""
-    return isinstance(value, list) and all(isinstance(link, dict) for link in value)
-
-
-def _valid_inbox_entry(entry: dict) -> bool:
-    """Whether a loaded inbox record has the shape received() gives it."""
-    auto = entry.get("auto")
-    return (isinstance(entry.get("hash"), str) and isinstance(entry.get("from"), str)
-            and ids.HEX16.fullmatch(entry["from"]) is not None and _valid_links(entry.get("links"))
-            and (auto is None or (isinstance(auto, list) and len(auto) == len(entry["links"])
-                                  and all(isinstance(a, dict) and _str_or_none(a.get("state")) for a in auto)))
-            and all(_str_or_none(entry.get(key)) for key in ("display_name", "title", "text", "method")))
-
-
-def _valid_outbox_entry(entry: dict) -> bool:
-    """Whether a loaded outbox record has the shape send() gives it."""
-    return (all(isinstance(entry.get(key), str) for key in ("hash", "to", "state", "method"))
-            and _valid_links(entry.get("links")) and all(_str_or_none(entry.get(key)) for key in ("text", "error")))
 
 
 def _unlisted() -> dict:
