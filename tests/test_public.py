@@ -27,7 +27,7 @@ import rnfs
 from rnfs import api, cli, embedded, fsutil, interface, objects, remote
 from rnfs import events as events_module
 from rnfs.api import ApiHandler, ApiServer, NameWatches
-from rnfs.config import Config
+from rnfs.config import LXMF_DEPRECATION, Config
 from rnfs.content.cid import RAW, Cid
 from rnfs.features.lxmf import Link, encode_field
 from rnfs.names import encode_record
@@ -571,6 +571,20 @@ class PublicTests:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.rnfs.names.keep(bad)
 
+    @contextlib.contextmanager
+    def lxmf_warnings(self, *methods: str):
+        """Check that the block calls exactly these rnfs.lxmf methods, in order, each warning (DeprecationWarning, at
+        the calling line, here) that LXMF is deprecated."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            yield
+        caught = [w for w in caught if LXMF_DEPRECATION in str(w.message)]
+        self.assertEqual([(w.category, str(w.message)) for w in caught],
+                         [(DeprecationWarning, f"lxmf.{method}() is deprecated: {LXMF_DEPRECATION}")
+                          for method in methods])
+        self.assertEqual({os.path.abspath(w.filename) for w in caught},
+                         {os.path.abspath(__file__)} if methods else set())
+
     def test_a_missing_feature_is_not_found(self):
         """Each feature's methods raise NotFound, with its API route's message, when the node hasn't loaded it."""
         calls = {"peers": (self.rnfs.peers, "no peers feature"),
@@ -579,58 +593,65 @@ class PublicTests:
                  "follow": (lambda: self.rnfs.names.follow(OTHER), "can't follow names"),
                  "lxmf": (self.rnfs.lxmf.inbox, "no lxmf feature")}
         for feature, (call, words) in calls.items():
-            with self.subTest(feature=feature), mock.patch.dict(self.b.features):
+            with self.subTest(feature=feature), mock.patch.dict(self.b.features), \
+                    self.lxmf_warnings(*(["inbox"] if feature == "lxmf" else [])):
                 del self.b.features[feature]
                 with self.assertRaisesRegex(rnfs.NotFound, words):
                     call()
 
     def test_lxmf_off(self):
-        """With LXMF off (a Node's default), address, send and sync raise ValueError saying why; the boxes list."""
-        for call in (self.rnfs.lxmf.address, lambda: self.rnfs.lxmf.send(SENDER, self.rnfs.add(b"x").cid),
-                     self.rnfs.lxmf.sync):
-            with self.assertRaisesRegex(ValueError, "LXMF has not been started"):
-                call()
-        self.assertEqual((self.rnfs.lxmf.inbox(), self.rnfs.lxmf.outbox()), ([], []))
+        """With LXMF off (a Node's default), address, send and sync raise ValueError saying why; the boxes list.
+        Each call warns that LXMF is deprecated."""
+        with self.lxmf_warnings("address", "send", "sync", "inbox", "outbox"):
+            for call in (self.rnfs.lxmf.address, lambda: self.rnfs.lxmf.send(SENDER, self.rnfs.add(b"x").cid),
+                         self.rnfs.lxmf.sync):
+                with self.assertRaisesRegex(ValueError, "LXMF has not been started"):
+                    call()
+            self.assertEqual((self.rnfs.lxmf.inbox(), self.rnfs.lxmf.outbox()), ([], []))
 
     def test_lxmf(self):
-        """address, send and the outbox, sync, the inbox (with its sender's contact), get as a job, remove."""
-        feature = self.b.feature("lxmf")
-        feature.attach(FakeLxmf())
-        address = self.rnfs.lxmf.address()
-        self.assertEqual((address.address, str(address), address.propagation_node), (RECIPIENT, RECIPIENT.hex(), None))
-        data = os.urandom(5000)
-        cid = self.share(data, "f.bin")
-        sent = self.rnfs.lxmf.send(SENDER, f"{cid}/f.bin", "for you")
-        self.assertEqual((sent.to, sent.method), (SENDER, "direct"))
-        outgoing, = self.rnfs.lxmf.outbox()
-        self.assertEqual((outgoing.id, outgoing.hash, outgoing.text, outgoing.state), (sent.id, sent.hash, "for you",
-                                                                                      "outbound"))
-        self.assertEqual((outgoing.links[0].cid, outgoing.links[0].path), (cid, ("f.bin",)))
-        with self.assertRaises(ValueError):
-            self.rnfs.lxmf.send(SENDER, cid, propagate=True)  # no propagation node
-        self.assertEqual(self.rnfs.lxmf.sync(), rnfs.Synced(None, False))
-        # A message from a contact, linking to the file on A
-        self.rnfs.contacts.add("sender", SENDER, kind="lxmf")
-        link = Link(cid, path=("f.bin",), from_node=A_ID)
-        entry_id = feature.received(message(content=b"have a look", fields=encode_field([link])))
-        received, = self.rnfs.lxmf.inbox()
-        self.assertEqual((received.id, received.sender, received.text, received.trusted, received.contact),
-                         (entry_id, SENDER, "have a look", True, "sender"))
-        self.assertEqual((str(received.links[0]), received.links[0].from_node), (link.uri(), A_ID))
-        fetched, = self.rnfs.lxmf.get(entry_id, output=self.out("lxmf"))
-        self.assertEqual((fetched.target, fetched.output), (f"{cid}/f.bin", self.out("lxmf")))
-        self.assertEqual(fetched.job.wait(10).state, "done")
-        with open(self.out("lxmf"), "rb") as f:
-            self.assertEqual(f.read(), data)
-        for bad_id, error in ((0, ValueError), (99, rnfs.NotFound)):
-            with self.subTest(bad_id=bad_id), self.assertRaises(error):
-                self.rnfs.lxmf.get(bad_id, directory=self.tmp)
-        self.assertEqual(self.rnfs.lxmf.remove(entry_id), 1)
-        with self.assertRaises(rnfs.NotFound):
-            self.rnfs.lxmf.remove(entry_id)
-        feature.received(message(content=b"again", fields=encode_field([link]), number=2))
-        self.assertEqual(self.rnfs.lxmf.remove_all(), 1)
-        self.assertEqual(self.rnfs.lxmf.inbox(), [])
+        """address, send and the outbox, sync, the inbox (with its sender's contact), get as a job, remove; each call
+        warns that LXMF is deprecated, and otherwise works as before."""
+        with self.lxmf_warnings("address", "send", "outbox", "send", "sync", "inbox", "get", "get", "get", "remove",
+                                "remove", "remove_all", "inbox"):
+            feature = self.b.feature("lxmf")
+            feature.attach(FakeLxmf())
+            address = self.rnfs.lxmf.address()
+            self.assertEqual((address.address, str(address), address.propagation_node),
+                             (RECIPIENT, RECIPIENT.hex(), None))
+            data = os.urandom(5000)
+            cid = self.share(data, "f.bin")
+            sent = self.rnfs.lxmf.send(SENDER, f"{cid}/f.bin", "for you")
+            self.assertEqual((sent.to, sent.method), (SENDER, "direct"))
+            outgoing, = self.rnfs.lxmf.outbox()
+            self.assertEqual((outgoing.id, outgoing.hash, outgoing.text, outgoing.state),
+                             (sent.id, sent.hash, "for you", "outbound"))
+            self.assertEqual((outgoing.links[0].cid, outgoing.links[0].path), (cid, ("f.bin",)))
+            with self.assertRaises(ValueError):
+                self.rnfs.lxmf.send(SENDER, cid, propagate=True)  # no propagation node
+            self.assertEqual(self.rnfs.lxmf.sync(), rnfs.Synced(None, False))
+            # A message from a contact, linking to the file on A
+            self.rnfs.contacts.add("sender", SENDER, kind="lxmf")
+            link = Link(cid, path=("f.bin",), from_node=A_ID)
+            entry_id = feature.received(message(content=b"have a look", fields=encode_field([link])))
+            received, = self.rnfs.lxmf.inbox()
+            self.assertEqual((received.id, received.sender, received.text, received.trusted, received.contact),
+                             (entry_id, SENDER, "have a look", True, "sender"))
+            self.assertEqual((str(received.links[0]), received.links[0].from_node), (link.uri(), A_ID))
+            fetched, = self.rnfs.lxmf.get(entry_id, output=self.out("lxmf"))
+            self.assertEqual((fetched.target, fetched.output), (f"{cid}/f.bin", self.out("lxmf")))
+            self.assertEqual(fetched.job.wait(10).state, "done")
+            with open(self.out("lxmf"), "rb") as f:
+                self.assertEqual(f.read(), data)
+            for bad_id, error in ((0, ValueError), (99, rnfs.NotFound)):
+                with self.subTest(bad_id=bad_id), self.assertRaises(error):
+                    self.rnfs.lxmf.get(bad_id, directory=self.tmp)
+            self.assertEqual(self.rnfs.lxmf.remove(entry_id), 1)
+            with self.assertRaises(rnfs.NotFound):
+                self.rnfs.lxmf.remove(entry_id)
+            feature.received(message(content=b"again", fields=encode_field([link]), number=2))
+            self.assertEqual(self.rnfs.lxmf.remove_all(), 1)
+            self.assertEqual(self.rnfs.lxmf.inbox(), [])
 
     def test_timeout_is_checked(self):
         """timeout() takes None or a positive number, on either class, and nests."""
@@ -682,6 +703,10 @@ class PublicTests:
         self.assertIn("pin", capabilities.event_kinds)
         self.assertIn("not_found", capabilities.error_codes)
         self.assertEqual(capabilities.has("shutdown"), self.daemon)
+        # LXMF still works, deprecated (it moves to an app of its own)
+        self.assertEqual(capabilities.deprecated, ("lxmf",))
+        self.assertTrue(capabilities.is_deprecated("lxmf"))
+        self.assertFalse(capabilities.is_deprecated("jobs"))
 
     def test_shutdown_and_daemon_info(self):
         """shutdown() is Unsupported (a Node; a daemon started without a way to stop it); daemon_info() None
@@ -731,9 +756,12 @@ class PublicTests:
         self.assertEqual((settings["max_jobs"].value, settings["max_jobs"].live), (2, True))
         change = self.rnfs.config_set({"max_jobs": 3, "lxmf_accept_from": (SENDER.hex(),)})
         self.assertEqual((change.applied, change.restart_required), (("max_jobs", "lxmf_accept_from"), ()))
+        self.assertEqual(change.warnings, (f"lxmf_accept_from is deprecated: {LXMF_DEPRECATION}",))
         self.assertEqual(self.b.config.max_jobs, 3)
         settings = self.rnfs.config()
         self.assertEqual((settings["max_jobs"].file, settings["lxmf_accept_from"].file), (3, (SENDER.hex(),)))
+        self.assertEqual((settings["max_jobs"].deprecated, settings["lxmf_accept_from"].deprecated),
+                         (None, LXMF_DEPRECATION))
         self.assertEqual(rnfs.Settings.from_dict(settings.to_dict()), settings)
         for bad in ({"no_such_setting": 1}, {}, {"max_jobs": "many"}, "max_jobs"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -1421,7 +1449,7 @@ class ObjectsTest(unittest.TestCase):
                       objects.Event(3, "pin", 1.7e9, {"change": "added", "cids": [str(cid)]}),
                       objects.EventBatch((objects.Event(1, "job", 1.0, {"id": "x"}),), 1, False, "e"),
                       objects.Capabilities("0.2.0", frozenset({"events"}), (("GET", "/api/events"),), ("lxmf",),
-                                           ("pin",), ("not_found",)),
+                                           ("pin",), ("not_found",), ("lxmf",)),
                       objects.Settings("/r/rnfs.toml", (objects.Setting("lxmf_accept_from", "lxmf", "list[string]",
                                                                         None, False, (), None, value=("a",)),),
                                        None, ("w",)),

@@ -29,6 +29,9 @@ from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
 
 DEFAULT_DIR = apiclient.DEFAULT_DIR
 COPY_SIZE = apiclient.COPY_SIZE
+# Set to anything but "" or "0", it silences the warning a deprecated command prints each time it runs (for a
+# script that knows; the command works the same either way)
+NO_DEPRECATION_WARNINGS = "RNFS_NO_DEPRECATION_WARNINGS"
 
 
 # text with control characters escaped, so names from other people's DAGs can't drive the terminal
@@ -38,6 +41,14 @@ printable = fsutil.printable
 def warn(message: str):
     """Print a warning to stderr."""
     print(f"rnfs: warning: {printable(message)}", file=sys.stderr)
+
+
+def warn_deprecated(command: str, why: str):
+    """Warn, on one line of stderr (stdout, which scripts read, stays the command's own), that command (e.g.
+    "rnfs send") is deprecated and why, unless NO_DEPRECATION_WARNINGS is set."""
+    if os.environ.get(NO_DEPRECATION_WARNINGS, "") not in ("", "0"):
+        return
+    warn(f"{command} is deprecated: {why} (set {NO_DEPRECATION_WARNINGS}=1 to hide this)")
 
 
 def fail(message: str):

@@ -39,6 +39,34 @@ Upgrade notes:
 - **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
+Deprecated:
+- **LXMF** (`send`, `inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `/api/lxmf/` routes, the library's `lxmf`
+  methods, the `lxmf_*` settings and the `inbox` events) still works exactly as in 0.1.6, but is moving out of rnfs
+  into a separate app built on the local API and the library, and a later release removes it from rnfs. Nothing
+  else changes: the network sees the same messages, `rnfs:` URIs and the LXMF link-map field stay rnfs's
+  (specification section 13) for that app and other clients, and the pins of auto-fetched links already became
+  `app:lxmf:<address>` (upgrade notes above), the source the app will own. Use instead: that app once it is
+  released; until then, rnfs's LXMF as before. Nodes that don't use LXMF can turn it off now with
+  `lxmf_enabled = false`.
+- The `/api/lxmf/` routes' responses, errors included, carry `Deprecation: @1792368000` (RFC 9745: deprecated since
+  2026-10-19); their bodies are unchanged. `GET /api/capabilities` gains `"deprecated": ["lxmf"]`
+  (`Capabilities.deprecated`, `is_deprecated("lxmf")`).
+- The settings schema (`GET /api/config`, `rnfs.config.settings_schema()`, `Setting.deprecated`) gains
+  `deprecated`: for each `lxmf_*` setting why it is going away, `null` for the others; `rnfs config get` shows it.
+  `GET /api/config` warns about the `lxmf_*` settings `rnfs.toml` sets, and `POST /api/config/set` (`rnfs config
+  set`, printed on stderr) about those a change sets; removing one isn't warned about.
+- A node running LXMF (on by default where the LXMF package is installed: every package includes it) logs at start
+  that it is deprecated, as a notice, saying `lxmf_enabled = false` turns it off; given `lxmf_*` settings (in
+  `rnfs.toml`, on the command line or as an `rnfs.Node`'s settings), it names them, as a warning while LXMF runs.
+  A node that neither runs it nor was given such a setting, an `rnfs.Node` by default, says nothing.
+- `rnfs send`, `inbox`, `inbox get`, `inbox rm`, `outbox`, `lxmf address` and `lxmf sync` print, each time they run,
+  one line on stderr saying they are deprecated and why; their stdout and exit status are unchanged, and
+  `RNFS_NO_DEPRECATION_WARNINGS=1` (anything but empty or `0`) silences the line. `rnfs --help` marks them
+  `(deprecated)`, and each one's `--help` says why.
+- `rnfs.Node` and `rnfs.Client`: each `lxmf` method (`address`, `send`, `inbox`, `get`, `remove`, `remove_all`,
+  `outbox`, `sync`) warns `DeprecationWarning` at the calling line, then works as before; Python's filters decide
+  when it shows (by default for code run as `__main__`). The `inbox` events are unchanged.
+
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
   `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's

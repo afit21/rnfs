@@ -64,6 +64,20 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual((groups["lxmf_enabled"], groups["lxmf_auto_fetch_quota"]), ("lxmf", "lxmf"))
         self.assertEqual(groups["deny_lists"], "deny lists")
 
+    def test_lxmf_settings_are_deprecated(self):
+        """Every lxmf_* setting, and only those, says it is deprecated and why (LXMF moves to an app of its own)."""
+        for entry in settings.settings_schema():
+            with self.subTest(entry["name"]):
+                expected = settings.LXMF_DEPRECATION if entry["name"].startswith("lxmf_") else None
+                self.assertEqual(entry["deprecated"], expected)
+        self.assertEqual(list(settings.deprecated_settings()),
+                         [f.name for f in fields(Config) if f.name.startswith("lxmf_")])
+        self.assertEqual(settings.deprecation_warnings(["beta", "nope"]), [])
+        self.assertEqual(settings.deprecation_warnings(["lxmf_enabled"]),
+                         [f"lxmf_enabled is deprecated: {settings.LXMF_DEPRECATION}"])
+        self.assertEqual(settings.deprecation_warnings(iter(["lxmf_accept_from", "beta", "lxmf_enabled"]), " in x"),
+                         [f"lxmf_enabled, lxmf_accept_from in x are deprecated: {settings.LXMF_DEPRECATION}"])
+
     def test_entries_agree_with_validate(self):
         for entry in settings.settings_schema():
             name = entry["name"]
@@ -451,6 +465,24 @@ class ApiTest(SettingsBase):
             self.assertEqual(self.set({"old_limit": None})["warnings"], [])
             self.assertEqual(self.read(), "beta = 5\n")
 
+    def test_deprecated_settings_are_warned_about(self):
+        """rnfs.toml setting an lxmf_* setting is warned about in GET /api/config, and so is setting one through
+        the API; removing one, or changing another setting, isn't. They still work as before."""
+        self.write(f'lxmf_accept_from = ["{ADDRESS}"]\nlxmf_display_name = "me"\nbeta = 4\n')
+        listing = self.call("GET", "/api/config")[1]
+        self.assertEqual(listing["warnings"], [f"lxmf_display_name, lxmf_accept_from in {self.toml} are deprecated: "
+                                               f"{settings.LXMF_DEPRECATION}"])
+        self.assertIsNone(listing["file_error"])
+        self.assertEqual(self.setting("lxmf_accept_from")["deprecated"], settings.LXMF_DEPRECATION)
+        self.assertIsNone(self.setting("beta")["deprecated"])
+        self.assertEqual(self.set({"beta": 5})["warnings"], [])
+        result = self.set({"lxmf_auto_fetch_from": [ADDRESS], "lxmf_display_name": None})
+        self.assertEqual(result["warnings"], [f"lxmf_auto_fetch_from is deprecated: {settings.LXMF_DEPRECATION}"])
+        self.assertEqual(result["applied"], ["lxmf_auto_fetch_from"])
+        self.assertEqual(self.b.config.lxmf_auto_fetch_from, [ADDRESS])
+        self.assertEqual(self.set({"lxmf_accept_from": None, "lxmf_auto_fetch_from": None})["warnings"], [])
+        self.assertEqual(self.call("GET", "/api/config")[1]["warnings"], [])
+
     def test_same_port_twice_is_refused(self):
         self.set({"api_port": self.b.config.gateway_port}, 400)
         self.assertFalse(os.path.exists(self.toml))
@@ -630,10 +662,16 @@ class CliTest(SettingsBase):
 
         code, out, err = self.run_cli("config", "set", "quiet_hours", "22:00-06:00")
         self.assertEqual((code, out), (0, "quiet_hours: saved in rnfs.toml and applied\n"), err)
-        code, out, _ = self.run_cli("config", "set", "lxmf_accept_from", f'["{ADDRESS}"]')
+        code, out, err = self.run_cli("config", "set", "lxmf_accept_from", f'["{ADDRESS}"]')
         self.assertEqual(self.b.config.lxmf_accept_from, [ADDRESS])
-        code, out, _ = self.run_cli("config", "set", "lxmf_display_name", '"two words"')
+        # A deprecated setting still works, with a warning on stderr (stdout is what it always was)
+        self.assertEqual((code, out), (0, "lxmf_accept_from: saved in rnfs.toml and applied\n"), err)
+        self.assertEqual(err, f"rnfs: warning: lxmf_accept_from is deprecated: {settings.LXMF_DEPRECATION}\n")
+        code, out, err = self.run_cli("config", "set", "lxmf_display_name", '"two words"')
         self.assertEqual(out, "lxmf_display_name: saved in rnfs.toml; restart the daemon to apply it\n")
+        self.assertIn("lxmf_display_name is deprecated", err)
+        self.assertIn(f"deprecated: {settings.LXMF_DEPRECATION}\n", self.run_cli("config", "get", "lxmf_enabled")[1])
+        self.assertNotIn("deprecated", self.run_cli("config", "get", "beta")[1])
         self.assertEqual(self.run_cli("config", "set", "slow", "yes")[1],
                          "slow: saved in rnfs.toml, but the daemon's command line sets it, which wins\n")
         self.assertIn("* quiet_hours = \"22:00-06:00\"\n", self.run_cli("config")[1])

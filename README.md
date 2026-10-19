@@ -435,7 +435,7 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `deny_lists` | `[]` | [Deny lists](#keeping-content-off-your-node) to apply |
 | `keep_max_names` | `100` | Names you keep or follow for others |
 | `follow_quota` | 1 GiB | Storage each followed name's target may use; a larger one isn't fetched and the previous one stays pinned (up to twice this while it changes). `0` stops fetching followed names |
-| `lxmf_accept_from` | everyone | Only keep LXMF messages from these addresses (recommended if you only expect links from people you know) |
+| `lxmf_accept_from` | everyone | Only keep LXMF messages from these addresses (recommended if you only expect links from people you know). Every `lxmf_*` setting is deprecated: [LXMF is moving to its own app](#lxmf-is-moving-out) |
 | `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota` | `[]`, 1 GiB | Senders whose links are fetched and pinned automatically, and the storage each may use |
 | `lxmf_propagation_node` | none | Propagation node for offline delivery (`send --propagate`) and periodic downloads |
 | `lxmf_send_from_hint` | `true` | Links you send carry your node ID, so recipients can fetch from you; this links your LXMF address to your node |
@@ -462,6 +462,14 @@ reaches everyone, so outsiders can see which CID it points at and when it change
 LXMF senders you've named (in `lxmf_accept_from`, `lxmf_auto_fetch_from`, or as an LXMF contact) are trusted.
 Anyone can make new LXMF addresses for free, so messages from everyone else only push out each other's, within
 fixed limits; set `lxmf_accept_from` if strangers' messages aren't wanted.
+
+<a id="lxmf-is-moving-out"></a>**LXMF is moving out of rnfs.** Sending and receiving links over LXMF (`send`,
+`inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `lxmf_*` settings, the `/api/lxmf/` routes and the library's
+`lxmf` methods) is deprecated since 0.2.0: it moves to a separate app built on rnfs's local API and library, and a
+later release removes it from rnfs. It works as before until then, and says so each time: the commands print a
+warning on stderr (`RNFS_NO_DEPRECATION_WARNINGS=1` hides it; stdout is unchanged), and the daemon logs it at
+start. `rnfs:` links stay part of rnfs, and the pins of links fetched automatically already belong to the app
+(`app:lxmf:<address>`). Don't use LXMF? `lxmf_enabled = false` turns it off now.
 
 # Commands
 
@@ -493,9 +501,9 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs name keep\|unkeep\|kept NAME` | Store and serve someone's name record, so it resolves while they're offline |
 | `rnfs name follow\|unfollow\|following NAME` | Keep the latest version a name points at pinned |
 | `rnfs contacts add NICK HEX` / `rm` / `ls` | Nicknames for names, node IDs and LXMF addresses |
-| `rnfs lxmf address` / `lxmf sync` | Your LXMF address / download waiting messages now |
-| `rnfs send ADDRESS TARGET [-m TEXT] [--propagate]` | Send an `rnfs:` link over LXMF |
-| `rnfs inbox` / `inbox get N` / `inbox rm N` / `outbox` | Received links (each line starts with the sender's address and whether it is `untrusted`, `trusted` or a contact; the display name the sender chose comes last, quoted), fetching them (a name link whose name can't be resolved needs `--use-sent-cid`), sent messages |
+| `rnfs lxmf address` / `lxmf sync` | (deprecated: [moving to its own app](#lxmf-is-moving-out)) Your LXMF address / download waiting messages now |
+| `rnfs send ADDRESS TARGET [-m TEXT] [--propagate]` | (deprecated) Send an `rnfs:` link over LXMF |
+| `rnfs inbox` / `inbox get N` / `inbox rm N` / `outbox` | (deprecated) Received links (each line starts with the sender's address and whether it is `untrusted`, `trusted` or a contact; the display name the sender chose comes last, quoted), fetching them (a name link whose name can't be resolved needs `--use-sent-cid`), sent messages |
 
 `add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
@@ -554,7 +562,8 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
 - Beyond content, pins, names and jobs: `peers()` and `stats()`, the address book (`contacts.add/get/list/remove`),
   keeping and following names (`names.keep/unkeep/kept`, `names.follow/unfollow/following`), and LXMF
   (`lxmf.address/send/inbox/get/remove/remove_all/outbox/sync`; off in an embedded node unless
-  `settings={"lxmf_enabled": True}`).
+  `settings={"lxmf_enabled": True}`; deprecated: each warns `DeprecationWarning`, as
+  [LXMF is moving to its own app](#lxmf-is-moving-out)).
 - To follow what changes instead of polling lists: `events.watch(callback, kinds=...)` (jobs, pins, the cache, the
   inbox, names, peers; an event with `event.lost` means "read everything again"), or `events.since(...)`. Also
   `capabilities()`, pin labels (`label_pin`), the cache (`cache()`, `uncache(cid)`), settings (`config()`,
@@ -601,7 +610,7 @@ edition, and readers `rnfs get library/maps/region.pdf`.
 **Sharing with a friend over LXMF.** `rnfs send <their LXMF address> <cid>/report.pdf -m "as promised"`.
 Sideband, NomadNet and MeshChat show the link as text; their rnfs node lists it in `rnfs inbox` and fetches it
 with `rnfs inbox get 1`, asking your node first. Add friends to `lxmf_auto_fetch_from` to fetch their links
-automatically.
+automatically. (Deprecated: [LXMF is moving to its own app](#lxmf-is-moving-out).)
 
 <a id="private-group"></a>**Private group.** `rnfs add minutes.pdf --to <alice's node ID> bob --to-self` seals
 a file so only those people can read it, while any node can carry it. For a fully closed group, run every

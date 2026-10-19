@@ -66,6 +66,8 @@ class SettingsFeature(Feature):
             warnings = [*warnings, *restart_config(config, file_values, path).warnings]
         except (ValueError, TypeError, AttributeError, OSError) as e:  # OSError: PermissionError too (untrusted)
             file_error = str(e)
+        # Deprecated settings it sets still work, but are going away (the lxmf_* ones, with LXMF)
+        warnings = [*warnings, *settings.deprecation_warnings(file_values, f" in {path}")]
         entries = [settings_entry(entry, config, file_values) for entry in settings.settings_schema()]
         return {"path": path, "settings": entries, "file_error": file_error, "warnings": warnings}
 
@@ -107,7 +109,9 @@ class SettingsFeature(Feature):
                 raise ValueError(str(e)) from None
             except (TypeError, AttributeError) as e:  # a value of a type a check didn't expect
                 raise ValueError(f"invalid settings: {e}") from None
-            warnings = [*warnings, *candidate.warnings]  # retired settings the file still holds
+            # Retired settings the file still holds, and deprecated ones this sets (removing one is what's wanted)
+            warnings = [*warnings, *candidate.warnings,
+                        *settings.deprecation_warnings(name for name, value in changes.items() if value is not None)]
             text = settings.edit_settings(data.decode("utf-8") if data is not None else "", changes)
             new_data = text.encode("utf-8")
             if settings.parse_settings(new_data, path) != values:  # not expected: edit_settings checks each step
@@ -392,6 +396,8 @@ def setting_fields(entry: dict) -> dict:
     if entry["pending"]:
         fields["pending"] = "rnfs.toml's value applies at the next start"
     fields["description"] = entry["description"]
+    if entry.get("deprecated"):  # .get: a daemon before 0.2.0's schema has no such key
+        fields["deprecated"] = entry["deprecated"]
     return fields
 
 
