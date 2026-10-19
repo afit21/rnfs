@@ -9,9 +9,10 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`); an older rnfs
-  can't open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count
-  as never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
+  `remote_pins_asked`, `remote_pins_served`); an older rnfs can't open it afterwards. Pins made before the upgrade
+  have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
+  `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
   `app:lxmf:<address>` (`pin ls` shows the new one), the source the LXMF wrapper app will own once LXMF leaves
   core; the LXMF built into rnfs uses it from now on, so nothing is released by the change. An older
@@ -187,6 +188,22 @@ Provider records (DHT servers; spec section 6, all local policy: nothing on the 
   within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
   each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
   still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
+
+Added:
+- **Remote pin status** (local only; `/pin` and the wire are unchanged): a node records the remote pins it asks
+  for (node, CID, pin or release, when, whether accepted) and works out whether each accepted one is done by
+  looking the node up among the CID's providers: paced (in the background at most 60 lookups an hour, 4 at
+  once, each pin hourly while waiting and daily after; on slow nodes 4 an hour, one at a time), waiting for up
+  to 24 hours after asking, then missing if not found. So "done" lags the node's publishing and is only as good as
+  the DHT. A node serving remote pins records what became of each (waiting, fetching, pinned, dropped with why:
+  quota, not found, denied, ...; refused because denied or its queue was full; released), which was only logged.
+  At most 10 000 asked entries and 1 000 served outcomes are kept. `remote_pin` events report both.
+  `rnfs pin remote ls [NODE_ID] [CID] [--check] [--json]` lists the pins asked for (`--check` looks them up now:
+  one lookup each, at most 32 a call, 4 on a slow node); `rnfs pin remote ls --served [--json]` lists those served
+  and each identity's use of `remote_pin_quota`. `GET /api/pin/remote?node=&cid=&check=1` and
+  `GET /api/pin/remote/served`; `ApiConnection.pin_remote_ls` / `pin_remote_served`; `Node/Client.remote_pins()`
+  and `served_pins()` (`RemotePin`, `ServedPins`, `ServedPin`, `RemotePinUsage`); capability
+  `remote_pin_status`.
 
 Changed:
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private

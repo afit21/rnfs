@@ -303,6 +303,14 @@ class _Backend:
         """POST /api/pin/remote."""
         return self.api.pin_remote(node_id, cid, pin)
 
+    def pin_remote_ls(self, node_id: str | None, cid: str | None, check: bool) -> list[dict]:
+        """GET /api/pin/remote."""
+        return self.api.pin_remote_ls(node_id, cid, check)
+
+    def pin_remote_served(self) -> dict:
+        """GET /api/pin/remote/served."""
+        return self.api.pin_remote_served()
+
     def providers(self, cid: str) -> list[str]:
         """GET /api/providers."""
         return self.api.providers(cid)

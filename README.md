@@ -483,6 +483,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs export TARGET -o FILE` / `import FILE` | Write or import an archive (USB sticks, sneakernet) |
 | `rnfs pin add TARGET` / `pin rm CID` / `pin ls` | Fetch and pin / unpin / list pins, their sources and where they came from |
 | `rnfs pin remote add\|rm NODE_ID CID` | Ask another node to pin or unpin (it must list you in `remote_pin_identities`) |
+| `rnfs pin remote ls [NODE_ID] [CID] [--check]` / `pin remote ls --served` | The remote pins you asked for and whether each is done (the node found among the CID's providers; `--check` looks now) / those others asked of your node, what became of each and their use of `remote_pin_quota` |
 | `rnfs gc` / `verify` | Evict cached downloads / re-check every stored block |
 | `rnfs deny add\|rm ENTRY…` / `deny ls` | Edit your deny list / show it and the lists in use |
 | `rnfs jobs [list\|show\|wait\|cancel\|clear] [ID]` | Background transfers: progress, rate, time left |
