@@ -28,6 +28,10 @@ rules make a run wait for more than the beta closest, so they can't hide what ho
   the dense core must answer too.
 Their extra queries go out within alpha like any other and count towards max_queries; their answers count as
 progress when they bring the key nearer, but never against the stall rule (they aren't meant to come nearer).
+
+Disjoint lookups (rnfs.dht.disjoint) run several Lookups that share no node: `claim(id)` is asked before each query
+(False: another path owns the node, which this one drops) and `taken(id)` leaves out nodes another path owns when a
+reply names them.
 """
 import heapq
 import queue
@@ -98,6 +102,7 @@ class Lookup:
       answered (local scores, section 6). Called from the running thread, at most once per node per lookup.
     - `size`: the network size estimate (rnfs.dht.density), which turns the density check on; `seniors`: the
       announce first-seen log's servers closest to the key heard at least provider_seniority ago (see above).
+    - `claim(id)`, `taken(id)`: a disjoint lookup's paths' shared node ownership (see above).
     - `on_complete(key, kth)`: told, at the end of each run that completed with at least k nodes known, the
       distance from the key to the k-th closest (the network size estimate's sample).
 
@@ -117,6 +122,7 @@ class Lookup:
                  report: Callable[[str], None] = _quiet, unreliable: Callable[[bytes], bool] = _never,
                  may_retry: Callable[[bytes], bool] = _never, max_queries: int = MAX_QUERIES,
                  on_useful: NodeCallback = _ignore, size: float | None = None, seniors: Iterable[bytes] = (),
+                 claim: Callable[[bytes], bool] = _always, taken: Callable[[bytes], bool] = _never,
                  on_complete: Callable[[bytes, int], object] = _unsampled):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
@@ -138,6 +144,8 @@ class Lookup:
         self.max_queries = max(1, max_queries)
         self.on_useful = on_useful
         self.size = size
+        self.claim = claim
+        self.taken = taken
         self.on_complete = on_complete
         self.ended = ""  # how the last run ended ("complete", "no progress", ...; "" before the first)
         self.dense = False  # the density check fired in a run
@@ -344,7 +352,7 @@ class Lookup:
         # usually closer. Every run re-queries them, which is what gives a fresh random half of providers.
         known: dict[bytes, int] = {}  # node ID -> distance, for usable nodes
         for node_id in list(self._start_nodes) + self.closest_answered() + self._seniors:
-            if self._usable(node_id):
+            if self._usable(node_id) and not self.taken(node_id):
                 known[node_id] = self._distance(node_id)
         seniors = [node_id for node_id in self._seniors if node_id in known]
         # Known nodes that were unreliable when found and haven't answered: ranked after every other
@@ -420,8 +428,9 @@ class Lookup:
                 if node_id is None:
                     break
                 queried.add(node_id)
-                if not self.allow_unknown(node_id):
-                    del known[node_id]  # over the unknown-ID budget: dropped, but not a failure
+                if not self.claim(node_id) or not self.allow_unknown(node_id):
+                    # Another path's (a disjoint lookup), or over the unknown-ID budget: dropped, but not a failure
+                    del known[node_id]
                     continue
                 if node_id not in ranked:
                     extras.add(node_id)
@@ -433,7 +442,11 @@ class Lookup:
             for node_id in sorted(known, key=known.__getitem__)[:window]:
                 if node_id not in doubtful or node_id in queried or node_id in passed or sent >= self.max_queries:
                     continue
-                if self.is_known(node_id) and self.may_retry(node_id):
+                if not self.is_known(node_id):
+                    passed.add(node_id)
+                elif not self.claim(node_id):
+                    known.pop(node_id, None)  # another path's (a disjoint lookup)
+                elif self.may_retry(node_id):
                     queried.add(node_id)
                     retrying.add(node_id)
                     retried += 1
@@ -481,7 +494,7 @@ class Lookup:
                     for provider in providers:  # at most k per reply, from nodes that answered
                         self._listed_by.setdefault(provider, set()).add(node_id)
             for new_id in nodes:
-                if new_id not in known and new_id not in queried and self._usable(new_id):
+                if new_id not in known and new_id not in queried and self._usable(new_id) and not self.taken(new_id):
                     known[new_id] = self._distance(new_id)
                     introduced.setdefault(new_id, node_id)
                     if self.unreliable(new_id):
