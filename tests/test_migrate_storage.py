@@ -19,7 +19,7 @@ from rnfs.content.storage import Storage, remote_source
 from rnfs.errors import RnfsError
 from rnfs.fetcher import Fetcher
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, state_rows, write_legacy
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -136,7 +136,7 @@ class PinsTest(MigrateTest):
                 self.assertFalse(os.path.exists(path))
         self.assertTrue(os.path.exists(os.path.join(self.state, "pins.json.damaged.3")))
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup(self):
         """A pins.json that can't be read stops startup: starting without it would let gc delete the pins."""
         path = write_legacy(self.state, "pins.json", self.VALUE)
@@ -265,7 +265,7 @@ class RemotePinsTest(MigrateTest):
         self.assertEqual(self.load(), [])
         self.assertTrue(os.path.exists(os.path.join(self.state, "remote_pins.json.damaged")))
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_is_left_for_the_next_start(self):
         """A file that can't be read is logged and skipped (the pins are best effort), and imported once it can
         be read."""

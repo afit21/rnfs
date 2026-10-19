@@ -169,7 +169,7 @@ def take_lock():
     handle = open(os.path.join(PAGE_DIR, "lock"), "a+")
     try:
         try:
-            import fcntl
+            import fcntl  # noqa: TID251 - ImportError on Windows, handled below
         except ImportError:  # Windows
             import msvcrt
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)

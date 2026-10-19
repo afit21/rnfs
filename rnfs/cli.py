@@ -335,7 +335,7 @@ def run_daemon(args):
         debug.note(debuglog.status_line(node), LOG_NOTICE)
     # `kill -USR1 <pid>` prints every thread's stack, for debugging hangs. Windows has no SIGUSR1
     if hasattr(signal, "SIGUSR1"):
-        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        faulthandler.register(signal.SIGUSR1, all_threads=True)  # noqa: TID251 - hasattr checked above
 
     # Replace RNS's handlers, which exit immediately, so the node shuts down first. On Windows, Ctrl+C is
     # SIGINT and Ctrl+Break (or CTRL_BREAK_EVENT sent to the daemon's process group) is SIGBREAK, whose

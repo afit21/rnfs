@@ -18,7 +18,7 @@ from rnfs.constants import DAY, ID_LENGTH
 from rnfs.content.cid import RAW, Cid
 from rnfs.dht.providers import ProviderStore
 from rnfs.publisher import DhtKey, Publisher
-from tests.support import POSIX_MODES, FakeClock, failing_commits, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, FakeClock, failing_commits, state_rows, write_legacy
 from tests.test_providers import held, saved
 
 T = 1_700_000_000.0
@@ -189,7 +189,7 @@ class ProvidersTest(MigrateTest):
         self.assertEqual(self.load(), NO_ROWS)
         self.assertTrue(os.path.isdir(self.path + ".damaged"))
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_is_left_for_the_next_start(self):
         """A file that can't be read is logged and left (the store starts empty: records are republished), and
         imported once it can be read."""
@@ -305,7 +305,7 @@ class PublishedTest(MigrateTest):
         self.assertTrue(os.path.exists(self.path + ".damaged.4"))
         self.assertEqual(self.migrated(), [])
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup(self):
         """A file that can't be read stops the start, as it did (read_json), and is imported once it can be."""
         write_legacy(self.state, self.NAME, self.VALUE)

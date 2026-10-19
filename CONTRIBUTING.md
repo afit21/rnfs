@@ -91,7 +91,8 @@ ruff check .
 ```
 
 A broad `except Exception` in `rnfs/` carries `# noqa: BLE001 - <why it must catch everything>`, an import that
-can't be at the top `# noqa: E402`, and RUF100 flags a `noqa` that suppresses nothing. The companion NomadNet
+can't be at the top `# noqa: E402`, a use of an API Windows lacks `# noqa: TID251 - <the guard>` ("Tests on every
+OS", above; the same holds in `rnfs/`), and RUF100 flags a `noqa` that suppresses nothing. The companion NomadNet
 pages (`companion-nomadnet-sites/*/index.mu`) are linted as Python. CI also fails on merge-conflict markers.
 
 Style: match the surrounding code. Every function has a docstring, comments say why rather than what, and lines

@@ -151,7 +151,7 @@ def loose_ancestor(real: str) -> str | None:
     root's. Best effort: a directory that can't be read is passed over."""
     if fsutil.IS_WINDOWS:
         return None
-    trusted = (0, os.geteuid())
+    trusted = (0, os.geteuid())  # noqa: TID251 - Windows returned above
     child, parent = real, os.path.dirname(real)
     while parent != child:
         try:

@@ -14,6 +14,9 @@ from rnfs import statedb
 # Unix permission bits (modes, umask, the execute bit): Windows has none, and its st_mode is synthesised
 POSIX_MODES = os.name != "nt"
 HAS_FIFO = hasattr(os, "mkfifo")
+# Root reads and writes past permission bits, so a test that needs them to refuse something skips as root too
+IS_ROOT = POSIX_MODES and os.geteuid() == 0  # noqa: TID251 - POSIX_MODES checked first
+PERMISSION_CHECKS = POSIX_MODES and not IS_ROOT
 
 
 def _can_symlink() -> bool:

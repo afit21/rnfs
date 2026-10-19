@@ -42,7 +42,7 @@ def foreign(path: str, real):
         if (info.st_dev, info.st_ino) != (target.st_dev, target.st_ino):
             return info
         fields = list(info[:10])
-        fields[4] = os.geteuid() + 1  # st_uid
+        fields[4] = os.geteuid() + 1  # noqa: TID251 - st_uid; used only by classes skipped without POSIX_MODES
         return os.stat_result(fields)
     return fake
 

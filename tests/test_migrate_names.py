@@ -18,7 +18,7 @@ from rnfs.config import Config
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import RnfsError
 from rnfs.names import NameManager, Record
-from tests.support import POSIX_MODES, FakeClock, failing_commits, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, FakeClock, failing_commits, state_rows, write_legacy
 from tests.test_names import FakeNetwork, FakePins
 
 A, B, C = Cid.for_block(RAW, b"a"), Cid.for_block(RAW, b"b"), Cid.for_block(DAG, b"c")
@@ -334,7 +334,7 @@ class FloorFileTest(FileTests, MigrateNamesTest):
         self.assertEqual(self.rows("SELECT * FROM name_floor"), [])
         self.assertEqual(self.rows("SELECT * FROM migrated"), [])
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup(self):
         """A name-floor.json that can't be read stops startup, as it did: a transient error isn't damage."""
         path = write_legacy(self.state, self.FILE, self.value())

@@ -449,7 +449,7 @@ class FolderTarTest(unittest.TestCase):
                 f.write(name.encode())
         if os.name != "nt":
             os.link(os.path.join(top, "plain"), os.path.join(top, "linked"))
-            os.mkfifo(os.path.join(top, "fifo"))
+            os.mkfifo(os.path.join(top, "fifo"))  # noqa: TID251 - not on Windows (os.name checked above)
             os.symlink("/etc/passwd", os.path.join(top, "escape"))
             with open(os.path.join(top.encode(), b"bad\xff"), "wb") as f:
                 f.write(b"x")

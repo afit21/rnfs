@@ -80,7 +80,7 @@ def lock_exclusive(path: str) -> int:
                     raise
                 raise BlockingIOError(errno.EAGAIN, f"{path} is locked by another process") from e
         else:
-            import fcntl
+            import fcntl  # noqa: TID251 - the POSIX branch; msvcrt on Windows
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # BlockingIOError when another process holds it
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
@@ -101,7 +101,7 @@ def unlock(fd: int):
             os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
-            import fcntl
+            import fcntl  # noqa: TID251 - the POSIX branch; msvcrt on Windows
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass  # closing releases it too
@@ -133,7 +133,7 @@ def lock_held(path: str) -> bool:
             os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
             return False
-        import fcntl
+        import fcntl  # noqa: TID251 - the POSIX branch; msvcrt on Windows
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -248,7 +248,7 @@ def final_path(fd: int) -> str | None:
             return None  # no /proc mounted
         return path if path.startswith("/") else None  # e.g. "anon_inode:[...]": not a file at a path
     if sys.platform == "darwin":
-        import fcntl
+        import fcntl  # noqa: TID251 - macOS only
         if hasattr(fcntl, "F_GETPATH"):
             return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
     return None
@@ -309,14 +309,14 @@ def check_owned_fd(path: str, fd: int, info: os.stat_result, what: str) -> str |
         if reason is None:
             return None
         return f"{what} {path} was accessible to other users ({reason}); restricted it to you and SYSTEM"
-    if info.st_uid != os.geteuid():
+    if info.st_uid != os.geteuid():  # noqa: TID251 - Windows returned above
         raise PermissionError(f"{what} {path} belongs to another user (uid {info.st_uid})")
     mode = stat.S_IMODE(info.st_mode)
     if not mode & 0o077:
         return None
     private = 0o700 if directory else 0o600
     try:
-        os.fchmod(fd, private)
+        os.fchmod(fd, private)  # noqa: TID251 - Windows returned above
     except OSError as e:
         raise PermissionError(f"{what} {path} is accessible to other users (mode {mode:o}) and can't be "
                               f"restricted: {e.strerror or e}") from None

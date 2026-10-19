@@ -797,7 +797,7 @@ class SecurityTest(NodeTest):
     def test_rnfs_dir_of_another_user_is_refused(self):
         theirs = os.path.join(self.tmp.name, "theirs")
         os.mkdir(theirs)
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):  # noqa: TID251 - skipped without POSIX_MODES
             with self.assertRaisesRegex(RnfsError, "belongs to another user"):
                 node_module._make_private_dirs(theirs)
         self.assertFalse(os.path.exists(os.path.join(theirs, "state")))  # nothing written there

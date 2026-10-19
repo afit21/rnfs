@@ -162,12 +162,12 @@ class BlockStore:
             raise RnfsError(f"can't use {path}: {e}") from None
         try:
             info = os.fstat(fd)
-            if info.st_uid != os.geteuid():
+            if info.st_uid != os.geteuid():  # noqa: TID251 - Windows returned above
                 raise RnfsError(f"{path} belongs to another user (uid {info.st_uid}); rnfs stores blocks only in "
                                 f"directories of its own there. Move it away, or as root give it to yourself "
-                                f"(chown -R {os.geteuid()} {path})")
+                                f"(chown -R {os.geteuid()} {path})")  # noqa: TID251 - Windows returned above
             if stat.S_IMODE(info.st_mode) & 0o077:
-                os.fchmod(fd, 0o700)
+                os.fchmod(fd, 0o700)  # noqa: TID251 - Windows returned above
         except OSError as e:
             raise RnfsError(f"can't make {path} private: {e}") from None
         finally:

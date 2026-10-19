@@ -43,7 +43,7 @@ from rnfs.content.storage import SIZES_STORE, Storage
 def drop_caches(cold: bool):
     """Write back dirty pages, and with cold drop the page cache too (root only)."""
     if hasattr(os, "sync"):
-        os.sync()
+        os.sync()  # noqa: TID251 - hasattr checked above
     if cold:
         with open("/proc/sys/vm/drop_caches", "w") as f:
             f.write("3\n")

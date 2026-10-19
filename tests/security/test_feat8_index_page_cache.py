@@ -95,7 +95,7 @@ class IndexPageCacheTest(unittest.TestCase):
     def test_busy_lock_serves_the_cache(self):
         """While another request holds the lock, a visit gets the cached page however old, without running the
         CLI; with no cached page at all it is asked to try again."""
-        import fcntl
+        import fcntl  # noqa: TID251 - skipped on Windows
         first = self.page()
         self.age_cache(3600)
         self.calls.clear()

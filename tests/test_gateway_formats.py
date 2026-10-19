@@ -244,7 +244,7 @@ class FormatTest(unittest.TestCase):
     def test_client_watch_works_beyond_fd_1024(self):
         # select.select() can't take a file descriptor of 1024 or more; poll() can
         try:
-            import resource
+            import resource  # noqa: TID251 - ImportError on Windows: skipped
         except ImportError:  # Windows
             self.skipTest("no fd limits here")
         from rnfs.gateway_formats import client_gone

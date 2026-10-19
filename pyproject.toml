@@ -43,8 +43,47 @@ extend-include = ["companion-nomadnet-sites/*/index.mu"]
 
 [tool.ruff.lint]
 # pyflakes, syntax errors, mutable/call defaults, raise-from; broad excepts (each carries a noqa with its reason),
-# imports not at the top (each carries a noqa), and noqa comments that suppress nothing
-select = ["F", "E9", "B006", "B008", "B904", "BLE001", "E402", "RUF100"]
+# imports not at the top (each carries a noqa), noqa comments that suppress nothing, and APIs Windows lacks (each
+# use carries a noqa naming its guard: below)
+select = ["F", "E9", "B006", "B008", "B904", "BLE001", "E402", "RUF100", "TID251"]
+
+# Code runs on Windows too (the Windows exe, and every test in CI), where these don't exist: a use is guarded (os.name,
+# fsutil.IS_WINDOWS, hasattr, or a test skipped by tests/support.py's POSIX_MODES, HAS_FIFO or CAN_SYMLINK) and says
+# so: `# noqa: TID251 - <the guard>`. CONTRIBUTING.md, "Tests on every OS"
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"os.geteuid".msg = "Windows has no os.geteuid: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.getuid".msg = "Windows has no os.getuid: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.getgid".msg = "Windows has no os.getgid: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.getegid".msg = "Windows has no os.getegid: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.fchmod".msg = "Windows has no os.fchmod: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.fchown".msg = "Windows has no os.fchown: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.lchown".msg = "Windows has no os.lchown: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.mkfifo".msg = "Windows has no os.mkfifo: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.mknod".msg = "Windows has no os.mknod: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.statvfs".msg = "Windows has no os.statvfs: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.fstatvfs".msg = "Windows has no os.fstatvfs: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.O_NOFOLLOW".msg = "Windows has no os.O_NOFOLLOW: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.O_DIRECTORY".msg = "Windows has no os.O_DIRECTORY: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.killpg".msg = "Windows has no os.killpg: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.getpgid".msg = "Windows has no os.getpgid: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.setsid".msg = "Windows has no os.setsid: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.fork".msg = "Windows has no os.fork: guard it and say how (# noqa: TID251 - <the guard>)"
+"os.sync".msg = "Windows has no os.sync: guard it and say how (# noqa: TID251 - <the guard>)"
+"resource".msg = "Windows has no resource: guard it and say how (# noqa: TID251 - <the guard>)"
+"fcntl".msg = "Windows has no fcntl: guard it and say how (# noqa: TID251 - <the guard>)"
+"pwd".msg = "Windows has no pwd: guard it and say how (# noqa: TID251 - <the guard>)"
+"grp".msg = "Windows has no grp: guard it and say how (# noqa: TID251 - <the guard>)"
+"termios".msg = "Windows has no termios: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGKILL".msg = "Windows has no signal.SIGKILL: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGHUP".msg = "Windows has no signal.SIGHUP: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGUSR1".msg = "Windows has no signal.SIGUSR1: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGUSR2".msg = "Windows has no signal.SIGUSR2: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGALRM".msg = "Windows has no signal.SIGALRM: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGQUIT".msg = "Windows has no signal.SIGQUIT: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.SIGPIPE".msg = "Windows has no signal.SIGPIPE: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.alarm".msg = "Windows has no signal.alarm: guard it and say how (# noqa: TID251 - <the guard>)"
+"signal.setitimer".msg = "Windows has no signal.setitimer: guard it and say how (# noqa: TID251 - <the guard>)"
+"socket.AF_UNIX".msg = "Windows has no socket.AF_UNIX: guard it and say how (# noqa: TID251 - <the guard>)"
 
 [tool.ruff.lint.per-file-ignores]
 # Tests catch broadly to report or clean up (threads, fakes, subprocesses)

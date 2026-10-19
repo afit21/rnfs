@@ -308,7 +308,7 @@ class ShardTest(unittest.TestCase):
     @unittest.skipUnless(POSIX_MODES, "Windows has no POSIX owners")
     def test_another_users_stops_the_start(self):
         os.mkdir(os.path.join(self.tmp.name, "ab"), 0o700)
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):  # noqa: TID251 - skipped without POSIX_MODES
             with self.assertRaisesRegex(RnfsError, "belongs to another user"):
                 BlockStore(self.tmp.name)
 

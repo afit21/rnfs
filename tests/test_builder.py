@@ -326,7 +326,7 @@ class PathTest(unittest.TestCase):
         self.write("real", b"r")
         os.symlink("real", os.path.join(self.root, "link"))
         os.symlink(self.tmp.name, os.path.join(self.root, "dirlink"))
-        os.mkfifo(os.path.join(self.root, "fifo"))
+        os.mkfifo(os.path.join(self.root, "fifo"))  # noqa: TID251 - skipped without HAS_FIFO
         bad_name = True
         try:
             with open(os.path.join(os.fsencode(self.root), b"bad\xff"), "wb") as f:
@@ -420,7 +420,7 @@ class PathTest(unittest.TestCase):
     @unittest.skipUnless(HAS_FIFO, "FIFOs (POSIX)")
     def test_not_a_file_or_directory(self):
         fifo = os.path.join(self.root, "fifo")
-        os.mkfifo(fifo)
+        os.mkfifo(fifo)  # noqa: TID251 - skipped without HAS_FIFO
         with self.assertRaises(ValueError):
             builder.add_path(fifo, NO_PUT)
 
@@ -428,7 +428,7 @@ class PathTest(unittest.TestCase):
     @unittest.skipUnless(HAS_FIFO, "FIFOs (POSIX)")
     def test_fifo_named_directly_never_blocks(self):
         fifo = os.path.join(self.root, "fifo")
-        os.mkfifo(fifo)
+        os.mkfifo(fifo)  # noqa: TID251 - skipped without HAS_FIFO
         with self.assertRaises(ValueError):
             within(5, builder.add_path, fifo, NO_PUT)
         # Swapped in after the type check: opened without blocking, then refused
@@ -504,7 +504,7 @@ class PathTest(unittest.TestCase):
         def swap():
             """Replace the file with a FIFO nobody writes to."""
             os.remove(victim)
-            os.mkfifo(victim)
+            os.mkfifo(victim)  # noqa: TID251 - skipped without HAS_FIFO
 
         with swap_on_open("victim", swap):
             built, warnings = within(5, builder.add_path, self.root, NO_PUT)

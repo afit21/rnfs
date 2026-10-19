@@ -61,12 +61,12 @@ class IdentityFileTest(unittest.TestCase):
     def test_identity_of_another_user_stops_the_node(self):
         os.replace(self.their_file, self.path)
         os.chmod(self.path, 0o600)
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):  # noqa: TID251 - class needs POSIX_MODES
             self.assertIn("belongs to another user", self.load())
 
     @unittest.skipUnless(HAS_FIFO, "FIFOs")
     def test_fifo_stops_the_node_without_hanging(self):
-        os.mkfifo(self.path, 0o600)
+        os.mkfifo(self.path, 0o600)  # noqa: TID251 - skipped without HAS_FIFO
         outcome = []
 
         def start():
@@ -94,7 +94,7 @@ class IdentityFileTest(unittest.TestCase):
         mine = RNS.Identity()
         mine.to_file(self.path)
         os.chmod(self.path, 0o644)  # loose, so the check tightens it
-        real_fchmod = os.fchmod
+        real_fchmod = os.fchmod  # noqa: TID251 - class skipped without POSIX_MODES
 
         def fchmod_then_swap(fd, mode):
             real_fchmod(fd, mode)

@@ -185,7 +185,7 @@ def make_private_root(root: str):
         return
     os.makedirs(root, mode=0o700, exist_ok=True)
     info = os.stat(root)
-    if info.st_uid != os.geteuid():
+    if info.st_uid != os.geteuid():  # noqa: TID251 - Windows returned above
         raise RnfsError(f"{root} belongs to another user (uid {info.st_uid}); the rnfs dir must be your own")
     mode = stat.S_IMODE(info.st_mode)
     if mode & 0o077:
@@ -236,7 +236,7 @@ def _make_private_subdir(path: str):
         fsutil.check_owned_fd(path, fd, info, "the rnfs dir's subdirectory")
     except OSError as e:
         raise RnfsError(f"{e}. rnfs uses only directories of your own there: move it away, or as root give it to "
-                        f"yourself (chown -R {os.geteuid()} {path})") from None
+                        f"yourself (chown -R {os.geteuid()} {path})") from None  # noqa: TID251 - POSIX only
     finally:
         os.close(fd)
     if mode & 0o077:
@@ -266,7 +266,7 @@ def _warn_foreign_entries(directory: str):
     """Warn about entries below directory, which others could write to until now, that another user owns: they
     may have been planted (in blocks/, a raw block is trusted by its length). One lstat pass, links not followed;
     nothing is removed."""
-    uid = os.geteuid()
+    uid = os.geteuid()  # noqa: TID251 - called only from _make_private_subdir (POSIX)
     count, first = 0, None
     for parent, directories, files in os.walk(directory):
         for name in directories + files:

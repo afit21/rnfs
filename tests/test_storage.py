@@ -15,7 +15,7 @@ from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content.storage import (FOLDER, USER, Storage, app_of, app_source, check_app_name, check_source, name_source,
                                   remote_source)
 from rnfs.errors import Closed, NotFound, StorageFull
-from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
 
 IDENTITY = "0123456789abcdef0123456789abcdef"
 
@@ -612,7 +612,7 @@ class PinTest(StorageTest):
         self.assertEqual(self.open().pins(), {})
         self.assertTrue(os.path.isdir(os.path.join(state, "pins.json.damaged.1")))
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unmovable_damaged_state_doesnt_stop_startup(self):
         # The database is open already (setUp's storage), so only moving the damaged file aside fails; a state
         # directory that is read-only from the start stops startup (test_statedb), since nothing could be saved
@@ -623,7 +623,7 @@ class PinTest(StorageTest):
         self.addCleanup(os.chmod, state, 0o700)
         self.assertEqual(self.open().pins(), {})
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_state_stops_startup_rather_than_losing_pins(self):
         cid = self.add(b"precious").cid
         state = os.path.join(self.tmp.name, "state")

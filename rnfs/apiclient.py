@@ -295,7 +295,8 @@ def read_daemon_info(rnfs_dir: str = DEFAULT_DIR) -> dict | None:
             info = os.fstat(f.fileno())
             if not stat.S_ISREG(info.st_mode):
                 return None
-            if not fsutil.IS_WINDOWS and (info.st_mode & 0o022 or info.st_uid != os.getuid()):
+            if not fsutil.IS_WINDOWS and (info.st_mode & 0o022
+                                          or info.st_uid != os.getuid()):  # noqa: TID251 - IS_WINDOWS checked first
                 return None
             raw = f.read(MAX_DAEMON_FILE + 1)
         if len(raw) > MAX_DAEMON_FILE:

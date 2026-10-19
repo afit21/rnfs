@@ -16,7 +16,7 @@ import RNS
 
 from rnfs import statedb
 from rnfs.errors import RnfsError
-from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
+from tests.support import PERMISSION_CHECKS, POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
 
 # The schema steps rnfs 0.1.5 released: a database 0.1.5 wrote has them already, so an edit to one would never
 # reach it. Never change this digest: append a step instead.
@@ -205,7 +205,7 @@ class OpenTest(StateDbTest):
         self.assertIn("is damaged", str(caught.exception))
         self.assertNotIn(self.path, statedb.open_databases())
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unwritable_directory_isnt_called_damage(self):
         """A database that can't be opened for writing (a read-only state directory) stops startup with what
         failed, not as damaged with advice to start over, and is left as it was."""
@@ -639,7 +639,7 @@ class MigrateTest(StateDbTest):
                 self.assertEqual(state_rows(self.state, "SELECT * FROM migrated"), [])
         self.assertTrue(os.path.exists(os.path.join(self.state, "test.json.damaged.2")))
 
-    @unittest.skipUnless(POSIX_MODES and hasattr(os, "getuid") and os.getuid() != 0, "needs permission checks")
+    @unittest.skipUnless(PERMISSION_CHECKS, "needs permission checks")
     def test_unreadable_file_stops_startup_unless_allowed(self):
         """A file that can't be read (not damage) stops startup and is left for the next start; one marked
         unreadable_ok is logged and skipped instead."""

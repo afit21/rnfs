@@ -888,7 +888,7 @@ class LocalJobsTest(JobsBase):
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs FIFOs")
     def test_import_of_a_fifo_is_refused_without_waiting(self):
         """A FIFO would hold the import (and a job slot) until something writes to it, uncancellable."""
-        os.mkfifo(self.out("fifo"))
+        os.mkfifo(self.out("fifo"))  # noqa: TID251 - skipped without mkfifo
         with self.assertRaisesRegex(ValueError, "not a regular file"):
             self.jobs.submit("import", path=self.out("fifo"))
         started = time.monotonic()

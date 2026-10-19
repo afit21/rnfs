@@ -19,7 +19,7 @@ import RNS
 from rnfs.config import Config
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
-from tests.support import state_rows
+from tests.support import IS_ROOT, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import A_ID, NetClient
 
@@ -86,7 +86,7 @@ class UnreadableNameKeyTest(unittest.TestCase):
         site = next(entry for entry in node.names.list() if entry["alias"] == "site")
         self.assertEqual((site["cid"], site["sequence"]), (str(self.cid), 1))
 
-    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads files without permission")
+    @unittest.skipIf(IS_ROOT, "root reads files without permission")
     @unittest.skipIf(os.name == "nt", "chmod can't make a file unreadable on Windows")
     def test_key_without_read_permission(self):
         """The key file's permissions taken away, then given back."""
