@@ -40,6 +40,10 @@ STATS_CACHE = 30.0  # seconds a shared instance's interface stats are reused for
 PATH_CACHE = 15.0
 MAX_CACHED_PATHS = 1024
 PATHFINDER_M = 128  # RNS.Transport.PATHFINDER_M: what hops_to returns for an unknown path
+# Where RNS.Transport.path_table entries keep the hop count and the interface the path came on (RNS's IDX_PT_HOPS,
+# IDX_PT_RVCD_IF), for RnsPaths.scan
+PATH_TABLE_HOPS = 2
+PATH_TABLE_INTERFACE = 5
 # Seconds a peer stays online after the last sign it was up (online()). Three link_idle_timeouts (300 s by
 # default): a peer just talked to doesn't turn offline the moment its idle link closes, nor between a fetch's
 # requests or a republish's. Far below announce_interval (6 h by default), so one announce doesn't keep a node
@@ -202,7 +206,7 @@ class RnsPaths:
                 found[bytes(entry["hash"])] = PathInfo(hops, name, bitrate, names)
             return found
         for node_id, entry in list(RNS.Transport.path_table.items()):
-            hops, interface = entry[2], entry[5]
+            hops, interface = entry[PATH_TABLE_HOPS], entry[PATH_TABLE_INTERFACE]
             if not isinstance(hops, int) or not 0 <= hops < PATHFINDER_M or (max_hops is not None and hops > max_hops):
                 continue
             found[bytes(node_id)] = PathInfo(hops, interface_label(interface),
