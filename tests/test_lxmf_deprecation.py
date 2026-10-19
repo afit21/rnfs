@@ -2,13 +2,16 @@
 of core"): LXMF keeps working exactly as before, and says it is deprecated wherever it is used. The API's routes
 carry a Deprecation header and capabilities list the feature. No Reticulum: offline nodes and a stand-in for
 LxmfNetwork, as in tests/test_lxmf.py."""
+import argparse
+import contextlib
+import io
 import json
 import os
 import sys
 import unittest
 from unittest import mock
 
-from rnfs import api, config, embedded, features
+from rnfs import api, cli, config, embedded, features
 from rnfs.api import ApiServer
 from rnfs.config import LXMF_DEPRECATION, Config
 from rnfs.features import lxmf
@@ -19,8 +22,8 @@ from tests.test_lxmf import B_ID, SENDER, FakeLxmf, FeatureTestCase
 from tests.test_lxmf import setUpModule, tearDownModule  # noqa: F401 - the nodes' log silenced, then restored
 
 
-class ApiTest(FeatureTestCase):
-    """Every LXMF route answers as before, with a Deprecation header (RFC 9745); no other route has one."""
+class ServedTestCase(FeatureTestCase):
+    """Node B with the lxmf feature on a stand-in network, served by an ApiServer."""
 
     def setUp(self):
         """Node B with the lxmf feature on a stand-in network, served by an ApiServer."""
@@ -39,6 +42,10 @@ class ApiTest(FeatureTestCase):
             headers["Content-Type"] = "application/json"
         status, response_headers, raw = raw_request(self.server.port, method, path, data, headers)
         return status, response_headers, json.loads(raw)
+
+
+class ApiTest(ServedTestCase):
+    """Every LXMF route answers as before, with a Deprecation header (RFC 9745); no other route has one."""
 
     def test_lxmf_routes_carry_the_header_and_answer_as_before(self):
         """Each route (successes and errors alike) carries `Deprecation: @<the date>`; bodies are unchanged."""
@@ -77,6 +84,97 @@ class ApiTest(FeatureTestCase):
         self.assertIn("lxmf", result["features"])
         self.assertLessEqual({tuple(route) for route in lxmf.LxmfFeature.api_routes()},
                              {tuple(route) for route in result["routes"]})
+
+
+class CliTest(ServedTestCase):
+    """Every LXMF command warns on one line of stderr that it is deprecated, unless RNFS_NO_DEPRECATION_WARNINGS
+    is set; stdout and the exit status are what they were. Their help says deprecated."""
+
+    def setUp(self):
+        """B's API, with its token where the CLI looks for it; a message with a link in B's inbox."""
+        super().setUp()
+        self.cli_dir = os.path.join(self.tmp.name, "cli")
+        os.makedirs(self.cli_dir)
+        cli.write_token(cli.token_path(self.cli_dir), self.server.token)
+        self.entry_id = self.feature.received(self.link_message())
+
+    def run_cli(self, *argv, silenced: str | None = None) -> tuple[int, str, str]:
+        """(exit code, stdout, stderr) of cli.main(argv), with RNFS_NO_DEPRECATION_WARNINGS set to silenced (None:
+        unset)."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = 0
+        with mock.patch.dict(os.environ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            os.environ.pop(cli.NO_DEPRECATION_WARNINGS, None)
+            if silenced is not None:
+                os.environ[cli.NO_DEPRECATION_WARNINGS] = silenced
+            try:
+                cli.main([*argv, "--api-port", str(self.server.port), "--dir", self.cli_dir])
+            except SystemExit as e:
+                if isinstance(e.code, str):
+                    print(e.code, file=sys.stderr)
+                    code = 1
+                else:
+                    code = e.code or 0
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def warning(self, command: str) -> str:
+        """The line `rnfs <command>` warns with."""
+        return (f"rnfs: warning: rnfs {command} is deprecated: {LXMF_DEPRECATION} (set RNFS_NO_DEPRECATION_WARNINGS=1 "
+                "to hide this)\n")
+
+    def test_each_command_warns_on_stderr_only(self):
+        """The same stdout, status and other stderr lines with the warning as without it (silenced)."""
+        commands = {("inbox",): "inbox", ("outbox",): "outbox", ("lxmf", "address"): "lxmf address",
+                    ("lxmf", "sync"): "lxmf sync"}
+        for argv, name in commands.items():
+            with self.subTest(argv=argv):
+                warned = self.run_cli(*argv)
+                silenced = self.run_cli(*argv, silenced="1")
+                self.assertEqual(warned[:2], silenced[:2])
+                self.assertEqual(warned[2], self.warning(name) + silenced[2])
+                self.assertNotIn("deprecated", silenced[2])
+        # lxmf sync fails here (no propagation node): the warning comes first, then the error, as without it
+        code, _, err = self.run_cli("lxmf", "sync")
+        self.assertEqual((code, err.splitlines()[0] + "\n"), (1, self.warning("lxmf sync")))
+
+    def test_send_and_inbox_get(self):
+        """Commands that change something do it once per run, warned or not."""
+        code, out, err = self.run_cli("send", SENDER.hex(), str(self.cid))
+        self.assertEqual((code, err), (0, self.warning("send")))
+        self.assertEqual(out, self.feature.outbox_list()[0]["hash"] + "\n")
+        code, out, err = self.run_cli("send", SENDER.hex(), str(self.cid), silenced="yes")
+        self.assertEqual((code, err, out), (0, "", self.feature.outbox_list()[1]["hash"] + "\n"))
+        for silenced, name in ((None, "one"), ("1", "two")):
+            output = os.path.join(self.tmp.name, name)
+            code, out, err = self.run_cli("inbox", "get", str(self.entry_id), "-o", output, silenced=silenced)
+            self.assertEqual((code, out), (0, output + "\n"), err)
+            self.assertEqual(err, self.warning("inbox get") if silenced is None else "")
+            with open(output, "rb") as f:
+                self.assertEqual(f.read(), self.data)
+        self.assertEqual(self.run_cli("inbox", "rm", "--all"), (0, "removed 1 message(s)\n", self.warning("inbox rm")))
+        self.assertEqual(self.run_cli("inbox", "rm", "--all", silenced="1"), (0, "removed 0 message(s)\n", ""))
+
+    def test_zero_or_empty_doesnt_silence(self):
+        for value in ("", "0"):
+            with self.subTest(value=value):
+                self.assertEqual(self.run_cli("outbox", silenced=value)[2], self.warning("outbox"))
+
+    def test_help_says_deprecated(self):
+        """The command list marks each LXMF command, and its --help says why; other commands aren't marked."""
+        parser = cli.build_parser()
+        commands = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+        listed = {choice.dest: choice.help for choice in commands._choices_actions}
+        for name in ("send", "inbox", "outbox", "lxmf"):
+            with self.subTest(name=name):
+                self.assertTrue(listed[name].endswith("(deprecated)"), listed[name])
+        self.assertNotIn("deprecated", listed["add"])
+        for argv in (("send",), ("inbox",), ("inbox", "get"), ("inbox", "rm"), ("outbox",), ("lxmf",),
+                     ("lxmf", "address"), ("lxmf", "sync")):
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                    parser.parse_args([*argv, "--help"])
+                self.assertIn(f"Deprecated: {LXMF_DEPRECATION}.", " ".join(out.getvalue().split()))
 
 
 class StartNoticeTest(FeatureTestCase):

@@ -40,6 +40,7 @@ the app:lxmf: pins and the LXMF identity, so this feature then also never releas
 Nothing here imports RNS or LXMF at module level (CLI commands mustn't load them); LxmfNetwork, made in
 start(), holds every RNS and LXMF object, so the rest works on offline test nodes with a stand-in network.
 """
+import functools
 import json
 import math
 import os
@@ -1751,8 +1752,13 @@ class LxmfFeature(features.Feature):
 
     @classmethod
     def cli_commands(cls, commands, command):
-        """send, inbox [get|rm], outbox, lxmf address|sync."""
-        send = command(commands, "send", _run_send, "send an rnfs link to an LXMF address or contact")
+        """send, inbox [get|rm], outbox, lxmf address|sync, each deprecated (_deprecated_command)."""
+
+        def deprecated(subparsers, name: str, run, help: str):
+            """_deprecated_command with the CLI's command helper: the argparse parser of the command."""
+            return _deprecated_command(command, subparsers, name, run, help)
+
+        send = deprecated(commands, "send", _run_send, "send an rnfs link to an LXMF address or contact")
         send.add_argument("to", metavar="ADDRESS|CONTACT", help="LXMF address (32 hex characters) or contact")
         send.add_argument("target", metavar="CID[/PATH]", help="<cid>[/path], name/<name>[/path] or an rnfs: URI")
         send.add_argument("-m", "--message", help="text to send with the link")
@@ -1762,31 +1768,49 @@ class LxmfFeature(features.Feature):
                           help="without lxmf_propagation_node set, use the nearest propagation node heard (for "
                                "--propagate, or if direct delivery fails)")
 
-        inbox = command(commands, "inbox", _run_inbox, "list received LXMF messages with rnfs links")
+        inbox = deprecated(commands, "inbox", _run_inbox, "list received LXMF messages with rnfs links")
         inbox_commands = inbox.add_subparsers(dest="inbox_command", metavar="command")
-        get = command(inbox_commands, "get", _run_inbox_get, "fetch the content an inbox message links to")
+        get = deprecated(inbox_commands, "inbox get", _run_inbox_get, "fetch the content an inbox message links to")
         get.add_argument("n", type=int, metavar="N", help="message number, from `rnfs inbox`")
         get.add_argument("--link", type=int, metavar="K", help="only the K-th link of the message")
         get.add_argument("-o", "--output", help="where to write (one link only; default: its name, here)")
         get.add_argument("--use-sent-cid", action="store_true",
                          help="if a name link's name can't be resolved, get the CID the sender says it pointed at "
                               "(nothing ties that CID to the name: only for a sender you trust)")
-        rm = command(inbox_commands, "rm", _run_inbox_rm,
-                     "remove inbox messages, releasing what they auto-fetched")
+        rm = deprecated(inbox_commands, "inbox rm", _run_inbox_rm,
+                        "remove inbox messages, releasing what they auto-fetched")
         rm.add_argument("n", type=int, nargs="?", metavar="N", help="message number")
         rm.add_argument("--all", action="store_true", help="remove every message")
 
-        command(commands, "outbox", _run_outbox, "list sent LXMF messages and their delivery state")
+        deprecated(commands, "outbox", _run_outbox, "list sent LXMF messages and their delivery state")
 
-        lxmf = commands.add_parser("lxmf", help="this node's LXMF identity").add_subparsers(
-            dest="lxmf_command", required=True, metavar="command")
-        command(lxmf, "address", _run_address, "print this node's LXMF address, to share")
-        sync = command(lxmf, "sync", _run_sync, "download waiting messages from the propagation node now")
+        lxmf = commands.add_parser("lxmf", help="this node's LXMF identity (deprecated)",
+                                   description=f"this node's LXMF identity. Deprecated: {LXMF_DEPRECATION}.")
+        lxmf = lxmf.add_subparsers(dest="lxmf_command", required=True, metavar="command")
+        deprecated(lxmf, "lxmf address", _run_address, "print this node's LXMF address, to share")
+        sync = deprecated(lxmf, "lxmf sync", _run_sync, "download waiting messages from the propagation node now")
         sync.add_argument("--nearest", action="store_true",
                           help="without lxmf_propagation_node set, use the nearest propagation node heard")
 
 
 FEATURE = LxmfFeature
+
+
+def _deprecated_command(command, subparsers, name: str, run, help: str):
+    """command(subparsers, ..., run, help) (the CLI's helper) for the LXMF command name (its words after rnfs, e.g.
+    "inbox get"): its help says it is deprecated and --help why, and each time it runs it first warns so on stderr
+    (cli.warn_deprecated), then runs as before."""
+
+    @functools.wraps(run)
+    def deprecated_run(args):
+        """Warn that the command is deprecated, then run it."""
+        from rnfs import cli
+        cli.warn_deprecated(f"rnfs {name}", LXMF_DEPRECATION)
+        return run(args)
+
+    parser = command(subparsers, name.split()[-1], deprecated_run, f"{help} (deprecated)")
+    parser.description = f"{help}. Deprecated: {LXMF_DEPRECATION}."
+    return parser
 
 
 # API handlers

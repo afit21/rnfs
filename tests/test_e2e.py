@@ -441,6 +441,7 @@ class NetworkTest(unittest.TestCase):
         self.assertIn("hello B", inbox)
         self.assertIn(f"from={a.node_id}", inbox)  # the sender's node, as a provider hint
         wait_for(lambda: "delivered" in a.out("outbox"), 60, "A's outbox to show the message delivered")
+        self.assertIn(b"rnfs: warning: rnfs outbox is deprecated: ", a.cli("outbox").stderr)  # stdout as it was
         number = inbox.split()[0].lstrip("#")
         fetched = b.out("inbox", "get", number, "-o", self.path("b-lxmf")).split()
         if fetched[0] == "job":  # with rnfs/features/jobs.py the fetch runs as a background job

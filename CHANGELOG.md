@@ -57,6 +57,10 @@ Deprecated:
   that it is deprecated, as a notice, saying `lxmf_enabled = false` turns it off; given `lxmf_*` settings (in
   `rnfs.toml`, on the command line or as an `rnfs.Node`'s settings), it names them, as a warning while LXMF runs.
   A node that neither runs it nor was given such a setting, an `rnfs.Node` by default, says nothing.
+- `rnfs send`, `inbox`, `inbox get`, `inbox rm`, `outbox`, `lxmf address` and `lxmf sync` print, each time they run,
+  one line on stderr saying they are deprecated and why; their stdout and exit status are unchanged, and
+  `RNFS_NO_DEPRECATION_WARNINGS=1` (anything but empty or `0`) silences the line. `rnfs --help` marks them
+  `(deprecated)`, and each one's `--help` says why.
 
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
