@@ -58,6 +58,7 @@ from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, Stor
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
+from rnfs.name_sync import NameSync
 from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, nomadnet, rates
@@ -682,6 +683,9 @@ class RnfsNode:
         self.names = NameManager(config, _NamePins(self), network=names_network)
         self.names.held_listener = self._name_event
         self._add_store(_StoreParts(close=self.names.close), batched=False)
+        # Folders synced to names (rnfs.name_sync): its syncs are written through, its per-file cache saved with the
+        # batched stores; scanned by a thread of its own (_start_threads)
+        self.folder_syncs = self._add_store(NameSync(self.names, self.storage, config, check=self._hash_check))
         self.backend = NodeBackend(self)
 
         self._lock = threading.Lock()
@@ -770,6 +774,7 @@ class RnfsNode:
         for name, target in (("rnfs-join", self._join), ("rnfs-publisher", self._run_publisher),
                              ("rnfs-names", lambda: self.names.run(self.stop_event)),
                              ("rnfs-maintenance", self._maintenance_loop),
+                             ("rnfs-name-sync", lambda: self.folder_syncs.run(self.stop_event)),
                              ("rnfs-remote-pin-checks", lambda: self.asked_pins.run(self.stop_event, self.joined))):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
@@ -803,6 +808,8 @@ class RnfsNode:
             for feature in reversed(list(self.features.values()))]
         steps += [("signalling the threads to stop", self.stop_event.set),
                   ("waking the publisher", self.publisher.wake)]
+        if getattr(self, "folder_syncs", None) is not None:
+            steps.append(("waking the name sync", self.folder_syncs.wake))
         if self.announcer is not None:
             steps.append(("stopping the announcer", self.announcer.stop))
         if self.announce_handler is not None:
@@ -2462,7 +2469,9 @@ class RnfsNode:
                 "warning": key_backup_warning(alias)}
 
     def name_rm(self, alias: str):
-        """Delete a name key, releasing its pin."""
+        """Delete a name key, releasing its pin; a sync of the name (name_sync) stops first."""
+        self.names.name(alias)  # NotFound before anything changes
+        self.folder_syncs.remove(alias)
         self.names.remove(alias)
 
     def name_export(self, alias: str) -> bytes:
@@ -2480,6 +2489,19 @@ class RnfsNode:
         root, names = self._parse_target(target)
         cid = walker.resolve(root, names, self.storage.getter()).cid if names else root
         return self.names.publish(alias, cid)
+
+    def name_sync(self, alias: str, path: str) -> dict:
+        """Keep a name pointing at a folder's current content (rnfs.name_sync): the sync's entry, and in private
+        mode a "warning" that each publish's announce reaches outsiders."""
+        return self.folder_syncs.sync(alias, path)
+
+    def name_unsync(self, alias: str):
+        """Stop syncing a name to its folder; the name keeps pointing where it last did."""
+        self.folder_syncs.unsync(alias)
+
+    def name_syncs(self) -> list[dict]:
+        """Every name synced to a folder, with how its sync stands."""
+        return self.folder_syncs.list()
 
     def name_resolve(self, name: str, for_gateway: bool = False) -> dict:
         """The record a name points at; NotFound if it can't be resolved."""

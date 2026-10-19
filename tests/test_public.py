@@ -24,7 +24,7 @@ from unittest import mock
 import RNS
 
 import rnfs
-from rnfs import api, cli, embedded, fsutil, interface, objects, remote
+from rnfs import api, cli, embedded, fsutil, interface, name_sync, objects, remote
 from rnfs import events as events_module
 from rnfs.api import ApiHandler, ApiServer, NameWatches
 from rnfs.config import LXMF_DEPRECATION, Config
@@ -371,6 +371,36 @@ class PublicTests:
         with self.assertRaises(rnfs.NotFound):
             self.rnfs.names.get("site")
         self.assertEqual(self.rnfs.names.import_key("again", key).name, name.name)
+
+    def test_name_sync(self):
+        """names.sync, syncs and unsync: a FolderSync for the folder, listed, published by the node's sync, stopped
+        with the name left where it pointed; refusals as NotFound."""
+        folder = self.out("site")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "index.html"), "wb") as f:
+            f.write(b"<h1>synced</h1>")
+        self.rnfs.names.create("site")
+        synced = self.rnfs.names.sync("site", folder)
+        self.assertIsInstance(synced, rnfs.FolderSync)
+        self.assertEqual((synced.alias, synced.path, synced.state, synced.published, str(synced)),
+                         ("site", folder, "new", None, "site"))
+        self.assertEqual(self.rnfs.names.syncs(), [synced])
+        with mock.patch.object(name_sync, "SETTLE_TIME", 0.0):  # B's sync thread doesn't run: scanned here
+            self.b.folder_syncs.tick()
+            self.b.folder_syncs.tick()
+        (entry,) = self.rnfs.names.syncs()
+        self.assertEqual((entry.state, entry.published), ("synced", entry.root))
+        self.assertEqual(self.rnfs.names.get("site").cid, entry.published)
+        self.rnfs.names.unsync("site")
+        self.assertEqual(self.rnfs.names.syncs(), [])
+        self.assertEqual(self.rnfs.names.get("site").cid, entry.published)
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.names.unsync("site")
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.names.sync("nope", folder)
+        with self.assertRaises(rnfs.NotFound):
+            self.rnfs.names.sync("site", self.out("missing"))
+        self.assertTrue(self.rnfs.capabilities().has("name_sync"))
 
     def test_publish_warning_is_a_runtime_warning(self):
         """The node's private-mode warning on publish (DHT-4) reaches the program as a RuntimeWarning, and the
@@ -1436,6 +1466,7 @@ class ObjectsTest(unittest.TestCase):
                       objects.Stats(1.7e9, {"sent": 1}, {"budget": 2}, {"TCP": {"sent": 1, "received": 0}}, 10, 5),
                       objects.Contact("alice", "node", A_ID), objects.Kept(OTHER, ("user",), 3, cid, 1.7e9),
                       objects.Followed(OTHER, cid, cid, 3, "current"),
+                      objects.FolderSync("site", "/f", "synced", None, cid, cid, 1.7e9, 1.7e9 + 3600),
                       objects.LxmfAddress(A_ID, "me", None, B_ID),
                       objects.Message(1, bytes(32), A_ID, "a", 1.7e9, 1.7e9, "t", "x", "direct",
                                       (objects.MessageLink("rnfs:x", cid, None, ("a",), 3, B_ID),), ({"state": "x"},),

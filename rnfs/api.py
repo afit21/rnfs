@@ -17,6 +17,7 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
 | GET  | /api/name/watch | `names` (comma-separated), `after` (a sequence or `-` per name), `wait` (≤ 30 s) | `{"records": [{"name", "cid", "sequence", "age"}]}`: the records held whose sequence is above `after`, as soon as there is one or after `wait` (below) |
+| GET  | /api/name/syncs | | `{"syncs": name_syncs()}`: `[{"alias", "path", "state", "reason", "root", "published", "published_at", "next_publish"}]` (rnfs.name_sync), by alias |
 | POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker`; or `nomadnet` (a NomadNet link) instead of `path`, with `name` and `identify` too | `add_path(...)`; with `nomadnet`, `add_nomadnet(...)`: its result has the snapshot's `name` and the `link` too |
 | POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`, `format`; body is the data | `add_stream(...)`; `format=tar`: the body is a tar stream, `add_tar(stream, name, ...)` builds the directory it holds (no `to`, `to_self` or `seal_name`) |
 | GET  | /api/get/stream | `target`, `format` (`tar`) | the target as a tar stream (`get_tar`), fetched first, Content-Length set |
@@ -39,6 +40,8 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | POST | /api/name/export | JSON `alias` | the key bytes |
 | POST | /api/name/import | query `alias`; body is the key bytes | `name_import(alias, key)` |
 | POST | /api/name/publish | JSON `alias`, `target` | `name_publish(alias, target)` |
+| POST | /api/name/sync | JSON `alias`, `path` (a folder) | `name_sync(alias, path)`: the sync's entry (as `/api/name/syncs` lists it), `warning` in private mode |
+| POST | /api/name/unsync | JSON `alias` | `{}` after `name_unsync(alias)` (404 if the name isn't synced) |
 | POST | /api/export | JSON `target`, `output` | `export(target, output)` |
 | POST | /api/import | JSON `path` | `import_archive(path)` |
 | GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...], "deprecated": [feature]}` (below) |
@@ -177,7 +180,7 @@ DEPRECATION_HEADER = "Deprecation"  # RFC 9745, on the responses of a deprecated
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream", "sealed_folders", "apps", "remote_pin_status", "add_nomadnet")
+                "import_stream", "sealed_folders", "apps", "remote_pin_status", "add_nomadnet", "name_sync")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -743,6 +746,7 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/name/list"): "api_name_list",
         ("GET", "/api/name/resolve"): "api_name_resolve",
         ("GET", "/api/name/watch"): "api_name_watch",
+        ("GET", "/api/name/syncs"): "api_name_syncs",
         ("POST", "/api/add"): "api_add",
         ("POST", "/api/add/stream"): "api_add_stream",
         ("GET", "/api/get/stream"): "api_get_stream",
@@ -763,6 +767,8 @@ class ApiHandler(TimedHandler):
         ("POST", "/api/name/export"): "api_name_export",
         ("POST", "/api/name/import"): "api_name_import",
         ("POST", "/api/name/publish"): "api_name_publish",
+        ("POST", "/api/name/sync"): "api_name_sync",
+        ("POST", "/api/name/unsync"): "api_name_unsync",
         ("POST", "/api/export"): "api_export",
         ("POST", "/api/import"): "api_import",
         ("POST", "/api/pin/label"): "api_pin_label",
@@ -1350,6 +1356,22 @@ class ApiHandler(TimedHandler):
         """POST /api/name/publish {"alias", "target"}: point a name at a target."""
         body = self.json_body()
         self.send_json(200, self.node.name_publish(parse_alias(body.get("alias")), parse_target(body.get("target"))))
+
+    def api_name_sync(self):
+        """POST /api/name/sync {"alias", "path"}: keep a name pointing at a folder's current content. Any caller may
+        start or stop a name's sync, as any may publish it; the name's pin is the name's own (name:<alias>), whoever
+        asked."""
+        body = self.json_body()
+        self.send_json(200, self.node.name_sync(parse_alias(body.get("alias")), parse_path(body.get("path"))))
+
+    def api_name_unsync(self):
+        """POST /api/name/unsync {"alias"}: stop syncing a name; it keeps pointing where it last did."""
+        self.node.name_unsync(parse_alias(self.json_body().get("alias")))
+        self.send_json(200, {})
+
+    def api_name_syncs(self):
+        """GET /api/name/syncs: the names synced to folders."""
+        self.send_json(200, {"syncs": self.node.name_syncs()})
 
     def api_export(self):
         """POST /api/export {"target", "output"}: write an archive to a path on this machine."""

@@ -363,6 +363,18 @@ class _Backend:
         """POST /api/name/publish."""
         return self.api.name_publish(alias, target)
 
+    def name_sync(self, alias: str, path: str) -> dict:
+        """POST /api/name/sync."""
+        return self.api.name_sync(alias, path)
+
+    def name_unsync(self, alias: str):
+        """POST /api/name/unsync."""
+        self.api.name_unsync(alias)
+
+    def name_syncs(self) -> list[dict]:
+        """GET /api/name/syncs."""
+        return self.api.name_syncs()
+
     def name_resolve(self, name: str) -> dict:
         """GET /api/name/resolve."""
         return self.api.name_resolve(name)

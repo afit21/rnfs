@@ -1054,6 +1054,20 @@ class ApiConnection:
         name's announce is visible outside the private network)."""
         return self.post("/api/name/publish", alias=alias, target=target)
 
+    def name_sync(self, alias: str, path: str) -> dict:
+        """Keep a name of this node pointing at a folder's current content (path: absolute, on the daemon's
+        machine): {"alias", "path", "state", "reason", "root", "published", "published_at", "next_publish"}, and
+        "warning" in private mode. NotFound for no such name or folder."""
+        return self.post("/api/name/sync", alias=alias, path=path)
+
+    def name_unsync(self, alias: str):
+        """Stop syncing a name to its folder (NotFound if it isn't synced); it keeps pointing where it last did."""
+        self.post("/api/name/unsync", alias=alias)
+
+    def name_syncs(self) -> list[dict]:
+        """Every name synced to a folder, as name_sync answers, by alias."""
+        return self.get("/api/name/syncs")["syncs"]
+
     def name_resolve(self, name: str) -> dict:
         """{"name", "cid", "sequence", "age"} of a name (32 hex characters, or a name contact's nick); NotFound if
         it doesn't resolve."""
