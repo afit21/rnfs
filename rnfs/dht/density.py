@@ -19,16 +19,21 @@ then looks further out. All local: nothing about it is sent, and nothing on the 
   learn of, so a publisher and a searcher agree on it; the ring after the core reaches past a core the radius
   underestimates. Publishers store to K servers of each ring; searchers continue until RING_ANSWERS of each ring
   have answered.
+- **How often it fired** (CheckCounts, for the node's status): the searches and the published keys it checked, and
+  those it flagged, over the last hour and day. A rate well above the few percent of false positives points at
+  identities placed next to keys, or at a size estimate gone wrong.
 """
 import bisect
 import math
 import os
 import statistics
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 
 from rnfs.constants import ID_LENGTH, K
+from rnfs.dht.recent import RecentCounts
 from rnfs.dht.routing import is_id
 
 SPACE = 1 << (ID_LENGTH * 8)  # the ID space: distances are below it
@@ -123,6 +128,30 @@ class SizeEstimate:
         """Samples held."""
         with self._lock:
             return len(self._distances)
+
+
+class CheckCounts:
+    """How often the density check ran and fired recently: once per search it checked (its first lookup had a size
+    estimate) and once per published key it checked over a region's servers, flagged when it fired (in any of the
+    search's lookups; for a key, when it got a widened lookup). In memory only, as the status reports it."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        """No checks yet; clock is monotonic seconds."""
+        self.checked = RecentCounts(clock)
+        self.flagged = RecentCounts(clock)
+
+    def note(self, flagged: bool):
+        """One check, flagged or not."""
+        self.checked.add()
+        if flagged:
+            self.flagged.add()
+
+    def status(self) -> dict:
+        """{"density_checked_hour", "density_flagged_hour", "density_checked_day", "density_flagged_day"}."""
+        checked_hour, checked_day = self.checked.hour_and_day()
+        flagged_hour, flagged_day = self.flagged.hour_and_day()
+        return {"density_checked_hour": checked_hour, "density_flagged_hour": flagged_hour,
+                "density_checked_day": checked_day, "density_flagged_day": flagged_day}
 
 
 def kth_distance(distances: Sequence[int]) -> int | None:
