@@ -57,12 +57,12 @@ class DhtAnnouncerTest(unittest.TestCase):
     def test_a_server_announces_every_interval_whatever_needs_reach_says(self):
         """Servers must stay in routing tables, so they always announce."""
         _, destination = self.announcer("server", needs_reach=lambda: False)
-        wait_for(lambda: destination.announces >= 5, timeout=10)
+        wait_for(lambda: destination.announces >= 5, timeout=10, what="5 announces")
 
     def test_a_client_that_only_fetches_announces_only_at_startup(self):
         """The startup announce and the one after startup_announce_delay, then nothing while nothing needs it."""
         _, destination = self.announcer("client", needs_reach=lambda: False)
-        wait_for(lambda: destination.announces == 2, timeout=10)
+        wait_for(lambda: destination.announces == 2, timeout=10, what="the 2 startup announces")
         time.sleep(INTERVAL * 5)
         self.assertEqual(destination.announces, 2)
 
@@ -71,11 +71,17 @@ class DhtAnnouncerTest(unittest.TestCase):
         then announces as a server would, until it no longer needs it."""
         needed = threading.Event()
         _, destination = self.announcer("client", needs_reach=needed.is_set)
-        wait_for(lambda: destination.announces == 2, timeout=10)
+        wait_for(lambda: destination.announces == 2, timeout=10, what="the 2 startup announces")
         needed.set()
-        wait_for(lambda: destination.announces >= 5, timeout=10)
+        wait_for(lambda: destination.announces >= 5, timeout=10, what="announces once needed")
         needed.clear()
-        time.sleep(INTERVAL * 2)  # one announce may have been under way
+
+        def quiet():
+            """No announce for a whole interval: one under way when it stopped being needed has landed."""
+            before = destination.announces
+            time.sleep(INTERVAL * 2)
+            return destination.announces == before
+        wait_for(quiet, timeout=10, what="the announces to stop")
         settled = destination.announces
         time.sleep(INTERVAL * 5)
         self.assertEqual(destination.announces, settled)
@@ -87,7 +93,7 @@ class DhtAnnouncerTest(unittest.TestCase):
             raise RuntimeError("bug")
 
         _, destination = self.announcer("client", needs_reach=broken)
-        wait_for(lambda: destination.announces >= 4, timeout=10)
+        wait_for(lambda: destination.announces >= 4, timeout=10, what="4 announces")
 
 
 if __name__ == "__main__":

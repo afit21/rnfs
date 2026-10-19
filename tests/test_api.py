@@ -1242,7 +1242,7 @@ class AppSupportTest(ApiTestCase):
         waiting = threading.Thread(target=self.call, args=("GET", "/api/events?after=0&wait=2"))
         waiting.start()
         self.addCleanup(waiting.join)
-        wait_for(lambda: server.server.RequestHandlerClass.event_waiters._value == 0)
+        wait_for(lambda: server.server.RequestHandlerClass.event_waiters._value == 0, what="the waiter in its slot")
         status, body = self.error("GET", "/api/events?after=0&wait=2")
         self.assertEqual((status, body["code"]), (503, "busy"))
         self.assertEqual(self.ok("GET", "/api/events?after=0")["events"], [])
