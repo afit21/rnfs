@@ -29,6 +29,7 @@ import threading
 from collections.abc import Callable, Iterable
 
 from rnfs.constants import ID_LENGTH, K
+from rnfs.dht.lookup import FIRST
 from rnfs.dht.routing import distance
 
 ID_BITS = ID_LENGTH * 8
@@ -51,15 +52,15 @@ def _shares(value: int, prefix: int, bits: int) -> bool:
 
 class Region:
     """What one region's lookup learned: the region is the keys sharing the first `bits` bits of `key`, the key looked
-    up; `closest` is that lookup's result for it; `nodes` every server learned, each with whether it ranks last
-    (unreliable and not answered); `paths` each disjoint path's own (none for a single lookup); `finds` the extra
-    /find sent. The publisher adds `rings` (key -> the ring servers its widened lookup found) and `deferred` (keys
+    up; `closest` is that lookup's result for it; `nodes` every server learned, each with its rank tier (dht.lookup:
+    UNRELIABLE if unreliable and not answered); `paths` each disjoint path's own (none for a single lookup); `finds`
+    the extra /find sent. The publisher adds `rings` (key -> the ring servers its widened lookup found) and `deferred` (keys
     flagged whose widened lookup the round couldn't afford)."""
 
     __slots__ = ("key", "bits", "closest", "nodes", "finds", "paths", "rings", "deferred")
 
-    def __init__(self, key: bytes, bits: int, closest: list[bytes], nodes: dict[bytes, bool], finds: int = 0,
-                 paths: list[dict[bytes, bool]] | None = None):
+    def __init__(self, key: bytes, bits: int, closest: list[bytes], nodes: dict[bytes, int], finds: int = 0,
+                 paths: list[dict[bytes, int]] | None = None):
         """A region found by a lookup for key."""
         self.key = key
         self.bits = bits
@@ -75,8 +76,8 @@ class Region:
         return prefix_length(key, self.key) >= self.bits
 
     def closest_to(self, key: bytes, count: int = K) -> list[bytes]:
-        """The count servers learned closest to key, ranked as a lookup ranks them (unreliable ones that haven't
-        answered after every other). For the key looked up, never fewer than its lookup found: the far half's
+        """The count servers learned closest to key, ranked as a lookup ranks them (by tier: unreliable ones that
+        haven't answered after every other). For the key looked up, never fewer than its lookup found: the far half's
         replies can name a server closer to it than one the lookup chose, never take one away."""
         if key == self.key:
             count = max(count, len(self.closest))
@@ -100,11 +101,11 @@ def find_region(lookup, key: bytes, own_id: bytes, members: Callable[[int], int]
     # Without any server found there is nothing to learn: every due key shares the outcome (retried soon)
     bits = prefix_length(key, ranked[-1]) if ranked else 0
     finds = explore(lookup, key, bits, own_id) if ranked and members(bits) >= 2 else 0
-    nodes = {n: doubtful for n, doubtful in lookup.candidates().items() if n != own_id}
+    nodes = {n: tier for n, tier in lookup.candidates().items() if n != own_id}
     for n in closest:
-        nodes.setdefault(n, False)
+        nodes.setdefault(n, FIRST)
     # A disjoint lookup's paths (rnfs.dht.disjoint), each storing to its own K closest too
-    paths = [{n: doubtful for n, doubtful in path.items() if n != own_id}
+    paths = [{n: tier for n, tier in path.items() if n != own_id}
              for path in getattr(lookup, "path_candidates", list)()]
     return Region(key, bits, closest, nodes, finds, paths)
 

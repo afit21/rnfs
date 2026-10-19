@@ -48,6 +48,10 @@ from rnfs.dht.routing import distance, is_id
 FindQuery = Callable[[bytes, bytes], tuple[list[bytes], list[bytes]] | None]
 NodeCallback = Callable[[bytes], object]  # return value ignored
 
+# Rank tiers: a run queries, and find_closest and candidates() rank, the nodes of a lower tier first, by distance within
+# each. Nodes that answered are always FIRST
+FIRST = 0  # answered, or nothing against it
+UNRELIABLE = 1  # unreliable (the routing table's) and not answered
 _POLL_INTERVAL = 0.5  # seconds between should_stop() checks while waiting for replies
 MAX_QUERIES = 8 * K  # queries a run sends at most (section 6)
 STALL_WINDOWS = 3  # a run ends after this many query windows of answers in a row that bring the key no nearer
@@ -179,16 +183,16 @@ class Lookup:
         As the spec says, these are the closest nodes known, not only those that answered: termination
         guarantees just the beta closest answered, and the stores sent to the rest show which are
         reachable. Left out: nodes that failed or were still not answering at the deadline, and
-        unqueried IDs whose identity isn't known (contacting them costs a path request). Unreliable nodes
-        come after every other, so stores are sent to them only to make up k.
+        unqueried IDs whose identity isn't known (contacting them costs a path request). Ranked by tier, then
+        distance: unreliable nodes come after every other, so stores are sent to them only to make up k.
         """
         self._run(None, lambda: False)
         candidates = self._choices(late=False)
         return sorted(candidates, key=lambda n: (candidates[n], self._distance(n)))[:self.k]
 
-    def candidates(self) -> dict[bytes, bool]:
-        """Every node find_closest chooses from, after a run (and ask()), with whether it ranks last: True for an
-        unreliable node that hasn't answered. Sweep providing ranks them for other keys near this one.
+    def candidates(self) -> dict[bytes, int]:
+        """Every node find_closest chooses from, after a run (and ask()), with its rank tier: UNRELIABLE for an
+        unreliable node that hasn't answered, else FIRST. Sweep providing ranks them for other keys near this one.
 
         The nodes the last run knew of that answered, or that it didn't query and whose identity is known; not
         those that failed or were still not answering when it ended. Unlike find_closest, also the answers that came
@@ -197,7 +201,7 @@ class Lookup:
         """
         return self._choices(late=True)
 
-    def _choices(self, late: bool) -> dict[bytes, bool]:
+    def _choices(self, late: bool) -> dict[bytes, int]:
         """candidates(), with (late) or without the answers that came after the last run ended."""
         with self._lock:
             answered = set(self._answered)
@@ -211,7 +215,7 @@ class Lookup:
                 if n not in known and self._usable(n):
                     known[n] = self._distance(n)
         doubtful, queried, out = self._last_doubtful, self._last_queried, self._out
-        return {n: n in doubtful and n not in answered for n in known
+        return {n: UNRELIABLE if n in doubtful and n not in answered else FIRST for n in known
                 if n in answered or (n not in out and n not in queried and self.is_known(n))}
 
     def ask(self, node_id: bytes, key: bytes) -> list[bytes] | None:
@@ -377,9 +381,13 @@ class Lookup:
         self._last_doubtful = doubtful
         self._out = set()
 
-        def rank(node_id: bytes) -> tuple[bool, int]:
-            """Sort key: reliable nodes (and those that answered) first, then by distance."""
-            return node_id in doubtful, known[node_id]
+        def tier(node_id: bytes) -> int:
+            """node_id's rank tier: reliable nodes (and those that answered) first."""
+            return UNRELIABLE if node_id in doubtful else FIRST
+
+        def rank(node_id: bytes) -> tuple[int, int]:
+            """Sort key: by tier, then by distance."""
+            return tier(node_id), known[node_id]
 
         def required() -> list[bytes]:
             """The nodes that must answer besides the beta closest known: the beta closest senior servers known, and
@@ -388,7 +396,7 @@ class Lookup:
             if self.size is not None:
                 by_distance = sorted(known, key=known.__getitem__)
                 ring = density.rings(by_distance, [known[node_id] for node_id in by_distance], self.size,
-                                     density.RING_ANSWERS, later=doubtful.__contains__)
+                                     density.RING_ANSWERS, later=tier)
                 if ring:
                     self.dense = True
                     needed += [node_id for node_id in ring if node_id not in needed]

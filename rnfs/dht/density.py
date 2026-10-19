@@ -40,9 +40,9 @@ META_STORE = "size_estimate"  # the meta table's store name for the samples
 _SAMPLE = 2 * ID_LENGTH  # bytes per saved sample: the key, then d_K
 
 
-def _never(node_id: bytes) -> bool:
-    """Default later: no node ranks last."""
-    return False
+def _never(node_id: bytes) -> int:
+    """Default later: every node ranks alike."""
+    return 0
 
 
 class SizeEstimate:
@@ -153,7 +153,7 @@ def radius(size: float, threshold: float = DENSITY_THRESHOLD) -> int:
 
 
 def rings(nodes: Sequence[bytes], distances: Sequence[int], size: float | None, count: int,
-          later: Callable[[bytes], bool] = _never) -> list[bytes]:
+          later: Callable[[bytes], int] = _never) -> list[bytes]:
     """The servers to reach beyond a dense core: count from each ring, the ring after the core's last rank and the ring
     beyond the radius, each closest first with the nodes later() says last (unreliable ones); none when the check
     doesn't fire or there is no estimate. nodes are ranked by distance to the key, distances theirs (ascending)."""

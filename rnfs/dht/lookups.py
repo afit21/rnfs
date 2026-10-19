@@ -181,8 +181,8 @@ class Lookups:
                                  on_complete=self.sizes.note)
         lookup.find_closest()
         nodes = dict(region.nodes)
-        for node_id, last in lookup.candidates().items():
-            nodes[node_id] = nodes.get(node_id, True) and last
+        for node_id, tier in lookup.candidates().items():
+            nodes[node_id] = min(nodes.get(node_id, tier), tier)
         ranked = sorted(nodes, key=lambda n: distance(n, key))
         return density.rings(ranked, [distance(n, key) for n in ranked], size, K, later=nodes.__getitem__)
 

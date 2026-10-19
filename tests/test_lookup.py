@@ -7,7 +7,7 @@ from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import ID_LENGTH, K
-from rnfs.dht.lookup import MAX_QUERIES, STALL_WINDOWS, Lookup
+from rnfs.dht.lookup import FIRST, MAX_QUERIES, STALL_WINDOWS, UNRELIABLE, Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import AVOID_AFTER, RoutingTable, distance
 from tests.support import FakeClock, wait_for
@@ -585,7 +585,7 @@ class CandidatesTest(LookupTestCase):
         far = ident(0x8000)  # unreliable and never asked: there are enough others
         lookup = self.lookup(net, key, [dead, hung, far] + near, timeout=0.3, unreliable={far}.__contains__)
         lookup.find_closest()
-        self.assertEqual(lookup.candidates(), {**{n: False for n in near}, far: True})
+        self.assertEqual(lookup.candidates(), {**{n: FIRST for n in near}, far: UNRELIABLE})
 
     def test_ask_merges_the_named_nodes(self):
         """ask() sends one /find about another key: its answer is counted and the nodes it names become candidates,
