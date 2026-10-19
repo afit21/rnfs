@@ -26,13 +26,12 @@ from rnfs import node as node_module
 from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content import builder
-from rnfs.content.blockstore import BlockStore
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 from tests.test_statedb import RELEASED_0_1_5_STEPS
-from tests.test_upgrade_014 import NODE_ID, make_blocks
+from tests.test_upgrade_014 import NODE_ID, FlatBlockStore, make_blocks
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "rnfs-0.1.5")
 
@@ -99,8 +98,8 @@ class UpgradeTest(unittest.TestCase):
     """A copy of the fixture under a temporary directory, with its blocks, started on with the clock at "now"."""
 
     def setUp(self):
-        """Copy the fixture and make its blocks; fake the wall clock, also for the stores that take it as an
-        argument."""
+        """Copy the fixture and make its blocks, in 0.1.6's flat layout; fake the wall clock, also for the stores
+        that take it as an argument."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = os.path.join(self.tmp.name, "rnfs")
@@ -110,7 +109,7 @@ class UpgradeTest(unittest.TestCase):
         os.makedirs(scratch)
         blocks = os.path.join(self.root, "blocks")
         self.built = make_blocks(blocks, scratch)
-        store = BlockStore(blocks)
+        store = FlatBlockStore(blocks)
         for data, name in _content().STREAMS:
             self.built.add(builder.add_stream(io.BytesIO(data), store.put, len(data), name).cid)
         self.state = os.path.join(self.root, "state")

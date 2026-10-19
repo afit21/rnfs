@@ -26,7 +26,7 @@ from rnfs import node as node_module
 from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content import builder
-from rnfs.content.blockstore import BlockStore
+from rnfs.content.blockstore import matches
 from rnfs.content.cid import Cid
 from rnfs.features import lxmf
 from rnfs.node import RnfsNode
@@ -72,10 +72,33 @@ def _content():
     return module
 
 
+class FlatBlockStore:
+    """Blocks as rnfs 0.1.6 and earlier stored them: one file per CID directly in the blocks directory,
+    blocks/<cid>. The upgrade tests write their blocks so, rather than through the current BlockStore, so that
+    they start on a directory exactly as those versions left it."""
+
+    def __init__(self, directory: str):
+        """A store writing into directory (created if missing)."""
+        self.directory = directory
+        os.makedirs(directory, exist_ok=True)
+
+    def path(self, cid: Cid) -> str:
+        """Where 0.1.6 stored the block for cid."""
+        return os.path.join(self.directory, str(cid))
+
+    def put(self, cid: Cid, block: bytes):
+        """Store block under cid, as 0.1.6's BlockStore.put left it (its temporary file renamed away)."""
+        if not matches(cid, block):
+            raise ValueError(f"block does not match {cid}")
+        with open(self.path(cid), "wb") as f:
+            f.write(block)
+
+
 def make_blocks(blocks_dir: str, scratch: str) -> set[Cid]:
-    """Store in blocks_dir the blocks of everything 0.1.4 added to the fixture, built by the current code (the
-    fixture keeps no blocks); the roots built. The CIDs must be those 0.1.4 recorded, as no CID changed."""
-    content, store, roots = _content(), BlockStore(blocks_dir), set()
+    """Store in blocks_dir, in 0.1.6's flat layout (FlatBlockStore), the blocks of everything 0.1.4 added to the
+    fixture, built by the current code (the fixture keeps no blocks); the roots built. The CIDs must be those
+    0.1.4 recorded, as no CID changed."""
+    content, store, roots = _content(), FlatBlockStore(blocks_dir), set()
     for data, name in content.STREAMS:
         roots.add(builder.add_stream(io.BytesIO(data), store.put, len(data), name).cid)
 
