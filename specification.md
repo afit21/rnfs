@@ -510,20 +510,25 @@ big-endian integer; "closest" means smallest distance.
   time the node was down included, until it is heard again. So a restart doesn't make every server new again,
   nor send path requests to find servers it already knew (rnfs: in the state database, the rows changed written
   every 30 s and at stop).
-- **Joining.** At startup a node sends `/find` for its own node ID to bootstrap nodes, one at a time, until
-  two have answered: first those it was given (`bootstrap_nodes`, `daemon --bootstrap`) in their order,
-  then, unless `default_bootstrap` is off or it is in private mode, the implementation's default bootstrap
-  nodes (rnfs: `DEFAULT_BOOTSTRAP_NODES`) in random order. It adds those that answer, then runs a lookup for
-  its own ID from the servers they listed and its routing table, without asking the contacted nodes again;
-  this fills its table with its neighbours.
-  - Bootstrap nodes are contacted outside the lookup's budget of `alpha` unknown IDs, so unreachable ones
-    don't stop the rest being tried.
+- **Joining.** At startup a node sends `/find` for its own node ID, one node at a time, until two have answered:
+  first servers of its saved routing table, then bootstrap nodes: those it was given (`bootstrap_nodes`,
+  `daemon --bootstrap`) in their order, then, unless `default_bootstrap` is off or it is in private mode, the
+  implementation's default bootstrap nodes (rnfs: `DEFAULT_BOOTSTRAP_NODES`) in random order. It adds those that
+  answer, then runs a lookup for its own ID from the servers they listed and its routing table, without asking
+  the contacted nodes again; this fills its table with its neighbours.
+  - Saved servers are asked best scored first (local scores, below), the longest known first between equals
+    (rnfs: by score band, at most 6 of them, leaving out those that failed a query since they were last heard;
+    those silent for long are asked too, as after a long downtime all are). A node that has joined once is its
+    own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio.
+  - Saved servers and bootstrap nodes are contacted outside the lookup's budget of `alpha` unknown IDs, so
+    unreachable ones don't stop the rest being tried.
   - A node behind an RNS access-point interface hears no announces from beyond it, so bootstrap nodes are
     its only way in.
   - While fewer than 3 servers are known that `/find` replies would include (not failed since last heard,
     nor silent for over `2 × announce_interval`), the node joins again, 5 minutes after the last join and
-    doubling up to `announce_interval`: on radio every path request is flooded. A node that knows only a
-    small island of servers still contacts the defaults at every start.
+    doubling up to `announce_interval`: on radio every path request is flooded. A node whose saved servers
+    answer contacts no bootstrap node, so one that knew only a small island of servers stays on it until it
+    hears announces from beyond it, or joins again with too few servers left.
   - Bootstrap nodes get no special trust: once answered, they are ordinary routing-table entries.
 - Because RNS floods announces, on small meshes (a few dozen nodes) the routing table holds most of the
   network, so lookups usually finish in one or two rounds.

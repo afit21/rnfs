@@ -274,6 +274,22 @@ class FailureAndSeniorityTest(RoutingTestCase):
         self.assertEqual(self.table.seniority(n), 0)
 
 
+class JoinOrderTest(RoutingTestCase):
+    """join_order(): the servers a join asks before bootstrap nodes."""
+
+    def test_longest_known_first_leaving_out_those_that_failed_since_heard(self):
+        young, old, failing, silent = node_id(1), node_id(2), node_id(3), node_id(4)
+        self.table.heard(old)
+        self.table.heard(silent)
+        self.clock.now += 10
+        for n in (young, failing):
+            self.table.heard(n)
+        self.table.failed(failing)
+        self.clock.now += 2 * ANNOUNCE + 1  # silent ones are still asked: after a long downtime, all are
+        self.table.heard(young)
+        self.assertEqual(self.table.join_order(), [old, silent, young])
+
+
 class ReplyFilterTest(RoutingTestCase):
     """closest(for_reply=True) leaves out nodes that failed since heard or have gone silent."""
 

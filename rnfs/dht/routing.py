@@ -362,6 +362,13 @@ class RoutingTable:
             return 2
         return 0 if now - entry.first_seen >= min_age else 1
 
+    def join_order(self) -> list[bytes]:
+        """The servers in the table that haven't failed a query since last heard, longest known first: those a join
+        asks before bootstrap nodes (the node puts the better scored first, keeping this order between equals)."""
+        with self._lock:
+            entries = [e for bucket in self._buckets for e in bucket.values() if e.failures == 0]
+        return [e.node_id for e in sorted(entries, key=lambda e: (e.first_seen, e.node_id))]
+
     def contains(self, node_id: bytes) -> bool:
         """True if node_id is in the table."""
         with self._lock:

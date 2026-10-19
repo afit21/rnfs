@@ -4,15 +4,15 @@ facade that the API, gateway and CLI call (design.md, "Node facade").
 Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), or for a node
 embedded in another program (rnfs.Node) the program's running instance, then the node's identity and its
 rnfs.dht destination, then the state database (rnfs.statedb, which imports the JSON state files of earlier
-versions first), the routing table, provider records, storage, the deny list (its accepted lists read back from
-storage), shared folder, fetcher, publisher, names and the features (rnfs.features); the request server answers
-through NodeBackend. Background threads: the announcer, the join (bootstrap nodes, then a lookup for our own ID,
-repeated while too few servers are known), the publish loop, the name re-announce loop, the features' own, a
-worker per source with remote pins waiting, and maintenance (shared-folder scans, provider record expiry and
-saves, max_storage enforcement, periodic state saves, publisher refreshes asked for, deny-list changes retried,
-the remote pins waiting saved). Stopping ends the features, then the node's services and threads (waiting for
-them, the features' too, at most STOP_TIMEOUT in all), saves every store and closes the state, each step guarded:
-one that fails skips none of the others.
+versions first), the routing table and local scores, provider records, storage, the deny list (its accepted lists
+read back from storage), shared folder, fetcher, publisher, names and the features (rnfs.features); the request
+server answers through NodeBackend. Background threads: the announcer, the join (saved servers and bootstrap nodes,
+then a lookup for our own ID, repeated while too few servers are known), the publish loop, the name re-announce
+loop, the features' own, a worker per source with remote pins waiting, and maintenance (shared-folder scans,
+provider record expiry and saves, max_storage enforcement, periodic state saves, publisher refreshes asked for,
+deny-list changes retried, the remote pins waiting saved). Stopping ends the features, then the node's services and
+threads (waiting for them, the features' too, at most STOP_TIMEOUT in all), saves every store and closes the state,
+each step guarded: one that fails skips none of the others.
 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
@@ -72,7 +72,8 @@ EVICT_INTERVAL = 60.0  # seconds between max_storage checks when nothing else tr
 GATEWAY_NAME_AGE = 60.0  # a gateway resolution reuses a record heard this recently
 STOP_TIMEOUT = 5.0  # seconds stop() waits in all for the threads it ends (the features' and the node's)
 REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetched; more are refused
-BOOTSTRAP_ANSWERS = 2  # a join stops contacting bootstrap nodes once this many have answered
+BOOTSTRAP_ANSWERS = 2  # a join stops contacting saved servers and bootstrap nodes once this many have answered
+SAVED_JOIN_TRIES = 6  # servers of the saved routing table a join asks at most, before bootstrap nodes
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 DENY_RETRY = 60.0  # seconds before maintenance applies a deny-list change again after applying it failed
@@ -968,13 +969,14 @@ class RnfsNode:
             delay = min(2 * delay, self.config.announce_interval)
 
     def join(self):
-        """Contact bootstrap nodes, then look up our own ID from what they and the routing table know."""
+        """Contact saved servers, then bootstrap nodes, then look up our own ID from what they and the routing
+        table know."""
         contacted, start = self._contact_bootstrap()
         start = start + self.routing.closest(self.node_id)
         if not start:
             log("no DHT servers known yet: waiting for announces", LOG_VERBOSE)
             return
-        # The bootstrap nodes contacted already answered (or failed) a /find for this key: not asked again
+        # The nodes contacted already answered (or failed) a /find for this key: not asked again
         lookup = self._new_lookup(self.node_id, start,
                                   lambda node_id: node_id in contacted or self.routing.is_banned(node_id))
         lookup.find_closest()
@@ -998,17 +1000,28 @@ class RnfsNode:
         """Every bootstrap node (the user's and the defaults in use) but this node: those seeded a score."""
         return set(self._bootstrap_nodes + self._default_bootstrap()) - {self.node_id}
 
-    def _contact_bootstrap(self) -> tuple[set[bytes], list[bytes]]:
-        """Ask bootstrap nodes for our own ID, one at a time, until BOOTSTRAP_ANSWERS have answered.
+    def join_candidates(self) -> list[bytes]:
+        """The nodes a join asks for our own ID, in order (section 6, "Joining"): up to SAVED_JOIN_TRIES servers of
+        the routing table, which is saved across restarts, that haven't failed a query since last heard, best
+        scored first (local scores, by band) and longest known breaking ties; then the bootstrap nodes
+        (bootstrap_ids) not among them. A node that has joined once is its own bootstrap list, so a restart doesn't
+        flood path requests for bootstrap nodes on radio."""
+        bands = self.scores.bands()
+        saved = sorted(self.routing.join_order(), key=lambda node_id: -bands.get(node_id, 0))[:SAVED_JOIN_TRIES]
+        return saved + [node_id for node_id in self.bootstrap_ids() if node_id not in saved]
 
-        Each costs a path request if its identity isn't known, outside any lookup's budget for unknown IDs,
-        so an unreachable one doesn't stop the rest being tried. Returns the nodes contacted and the
-        servers their answers listed.
+    def _contact_bootstrap(self) -> tuple[set[bytes], list[bytes]]:
+        """Ask the join's candidates (saved servers, then bootstrap nodes) for our own ID, one at a time, until
+        BOOTSTRAP_ANSWERS have answered.
+
+        Each costs a path request if its identity isn't known, outside any lookup's budget for unknown IDs, so an
+        unreachable one doesn't stop the rest being tried. Returns the nodes contacted and the servers their
+        answers listed.
         """
         contacted: set[bytes] = set()
         found: list[bytes] = []
         answered = 0
-        for node_id in self.bootstrap_ids():
+        for node_id in self.join_candidates():
             if answered >= BOOTSTRAP_ANSWERS or self.stop_event.is_set():
                 break
             contacted.add(node_id)
@@ -1017,7 +1030,7 @@ class RnfsNode:
             except Exception:  # noqa: BLE001 - an unanswering bootstrap node is skipped
                 reply = None
             if reply is None:
-                log(f"bootstrap node {node_name(node_id)} didn't answer", LOG_VERBOSE)
+                log(f"joining: {node_name(node_id)} didn't answer", LOG_VERBOSE)
                 self._query_failed(node_id)
                 continue
             answered += 1

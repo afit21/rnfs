@@ -1189,6 +1189,41 @@ class JoinTest(NodeTest):
         self.assertLess(min(distance(n, self.X_ID) for n in self.SERVERS[1:]), distance(self.SERVERS[0], self.X_ID))
         self.assertGreater(x.scores.score(self.SERVERS[0]), 0)
 
+    def test_saved_servers_are_asked_first_best_scored_first(self):
+        x = self.joiner(bootstrap_nodes=[self.DEAD[0].hex()], default_bootstrap=False)
+        for server_id in self.SERVERS:  # longest known first, between equal scores
+            x.routing.heard(server_id)
+        for _ in range(4):
+            x.scores.served(self.SERVERS[2])
+        x.scores.bad_block(self.SERVERS[1])  # after those scoring 0 (a ban would keep it out of the table)
+        self.assertEqual(x.join_candidates(),
+                         [self.SERVERS[2], self.SERVERS[0], self.SERVERS[3], self.SERVERS[1], self.DEAD[0]])
+        x.join()
+        self.assertEqual(self.finds[:2], [self.SERVERS[2], self.SERVERS[0]])
+        self.assertNotIn(self.DEAD[0], self.finds)  # two saved servers answered: no bootstrap node needed
+        self.assertEqual(len(self.finds), len(set(self.finds)))
+
+    def test_a_restart_rejoins_from_the_saved_table(self):
+        x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
+        x.join()
+        self.assertGreaterEqual(x.routing.live_count(), 3)
+        x.stop()
+        self.finds.clear()
+        x = self.joiner(bootstrap_nodes=[self.DEAD[0].hex()])  # the defaults are servers too: not needed either
+        x.join()
+        self.assertTrue(set(self.finds) <= set(self.SERVERS))
+        self.assertGreaterEqual(x.routing.live_count(), 3)
+
+    def test_saved_servers_that_failed_are_skipped_and_few_are_tried(self):
+        x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
+        gone = [bytes([0x60 + i] * 16) for i in range(node_module.SAVED_JOIN_TRIES + 2)]
+        for node_id in gone:
+            x.routing.heard(node_id)
+        x.routing.failed(gone[0])  # failed since last heard: not asked
+        x.join()
+        self.assertEqual(self.finds[:node_module.SAVED_JOIN_TRIES + 1],
+                         gone[1:node_module.SAVED_JOIN_TRIES + 1] + [self.SERVERS[0]])
+
     def test_joins_again_while_too_few_servers_are_known(self):
         x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
         first = self.net.nodes.pop(self.SERVERS[0])  # unreachable at startup

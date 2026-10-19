@@ -292,7 +292,8 @@ lock held, since it may block on RNS; the table is checked again once it answers
 `AVOID_AFTER` (300 s), doubling per further failure up to `AVOID_MAX` (3600 s); True claims the retry, pushing
 the next one back a further backoff, so concurrent lookups don't all retry it), `remove(node_id)`, `ban(node_id)`,
 `is_banned(node_id)`, `closest(key, count=K, for_reply=False)`,
-`seniority(node_id) -> float | None` (seconds in the table), `is_senior(node_id, min_age)`, `standing(node_id,
+`seniority(node_id) -> float | None` (seconds in the table), `join_order()` (the servers a join asks first, before
+the node orders them by score), `is_senior(node_id, min_age)`, `standing(node_id,
 min_age) -> int` (0 senior and healthy, 1 healthy, 2 stale, 3 absent: ranks keepers), `standings(min_age) ->
 dict` (every node's standing now: the keeper query's snapshot from before its lookup), `contains(node_id)`,
 `nodes()`, `node_count()`, `live_count()` (nodes `/find` replies would include).
@@ -1434,8 +1435,11 @@ Everything in the specification is implemented, with these simplifications and a
 - Lookups (`RnfsNode._lookup`) start from the closest nodes `/find` replies would give, then others to make up K,
   then unreliable ones if still short; answers go to `RoutingTable.answered`, failures to `failed`, and the
   join's lookup is wired the same way. A failed `/provide` or `/blocks` isn't counted there.
-- Joining (`RnfsNode._join`, `join`): bootstrap nodes are asked one at a time with `PeerClient.find`, outside
-  any `Lookup`, until `BOOTSTRAP_ANSWERS` (2) answer; the lookup that follows excludes them. The thread then
+- Joining (`RnfsNode._join`, `join`): the join's candidates (`join_candidates`: up to `SAVED_JOIN_TRIES` (6)
+  servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
+  first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with
+  `PeerClient.find`, outside any `Lookup`, until `BOOTSTRAP_ANSWERS` (2) answer; the lookup that follows excludes
+  them. The thread then
   checks `RoutingTable.live_count()` every `REJOIN_DELAY` (300 s) and joins again while it is under
   `MIN_SERVERS` (3), doubling the wait up to `announce_interval`. `DEFAULT_BOOTSTRAP_NODES` lives in
   `rnfs/constants.py` and changes only with a release; the e2e test turns it off (`default_bootstrap = false`).

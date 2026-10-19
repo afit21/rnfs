@@ -104,6 +104,10 @@ The DHT (local behaviour: nothing on the wire changes):
   verified, `/find` answers that led to providers who served or to closer servers that answered) and lost by
   failures, bad blocks and silence (scores halve each week). Bootstrap nodes start with a small seed they keep
   only by earning it. Nothing is sent; at most 4096 peers are scored.
+- A join (at start, and again while too few servers are live) asks up to 6 servers of the saved routing table
+  first, best scored first, and bootstrap nodes only if fewer than two of those answer: a node that has joined
+  once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. A node
+  whose saved servers answer no longer contacts the default bootstrap nodes at every start.
 
 ## 0.1.6
 
