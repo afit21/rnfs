@@ -631,7 +631,9 @@ and repeat.
   aren't slow keep `alpha` per lookup, and each disjoint path its own. In the topology simulation (islands of LoRa
   servers hearing 5–16% of the internet servers' announces) an island publisher's records reached 3.7–4.4 of their
   10 closest servers instead of 1.3–2.7, and internet nodes found island content 99% of the time instead of
-  68–91%, for 11–19% more publish airtime. The keeper query's own budget stays `alpha`.
+  68–91%, for 11–19% more publish airtime. Over the fake network of `tests/test_topology.py` (1,000 servers, islands
+  hearing 16%) its records reached 6.9 of their 10 closest instead of 3.6 (3,000 servers hearing 5.3%: 6.3 instead
+  of 2.4). The keeper query's own budget stays `alpha`.
 - Nodes that fail to answer are dropped from the lookup and counted in the routing table.
 - **Unreliable nodes.** An announce shows a node is alive, not that a link to it can be established: a far
   node whose announces keep arriving may never accept a link, and each query to it then costs RNS's whole
@@ -671,7 +673,10 @@ and repeat.
     server behind it look slow, but not hide them: they are still asked when the lookup needs them.
   - In the topology simulation it cut the airtime internet nodes' lookups cost the islands by 97% (27 s to 0.6 s
     each), while internet nodes still found island content 98% of the time (with the slow nodes' larger budgets
-    above). The 3-hop threshold assumes internet paths of at most 3 hops; deeper backbones need the link signal.
+    above). Over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands): island `/find` per
+    internet search 0.76 to 0, island stores per internet publish 2.5 to 0.07, island content still found 99% of the
+    time (3,000 servers: 0.93 to 0, 2.5 to 0.01, 100%). The 3-hop threshold assumes internet paths of at most 3
+    hops; deeper backbones need the link signal.
 - Every lookup has a time budget, `lookup_timeout`.
 - **Termination.** As in IPFS, a lookup is complete once the `beta` closest nodes it knows of have all
   answered, or once every known node has been queried without finding new ones. Nodes near a key can keep
