@@ -3,9 +3,10 @@
 - `rnfs:<cid>[/path][?from=<node ID>]` and `rnfs:name/<name>[/path][?from=<node ID>]`, path names percent-encoded
   as UTF-8 (parse_uri / format_uri). rnfs.Node's and rnfs.Client's targets may be one (interface.Rnfs._target).
 - The link-map field: a message carries its links in LXMF's custom fields (FIELD_CUSTOM_TYPE "rnfs",
-  FIELD_CUSTOM_DATA a list of link maps) for clients that know rnfs (encode_field / decode_field), as the LXMF
-  feature (rnfs/features/lxmf.py) sends them. tests/test_wire.py checks its bytes against the vectors of earlier
-  releases.
+  FIELD_CUSTOM_DATA a list of link maps) for clients that know rnfs (encode_field / decode_field). rnfs itself no
+  longer sends or receives LXMF messages (since 0.2.0: LXMF is an app of its own); the field stays defined here,
+  as the interop contract of the LXMF apps and other clients that carry rnfs links, and tests/test_wire.py checks
+  its bytes against the vectors of earlier releases.
 
 Everything decoded is untrusted: parsed strictly and capped. Standard library only (no RNS: the CLI and
 rnfs.Client import this).
@@ -54,24 +55,6 @@ class Link:
     def uri(self) -> str:
         """The canonical rnfs: URI."""
         return format_uri(self)
-
-    def to_json(self) -> dict:
-        """JSON-ready form (inbox, outbox and API)."""
-        return {"uri": format_uri(self), "cid": str(self.cid) if self.cid is not None else None,
-                "name": self.name.hex() if self.name is not None else None, "path": list(self.path),
-                "size": self.size, "from": self.from_node.hex() if self.from_node is not None else None}
-
-    @classmethod
-    def from_json(cls, value) -> "Link":
-        """A link from to_json's form; ValueError if it is malformed (e.g. a damaged state file)."""
-        if not isinstance(value, dict):
-            raise ValueError("a link must be an object")
-        link = parse_uri(value.get("uri"))
-        cid = Cid.parse(value["cid"]) if value.get("cid") is not None else link.cid
-        size = value.get("size")
-        if size is not None and (isinstance(size, bool) or not isinstance(size, int) or not 0 <= size < 2 ** 64):
-            raise ValueError("invalid size")
-        return Link(cid, link.name, link.path, size, link.from_node)
 
 
 def format_uri(link: Link) -> str:

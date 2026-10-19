@@ -33,7 +33,7 @@ from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH
 
 # Module paths, in start order. A feature may use the features before it
 FEATURE_MODULES: list[str] = ["rnfs.features.peers", "rnfs.features.jobs", "rnfs.features.keepers",
-                               "rnfs.features.follow", "rnfs.features.contacts", "rnfs.features.lxmf",
+                               "rnfs.features.follow", "rnfs.features.contacts",
                                "rnfs.features.deny", "rnfs.features.settings"]
 
 ApiRoute = Callable[[object], None]  # handler(api_handler)

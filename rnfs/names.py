@@ -8,7 +8,7 @@ also remembers a replayed announce as just heard, so an announce shows its recor
 ANNOUNCE_VALIDITY announce intervals after it was signed (_announce_heard): past that, resolves ask keepers. One
 older than the announce RNS took the path from, or carrying another record, is a suspected replay, as old as it is
 (RnsNetwork.recalled_emission), and resolves ask keepers at once.
-Names resolved for the gateway or LXMF auto-fetch keep their records in a bounded table, where announces of
+Names resolved for the gateway keep their records in a bounded table, where announces of
 names this node never resolved can't push them out, and their highest sequence in a bounded persisted floor, saved
 within seconds of a resolve or an announce raising it, where names resolved in the last FLOOR_KEEP_AGE are forgotten
 only past a hard bound.
@@ -435,7 +435,7 @@ class NameAnnounceHandler:
 
 
 class _NameFloor(Mapping):
-    """The highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), and when it was last
+    """The highest sequence of each name resolved without persist (the gateway), and when it was last
     resolved (wall clock), least recently resolved first, persisted in the name_floor table. One value per name,
     (sequence, resolved, used), used being its row's place in the table; read as a mapping of name -> (sequence,
     resolved).
@@ -743,7 +743,7 @@ class NameManager:
 
         self._remove_old_temps()
         self._db = statedb.connect(config.state_dir)
-        # The highest sequence of each name resolved without persist (gateway, LXMF auto-fetch), bounded and saved
+        # The highest sequence of each name resolved without persist (the gateway), bounded and saved
         self._floor = _NameFloor(self._db, self._lock, clock, monotonic, self._floor_size)
         try:
             self._load_keys()
@@ -1113,7 +1113,7 @@ class NameManager:
         """The highest record held for name after refreshing it: {"name", "cid", "sequence", "age"}, or None.
 
         persist is True for the CLI and API (the highest sequence is then kept forever) and False for the gateway
-        and LXMF auto-fetch (the record goes only into the bounded table, and its sequence into the bounded floor).
+        (the record goes only into the bounded table, and its sequence into the bounded floor).
         The network refresh, which can take path_timeout and then a keeper query, is skipped for this node's own
         names, when the held record was heard less than max_age seconds ago, and when a refresh of the name ended
         less than max_age ago (_shared_refresh). A resolve finding a refresh of the name running waits for it.

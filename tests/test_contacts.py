@@ -224,7 +224,7 @@ class ContactsNodeTest(unittest.TestCase):
         for text, kind in (("anode", "name"), ("nobody", "node"), ("Bad!", "node")):
             with self.assertRaises(ValueError):
                 self.book.resolve_id(text, kind)
-        # Worded for each kind: LXMF's recipients come through here too
+        # Worded for each kind, LXMF addresses too (contacts an LXMF app reads through the API)
         self.book.add("relay", B_ID.hex(), "lxmf")
         self.assertEqual(self.book.resolve_id("relay", "lxmf"), B_ID)
         for text, kind, message in (("anode", "lxmf", "contact anode is not an LXMF address"),
@@ -251,7 +251,7 @@ class ContactsNodeTest(unittest.TestCase):
                 self.assertEqual([p.default for p in actual.parameters.values()],
                                  [p.default for p in expected.parameters.values()])
         # And the features using it declare it
-        for name in ("jobs", "keepers", "follow", "lxmf"):
+        for name in ("jobs", "keepers", "follow"):
             self.assertIs(self.b.feature(name).dependency("contacts"), self.book)
 
 

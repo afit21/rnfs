@@ -8,10 +8,9 @@ two classes can't drift apart; only lifecycle, how name records are heard, and t
 A target is a Cid, `<cid>[/name…]` (whose first part may be a name contact's nick), or an rnfs: URI (section 13):
 a name URI's name is resolved first (persisted, as names.resolve does), and its from= is the from_node of the
 methods taking one. Node IDs are 16 bytes or 32 hex characters; names 16 bytes, 32 hex characters or a Name, and a
-name contact's nick where the API takes one (resolve, keep, follow); an LXMF recipient 16 bytes, 32 hex characters
-or an LXMF contact's nick.
+name contact's nick where the API takes one (resolve, keep, follow).
 
-The features' methods (peers, stats, contacts, names.keep and follow, lxmf) call the feature as its API route does,
+The features' methods (peers, stats, contacts, names.keep and follow) call the feature as its API route does,
 so a Node raises what a Client gets back: NotFound when the feature isn't loaded, ValueError for what it refuses.
 timeout() bounds a Client's requests per thread; a Node, which makes none, only checks its argument.
 
@@ -35,16 +34,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from rnfs import ids
-from rnfs.config import LXMF_DEPRECATION
 from rnfs.content.cid import Cid
 from rnfs.errors import Closed, NotFound, RnfsError
 from rnfs.events import EVENT_KINDS
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
 from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
 from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
-                          Exported, Followed, FolderSync, Imported, Info, Kept, LxmfAddress, Message, Outgoing, Peer,
-                          Pin, Record, RemotePin, Sent, ServedPins, Settings, SettingsChange, Stat, Stats, Status,
-                          Synced, Uncached, Verified, Written)
+                          Exported, Followed, FolderSync, Imported, Info, Kept, Peer, Pin, Record, RemotePin,
+                          ServedPins, Settings, SettingsChange, Stat, Stats, Status, Uncached, Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
@@ -421,7 +418,6 @@ class Rnfs:
         self.jobs = Jobs(self)
         self.deny = Deny(self)
         self.contacts = Contacts(self)
-        self.lxmf = Lxmf(self)
         self.events = Events(self)
 
     # Lifecycle
@@ -1491,125 +1487,6 @@ class Contacts:
         return [Contact.from_dict(contact) for contact in self._owner._backend.contacts()]
 
 
-@dataclass(frozen=True)
-class Fetched:
-    """One link fetched by Lxmf.get: its target (`<cid>[/path]`, a name link's name resolved) and output path;
-    the Job fetching it (a Node's and a daemon's jobs feature runs the fetch as a job) or, fetched in the call, its
-    CID; warnings (a name link fetched by the CID it was sent with), and error if it failed after an earlier link
-    had started (the first link's failure is raised instead)."""
-
-    target: str
-    output: str
-    job: Job | None = None
-    cid: Cid | None = None
-    warnings: tuple[str, ...] = ()
-    error: str | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict, owner: Rnfs | None = None) -> "Fetched":
-        """From the API's form: {"target", "output", "job" | "cid", "warnings"?, "error"?}."""
-        job, cid = data.get("job"), data.get("cid")
-        return cls(data["target"], data["output"], Job.from_dict(job, owner) if job else None,
-                   Cid.parse(cid) if cid else None, tuple(data.get("warnings") or ()), data.get("error"))
-
-    def to_dict(self) -> dict:
-        """The API's form, every key present (None where the node leaves one out)."""
-        return {"target": self.target, "output": self.output, "job": self.job.to_dict() if self.job else None,
-                "cid": str(self.cid) if self.cid else None, "warnings": list(self.warnings), "error": self.error}
-
-
-def _lxmf_deprecated(method: str):
-    """Warn that Lxmf's method is deprecated (DeprecationWarning, at the line calling it: stacklevel 3, past this
-    and the method). Python's warning filters decide how often it shows: by default once per calling line, and
-    only for code run as __main__ unless the program or -W shows DeprecationWarning."""
-    warnings.warn(f"lxmf.{method}() is deprecated: {LXMF_DEPRECATION}", DeprecationWarning, stacklevel=3)
-
-
-class Lxmf:
-    """A node's LXMF messaging (Rnfs.lxmf; rnfs/features/lxmf.py): rnfs links sent to and received from LXMF
-    addresses (Sideband, NomadNet, MeshChat, other rnfs nodes). A Node runs it only with settings
-    {"lxmf_enabled": True}; while it is off, address, send and sync raise ValueError saying why (inbox and outbox
-    list what is stored). Every method raises NotFound without the lxmf feature.
-
-    Deprecated since 0.2.0 (config.LXMF_DEPRECATION): each method works as before, but first warns
-    (DeprecationWarning). rnfs: URIs stay rnfs's: a target may still be one, and the inbox events are unchanged."""
-
-    def __init__(self, owner: Rnfs):
-        """The LXMF messaging of owner."""
-        self._owner = owner
-
-    def address(self) -> LxmfAddress:
-        """This node's LXMF address and display name, the propagation node set and the nearest one heard."""
-        _lxmf_deprecated("address")
-        self._owner._check()
-        return LxmfAddress.from_dict(self._owner._backend.lxmf_address())
-
-    def send(self, to, target, message: str | None = None, *, propagate: bool = False,
-             nearest: bool = False) -> Sent:
-        """Send a link to target (a Cid, `<cid>[/path]`, a name contact's nick path or an rnfs: URI, a name URI
-        sent as a name link that follows the name), with message as its text, to to (an LXMF address: 16 bytes
-        or 32 hex characters; or an LXMF contact's nick). Direct unless propagate (through the propagation node;
-        nearest: without lxmf_propagation_node set, the nearest heard); a direct message that fails is sent again
-        through the propagation node, if one is set. Returns once queued: outbox() says how it went. Raises
-        ValueError (LXMF off, recipient or target invalid, no propagation node), NotFound (no announce heard
-        from the recipient yet: a path request was sent, try again shortly)."""
-        _lxmf_deprecated("send")
-        self._owner._check()
-        if isinstance(target, Cid):
-            target = str(target)
-        elif not isinstance(target, str):
-            raise ValueError(f"a target is a Cid, <cid>[/path] or an rnfs: URI, not {type(target).__name__}")
-        return Sent.from_dict(self._owner._backend.lxmf_send(hash_arg(to), target, message, bool(propagate),
-                                                             bool(nearest)))
-
-    def inbox(self) -> list[Message]:
-        """The messages received with rnfs links, oldest first."""
-        _lxmf_deprecated("inbox")
-        self._owner._check()
-        return [Message.from_dict(entry) for entry in self._owner._backend.lxmf_inbox()]
-
-    def get(self, id: int, *, link: int | None = None, output=None, directory=None,
-            use_sent_cid: bool = False) -> list[Fetched]:
-        """Fetch the links of inbox message id (only link, 1-based, if given) and write each to output (one
-        link; must not exist) or into directory under its last path name (the root CID if that name is unsafe:
-        the sender chose it), asking the sender's node first, then the DHT. Each fetch is a job (Fetched.job).
-        A name link whose name can't be resolved raises NotFound before anything starts, unless use_sent_cid:
-        then the CID it was sent with is fetched (nothing ties it to the name), with a warning. Raises NotFound (no
-        such message), ValueError (id or link invalid, neither or a clashing output)."""
-        _lxmf_deprecated("get")
-        self._owner._check()
-        results = self._owner._backend.lxmf_inbox_get(
-            id, link, _abspath(output) if output is not None else None,
-            _abspath(directory) if directory is not None else None, bool(use_sent_cid))
-        return [Fetched.from_dict(result, self._owner) for result in results]
-
-    def remove(self, id: int) -> int:
-        """Remove inbox message id, releasing the pins its links were auto-fetched under; 1. Raises NotFound (no
-        such message), ValueError."""
-        _lxmf_deprecated("remove")
-        self._owner._check()
-        return self._owner._backend.lxmf_inbox_rm(id, False)
-
-    def remove_all(self) -> int:
-        """Remove every inbox message, releasing their auto-fetched pins; how many."""
-        _lxmf_deprecated("remove_all")
-        self._owner._check()
-        return self._owner._backend.lxmf_inbox_rm(None, True)
-
-    def outbox(self) -> list[Outgoing]:
-        """The messages sent, oldest first, with their delivery state."""
-        _lxmf_deprecated("outbox")
-        self._owner._check()
-        return [Outgoing.from_dict(entry) for entry in self._owner._backend.lxmf_outbox()]
-
-    def sync(self, nearest: bool = False) -> Synced:
-        """Start downloading the messages waiting at the propagation node (nearest: without lxmf_propagation_node
-        set, the nearest heard). Raises ValueError (LXMF off)."""
-        _lxmf_deprecated("sync")
-        self._owner._check()
-        return Synced.from_dict(self._owner._backend.lxmf_sync(bool(nearest)))
-
-
 def _whole(value, name: str, none: bool = False) -> int | None:
     """value if it is a whole number of at least 0 (or None, if none); ValueError otherwise, as the API's
     parse_int refuses it."""
@@ -1621,8 +1498,8 @@ def _whole(value, name: str, none: bool = False) -> int | None:
 
 
 class Events:
-    """What changes on a node (Rnfs.events; rnfs/events.py; design.md, "Events"): jobs, pins, the cache, the LXMF
-    boxes, names and peers, each an Event, so an app follows them instead of polling every list. A Node hears its
+    """What changes on a node (Rnfs.events; rnfs/events.py; design.md, "Events"): jobs, pins, the cache, names,
+    peers and remote pins, each an Event, so an app follows them instead of polling every list. A Node hears its
     own as they are published; a Client long-polls GET /api/events. A daemon before 0.2.0 has no events:
     NoSuchEndpoint (a NotFound)."""
 

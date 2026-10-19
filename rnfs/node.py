@@ -161,9 +161,10 @@ def import_remote_pins(value: list, tx) -> int:
     return count
 
 
-# The node's subdirectories of the rnfs dir (Config.state_dir, blocks_dir, identity_path's, names_dir; LXMF's
-# ratchets), made private at each start. Not files/, the shared folder, whose contents the user chooses
-PRIVATE_SUBDIRS = ("state", "blocks", "storage", "names", "lxmf")
+# The node's subdirectories of the rnfs dir (Config.state_dir, blocks_dir, identity_path's, names_dir), made private
+# at each start. Not files/, the shared folder, whose contents the user chooses; nor lxmf/, the LXMF router state
+# rnfs before 0.2.0 kept there, left as it is for an LXMF app to adopt (rnfs no longer creates it)
+PRIVATE_SUBDIRS = ("state", "blocks", "storage", "names")
 _DIRECTORY_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | fsutil.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
                     | getattr(os, "O_NONBLOCK", 0))
 
@@ -727,8 +728,7 @@ class RnfsNode:
         # name, never the pin it names, which is committed durably first; its save writes a name whose write failed
         self.pin_names = self._add_store(PinNames(config.state_dir), batched=False)
         self.pin_names.prune_labels(self.storage.pinned_cids())
-        # The apps rnfs app add issued tokens to (the API's callers besides the CLI), written through; before the
-        # features: LXMF's start-up release of its pins checks for an app called lxmf
+        # The apps rnfs app add issued tokens to (the API's callers besides the CLI), written through
         self.apps = self._add_store(AppRegistry(config.state_dir), batched=False)
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
@@ -2075,14 +2075,9 @@ class RnfsNode:
 
     def app_add(self, name: str) -> dict:
         """Issue a token to a new app called name: {"name", "created", "token"}, the only time the token is given.
-        Raises ValueError for an invalid name or one taken, and for lxmf while the LXMF built into rnfs is on: its
-        pins (app:lxmf:<address>) would be the app's too."""
+        Raises ValueError for an invalid name or one taken. An app called lxmf holds the app:lxmf:<address> pins
+        the LXMF feature of rnfs before 0.2.0 made (storage.LXMF_PREFIX), and removing it releases them."""
         check_app_name(name)
-        lxmf = self.features.get("lxmf")
-        if name == "lxmf" and lxmf is not None and lxmf.in_use():
-            raise ValueError("the LXMF built into rnfs is on, and pins with app:lxmf: itself: set lxmf_enabled to "
-                             "false (rnfs config set lxmf_enabled false) and restart the daemon before adding an "
-                             "app called lxmf")
         return self.apps.add(name)
 
     def app_ls(self) -> list[dict]:

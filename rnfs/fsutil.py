@@ -421,7 +421,7 @@ MAX_COMBINING_RUN = 2  # combining marks kept in a row (some scripts stack two);
 
 
 def printable_label(text) -> str:
-    """text, a label someone else chose (an LXMF display name), escaped as printable() does, and also where it
+    """text, a label someone else chose (e.g. a display name), escaped as printable() does, and also where it
     could pass for another label or for none: backslashes (so it can't spell out an escape), the blank fillers,
     a combining mark that follows no printed character (it would join what was printed before) or makes more
     than MAX_COMBINING_RUN in a row, and a label of nothing but spaces. Not for paths: printable() keeps a
@@ -462,7 +462,7 @@ def unsafe_name_reason(name: str) -> str | None:
 def safe_default_name(name, fallback):
     """name if it is fit to be an output name chosen without asking the user, else fallback.
 
-    The name comes from someone else (a DAG entry, a sealed name, an LXMF link), so beyond being one
+    The name comes from someone else (a DAG entry, a sealed name), so beyond being one
     plain path component here it must be printable and not hidden: a dotfile such as .bash_login or
     .npmrc written into the current directory unnoticed could change how other programs behave. Nor may
     it start with "-", which a later shell command would read as an option.

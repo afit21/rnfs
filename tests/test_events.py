@@ -41,7 +41,7 @@ class EventLogTest(unittest.TestCase):
     def test_restart_is_reported(self):
         """A sequence beyond the log's, or another epoch, means the daemon restarted: lost, and all held."""
         log = EventLog()
-        log.publish("inbox", id=1)
+        log.publish("job", id="1")
         self.assertTrue(log.since(10)["lost"])
         result = log.since(1, epoch="another run")
         self.assertTrue(result["lost"])

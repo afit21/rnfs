@@ -475,7 +475,7 @@ class ApiConnection:
 
     request() and call() are the whole protocol; get() and post() call any endpoint (features' too); the other
     methods are every core route (api.ApiHandler.ROUTES), jobs, the deny list and the features' routes rnfs.Client
-    uses (peers, contacts, keep, follow, LXMF), returning what the API answers (design.md, "Node facade"). Every
+    uses (peers, contacts, keep, follow), returning what the API answers (design.md, "Node facade"). Every
     failure raises an ApiError subclass. timeout bounds each request (None: no bound; see the module docstring for
     using_timeout and a call's own).
     """
@@ -840,7 +840,7 @@ class ApiConnection:
 
     def app_add(self, name: str) -> dict:
         """Issue a token to a new app called name: {"name", "created", "token"}, the only time the token is given.
-        BadRequest for an invalid name, one taken, or lxmf while the daemon's own LXMF is on."""
+        BadRequest for an invalid name or one taken."""
         return self.post("/api/apps/add", name=name)
 
     def app_rm(self, name: str) -> dict:
@@ -1141,7 +1141,7 @@ class ApiConnection:
         return self._post("/api/jobs/clear", id=job_id)["removed"]
 
     # The features' routes rnfs.Client uses (rnfs/features/: NotFound from a daemon without the feature). A name
-    # is 32 hex characters or a name contact's nick; an LXMF recipient an address (hex) or an LXMF contact's nick
+    # is 32 hex characters or a name contact's nick
 
     def peers(self) -> list[dict]:
         """Every node the daemon knows, nearest first: [{"node_id", "mode", "in_table", "seniority", "senior",
@@ -1195,40 +1195,3 @@ class ApiConnection:
     def name_following(self) -> list[dict]:
         """Every followed name: [{"name", "pinned", "latest", "sequence", "state"}]."""
         return self.get("/api/name/following")["following"]
-
-    def lxmf_address(self) -> dict:
-        """{"address", "display_name", "propagation_node", "nearest_propagation_node"}; BadRequest if LXMF is off."""
-        return self.get("/api/lxmf/address")
-
-    def lxmf_send(self, to: str, target: str, message: str | None = None, propagate: bool = False,
-                  nearest: bool = False) -> dict:
-        """Send a link to target (and message) over LXMF, queued: {"id", "hash", "to", "method"}."""
-        return self._post("/api/lxmf/send", to=to, target=target, message=message, propagate=propagate or None,
-                          nearest=nearest or None)
-
-    def lxmf_inbox(self) -> list[dict]:
-        """The inbox, oldest first: [{"id", "hash", "from", "display_name", "sent", "received", "title", "text",
-        "method", "links", "auto", "trusted", "contact"}]."""
-        return self.get("/api/lxmf/inbox")["messages"]
-
-    def lxmf_inbox_get(self, entry_id: int, link: int | None = None, output: str | None = None,
-                       directory: str | None = None, use_sent_cid: bool = False) -> list[dict]:
-        """Fetch inbox message entry_id's links (or link, 1-based) to output or into directory (paths on this
-        machine): [{"target", "output", "job" | "cid", "warnings"?, "error"?}]."""
-        output = os.path.abspath(os.path.expanduser(output)) if output is not None else None
-        directory = os.path.abspath(os.path.expanduser(directory)) if directory is not None else None
-        return self._post("/api/lxmf/inbox/get", id=entry_id, link=link, output=output, directory=directory,
-                          use_sent_cid=use_sent_cid or None)["results"]
-
-    def lxmf_inbox_rm(self, entry_id: int | None = None, every: bool = False) -> int:
-        """Remove inbox message entry_id, or every one (every); how many (NotFound for an id there isn't)."""
-        return self.post("/api/lxmf/inbox/rm", **({"all": True} if every else {"id": entry_id}))["removed"]
-
-    def lxmf_outbox(self) -> list[dict]:
-        """The messages sent, oldest first: [{"id", "hash", "to", "time", "links", "text", "method", "state",
-        "progress", ...}]."""
-        return self.get("/api/lxmf/outbox")["messages"]
-
-    def lxmf_sync(self, nearest: bool = False) -> dict:
-        """Start downloading waiting messages from the propagation node: {"propagation_node", "started"}."""
-        return self._post("/api/lxmf/sync", nearest=nearest or None)

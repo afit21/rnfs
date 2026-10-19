@@ -40,8 +40,8 @@ class SettingsFeature(Feature):
     """Reads and changes rnfs.toml for the API, applying LIVE settings to the running node. Thread-safe."""
 
     name = NAME
-    # What some live settings are copied into: the job manager, the keeper store, LXMF's sender lists
-    optional = ("jobs", "keepers", "lxmf")
+    # What some live settings are copied into: the job manager, the keeper store
+    optional = ("jobs", "keepers")
 
     def __init__(self, node):
         """Nothing to load: rnfs.toml is read at each request."""
@@ -227,21 +227,6 @@ def _keep_max_names(feature: SettingsFeature, value: int):
         keepers.store.max_names = value
 
 
-def _lxmf_senders(attribute: str):
-    """A hook replacing LXMF's set of normalised addresses attribute (accept_from or auto_fetch_from) whole. A
-    sender taken off lxmf_auto_fetch_from has its queued links refused when their turn comes, as at a start."""
-
-    def hook(feature: SettingsFeature, value: list[str]):
-        """Replace the set."""
-        lxmf = feature.dependency("lxmf")
-        if lxmf is not None:
-            from rnfs.features.lxmf import parse_address
-            setattr(lxmf, attribute, {parse_address(address).hex() for address in value})
-
-    hook.__name__ = f"_lxmf_{attribute}"
-    return hook
-
-
 # Settings applied at once: name -> hook (None: read from node.config at each use, which is enough). Each was
 # checked against the code using it; config.LIVE_SETTINGS names exactly these (tests/test_settings.py checks)
 LIVE = {
@@ -260,10 +245,6 @@ LIVE = {
     "keep_max_names": _keep_max_names,
     "keeper_query": None,  # KeepersFeature.always_ask, at each resolve
     "follow_quota": None,  # FollowFeature, at each fetch of a new target
-    "lxmf_accept_from": _lxmf_senders("accept_from"),
-    "lxmf_auto_fetch_from": _lxmf_senders("auto_fetch_from"),
-    "lxmf_auto_fetch_quota": None,  # LxmfFeature._fetch_and_pin
-    "lxmf_send_from_hint": None,  # LxmfFeature, at each link sent
 }
 
 

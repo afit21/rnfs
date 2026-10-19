@@ -24,7 +24,7 @@ _passing = threading.local()
 
 def log(message: str, level: int = LOG_INFO):
     """Log message with an "rnfs" prefix at the given RNS loglevel, non-printable characters escaped."""
-    # Messages carry remote-chosen names (DAG entries, LXMF links, request paths): escaping here, once,
+    # Messages carry remote-chosen names (DAG entries, request paths): escaping here, once,
     # keeps escape sequences and fake newlines out of every log line without each caller remembering
     text = printable(message)
     sink = _debug_sink

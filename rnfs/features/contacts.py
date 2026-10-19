@@ -9,9 +9,10 @@
 - A target may start with a name contact's nick: `rnfs get alice/docs/report.pdf` resolves alice's name to
   its CID first (RnfsNode._parse_target calls expand_target; never for the gateway, so web pages can't use
   or probe the address book). Wherever the CLI takes a node ID (`get --from`, `ping`, `pin remote`), a node
-  contact's nick works too (node_arg). The LXMF feature resolves a recipient's nick with resolve_id(nick, "lxmf"),
-  trusts senders that has(address, "lxmf") finds, and names them in the inbox listing with nick_of(address,
-  "lxmf"). What other features may call is rnfs.features.ContactsApi (tests/test_contacts.py checks it).
+  contact's nick works too (node_arg). What other features may call is rnfs.features.ContactsApi
+  (tests/test_contacts.py checks it).
+- LXMF contacts are for apps: rnfs itself no longer sends or receives LXMF (since 0.2.0), but an LXMF app reads the
+  address book through the API (GET /api/contacts) to decide which senders it trusts and to name them.
 - Stored in the state database's contacts table (rnfs.statedb), each change written at once, durably; at most
   MAX_CONTACTS entries.
 
@@ -200,7 +201,7 @@ class ContactsFeature(Feature):
                     for nick, (kind, ident) in sorted(self._contacts.items())]
 
     def lookup(self, nick: str, kind: str | None = None) -> bytes | None:
-        """The hash of contact nick (of that kind, if given), or None. For other features (e.g. LXMF's send)."""
+        """The hash of contact nick (of that kind, if given), or None. For other features too."""
         if not is_nick(nick):
             return None
         with self._lock:
@@ -210,13 +211,13 @@ class ContactsFeature(Feature):
         return entry[1]
 
     def has(self, ident: bytes, kind: str) -> bool:
-        """Whether some contact of that kind has hash ident (for other features: LXMF trusts its contacts)."""
+        """Whether some contact of that kind has hash ident (for other features)."""
         with self._lock:
             return (kind, bytes(ident)) in self._nicks
 
     def nick_of(self, ident: bytes, kind: str) -> str | None:
         """The nick of the contact of that kind with hash ident (the first by nick if several name it), or None
-        (for other features: the LXMF inbox listing names its senders' contacts)."""
+        (for other features)."""
         with self._lock:
             nicks = self._nicks.get((kind, bytes(ident)))
             return min(nicks) if nicks else None
@@ -233,7 +234,7 @@ class ContactsFeature(Feature):
     def resolve_id(self, text: str, kind: str) -> bytes:
         """32 hex characters as bytes, or the hash of a contact of kind with that nick. ValueError otherwise.
 
-        Other features call it too (keepers' and follow's names, LXMF's recipients), so they all word it alike.
+        Other features call it too (keepers' and follow's names), so they all word it alike.
         """
         try:
             return parse_hex(text)

@@ -146,10 +146,11 @@ class FixtureCase(unittest.TestCase):
 
     def start(self) -> RnfsNode:
         """An offline node on the copy (stopped before the directory is removed)."""
-        # As a start reads them from rnfs.toml: max_records, retired in 0.2.0, is left out with a warning
+        # As a start reads them from rnfs.toml: max_records and the lxmf_* settings, retired in 0.2.0, are left out
+        # with a warning
         config = Config.combine(self.root, EXPECTED["settings"])
         self.assertEqual([warning.split(":")[0] for warning in config.warnings],
-                         ["ignoring max_records in rnfs.toml"])
+                         ["ignoring lxmf_auto_fetch_from in rnfs.toml", "ignoring max_records in rnfs.toml"])
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
@@ -212,8 +213,8 @@ class UpgradeTest(FixtureCase):
 
     def test_lxmf_pins_become_app_pins(self):
         """The fixture's two lxmf:<address> pins (an auto-fetch sender's) are app:lxmf:<address> pins after the
-        upgrade, of the same CIDs, and no lxmf: source is left; the LXMF feature still counts them as its own (its
-        inbox records them), so they are kept."""
+        upgrade, of the same CIDs, and no lxmf: source is left. No part of rnfs releases them since LXMF left it in
+        0.2.0: they are kept for an app called lxmf (tests/test_apps.py: removing that app releases them)."""
         legacy = {row(values) for values in EXPECTED["tables"]["pins"] if values[1].startswith("lxmf:")}
         self.assertEqual(len(legacy), 2)
         node = self.start()

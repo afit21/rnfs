@@ -2,13 +2,14 @@
 (tests/fixtures/rnfs-0.1.4, every one of its 17 JSON state files populated; see its README) holds every record.
 
 Each store's state in memory is compared with the fixture's files read here with plain json, so the expectation
-comes from the fixture itself. The only differences allowed are those the 0.1.4 load made too: outbox messages
-not finished are failed (LXMF doesn't persist its queue), and the node's own provider records are stored again
-(the publisher records itself for everything it provides); and 0.2.0's own: the departed and evicted publishers
-providers.json remembers aren't imported, and the newcomer pool's records are no longer pooled (0.2.0's record
-budget and storage tiers replaced both). Then: each file is kept as <name>.migrated, none is
-set aside as damaged, the migrated table counts each file's records, a second start changes nothing, and a
-restart keeps everything.
+comes from the fixture itself. The only differences allowed are those the 0.1.4 load made too: the node's own
+provider records are stored again (the publisher records itself for everything it provides); and 0.2.0's own: the
+departed and evicted publishers providers.json remembers aren't imported, and the newcomer pool's records are no
+longer pooled (0.2.0's record budget and storage tiers replaced both). The LXMF inbox and outbox, which no store of
+0.2.0 reads (LXMF moved out of rnfs into an app of its own), are compared as the state database holds them, kept
+for that app: exactly as 0.1.4 wrote them. Then: each file is kept as <name>.migrated, none is set aside as
+damaged, the migrated table counts each file's records, a second start changes nothing, and a restart keeps
+everything.
 
 The clock is the fixture's T0 plus a day (generate.py), so no record has expired."""
 import functools
@@ -31,7 +32,6 @@ from rnfs.content import builder
 from rnfs.content.blockstore import matches
 from rnfs.content.cid import Cid
 from rnfs.content.storage import upgraded_source
-from rnfs.features import lxmf
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, pinned_entries, state_rows
 from tests.test_names import FakeNetwork
@@ -41,13 +41,12 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "
 T0 = 1792054800.0  # the fake clock generate.py wrote the fixture at (records span T0 - 3 days to T0 + 1 hour)
 NOW = T0 + 86400.0
 NODE_ID = bytes.fromhex("4e0de1d04e0de1d04e0de1d04e0de1d0")  # generate.py's NODE_ID
-# generate.py's SETTINGS: nothing in the fixture is filtered out by configuration. max_records is retired in 0.2.0:
-# start() leaves it out with a warning, as a start does with an rnfs.toml holding it
+# generate.py's SETTINGS: nothing in the fixture is filtered out by configuration. max_records and the lxmf_*
+# settings are retired in 0.2.0: start() leaves them out with a warning, as a start does with an rnfs.toml holding them
 SETTINGS = {"remote_pin_identities": ["0123456789abcdef0123456789abcdef"],
             "lxmf_auto_fetch_from": ["a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"], "max_records": 40, "slow": "no",
             "path_timeout": 2, "lookup_timeout": 2}
 LEGACY = [item.file for item in statedb.LEGACY]
-UNFINISHED_ERROR = "the daemon stopped before it was delivered"
 
 _saved_loglevel = RNS.loglevel
 
@@ -131,12 +130,6 @@ def cids(texts) -> list[Cid]:
     return [Cid.parse(text) for text in texts]
 
 
-def unfinished(message: dict) -> bool:
-    """An outbox message not finished when the daemon stopped (as LxmfFeature tells them at start)."""
-    return message["state"] not in lxmf.FINAL_STATES and not (message["method"] == "propagated"
-                                                                and message["state"] == "sent")
-
-
 def loadable_jobs() -> list[dict]:
     """The fixture's jobs this platform loads: a get's output must be absolute, and /home/... isn't on Windows
     (Python 3.13 and later), so there 0.1.4 and the import both skip it."""
@@ -169,7 +162,7 @@ class UpgradeTest(unittest.TestCase):
         """An offline node on the copy (stopped before the directory is removed)."""
         config = Config.combine(self.root, SETTINGS)
         self.assertEqual([warning.split(":")[0] for warning in config.warnings],
-                         ["ignoring max_records in rnfs.toml"])
+                         ["ignoring lxmf_auto_fetch_from in rnfs.toml", "ignoring max_records in rnfs.toml"])
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
@@ -316,23 +309,26 @@ class UpgradeTest(unittest.TestCase):
                           for nick, (kind, ident) in node.feature("contacts")._contacts.items()},
                          fixture("contacts.json")["contacts"])
 
+    def box(self, box: str) -> tuple[list[dict], int]:
+        """The LXMF box's records in the state database (rnfs.lxmf_messages), oldest first, and its next id."""
+        db = statedb.connect(self.state)
+        try:
+            rows = db.query("SELECT id, record FROM lxmf_messages WHERE box = ? ORDER BY id", (box,))
+            return [statedb.load(record) for _, record in rows], db.meta(box, "next_id")
+        finally:
+            db.close()
+
     def check_inbox(self, node: RnfsNode):
         """Every inbox message with its exact text (non-BMP characters included) and auto-fetch results, and
         the next id."""
         expected = fixture("lxmf_inbox.json")
-        inbox = node.feature("lxmf").inbox
-        self.assertEqual(inbox.entries(), expected["messages"])
-        self.assertEqual(inbox._next_id, expected["next_id"])
+        self.assertEqual(self.box("inbox"), (expected["messages"], expected["next_id"]))
 
     def check_outbox(self, node: RnfsNode):
-        """Every outbox message with its exact text; those not finished are failed now."""
+        """Every outbox message with its exact text, those not finished too (as they were: nothing loads them)."""
         expected = fixture("lxmf_outbox.json")
-        messages = [{**message, "state": "failed", "error": UNFINISHED_ERROR} if unfinished(message) else message
-                    for message in expected["messages"]]
-        self.assertTrue(any(map(unfinished, expected["messages"])))
-        outbox = node.feature("lxmf").outbox
-        self.assertEqual(outbox.entries(), messages)
-        self.assertEqual(outbox._next_id, expected["next_id"])
+        self.assertTrue(any(message["state"] in ("outbound", "sending") for message in expected["messages"]))
+        self.assertEqual(self.box("outbox"), (expected["messages"], expected["next_id"]))
 
     def check_all(self, node: RnfsNode):
         """Every store's check."""

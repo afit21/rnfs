@@ -1,9 +1,12 @@
 """The LXMF inbox and outbox records (the state database's lxmf_messages table) and their import from rnfs 0.1.4.
 
-rnfs 0.1.4 kept its LXMF inbox and outbox in <state>/lxmf_inbox.json and lxmf_outbox.json; statedb.migrate imports
-them once into the lxmf_messages table (one row per record, in its box: "inbox" or "outbox", with each box's
-next id and whether it was read whole in the meta table), checked and bounded as the LXMF feature always loaded
-them: import_inbox and import_outbox.
+LXMF messaging was part of rnfs until 0.2.0, which moved it out into an app of its own. Its messages stay in the
+lxmf_messages table (one row per record, in its box: "inbox" or "outbox", with each box's next id and whether it
+was read whole in the meta table) for an LXMF app to import; nothing in rnfs reads, changes or deletes them.
+
+rnfs 0.1.4 kept them in <state>/lxmf_inbox.json and lxmf_outbox.json. So that an upgrade from it keeps them too,
+statedb.migrate imports those files once into the table, checked and bounded as the LXMF feature loaded them
+(import_inbox and import_outbox).
 
 Standard library only at module level (rnfs.statedb and rnfs.log, which load RNS, are imported when importing).
 """
@@ -19,7 +22,7 @@ MAX_ID = 2 ** 63 - 2  # largest record id: the next id must still fit SQLite's i
 
 
 def _log(message: str, level: int):
-    """Log through rnfs.log (imported here: it loads RNS), as the LXMF feature did."""
+    """Log through rnfs.log (imported here: it loads RNS), with the prefix the LXMF feature's messages had."""
     from rnfs import log as rnfs_log
     rnfs_log.log(f"lxmf: {message}", level)
 
@@ -62,7 +65,7 @@ def _str_or_none(value) -> bool:
 
 
 def _valid_links(value) -> bool:
-    """Whether value is a list of link records (dicts, rnfs.uris.Link.to_json's form)."""
+    """Whether value is a list of link records (dicts: {"uri", "cid", "name", "path", "size", "from"})."""
     return isinstance(value, list) and all(isinstance(link, dict) for link in value)
 
 

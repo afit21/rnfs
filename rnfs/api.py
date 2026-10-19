@@ -73,13 +73,6 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | GET  | /api/contacts/get | `nick` | the contact |
 | POST | /api/contacts/add | JSON `nick`, `id`, `kind` (optional) | the contact |
 | POST | /api/contacts/rm | JSON `nick` | `{}` |
-| GET  | /api/lxmf/address | | `{"address", "display_name", "propagation_node", "nearest_propagation_node"}` |
-| POST | /api/lxmf/send | JSON `to`, `target`, `message`, `propagate`, `nearest` | `{"id", "hash", "to", "method"}` |
-| GET  | /api/lxmf/inbox | | `{"messages": [...]}` |
-| POST | /api/lxmf/inbox/get | JSON `id`, `link`, `output` or `directory`, `use_sent_cid` | `{"results": [...]}` |
-| POST | /api/lxmf/inbox/rm | JSON `id`, or `all` | `{"removed": count}` |
-| GET  | /api/lxmf/outbox | | `{"messages": [...]}` |
-| POST | /api/lxmf/sync | JSON `nearest` | `{"propagation_node", "started"}` |
 | GET  | /api/deny | | `{"entries": [local entry], "lists": [{"source", "cid", "entries", "state"}]}` |
 | POST | /api/deny/add | JSON `entries` | `{"added": [entries new to the local list]}` |
 | POST | /api/deny/rm | JSON `entries` | `{"removed": [...]}` (404 if one isn't on the local list) |
@@ -118,7 +111,7 @@ Security:
   read the rnfs directory may use it. A custom header also forces a CORS preflight, which fails because
   the API never sends CORS headers, and a web page can't know the token anyway. Status stays open for
   health checks and the CLI's proof check below, but without the token it answers only `{"version": ...}`:
-  the node and identity hashes, LXMF address and traffic counters need the token like everything else.
+  the node and identity hashes and traffic counters need the token like everything else.
 - A request carrying `X-Rnfs-Challenge: <32 hex digits>` gets `X-Rnfs-Proof: <rnfs.apiclient.api_proof>` in its
   response, which only a server knowing the token can make. Before it first sends the token, a client
   (rnfs.apiclient, which the CLI uses) makes whatever listens on the port prove this (with a status request),

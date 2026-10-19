@@ -2,8 +2,9 @@
 
 - Pins are recursive and held by sources: "user", "folder", "name:<alias>", "remote:<identity hash>", "deny" (the
   deny lists' own blocks), "app:<app>" and "app:<app>:<key>" (pins an app made with its API token, rnfs.apps),
-  and the features' "follow:" and LXMF's "app:lxmf:" (lxmf: until rnfs 0.2.0, whose upgrade rewrote them). A pin
-  lasts while any source holds it. Pins are never evicted.
+  and the features' "follow:". The LXMF feature of rnfs before 0.2.0 pinned with "lxmf:<sender>", which 0.2.0's
+  upgrade rewrote as "app:lxmf:<sender>": an app called lxmf holds them. A pin lasts while any source holds it.
+  Pins are never evicted.
 - Cache is everything else. Each cached fetch is recorded as root + path + target, which keeps the path's
   nodes and the target's DAG; fetches are evicted least recently used first when storage exceeds
   max_storage, and gc() evicts them all.
@@ -51,9 +52,10 @@ SIZES_STORE = "block_sizes"  # its meta value "clean": 1 once close() saved the 
 DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
 APP_PREFIX = "app:"
-# In-core LXMF's pins (rnfs/features/lxmf.py): app:lxmf:<sender address>, the source the LXMF wrapper app takes
-# over. Until rnfs 0.2.0 they were lxmf:<sender address> (LEGACY_LXMF_PREFIX): its schema step rewrote them, and
-# import_pins rewrites those of an older pins.json, imported after that step
+# The pins the LXMF feature of rnfs before 0.2.0 made: lxmf:<sender address> (LEGACY_LXMF_PREFIX), which 0.2.0,
+# whose LXMF moved out of rnfs into an app of its own, made app:lxmf:<sender address>: an app called lxmf holds them
+# (rnfs app add lxmf; rnfs app rm lxmf releases them). Its schema step rewrote the pins table's, and import_pins
+# rewrites those of an older pins.json, imported after that step
 LXMF_PREFIX = APP_PREFIX + "lxmf:"
 LEGACY_LXMF_PREFIX = "lxmf:"
 # An app's name (rnfs app add): an alias's characters (names.check_alias) in lowercase, so it never holds ":" and
@@ -99,8 +101,8 @@ def check_source(source: str):
     # follow:<name>: the latest target of a followed name (rnfs/features/follow.py)
     if isinstance(source, str) and source.startswith("follow:") and _IDENTITY_HASH.fullmatch(source[len("follow:"):]):
         return
-    # app:<app>[:<key>]: pins an app made through the API with its token (rnfs/apps.py), and in-core LXMF's
-    # app:lxmf:<sender> (rnfs/features/lxmf.py)
+    # app:<app>[:<key>]: pins an app made through the API with its token (rnfs/apps.py), and the app:lxmf:<sender>
+    # pins the LXMF feature of rnfs before 0.2.0 left (LXMF_PREFIX)
     if isinstance(source, str) and app_of(source) is not None:
         return
     raise ValueError(f"invalid pin source {source!r}")

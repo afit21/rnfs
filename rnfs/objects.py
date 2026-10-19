@@ -10,10 +10,9 @@ from dataclasses import MISSING, dataclass, field, fields
 from rnfs.content.cid import Cid
 
 __all__ = ["Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record", "Status", "Collected", "Verified",
-           "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "LxmfAddress",
-           "MessageLink", "Message", "Outgoing", "Sent", "Synced", "Cached", "Uncached", "Event", "EventBatch",
-           "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
-           "ServedPins", "FolderSync"]
+           "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "Cached",
+           "Uncached", "Event", "EventBatch", "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin",
+           "ServedPin", "RemotePinUsage", "ServedPins", "FolderSync"]
 
 
 def _cid(text) -> Cid:
@@ -207,7 +206,7 @@ class Record(_Object):
 
 @dataclass(frozen=True)
 class Status(_Object):
-    """The node's status; features holds every other field (traffic, jobs, LXMF, ...)."""
+    """The node's status; features holds every other field (traffic, jobs, ...)."""
 
     version: str
     node_id: bytes | None = _field(_hex, None)
@@ -418,108 +417,6 @@ class FolderSync(_Object):
 
 
 @dataclass(frozen=True)
-class LxmfAddress(_Object):
-    """This node's LXMF identity (lxmf.address()): its address (16 bytes), display name, the propagation node set
-    (lxmf_propagation_node) and the nearest one heard (None: none)."""
-
-    address: bytes = _field(_hex)
-    display_name: str | None = None
-    propagation_node: bytes | None = _field(_hex, None)
-    nearest_propagation_node: bytes | None = _field(_hex, None)
-
-    def __str__(self) -> str:
-        """The address in hex."""
-        return self.address.hex()
-
-
-@dataclass(frozen=True)
-class MessageLink(_Object):
-    """An rnfs link in an LXMF message (section 13): its rnfs: URI, the CID (a name link's: what it pointed at when
-    sent) or the name (16 bytes) and the path below it, the size and provider hint (from_node) as the sender gave
-    them (untrusted: fetches verify)."""
-
-    uri: str
-    cid: Cid | None = _field(_cid, None)
-    name: bytes | None = _field(_hex, None)
-    path: tuple[str, ...] = _field(tuple, ())
-    size: int | None = None
-    from_node: bytes | None = _field(_hex, None, key="from")
-
-    def __str__(self) -> str:
-        """The rnfs: URI."""
-        return self.uri
-
-
-def _links(values) -> tuple[MessageLink, ...]:
-    """A message's links from their JSON form."""
-    return tuple(MessageLink.from_dict(value) for value in values)
-
-
-@dataclass(frozen=True)
-class Message(_Object):
-    """A message in the LXMF inbox (lxmf.inbox()): its inbox id, hash, sender's LXMF address (sender, the API's
-    "from") and display name (the sender's own word: trusted and contact say what this node knows of it), when
-    sent (the sender's clock; None if implausible) and received, title and text, delivery method, its rnfs links,
-    each link's auto-fetch result ({"state", "cid" or "error"}; None unless the sender is in lxmf_auto_fetch_from),
-    whether the sender is trusted now, and the nick of the LXMF contact with its address."""
-
-    id: int
-    hash: bytes = _field(_hex)
-    sender: bytes = _field(_hex, key="from")
-    display_name: str | None = None
-    sent: float | None = None
-    received: float | None = None
-    title: str = ""
-    text: str = ""
-    method: str = "unknown"
-    links: tuple[MessageLink, ...] = _field(_links, ())
-    auto: tuple[dict, ...] | None = _field(tuple, None)
-    trusted: bool = False
-    contact: str | None = None
-
-
-@dataclass(frozen=True)
-class Outgoing(_Object):
-    """A message in the LXMF outbox (lxmf.outbox()): its outbox id, hash, recipient, when queued, its links and
-    text, method ("direct" or "propagated"), state ("outbound", "sending", "sent", "delivered", "failed", ...) and
-    progress, the error of a failed propagation fallback, and for a direct message sent again through the
-    propagation node, the direct attempt's hash (direct_hash) and fallback True."""
-
-    id: int
-    hash: bytes = _field(_hex)
-    to: bytes = _field(_hex)
-    time: float | None = None
-    links: tuple[MessageLink, ...] = _field(_links, ())
-    text: str = ""
-    method: str = "direct"
-    state: str = "outbound"
-    progress: float | None = None
-    error: str | None = None
-    direct_hash: bytes | None = _field(_hex, None)
-    fallback: bool = False
-
-
-@dataclass(frozen=True)
-class Sent(_Object):
-    """A message lxmf.send() queued: its outbox id, hash, recipient's address and method; the outbox says how it
-    went."""
-
-    id: int
-    hash: bytes = _field(_hex)
-    to: bytes = _field(_hex)
-    method: str = "direct"
-
-
-@dataclass(frozen=True)
-class Synced(_Object):
-    """What lxmf.sync() did: the propagation node asked (None: none set or heard) and whether a download
-    started."""
-
-    propagation_node: bytes | None = _field(_hex, None)
-    started: bool = False
-
-
-@dataclass(frozen=True)
 class Cached(_Object):
     """A cached fetch (cache()): a download kept until evicted, not pinned. cid is the target, reached from root
     through path (() for a bare CID); whether the same content is pinned too, complete, its type and size (None
@@ -623,7 +520,7 @@ class Uncached(_Object):
 @dataclass(frozen=True)
 class Event(_Object):
     """Something that changed on the node (events): seq (1, 2, ... in the node's run), kind ("job", "pin",
-    "cache", "inbox", "name", "peer", "remote_pin"; design.md, "Events", lists each kind's fields), time (Unix), and
+    "cache", "name", "peer", "remote_pin"; design.md, "Events", lists each kind's fields), time (Unix), and
     the kind's own fields in fields. kind "lost" (lost is True) is no node's: events.watch delivers it when events
     were missed (the watch fell behind, or the daemon restarted), so what the app shows should be read again; its
     fields hold the run's "epoch"."""

@@ -6,14 +6,13 @@ node_id, identity_hash, lxmf_address and the traffic counters, to any local proc
 /api/lxmf/address, which returns the same LXMF address, needs the token. Without the token the fixed API
 answers only {"version"}; the full document needs the token, which `rnfs status` now sends.
 
-The API tests run a real ApiServer over a real offline node (its LXMF network replaced by a stand-in holding
-only an address, as an offline node has none); the CLI tests reuse tests.test_cli's CliTestCase.
+The API tests run a real ApiServer over a real offline node; the CLI tests reuse tests.test_cli's CliTestCase.
+(rnfs 0.2.0 moved LXMF out of rnfs, and lxmf_address out of the status with it.)
 """
 import hmac
 import json
 import os
 import tempfile
-import types
 import unittest
 
 import RNS
@@ -27,8 +26,7 @@ from tests.test_cli import CliTestCase
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
-LXMF_ADDRESS = bytes([0x5C] * 16)
-PRIVATE_FIELDS = ("node_id", "identity_hash", "lxmf_address", "bytes_sent", "bytes_received", "pins", "records")
+PRIVATE_FIELDS = ("node_id", "identity_hash", "bytes_sent", "bytes_received", "pins", "records")
 
 _saved_loglevel = RNS.loglevel
 
@@ -47,15 +45,12 @@ class ApiStatusTest(unittest.TestCase):
     """GET /api/status on a real ApiServer and offline node."""
 
     def setUp(self):
-        """An offline node with a stand-in LXMF address, behind an ApiServer."""
+        """An offline node behind an ApiServer."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.node = RnfsNode.offline(Config(rnfs_dir=tmp.name, slow="no"), bytes([0xA] * 16), NetClient(),
                                      FakeNetwork())
         self.addCleanup(self.node.stop)
-        lxmf = self.node.features.get("lxmf")
-        if lxmf is not None:
-            lxmf.network = types.SimpleNamespace(address=LXMF_ADDRESS)
         self.server = ApiServer(self.node, 0)
         self.server.start()
         self.addCleanup(self.server.stop)
@@ -80,8 +75,6 @@ class ApiStatusTest(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(body["node_id"], self.node.node_id.hex())
         self.assertIn("records", body)
-        if self.node.features.get("lxmf") is not None:
-            self.assertEqual(body.get("lxmf_address"), LXMF_ADDRESS.hex())
 
     def test_wrong_token_gets_the_open_answer(self):
         """A wrong token is treated as none: only the version."""

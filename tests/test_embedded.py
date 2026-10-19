@@ -428,7 +428,7 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
             refused.append(reason)
         return reason
     guards.refusal = recording_refusal
-    # LXMF and the DHT mode are left to rnfs.Node's defaults: off, and client
+    # The DHT mode is left to rnfs.Node's default: client
     settings = {"default_bootstrap": False, "startup_announce_delay": 2, "path_timeout": WAIT}
     # A start failing late leaves nothing behind (its rnfs.dht destination above all), so the next one works
     from rnfs.node import RnfsNode
@@ -446,7 +446,6 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
         ("random", Cid.for_block(RAW, RANDOM_BLOCK)), ("zeros", Cid.for_block(RAW, ZERO_BLOCK)), ("big", BIG_CID))}
     results["compress_limit"] = RNS.Resource.AUTO_COMPRESS_MAX_SIZE
     results["lxmf_imported"] = "LXMF" in sys.modules
-    results["lxmf_network"] = node.internal.feature("lxmf").network is not None
     results["dht_mode"] = node.status().dht_mode
     print("EXERCISED", flush=True)
     sys.stdin.readline()  # the peer has finished with this process's destinations
@@ -570,9 +569,8 @@ class HostProgramTest(unittest.TestCase):
                             or reason.startswith("rnfs responses are one segment")
                             for reason in host_results["refused"]), detail)  # nothing of the host's refused
 
-        # LXMF off: no LXMF objects, not even the module; the host's Reticulum survives the node's stop
+        # rnfs has no LXMF since 0.2.0: not even the module is loaded; the host's Reticulum survives the node's stop
         self.assertFalse(host_results["lxmf_imported"], detail)
-        self.assertFalse(host_results["lxmf_network"], detail)
         self.assertEqual(host_results["dht_mode"], "client", detail)
         self.assertTrue(host_results["reticulum_kept"], detail)
         self.assertEqual(host_results["after_stop"], BIG, detail)

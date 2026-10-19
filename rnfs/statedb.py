@@ -207,7 +207,7 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "DELETE FROM provider_evicted",
     )),
     ("lxmf_app_pins", (
-        # In-core LXMF's pins become the LXMF wrapper app's (rnfs 0.2.0): lxmf:<address> -> app:lxmf:<address>
+        # In-core LXMF's pins become the LXMF app's (rnfs 0.2.0): lxmf:<address> -> app:lxmf:<address>
         # (storage.LXMF_PREFIX). Only valid ones, as GLOB is case-sensitive and spelt out: an invalid lxmf: row is
         # still deleted when storage loads, never turned into a valid app: one. A row whose new form a pin already
         # has (none can, short of a database edited by hand) stays as it was, and is deleted

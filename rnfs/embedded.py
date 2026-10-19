@@ -6,7 +6,7 @@ It is an RnfsNode (rnfs/node.py) started embedded, in its own rnfs dir, behind r
   runs); the node never stops it.
 - The guards and the compression rule cover only its rnfs.dht links (network/guards.py, DHT); the program's
   own links behave as with RNS alone.
-- Where neither rnfs.toml nor settings say otherwise, it runs as a DHT client with LXMF off (EMBEDDED_DEFAULTS).
+- Where neither rnfs.toml nor settings say otherwise, it runs as a DHT client (EMBEDDED_DEFAULTS).
   It serves no API or gateway, writes no debug log and installs no signal handlers of its own (a Reticulum the
   node starts installs RNS's, which needs the main thread: start Reticulum first to run a Node off it).
 - If starting fails, nothing of it is left in the process (RnfsNode releases its rnfs.dht destination), so the
@@ -37,8 +37,8 @@ from rnfs.node import RnfsNode, lock_rnfs_dir, make_private_root
 from rnfs.objects import Record
 
 # An embedded node's settings where neither rnfs.toml nor the program's settings give them: an app's node is
-# often short-lived, and short-lived nodes should be DHT clients (section 6); the program has its own LXMF
-EMBEDDED_DEFAULTS = {"dht_mode": "client", "lxmf_enabled": False}
+# often short-lived, and short-lived nodes should be DHT clients (section 6)
+EMBEDDED_DEFAULTS = {"dht_mode": "client"}
 # The capabilities (api.CAPABILITIES) a Node lacks: it serves no API to be stopped through, and writes no daemon.json
 NODE_LACKS = ("shutdown", "daemon_json")
 
@@ -424,45 +424,6 @@ class _Backend:
         """FollowFeature.following, as GET /api/name/following."""
         from rnfs.features import follow
         return follow._feature(self).following()
-
-    def lxmf_address(self) -> dict:
-        """LxmfFeature.address, as GET /api/lxmf/address."""
-        from rnfs.features import lxmf
-        return lxmf._feature(self).address()
-
-    def lxmf_send(self, to: str, target: str, message: str | None, propagate: bool, nearest: bool) -> dict:
-        """LxmfFeature.send, as POST /api/lxmf/send."""
-        from rnfs.features import lxmf
-        return lxmf._feature(self).send(to, target, message, propagate, nearest)
-
-    def lxmf_inbox(self) -> list[dict]:
-        """LxmfFeature.inbox_list, as GET /api/lxmf/inbox."""
-        from rnfs.features import lxmf
-        return lxmf._feature(self).inbox_list()
-
-    def lxmf_inbox_get(self, entry_id, link, output: str | None, directory: str | None,
-                       use_sent_cid: bool) -> list[dict]:
-        """LxmfFeature.inbox_get, as POST /api/lxmf/inbox/get: id and link checked as it checks them."""
-        from rnfs.features import lxmf
-        return lxmf._feature(self).inbox_get(lxmf._int(entry_id, "id"), lxmf._int(link, "link", False), output,
-                                             directory, use_sent_cid)
-
-    def lxmf_inbox_rm(self, entry_id, every: bool) -> int:
-        """LxmfFeature.inbox_rm of entry_id (checked as POST /api/lxmf/inbox/rm checks it), or every message."""
-        from rnfs.features import lxmf
-        if every:
-            return lxmf._feature(self).inbox_rm(None)
-        return lxmf._feature(self).inbox_rm(lxmf._int(entry_id, "id"))
-
-    def lxmf_outbox(self) -> list[dict]:
-        """LxmfFeature.outbox_list, as GET /api/lxmf/outbox."""
-        from rnfs.features import lxmf
-        return lxmf._feature(self).outbox_list()
-
-    def lxmf_sync(self, nearest: bool) -> dict:
-        """LxmfFeature.sync, as POST /api/lxmf/sync."""
-        from rnfs.features import lxmf
-        return lxmf._feature(self).sync(nearest)
 
     # Streams (rnfs 0.2.0)
 

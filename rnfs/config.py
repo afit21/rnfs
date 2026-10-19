@@ -55,24 +55,21 @@ _HEX_ID = ids.HEX16  # the name other modules used before rnfs.ids
 
 # Groups, as the markers in Config mark them: (group, its first field), in field order; a group runs to the next
 SECTIONS = (("core", "reticulum_dir"), ("transfers", "max_jobs"), ("mesh", "upload_budget"),
-            ("names", "keep_max_names"), ("lxmf", "lxmf_enabled"), ("deny lists", "deny_lists"))
+            ("names", "keep_max_names"), ("deny lists", "deny_lists"))
 # Feature settings' limits (their features check them): name -> (minimum, maximum or None)
 FEATURE_LIMITS = {"max_jobs": (1, None), "max_finished_jobs": (1, None), "upload_budget": (1, None),
                   "local_hops": (1, None), "local_replicas": (0, 5),
-                  "keep_max_names": (0, None), "follow_quota": (0, None), "lxmf_auto_fetch_quota": (0, None),
-                  "lxmf_sync_interval": (0, None)}
+                  "keep_max_names": (0, None), "follow_quota": (0, None)}
 # Units of what the tables don't give one (DURATIONS are seconds, RATES bits/s)
 UNITS = {"min_rate_sample": "bytes", "record_budget": "bytes", "max_storage": "bytes", "max_download_size": "bytes",
-         "remote_pin_quota": "bytes", "follow_quota": "bytes", "lxmf_auto_fetch_quota": "bytes",
-         "upload_budget": "bytes/hour", "lxmf_sync_interval": "seconds", "local_hops": "hops",
+         "remote_pin_quota": "bytes", "follow_quota": "bytes", "upload_budget": "bytes/hour", "local_hops": "hops",
          "local_replicas": "servers"}
 # Settings a running node applies at once when changed through the API (rnfs/features/settings.py, whose LIVE table
 # must name exactly these); every other one applies at the next start
 LIVE_SETTINGS = frozenset({
     "max_storage", "max_download_size", "max_output_entries", "max_upload_rate", "remote_pin_quota",
     "scan_interval", "provide_entries", "max_jobs", "max_finished_jobs", "serve_interfaces", "no_serve_interfaces",
-    "quiet_hours", "keep_max_names", "keeper_query", "follow_quota", "lxmf_accept_from", "lxmf_auto_fetch_from",
-    "lxmf_auto_fetch_quota", "lxmf_send_from_hint"})
+    "quiet_hours", "keep_max_names", "keeper_query", "follow_quota"})
 # One line per setting (specification section 12 has the full notes)
 DESCRIPTIONS = {
     "reticulum_dir": "Reticulum config directory; unset: RNS's own, the one rnsd uses",
@@ -135,31 +132,23 @@ DESCRIPTIONS = {
     "keep_max_names": "Names kept (keep and follow) for others; this node's own names don't count",
     "keeper_query": "fallback: ask keepers when a path request heard nothing; always: on every network resolve",
     "follow_quota": "Bytes a followed name's new target may hold; 0: followed names aren't fetched",
-    "lxmf_enabled": "LXMF on or off; unset: on if the LXMF package is installed",
-    "lxmf_display_name": "Name announced with the LXMF address; unset: rnfs node",
-    "lxmf_propagation_node": "LXMF propagation node (hex) for propagated messages and downloads; unset: none",
-    "lxmf_send_from_hint": "Sent links carry this node's ID as a provider hint (linking the LXMF address to it)",
-    "lxmf_sync_interval": "How often messages are downloaded from the propagation node; 0: never",
-    "lxmf_accept_from": "LXMF addresses (hex) whose messages are kept; empty: everyone",
-    "lxmf_auto_fetch_from": "LXMF addresses (hex) whose links are fetched and pinned",
-    "lxmf_auto_fetch_quota": "Storage the pins of one auto-fetch sender may use",
     "deny_lists": "Deny-list sources: <cid>[/path] or name/<name>[/path]",
 }
 # Settings earlier versions had and this one doesn't: name -> what took its place, for the warning. One left in
 # rnfs.toml (or given to an embedded node) is dropped with a warning instead of refused as unknown, so settings an
 # older version accepted still start the node. The settings API and `rnfs config set` know it no more than any other
 # name that isn't a setting (`rnfs config unset` removes it from rnfs.toml)
+# LXMF messaging left rnfs in 0.2.0 for an app of its own, built on the local API and the library
+_LXMF_RETIRED = "since rnfs 0.2.0 LXMF messaging is no longer part of rnfs, but an app of its own"
 RETIRED_SETTINGS: MappingProxyType = MappingProxyType({
     "max_records": "since rnfs 0.2.0 provider records are bounded by record_budget, in bytes of disk",
+    **{name: _LXMF_RETIRED for name in ("lxmf_enabled", "lxmf_display_name", "lxmf_propagation_node",
+                                        "lxmf_send_from_hint", "lxmf_sync_interval", "lxmf_accept_from",
+                                        "lxmf_auto_fetch_from", "lxmf_auto_fetch_quota")},
 })
-# Why LXMF is deprecated, for every warning about it (the daemon's log, the CLI, the API, the settings schema, the
-# library): it still works in 0.2.0, but leaves rnfs for an app of its own, its lxmf_* settings with it. Here,
-# standard library only, so the CLI and rnfs.Client can say it without loading RNS
-LXMF_DEPRECATION = ("LXMF messaging is moving out of rnfs into a separate app built on the local API and the "
-                    "library, and a later release removes it from rnfs")
 # Groups of settings (SECTIONS) that still work but are going away: group -> why. The schema gives each of their
 # settings that reason ("deprecated"), and rnfs.toml or a change through the API setting one is warned about
-DEPRECATED_GROUPS: MappingProxyType = MappingProxyType({"lxmf": LXMF_DEPRECATION})
+DEPRECATED_GROUPS: MappingProxyType = MappingProxyType({})
 _TYPE_NAMES = {int: "int", float: "float", bool: "bool", str: "string", list[str]: "list[string]"}
 MAX_TOML_INT = 2 ** 63 - 1  # TOML integers are 64-bit signed
 
@@ -263,15 +252,6 @@ class Config:
     # briefly holds the old target and the new one, so up to twice this per followed name
     follow_quota: int = 1 * GIB
     # --- content (pin=false, sealing, chunker, gateway formats) ---
-    # --- lxmf (rnfs/features/lxmf.py) ---
-    lxmf_enabled: bool | None = None  # None: on if the LXMF package is installed
-    lxmf_display_name: str | None = None  # announced name; None: "rnfs node" (nothing linking it to the node ID)
-    lxmf_propagation_node: str | None = None  # LXMF propagation node (hex); None: none for automatic use
-    lxmf_send_from_hint: bool = True  # sent links carry from=<node ID>: links the LXMF address to the node ID
-    lxmf_sync_interval: float = 3600  # seconds between downloads from the propagation node; 0: never
-    lxmf_accept_from: list[str] = field(default_factory=list)  # LXMF addresses (hex); empty: everyone
-    lxmf_auto_fetch_from: list[str] = field(default_factory=list)  # senders whose links are fetched and pinned
-    lxmf_auto_fetch_quota: int = 1 * GIB  # per sender in lxmf_auto_fetch_from
     # --- deny lists (rnfs/features/deny.py) ---
     deny_lists: list[str] = field(default_factory=list)  # deny-list sources: <cid>[/path] or name/<name>[/path]
 
@@ -370,9 +350,6 @@ class Config:
             raise ValueError("keep_max_names must be a whole number, not negative")
         if type(self.follow_quota) is not int or self.follow_quota < 0:
             raise ValueError("follow_quota must be a whole number of bytes, not negative")
-        # lxmf
-        from rnfs.features import lxmf  # here, like mesh: only needed once settings are checked
-        lxmf.validate_settings(self)
         # deny lists
         from rnfs.features import deny
         deny.validate_settings(self)
