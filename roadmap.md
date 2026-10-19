@@ -31,11 +31,11 @@ CHANGELOG.md).
 
 # 0.2.0
 
-The feature-complete release, shipped as one release after 0.1.6: the work planned as 0.1.7 is part of it, and
-there are no 0.1.x releases in between. It is the last foreseeable feature release: everything planned is listed
-here, and later 0.2.x releases are for fixes, the items below still to do, and those that wait on others (older
-nodes leaving the network, Reticulum). Nodes of 0.1.3 and later keep working with 0.2.0 nodes: no CID changes,
-wire changes additive only, and every state change gets an upgrade migration from 0.1.6.
+The feature-complete release, shipped as one release after 0.1.6: the work planned as 0.1.7 is part of it, and there are
+no 0.1.x releases in between. It is the last foreseeable feature release: everything planned is listed here, and later
+0.2.x releases are for fixes and the items below still to do. What can't ship yet, because it waits on older nodes
+leaving the network or on Reticulum, is under Future. Nodes of 0.1.3 and later keep working with 0.2.0 nodes: no CID
+changes, wire changes additive only, and every state change gets an upgrade migration from 0.1.6.
 
 ## Local API and library for companion apps (implemented)
 
@@ -645,7 +645,11 @@ until the wrapper's first release; the owner decided to remove it in 0.2.0 witho
   are kept. Served outcomes carry a reason (quota, not found, denied, queue full, ...). `remote_pin` events report both
   sides.
 
-## Fewer name announces (to do, once 0.1.5 and 0.1.6 resolvers are gone)
+# Future
+
+What can't ship in 0.2.0: it waits on older nodes leaving the network or on Reticulum, or isn't planned.
+
+## Fewer name announces (once 0.1.5 and 0.1.6 resolvers are gone)
 
 * Announce a name only when it changes, and resolve through keepers first, once resolvers of 0.1.5 and 0.1.6
   are gone: they count an announce as current for only 2 × `announce_interval`. Keepers first is in effect
@@ -653,7 +657,7 @@ until the wrapper's first release; the owner decided to remove it in 0.2.0 witho
   Paths at transport nodes lapse a week after a name's last announce, so even then a name needs a keepalive
   announce more often than that
 
-## Waiting on Reticulum (to do, once Reticulum offers them)
+## Waiting on Reticulum
 
 * Traffic classes: RNS 1.5's inbound queues have classes (data, announce, path request, ingress limited), but an
   application can't set one. If RNS lets applications mark traffic, mark `/blocks` responses as bulk so DHT
