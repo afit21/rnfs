@@ -150,6 +150,13 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # A label the user gave a pin (pin label), kept apart from where it was added from (pin_names); dump()ed
         "CREATE TABLE pin_labels (cid BLOB PRIMARY KEY, label TEXT NOT NULL) WITHOUT ROWID",
     )),
+    ("routing", (
+        # The routing table (rnfs 0.2.0; rnfs.dht.routing_state), one row per node: state 0 in the table (first_seen,
+        # at = last heard, failures = failed queries since), 1 dropped with its seniority kept (first_seen, at = when
+        # dropped), 2 banned (at = when the ban ends). Times are Unix time
+        "CREATE TABLE routing (node BLOB PRIMARY KEY, state INTEGER NOT NULL, first_seen REAL, at REAL NOT NULL,"
+        " failures INTEGER NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

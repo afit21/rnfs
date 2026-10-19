@@ -502,6 +502,14 @@ big-endian integer; "closest" means smallest distance.
 - A node is dropped after `max_failures` queries in a row go unanswered; hearing from it resets the count.
   Lossy links can drop a live server this way, so a dropped node's first-seen time is kept for
   `2 × announce_interval`, and it regains its seniority if it comes back within that time.
+- **Saved across restarts.** A node SHOULD save its routing table: each entry's first-seen and last-heard times
+  and whether it failed a query since, the first-seen times of dropped nodes until they expire, and bans until
+  they end. Times are saved as wall clock; one later than the current time when loaded (a clock since corrected
+  backwards) counts as now, and a loaded ban ends at most `ban_time` from now. A loaded entry keeps its
+  seniority, and `/find` replies leave it out while it has been silent for over `2 × announce_interval`, the
+  time the node was down included, until it is heard again. So a restart doesn't make every server new again,
+  nor send path requests to find servers it already knew (rnfs: in the state database, the rows changed written
+  every 30 s and at stop).
 - **Joining.** At startup a node sends `/find` for its own node ID to bootstrap nodes, one at a time, until
   two have answered: first those it was given (`bootstrap_nodes`, `daemon --bootstrap`) in their order,
   then, unless `default_bootstrap` is off or it is in private mode, the implementation's default bootstrap

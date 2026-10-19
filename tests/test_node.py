@@ -26,7 +26,7 @@ from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module, statedb
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES, failing_commits, state_rows, wait_for
+from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, wait_for
 from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
@@ -924,6 +924,24 @@ class RestartTest(NodeTest):
         self.b = self.restart(self.b, "b", B_ID)
         self.assertEqual(self.b._eligible_targets(), {Cid.parse(cid)})
         self.assertIn(Cid.parse(cid), self.b.publisher.provided())
+
+    def test_routing_table_is_kept_at_a_restart(self):
+        """Saved at stop and loaded at start, with wall-clock times: seniority is kept, and /find replies still
+        leave out a node silent for over 2 × announce_interval before the restart."""
+        quiet, banned = bytes([0x21] * 16), bytes([0x22] * 16)
+        self.b.routing.heard(quiet)
+        self.b.routing.ban(banned)
+        senior_for = self.b.routing.seniority(A_ID)
+        self.b.stop()
+        silent_since = time.time() - 2 * self.b.config.announce_interval - 60
+        state_execute(self.b.config.state_dir, "UPDATE routing SET first_seen = ?, at = ? WHERE node = ?",
+                      (silent_since, silent_since, quiet))
+        self.b = self.make_node("b", B_ID)
+        self.assertEqual(sorted(self.b.routing.nodes()), sorted([A_ID, quiet]))
+        self.assertGreaterEqual(self.b.routing.seniority(A_ID), senior_for)
+        self.assertGreater(self.b.routing.seniority(quiet), 2 * self.b.config.announce_interval)
+        self.assertTrue(self.b.routing.is_banned(banned))
+        self.assertEqual(self.b.backend.find(quiet)[1], [A_ID])
 
     def test_failed_fetched_save_is_tried_again(self):
         target = Cid.for_block(RAW, b"target")

@@ -17,6 +17,9 @@ Upgrade notes:
   assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
 
+- **Routing state:** the state database gains a table for the routing table (`routing`), which is now kept across
+  restarts.
+
 Added, for apps:
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
   daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
@@ -92,6 +95,11 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+
+The DHT (local behaviour: nothing on the wire changes):
+- The routing table is saved and loaded at start, so a restart doesn't make every server new again: servers keep
+  their seniority (which ranks providers and keepers), bans last their time, and `/find` replies still leave out
+  servers silent for over 2 × `announce_interval`, the time the node was down included.
 
 ## 0.1.6
 

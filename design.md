@@ -118,6 +118,7 @@ rnfs/
     shared_folder.py  importing <rnfs dir>/files/ with pin source "folder" (section 8)
   dht/                no RNS dependency
     routing.py        RoutingTable: buckets, seniority, failures, unreliable nodes, bans (section 6)
+    routing_state.py  RoutingState: the routing table saved in the state database (section 6)
     providers.py      ProviderStore: records, TTL, max_records eviction, /find reply selection (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
@@ -280,9 +281,9 @@ before they are pinned.
 
 ## DHT layer interfaces
 
-`routing.py` — `RoutingTable(own_id, config, clock=time.monotonic, admit=None)` (`admit(node_id)`: private mode's
-member check, asked only for a node not in the table and without the table's lock held, since it may block on
-RNS; the table is checked again once it answers):
+`routing.py` — `RoutingTable(own_id, config, clock=time.monotonic, admit=None, wall_clock=time.time)`
+(`admit(node_id)`: private mode's member check, asked only for a node not in the table and without the table's
+lock held, since it may block on RNS; the table is checked again once it answers):
 `heard(node_id) -> bool` (proven server: announce in server mode, or answered `/find`), `answered(node_id) -> bool`
 (`heard`, and reliable again), `failed(node_id) -> bool` (True if dropped), `unreliable(node_id)` (its last
 `max_failures` queries or more failed, in the table or not; announces don't clear it: `_unanswered`, at most
@@ -297,6 +298,16 @@ dict` (every node's standing now: the keeper query's snapshot from before its lo
 Every `heard` forgets expired bans and dropped nodes' seniority, looking only at the front of each: both are kept
 in expiry order (an entry set again is moved to the end), and their readers check expiry too, so an entry out of
 order (after a clock step or a changed setting) only lingers in memory.
+Persistence (0.2.0): the table runs on the monotonic clock and converts to wall clock (`wall_clock() - clock()` as
+the offset) only for saved rows. `row(node_id)` gives `(node, IN_TABLE, first seen, last heard, failures)`,
+`(node, DROPPED, first seen, when dropped, 0)` or `(node, BANNED, None, ban end, 0)`, or None; `track(changed)`
+sets the listener told, under the table's lock (`lock`, an RLock), each node whose row changed; `restore(rows)`
+loads saved rows into an unused table (times in the future clamped to now, a ban to at most `ban_time` ahead;
+expired drops and bans, malformed rows, our own ID, nodes `admit` now rejects and a full bucket's youngest left
+out) and returns the nodes whose saved rows must be written again or deleted. `routing_state.py` —
+`RoutingState(table, state_dir)`, a `node.Store`: loads the `routing` table into the table, then saves the rows
+changed through a SNAPSHOT `RowStore` taking the table's lock; it imports the state database so `routing.py`,
+which lookups import, needn't.
 
 `providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
 max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
@@ -1324,6 +1335,8 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
 - `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
   stop, changed rows only);
+- `routing` (0.2.0: the routing table, `RoutingState`: one row per node in the table, dropped with its seniority
+  kept, or banned, times as Unix time; NORMAL with the periodic saves and at stop, changed rows only);
 - `names_published`, `names_held` (sequences as decimal text, up to 2^64 − 1; FULL, changed rows only; a
   malformed row stops startup, as a malformed `names.json` did, since skipping it could allow rollback) and
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at
@@ -1393,8 +1406,10 @@ against `server.Backend`), so production code needn't look up with `getattr` a m
 ## Status
 
 Everything in the specification is implemented, with these simplifications and additions:
-- The routing table isn't persisted. At startup it is seeded from the rnfs.dht server announces that RNS
-  cached within 2 × `announce_interval` (`Identity.known_destinations`, an RNS internal), then the join runs.
+- The routing table is saved in the state database (`routing_state.RoutingState`) and loaded at start. Before
+  the join it is also seeded from the rnfs.dht server announces that RNS cached within 2 × `announce_interval`
+  (`Identity.known_destinations`, an RNS internal). The nodes' failed queries in a row (`unreliable`) aren't
+  saved.
 - Lookups (`RnfsNode._lookup`) start from the closest nodes `/find` replies would give, then others to make up K,
   then unreliable ones if still short; answers go to `RoutingTable.answered`, failures to `failed`, and the
   join's lookup is wired the same way. A failed `/provide` or `/blocks` isn't counted there.

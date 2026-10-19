@@ -49,6 +49,7 @@ from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_rese
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
+from rnfs.dht.routing_state import RoutingState
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
@@ -581,6 +582,8 @@ class RnfsNode:
         self._add_store(_StoreParts(close=self._db.close), batched=False)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
+        # Loaded from the state database, so a restart rejoins from the servers it knew; saved with the batched stores
+        self._add_store(RoutingState(self.routing, config.state_dir))
         # Saved with their expiry, every SAVE_INTERVAL (maintain): they change with every /provide
         self.records = self._add_store(ProviderStore(config.max_records, config.state_dir, own_id=node_id,
                                                      seniority=config.provider_seniority), batched=False)

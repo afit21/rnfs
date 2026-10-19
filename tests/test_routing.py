@@ -1,13 +1,17 @@
 """Tests for the DHT routing table: buckets, replacement, failures, seniority, bans and reply filtering."""
 import random
+import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import BUCKET_COUNT, ID_LENGTH, K
 from rnfs.dht import routing
+from rnfs import statedb
 from rnfs.dht.routing import AVOID_AFTER, AVOID_MAX, RoutingTable, distance
-from tests.support import FakeClock
+from rnfs.dht.routing_state import RoutingState
+from tests.support import FakeClock, state_execute, state_rows
 
 OWN_ID = bytes(ID_LENGTH)
 ANNOUNCE = 6 * 3600
@@ -477,6 +481,216 @@ class PruneTest(RoutingTestCase):
         self.assertEqual(self.table.seniority(early), 0)
         self.assertTrue(self.table.heard(late))
         self.assertEqual(self.table.seniority(late), 1000 + 2 * ANNOUNCE + 1 - 5000)
+
+class PersistenceTest(RoutingTestCase):
+    """row() and restore(): what a restart keeps, with times saved as wall clock and the monotonic clock restarted."""
+
+    WALL = 1_700_000_000.0
+
+    def setUp(self):
+        """The table of RoutingTestCase, with a wall clock WALL - 1000 seconds ahead of its monotonic one."""
+        super().setUp()
+        self.wall = FakeClock(self.WALL)
+        self.table = RoutingTable(OWN_ID, self.config, clock=self.clock, wall_clock=self.wall)
+
+    def tick(self, seconds: float):
+        """Move both clocks on."""
+        self.clock.now += seconds
+        self.wall.now += seconds
+
+    def saved(self, table: RoutingTable | None = None) -> list[tuple]:
+        """Every row the table would save now."""
+        table = table or self.table
+        candidates = [node_id(n) for n in range(1, 400)]
+        return [row for row in map(table.row, candidates) if row is not None]
+
+    def restarted(self, downtime: float, rows: list[tuple] | None = None, **kwargs) -> RoutingTable:
+        """A new table loading the saved rows after downtime, on a monotonic clock started anew (at 5)."""
+        rows = self.saved() if rows is None else rows
+        self.wall.now += downtime
+        self.clock = FakeClock(5.0)
+        table = RoutingTable(OWN_ID, self.config, clock=self.clock, wall_clock=self.wall, **kwargs)
+        self.changed = table.restore(rows)
+        return table
+
+    def test_round_trip_keeps_seniority_last_heard_failures_drops_and_bans(self):
+        old, fresh, failing, dropped, banned = (node_id(n) for n in (10, 11, 12, 13, 14))
+        self.table.heard(old)
+        self.tick(5000)
+        for n in (fresh, failing, dropped):
+            self.table.heard(n)
+        self.table.failed(failing)
+        while not self.table.failed(dropped):
+            pass
+        self.table.ban(banned)
+        self.tick(100)
+        rows = self.saved()
+        self.assertEqual({row[0] for row in rows}, {old, fresh, failing, dropped, banned})
+        self.assertIn((old, routing.IN_TABLE, self.WALL, self.WALL, 0), rows)
+        table = self.restarted(600, rows)
+        self.assertEqual(self.changed, [])
+        self.assertEqual(sorted(table.nodes()), [old, fresh, failing])
+        self.assertEqual(table.seniority(old), 5000 + 100 + 600)
+        self.assertEqual(table.seniority(fresh), 100 + 600)
+        self.assertFalse(table.unreliable(failing))  # failed queries in a row aren't saved ...
+        self.assertNotIn(failing, table.closest(failing, for_reply=True))  # ... but it failed since last heard
+        self.assertTrue(table.is_banned(banned))
+        self.clock.now += 3600 - 700
+        self.assertFalse(table.is_banned(banned))  # the ban still ends ban_time after it began
+        self.assertTrue(table.heard(dropped))  # back within 2 × announce_interval of its drop: seniority regained
+        self.assertEqual(table.seniority(dropped), 5000 + 100 + 600 + 2900 - 5000)
+        self.assertEqual(self.saved(table), [table.row(n) for n in sorted(r[0] for r in self.saved(table))])
+
+    def test_find_replies_still_leave_out_nodes_silent_since_before_the_restart(self):
+        quiet, recent = node_id(20), node_id(21)
+        self.table.heard(quiet)
+        self.tick(ANNOUNCE)
+        self.table.heard(recent)
+        table = self.restarted(ANNOUNCE + 10)  # quiet: silent 2 × ANNOUNCE + 10 by now
+        self.assertEqual(table.closest(quiet, for_reply=True), [recent])
+        self.assertEqual(table.live_count(), 1)
+        self.assertEqual(sorted(table.closest(quiet)), [quiet, recent])  # kept, for joins and lookups
+        table.heard(quiet)
+        self.assertEqual(sorted(table.closest(quiet, for_reply=True)), [quiet, recent])
+
+    def test_expired_drops_and_bans_are_left_out_and_their_rows_deleted(self):
+        dropped, banned = node_id(30), node_id(31)
+        self.table.heard(dropped)
+        while not self.table.failed(dropped):
+            pass
+        self.table.ban(banned)
+        table = self.restarted(2 * ANNOUNCE + 1)
+        self.assertEqual(sorted(self.changed), [dropped, banned])
+        self.assertIsNone(table.row(dropped))
+        self.assertFalse(table.is_banned(banned))
+        self.assertTrue(table.heard(dropped))
+        self.assertEqual(table.seniority(dropped), 0)  # new again
+
+    def test_times_in_the_future_count_as_now(self):
+        ahead = self.WALL + 10 * ANNOUNCE  # saved while the clock was ahead, since corrected
+        rows = [(node_id(40), routing.IN_TABLE, ahead, ahead, 0), (node_id(41), routing.DROPPED, ahead, ahead, 0),
+                (node_id(42), routing.BANNED, None, ahead, 0)]
+        table = self.restarted(0, rows)
+        self.assertEqual(sorted(self.changed), [node_id(40), node_id(41), node_id(42)])  # written again, clamped
+        self.assertEqual(table.seniority(node_id(40)), 0)
+        self.assertEqual(table.row(node_id(40)), (node_id(40), routing.IN_TABLE, self.WALL, self.WALL, 0))
+        self.assertEqual(table.row(node_id(41))[2:4], (self.WALL, self.WALL))
+        self.assertEqual(table.row(node_id(42))[3], self.WALL + 3600)  # at most ban_time from now
+        self.clock.now += 3600
+        self.assertFalse(table.is_banned(node_id(42)))
+
+    def test_malformed_rows_and_our_own_id_are_left_out(self):
+        good = (node_id(50), routing.IN_TABLE, self.WALL, self.WALL, 0)
+        bad = [(b"short", routing.IN_TABLE, self.WALL, self.WALL, 0), (node_id(51), 7, self.WALL, self.WALL, 0),
+               (node_id(52), routing.IN_TABLE, None, self.WALL, 0), (node_id(53), routing.IN_TABLE, "x", 1.0, 0),
+               (node_id(54), routing.DROPPED, self.WALL, float("nan"), 0), (node_id(55), True, 1.0, 1.0, 0),
+               (node_id(56), routing.IN_TABLE, 1.0, 1.0, -1), (node_id(57), routing.IN_TABLE, 1.0, 1.0, 1.5),
+               (OWN_ID, routing.IN_TABLE, self.WALL, self.WALL, 0)]
+        table = self.restarted(0, [good, *bad])
+        self.assertEqual(table.nodes(), [node_id(50)])
+        self.assertEqual(self.changed, [row[0] for row in bad])
+
+    def test_admit_is_asked_again(self):
+        """Private mode: a node no longer a member isn't loaded."""
+        rows = [(node_id(n), routing.IN_TABLE, self.WALL, self.WALL, 0) for n in (60, 61)]
+        table = self.restarted(0, rows, admit=lambda n: n == node_id(60))
+        self.assertEqual(table.nodes(), [node_id(60)])
+        self.assertEqual(self.changed, [node_id(61)])
+
+    def test_a_full_bucket_keeps_the_nodes_first_seen_first(self):
+        # Only after our own ID changed can saved rows overfill a bucket
+        ids = bucket_ids(8, K + 2)
+        rows = [(n, routing.IN_TABLE, self.WALL - i, self.WALL, 0) for i, n in enumerate(ids)]
+        table = self.restarted(0, rows)
+        self.assertEqual(sorted(table.nodes()), sorted(ids[2:]))
+        self.assertEqual(sorted(self.changed), sorted(ids[:2]))
+
+    def test_every_change_is_reported_with_the_lock_held(self):
+        changes = []
+        self.table.track(lambda n: changes.append((n, self.table._lock._is_owned())))
+        a, b = node_id(70), node_id(71)
+        self.table.heard(a)
+        self.table.heard(a)
+        self.table.failed(a)
+        self.table.answered(a)
+        self.table.ban(b)
+        self.table.remove(a)
+        self.tick(3601)
+        self.assertFalse(self.table.is_banned(b))
+        self.assertEqual(changes, [(a, True)] * 4 + [(b, True)] * 2 + [(a, True), (b, True)])  # ban() removes first
+        for n in (72, 73):
+            self.table.heard(node_id(n))
+            while not self.table.failed(node_id(n)):
+                pass
+        changes.clear()
+        self.tick(2 * ANNOUNCE + 1)
+        self.table.heard(node_id(74))  # prunes the expired seniority of both
+        self.assertEqual([n for n, _ in changes], [node_id(72), node_id(73), node_id(74)])
+
+
+class RoutingStateTest(RoutingTestCase):
+    """The table saved in the state database (routing_state.RoutingState): changed rows only, read back at start."""
+
+    def setUp(self):
+        """A state directory, and the table of RoutingTestCase saved in it."""
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state_dir = tmp.name
+        self.wall = FakeClock(1_700_000_000.0)
+        self.table = RoutingTable(OWN_ID, self.config, clock=self.clock, wall_clock=self.wall)
+        self.state = self.open(self.table)
+
+    def open(self, table: RoutingTable) -> RoutingState:
+        """table's saved state, closed at the end of the test."""
+        state = RoutingState(table, self.state_dir)
+        self.addCleanup(state.close)
+        return state
+
+    def rows(self) -> list[tuple]:
+        """The saved rows, by node."""
+        return state_rows(self.state_dir, "SELECT node, state, first_seen, at, failures FROM routing ORDER BY node")
+
+    def test_saves_changed_rows_and_loads_them_at_start(self):
+        for n in (1, 2, 3):
+            self.table.heard(node_id(n))
+        self.table.ban(node_id(4))
+        self.assertEqual(self.rows(), [])  # nothing written until the save
+        self.state.save()
+        self.assertEqual([row[:2] for row in self.rows()], [(node_id(n), routing.IN_TABLE) for n in (1, 2, 3)]
+                         + [(node_id(4), routing.BANNED)])
+        written = []
+        real = statedb.RowStore.write_rows
+        with mock.patch.object(statedb.RowStore, "write_rows",
+                               lambda store, tx, snapshot: (written.append(snapshot), real(store, tx, snapshot))):
+            self.state.save()  # nothing changed: nothing written
+            self.clock.now += 60
+            self.wall.now += 60
+            self.table.heard(node_id(2))
+            self.table.remove(node_id(3))
+            self.state.save()
+        self.assertEqual(len(written), 1)  # one save, of the two rows that changed
+        self.assertEqual(dict(written[0]), {node_id(2): self.table.row(node_id(2)), node_id(3): None})
+        self.state.close()
+        table = RoutingTable(OWN_ID, self.config, clock=FakeClock(7.0), wall_clock=self.wall)
+        self.open(table)
+        self.assertEqual(sorted(table.nodes()), [node_id(1), node_id(2)])
+        self.assertTrue(table.is_banned(node_id(4)))
+        self.assertEqual(table.seniority(node_id(1)), 60)
+
+    def test_rows_not_loaded_are_deleted_by_the_next_save(self):
+        state_execute(self.state_dir, "INSERT INTO routing VALUES (?, ?, ?, ?, ?)", (b"short", 0, 1.0, 1.0, 0))
+        state_execute(self.state_dir, "INSERT INTO routing VALUES (?, ?, ?, ?, ?)",
+                      (node_id(9), routing.BANNED, None, 1.0, 0))  # ended long ago
+        state_execute(self.state_dir, "INSERT INTO routing VALUES (?, ?, ?, ?, ?)",
+                      (node_id(8), routing.IN_TABLE, 1.0, 2.0, 0))
+        self.state.close()
+        table = RoutingTable(OWN_ID, self.config, clock=self.clock, wall_clock=self.wall)
+        state = self.open(table)
+        self.assertEqual(table.nodes(), [node_id(8)])
+        state.save()
+        self.assertEqual(self.rows(), [(node_id(8), routing.IN_TABLE, 1.0, 2.0, 0)])
+
 
 class ThreadSafetyTest(RoutingTestCase):
     """Concurrent use from announce, request and lookup threads."""
