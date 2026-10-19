@@ -1457,7 +1457,11 @@ Everything in the specification is implemented, with these simplifications and a
   servers of the routing table, from `RoutingTable.join_order()`, those not failed since last heard, longest known
   first, sorted stably by score band, best first; then `bootstrap_ids()`) are asked one at a time with
   `PeerClient.find`, outside any `Lookup`, until `BOOTSTRAP_ANSWERS` (2) answer; the lookup that follows excludes
-  them. The thread then
+  them. `join()` returns the nodes contacted when a saved server answered and no default bootstrap node was asked;
+  `_join` then calls `check_defaults` (after `joined` is set, and after each rejoin): unless the node is slow, it
+  asks the defaults (`bootstrap_ids()`'s, not contacted yet) one at a time until one answers, at most
+  `DEFAULT_CHECKS` (2), and runs a lookup for its own ID from the servers that one listed. With
+  `default_bootstrap` off or in private mode there are none. The thread then
   checks `RoutingTable.live_count()` every `REJOIN_DELAY` (300 s) and joins again while it is under
   `MIN_SERVERS` (3), doubling the wait up to `announce_interval`. `DEFAULT_BOOTSTRAP_NODES` lives in
   `rnfs/constants.py` and changes only with a release; the e2e test turns it off (`default_bootstrap = false`).

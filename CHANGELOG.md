@@ -105,8 +105,9 @@ The DHT (local behaviour: nothing on the wire changes):
   only by earning it. Nothing is sent; at most 4096 peers are scored.
 - A join (at start, and again while too few servers are live) asks up to 6 servers of the saved routing table
   first, best scored first, and bootstrap nodes only if fewer than two of those answer: a node that has joined
-  once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. A node
-  whose saved servers answer no longer contacts the default bootstrap nodes at every start.
+  once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio. After
+  such a join, a node that isn't slow still asks the default bootstrap nodes (until one answers, at most 2), so
+  one that saved only an island of servers reaches the rest of the network; a slow node no longer does.
 - Choosing providers: within each seniority group (seniority stays first), providers with a better local score
   are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536

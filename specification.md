@@ -526,9 +526,14 @@ big-endian integer; "closest" means smallest distance.
     its only way in.
   - While fewer than 3 servers are known that `/find` replies would include (not failed since last heard,
     nor silent for over `2 × announce_interval`), the node joins again, 5 minutes after the last join and
-    doubling up to `announce_interval`: on radio every path request is flooded. A node whose saved servers
-    answer contacts no bootstrap node, so one that knew only a small island of servers stays on it until it
-    hears announces from beyond it, or joins again with too few servers left.
+    doubling up to `announce_interval`: on radio every path request is flooded.
+  - After a join that saved servers answered (so no default bootstrap node was asked), a node that isn't slow
+    SHOULD still ask the default bootstrap nodes, one at a time in random order until one answers (rnfs: at
+    most 2), and look up its own ID from the servers it lists, once the join is done so it isn't delayed: a node
+    that saved only a small island of servers still reaches the rest of the network. A slow node skips them, as
+    every path request on radio is flooded, and stays on such an island until it hears announces from beyond
+    it, or joins again with too few servers left. With `default_bootstrap` off or in private mode there are no
+    defaults to ask.
   - Bootstrap nodes get no special trust: once answered, they are ordinary routing-table entries.
 - Because RNS floods announces, on small meshes (a few dozen nodes) the routing table holds most of the
   network, so lookups usually finish in one or two rounds.

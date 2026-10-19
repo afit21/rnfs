@@ -75,6 +75,8 @@ STOP_TIMEOUT = 5.0  # seconds stop() waits in all for the threads it ends (the f
 REMOTE_PIN_QUEUE = 64  # remote pins one source may have waiting or being fetched; more are refused
 BOOTSTRAP_ANSWERS = 2  # a join stops contacting saved servers and bootstrap nodes once this many have answered
 SAVED_JOIN_TRIES = 6  # servers of the saved routing table a join asks at most, before bootstrap nodes
+# Default bootstrap nodes a fast node still asks, until one answers, after a join its saved servers answered
+DEFAULT_CHECKS = 2
 MIN_SERVERS = 3  # while fewer live servers are known, the join runs again
 REJOIN_DELAY = 300.0  # seconds before joining again; doubles after each join, up to announce_interval
 DENY_RETRY = 60.0  # seconds before maintenance applies a deny-list change again after applying it failed
@@ -953,40 +955,85 @@ class RnfsNode:
         """Join at startup, then again whenever fewer than MIN_SERVERS live servers are known (section 6).
 
         A join that leaves too few servers is retried after REJOIN_DELAY, doubling up to announce_interval:
-        on radio, every path request for a bootstrap node is flooded.
+        on radio, every path request for a bootstrap node is flooded. After a join its saved servers answered, the
+        default bootstrap nodes are asked too (check_defaults), once the join is done, so they don't delay it.
         """
+        contacted = None
         try:
             if self.reticulum is not None:
                 self._seed_routing()
-            self.join()
+            contacted = self.join()
         except Exception as e:  # noqa: BLE001 - joining is retried; logged
             log(f"joining the DHT failed: {e!r}", LOG_ERROR)
         finally:
             self.joined.set()
+        self._check_defaults_after(contacted)
         delay = REJOIN_DELAY
         while not self.stop_event.wait(delay):
             if self.routing.live_count() >= MIN_SERVERS:
                 delay = REJOIN_DELAY
                 continue
+            contacted = None
             try:
-                self.join()
+                contacted = self.join()
             except Exception as e:  # noqa: BLE001 - joining is retried; logged
                 log(f"joining the DHT failed: {e!r}", LOG_ERROR)
+            self._check_defaults_after(contacted)
             delay = min(2 * delay, self.config.announce_interval)
 
-    def join(self):
+    def _check_defaults_after(self, contacted: set[bytes] | None):
+        """check_defaults(contacted) after a join that returned contacted (None: not due, or the join failed); a
+        failure is logged."""
+        if contacted is None:
+            return
+        try:
+            self.check_defaults(contacted)
+        except Exception as e:  # noqa: BLE001 - the next join tries again; logged
+            log(f"asking the default bootstrap nodes failed: {e!r}", LOG_ERROR)
+
+    def join(self) -> set[bytes] | None:
         """Contact saved servers, then bootstrap nodes, then look up our own ID from what they and the routing
-        table know."""
-        contacted, start = self._contact_bootstrap()
+        table know. Returns the nodes contacted if saved servers answered and no default bootstrap node was asked
+        (check_defaults is then due), else None."""
+        saved = set(self.saved_join_candidates())
+        contacted, start, answered = self._contact_bootstrap()
+        due = contacted if answered & saved and not contacted & set(self._default_bootstrap()) else None
         start = start + self.routing.closest(self.node_id)
         if not start:
             log("no DHT servers known yet: waiting for announces", LOG_VERBOSE)
-            return
+            return due
         # The nodes contacted already answered (or failed) a /find for this key: not asked again
         lookup = self._new_lookup(self.node_id, start,
                                   lambda node_id: node_id in contacted or self.routing.is_banned(node_id))
         lookup.find_closest()
         log(f"joined the DHT: {plural(self.routing.node_count(), 'server')} known", LOG_NOTICE)
+        return due
+
+    def check_defaults(self, contacted: set[bytes]):
+        """After a join its saved servers answered (so no default bootstrap node was asked), ask the default
+        bootstrap nodes too, one at a time in random order until one answers, at most DEFAULT_CHECKS of them, and
+        look up our own ID from the servers it lists: a node that saved only an island of servers still reaches the
+        rest of the network, as when every start asked the defaults (section 6, "Joining").
+
+        Not on a slow node (every path request on radio is flooded), nor with default_bootstrap off or in private
+        mode (no defaults then). contacted: the nodes the join asked, which aren't asked again."""
+        if self.slow:
+            return
+        defaults = set(self._default_bootstrap())
+        candidates = [node_id for node_id in self.bootstrap_ids() if node_id in defaults and node_id not in contacted]
+        for node_id in candidates[:DEFAULT_CHECKS]:
+            if self.stop_event.is_set():
+                return
+            reply = self._ask_for_own_id(node_id)
+            if reply is None:
+                continue
+            asked = contacted | {node_id}
+            lookup = self._new_lookup(self.node_id, list(reply[1]),
+                                      lambda other: other in asked or self.routing.is_banned(other))
+            lookup.find_closest()
+            log(f"default bootstrap node {node_name(node_id)} answered: "
+                f"{plural(self.routing.node_count(), 'server')} known", LOG_VERBOSE)
+            return
 
     def bootstrap_ids(self) -> list[bytes]:
         """Bootstrap nodes in the order a join contacts them: bootstrap_nodes as given, then (unless
@@ -1006,43 +1053,54 @@ class RnfsNode:
         """Every bootstrap node (the user's and the defaults in use) but this node: those seeded a score."""
         return set(self._bootstrap_nodes + self._default_bootstrap()) - {self.node_id}
 
-    def join_candidates(self) -> list[bytes]:
-        """The nodes a join asks for our own ID, in order (section 6, "Joining"): up to SAVED_JOIN_TRIES servers of
-        the routing table, which is saved across restarts, that haven't failed a query since last heard, best
-        scored first (local scores, by band) and longest known breaking ties; then the bootstrap nodes
-        (bootstrap_ids) not among them. A node that has joined once is its own bootstrap list, so a restart doesn't
-        flood path requests for bootstrap nodes on radio."""
+    def saved_join_candidates(self) -> list[bytes]:
+        """The saved servers a join asks first: up to SAVED_JOIN_TRIES servers of the routing table, which is saved
+        across restarts, that haven't failed a query since last heard, best scored first (local scores, by band)
+        and longest known breaking ties."""
         bands = self.scores.bands()
-        saved = sorted(self.routing.join_order(), key=lambda node_id: -bands.get(node_id, 0))[:SAVED_JOIN_TRIES]
+        return sorted(self.routing.join_order(), key=lambda node_id: -bands.get(node_id, 0))[:SAVED_JOIN_TRIES]
+
+    def join_candidates(self) -> list[bytes]:
+        """The nodes a join asks for our own ID, in order (section 6, "Joining"): the saved servers
+        (saved_join_candidates), then the bootstrap nodes (bootstrap_ids) not among them. A node that has joined
+        once is its own bootstrap list, so a restart doesn't flood path requests for bootstrap nodes on radio."""
+        saved = self.saved_join_candidates()
         return saved + [node_id for node_id in self.bootstrap_ids() if node_id not in saved]
 
-    def _contact_bootstrap(self) -> tuple[set[bytes], list[bytes]]:
+    def _contact_bootstrap(self) -> tuple[set[bytes], list[bytes], set[bytes]]:
         """Ask the join's candidates (saved servers, then bootstrap nodes) for our own ID, one at a time, until
         BOOTSTRAP_ANSWERS have answered.
 
         Each costs a path request if its identity isn't known, outside any lookup's budget for unknown IDs, so an
-        unreachable one doesn't stop the rest being tried. Returns the nodes contacted and the servers their
-        answers listed.
+        unreachable one doesn't stop the rest being tried. Returns the nodes contacted, the servers their answers
+        listed, and the nodes that answered.
         """
         contacted: set[bytes] = set()
         found: list[bytes] = []
-        answered = 0
+        answered: set[bytes] = set()
         for node_id in self.join_candidates():
-            if answered >= BOOTSTRAP_ANSWERS or self.stop_event.is_set():
+            if len(answered) >= BOOTSTRAP_ANSWERS or self.stop_event.is_set():
                 break
             contacted.add(node_id)
-            try:
-                reply = self.client.find(node_id, self.node_id)
-            except Exception:  # noqa: BLE001 - an unanswering bootstrap node is skipped
-                reply = None
-            if reply is None:
-                log(f"joining: {node_name(node_id)} didn't answer", LOG_VERBOSE)
-                self._query_failed(node_id)
-                continue
-            answered += 1
-            self._answered(node_id)
-            found.extend(reply[1])
-        return contacted, found
+            reply = self._ask_for_own_id(node_id)
+            if reply is not None:
+                answered.add(node_id)
+                found.extend(reply[1])
+        return contacted, found, answered
+
+    def _ask_for_own_id(self, node_id: bytes) -> tuple[list[bytes], list[bytes]] | None:
+        """Send node_id a /find for our own ID, outside any lookup: its reply (providers, servers), counted as an
+        answer, or None, counted as a failed query."""
+        try:
+            reply = self.client.find(node_id, self.node_id)
+        except Exception:  # noqa: BLE001 - an unanswering node is skipped
+            reply = None
+        if reply is None:
+            log(f"joining: {node_name(node_id)} didn't answer", LOG_VERBOSE)
+            self._query_failed(node_id)
+            return None
+        self._answered(node_id)
+        return reply
 
     def _run_publisher(self):
         """The publish loop, started once the join has filled the routing table."""

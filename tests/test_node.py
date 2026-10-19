@@ -1241,6 +1241,74 @@ class JoinTest(NodeTest):
         self.assertEqual(self.finds[:node_module.SAVED_JOIN_TRIES + 1],
                          gone[1:node_module.SAVED_JOIN_TRIES + 1] + [self.SERVERS[0]])
 
+    ISLAND = [bytes([0x40 + i] * 16) for i in range(2)]  # servers that know only each other
+
+    def island_joiner(self, **settings) -> RnfsNode:
+        """The joining node, its saved routing table holding only the two island servers (which answer)."""
+        for server_id in self.ISLAND:
+            self.make_node(f"i{server_id[0]}", server_id)
+        for server_id in self.ISLAND:
+            for other in self.ISLAND:
+                self.net.nodes[server_id].routing.heard(other)
+        x = self.joiner(**settings)
+        for server_id in self.ISLAND:
+            x.routing.heard(server_id)
+        return x
+
+    def defaults_asked(self) -> list[bytes]:
+        """The default bootstrap nodes (SERVERS[1:], as patched) asked so far."""
+        return [node_id for node_id in self.finds if node_id in self.SERVERS[1:]]
+
+    def test_a_fast_node_still_asks_the_defaults_after_its_saved_servers_answered(self):
+        x = self.island_joiner()
+        joined_when_asked = []
+        find = self.net.find
+
+        def note(node_id, key):
+            """Note whether the join was done when a default bootstrap node was asked."""
+            if node_id in self.SERVERS[1:]:
+                joined_when_asked.append(x.joined.is_set())
+            return find(node_id, key)
+
+        self.net.find = note
+        thread = threading.Thread(target=x._join, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(x.stop_event.set)
+        wait_for(lambda: x.routing.contains(self.SERVERS[0]), what="the network beyond the island")
+        self.assertEqual(self.finds[:2], self.ISLAND)  # the saved servers answered the join itself
+        # The first default asked answered, and the lookup from the servers it listed asked the others too
+        self.assertTrue(self.defaults_asked())
+        self.assertTrue(joined_when_asked and all(joined_when_asked))  # after the join, so it isn't delayed
+
+    def test_at_most_two_defaults_are_asked_until_one_answers(self):
+        x = self.island_joiner()
+        for server_id in self.SERVERS[1:]:
+            self.net.nodes.pop(server_id)  # unreachable
+        x._check_defaults_after(x.join())
+        self.assertEqual(len(self.defaults_asked()), node_module.DEFAULT_CHECKS)
+
+    def test_a_slow_node_doesnt_ask_the_defaults_after_its_saved_servers_answered(self):
+        x = self.island_joiner()
+        x.slow = True  # every path request on radio is flooded
+        contacted = x.join()
+        self.assertEqual(contacted, set(self.ISLAND))  # due, but skipped by a slow node
+        x._check_defaults_after(contacted)
+        self.assertEqual(self.defaults_asked(), [])
+        self.assertFalse(x.routing.contains(self.SERVERS[1]))
+
+    def test_without_defaults_none_are_asked(self):
+        x = self.island_joiner(default_bootstrap=False)
+        x._check_defaults_after(x.join())
+        private = self.make_node("p", bytes([0xF] * 16), private=True)
+        private.check_defaults(set())
+        self.assertEqual(self.defaults_asked(), [])
+
+    def test_not_due_when_the_join_asked_the_defaults_or_no_saved_server_answered(self):
+        x = self.joiner()
+        self.assertIsNone(x.join())  # no saved servers: the join asked the defaults itself
+        self.assertTrue(self.defaults_asked())
+
     def test_joins_again_while_too_few_servers_are_known(self):
         x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)
         first = self.net.nodes.pop(self.SERVERS[0])  # unreachable at startup
