@@ -762,6 +762,11 @@ and repeat.
 - rnfs stores blocks only in real directories of its own: a subdirectory of `blocks/` that is a link (or a
   Windows junction), isn't a directory or belongs to another user stops the start; a loose one is made 0700.
   Links inside `blocks/` are never followed.
+- Every stored block's size is kept in the state database too, written whenever pins or cache records are saved,
+  so a start needn't list every block: after a clean stop rnfs reads them from there. After a stop that wasn't
+  clean (a crash, a power loss, or the first start of 0.2.0) it lists every block, deleting partial files a crash
+  left, and writes the sizes again. A block whose file turns out to be missing counts as a damaged block: deleted
+  from the index once read, and fetched again if needed.
 - rnfs keeps the rest of its state (pins, cache records, names, provider records, jobs, ...) in one SQLite
   database, `<rnfs dir>/state/rnfs.db`, readable by its owner only. The JSON state files earlier versions wrote
   under `<rnfs dir>/state/` are imported into it at the first start, each once and whole, and kept as

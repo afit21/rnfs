@@ -18,7 +18,7 @@ subdirectories, then the directories synced. The move is resumable: a rename is 
 is left, and a block already in its subdirectory makes the flat copy (the same content, by its CID) redundant,
 so it is deleted. A block whose move fails (on Windows a scanner may hold it open) stays readable where it is
 (flat) until a later start moves it. Partial files inside the subdirectories are deleted by scan(tidy=True),
-which Storage runs when it lists every block after an unclean stop.
+which Storage runs when it lists every block, after a stop that wasn't clean: a clean one leaves none (untidy).
 
 A subdirectory must be a real directory of this user's: one that is a symlink (or a Windows junction), not a
 directory, or another user's stops the start (RnfsError), as node._make_private_dirs does for blocks/ itself, so
@@ -77,6 +77,12 @@ class BlockStore:
         self._top_dirty = False
         # Blocks left directly in blocks/ because their move failed: path() finds them there until a later start
         self._flat: set[Cid] = set()
+        # Every block found directly in blocks/ at the start, moved or not: CID -> size. Storage adds them to an
+        # index it loads from the state database, which blocks an older rnfs stored would be missing from
+        self.found_flat: dict[Cid, int] = {}
+        # A partial file couldn't be deleted (on Windows, in use), so one may be left in a subdirectory, which only
+        # a tidy scan would find: Storage then doesn't record a clean stop
+        self.untidy = False
         os.makedirs(self.directory, exist_ok=True)
         self._open()
 
@@ -95,15 +101,16 @@ class BlockStore:
                     try:
                         cid = Cid.from_block_name(name)
                         if entry.is_file(follow_symlinks=False):
-                            flat.append(cid)
-                    except ValueError:
+                            flat.append((cid, entry.stat(follow_symlinks=False).st_size))
+                    except (ValueError, OSError):
                         continue
         if not flat:
             return
         if self._report is not None:
             self._report(f"moving {len(flat)} block{'' if len(flat) == 1 else 's'} into subdirectories of "
                          f"{self.directory} (on a large store this takes a while, once)")
-        for cid in flat:
+        for cid, size in flat:
+            self.found_flat[cid] = size
             if not self._move_flat(cid):
                 self._flat.add(cid)
         with self._lock:
@@ -245,10 +252,10 @@ class BlockStore:
                 pass
             raise
 
-    @staticmethod
-    def _remove_partial(path: str):
-        """Delete a partial file put() leaves; one Windows keeps in use is left for a later start."""
-        fsutil.remove(path)
+    def _remove_partial(self, path: str):
+        """Delete a partial file put() leaves; one Windows keeps in use is left for a later start (untidy)."""
+        if not fsutil.remove(path):
+            self.untidy = True
 
     def sync(self):
         """Make the names of the blocks stored so far survive a power loss: sync each subdirectory blocks were
@@ -312,7 +319,7 @@ class BlockStore:
                             try:
                                 self._remove_partial(entry.path)
                             except OSError:
-                                pass  # left for a later start; the blocks are still listed
+                                self.untidy = True  # left for a later start; the blocks are still listed
                         continue
                     try:
                         cid = Cid.from_block_name(name)

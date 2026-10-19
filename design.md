@@ -263,6 +263,21 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   since the last `save()`; those still cached are always the most recently used, so a save writes them with
   new `used` values (the table's LRU order) and deletes the others.
 - `verify() -> stats` re-checks every block, deleting bad ones.
+- The block index, `_sizes` (CID -> size), is also the `block_sizes` table (schema step `block_sizes`). `_put`
+  and `_delete` note each change in `_sizes_dirty` (a size, or None); `_save_pins` writes them in the pin's durable
+  transaction and `save()` with the cache records, each taking and writing them under the lock (`save()` syncs
+  the blocks first, outside it), so an older batch never lands after a newer one. The table is trusted only after
+  a clean stop: `close()` marks the store closed (`_put` raises `Closed`, `_delete` deletes nothing), syncs the
+  blocks, writes what is left and sets the meta value `(block_sizes, clean)` to 1 in one durable transaction,
+  unless a put is still writing (`_writing`, a thread that outlived the node's stop) or `BlockStore.untidy` (a
+  partial file it couldn't delete). At the next start `_index` clears the mark durably before the block store
+  is opened (so the move of flat blocks, or anything after, can't be trusted to a stale table), then loads the
+  table, adding the flat blocks `BlockStore` found (`found_flat`: an older rnfs may have stored some since); with
+  no mark, a 0, or a row that doesn't parse, it lists every block (`scan(tidy=True)`) and rewrites the table. A
+  row whose file is missing is found when the block is read, as a damaged block is (`get` deletes it from the
+  index). On 100 000 small blocks (NVMe, warm cache) a start indexes them in 0.19 s from the table against
+  0.65 s for 0.1.6's listing; a start after an unclean stop takes 0.98 s (the listing of 1,024 directories and the
+  table rewrite).
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.

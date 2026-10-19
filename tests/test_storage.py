@@ -9,10 +9,11 @@ from unittest import mock
 
 from rnfs import constants, fsutil, statedb
 from rnfs.content import builder, dag, storage as storage_module, walker
+from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
 from rnfs.content.storage import FOLDER, USER, Storage, check_source, name_source, remote_source
-from rnfs.errors import NotFound, StorageFull
+from rnfs.errors import Closed, NotFound, StorageFull
 from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
 
 IDENTITY = "0123456789abcdef0123456789abcdef"
@@ -105,6 +106,166 @@ class BlockTest(StorageTest):
             thread.join()
         self.assertEqual(self.storage.used_bytes(), 20000)
         self.assertEqual(self.storage.block_count(), 200)
+
+
+class BlockSizesTest(StorageTest):
+    """The block_sizes table: loaded at a start after a clean stop, instead of listing every block."""
+
+    def rows(self) -> dict[Cid, int]:
+        """The block_sizes table as committed."""
+        return {Cid.from_bytes(binary): size for binary, size in state_rows(self.state, "SELECT cid, size FROM "
+                                                                                       "block_sizes")}
+
+    def clean(self):
+        """The clean mark as committed (None if never set)."""
+        rows = state_rows(self.state, "SELECT value FROM meta WHERE store = 'block_sizes' AND key = 'clean'")
+        return rows[0][0] if rows else None
+
+    def setUp(self):
+        """As StorageTest, with a few blocks stored."""
+        super().setUp()
+        self.state = os.path.join(self.tmp.name, "state")
+        self.blocks = {}
+        for n in range(5):
+            data = b"block %d" % n * (n + 1)
+            self.blocks[Cid.for_block(RAW, data)] = data
+            self.storage.put(Cid.for_block(RAW, data), data)
+
+    def sizes(self, storage: Storage) -> dict[Cid, int]:
+        """What storage holds: CID -> size."""
+        return {cid: storage.block_size(cid) for cid in self.blocks if storage.has(cid)}
+
+    def test_loaded_after_a_clean_stop(self):
+        self.assertEqual(self.clean(), 0)  # a running store's table isn't trusted
+        self.storage.close()
+        self.assertEqual(self.clean(), 1)
+        self.assertEqual(self.rows(), {cid: len(data) for cid, data in self.blocks.items()})
+        with mock.patch.object(BlockStore, "scan", side_effect=AssertionError("listed every block")):
+            storage = self.open()
+        self.assertEqual(self.sizes(storage), {cid: len(data) for cid, data in self.blocks.items()})
+        self.assertEqual(storage.used_bytes(), sum(map(len, self.blocks.values())))
+        self.assertEqual(self.clean(), 0)  # cleared at once, until this one stops cleanly
+        storage.close()
+        self.assertEqual(self.clean(), 1)
+
+    def test_rows_follow_blocks_stored_and_deleted(self):
+        # Written whenever pins or cache records are saved, so a clean stop has little left to write
+        pinned = self.add(b"pinned").cid
+        self.storage.pin(pinned, USER)
+        self.assertEqual(set(self.rows()), set(self.blocks) | {pinned})
+        self.storage.gc()  # the other blocks are cache that nothing reaches
+        self.storage.save()
+        self.assertEqual(self.rows(), {pinned: 6})
+        self.storage.close()
+        self.assertEqual(self.sizes(self.open()), {})
+        self.assertEqual(self.rows(), {pinned: 6})
+
+    def test_an_unclean_stop_lists_every_block(self):
+        # The process ended without close(): the table may miss blocks stored since, or list deleted ones
+        self.storage.save()
+        extra = Cid.for_block(RAW, b"stored after the last save")
+        self.storage.put(extra, b"stored after the last save")
+        gone = next(iter(self.blocks))
+        os.remove(self.storage.blocks.path(gone))  # as a delete since the last save would
+        partial = os.path.join(os.path.dirname(self.storage.blocks.path(extra)), PARTIAL_PREFIX + "x")
+        open(partial, "wb").close()
+        with mock.patch("rnfs.content.storage.log") as logged:
+            storage = self.open()  # the first is still open, so its stop was never recorded clean
+        self.assertIn("didn't stop cleanly", logged.call_args_list[0].args[0])
+        expected = {cid: len(data) for cid, data in self.blocks.items() if cid != gone}
+        self.assertEqual(self.sizes(storage), expected)
+        self.assertTrue(storage.has(extra))
+        self.assertEqual(self.rows(), {**expected, extra: len(b"stored after the last save")})
+        self.assertFalse(os.path.exists(partial))  # a full listing deletes partial files a crash left
+
+    def test_a_missing_file_counts_as_a_damaged_block(self):
+        cid = next(iter(self.blocks))
+        self.storage.close()
+        os.remove(self.storage.blocks.path(cid))
+        storage = self.open()
+        self.assertTrue(storage.has(cid))  # the table says so, until it is read
+        self.assertIsNone(storage.get(cid))
+        self.assertFalse(storage.has(cid))
+        self.assertEqual(storage.used_bytes(), sum(len(data) for other, data in self.blocks.items() if other != cid))
+        storage.close()
+        self.assertNotIn(cid, self.rows())
+
+    def test_flat_blocks_are_indexed_after_a_clean_stop(self):
+        # An older rnfs run since the clean stop stored a block directly in blocks/
+        self.storage.close()
+        data = b"stored by rnfs 0.1.6"
+        cid = Cid.for_block(RAW, data)
+        with open(os.path.join(self.tmp.name, "blocks", str(cid)), "wb") as f:
+            f.write(data)
+        storage = self.open()
+        self.assertEqual(storage.get(cid), data)
+        self.assertEqual(storage.block_size(cid), len(data))
+        storage.close()
+        self.assertEqual(self.rows()[cid], len(data))
+
+    def test_an_invalid_row_lists_every_block(self):
+        self.storage.close()
+        state_execute(self.state, "INSERT INTO block_sizes (cid, size) VALUES (?, ?)", (b"\x01\x02", 3))
+        storage = self.open()
+        self.assertEqual(self.sizes(storage), {cid: len(data) for cid, data in self.blocks.items()})
+        self.assertNotIn(b"\x01\x02", [binary for binary, in state_rows(self.state, "SELECT cid FROM block_sizes")])
+
+    def test_a_put_still_writing_at_close_isnt_a_clean_stop(self):
+        started, release = threading.Event(), threading.Event()
+        real_put = BlockStore.put
+
+        def slow_put(store, cid, block):
+            """Write the block once the test lets it."""
+            started.set()
+            release.wait(10)
+            real_put(store, cid, block)
+
+        with mock.patch.object(BlockStore, "put", slow_put):
+            writer = threading.Thread(target=self.storage.put, args=(Cid.for_block(RAW, b"late"), b"late"))
+            writer.start()
+            self.assertTrue(started.wait(10))
+            self.storage.close()
+            release.set()
+            writer.join()
+        self.assertEqual(self.clean(), 0)
+        storage = self.open()
+        self.assertTrue(storage.has(Cid.for_block(RAW, b"late")))  # found by listing every block
+
+    def test_nothing_is_stored_or_deleted_after_close(self):
+        self.storage.close()
+        with self.assertRaises(Closed):
+            self.storage.put(Cid.for_block(RAW, b"late"), b"late")
+        with self.storage._lock:
+            self.assertEqual(self.storage._delete(set(self.blocks)), (set(), 0))
+        for cid in self.blocks:
+            self.assertTrue(os.path.exists(self.storage.blocks.path(cid)))
+
+    def test_a_partial_file_left_isnt_a_clean_stop(self):
+        # On Windows one may be in use: only a full listing at the next start finds it again
+        cid = Cid.for_block(RAW, b"new")
+        with mock.patch.object(fsutil, "replace", side_effect=OSError(5, "I/O error")), \
+                mock.patch.object(fsutil, "remove", return_value=False):
+            with self.assertRaises(OSError):
+                self.storage.put(cid, b"new")
+        self.storage.close()
+        self.assertEqual(self.clean(), 0)
+        for name in os.listdir(os.path.dirname(self.storage.blocks.path(cid))):
+            if name.startswith(PARTIAL_PREFIX):
+                break
+        else:
+            self.fail("no partial file left")
+        self.open()
+        self.assertEqual([name for name in os.listdir(os.path.dirname(self.storage.blocks.path(cid)))
+                          if name.startswith(PARTIAL_PREFIX)], [])
+
+    def test_a_failed_save_writes_the_rows_next_time(self):
+        cid = self.add(b"x").cid
+        with failing_commits():
+            with self.assertRaises(OSError):
+                self.storage.pin(cid, USER)
+        self.assertNotIn(cid, self.rows())
+        self.storage.save()
+        self.assertIn(cid, self.rows())
 
 
 class WriterTest(StorageTest):

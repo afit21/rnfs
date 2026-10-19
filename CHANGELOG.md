@@ -16,7 +16,8 @@ Upgrade notes:
   API answers once it is done). Each start moves whatever is left, so an interrupted upgrade loses nothing, and
   a block Windows won't let rnfs move stays readable until a later start moves it. An older rnfs doesn't find
   the moved blocks. A subdirectory of `blocks/` that is a link, not a directory or another user's stops the
-  start.
+  start. The state database gains a `block_sizes` table, every stored block's size, which the first start
+  fills by listing the blocks.
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
@@ -105,6 +106,15 @@ Changed:
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
+
+Faster:
+- A start no longer lists every stored block before the API answers: their sizes are kept in the state database
+  (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
+  as before, and writes the table again. 100 000 small blocks on a desktop NVMe disk (warm cache): 0.65 s to
+  index them before, 0.19 s now after a clean stop, 0.98 s after an unclean one (1,024 directories listed and the
+  table rewritten); moving them out of 0.1.6's flat layout at the first start took 5.9 s. A cold cache and a
+  slow disk should gain more, as the table is one file read in order: Raspberry Pi SD-card numbers are still to
+  be measured (`tests/bench_startup.py`, `--cold` for a cache dropped as after a reboot).
 
 ## 0.1.6
 

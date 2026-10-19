@@ -150,6 +150,11 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # A label the user gave a pin (pin label), kept apart from where it was added from (pin_names); dump()ed
         "CREATE TABLE pin_labels (cid BLOB PRIMARY KEY, label TEXT NOT NULL) WITHOUT ROWID",
     )),
+    ("block_sizes", (
+        # Every stored block's size (rnfs 0.2.0), so a start needn't list them all: trusted only while the meta
+        # value (block_sizes, clean) is 1, which Storage.close() sets once it has written the table whole
+        "CREATE TABLE block_sizes (cid BLOB PRIMARY KEY, size INTEGER NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 
