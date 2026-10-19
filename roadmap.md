@@ -415,7 +415,7 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   content), then syncs the directories. A block whose rename fails (Windows antivirus) stays readable where it
   is until a later start moves it. Scans never follow symlinks in `blocks/`
 
-## Network status
+## Network status (done)
 
 * `rnfs status` (and `GET /api/status`) reports what the node can see of the network: the estimated number of
   DHT servers (the density check's size estimate), how often the density check fired recently, partition mode
