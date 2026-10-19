@@ -59,7 +59,7 @@ What companion apps need from the daemon, most impactful first.
   of per connection
 
 
-## Providing at scale
+## Providing at scale (done, but the Gutenberg benchmark)
 
 Today a node can advertise about 1000 roots on a small network (100 while it is new): each server stores at most
 `max_records / 100` records per publisher, and with 10 or fewer servers every server holds every key. Each root
@@ -120,7 +120,7 @@ so it never finishes within a day. Every record is also held in memory (about 50
 * Benchmark: one node publishing a large collection (e.g. the ~70k-file Gutenberg mirror) over rnfs, kept
   findable through republishing
 
-## Resisting floods
+## Resisting floods (done)
 
 RNS identities are free and RNS has no IP addresses, so no cap keyed on an identity bounds an attacker, and no
 deployed DHT's defence (IP diversity, a directory authority) carries over. The model: **share freely while there
@@ -177,7 +177,7 @@ simulated in [docs/simulations/storage](docs/simulations/storage/RESULTS.md).
   day), and crowd honest newcomers. Recovery after a flood ends: at once for pre-aged floods on stores below
   ~85% use, 4.5–5.5 days for fresh floods on a full store, 7–9 days for identities already Earned
 
-## Finding content when identities are placed next to a key
+## Finding content when identities are placed next to a key (done)
 
 Generating identities closer to a key than every honest server costs about 4 s of one core each, even with 10,000
 servers, and 10 of them hide content completely today (found 0–4% of the time). Simulated in
@@ -258,7 +258,7 @@ reconnects. Simulated in [docs/simulations/topology](docs/simulations/topology/R
   of the time (55% today). Two-level records need both publisher and searcher upgraded; the other changes help
   as soon as either side has
 
-## Less announce traffic
+## Less announce traffic (done)
 
 Every node announces `rnfs.dht` every 6 hours and every name its own destination, and RNS floods announces across
 the network. A LoRa channel's 2% announce allowance carries about 1,150 a day at 1 kbit/s, enough for about 290
@@ -279,7 +279,7 @@ rnfs nodes; at 100k nodes announces approach RNS's per-interface ingress limit o
   a path-answered resolve's airtime), and transport nodes answer path requests from their cached, old announce
   anyway
 
-## Providing files inside folders
+## Providing files inside folders (done)
 
 * A `provide_entries` setting that also provides the CID of every file and folder inside a complete pin, so
   each can be found by its own CID rather than only as `<root>/<path>`, and the same file in two folders can be
@@ -294,7 +294,7 @@ rnfs nodes; at 100k nodes announces approach RNS's per-interface ingress limit o
   what a 1 kbit/s node can republish. `provide_entries = true` or `false` overrides the default either way
 * Unpinning a folder withdraws every entry it provided
 
-## Gateway: an origin per site
+## Gateway: an origin per site (done)
 
 * Subdomain gateway: `<cid>.rnfs.localhost:8789` and `<name>.name.localhost:8789`, so a page can `fetch()`
   files of its own DAG; the path gateway (`/rnfs/<cid>`, `/name/<name>`) stays
@@ -315,7 +315,7 @@ rnfs nodes; at 100k nodes announces approach RNS's per-interface ingress limit o
   cookies (localStorage and IndexedDB are per origin); not every resolver maps `*.localhost` to loopback
   (browsers do), so the path gateway stays the fallback; links between sites must be absolute subdomain URLs
 
-## Pin by NomadNet address
+## Pin by NomadNet address (done)
 
 `rnfs add` recognises a NomadNet link and adds what the NomadNet node returns:
 
@@ -351,7 +351,7 @@ rnfs add e166ecdbc405bcc9762b6767617fc949:/file/song.mp3   # a file the node ser
     callback (RNS deletes it after); a page response must be one byte string, checked from its msgpack headers
     before RNS decodes it, as `rnfs.dht` responses are
 
-## LXMF moves out of core
+## LXMF moves out of core (deprecation done; removal waits for the wrapper)
 
 LXMF becomes a separate wrapper project built on the local API and the library.
 
@@ -376,7 +376,7 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   doesn't list is skipped once an app named `lxmf` exists, so it never releases the wrapper's pins. The
   `lxmf_messages` inbox stays in rnfs.db (whether to export it for the wrapper is open)
 
-## Per-app API tokens and pin sources
+## Per-app API tokens and pin sources (done)
 
 * `rnfs app add <name>` issues a labelled token for an application; `rnfs app ls` and `rnfs app rm <name>`
   list and revoke them. The current `api_token` stays as the full-access token for the CLI
@@ -397,7 +397,7 @@ LXMF becomes a separate wrapper project built on the local API and the library.
 * An OpenAPI reference for the local API (request and response shapes, error codes), checked against the
   code by tests as `rnfs/api.py`'s route list is today
 
-## Block storage and startup
+## Block storage and startup (done)
 
 * Startup lists every block (twice: once for leftover `.partial-` files, once for sizes) before the API binds,
   so `rnfs status` says "no daemon is running" while a large store is scanned. The directory lock is taken
@@ -423,7 +423,7 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   how many newcomers were refused or evicted recently. It is the cheapest way to learn how big the network is
   and to notice a flood or an attack on a key, and needs nothing on the wire
 
-## Encrypted folders
+## Encrypted folders (done)
 
 * `add --to` accepts a folder: rnfs packs it as one tar stream and seals that as a single sealed file, so the
   folder's names and structure are hidden along with its content. Sealed files are unchanged: the sealed name
@@ -434,19 +434,20 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   rules, depth and entry limits), streams into the sealer (which already takes a stream of unknown length), and
   puts everything under one top directory `<folder>/`, so `tar xf` doesn't spill into the current directory
 * `get` of such a file, by a recipient, decrypts it and unpacks it only if the sealed name ends in `.tar` and the
-  content is a valid tar, reusing both rule sets as they are: the tar reader of `POST /api/add/stream` builds it
+  content is a valid tar that starts with rnfs's sealed-folder marker (a pax global header holding only
+  `comment=rnfs sealed folder`, which extractors ignore), so a real `.tar` someone sealed as a file stays a file, reusing both rule sets as they are: the tar reader of `POST /api/add/stream` builds it
   into the block store (regular files and directories only, no absolute or `..` paths, entry-count and depth
   limits), `get`'s write-out writes it (temporary name, renamed when complete, unsafe names skipped), and the
   plaintext blocks are collected afterwards; the free-space check counts both. `--no-extract` writes the `.tar`
   instead. `cat` gives the decrypted tar, as for any sealed file; the gateway and `--raw` give the sealed bytes
 
-## Name key backups
+## Name key backups (done)
 
 * Losing a name's key loses the name for good: nothing can move it to a new key. `name create` and `name import`
   say so and print the `name export` command; the node remembers which keys were exported since they were
   created, and `rnfs status` lists names whose key has never been exported
 
-## Publishing a folder to a name
+## Publishing a folder to a name (done)
 
 * `rnfs name sync <alias> <folder>` keeps a name pointing at a folder's current content: every `scan_interval`
   the folder is imported as the shared folder is (unchanged files recognised by their metadata, not re-read;
@@ -459,7 +460,7 @@ LXMF becomes a separate wrapper project built on the local API and the library.
   with the version before. `rnfs name unsync <alias>` stops it and keeps the name where it last pointed. Also
   through the API and the library
 
-## Remote pin status
+## Remote pin status (done)
 
 * `rnfs pin remote ls` lists the remote pins this node asked for: node, CID, when it asked, and whether it is
   done, worked out locally by looking up the CID's providers and finding that node among them (paced on slow
