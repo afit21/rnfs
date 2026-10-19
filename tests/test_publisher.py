@@ -44,6 +44,10 @@ class FakeLookup:
         """The fixed nodes, none unreliable."""
         return {node: False for node in self.nodes}
 
+    def remaining(self):
+        """Time left in its budget: plenty."""
+        return 600.0
+
     def ask(self, node_id, key):
         """No answer (noted)."""
         self.asked.append((node_id, key))

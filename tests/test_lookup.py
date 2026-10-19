@@ -637,6 +637,9 @@ class CandidatesTest(LookupTestCase):
         started = time.monotonic()
         self.assertIsNone(lookup.ask(hung, ident(4)))
         self.assertLess(time.monotonic() - started, 1)
+        asked = len(net.queried)
+        self.assertIsNone(lookup.ask(answering, ident(4)))  # the budget is spent: nothing is sent
+        self.assertEqual(len(net.queried), asked)
 
 
 class FindProvidersTest(LookupTestCase):

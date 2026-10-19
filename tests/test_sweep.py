@@ -232,6 +232,13 @@ class FindRegionTest(unittest.TestCase):
         lookup = ScriptedLookup([outsider], [outsider], knows={outsider: []})
         self.assertEqual(explore(lookup, key, 1, OWN), 1)
 
+    def test_nothing_sent_once_the_lookup_is_out_of_time(self):
+        far = [top("01", i << 100) for i in range(1, 8)]
+        lookup = ScriptedLookup(far, far)
+        lookup.remaining = lambda: 0.0
+        self.assertEqual(explore(lookup, top("00"), 1, OWN), 0)
+        self.assertEqual(lookup.asked, [])
+
     def test_unanswered_servers_tried_up_to_a_limit(self):
         far = [top("01", i << 100) for i in range(1, 8)]
         lookup = ScriptedLookup(far, far, dead=far)

@@ -190,8 +190,8 @@ class Lookup:
         """
         if self.deadline is None:
             self.deadline = self.clock() + self.timeout
-        if not self._usable(node_id) or not self.allow_unknown(node_id):
-            return None
+        if self.remaining() <= 0 or not self._usable(node_id) or not self.allow_unknown(node_id):
+            return None  # nothing sent
         results: queue.Queue = queue.Queue()
         self._out.add(node_id)
         self._send(node_id, results, key)

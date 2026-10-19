@@ -104,6 +104,8 @@ def explore(lookup, key: bytes, bits: int, own_id: bytes) -> int:
         asked: set[bytes] = {own_id}
         failed = 0
         while sent < MAX_REGION_FINDS and failed < REGION_FIND_TRIES:
+            if lookup.remaining() <= 0:
+                return sent  # the lookup's time budget is spent: nothing more is sent
             candidates = lookup.candidates()
             node_id = min((n for n in candidates if n not in asked), default=None,
                           key=lambda n: (candidates[n], distance(n, centre_id)))
