@@ -1,18 +1,18 @@
 """RnfsNode: one running rnfs node, wiring Reticulum to the DHT, storage, fetching and publishing, and the
 facade that the API, gateway and CLI call (design.md, "Node facade").
 
-Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), or for a node
-embedded in another program (rnfs.Node) the program's running instance, then the node's identity and its
-rnfs.dht destination, then the state database (rnfs.statedb, which imports the JSON state files of earlier
-versions first), the routing table and local scores, provider records, storage, the deny list (its accepted lists
-read back from storage), shared folder, fetcher, publisher, names and the features (rnfs.features); the request
-server answers through NodeBackend. Background threads: the announcer, the join (saved servers and bootstrap nodes,
-then a lookup for our own ID, repeated while too few servers are known), the publish loop, the name re-announce
-loop, the features' own, a worker per source with remote pins waiting, and maintenance (shared-folder scans,
-provider record expiry and saves, max_storage enforcement, periodic state saves, publisher refreshes asked for,
-deny-list changes retried, the remote pins waiting saved). Stopping ends the features, then the node's services and
-threads (waiting for them, the features' too, at most STOP_TIMEOUT in all), saves every store and closes the state,
-each step guarded: one that fails skips none of the others.
+Startup: Reticulum from <rnfs dir> (attaching to a shared instance if its config shares one), or for a node embedded
+in another program (rnfs.Node) the program's running instance, then the node's identity and its rnfs.dht
+destination, then the state database (rnfs.statedb, which imports the JSON state files of earlier versions first),
+the routing table, local scores and the announce first-seen log, provider records, storage, the deny list (its
+accepted lists read back from storage), shared folder, fetcher, publisher, names and the features (rnfs.features);
+the request server answers through NodeBackend. Background threads: the announcer, the join (saved servers and
+bootstrap nodes, then a lookup for our own ID, repeated while too few servers are known), the publish loop, the name
+re-announce loop, the features' own, a worker per source with remote pins waiting, and maintenance (shared-folder
+scans, provider record expiry and saves, max_storage enforcement, periodic state saves, publisher refreshes asked
+for, deny-list changes retried, the remote pins waiting saved). Stopping ends the features, then the node's services
+and threads (waiting for them, the features' too, at most STOP_TIMEOUT in all), saves every store and closes the
+state, each step guarded: one that fails skips none of the others.
 
 Threading: RNS calls the announce and request handlers on its own threads; facade calls come from API and
 gateway threads. Every component locks internally; the node itself only guards the small sets it owns.
@@ -46,6 +46,7 @@ from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content.shared_folder import SharedFolder
 from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_reserve, remote_source
+from rnfs.dht.firstseen import FirstSeenLog
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
@@ -588,6 +589,9 @@ class RnfsNode:
         self._add_store(RoutingState(self.routing, config.state_dir))
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
         self.scores = self._add_store(Scores(config.state_dir, seeded=self._bootstrap_set()))
+        # When each server's announce was first heard (section 6; for publishing and searching to come); saved with
+        # the batched stores
+        self.first_seen = self._add_store(FirstSeenLog(config.state_dir))
         # Saved with their expiry, every SAVE_INTERVAL (maintain): they change with every /provide
         self.records = self._add_store(ProviderStore(config.max_records, config.state_dir, own_id=node_id,
                                                      seniority=config.provider_seniority), batched=False)
@@ -865,14 +869,16 @@ class RnfsNode:
     def _heard_server(self, node_id: bytes):
         """A server-mode announce (or path response) from node_id."""
         self._count_heard(node_id, "server")
+        self.first_seen.heard(node_id)
         if self.routing.heard(node_id):
             log(f"heard DHT server {node_name(node_id)} ({self.routing.node_count()} known)", LOG_VERBOSE)
             self.publisher.wake()
 
     def _heard_client(self, node_id: bytes):
-        """node_id announces client mode: it doesn't belong in the routing table."""
+        """node_id announces client mode: it doesn't belong in the routing table, nor in the first-seen log."""
         self._count_heard(node_id, "client")
         self.routing.remove(node_id)
+        self.first_seen.forget(node_id)
 
     def _count_heard(self, node_id: bytes, mode: str):
         """Count node_id's announce in the traffic counters, which `rnfs peers` reads its DHT mode and last-heard

@@ -163,6 +163,12 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "CREATE TABLE peer_scores (node BLOB PRIMARY KEY, score REAL NOT NULL, updated REAL NOT NULL, useful REAL,"
         " seeded REAL) WITHOUT ROWID",
     )),
+    ("first_seen", (
+        # The announce first-seen log (rnfs 0.2.0; rnfs.dht.firstseen): when each server's rnfs.dht announce was
+        # first heard, and about when last (it orders forgetting). Times are Unix time
+        "CREATE TABLE announce_first_seen (node BLOB PRIMARY KEY, first_heard REAL NOT NULL, last_heard REAL NOT NULL)"
+        " WITHOUT ROWID",
+    )),
 )
 
 

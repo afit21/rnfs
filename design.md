@@ -120,6 +120,7 @@ rnfs/
     routing.py        RoutingTable: buckets, seniority, failures, unreliable nodes, bans (section 6)
     routing_state.py  RoutingState: the routing table saved in the state database (section 6)
     scores.py         Scores: local scores per peer, decay, bootstrap seeds, the capped saved table (section 6)
+    firstseen.py      FirstSeenLog: when each server's announce was first heard; closest old servers (section 6)
     providers.py      ProviderStore: records, TTL, max_records eviction, /find reply selection (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
@@ -371,6 +372,20 @@ The node wires it: lookups' `on_failure` is `_query_failed` (the routing table's
 the fetcher (`Fetcher(scores=)`, in memory only if not given) calls `served` for each response with verified
 blocks and `useful_answer` once per fetch for each of its lookup's `listers` of that provider (`Fetch._served`),
 `failed` in `_fail` and `bad_block` with the ban.
+
+`firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
+`heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
+table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
+exclude)`: the count closest to key of the servers first heard at least min_age ago (publishers and searchers will
+pass `provider_seniority`), not excluded (`exclude` runs under the log's lock). Memory: an `OrderedDict` node ID ->
+first heard, least recently heard first (a heard moves to the end; past `MAX_FIRST_SEEN`, 65,536, the front is
+forgotten), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a new server at
+65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a contiguous run
+of the sorted list, all closer to the key than any outside it: `closest` binary-searches the narrowest run holding
+count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old enough, and ranks only that
+run (about 20 µs at 65,536). Saved in `announce_first_seen` through a SNAPSHOT `RowStore`: an announce only marks
+its row, and a row's `last_heard` is the time of the save writing it (within 30 s of the announce), which only
+orders forgetting after a restart.
 
 ## Network layer interfaces
 
@@ -1359,7 +1374,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - `routing` (0.2.0: the routing table, `RoutingState`: one row per node in the table, dropped with its seniority
   kept, or banned, times as Unix time; NORMAL with the periodic saves and at stop, changed rows only) and
   `peer_scores` (0.2.0: local scores, `Scores`: score, when it was set, last raised, seeded; at most 4096 rows;
-  NORMAL with the periodic saves and at stop, changed rows only);
+  NORMAL with the periodic saves and at stop, changed rows only) and `announce_first_seen` (0.2.0: the announce
+  first-seen log, `FirstSeenLog`: first heard and about when last heard; at most 65,536 rows; NORMAL with the
+  periodic saves and at stop, changed rows only);
 - `names_published`, `names_held` (sequences as decimal text, up to 2^64 − 1; FULL, changed rows only; a
   malformed row stops startup, as a malformed `names.json` did, since skipping it could allow rollback) and
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at

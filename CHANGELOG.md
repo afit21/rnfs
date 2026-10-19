@@ -16,9 +16,8 @@ Upgrade notes:
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
   assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
-
 - **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
-  restarts, and for local scores (`peer_scores`).
+  restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
 Added, for apps:
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
@@ -110,6 +109,10 @@ The DHT (local behaviour: nothing on the wire changes):
   whose saved servers answer no longer contacts the default bootstrap nodes at every start.
 - Choosing providers: within each seniority group (seniority stays first), providers with a better local score
   are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
+- The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
+  servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
+  the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
+  next to a key can't be. Publishing and searching will use it.
 
 ## 0.1.6
 

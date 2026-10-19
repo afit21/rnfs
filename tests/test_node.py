@@ -945,6 +945,23 @@ class RestartTest(NodeTest):
         self.assertTrue(self.b.routing.is_banned(banned))
         self.assertEqual(self.b.backend.find(quiet)[1], [A_ID])
 
+    def test_announce_first_seen_log_is_kept_at_a_restart(self):
+        """Server announces are logged when first heard, client announces forget, and the log is saved with the
+        batched stores."""
+        server, client = bytes([0x31] * 16), bytes([0x32] * 16)
+        self.b._heard_server(server)
+        heard = self.b.first_seen.first_heard(server)
+        self.assertIsNotNone(heard)
+        self.b._heard_server(client)
+        self.b._heard_client(client)
+        self.assertIsNone(self.b.first_seen.first_heard(client))
+        self.b._save_state()
+        self.assertEqual(state_rows(self.b.config.state_dir, "SELECT node, first_heard FROM announce_first_seen"),
+                         [(server, heard)])
+        self.b = self.restart(self.b, "b", B_ID)
+        self.assertEqual(self.b.first_seen.first_heard(server), heard)
+        self.assertEqual(self.b.first_seen.closest(server, min_age=0), [server])
+
     def test_failed_fetched_save_is_tried_again(self):
         target = Cid.for_block(RAW, b"target")
         self.b._note_fetched(target)
