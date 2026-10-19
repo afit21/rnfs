@@ -473,8 +473,31 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
   the recipients' identity hashes, the approximate size, or (with `--wrap`) the wrapper's entry name, and it
   says nothing about who sealed it: anyone with a recipient's public key can seal a file for them, and any
   recipient can seal different content for the others.
-- `add --to` seals single files only: sealing each file of a directory would leave its names and tree
-  visible. Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
+- **Folders.** `add --to` of a folder seals it as one sealed file, never file by file (which would leave its
+  names and tree visible): the folder is packed as one plain tar (POSIX pax) and that tar is sealed with the
+  sealed name `<folder>.tar`. The format above is unchanged, so a reader that only decrypts (rnfs 0.1.x) gets a
+  tar file it can unpack itself.
+  - Every member is under one top directory named after the folder (`<folder>/…`), so extracting the tar
+    creates nothing else in the directory it is extracted in. Each directory comes before what it holds.
+  - The folder is walked with `add`'s rules: hidden files included; symlinks, devices, sockets, FIFOs, names
+    that break the name rules and entries that change while being opened skipped with a warning; a file with
+    other hard links is an ordinary file (members are regular files and directories only, never links). Names
+    holding `\`, `＼` or `／`, or starting as a Windows drive does (`C:`), are skipped with a warning too, as
+    `GET /api/get/stream` skips them (section 11).
+  - Files are mode 0644 (0755 if executable), directories 0755, owned by uid and gid 0 without user or group
+    names, every member dated the time of packing.
+  - The tar must unpack where it is sent: more than `max_output_entries` files and directories (the top one
+    included), or a tree deeper than `MAX_DEPTH` once built as `add --wrap` builds the folder with fixed
+    chunks, is refused (rnfs: `TooLarge`, 413). A file that gets shorter while it is read is an error (its
+    member's size was already written).
+  - A folder whose name breaks the name rules, or is over 251 bytes (`<name>.tar` must pass them), is refused,
+    not sealed without a name, and so is `--no-sealed-name` with a folder: the name is what tells a recipient's
+    `get` to unpack it. With `--wrap` the wrapper's entry is `<folder>.tar`.
+  - What it hides: the folder's file names, its structure and each file's size. What it doesn't: the
+    recipients, and the approximate total size (the tar's: the files' sizes rounded up to 512 bytes, plus at
+    least 512 bytes per entry), which says roughly how much the folder holds.
+
+  Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
 - **Gateways MUST NOT decrypt** sealed files (the gateway is reachable by web pages); they serve the stored
   bytes as `application/octet-stream`.
 
@@ -1221,7 +1244,7 @@ are local conveniences, not part of the protocol.
 
 | Command | Does |
 |---|---|
-| `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
+| `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files; a directory as one tar named `<directory>.tar`); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
 | `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; `--raw` writes the stored bytes |
 | `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
@@ -1462,7 +1485,8 @@ in its requests and responses (rnfs: these routes):
   component, or whose names break the entry-name rules are skipped with a warning; directories a path implies
   are made; a later file replaces an earlier one of the same path, and a member conflicting with what is
   there as the other type is skipped with a warning. A file is executable if its mode has the owner's execute
-  bit. Sealing is refused (400). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
+  bit. Sealing is refused (400): a sealed folder is added from a path (`POST /api/add` with `to`), where the node
+  packs the folder itself (section 5). The node MUST bound what a tar can make it hold: rnfs refuses (413) more than
   `max_output_entries` files and directories or nesting deeper than `MAX_DEPTH`, refuses (400) extended headers
   over 64 KiB, more than 8 in a row, global headers of more than 4 KiB in all, and sparse files, and keeps 100
   warnings (counting the rest), each naming at most 300 characters of the member. A malformed header anywhere,

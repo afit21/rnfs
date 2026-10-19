@@ -84,6 +84,16 @@ Added, for apps:
 - **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
 
+Added:
+- **Encrypted folders:** `rnfs add --to <recipient>… <folder>` (and `--to-self`, `--background`, `POST /api/add`
+  with `to`) seals a folder as one sealed file: the folder is packed as a tar, everything under one top directory
+  `<folder>/`, and sealed under the name `<folder>.tar`, so its file names and structure are hidden along with
+  its content (not its approximate total size). The sealed-file format is unchanged: a recipient on 0.1.x gets a
+  tar it can unpack itself. The folder is walked as `add` walks one (symlinks, devices and invalid names skipped
+  with warnings; names holding `\`, `＼` or `／`, or starting as a Windows drive does, skipped too); more than
+  `max_output_entries` entries or a tree deeper than `MAX_DEPTH` is refused, and so are a folder name over 251
+  bytes and `--no-sealed-name` with a folder (the name is what makes a recipient's `get` unpack it).
+
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in

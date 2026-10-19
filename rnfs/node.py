@@ -1287,8 +1287,10 @@ class RnfsNode:
                  chunker: str | None = None, progress: Callable[[int], None] | None = None) -> dict:
         """Import a file or directory on this machine, pinned "user" (cache if not pin) unless only_hash.
 
-        With to/to_self the file is sealed for those recipients first (seal.py; directories are refused),
-        its name sealed inside unless not seal_name; chunker is "fixed" (default) or "fastcdc". progress, if
+        With to/to_self the file is sealed for those recipients first (seal.py), its name sealed inside unless not
+        seal_name; a directory is sealed as one tar named `<name>.tar` (node_content.add_sealed_path, at most
+        max_output_entries files and directories; refused without seal_name). chunker is "fixed" (default) or
+        "fastcdc". progress, if
         given, is told the bytes read as they are (builder.BuildOptions.progress: an add job's), and may raise to
         stop the add; blocks stored by then are unreferenced, for the next collection.
         """
@@ -1303,8 +1305,8 @@ class RnfsNode:
             with self._refusing(), self.storage.protect() as session:
                 with session.writer() as put:
                     if recipients:
-                        built = node_content.add_sealed_path(path, put, wrap, recipients, seal_name, options)
-                        warnings = []
+                        built, warnings = node_content.add_sealed_path(path, put, wrap, recipients, seal_name,
+                                                                       options, self.config.max_output_entries)
                     else:
                         built, warnings = builder.add_path(path, put, wrap, options)
                 node_content.keep_added(self, built.cid, pin)

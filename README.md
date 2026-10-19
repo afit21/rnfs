@@ -493,7 +493,7 @@ Every command except `daemon` talks to the running daemon, so run them as the da
 `add` options: `--wrap` keeps the file's name in the link; `--only-hash` prints the CID without storing;
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
 `--to RECIPIENT…` (after the path) seals a file so only those node IDs, LXMF addresses or contacts can read it,
-and `--to-self` adds you.
+and `--to-self` adds you; a folder is sealed as one file, a tar named `<folder>.tar`, hiding its names too.
 
 `get` without `-o` uses the target's name only if it is a safe file name (printable, not starting with `.`),
 otherwise its CID, and writes under a temporary name until the transfer is complete. It decrypts sealed files

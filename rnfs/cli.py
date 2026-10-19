@@ -842,10 +842,11 @@ def build_parser() -> argparse.ArgumentParser:
     # --- content: unpinned adds, sealed files, chunkers ---
     add.add_argument("--no-pin", action="store_true", help="keep it as evictable cache instead of pinning it")
     add.add_argument("--to", nargs="+", action="extend", metavar="RECIPIENT",
-                     help="seal it so only these can read it: rnfs node IDs, LXMF addresses or identity hashes "
-                          "RNS has heard, 128-hex public keys, or contact nicks")
+                     help="seal it (a folder as one tar, <folder>.tar) so only these can read it: rnfs node IDs, "
+                          "LXMF addresses or identity hashes RNS has heard, 128-hex public keys, or contact nicks")
     add.add_argument("--to-self", action="store_true", help="seal it for this node's identity too")
-    add.add_argument("--no-sealed-name", action="store_true", help="with --to: don't seal the file name inside")
+    add.add_argument("--no-sealed-name", action="store_true",
+                     help="with --to: don't seal the file name inside (not for a folder)")
     add.add_argument("--chunker", choices=["fixed", "fastcdc"], help="fixed 64 KiB chunks (default) or FastCDC "
                      "content-defined chunks, which keep most chunks of an edited file unchanged")
 

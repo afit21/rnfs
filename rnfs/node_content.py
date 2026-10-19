@@ -82,20 +82,61 @@ def sealing_stream(stream: BinaryIO, size: int | None, recipients: list[bytes],
     return seal.SealingReader(stream, recipients, seal_name, size), None
 
 
+TAR_SUFFIX = ".tar"  # a sealed folder's sealed name is the folder's name and this
+
+
+def folder_sealed_name(name: str, seal_name: bool) -> str:
+    """The sealed name of a folder called name: name + TAR_SUFFIX. Raises ValueError if the folder can't be sealed
+    under it, rather than sealing it unnamed as a file with an invalid name is (the name is what makes a recipient's
+    get unpack it): a name that isn't a valid entry name, one over 251 bytes (the sealed name would break the name
+    rules), and seal_name False (--no-sealed-name)."""
+    if not seal_name:
+        raise ValueError(f"--no-sealed-name can't be used with a folder: its sealed name (the folder's name and "
+                         f"{TAR_SUFFIX}) is what tells a recipient's get to unpack it; rename the folder to change it")
+    if not dag.is_valid_name(name):
+        raise ValueError(f"the folder's name {builder.display_path(name)!r} is not valid UTF-8 or breaks the name "
+                         f"rules, so it can't be sealed under it")
+    sealed = name + TAR_SUFFIX
+    if not dag.is_valid_name(sealed):
+        raise ValueError(f"the folder's name is {len(name.encode('utf-8'))} bytes: a sealed folder's name may have "
+                         f"at most {dag.MAX_NAME_BYTES - len(TAR_SUFFIX)} (with {TAR_SUFFIX}, {dag.MAX_NAME_BYTES}); "
+                         f"rename it")
+    return sealed
+
+
 def add_sealed_path(path: str, put: builder.Put, wrap: bool, recipients: list[bytes], seal_name: bool,
-                    options: builder.BuildOptions | None = None) -> builder.Built:
-    """Seal the regular file at path and build it (wrapped under its visible name if wrap), with options (the
-    chunker, the deny check of the sealed bytes, builder.build_file; and progress, given the plaintext read)."""
+                    options: builder.BuildOptions | None = None,
+                    max_entries: int = 100_000) -> tuple[builder.Built, list[str]]:
+    """Seal the regular file or folder at path and build it (wrapped under its visible name if wrap), with options
+    (the chunker, the deny check of the sealed bytes, builder.build_file; and progress, given the plaintext read).
+    Returns it and the warnings for what was skipped.
+
+    A folder is packed as one tar (tarstream.folder_chunks: add's rules, everything under the folder's name, at
+    most max_entries files and directories) and sealed as `<folder>.tar` (folder_sealed_name), which is also its
+    visible name with wrap."""
+    from rnfs.content import tarstream
+
     handle, st = builder.open_path(path)
     try:
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError("--to seals single files: put a directory in an archive (e.g. tar) and add that")
         name = os.path.basename(os.path.normpath(os.path.abspath(path)))
+        progress = options.progress if options is not None else None
+        warnings: list[str] = []
+        if stat.S_ISDIR(st.st_mode):
+            sealed_name = folder_sealed_name(name, seal_name)
+            tar = tarstream.IteratorReader(tarstream.folder_chunks(handle, path, name, max_entries, warnings.append,
+                                                                   progress))
+            try:
+                built = builder.add_stream(seal.SealingReader(tar, recipients, sealed_name), put, None,
+                                           sealed_name if wrap else None, options=options)
+            finally:
+                tar.close()
+            return built, warnings
         sealed_name = name if seal_name and dag.is_valid_name(name) else None
         with os.fdopen(handle, "rb", closefd=False) as f:
-            plain = builder.counted(f, options.progress if options is not None else None)
-            return builder.add_stream(seal.SealingReader(plain, recipients, sealed_name), put, None,
-                                      name if wrap else None, options=options)
+            plain = builder.counted(f, progress)
+            built = builder.add_stream(seal.SealingReader(plain, recipients, sealed_name), put, None,
+                                       name if wrap else None, options=options)
+        return built, warnings
     finally:
         builder.close(handle)
 

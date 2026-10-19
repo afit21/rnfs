@@ -114,7 +114,8 @@ rnfs/
     blockstore.py     one file per CID, atomic, verified (section 8)
     storage.py        Storage: blocks + pins (sources) + cached fetches + protection + eviction/GC (section 8)
     archive.py        export/import stream; archive_size for an exact Content-Length (section 8)
-    tarstream.py      directories as tar streams: build_tar (an upload), plan/length/chunks (a download)
+    tarstream.py      directories as tar streams: build_tar (an upload), plan/length/chunks (a download),
+                      folder_chunks (a local folder, for sealing)
     shared_folder.py  importing <rnfs dir>/files/ with pin source "folder" (section 8)
   dht/                no RNS dependency
     routing.py        RoutingTable: buckets, seniority, failures, unreliable nodes, bans (section 6)
@@ -403,7 +404,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 
 | Method | Returns |
 |---|---|
-| `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`) |
+| `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`); with `to`/`to_self` a directory is packed as one tar and sealed as `<name>.tar` (`node_content.add_sealed_path`, `tarstream.folder_chunks`) |
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
 | `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `name` or `(tar upload)` |
 | `get(target, output, from_node=None, raw=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw`; a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
@@ -957,6 +958,20 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   the fetched targets for the roots strategy), `seal_recipients` (`RNS.Identity.recall` by destination hash, then
   identity hash; the node's own identity; contacts), `open_sealed` over a Fetch's `read_range`,
   `sealed_info`, `write_sealed`, `block`, `export_stream`, and the API option parser `add_options`.
+- Sealed folders (`add_sealed_path` of a directory): `folder_sealed_name` refuses a name `<name>.tar` couldn't
+  carry (over 251 bytes, invalid) and `seal_name=False` before anything is read, rather than sealing unnamed as
+  a file with an invalid name is. `tarstream.folder_chunks` is a generator writing the tar as it walks
+  (`builder.open_path`/`open_child`/`list_directory`, the same descriptor-relative opening and `Changed` checks
+  as `_build_tree`, which it can't reuse since that builds a DAG); `tarstream.IteratorReader` turns it into the
+  stream `SealingReader` reads, so one segment of plaintext is held at a time. Its headers are `_header_of`,
+  shared with the writer of stored DAGs. `Changed` is only raised by opening and listing, before an entry's
+  header is written, so a skipped entry never leaves half a member. The entry limit is the sender's
+  `max_output_entries` (the recipient's unpack has its own), and the depth check is exact: `fixed_height` and
+  `directory_height` compute the height `builder` gives each file and directory with fixed chunks (as the
+  recipient's `build_tar` builds them), checked against `MAX_DEPTH` one level up for the tar's root; a refusal
+  can come once part of the folder has been sealed, and what was stored is then unreferenced, for the next
+  collection. A file's size is its open `fstat`'s; a file growing meanwhile is cut there, one shrinking fails
+  the add.
 - `gateway_formats.py` — `?format=raw|archive`; `archive.archive_size` gives the exact length, so the archive
   is sent with a Content-Length before streaming. For every format, a web page's request or a HEAD always
   gets 409, stored or not (a 200 download for stored content only told pages what is stored: L6), before the

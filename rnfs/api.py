@@ -1119,7 +1119,7 @@ class ApiHandler(TimedHandler):
         if stream_format != "tar":
             raise ValueError("format must be tar")
         if {"to", "to_self", "seal_name"} & options.keys():
-            raise ValueError("a tar stream can't be sealed: sealing is for single files")
+            raise ValueError("a tar stream can't be sealed: seal a folder by its path (POST /api/add with to)")
         # add_tar reads the body to its end, checking that only zeros follow the tar's (its padding)
         self.send_json(200, self.node.add_tar(reader, name=name, only_hash=only_hash, **options))
 
