@@ -852,6 +852,35 @@ def run_name_publish(args):
         warn(result["warning"])
 
 
+def run_name_sync(args):
+    """Keep a name pointing at a folder's current content."""
+    path = absolute(args.folder)
+    entry = client(args).name_sync(args.alias, path)
+    print(printable(f"syncing {path} to name {entry['alias']}: published when its content changes, once it has "
+                    f"been unchanged a minute, at most once an hour"))
+    if entry.get("warning"):  # private mode: each publish's announce still reaches outsiders
+        warn(entry["warning"])
+
+
+def run_name_unsync(args):
+    """Stop syncing a name to its folder."""
+    client(args).name_unsync(args.alias)
+    print(printable(f"stopped syncing name {args.alias}; it keeps pointing where it last did"))
+
+
+def run_name_syncs(args):
+    """List the names synced to folders: alias, state, CID last published, folder (and why one is paused)."""
+    syncs = client(args).name_syncs()
+    if args.json:
+        print(json.dumps(syncs, indent=2))
+        return
+    for entry in syncs:
+        fields = [entry["alias"], entry["state"], entry.get("published") or "-", entry["path"]]
+        if entry.get("reason"):
+            fields.append(f"({entry['reason']})")
+        print("\t".join(printable(field) for field in fields))
+
+
 def run_name_resolve(args):
     """Print the CID a name points at."""
     print(printable(client(args).name_resolve(args.name)["cid"]))
@@ -1103,6 +1132,12 @@ def build_parser() -> argparse.ArgumentParser:
     publish = command(name, "publish", run_name_publish, "point a name at a CID")
     publish.add_argument("alias")
     publish.add_argument("target", metavar="CID[/PATH]")
+    name_sync = command(name, "sync", run_name_sync, "keep a name pointing at a folder's current content")
+    name_sync.add_argument("alias")
+    name_sync.add_argument("folder")
+    command(name, "unsync", run_name_unsync, "stop syncing a name to its folder").add_argument("alias")
+    command(name, "syncs", run_name_syncs, "list the names synced to folders").add_argument(
+        "--json", action="store_true", help="print the syncs as JSON")
     resolve = command(name, "resolve", run_name_resolve, "print the CID a name points at")
     resolve.add_argument("name", help="the name (32 hex characters) or a name contact's nick")
 

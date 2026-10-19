@@ -10,7 +10,8 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
-  `remote_pins_asked`, `remote_pins_served`); an older rnfs can't open it afterwards. Pins made before the upgrade
+  `remote_pins_asked`, `remote_pins_served`, `name_syncs`, `name_sync_files`); an older rnfs can't open it
+  afterwards. Pins made before the upgrade
   have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
@@ -204,6 +205,21 @@ Added:
   `GET /api/pin/remote/served`; `ApiConnection.pin_remote_ls` / `pin_remote_served`; `Node/Client.remote_pins()`
   and `served_pins()` (`RemotePin`, `ServedPins`, `ServedPin`, `RemotePinUsage`); capability
   `remote_pin_status`.
+- **Publishing a folder to a name** (local behaviour built on `name publish`; nothing on the wire changes):
+  `rnfs name sync <alias> <folder>` keeps a name pointing at a folder's current content. Every `scan_interval` the
+  folder is imported as the shared folder is (unchanged files recognised by their metadata, not read again; links,
+  special files and files with other hard links left out; a folder in the rnfs directory refused), with FastCDC,
+  so an edited file shares most of its blocks with the version before. When its root changes the name is
+  published to it, as `name publish` does (the previous version's `name:` pin released), once the folder has
+  stayed unchanged a minute and at most once an hour per name (RNS's transport nodes stop rebroadcasting a
+  destination announcing faster than that). A folder that is missing, unreadable, empty or whose import fails
+  pauses the sync, logged once, and nothing is published. `rnfs name unsync <alias>` stops it, the name keeping
+  its target; `rnfs name rm` stops it too; `rnfs name syncs [--json]` lists the syncs and how they stand. Syncs
+  are kept in the state database and resume after a restart. In private mode `name sync` warns, as `name publish`
+  does, and the sync logs it once. `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`,
+  `GET /api/name/syncs`; `ApiConnection.name_sync`, `name_unsync`, `name_syncs`; `Node/Client.names.sync`,
+  `unsync` and `syncs()` (`FolderSync`); capability `name_sync`. An app's token may start and stop a sync, as it
+  may publish; the name's pin stays the name's.
 
 Changed:
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private

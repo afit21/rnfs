@@ -33,7 +33,7 @@ _EXPORTS = {
                                          "MessageLink", "Message", "Outgoing", "Sent", "Synced", "Cached",
                                          "Uncached", "Event", "EventBatch", "Capabilities", "Setting", "Settings",
                                          "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
-                                         "ServedPins")},
+                                         "ServedPins", "FolderSync")},
     **{name: "rnfs.interface" for name in ("Rnfs", "Name", "Names", "Job", "Jobs", "Deny", "Watch", "File",
                                            "Contacts", "Lxmf", "Fetched", "Events")},
     **{name: "rnfs.errors" for name in ("RnfsError", "NotFound", "TooLarge", "InvalidDag", "StorageFull", "Busy",

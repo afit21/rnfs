@@ -302,6 +302,18 @@ class _Backend:
         """RnfsNode.name_publish."""
         return self.node.name_publish(alias, target)
 
+    def name_sync(self, alias: str, path: str) -> dict:
+        """RnfsNode.name_sync."""
+        return self.node.name_sync(alias, path)
+
+    def name_unsync(self, alias: str):
+        """RnfsNode.name_unsync."""
+        self.node.name_unsync(alias)
+
+    def name_syncs(self) -> list[dict]:
+        """RnfsNode.name_syncs."""
+        return self.node.name_syncs()
+
     def name_resolve(self, name: str) -> dict:
         """RnfsNode.name_resolve of a name or a name contact's nick, as GET /api/name/resolve takes them."""
         from rnfs.features.keepers import parse_name_arg

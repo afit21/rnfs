@@ -102,6 +102,7 @@ class ParsingTest(unittest.TestCase):
                      ["pin", "remote", "rm", node, cid], ["gc"], ["verify"], ["providers", cid], ["ping", node],
                      ["name", "create", "a"], ["name", "rm", "a"], ["name", "export", "a"], ["name", "import", "a"],
                      ["name", "list"], ["name", "publish", "a", cid], ["name", "resolve", node],
+                     ["name", "sync", "a", "f"], ["name", "unsync", "a"], ["name", "syncs", "--json"],
                      ["export", cid, "-o", "f"], ["import", "f"], ["status"], ["daemon"]):
             self.assertTrue(callable(cli.build_parser().parse_args(argv).run), argv)
 
@@ -352,6 +353,22 @@ class OtherCommandTest(CliTestCase):
         self.assertIn(f"site\t{name}\t{cid}\t1", self.ok("name", "list"))
         self.ok("name", "rm", "copy")
         self.assertNotIn("copy\t", self.ok("name", "list"))
+
+    def test_name_sync(self):
+        """name sync sends the folder made absolute; syncs lists the syncs (and as JSON); unsync stops one, and fails
+        for a name not synced."""
+        self.ok("name", "create", "site")
+        os.makedirs(os.path.join(self.tmp, "site"))
+        with contextlib.chdir(self.tmp):
+            self.assertIn("syncing", self.ok("name", "sync", "site", "site"))
+        ((alias, path),) = [args for args, _ in self.node.called("name_sync")]
+        self.assertEqual((alias, real(path)), ("site", real(os.path.join(self.tmp, "site"))))
+        self.assertEqual(self.ok("name", "syncs"), f"site\tnew\t-\t{path}\n")
+        self.assertEqual([entry["alias"] for entry in json.loads(self.ok("name", "syncs", "--json"))], ["site"])
+        self.ok("name", "unsync", "site")
+        self.assertEqual(self.ok("name", "syncs"), "")
+        self.assertEqual(self.run_cli("name", "unsync", "site")[0], 1)
+        self.assertEqual(self.run_cli("name", "sync", "site", os.path.join(self.tmp, "missing"))[0], 1)
 
     def test_archives(self):
         cid = self.node.put_file(b"abc")

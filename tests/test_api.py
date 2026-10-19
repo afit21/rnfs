@@ -47,6 +47,7 @@ class FakeNode:
         self.pins: dict[str, set[str]] = {}
         self.keys: dict[str, bytes] = {}  # alias → key
         self.records: dict[str, dict] = {}  # name → {"cid", "sequence"}
+        self.syncs: dict[str, str] = {}  # alias → folder synced (name_sync)
         self.provider_map: dict[str, list[bytes]] = {}
         self.piece = 7  # read() yields pieces this big, to exercise streaming
         self.cached: set[str] = set()  # cache_ls's targets
@@ -416,6 +417,26 @@ class FakeNode:
         sequence = self.records.get(name, {}).get("sequence", 0) + 1
         self.records[name] = {"cid": self._resolve(target), "sequence": sequence}
         return {"name": name, **self.records[name]}
+
+    def name_sync(self, alias, path):
+        self.record("name_sync", alias, path)
+        if alias not in self.keys:
+            raise NotFound(f"no name {alias}")
+        if not os.path.isdir(path):
+            raise NotFound(f"no folder {path}")
+        self.syncs[alias] = path
+        return {"alias": alias, "path": path, "state": "new", "reason": None, "root": None, "published": None,
+                "published_at": None, "next_publish": None}
+
+    def name_unsync(self, alias):
+        self.record("name_unsync", alias)
+        if self.syncs.pop(alias, None) is None:
+            raise NotFound(f"name {alias} isn't synced")
+
+    def name_syncs(self):
+        self.record("name_syncs")
+        return [{"alias": alias, "path": path, "state": "new", "reason": None, "root": None, "published": None,
+                 "published_at": None, "next_publish": None} for alias, path in sorted(self.syncs.items())]
 
     def name_resolve(self, name, for_gateway=False):
         self.record("name_resolve", name, for_gateway=for_gateway)
@@ -1276,6 +1297,51 @@ class RemotePinStatusTest(ApiTestCase):
         self.assertEqual((served["pins"][0]["reason"], served["usage"][0]["used"], served["quota"]), ("quota", 5, 100))
         self.assertIn("remote_pin_status", self.ok("GET", "/api/capabilities")["capabilities"])
         self.assertEqual(self.call("POST", "/api/pin/remote/served", {})[0], 405)
+
+
+class NameSyncRoutesTest(ApiTestCase):
+    """POST /api/name/sync, /api/name/unsync and GET /api/name/syncs: parameters passed on, refusals."""
+
+    def test_sync_unsync_and_list(self):
+        """A sync is started with an absolute folder, listed, and stopped; the capability is listed."""
+        self.ok("POST", "/api/name/create", {"alias": "site"})
+        with tempfile.TemporaryDirectory() as folder:
+            entry = self.ok("POST", "/api/name/sync", {"alias": "site", "path": folder})
+            self.assertEqual((entry["alias"], entry["path"], entry["state"]), ("site", folder, "new"))
+            self.assertEqual(self.node.called("name_sync"), [(("site", folder), {})])
+            self.assertEqual([sync["alias"] for sync in self.ok("GET", "/api/name/syncs")["syncs"]], ["site"])
+            self.assertEqual(self.ok("POST", "/api/name/unsync", {"alias": "site"}), {})
+            self.assertEqual(self.ok("GET", "/api/name/syncs"), {"syncs": []})
+        self.assertIn("name_sync", self.ok("GET", "/api/capabilities")["capabilities"])
+
+    def test_refusals(self):
+        """A relative or missing path, or no alias: 400; no such name, or a name not synced: 404; GET of the POST
+        routes: 405."""
+        self.ok("POST", "/api/name/create", {"alias": "site"})
+        self.assertEqual(self.call("POST", "/api/name/sync", {"alias": "site", "path": "relative"})[0], 400)
+        self.assertEqual(self.call("POST", "/api/name/sync", {"alias": "site"})[0], 400)
+        self.assertEqual(self.call("POST", "/api/name/sync", {"path": os.getcwd()})[0], 400)
+        self.assertEqual(len(self.node.called("name_sync")), 0)  # refused before the node is asked
+        self.assertEqual(self.call("POST", "/api/name/sync", {"alias": "nope", "path": os.getcwd()})[0], 404)
+        self.assertEqual(self.call("POST", "/api/name/unsync", {"alias": "site"})[0], 404)
+        self.assertEqual(self.call("GET", "/api/name/sync")[0], 405)
+        self.assertEqual(self.call("POST", "/api/name/syncs", {})[0], 405)
+
+
+class NameSyncAppTest(AppTokenTestCase):
+    """An app's token may start and stop a name's sync, as it may publish the name: the name's pin stays the
+    name's own, so the node isn't given the app's pin source."""
+
+    def test_app_syncs_a_name(self):
+        self.ok("POST", "/api/name/create", {"alias": "site"})
+        with tempfile.TemporaryDirectory() as folder:
+            status, _, _ = self.call("POST", "/api/name/sync", {"alias": "site", "path": folder},
+                                     self.as_app("wiki", self.wiki), api=False)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.node.called("name_sync"), [(("site", folder), {})])
+            status, _, _ = self.call("POST", "/api/name/unsync", {"alias": "site"},
+                                     self.as_app("notes", self.notes), api=False)
+            self.assertEqual(status, 200)
 
 
 class RouteTableTest(unittest.TestCase):

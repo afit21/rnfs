@@ -41,9 +41,9 @@ from rnfs.events import EVENT_KINDS
 # A job's final states, and the longest wait one request for a job asks for (the API's cap)
 from rnfs.features.jobs import FINISHED, MAX_WAIT as MAX_JOB_WAIT
 from rnfs.objects import (Added, Cached, Capabilities, Collected, Contact, DenyState, Entry, Event, EventBatch,
-                          Exported, Followed, Imported, Info, Kept, LxmfAddress, Message, Outgoing, Peer, Pin, Record,
-                          RemotePin, Sent, ServedPins, Settings, SettingsChange, Stat, Stats, Status, Synced,
-                          Uncached, Verified, Written)
+                          Exported, Followed, FolderSync, Imported, Info, Kept, LxmfAddress, Message, Outgoing, Peer,
+                          Pin, Record, RemotePin, Sent, ServedPins, Settings, SettingsChange, Stat, Stats, Status,
+                          Synced, Uncached, Verified, Written)
 
 FILE_BUFFER = 64 * 1024  # what a File reads at least per refill: one read() of the node, one GET /api/cat
 # The most one refill of a File read sequentially fetches: each sequential refill doubles from FILE_BUFFER up
@@ -1167,6 +1167,30 @@ class Names:
         this node's own publishes). Only listens: resolve() asks. Raises ValueError; a Client NotFound from a
         daemon that can't watch names."""
         return self._owner._watch_name(name_bytes(name), callback)
+
+    def sync(self, alias: str, path) -> FolderSync:
+        """Keep the name alias pointing at the folder at path (on the node's machine; a relative path is made
+        absolute here): every scan_interval the folder is imported (FastCDC), and when its content changed the name
+        is published to it, once it has been unchanged a minute and at most once an hour (rnfs.name_sync). Syncing
+        the name again to another folder replaces its folder. Raises NotFound (no such name or folder), ValueError
+        (not a folder, or one inside the rnfs directory). In private mode the node's warning that each publish's
+        announce is visible outside the private network is raised as a RuntimeWarning, as publish does."""
+        self._owner._check()
+        result = self._owner._backend.name_sync(alias, _abspath(path))
+        if result.get("warning"):
+            warnings.warn(result["warning"], RuntimeWarning, stacklevel=2)
+        return FolderSync.from_dict(result)
+
+    def unsync(self, alias: str):
+        """Stop syncing the name alias to its folder; it keeps pointing where it last did. Raises NotFound (not
+        synced)."""
+        self._owner._check()
+        self._owner._backend.name_unsync(alias)
+
+    def syncs(self) -> "list[FolderSync]":
+        """Every name synced to a folder, with how its sync stands, by alias."""
+        self._owner._check()
+        return [FolderSync.from_dict(entry) for entry in self._owner._backend.name_syncs()]
 
     # Keepers and follow (rnfs/features/keepers.py, follow.py). After list(), so their annotations name the
     # builtin through strings

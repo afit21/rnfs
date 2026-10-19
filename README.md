@@ -371,6 +371,7 @@ A CID always means the same content. A **name** is a fixed ID you can point at n
 ```sh
 rnfs name create site                   # prints the name (32 hex characters)
 rnfs name publish site <cid>            # again later for a new version
+rnfs name sync site ~/site              # or keep it pointing at a folder, published as it changes
 rnfs contacts add site <name>           # a nickname, so others can type "site"
 rnfs get site/index.html                # whatever the name points at now
 rnfs name follow <name>                 # keep the latest version pinned
@@ -491,6 +492,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs name export\|import ALIAS` | Back up or restore a name's private key |
 | `rnfs name keep\|unkeep\|kept NAME` | Store and serve someone's name record, so it resolves while they're offline |
 | `rnfs name follow\|unfollow\|following NAME` | Keep the latest version a name points at pinned |
+| `rnfs name sync ALIAS FOLDER` / `name unsync ALIAS` / `name syncs` | Keep your name pointing at a folder's current content: published when it changes, once unchanged a minute, at most once an hour / stop (the name keeps its target) / list the syncs and how they stand |
 | `rnfs contacts add NICK HEX` / `rm` / `ls` | Nicknames for names, node IDs and LXMF addresses |
 | `rnfs lxmf address` / `lxmf sync` | Your LXMF address / download waiting messages now |
 | `rnfs send ADDRESS TARGET [-m TEXT] [--propagate]` | Send an `rnfs:` link over LXMF |
@@ -612,7 +614,9 @@ resolvable through your node while they're offline.
 `rnsd`, every link looks like it arrives on the local interface.
 
 **A website on the mesh.** `rnfs add mysite/`, then `rnfs name create site && rnfs name publish site <cid>`.
-Visitors open `http://127.0.0.1:8789/name/<name>/` on their own node, and each `name publish` updates it.
+Visitors open `http://127.0.0.1:8789/name/<name>/` on their own node, and each `name publish` updates it; or
+`rnfs name sync site mysite/` publishes the folder whenever it changes (at most once an hour, and only once it has
+been unchanged for a minute, so a half-copied site isn't published).
 NomadNet pages can't open `rnfs:` links, so show the link as text: `rnfs:name/<name>/index.html`.
 
 # Running several nodes

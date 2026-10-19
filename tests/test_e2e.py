@@ -336,6 +336,21 @@ class NetworkTest(unittest.TestCase):
         status, _, body = b.gateway(f"/name/{name}/index.txt")
         self.assertEqual((status, body), (200, b"hello from rnfs\n"))
 
+        # A name synced to a folder: the daemon's sync thread scans it at once (it publishes once the folder has been
+        # unchanged a minute, which rnfs.name_sync's tests check with a fake clock); unsync and name rm stop it
+        synced_site = self.path("synced-site")
+        os.makedirs(synced_site)
+        with open(os.path.join(synced_site, "index.txt"), "wb") as f:
+            f.write(b"synced\n")
+        a.out("name", "create", "synced")
+        self.assertIn("syncing", a.out("name", "sync", "synced", synced_site))
+        wait_for(lambda: "\tsettling\t" in a.out("name", "syncs"), 30, "A's sync thread to scan the folder")
+        a.cli("name", "unsync", "synced")
+        self.assertEqual(a.out("name", "syncs"), "")
+        a.cli("name", "sync", "synced", synced_site)
+        a.cli("name", "rm", "synced")
+        self.assertEqual(a.out("name", "syncs"), "")
+
         # A damaged block on A: A re-checks before serving, so it answers None rather than bad data; B then
         # fails over to the hub, which imported the archive and provides it too
         with open(os.path.join(a.dir, "blocks", shard_of(index_cid), index_cid), "wb") as f:

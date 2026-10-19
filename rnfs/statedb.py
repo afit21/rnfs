@@ -238,6 +238,17 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "CREATE TABLE remote_pins_served (identity BLOB NOT NULL, cid BLOB NOT NULL, state TEXT NOT NULL, reason TEXT,"
         " at REAL NOT NULL, detail TEXT, PRIMARY KEY (identity, cid)) WITHOUT ROWID",
     )),
+    ("name_sync", (
+        # Folders synced to names (rnfs 0.2.0; rnfs.name_sync), by alias: the folder (its dump()ed absolute path), the
+        # signature and root of its last import (NULL before one), the root the sync last published and when (Unix
+        # time; NULL before one), and when the sync was set up
+        "CREATE TABLE name_syncs (alias TEXT PRIMARY KEY, path TEXT NOT NULL, signature TEXT, root BLOB,"
+        " published BLOB, published_at REAL, added REAL NOT NULL) WITHOUT ROWID",
+        # What each file of a synced folder was built as (FastCDC), as shared_folder_files holds the shared folder's;
+        # name: the dump()ed alias of the sync it was read for
+        "CREATE TABLE name_sync_files (name TEXT NOT NULL, state TEXT NOT NULL, cid BLOB NOT NULL,"
+        " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
+    )),
 )
 
 

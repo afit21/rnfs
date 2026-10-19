@@ -354,6 +354,9 @@ class FolderImporter:
         self.files_chunker = files_chunker
         # Entry name -> (signature that failed to import, when to try it again: None for not until it changes, why)
         self.failed: dict[str, tuple[str, float | None, str]] = {}
+        # Entry name -> why its last import couldn't read it whole (changed while being read, or unreadable); only
+        # while it stays so
+        self.unread: dict[str, str] = {}
         self._warned: set[str] = set()  # skipped entries (and folder problems) already warned about
 
     def warn_once(self, key: str, message: str):
@@ -370,20 +373,23 @@ class FolderImporter:
     def retain(self, names: set[str]):
         """Forget the failures of the entries not in names (gone)."""
         self.failed = {name: failed for name, failed in self.failed.items() if name in names}
+        self.unread = {name: why for name, why in self.unread.items() if name in names}
 
     def import_entry(self, name: str, handle: builder.Handle, st: os.stat_result, path: str,
                      options: builder.BuildOptions, known: tuple[str, Cid] | None,
                      keep: Callable[[Cid], None]) -> tuple[str, Cid] | None:
         """(signature, CID) of the entry name open as handle (whose stat is st, at path), built with options unless
         known (its last import's signature and CID) still matches it and is stored; None if it can't be imported
-        (logged, and kept in failed). keep(cid) is called with the CID, while the build's blocks are still
-        protected; an OSError it raises fails a build as a full disk does, and is only logged for an entry
-        unchanged."""
+        (logged and kept in failed; or, not read whole, in unread). keep(cid) is called with the CID, while the
+        build's blocks are still protected; an OSError it raises fails a build as a full disk does, and is only
+        logged for an entry unchanged."""
         shown = display_path(path)
         try:
             sig = open_signature(handle, st, path)
-        except OSError:
+        except OSError as e:
+            self.unread[name] = str(e)
             return None
+        self.unread.pop(name, None)
         if known is not None and known[0] == sig and self.storage.is_complete(known[1]):
             try:
                 keep(known[1])

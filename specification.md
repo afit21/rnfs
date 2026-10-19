@@ -914,9 +914,9 @@ silent longer than every one of them; announces are recorded in memory and writt
   A pin lasts while any source holds it.
 - `pin rm` removes only its caller's source: `user` for the CLI, and for an app only its own (`app:<app>`, or
   `app:<app>:<key>` with its pin key; section 11). Other sources are released by whatever created them: the folder
-  scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
-  a followed name's newer target once that is complete; removing the LXMF messages that hold it; removing the
-  app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
+  scan; `name publish` (a name's sync too, section 9) or `name rm`; `/pin` with `false` or a remote quota being
+  exceeded; `name unfollow`, or a followed name's newer target once that is complete; removing the LXMF messages
+  that hold it; removing the app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
 - Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
   names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
   `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
@@ -1227,6 +1227,41 @@ followed name is checked when a newer record is heard and every `announce_interv
   the name again. A failed fetch is retried with the record held, without a path request. A name whose owner
   is gone for good therefore costs a flooded path request at most every `announce_interval`.
 
+**Syncing a folder** (rnfs 0.2.0; local behaviour built on Publish: nothing on the wire changes). A node MAY keep
+one of its names pointing at a local folder's current content (rnfs: `name sync <alias> <folder>`).
+- Every `scan_interval` the folder is imported as the shared folder's entries are (section 8), the whole folder
+  as one directory: unchanged content is recognised by its metadata rather than read, links, devices, sockets and
+  files with other hard links are left out, and a folder that resolves, as opened, to the rnfs dir, a directory
+  holding it, or into the folders holding its keys and state is refused. Files are cut with FastCDC (section 5),
+  so an edited file shares most of its blocks with the version before: the root is the CID
+  `add --chunker fastcdc` gives the folder.
+- When the root differs from the one the sync last published and from the name's target, the name is published to
+  it as `name publish` does (Publish, above): pinned with source `name:<alias>`, the previous target's pin
+  released, so only the latest version is kept. The publish waits until:
+  - a scan at least 60 s after the new root was first seen finds the folder unchanged, so a folder still being
+    copied into isn't published half-copied (rnfs scans again then, if `scan_interval` is longer; a folder that
+    changes while it is read counts as changing). A copy that stalls for longer than that can still be published
+    part-way, and is published whole once it ends;
+  - an hour has passed since the sync last published the name (rnfs: the time is saved, so a restart doesn't
+    shorten it). RNS transport nodes count the announces of a destination arriving less than an hour apart
+    (`announce_rate_target`, 3600 s by default on transport instances) and, after more than
+    `announce_rate_grace` (5) of them, stop rebroadcasting it until an hour after the last one they let through
+    (Limits, below): publishing faster would spend airtime on announces that don't get through.
+- A folder that is missing, can't be read, is refused, isn't a folder or is empty (an unmounted drive's mount point
+  looks empty), or whose import fails (the deny list, a full disk), pauses the sync: nothing is published, the
+  name keeps its target, and rnfs logs why once and shows it in the sync's state. The sync resumes by itself once
+  the folder is back.
+- Stopping the sync (rnfs: `name unsync <alias>`) leaves the name where it last pointed, pinned; removing the name
+  (`name rm`) stops it too. A name published by hand while synced keeps that target until the folder next
+  changes. Two names may sync one folder: each imports it and publishes the same root, pinned by both. rnfs saves
+  its syncs (the name, the folder, its last import, and the root last published and when), so they resume after a
+  restart.
+- In private mode each publish's announce reaches outsiders (section 3): starting a sync warns of it as
+  `name publish` does (rnfs: a `warning` in `POST /api/name/sync`'s result, which `rnfs name sync` prints to
+  stderr), and rnfs logs it once per sync rather than at each publish.
+- Any caller of the local API may start or stop a name's sync, an app's token included, as any may publish the
+  name; the name's pin is always the name's own, `name:<alias>`, never the caller's.
+
 **Limits.**
 - A name resolves only while its owner is online, a reachable transport node still holds its announce, or a
   keeper of it is reachable. Paths last 1 week on normal interfaces, less on access-point and roaming ones.
@@ -1421,6 +1456,7 @@ are local conveniences, not part of the protocol.
 | `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
+| `name sync <alias> <folder>`, `name unsync <alias>`, `name syncs [--json]` | Keep a name pointing at a folder's current content, published at most once an hour once it has been unchanged a minute (section 9, Syncing a folder); `syncs` lists each sync's folder, state (`new`, `settling`, `waiting`, `synced`, `paused` and why), the root last imported and the one last published and when (rnfs: `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`, `GET /api/name/syncs`) |
 | `export <cid>[/path] -o file [--background]`, `import file [--background]` | Archives; `import --background` runs as an `import` job |
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
@@ -1837,7 +1873,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `remote_pin_identities` | empty | Identities allowed to send `/pin` |
 | `private` | off | Private mode (section 3) |
 | `members` | empty | Private mode's member identities |
-| `scan_interval` | 60 s | Shared folder |
+| `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9) |
 | `provide_strategy` | `roots` | `roots` (pins and complete cached downloads) or `pinned` (pins only) |
 | `gateway_scripts` | on | |
 | `gateway_fetches` | 2 | Network fetches at a time for requests that aren't the user's own navigation |

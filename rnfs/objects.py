@@ -13,7 +13,7 @@ __all__ = ["Cid", "Added", "Written", "Entry", "Info", "Stat", "Pin", "Record", 
            "Exported", "Imported", "DenyState", "Peer", "Stats", "Contact", "Kept", "Followed", "LxmfAddress",
            "MessageLink", "Message", "Outgoing", "Sent", "Synced", "Cached", "Uncached", "Event", "EventBatch",
            "Capabilities", "Setting", "Settings", "SettingsChange", "RemotePin", "ServedPin", "RemotePinUsage",
-           "ServedPins"]
+           "ServedPins", "FolderSync"]
 
 
 def _cid(text) -> Cid:
@@ -380,6 +380,28 @@ class Followed(_Object):
     def __str__(self) -> str:
         """The name in hex."""
         return self.name.hex()
+
+
+@dataclass(frozen=True)
+class FolderSync(_Object):
+    """A name of this node synced to a folder (names.sync): its alias, the folder (a path on the node's machine),
+    the sync's state ("new": not scanned yet, "settling": a change waiting to stay unchanged a minute, "waiting":
+    for an hour since its last publish, "synced", "paused": reason says why), the folder's root as last imported,
+    the root the sync last published and when (Unix time), and when the hourly limit next lets it publish (None:
+    it holds nothing back)."""
+
+    alias: str
+    path: str
+    state: str = "new"
+    reason: str | None = None
+    root: Cid | None = _field(_cid, None)
+    published: Cid | None = _field(_cid, None)
+    published_at: float | None = None
+    next_publish: float | None = None
+
+    def __str__(self) -> str:
+        """The alias."""
+        return self.alias
 
 
 @dataclass(frozen=True)
