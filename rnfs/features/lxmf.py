@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
 
 from rnfs import events, features, fsutil, ids
-from rnfs.config import LXMF_DEPRECATION
+from rnfs.config import LXMF_DEPRECATION, deprecated_given
 from rnfs.features import _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
@@ -1020,7 +1020,26 @@ class LxmfFeature(features.Feature):
     # Lifecycle
 
     def start(self):
-        """Start LXMF (if enabled and installed), the announce/sync loop and the auto-fetch worker."""
+        """Start LXMF (if enabled and installed), the announce/sync loop and the auto-fetch worker; then say once
+        that LXMF is deprecated, if it runs or an lxmf_* setting was given."""
+        self._start()
+        self._deprecation_notice()
+
+    def _deprecation_notice(self):
+        """Log that LXMF is deprecated (config.LXMF_DEPRECATION) if this node uses it: it runs (on by default where
+        the package is installed), or an lxmf_* setting was given (config.deprecated_given). A warning when it runs
+        as the user configured it, who relies on it; else a notice. Nothing for a node that neither runs it nor was
+        told anything about it (an embedded node's default)."""
+        given = deprecated_given(self.config)
+        running = self.network is not None
+        if given:
+            _log(f"deprecated: {LXMF_DEPRECATION}; the settings {', '.join(given)} go with it",
+                 LOG_WARNING if running else LOG_NOTICE)
+        elif running:
+            _log(f"deprecated: {LXMF_DEPRECATION} (lxmf_enabled = false turns it off now)", LOG_NOTICE)
+
+    def _start(self):
+        """start()'s work, without the notice."""
         if self.config.lxmf_enabled is False:
             self.off_reason = "LXMF is off (lxmf_enabled = false)"
             _log("off: lxmf_enabled is false", LOG_VERBOSE)

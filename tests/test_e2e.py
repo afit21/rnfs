@@ -432,6 +432,8 @@ class NetworkTest(unittest.TestCase):
         # --- lxmf: A sends B a link over LXMF; B fetches it from its inbox ---
         b_address = b.out("lxmf", "address").splitlines()[0]
         self.assertEqual(b.status()["lxmf_address"], b_address)
+        with open(b.log_path, encoding="utf-8", errors="replace") as f:
+            self.assertIn("rnfs lxmf: deprecated: LXMF messaging is moving out of rnfs", f.read())  # said at start
         wait_for(lambda: a.cli("send", b_address, file_cid, "-m", "hello B", check=False).returncode == 0, 60,
                  "A to send B an LXMF message")
         inbox = wait_for(lambda: (lambda out: out if file_cid in out else None)(b.out("inbox")), 90,

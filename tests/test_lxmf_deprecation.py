@@ -3,16 +3,20 @@ of core"): LXMF keeps working exactly as before, and says it is deprecated where
 carry a Deprecation header and capabilities list the feature. No Reticulum: offline nodes and a stand-in for
 LxmfNetwork, as in tests/test_lxmf.py."""
 import json
+import os
+import sys
 import unittest
 from unittest import mock
 
-from rnfs import api, features
+from rnfs import api, config, embedded, features
 from rnfs.api import ApiServer
-from rnfs.config import LXMF_DEPRECATION
+from rnfs.config import LXMF_DEPRECATION, Config
 from rnfs.features import lxmf
+from rnfs.log import LOG_INFO, LOG_NOTICE, LOG_WARNING
 
 from tests.test_api import raw_request
-from tests.test_lxmf import SENDER, FeatureTestCase, setUpModule, tearDownModule  # noqa: F401 - the log's level
+from tests.test_lxmf import B_ID, SENDER, FakeLxmf, FeatureTestCase
+from tests.test_lxmf import setUpModule, tearDownModule  # noqa: F401 - the nodes' log silenced, then restored
 
 
 class ApiTest(FeatureTestCase):
@@ -73,6 +77,56 @@ class ApiTest(FeatureTestCase):
         self.assertIn("lxmf", result["features"])
         self.assertLessEqual({tuple(route) for route in lxmf.LxmfFeature.api_routes()},
                              {tuple(route) for route in result["routes"]})
+
+
+class StartNoticeTest(FeatureTestCase):
+    """At start the node says once that LXMF is deprecated, if it runs it or was given an lxmf_* setting."""
+
+    def started(self, network=True, **settings) -> list[tuple[str, int]]:
+        """The lines B's lxmf feature logs at start (on a stand-in network if network, else without the LXMF
+        package), with settings given as rnfs.toml or the command line would; its threads don't run."""
+        self.b = self.make_node("b", B_ID, **settings)
+        feature = self.b.feature("lxmf")
+        logged = []
+        stand_in = mock.patch.object(lxmf, "LxmfNetwork", return_value=FakeLxmf()) if network else \
+            mock.patch.dict(sys.modules, {"LXMF": None})
+        with stand_in, mock.patch.object(feature, "_run"), mock.patch.object(feature, "_run_auto_fetch"), \
+                mock.patch.object(lxmf, "_log", side_effect=lambda text, level=LOG_INFO: logged.append((text, level))):
+            feature.start()
+        self.addCleanup(feature.stop)
+        return [(text, level) for text, level in logged if "deprecated" in text]
+
+    def test_running_by_default_is_a_notice(self):
+        self.assertEqual(self.started(), [(f"deprecated: {LXMF_DEPRECATION} (lxmf_enabled = false turns it off "
+                                           "now)", LOG_NOTICE)])
+
+    def test_running_as_configured_is_a_warning_naming_the_settings(self):
+        self.assertEqual(self.started(lxmf_accept_from=[SENDER.hex()], lxmf_enabled=True, lxmf_sync_interval=60),
+                         [(f"deprecated: {LXMF_DEPRECATION}; the settings lxmf_enabled, lxmf_sync_interval, "
+                           "lxmf_accept_from go with it", LOG_WARNING)])
+
+    def test_off_with_settings_is_a_notice(self):
+        """Switched off (or not installed) but configured: the settings are named, as a notice."""
+        self.assertEqual(self.started(lxmf_enabled=False),
+                         [(f"deprecated: {LXMF_DEPRECATION}; the settings lxmf_enabled go with it", LOG_NOTICE)])
+        self.assertIsNone(self.b.feature("lxmf").network)
+
+    def test_unused_says_nothing(self):
+        """Not installed and not configured; a setting given its default value counts as not given."""
+        self.assertEqual(self.started(network=False, lxmf_sync_interval=3600), [])
+
+    def test_an_embedded_nodes_default_is_not_given(self):
+        """EMBEDDED_DEFAULTS turn LXMF off without the user asking: not a setting given; the user's own is."""
+        rnfs_dir = os.path.join(self.tmp.name, "embedded")
+        os.makedirs(rnfs_dir)
+        self.assertEqual(config.deprecated_given(Config.load(rnfs_dir, defaults=embedded.EMBEDDED_DEFAULTS)), [])
+        self.assertEqual(config.deprecated_given(Config.load(rnfs_dir, defaults=embedded.EMBEDDED_DEFAULTS,
+                                                             lxmf_enabled=True)), ["lxmf_enabled"])
+        with open(os.path.join(rnfs_dir, "rnfs.toml"), "w") as f:
+            f.write("lxmf_send_from_hint = false\nlxmf_auto_fetch_quota = 1073741824\n")  # the latter: its default
+        os.chmod(os.path.join(rnfs_dir, "rnfs.toml"), 0o600)
+        self.assertEqual(config.deprecated_given(Config.load(rnfs_dir)), ["lxmf_send_from_hint"])
+        self.assertEqual(config.deprecated_given(Config()), [])
 
 
 class FeatureDeclarationTest(unittest.TestCase):

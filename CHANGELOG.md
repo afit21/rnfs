@@ -53,6 +53,10 @@ Deprecated:
   `deprecated`: for each `lxmf_*` setting why it is going away, `null` for the others; `rnfs config get` shows it.
   `GET /api/config` warns about the `lxmf_*` settings `rnfs.toml` sets, and `POST /api/config/set` (`rnfs config
   set`, printed on stderr) about those a change sets; removing one isn't warned about.
+- A node running LXMF (on by default where the LXMF package is installed: every package includes it) logs at start
+  that it is deprecated, as a notice, saying `lxmf_enabled = false` turns it off; given `lxmf_*` settings (in
+  `rnfs.toml`, on the command line or as an `rnfs.Node`'s settings), it names them, as a warning while LXMF runs.
+  A node that neither runs it nor was given such a setting, an `rnfs.Node` by default, says nothing.
 
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as

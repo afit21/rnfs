@@ -567,6 +567,21 @@ def deprecated_settings() -> dict[str, str]:
     return {entry["name"]: entry["deprecated"] for entry in settings_schema() if entry["deprecated"] is not None}
 
 
+def deprecated_given(config: Config) -> list[str]:
+    """The deprecated settings config was given a value of: one other than the default, and other than what an
+    embedded node's program gave as its default (given_defaults: EMBEDDED_DEFAULTS turn LXMF off, which no user
+    asked for), so set in rnfs.toml or on the command line (or a Node's settings). In Config's order."""
+    defaults = {entry["name"]: entry["default"] for entry in settings_schema()}
+    return [name for name in deprecated_settings()
+            if not _same(getattr(config, name), config.given_defaults.get(name, defaults[name]))
+            and not _same(getattr(config, name), defaults[name])]
+
+
+def _same(a, b) -> bool:
+    """Whether two setting values are the same, of the same type (True isn't 1, 1.0 is 1)."""
+    return a == b and (type(a) is bool) == (type(b) is bool)
+
+
 def deprecation_warnings(names, where: str = "") -> list[str]:
     """The warnings for setting names (any iterable of names): one per reason the deprecated ones among them have,
     naming them, in Config's order, and where (e.g. " in <path>"); [] if none is deprecated."""
