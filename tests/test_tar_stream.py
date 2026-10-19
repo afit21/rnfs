@@ -336,8 +336,19 @@ class WriteTarTest(unittest.TestCase):
             level = builder.build_directory([Entry("d" * 200, level.cid, level.size, dag.KIND_DIRECTORY),
                                              Entry("again", level.cid, level.size, dag.KIND_DIRECTORY)], self.store.put)
         data, _ = self.tar(level.cid, max_entries=200)
-        out = self.extract(data, os.path.join(self.tmp, "out"))
-        self.assertEqual(len([path for path in files_of(out) if not path.endswith("/")]), 32)
+        # Checked in memory, not extracted: the deepest path (~1300 bytes) is past macOS's PATH_MAX of 1024. The data
+        # filter still passes judgement on every member, as extractall would
+        where = os.path.join(self.tmp, "out")
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            files = []
+            for info in archive.getmembers():
+                self.assertIsNotNone(tarfile.data_filter(info, where), info.name)
+                if info.isfile():
+                    self.assertEqual(archive.extractfile(info).read(), b"same")
+                    files.append(info.name)
+        self.assertEqual(len(files), 32)
+        self.assertGreater(max(map(len, files)), 1024)  # past ustar's 255 bytes and macOS's PATH_MAX alike
+        self.assertTrue(all(name.endswith("/" + "n" * 255) for name in files))
         with self.assertRaises(NodeTooLarge):
             self.tar(level.cid, max_entries=50)
 
