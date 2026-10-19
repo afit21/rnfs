@@ -475,6 +475,7 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 | `rnfs status` / `peers` / `stats` | Node ID and identity hash, storage, jobs, LXMF address / known nodes, their round-trip time and whether each is online / traffic |
 | `rnfs ping NODE_ID` / `providers CID` | Round-trip time to a node / nodes providing a CID |
 | `rnfs add PATH\|-` | Add a file, directory or stdin, pin it and print its CID (options below) |
+| `rnfs add DEST:/page/PATH` / `add DEST:/file/PATH` | Add a snapshot of a NomadNet page or file (`DEST` is the NomadNet node's 32-hex address), pin it and print its CID |
 | `rnfs get TARGET [-o OUT] [--from NODE_ID] [--background]` | Fetch and write out a file or directory |
 | `rnfs cat TARGET [--offset N] [--length N]` | Write a file, or part of one, to stdout |
 | `rnfs ls TARGET` / `stat TARGET` | List a directory / size and how much is stored locally |
@@ -500,6 +501,12 @@ Every command except `daemon` and `url` talks to the running daemon, so run them
 `--no-pin` keeps it as evictable cache; `--chunker fastcdc` lets an edited version share most blocks;
 `--to RECIPIENT…` (after the path) seals a file so only those node IDs, LXMF addresses or contacts can read it,
 and `--to-self` adds you; a folder is sealed as one file, a tar named `<folder>.tar`, hiding its names too.
+
+A NomadNet link (`rnfs add e166ecdbc405bcc9762b6767617fc949:/page/index.mu`) is fetched from that node as it serves
+it now and added like a file, with the link shown in `pin ls`; run it again for a newer snapshot. The same options
+apply, and `--name N` wraps it under that name. Requests are anonymous; `--identify` identifies with rnfs's own
+NomadNet identity (`storage/nomadnet_identity`, not your node's) for pages the node serves only to identities it
+lists. A local file whose name looks like such a link is added as `./NAME`.
 
 `get` without `-o` uses the target's name only if it is a safe file name (printable, not starting with `.`),
 otherwise its CID, and writes under a temporary name until the transfer is complete. It decrypts sealed files

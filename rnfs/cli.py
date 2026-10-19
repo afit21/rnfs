@@ -22,7 +22,7 @@ import stat
 import sys
 import time
 
-from rnfs import __version__, apiclient, fsutil
+from rnfs import __version__, apiclient, fsutil, nomadnet
 from rnfs.apiclient import CHALLENGE_HEADER, PROOF_HEADER, TOKEN_FILE, api_proof, token_path  # noqa: F401
 from rnfs.apiclient import daemon_info_path
 from rnfs.config import DEFAULT_API_PORT, LOCK_FILE, Config
@@ -456,7 +456,13 @@ def run_add(args):
     """Add a file, directory or stdin and print its CID; with --background, start an add job and print its ID.
 
     In the foreground an add stays one request, not a job: a job would wait behind max_jobs transfers (one on slow
-    nodes), and a local add mustn't queue behind an hour-long LoRa download."""
+    nodes), and a local add mustn't queue behind an hour-long LoRa download. A NomadNet link is a transfer, so it
+    runs as a job like get (run_add_nomadnet)."""
+    if nomadnet.looks_like(args.path):
+        run_add_nomadnet(args)
+        return
+    if getattr(args, "identify", False):
+        fail("--identify is for NomadNet links (<destination>:/page/... or :/file/...)")
     if getattr(args, "background", False):
         if args.path == "-":
             fail("--background adds a path; stdin is added in the foreground")
@@ -493,6 +499,37 @@ def run_add(args):
             fail(f"no such file or directory: {args.path}")
         result = api.post("/api/add", path=path, wrap=args.wrap, only_hash=args.only_hash, **add_options(args))
     print_added(result)
+
+
+def run_add_nomadnet(args):
+    """`rnfs add <destination>:/page/<path>` (or :/file/<path>): add a snapshot of what that NomadNet node serves
+    there, as a job followed with a progress line (the transfer can take long on LoRa), or one request on a daemon
+    without jobs; --background prints the job's ID. A local file named like that is added as ./<name>."""
+    try:
+        link = str(nomadnet.parse(args.path))
+    except ValueError as e:
+        fail(f"{e}; a local file of that name is added as ./{args.path}")
+    if args.name is not None and not nomadnet.is_valid_name(args.name):
+        fail(f"invalid entry name {args.name!r}")
+    api = client(args)
+    if not daemon_has(args, api, "add_nomadnet"):
+        fail("this daemon can't add from NomadNet links (it is older than rnfs 0.2.0); update it")
+    flags = {name: True for name in ("wrap", "only_hash", "identify") if getattr(args, name, False)}
+    fields = {**flags, **({"name": args.name} if args.name else {}), **add_options(args)}
+    from rnfs.features import jobs
+    result = jobs.run_transfer(args, {"kind": "add", "nomadnet": link, **fields},
+                               lambda api: api.post("/api/add", nomadnet=link, **fields))
+    if result is not None:
+        print_added(result)
+
+
+def daemon_has(args, api: ApiClient, capability: str) -> bool:
+    """True if the daemon api talks to lists capability in GET /api/capabilities (one before 0.2.0 has none)."""
+    plain = apiclient.ApiConnection(args.dir, port=api.port, token_file=api.token_file)  # {} from an old daemon
+    try:
+        return capability in (plain.capabilities().get("capabilities") or [])
+    except apiclient.ApiError as e:
+        fail(str(e))
 
 
 def default_output(target: str) -> str:
@@ -993,13 +1030,18 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("-v", "--verbose", action="count", default=0,
                         help="log more detail: -v for every DHT query, -vv for RNS debug output")
 
-    add = command(commands, "add", run_add, "add a file, directory or stdin (-), pin it and print its CID")
-    add.add_argument("path", help="file or directory, or - for stdin")
+    add = command(commands, "add", run_add, "add a file, directory, stdin (-) or a NomadNet page or file, pin it and "
+                                            "print its CID")
+    add.add_argument("path", help="file or directory, - for stdin, or a NomadNet link: <destination>:/page/<path> or "
+                                  "<destination>:/file/<path> (a local file named like that: ./<name>)")
     add.add_argument("--wrap", action="store_true", help="put it in a directory")
     add.add_argument("--only-hash", action="store_true", help="just print the CID; store nothing")
-    add.add_argument("--name", help="with stdin: wrap it in a directory as this entry")
+    add.add_argument("--name", help="with stdin or a NomadNet link: wrap it in a directory as this entry")
     add.add_argument("--background", action="store_true",
-                     help="start an add job (a path only), print its ID and return (rnfs jobs)")
+                     help="start an add job (a path or NomadNet link), print its ID and return (rnfs jobs)")
+    add.add_argument("--identify", action="store_true",
+                     help="NomadNet links: identify to the node with rnfs's own NomadNet identity "
+                          "(storage/nomadnet_identity), for pages it serves only to identities it lists")
     # --- content: unpinned adds, sealed files, chunkers ---
     add.add_argument("--no-pin", action="store_true", help="keep it as evictable cache instead of pinning it")
     add.add_argument("--to", nargs="+", action="extend", metavar="RECIPIENT",

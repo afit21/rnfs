@@ -230,6 +230,9 @@ pass a `max_response_size` just above their largest honest answer.
   reaching the node over the same interface whose handshake takes longer is cut off (RNS tells it at once, and
   it may try again), while initiators on other interfaces are not affected. Each request still costs the node
   the key exchange and a proof; RNS's own long responder timeout is the root cause.
+- Links a node opens to NomadNet nodes to add what they serve (section 11, Adding from NomadNet) carry compressed
+  Resources of several segments and files with metadata: they are bounded per link as section 11 says, and none of
+  the rules below that are for `rnfs.dht` links applies to them, nor do they change any.
 - rnfs neither sends nor accepts compressed Resources on `rnfs.dht` links. Handlers are registered with
   `auto_compress=False`, requests are never sent unless they fit one packet, and a node MUST reject, before
   accepting it, any Resource advertisement on an `rnfs.dht` link that has the compressed flag set, since RNS
@@ -1405,6 +1408,7 @@ are local conveniences, not part of the protocol.
 | Command | Does |
 |---|---|
 | `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files; a directory as one tar named `<directory>.tar`); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
+| `add <destination>:/page/<path>\|<destination>:/file/<path> [the options above] [--identify]` | Add a snapshot of a page or file a NomadNet node serves, as a file (Adding from NomadNet, below); `--name N` wraps it as entry N; `--identify` identifies to the NomadNet node. A local file named like that is added as `./<name>` |
 | `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw] [--no-extract]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; a sealed folder (a sealed `.tar` starting with the sealed-folder marker, section 5) is unpacked to a directory (section 5, Unpacking), named without `-o` (for a bare CID, or a path ending in `.tar`) after the folder by the same rule, while a tar sealed as a file is written as that file; `--no-extract` writes it as the decrypted `.tar` instead; `--raw` writes the stored bytes |
 | `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range), a sealed folder giving its tar (never unpacked); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
@@ -1653,9 +1657,9 @@ request or terminal staying open. A job has a kind — `get` (fetch a target and
 optionally from one node), `pin` (fetch a target completely and pin it with source `user`, or the app's that
 queued it: App tokens, above), `export`
 (write an archive of a target to an output path), `add` (add a file or directory at a path on the node's
-machine, with `POST /api/add`'s options) or `import` (import an archive at such a path) — and a state: `queued`,
-`running`, `done`, `failed` or `cancelled`. Its result, when done, MUST be what the equivalent API call returns
-(`POST /api/get`, `/api/pin/add`, `/api/export`, `/api/add`, `/api/import`), and its error, when failed, the
+machine, or a NomadNet link's snapshot (below), with `POST /api/add`'s options) or `import` (import an archive
+at such a path) — and a state: `queued`, `running`, `done`, `failed` or `cancelled`. Its result, when done,
+MUST be what the equivalent API call returns (`POST /api/get`, `/api/pin/add`, `/api/export`, `/api/add`, `/api/import`), and its error, when failed, the
 message that call would have reported.
 - At most `max_jobs` jobs run at once; queued jobs MUST be started oldest first.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
@@ -1668,11 +1672,12 @@ message that call would have reported.
   step (within 0.5 s), not at the end of a request in flight, whose link is then closed (section 7). Writing
   out (`get`) or the archive (`export`) after the fetch is local and is not interrupted. A running `add` or
   `import` MUST stop at its next read of the file or archive; what it stored by then is unreferenced, for the
-  next collection.
+  next collection. A running `add` of a NomadNet link stops its fetch within 0.5 s, closing its link.
 - `add` and `import` jobs fetch nothing and hold no blocks while queued: one interrupted (or queued at a
   restart) runs again from the start, which is safe because adding and importing are idempotent (the same
-  content gives the same CIDs; a sealed add seals afresh, so its CID is the finishing run's). Their path MUST
-  exist when queued (404 otherwise); they have no target or output, so the output rules don't apply.
+  content gives the same CIDs; a sealed add seals afresh, so its CID is the finishing run's; an add of a NomadNet
+  link takes a new snapshot). Their path MUST exist when queued (404 otherwise); they have no target or output, so
+  the output rules don't apply.
 - Stopping the node MUST NOT wait for jobs beyond a short bound (rnfs: the node's stop budget, 5 s for every
   thread it ends); a job interrupted by the shutdown is saved as queued and resumes at the next start.
 - At most `max_finished_jobs` (at least 1) finished jobs are kept, the oldest finished forgotten first, but
@@ -1701,6 +1706,58 @@ message that call would have reported.
 - A node with an event log (rnfs: `GET /api/events`) publishes a `job` event at every change of a job's state,
   when it is forgotten (`removed`: true), and at most once a second for a running job's progress, with its `id`,
   `job_kind`, `state`, `error` and progress fields but not its result.
+
+**Adding from NomadNet.** A NomadNet node serves pages and files as link requests on its `nomadnetwork.node`
+destination. A node MAY add what one serves, as a one-off snapshot (rnfs: `add <destination>:/page/<path>` or
+`:/file/<path>`; `POST /api/add` with `nomadnet` instead of `path`; an `add` job with `nomadnet`; `add_nomadnet` in
+the library). Never through the gateway: web pages must not make the node fetch.
+- **Syntax.** 32 hex digits (the `nomadnetwork.node` destination hash), `:`, then `/page/<path>` or `/file/<path>`:
+  components separated by single slashes, each a valid entry name (section 5: not empty, `.` or `..`), printable,
+  at most 1024 characters in all. Request data (a page's form fields or `var_` values, written after a backtick)
+  is not supported. On the command line a local file named like a link is added as `./<name>`.
+- **Fetch.** The node finds a path to the destination and recalls its identity (each within `path_timeout`), links
+  only to the `nomadnetwork.node` destination of that identity whose hash is the one given, waits for the link
+  within RNS's establishment timeout (rnfs: plus 5 s), and sends one request for the path with no data. A page
+  comes back as bytes (an executable page as rendered for this request), a file as a Resource whose metadata
+  carries its `name`. Until an answer starts, RNS's request timeout applies (and rnfs's hard deadline, twice it);
+  once it does, the fetch fails if it makes no progress for `stall_timeout` or isn't complete within its size at
+  32 bytes/s. The link is closed when the fetch ends. Nothing answering (NomadNet sends nothing for a path it
+  doesn't serve or an error) fails the add.
+- **Identity.** The link is anonymous unless the user asks to identify (rnfs: `--identify`); it then identifies
+  with an identity kept for this alone (rnfs: `<rnfs dir>/storage/nomadnet_identity`, created on first use, private
+  like the node's), never the node's, so allowlisted pages can be fetched without tying them to the node ID.
+  NomadNet answers a visitor its `.allowed` list doesn't name with its own "Request Not Allowed" page rather than
+  an error: an answer that is that page (line endings and surrounding whitespace aside) fails the add instead of
+  being added. On an identified link it is retried once after identifying again (`Link.identify` is
+  unacknowledged).
+- **The snapshot** is added as data is (a file, chunked, checked against the deny list, pinned with the caller's
+  source, `user` or an app's, unless `--no-pin`, sealed with `--to`), and the pin's origin (`pin ls`) is the link. Its name, used with `--wrap`
+  and sealed inside, is for a file the name the node sent if it is a valid entry name, else the path's last
+  component; for a page always the path's last component. `--name` wraps it under that name instead. Each add
+  takes a new snapshot. An `add` job's progress is the answer's bytes received of its advertised size; one
+  interrupted fetches again from the start.
+- **Limits, per link.** NomadNet compresses files up to 32 MB and sends anything over one Resource segment
+  (`RNS.Resource.MAX_EFFICIENT_SIZE`) as several, while the daemon's process-wide decompression limit is 0 and
+  RNS checks neither a segment's decompressed size against the advertised one nor the segments' sequence. So the
+  node bounds the link it opened, and nothing else (section 3: `rnfs.dht` links keep every rule, the daemon's
+  process-wide limit stays 0, an embedded node leaves its host's settings alone):
+  - the request carries `max_response_size` = the smaller of `max_download_size` (if set) and the free space above
+    the disk reserve where the answer is copied;
+  - a `resource_started` callback on the link gives each segment `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1
+    and requires the first to be segment 1 whose original hash is its own hash, and each to carry the first's
+    original hash, total size and metadata flag, the segment count an honest sender computes from that total
+    (1 up to `MAX_EFFICIENT_SIZE` bytes, else ⌊(total − 1) / `MAX_EFFICIENT_SIZE`⌋ + 1), and the index after the
+    previous segment's, which must be complete; anything else cancels the transfer and closes the link;
+  - as each segment completes, what RNS has assembled must be no larger than the advertised total, and a file's
+    metadata (stored by RNS before it decodes it) must be a map of at most 16 entries whose keys are strings and
+    whose values are strings, integers, booleans or nil, at most 4 KiB in all; otherwise it is removed unread and
+    the link closed;
+  - a page answer must be `[request_id, page]` with the page one `bin` or `str` (or `nil` or `False`, which fail the
+    add), checked from its msgpack headers before RNS decodes it, as `rnfs.dht` responses are (section 3); a file
+    answer is copied, no larger than the advertised total, inside the response callback (RNS deletes it after);
+  - the advertisement checks of section 3 that cover every link in the daemon (no request Resources, transfer size
+    within data size and one segment's) apply to these links in an embedded node too; the `rnfs.dht`-only ones
+    (one segment, no metadata, no compression) don't.
 
 **Streams.** For a client that can't share files with the node (a sandboxed app), the API also carries content
 in its requests and responses (rnfs: these routes):

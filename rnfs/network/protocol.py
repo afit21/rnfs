@@ -401,3 +401,100 @@ def packed_request_id(packed: bytes) -> bytes | None:
     if request_id is None or request_id[0] != REQUEST_ID_LENGTH:
         return None
     return bytes(packed[request_id[1] - REQUEST_ID_LENGTH:request_id[1]])
+
+
+# NomadNet answers (rnfs/network/nomadnet.py), checked the same way on the links rnfs opens to NomadNet nodes
+#
+# A page is answered as [request_id, page], the page one flat byte string (NomadNet sends bytes); nothing, or nil or
+# False, when there is none. A file comes as a Resource with metadata, which RNS hands over undecoded (an open
+# file) after decoding the metadata, which is checked on its own first (metadata_refusal).
+
+_STR_WIDTHS = {0xD9: 1, 0xDA: 2, 0xDB: 4}  # str8, str16, str32: bytes of length after the code (fixstr: 0xa0-0xbf)
+_INT_WIDTHS = {0xCC: 1, 0xCD: 2, 0xCE: 4, 0xCF: 8, 0xD0: 1, 0xD1: 2, 0xD2: 4, 0xD3: 8}  # uint8-64, int8-64
+PAGE_HEAD_SIZE = 32  # bytes of a page answer page_response_refusal needs: its framing and the page's header
+MAX_METADATA_SIZE = 4 * KIB  # a NomadNet file's metadata, {"name": <file name>}, is a few hundred bytes at most
+MAX_METADATA_ENTRIES = 16
+
+
+def _string_at(packed: bytes, position: int, length: int | None = None) -> tuple[int, int] | None:
+    """(length, position after its data) of a bin or str at position, or None if there's none or it would end
+    past length (the whole answer's size, of which packed may hold only the start; default len(packed))."""
+    length = len(packed) if length is None else length
+    if position >= len(packed):
+        return None
+    code = packed[position]
+    if 0xA0 <= code <= 0xBF:
+        size, start = code & 0x1F, position + 1
+    else:
+        width = _BIN_WIDTHS.get(code) or _STR_WIDTHS.get(code)
+        start = position + 1 + (width or 0)
+        if width is None or start > len(packed):
+            return None
+        size = int.from_bytes(packed[position + 1:start], "big")
+    return (size, start + size) if start + size <= length else None
+
+
+def page_response_refusal(head: bytes, length: int) -> str | None:
+    """Why a NomadNet answer of length bytes, whose first bytes are head (at least PAGE_HEAD_SIZE of them, or all),
+    can't be a page answer, judged from msgpack headers alone; None if it may be.
+
+    It must be [request_id, page]: a 16-byte bin request ID, then the page as one bin or str, or nil or False
+    (none), with nothing after it. So RNS decodes it into one byte string at most, never a structure.
+    """
+    outer = _array_at(head, 0)
+    request_id = _bin_at(head, outer[1]) if outer is not None and outer[0] == 2 else None
+    if request_id is None or request_id[0] != REQUEST_ID_LENGTH or request_id[1] >= length:
+        return "not a response"
+    position = request_id[1]
+    if position < len(head) and head[position] in (_NIL, _FALSE):
+        end = position + 1
+    else:
+        page = _string_at(head, position, length)
+        if page is None:
+            return "not a page: a NomadNet page is one byte string"
+        end = page[1]
+    if end != length:
+        return f"{length - end} bytes after the page"
+    return None
+
+
+def metadata_refusal(packed: bytes) -> str | None:
+    """Why packed (a Resource's metadata as RNS stores it, before decoding it) isn't what a NomadNet file carries,
+    from msgpack headers alone; None if it may be: a map of at most MAX_METADATA_ENTRIES entries whose keys are
+    bin or str and whose values are bin, str, nil, booleans or integers, at most MAX_METADATA_SIZE bytes in all.
+    Nothing nested, so RNS's decoding of it can't recurse or build more than a few objects."""
+    if len(packed) > MAX_METADATA_SIZE:
+        return f"{len(packed)} bytes of metadata, over {MAX_METADATA_SIZE}"
+    if not packed:
+        return "empty metadata"
+    if 0x80 <= packed[0] <= 0x8F:
+        count, position = packed[0] & 0x0F, 1
+    elif packed[0] == 0xDE and len(packed) >= 3:
+        count, position = int.from_bytes(packed[1:3], "big"), 3
+    else:
+        return "metadata that isn't a map"
+    if count > MAX_METADATA_ENTRIES:
+        return f"metadata of {count} entries, over {MAX_METADATA_ENTRIES}"
+    for index in range(2 * count):
+        position = _scalar_end(packed, position, key=index % 2 == 0)
+        if position is None:
+            return "metadata holding something other than names, numbers and flags"
+    if position != len(packed):
+        return f"{len(packed) - position} bytes after the metadata"
+    return None
+
+
+def _scalar_end(packed: bytes, position: int, key: bool) -> int | None:
+    """Position after the bin or str (and unless key: nil, boolean or integer) at position, or None."""
+    string = _string_at(packed, position)
+    if string is not None:
+        return string[1]
+    if key or position >= len(packed):
+        return None
+    code = packed[position]
+    if code in (_NIL, _FALSE, _TRUE) or code <= 0x7F or code >= 0xE0:  # nil, booleans, positive and negative fixints
+        return position + 1
+    width = _INT_WIDTHS.get(code)
+    if width is None or position + 1 + width > len(packed):
+        return None
+    return position + 1 + width

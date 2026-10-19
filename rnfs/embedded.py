@@ -193,6 +193,10 @@ class _Backend:
         """RnfsNode.add_path."""
         return self.node.add_path(path, **options)
 
+    def add_nomadnet(self, link: str, **options) -> dict:
+        """RnfsNode.add_nomadnet."""
+        return self.node.add_nomadnet(link, **options)
+
     def add_stream(self, data, length: int | None, name: str | None, **options) -> dict:
         """RnfsNode.add_stream of bytes or a binary file."""
         stream = io.BytesIO(data) if isinstance(data, bytes) else data

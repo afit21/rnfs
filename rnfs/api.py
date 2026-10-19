@@ -17,7 +17,7 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/name/list | | `{"names": name_list()}` |
 | GET  | /api/name/resolve | `name` | `name_resolve(name)` |
 | GET  | /api/name/watch | `names` (comma-separated), `after` (a sequence or `-` per name), `wait` (≤ 30 s) | `{"records": [{"name", "cid", "sequence", "age"}]}`: the records held whose sequence is above `after`, as soon as there is one or after `wait` (below) |
-| POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker` | `add_path(...)` |
+| POST | /api/add | JSON `path`, `wrap`, `only_hash`, `pin`, `to` (list), `to_self`, `seal_name` (bool), `chunker`; or `nomadnet` (a NomadNet link) instead of `path`, with `name` and `identify` too | `add_path(...)`; with `nomadnet`, `add_nomadnet(...)`: its result has the snapshot's `name` and the `link` too |
 | POST | /api/add/stream | query `name`, `only_hash`, `pin`, `to` (comma-separated), `to_self`, `seal_name` (the name), `chunker`, `format`; body is the data | `add_stream(...)`; `format=tar`: the body is a tar stream, `add_tar(stream, name, ...)` builds the directory it holds (no `to`, `to_self` or `seal_name`) |
 | GET  | /api/get/stream | `target`, `format` (`tar`) | the target as a tar stream (`get_tar`), fetched first, Content-Length set |
 | GET  | /api/export/stream | `target` | the target's archive (`export_chunks`), byte-identical to `export`, Content-Length set |
@@ -149,7 +149,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from rnfs import __version__, events, fsutil, ids
+from rnfs import __version__, events, fsutil, ids, nomadnet
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PIN_KEY_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
@@ -172,7 +172,7 @@ MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream", "sealed_folders", "apps", "remote_pin_status")
+                "import_stream", "sealed_folders", "apps", "remote_pin_status", "add_nomadnet")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -276,6 +276,20 @@ def parse_int(text, name: str, default: int | None) -> int | None:
         raise ValueError(f"{name} must be an integer") from None
     if value < 0:
         raise ValueError(f"{name} must not be negative")
+    return value
+
+
+def parse_nomadnet(text) -> str:
+    """A NomadNet link (<32 hex>:/page/<path> or :/file/<path>, rnfs.nomadnet.parse) as written, or ValueError."""
+    return str(nomadnet.parse(text))
+
+
+def parse_entry_name(value) -> str | None:
+    """An entry name (rnfs.nomadnet.is_valid_name), or None if absent or empty; ValueError otherwise."""
+    if value is None or value == "":
+        return None
+    if not nomadnet.is_valid_name(value):
+        raise ValueError(f"invalid entry name {value!r}")
     return value
 
 
@@ -1164,9 +1178,20 @@ class ApiHandler(TimedHandler):
     # POST endpoints
 
     def api_add(self):
-        """POST /api/add: import a file or directory on this machine (parameters: the module docstring's table)."""
+        """POST /api/add: import a file or directory on this machine, or (nomadnet) a snapshot of what a NomadNet node
+        serves (parameters: the module docstring's table)."""
         source = self.pin_source()
         body = self.json_body()
+        if body.get("nomadnet") is not None:
+            if body.get("path") is not None:
+                raise ValueError("give either path or nomadnet, not both")
+            self.send_json(200, self.node.add_nomadnet(parse_nomadnet(body.get("nomadnet")),
+                                                       wrap=parse_bool(body.get("wrap")),
+                                                       only_hash=parse_bool(body.get("only_hash")),
+                                                       name=parse_entry_name(body.get("name")),
+                                                       identify=parse_bool(body.get("identify")),
+                                                       **node_content.add_options(body.get), **source))
+            return
         self.send_json(200, self.node.add_path(parse_path(body.get("path")), wrap=parse_bool(body.get("wrap")),
                                                only_hash=parse_bool(body.get("only_hash")),
                                                **node_content.add_options(body.get), **source))  # pin, to, chunker…

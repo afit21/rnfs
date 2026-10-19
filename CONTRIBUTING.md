@@ -42,7 +42,7 @@ variables:
 
 | Variable | What it turns on |
 |---|---|
-| `RNFS_E2E=1` | Real daemons and real RNS over local TCP, driven through the CLI or the library. Run them with `RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins` (3 to 4 minutes). CI's end-to-end step lists every module gated on it, and `tests/test_packaging.py` fails if a new one is missing from that list. |
+| `RNFS_E2E=1` | Real daemons and real RNS over local TCP, driven through the CLI or the library. Run them with `RNFS_E2E=1 python3 -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins tests.test_nomadnet_e2e` (3 to 4 minutes). CI's end-to-end step lists every module gated on it, and `tests/test_packaging.py` fails if a new one is missing from that list. |
 | `RNFS_FUZZ_EXAMPLES=N` | A deeper, randomized run of `tests/security/test_fuzz_parsers.py` (e.g. 3000 examples per parser). That module needs hypothesis, which isn't one of rnfs's dependencies: without it every test there is skipped, as in CI. |
 | `RNFS_BENCH=1` | Prints the FastCDC chunking rate measured by `tests/test_chunker.py` (the test itself only checks a floor). |
 

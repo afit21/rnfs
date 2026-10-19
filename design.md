@@ -142,7 +142,10 @@ rnfs/
     guards.py         guards rejecting oversized, compressed or request Resource advertisements (on every
                       link in the daemon, on rnfs.dht links only in an embedded node) and, on rnfs.dht links,
                       responses that fail a msgpack header check before RNS decodes them (3, 10); the
-                      half-open incoming link cap per destination (3)
+                      same for NomadNet links this node opened, against a page's shape; the half-open
+                      incoming link cap per destination (3)
+    nomadnet.py       fetching a page or file from a NomadNet node over a link of its own, bounded per link
+                      (Transfer: segment sequence and decompression bound, metadata check) (11)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
     client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
@@ -526,6 +529,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 |---|---|
 | `add_path(path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None)` | `{"cid", "size", "warnings": [str]}` (+ `"sealed"`); file or directory, pinned `user` (or cached with `pin=False`); with `to`/`to_self` a directory is packed as one tar and sealed as `<name>.tar` (`node_content.add_sealed_path`, `tarstream.folder_chunks`) |
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
+| `add_nomadnet(link, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True, chunker=None, name=None, identify=False, progress=None)` | as `add_stream` (+ `"name"`, the snapshot's name, and `"link"`): a snapshot of what a NomadNet node serves at `link` (`node_content.add_nomadnet`, "Adding from NomadNet" below); recorded in pin_names as the link; `progress(received, total)` is an add job's |
 | `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `name` or `(tar upload)` |
 | `get(target, output, from_node=None, raw=False, no_extract=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it; + `"extracted"` for a sealed folder unpacked, `name` then the directory's); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` and unpacking a sealed folder unless `no_extract` (`node_content.get_sealed`); a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
 | `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`, and for a recipient `"sealed_folder"`; the sealed name is None unless `safe_default_name` accepts it) |
@@ -905,6 +909,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `status() -> Status` | | `status()` / `GET /api/status` |
 | `node_id -> bytes` (property) | | `node_id` / status, read once |
 | `add(source, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None) -> Added` | `ValueError` (options: `name` with a path, `wrap` without `name`, a source neither a path, bytes nor a binary file), `NotFound` (path), `Denied` (a file's hash), `StorageFull`, `OSError` | a path (str or PathLike): `add_path` / `POST /api/add`; bytes or a binary file: `add_stream(name=name)` / `POST /api/add/stream`, sealing with `name` as the sealed name unless `seal_name` is False |
+| `add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False) -> Added` | `ValueError` (a malformed link or option), `NotFound` (unreachable, no answer, "Request Not Allowed"), `TooLarge`, `Denied`, `StorageFull` | `add_nomadnet` / `POST /api/add` with `nomadnet` |
 | `get(target, output, *, from_node=None, raw=False, no_extract=False) -> Written` | fetch errors, `ValueError` (output exists), `OSError` | `get` / `POST /api/get` (`no_extract` sent only when set) |
 | `open(target, *, from_node=None, raw=False) -> File` | fetch errors, `ValueError` (a directory) | `info`, then `read(target, offset, length)` per refill / `GET /api/info`, then `GET /api/cat?offset=&length=&from=` per refill |
 | `cat(target, *, offset=0, length=None, from_node=None, raw=False) -> Iterator[bytes]` | fetch errors, `ValueError` | `read` / `GET /api/cat` |
@@ -936,9 +941,9 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `names.resolve(name) -> Record` (bytes, hex, `Name` or a contact's nick) | `NotFound` (unresolved), `ValueError` | `name_resolve` / `GET /api/name/resolve` |
 | `names.watch(name, callback) -> Watch` | `ValueError`; a Client: `NotFound` from a daemon without the endpoint | below / `GET /api/name/watch` |
 | `Name`: `alias`, `name: bytes`, `cid`, `sequence`, `str()` hex; `publish(target) -> Record`, `export_key() -> bytes`, `remove()`, `refresh() -> Name` | `publish`: `NotFound` (path not stored), `ValueError`, `RnfsError` (highest sequence) | `name_publish`, `name_export`, `name_rm` / `POST /api/name/publish`, `/api/name/export`, `/api/name/rm` |
-| `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False) -> Job`, `jobs.pin(target, *, on_progress=None) -> Job`, `jobs.export(target, output, *, on_progress=None) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
+| `jobs.get(target, output, *, from_node=None, sealed_name=False, fallback_dht=False, on_progress=None, no_extract=False) -> Job`, `jobs.pin(target, *, on_progress=None) -> Job`, `jobs.export(target, output, *, on_progress=None) -> Job`, `jobs.add(path, *, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, on_progress=None) -> Job`, `jobs.add_nomadnet(link, *, name=None, wrap=False, pin=True, only_hash=False, to=None, to_self=False, seal_name=True, chunker=None, identify=False, on_progress=None) -> Job`, `jobs.import_archive(path, *, on_progress=None) -> Job` | `ValueError` (output exists or in use, an option), `NotFound` (add, import: no such path), `Busy` (1000 active) | `JobsFeature.submit` / `POST /api/jobs` |
 | `jobs.job(job_id) -> Job`, `jobs.list() -> list[Job]`, `jobs.clear(job_id=None) -> int` | `NotFound`, `ValueError` (not finished) | `JobsFeature.get`, `list`, `clear` / `GET /api/jobs/get`, `GET /api/jobs`, `POST /api/jobs/clear` |
-| `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
+| `Job`: `id`, `kind`, `target` (None for add and import), `output`, `from_node`, `sealed_name`, `fallback_dht`, `no_extract`, `path`, `options` (add and import), `source` (pin, add and import), `nomadnet` (an add of a NomadNet link), `state`, `error`, `result: dict`, `total_bytes`, `done_bytes`, `downloaded_bytes`, `blocks`, `blocks_total`, `rate`, `eta`, `created`, `started`, `finished`, `runs`, `done` (finished); `refresh() -> Job`, `wait(timeout=None) -> Job`, `cancel() -> Job`, `watch(callback) -> Watch` | `wait`: `TimeoutError`; `NotFound` once cleared | `JobsFeature.get(wait=)`, `cancel` / `GET /api/jobs/get?wait=`, `POST /api/jobs/cancel` |
 | `deny.list() -> DenyState`, `deny.add(entries) -> list[str]`, `deny.remove(entries) -> list[str]` | `ValueError` (malformed entry, too many), `NotFound` (remove: not on it) | `node.deny.entries`/`add`/`remove`, `DenyFeature.lists` / `GET /api/deny`, `POST /api/deny/add`, `/api/deny/rm` |
 | `timeout(seconds) -> context manager` | `ValueError` (not None or a positive number) | a Client: `ApiConnection.using_timeout`; a Node: nothing (above) |
 | `peers() -> list[Peer]`, `stats() -> Stats` | `NotFound` (no peers feature) | `PeersFeature.peers`, `stats` / `GET /api/peers`, `/api/stats` |
@@ -1163,6 +1168,32 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   can come once part of the folder has been sealed, and what was stored is then unreferenced, for the next
   collection. A file's size is its open `fstat`'s; a file growing meanwhile is cut there, one shrinking fails
   the add.
+- **Adding from NomadNet** (`rnfs add <destination>:/page/<path>`, specification section 11). `rnfs/nomadnet.py`
+  (no RNS: the CLI uses it) parses links (`parse`, `looks_like` for the CLI's `./` escape), names a snapshot
+  (`snapshot_name`) and recognises NomadNet's "Request Not Allowed" page (`is_not_allowed`, NomadNet's
+  `DEFAULT_NOTALLOWED` text). `node_content.add_nomadnet` checks the options (recipients, chunker) before any
+  network work, loads `storage/nomadnet_identity` for `identify` (`load_or_create_identity`, private), bounds the
+  answer (`nomadnet_room`: `max_download_size` and the free space above the disk reserve in the state directory),
+  calls `network/nomadnet.fetch`, and adds the copy it hands back with `add_stream(origin=link, source=source)`
+  (pinned with the caller's source; `pin ls`'s origin is the link, and a user's label stays), removing the copy afterwards; the node removes copies a crash left
+  (`remove_leftovers`, at start). `network/nomadnet.fetch` opens its own link (`open_link`: `await_path`, a recall
+  loop as `LinkPool._recall`, the `nomadnetwork.node` destination whose hash is the one given, marked with
+  `guards.mark_nomadnet` right after `RNS.Link` is made), identifies if asked, and sends one request; a "Request
+  Not Allowed" answer on an identified link is retried once after identifying again. Per request a `Transfer` holds
+  the state RNS's callbacks fill in, hooked on the link: `set_resource_started_callback` (`resource_started`:
+  `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1, then `segment_refusal`), and on the link instance
+  `resource_concluded` (RNS's, then the assembled size against the total and, on segment 1, `metadata_refusal` on
+  the `.meta` file RNS wrote, removed if refused so RNS never decodes it) and `receive` (notes an advertised size
+  over the bound, which RNS rejects silently, to report `TooLarge`). Refusing cancels the Resource and tears the
+  link down; RNS's leftover segment files (`<resourcepath>/<original hash>[.meta]`) are removed when a fetch fails.
+  `on_response` copies the answer into `<state>/.rnfs-nomadnet-<random>.partial` on RNS's thread (a file answer at
+  most the advertised total; RNS deletes its own file after the callback). The waiting thread polls every
+  `links.POLL_INTERVAL`: `progress(received, total)` (an add job's `Job.read`, which raises `Cancelled`), the node's
+  `stop_event`, the request deadline (`LinkPool.request_deadline`), `stall_timeout` and the overall deadline (the
+  size at `FLOOR_RATE`, 32 B/s). Add jobs carry `nomadnet` instead of `path` (kept in the job record only when set),
+  with `name` and `identify` among their options (`jobs.NOMADNET_OPTIONS`); the CLI runs a foreground NomadNet add
+  as such a job (like `get`), falling back to `POST /api/add` on a daemon without jobs, after checking the
+  `add_nomadnet` capability.
 - `gateway_formats.py` — `?format=raw|archive`; `archive.archive_size` gives the exact length, so the archive
   is sent with a Content-Length before streaming. For every format, a web page's request or a HEAD always
   gets 409, stored or not (a 200 download for stored content only told pages what is stored: L6), before the
@@ -1291,6 +1322,14 @@ and in total, never persisted.
   malformed; refusals are logged at most once a minute. `guarded_receive` drops a response packet on an
   incoming `rnfs.dht` link, and a request packet on one this node opened (`link.initiator`), without
   decrypting it. Everything else goes to RNS's own methods unchanged.
+- On NomadNet links this node opened (`guards.mark_nomadnet`: an attribute on the link, so another program's
+  NomadNet links in the process aren't touched) `refusal` applies, in both scopes, the checks that cover every link
+  in the daemon, never the `rnfs.dht`-only three, and `guarded_accept` leaves the decompression limit the fetch's
+  callback set. `guarded_response_resource_concluded` reads a page answer's first `PAGE_HEAD_SIZE` bytes and its
+  length (not the whole of it) for `protocol.page_response_refusal` (`[16-byte bin, bin or str or nil or False]`,
+  nothing after), hands a file answer (a Resource with metadata) over undecoded, and drops unread an answer arriving
+  after the fetch closed the link; `guarded_receive` checks a large page packet the same way and drops request
+  packets.
 - `guards.limit_half_open(destination, limit)` replaces a destination's `incoming_link_request` (on the
   instance; RNS's `Destination.receive` calls it for each link request) with `HalfOpenLimit`, which, before
   RNS validates a request, closes (`Link.teardown()`) the oldest `PENDING`/`HANDSHAKE` link in
@@ -1440,7 +1479,9 @@ name in the output's directory; the CLI sets it for `rnfs get <bare cid>` withou
 `GET /api/info` first; an unpacked folder is then named after its directory),
 `fallback_dht` (a get with `from` that fails, other than by cancellation, `TooLarge` or `StorageFull`, is retried
 once through the DHT) and `no_extract` (a sealed folder written as its tar; kept in the job's record only when set,
-so other records stay as 0.1.6 wrote them); for `kind` `add`, `path` and `POST /api/add`'s options (flat, as `/api/add` takes them; kept in the job as `options`, only those set), for `import`, `path`.
+so other records stay as 0.1.6 wrote them); for `kind` `add`, `path` (or `nomadnet`, a NomadNet link, with `name`
+and `identify` too; kept in the record only when set) and `POST /api/add`'s options (flat, as `/api/add` takes them;
+kept in the job as `options`, only those set), for `import`, `path`.
 Add and import jobs run `add_path`/`import_archive` with `progress=Job.read`, which counts `done_bytes` (and the
 rate, of bytes read) and raises `Cancelled` once cancelled or stopping; their `total_bytes` is `builder.tree_size`
 (measured first, cancellable between entries) or the archive's size. They hold no protection session (they fetch
@@ -1454,8 +1495,9 @@ at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job
 address, then `contact <nick>`, `trusted` or `untrusted` (`?` without the fields), the method, and last the
 display name quoted and escaped with `fsutil.printable_label`.
 Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
-`chunker` (and the same as query parameters on `/api/add/stream`); `POST /api/get` `raw`, `no_extract`; `GET /api/cat`
-`raw=1`, `block=1`; `GET /api/info` `from`.
+`chunker` (and the same as query parameters on `/api/add/stream`), and (0.2.0) `nomadnet` instead of `path`, with
+`name` and `identify`; `POST /api/get` `raw`, `no_extract`; `GET /api/cat` `raw=1`, `block=1`; `GET /api/info`
+`from`.
 
 ## Threads
 

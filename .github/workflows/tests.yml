@@ -45,7 +45,7 @@ jobs:
           RNFS_E2E: "1"
         run: >-
           python -m unittest tests.test_e2e tests.test_client tests.test_embedded tests.security.test_h1_real_rns
-          tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins
+          tests.security.test_m1_real_rns tests.security.test_h2_display_page_pins tests.test_nomadnet_e2e
         timeout-minutes: 20
       - name: Command works
         run: rnfs --version

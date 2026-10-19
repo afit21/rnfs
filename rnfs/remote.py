@@ -240,6 +240,10 @@ class _Backend:
         """POST /api/add."""
         return self.api.add_path(path, **options)
 
+    def add_nomadnet(self, link: str, **options) -> dict:
+        """POST /api/add with nomadnet."""
+        return self.api.add_nomadnet(link, **options)
+
     def add_stream(self, data, length: int | None, name: str | None, **options) -> dict:
         """POST /api/add/stream."""
         return self.api.add_stream(data, name=name, length=length, **options)
