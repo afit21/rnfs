@@ -30,7 +30,7 @@ import RNS
 
 from rnfs import fetcher, fsutil, interface
 from rnfs.apiclient import check_timeout
-from rnfs.config import Config
+from rnfs.config import RETIRED_SETTINGS, Config
 from rnfs.errors import RnfsError, Unsupported
 from rnfs.log import LOG_ERROR, LOG_WARNING, log
 from rnfs.node import RnfsNode, lock_rnfs_dir, make_private_root
@@ -69,7 +69,8 @@ class Node(interface.Rnfs):
         if reticulum is not None and reticulum is not RNS.Reticulum.get_instance():
             raise ValueError("reticulum must be this process's running RNS.Reticulum (RNS.Reticulum.get_instance())")
         settings = dict(settings or {})
-        unknown = settings.keys() - ({f.name for f in fields(Config)} - {"rnfs_dir"})
+        # A retired one is left out with a warning (Config.combine), as in rnfs.toml
+        unknown = settings.keys() - ({f.name for f in fields(Config)} - {"rnfs_dir"}) - RETIRED_SETTINGS.keys()
         if unknown:
             raise ValueError(f"unknown settings: {', '.join(sorted(unknown))}")
         rnfs_dir = os.fspath(rnfs_dir)

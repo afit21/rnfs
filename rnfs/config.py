@@ -136,6 +136,11 @@ DESCRIPTIONS = {
     "lxmf_auto_fetch_quota": "Storage the pins of one auto-fetch sender may use",
     "deny_lists": "Deny-list sources: <cid>[/path] or name/<name>[/path]",
 }
+# Settings earlier versions had and this one doesn't: name -> what took its place, for the warning. One left in
+# rnfs.toml (or given to an embedded node) is dropped with a warning instead of refused as unknown, so settings an
+# older version accepted still start the node. The settings API and `rnfs config set` know it no more than any other
+# name that isn't a setting (`rnfs config unset` removes it from rnfs.toml)
+RETIRED_SETTINGS: MappingProxyType = MappingProxyType({})
 _TYPE_NAMES = {int: "int", float: "float", bool: "bool", str: "string", list[str]: "list[string]"}
 MAX_TOML_INT = 2 ** 63 - 1  # TOML integers are 64-bit signed
 
@@ -149,10 +154,10 @@ def _is_number(value) -> bool:
 class Config:
     """Settings for an RnfsNode.
 
-    warnings: what Config.load changed to trust the settings, for the caller to show (a plain attribute, not a
-    field, so rnfs.toml can't set it). overrides and given_defaults: what Config.load was given over and under
-    rnfs.toml (the daemon's command line, an embedded node's settings and defaults), so the settings feature can
-    tell what a restart would run with.
+    warnings: what Config.load changed to trust the settings, and the retired settings it ignored, for the caller to
+    show (a plain attribute, not a field, so rnfs.toml can't set it). overrides and given_defaults: what Config.load
+    was given over and under rnfs.toml (the daemon's command line, an embedded node's settings and defaults), so the
+    settings feature can tell what a restart would run with.
     """
 
     # Unannotated, so not dataclass fields; Config.load sets them (never changed in place: a copy is shared)
@@ -404,6 +409,7 @@ class Config:
         path = settings_path(rnfs_dir)
         data, warnings = read_settings_file(path)
         config = cls.combine(rnfs_dir, parse_settings(data, path), defaults, overrides, path)
+        warnings.extend(config.warnings)  # the retired settings left out
         warnings.extend(config.check_reticulum_config())
         config.warnings = warnings
         return config
@@ -429,9 +435,16 @@ class Config:
                 path: str = SETTINGS_FILE) -> "Config":
         """The settings of rnfs_dir from rnfs.toml's values (file_values, as parse_settings gives them, read from
         path), over defaults and under overrides (None values ignored), validated as Config.load does, with
-        overrides and given_defaults recorded. Raises ValueError (TypeError for an override that isn't a field).
+        overrides and given_defaults recorded. Retired settings (RETIRED_SETTINGS) are left out, wherever they come
+        from, each with a warning in the result's warnings. Raises ValueError (TypeError for an override that isn't
+        a field).
         """
-        values: dict = dict(defaults or {})
+        # An embedded node's defaults are the app's, not the user's: left out without a word
+        retired = sorted((file_values.keys() | (overrides or {}).keys()) & RETIRED_SETTINGS.keys())
+        warnings = tuple(f"ignoring {name}{f' in {path}' if name in file_values else ''}: it is no longer a setting "
+                         f"({RETIRED_SETTINGS[name]}); remove it" for name in retired)
+        defaults, file_values, overrides = _current(defaults), _current(file_values), _current(overrides)
+        values: dict = dict(defaults)
         values.update(file_values)
         known = {f.name for f in fields(cls)}
         unknown = values.keys() - known
@@ -440,14 +453,20 @@ class Config:
         if "rnfs_dir" in values:
             # The file lives in the rnfs dir, so it can't move it; --dir does
             raise ValueError(f"rnfs_dir can't be set in {path}; use --dir")
-        given = {k: v for k, v in (overrides or {}).items() if v is not None}
+        given = {k: v for k, v in overrides.items() if v is not None}
         values.update(given)
         values["rnfs_dir"] = rnfs_dir
         config = cls(**values)
         config.validate()
         config.overrides = MappingProxyType(given)
-        config.given_defaults = MappingProxyType(dict(defaults or {}))
+        config.given_defaults = MappingProxyType(defaults)
+        config.warnings = warnings
         return config
+
+
+def _current(values: dict | None) -> dict:
+    """values (setting name -> value; None: none) without the retired settings."""
+    return {name: value for name, value in (values or {}).items() if name not in RETIRED_SETTINGS}
 
 
 def settings_path(rnfs_dir: str) -> str:

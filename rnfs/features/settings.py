@@ -61,8 +61,9 @@ class SettingsFeature(Feature):
         try:
             data, warnings = settings.read_settings_file(path)
             file_values = settings.parse_settings(data, path)
-            # What a restart would make of it, so a file it would refuse says so before the restart does
-            restart_config(config, file_values, path)
+            # What a restart would make of it, so a file it would refuse says so before the restart does (and one
+            # holding a retired setting is told so)
+            warnings = [*warnings, *restart_config(config, file_values, path).warnings]
         except (ValueError, TypeError, AttributeError, OSError) as e:  # OSError: PermissionError too (untrusted)
             file_error = str(e)
         entries = [settings_entry(entry, config, file_values) for entry in settings.settings_schema()]
@@ -106,6 +107,7 @@ class SettingsFeature(Feature):
                 raise ValueError(str(e)) from None
             except (TypeError, AttributeError) as e:  # a value of a type a check didn't expect
                 raise ValueError(f"invalid settings: {e}") from None
+            warnings = [*warnings, *candidate.warnings]  # retired settings the file still holds
             text = settings.edit_settings(data.decode("utf-8") if data is not None else "", changes)
             new_data = text.encode("utf-8")
             if settings.parse_settings(new_data, path) != values:  # not expected: edit_settings checks each step

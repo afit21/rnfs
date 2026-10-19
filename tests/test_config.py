@@ -2,10 +2,18 @@
 import os
 import tempfile
 import unittest
+from types import MappingProxyType
+from unittest import mock
 
+from rnfs import config as config_module
 from rnfs.config import DURATIONS, MAX_DURATION, OPTIONAL, Config
 
 ID = "ab" * 16
+
+
+def ignored(config: Config) -> list[str]:
+    """config's warnings about retired settings (left out), without those about the file's mode."""
+    return [warning for warning in config.warnings if warning.startswith("ignoring ")]
 
 
 class ValidateTest(unittest.TestCase):
@@ -128,6 +136,26 @@ class LoadTest(unittest.TestCase):
         config = self.load(f'private = true\nmembers = ["{ID}"]\nslow_bitrate = 50000\nstall_timeout = 90.5\n'
                            'max_storage = 1_000_000\n', api_port=9000)
         self.assertEqual((config.private, config.members, config.api_port), (True, [ID], 9000))
+        self.assertEqual(ignored(config), [])
+
+    def test_retired_settings_are_dropped_with_a_warning(self):
+        """A retired setting starts the node, wherever it is given, with a warning (an embedded node's defaults
+        excepted: those are the app's); an unknown one is still refused."""
+        path = os.path.join(self.dir, "rnfs.toml")
+        with mock.patch.object(config_module, "RETIRED_SETTINGS", MappingProxyType({"old_limit": "use new_limit"})):
+            config = self.load("old_limit = 5\nbeta = 4\n")
+            self.assertEqual(config.beta, 4)
+            self.assertFalse(hasattr(config, "old_limit"))
+            self.assertEqual(ignored(config), [f"ignoring old_limit in {path}: it is no longer a setting "
+                                               "(use new_limit); remove it"])
+            config = self.load("", old_limit=3)
+            self.assertEqual(ignored(config), ["ignoring old_limit: it is no longer a setting (use new_limit); "
+                                               "remove it"])
+            self.assertEqual(dict(config.overrides), {})
+            config = Config.load(self.dir, defaults={"old_limit": 1, "beta": 5})
+            self.assertEqual((config.beta, ignored(config), dict(config.given_defaults)), (5, [], {"beta": 5}))
+            with self.assertRaises(ValueError):
+                self.load("old_limit = 5\nnew_thing = 1\n")
 
 
 if __name__ == "__main__":

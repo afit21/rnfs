@@ -434,6 +434,23 @@ class ApiTest(SettingsBase):
         self.assertEqual(self.read(), "beta = 5\nalpha = 2\n")
         self.assertIsNone(self.call("GET", "/api/config")[1]["file_error"])
 
+    def test_retired_settings_are_ignored_with_a_warning(self):
+        """A retired setting in rnfs.toml is reported, never refused; it can't be set, only removed."""
+        with mock.patch.object(settings, "RETIRED_SETTINGS", MappingProxyType({"old_limit": "use new_limit"})):
+            self.write("old_limit = 5\n")
+            listing = self.call("GET", "/api/config")[1]
+            self.assertIsNone(listing["file_error"])
+            self.assertNotIn("old_limit", [entry["name"] for entry in listing["settings"]])
+            self.assertEqual([w for w in listing["warnings"] if "old_limit" in w],
+                             [f"ignoring old_limit in {self.toml}: it is no longer a setting (use new_limit); "
+                              "remove it"])
+            self.assertIn("unknown setting 'old_limit'", self.set({"old_limit": 6}, 400)["error"])
+            result = self.set({"beta": 5})
+            self.assertTrue(any("old_limit" in warning for warning in result["warnings"]))
+            self.assertEqual(self.read(), "old_limit = 5\nbeta = 5\n")
+            self.assertEqual(self.set({"old_limit": None})["warnings"], [])
+            self.assertEqual(self.read(), "beta = 5\n")
+
     def test_same_port_twice_is_refused(self):
         self.set({"api_port": self.b.config.gateway_port}, 400)
         self.assertFalse(os.path.exists(self.toml))
