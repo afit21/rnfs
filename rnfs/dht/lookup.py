@@ -81,6 +81,9 @@ class Lookup:
     - `on_useful(id)`: a node whose answer proved useful: it named a node closer to the key than itself that then
       answered (local scores, section 6). Called from the running thread, at most once per node per lookup.
 
+    After find_closest, candidates() gives every node it chose from and ask() sends one more /find about a nearby
+    key, so one lookup serves the keys of a region (sweep providing, rnfs.publisher).
+
     A Lookup may be run again (find_providers after every provider failed): each run re-queries the nodes,
     so /find replies give a fresh random half of providers, within the same deadline and unknown-ID budget.
     Runs of one Lookup must not overlap.
@@ -141,10 +144,66 @@ class Lookup:
         come after every other, so stores are sent to them only to make up k.
         """
         self._run(None, lambda: False)
-        candidates = [n for n in self._last_known
-                      if n in self._answered or (n not in self._last_queried and self.is_known(n))]
+        candidates = self.candidates()
+        return sorted(candidates, key=lambda n: (candidates[n], self._distance(n)))[:self.k]
+
+    def candidates(self) -> dict[bytes, bool]:
+        """Every node find_closest chooses from, after a run (and ask()), with whether it ranks last: True for an
+        unreliable node that hasn't answered. Sweep providing ranks them for other keys near this one.
+
+        The nodes the last run knew of that answered, or that it didn't query and whose identity is known; not
+        those that failed or were still not answering when it ended.
+        """
+        with self._lock:
+            answered = set(self._answered)
         doubtful = self._last_doubtful
-        return sorted(candidates, key=lambda n: (n in doubtful, self._distance(n)))[:self.k]
+        return {n: n in doubtful for n in list(self._last_known)
+                if n in answered or (n not in self._last_queried and self.is_known(n))}
+
+    def ask(self, node_id: bytes, key: bytes) -> list[bytes] | None:
+        """Send node_id one /find about key, a key near this lookup's (sweep providing asks about the far half of
+        a region), within the lookup's deadline; None if it didn't answer by then. Its answer or failure is counted
+        as a run's (on_answer, on_failure), and the nodes it names join the nodes candidates() gives: returned as
+        it named them (valid IDs, at most k), so the caller can tell whether it named k.
+
+        Call it only between runs. node_id must be usable (not this node, failed, excluded) and is charged to the
+        budget of unknown IDs as a run's queries are.
+        """
+        if self.deadline is None:
+            self.deadline = self.clock() + self.timeout
+        if not self._usable(node_id) or not self.allow_unknown(node_id):
+            return None
+        results: queue.Queue = queue.Queue()
+        self._last_queried.add(node_id)
+        self._send(node_id, results, key)
+        reply = None
+        while True:
+            wait = min(self.deadline - self.clock(), self.poll_interval)
+            if wait <= 0:
+                return None  # still out: its outcome is counted when it comes
+            try:
+                answered_id, reply = results.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if answered_id == node_id:
+                break
+        known = self._last_known
+        if reply is None:
+            with self._lock:
+                self._failed.add(node_id)
+            known.pop(node_id, None)
+            return None
+        with self._lock:
+            self._answered.add(node_id)
+        self._last_doubtful.discard(node_id)
+        known.setdefault(node_id, self._distance(node_id))
+        nodes = reply[1]
+        for new_id in nodes:
+            if new_id not in known and new_id not in self._last_queried and self._usable(new_id):
+                known[new_id] = self._distance(new_id)
+                if self.unreliable(new_id):
+                    self._last_doubtful.add(new_id)
+        return list(nodes)
 
     def find_providers(self, on_provider: NodeCallback, should_stop: Callable[[], bool] = lambda: False
                        ) -> list[bytes]:
@@ -391,19 +450,23 @@ class Lookup:
             log(f"lookup for {self.key.hex()}: the useful-answer callback for {_name(introducer)} raised {e!r}",
                 LOG_WARNING)
 
-    def _send(self, node_id: bytes, results: queue.Queue):
-        """Query node_id on a worker thread, which reports the outcome and queues it for the run."""
+    def _send(self, node_id: bytes, results: queue.Queue, key: bytes | None = None):
+        """Query node_id about key (the lookup's own by default) on a worker thread, which reports the outcome
+        and queues it for the run."""
+        key = self.key if key is None else key
+        about = "" if key == self.key else f" about {key.hex()}"
+
         def work():
             """Run the blocking query, report it, and hand the cleaned reply to the run."""
             started = self.clock()
             try:
-                reply = self._clean(self.query(node_id, self.key))
+                reply = self._clean(self.query(node_id, key))
             except Exception as e:  # noqa: BLE001 - one broken node must not abort the lookup
                 reply = None  # one broken node must not abort the lookup
-                self.report(f"lookup for {self.key.hex()}: asking {_name(node_id)} raised {e!r}")
+                self.report(f"lookup for {self.key.hex()}: asking {_name(node_id)}{about} raised {e!r}")
             else:
                 took = self.clock() - started
-                self.report(f"lookup for {self.key.hex()}: {_name(node_id)} " + (
+                self.report(f"lookup for {self.key.hex()}: {_name(node_id)}{about} " + (
                     f"failed after {took:.1f}s" if reply is None
                     else f"answered in {took:.1f}s: {len(reply[0])} providers, {len(reply[1])} nodes"))
             try:
