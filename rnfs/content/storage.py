@@ -279,7 +279,7 @@ class Storage:
         self._sizes: dict[Cid, int] = dict(self.blocks.scan())
         self._used = sum(self._sizes.values())
         self._pins: dict[Cid, set[str]] = {}
-        # When each pinned CID was first pinned by any source (Unix time; pin_times); one pinned before rnfs 0.1.7
+        # When each pinned CID was first pinned by any source (Unix time; pin_times); one pinned before rnfs 0.2.0
         # has none
         self._added: dict[Cid, float] = {}
         self._pinned: frozenset[Cid] | None = None  # pinned_cids(), built when asked; None again once pins change
@@ -553,7 +553,7 @@ class Storage:
             log(f"storage: a change listener failed: {e!r}", LOG_ERROR)
 
     def pin_added(self, cid: Cid) -> float | None:
-        """When cid was first pinned (Unix time; None if not pinned, or pinned before rnfs 0.1.7 recorded it)."""
+        """When cid was first pinned (Unix time; None if not pinned, or pinned before rnfs 0.2.0 recorded it)."""
         with self._lock:
             return self._added.get(cid) if cid in self._pins else None
 

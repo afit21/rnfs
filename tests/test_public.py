@@ -591,10 +591,10 @@ class PublicTests:
                 with self.rnfs.timeout(bad):
                     pass
 
-    # 0.1.7: pin details and labels, the cache, capabilities, events, the daemon, settings, streams
+    # 0.2.0: pin details and labels, the cache, capabilities, events, the daemon, settings, streams
 
     def test_pin_details_and_label(self):
-        """pins() gives 0.1.7's details; label_pin labels a pin, None clears it, and an unpinned CID is NotFound."""
+        """pins() gives 0.2.0's details; label_pin labels a pin, None clears it, and an unpinned CID is NotFound."""
         data = os.urandom(5000)
         cid = self.rnfs.add(data).cid
         pin, = self.rnfs.pins(cid)
@@ -982,7 +982,7 @@ class ClientTest(PublicTests, unittest.TestCase):
             self.assertGreaterEqual(time.monotonic() - started, remote.SHORT_POLL * 0.9)
 
     def test_old_daemon_has_no_events_or_capabilities(self):
-        """A daemon without the 0.1.7 endpoints: empty capabilities, and NoSuchEndpoint (a NotFound) from
+        """A daemon without the 0.2.0 endpoints: empty capabilities, and NoSuchEndpoint (a NotFound) from
         events.since and events.watch."""
         new = {"/api/events", "/api/capabilities"}
         without = {route: name for route, name in ApiHandler.ROUTES.items() if route[1] not in new}
@@ -1348,7 +1348,7 @@ class ObjectsTest(unittest.TestCase):
                       objects.Cached(cid, cid, ("a",), False, True, "file", 3, True), objects.Uncached(1, 2, 3),
                       objects.Event(3, "pin", 1.7e9, {"change": "added", "cids": [str(cid)]}),
                       objects.EventBatch((objects.Event(1, "job", 1.0, {"id": "x"}),), 1, False, "e"),
-                      objects.Capabilities("0.1.7", frozenset({"events"}), (("GET", "/api/events"),), ("lxmf",),
+                      objects.Capabilities("0.2.0", frozenset({"events"}), (("GET", "/api/events"),), ("lxmf",),
                                            ("pin",), ("not_found",)),
                       objects.Settings("/r/rnfs.toml", (objects.Setting("lxmf_accept_from", "lxmf", "list[string]",
                                                                         None, False, (), None, value=("a",)),),

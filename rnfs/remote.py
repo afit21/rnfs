@@ -475,7 +475,7 @@ class _Backend:
         return self.api.cache_rm(cid)
 
     def capabilities(self) -> dict:
-        """GET /api/capabilities ({} from a daemon before 0.1.7)."""
+        """GET /api/capabilities ({} from a daemon before 0.2.0)."""
         return self.api.capabilities()
 
     def shutdown(self, wait: float | None) -> bool:

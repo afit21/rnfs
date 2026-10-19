@@ -321,7 +321,7 @@ def human_rtt(seconds) -> str:
 
 def format_peers(peers: list[dict], now: float) -> list[str]:
     """The `rnfs peers` table, one line per node, escaped (the daemon's fields mustn't drive the terminal). RTT and
-    ONLINE come last, so the older columns keep their places; a daemon before 0.1.7 sends neither ("-")."""
+    ONLINE come last, so the older columns keep their places; a daemon before 0.2.0 sends neither ("-")."""
     lines = [f"{'NODE':<32} {'MODE':<7} {'TABLE':>6} {'HOPS':>4} {'INTERFACE':<20} {'RATE':>10} {'HEARD':>6} "
              f"{'SENT':>9} {'RECV':>9} {'FAIL':>5} {'RTT':>7} ONLINE"]
     for peer in peers:

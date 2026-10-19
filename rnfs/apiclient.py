@@ -15,13 +15,13 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   is made on the connection that then carries the request (the daemon keeps it open for that one request), for
   every request, so a client used for a long time sends nothing to a program listening on the port after the
   daemon stopped. A daemon that closes that connection gets nothing more (ConnectionFailed).
-- The port: a running daemon (0.1.7 on) writes `<rnfs dir>/daemon.json` (read_daemon_info: its PID, ports,
+- The port: a running daemon (0.2.0 on) writes `<rnfs dir>/daemon.json` (read_daemon_info: its PID, ports,
   version, start time and Reticulum config), which is read first, so a client finds the daemon whatever its
   rnfs.toml holds (an older client can't read a newer one's settings); without it (or with a stale one), the
   api_port in rnfs.toml. Nothing is trusted from it but the port, and the proof below still comes first.
 - That proof request is also where the daemon's version is read (Client.daemon_version), and check_daemon is the
   one place to refuse a daemon by it: one before 0.1.5 (OLDEST_DAEMON), which closes the connection it proved
-  itself on so the request could only go on a new one, is refused before the token is sent (until 0.1.7 the
+  itself on so the request could only go on a new one, is refused before the token is sent (until 0.2.0 the
   client did send it on a new connection).
 - Every failure raises an ApiError subclass whose message says what went wrong, as the CLI prints it: no daemon
   (DaemonNotRunning), the connection failing (ConnectionFailed), the token (TokenError), the proof or the token
@@ -30,7 +30,7 @@ Standard library only, and it never imports RNS, so a program using it starts qu
   StorageFull, other 5xx ServerError). ApiError is an rnfs.errors.RnfsError, and each status's error also a
   subclass of the node's own (NotFound of rnfs.errors.NotFound, BadRequest of ValueError, ...), so one except
   clause catches what rnfs.Node and rnfs.Client raise alike. Every ApiError has the daemon's machine-readable
-  code (rnfs.errors.CODES; None from a daemon before 0.1.7): a 404 for an endpoint the daemon doesn't have is
+  code (rnfs.errors.CODES; None from a daemon before 0.2.0): a 404 for an endpoint the daemon doesn't have is
   NoSuchEndpoint (also told from an older daemon's message), one for something it can't do Unsupported, both
   NotFound subclasses.
 - Each request opens its own connection (its proof, then the request), so an ApiConnection may be used from
@@ -70,13 +70,13 @@ PROOF_TIMEOUT = 15  # seconds to connect and prove (at most the client's timeout
 PROOF_READ_LIMIT = 64 * 1024  # the most read of a proof's response (the daemon's is a few dozen bytes)
 COPY_SIZE = 64 * 1024  # what a Stream reads at a time when iterated
 # The oldest daemon a client talks to: one before 0.1.5 closes the connection it proved itself on, so the request
-# could only go on a new connection, which another listener could take (clients before 0.1.7 sent it there)
+# could only go on a new connection, which another listener could take (clients before 0.2.0 sent it there)
 OLDEST_DAEMON = (0, 1, 5)
 
 
 class ApiError(errors.RnfsError):
     """An API call failed; str() says why. status is the HTTP status, or None if the daemon never answered; code
-    the daemon's machine-readable code (rnfs.errors.CODES), or None (no response, or a daemon before 0.1.7)."""
+    the daemon's machine-readable code (rnfs.errors.CODES), or None (no response, or a daemon before 0.2.0)."""
 
     def __init__(self, message: str, status: int | None = None, code: str | None = None):
         """An error with message, from a response with status (None: no response) and code."""
@@ -164,7 +164,7 @@ def _status_errors() -> dict[int, type[ApiError]]:
 STATUS_ERRORS = _status_errors()
 
 
-# A daemon before 0.1.7 sends no code; its 404 for an unknown endpoint says this
+# A daemon before 0.2.0 sends no code; its 404 for an unknown endpoint says this
 _NO_ENDPOINT_MESSAGE = "no such API endpoint"
 
 
@@ -671,7 +671,7 @@ class ApiConnection:
 
     def capabilities(self) -> dict:
         """What the daemon offers: {"version", "capabilities", "routes", "features", "event_kinds", "error_codes"};
-        from a daemon before 0.1.7, which has no such endpoint, {} (so every capability is absent)."""
+        from a daemon before 0.2.0, which has no such endpoint, {} (so every capability is absent)."""
         try:
             return self.get("/api/capabilities")
         except NoSuchEndpoint:
@@ -682,7 +682,7 @@ class ApiConnection:
         """The daemon's events after sequence after (of kinds, if given), as soon as there is one or after wait
         seconds (the API caps it): {"events", "next", "lost", "epoch"}. after None answers at once with the
         "next" to start from; pass the epoch given, so a restarted daemon answers "lost". NoSuchEndpoint from a
-        daemon before 0.1.7."""
+        daemon before 0.2.0."""
         return self.get("/api/events", after=after, kinds=",".join(kinds) if kinds else None, wait=wait or None,
                         epoch=epoch)
 
@@ -691,7 +691,7 @@ class ApiConnection:
         it has stopped: its API no longer answers and, when its daemon.json in this client's rnfs dir names this
         port, its process has ended (it saves its state and releases the rnfs dir's lock after its API stops, so
         a daemon started next can take it); True once it has, False if not within wait. Without wait, True once it
-        agreed. Unsupported from a daemon that can't be stopped this way, NoSuchEndpoint from one before 0.1.7."""
+        agreed. Unsupported from a daemon that can't be stopped this way, NoSuchEndpoint from one before 0.2.0."""
         running = self.daemon_info()
         pid = running["pid"] if running is not None and running["api_port"] == self.port else None
         self.post("/api/shutdown")
@@ -838,7 +838,7 @@ class ApiConnection:
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
         """Every pin (or cid's): [{"cid", "sources", "complete", "type", "sealed", "name", and from a daemon since
-        0.1.7 "label", "origin", "size", "entries", "added"}]."""
+        0.2.0 "label", "origin", "size", "entries", "added"}]."""
         return self.get("/api/pin/ls", cid=cid)["pins"]
 
     def pin_label(self, cid: str, label: str | None) -> dict:
@@ -932,7 +932,7 @@ class ApiConnection:
         """The daemon's settings: {"path" (its rnfs.toml), "settings": [each setting's schema entry with "value"
         (running), "file" (rnfs.toml's, None if it doesn't set it), "overridden" (by the daemon's command line,
         which wins), "pending" (a restart would change it)], "file_error" (why a restart would refuse rnfs.toml,
-        or None), "warnings"}. NoSuchEndpoint from a daemon before 0.1.7."""
+        or None), "warnings"}. NoSuchEndpoint from a daemon before 0.2.0."""
         return self.get("/api/config")
 
     def config_set(self, settings: dict) -> dict:

@@ -484,7 +484,7 @@ class Rnfs:
 
     def capabilities(self) -> Capabilities:
         """What the node offers: its version, capabilities (has("events"), ...), API routes, features loaded,
-        event kinds and error codes. A daemon before 0.1.7 can't say: an empty Capabilities, every has() False. A
+        event kinds and error codes. A daemon before 0.2.0 can't say: an empty Capabilities, every has() False. A
         Node's are a daemon's but "shutdown" and "daemon_json", which it can't do; its routes are the API's, whose
         operations it offers through its methods."""
         self._check()
@@ -494,14 +494,14 @@ class Rnfs:
         """Stop the daemon (a Client), as SIGTERM does; this Client stays usable once a daemon runs again. With
         wait, True once its API stops answering within wait seconds (False: still answering); without, True once
         it agreed. Raises Unsupported: from a Node (close() stops it), or a daemon that can't be stopped this way;
-        NoSuchEndpoint (a NotFound) from a daemon before 0.1.7."""
+        NoSuchEndpoint (a NotFound) from a daemon before 0.2.0."""
         self._check()
         return self._backend.shutdown(wait)
 
     def daemon_info(self) -> dict | None:
         """What the running daemon wrote about itself in its rnfs dir (daemon.json: "pid", "api_port",
         "gateway_port", "version", "started", "rnfs_dir", "reticulum_config", "shared_instance", "node_id"), or None:
-        none there (a daemon before 0.1.7), it can't be trusted or its process has ended; always None for a Node,
+        none there (a daemon before 0.2.0), it can't be trusted or its process has ended; always None for a Node,
         which is no daemon. Read from the file, not asked of the daemon."""
         self._check()
         return self._backend.daemon_info()
@@ -509,7 +509,7 @@ class Rnfs:
     def config(self) -> Settings:
         """The node's settings: each with its schema, running value, rnfs.toml's, and whether the command line (a
         Node's settings) overrides it or a restart would change it; rnfs.toml's path and why a restart would refuse
-        it, if it would. Raises NotFound without the settings feature (a daemon before 0.1.7: NoSuchEndpoint)."""
+        it, if it would. Raises NotFound without the settings feature (a daemon before 0.2.0: NoSuchEndpoint)."""
         self._check()
         return Settings.from_dict(self._backend.config())
 
@@ -1514,7 +1514,7 @@ def _whole(value, name: str, none: bool = False) -> int | None:
 class Events:
     """What changes on a node (Rnfs.events; rnfs/events.py; design.md, "Events"): jobs, pins, the cache, the LXMF
     boxes, names and peers, each an Event, so an app follows them instead of polling every list. A Node hears its
-    own as they are published; a Client long-polls GET /api/events. A daemon before 0.1.7 has no events:
+    own as they are published; a Client long-polls GET /api/events. A daemon before 0.2.0 has no events:
     NoSuchEndpoint (a NotFound)."""
 
     def __init__(self, owner: Rnfs):

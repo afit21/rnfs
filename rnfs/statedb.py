@@ -144,7 +144,7 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         " height INTEGER NOT NULL, digest BLOB, PRIMARY KEY (name, state)) WITHOUT ROWID",
     )),
     ("pin_details", (
-        # When each pinned CID was first pinned (Unix time; rnfs 0.1.7), by any source; a pin made by an earlier
+        # When each pinned CID was first pinned (Unix time; rnfs 0.2.0), by any source; a pin made by an earlier
         # version has no row. A table of its own: the released tables stay exactly as 0.1.5 made them
         "CREATE TABLE pin_times (cid BLOB PRIMARY KEY, added REAL NOT NULL) WITHOUT ROWID",
         # A label the user gave a pin (pin label), kept apart from where it was added from (pin_names); dump()ed

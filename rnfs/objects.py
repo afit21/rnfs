@@ -167,10 +167,10 @@ class Stat(_Object):
 @dataclass(frozen=True)
 class Pin(_Object):
     """A pin: its CID, sources ("user", "folder", "name:<alias>", ...), whether complete, its type and whether a
-    sealed file (None when its stored blocks can't tell), and a local name for it if one is known. From 0.1.7 (None
+    sealed file (None when its stored blocks can't tell), and a local name for it if one is known. From 0.2.0 (None
     from an older daemon, or where not known): the label its user gave it (label_pin), where it was added from on
     this machine (origin), its content size (once its root block is stored), a directory's entry count, and when
-    it was first pinned (Unix time; None for a pin made before 0.1.7)."""
+    it was first pinned (Unix time; None for a pin made before 0.2.0)."""
 
     cid: Cid = _field(_cid)
     sources: tuple[str, ...] = _field(tuple, ())
@@ -280,7 +280,7 @@ class Peer(_Object):
     routing table and for how many seconds (seniority; senior once past provider_seniority), the path's hops,
     interface and bitrate, whether a link is open and its rate estimate (bits/s), when it was last heard and last
     active (Unix times), whether banned, the traffic counted since the node started (bytes sent and received,
-    requests made, answered, refused, failed, and bad blocks), and from 0.1.7 when it was first heard, the
+    requests made, answered, refused, failed, and bad blocks), and from 0.2.0 when it was first heard, the
     round-trip seconds of the last link to it (rtt, measured at rtt_at) and whether it is online now (None from a
     daemon that predates them)."""
 
@@ -563,7 +563,7 @@ def _routes(values) -> tuple[tuple[str, str], ...]:
 class Capabilities(_Object):
     """What the node offers (capabilities()): its version, its capabilities (api.CAPABILITIES: "events",
     "pin_label", "config", ...), the API routes ((method, path)), the features loaded, the event kinds and the
-    error codes. Empty from a daemon before 0.1.7, which can't say: every has() is False."""
+    error codes. Empty from a daemon before 0.2.0, which can't say: every has() is False."""
 
     version: str | None = None
     capabilities: frozenset[str] = _field(frozenset, frozenset())

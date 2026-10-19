@@ -1643,17 +1643,17 @@ class RnfsNode:
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
         """Pins with their sources, whether they're complete, their type, whether they're sealed files, a local
-        name when one is known, and (rnfs 0.1.7) their label, origin, size, entry count and when added.
+        name when one is known, and (rnfs 0.2.0) their label, origin, size, entry count and when added.
 
         origin is where the pin was added from on this machine (pin_names) or the shared-folder entry it came
-        from; label the name its user gave it (pin_label), kept apart from origin. name, as before 0.1.7, is the
+        from; label the name its user gave it (pin_label), kept apart from origin. name, as before 0.2.0, is the
         label, else the origin, else for a stored directory its single entry's name (add --wrap) or its entry
         count as text. For a sealed file origin is still the local path or the name given to add (this node's own
         record, for its user): `sealed` tells callers that show pins to others not to show the name or the content.
         `sealed` is None when it can't be told without fetching (the root or the file's first chunk isn't stored).
         size is the content size the root block states (None until it is stored), entries a directory's entry
         count (None for a file, or while a large directory's index isn't all stored), added when it was first
-        pinned (None for a pin made before rnfs 0.1.7).
+        pinned (None for a pin made before rnfs 0.2.0).
         """
         pins = self.storage.pins()
         self.pin_names.prune(set(pins))
@@ -1728,7 +1728,7 @@ class RnfsNode:
     def _pin_shape(self, cid: Cid, count: bool = True) -> "_PinDetails":
         """The _PinDetails of a pin whose root block is stored, but sealed (None): its type ("file" or
         "directory"), for a directory its one entry's name or "(directory: N entries)" (inside; a large
-        directory's index root, "(directory)" as before 0.1.7) and, if count, its entry count, and its content
+        directory's index root, "(directory)" as before 0.2.0) and, if count, its entry count, and its content
         size. All None if the root isn't stored (or isn't a valid DAG node)."""
         unknown = _PinDetails(None, None, None, None, None)
         if cid.is_raw:  # a raw block is its own content: its size is known without reading it

@@ -438,7 +438,7 @@ class _Backend:
         from rnfs.features import lxmf
         return lxmf._feature(self).sync(nearest)
 
-    # Streams (rnfs 0.1.7)
+    # Streams (rnfs 0.2.0)
 
     def add_tar(self, data, name: str | None, pin: bool, only_hash: bool, chunker: str | None) -> dict:
         """RnfsNode.add_tar of bytes or a binary file."""
@@ -471,7 +471,7 @@ class _Backend:
         """RnfsNode.import_stream of bytes or a binary file."""
         return self.node.import_stream(io.BytesIO(data) if isinstance(data, bytes) else data)
 
-    # Pins, the cache, the node (rnfs 0.1.7)
+    # Pins, the cache, the node (rnfs 0.2.0)
 
     def pin_label(self, cid: str, label: str | None) -> dict:
         """RnfsNode.pin_label."""

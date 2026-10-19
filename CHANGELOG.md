@@ -2,7 +2,7 @@
 
 [specification.md](specification.md) is the authority on behaviour.
 
-## 0.1.7 (unreleased)
+## 0.2.0 (unreleased)
 
 The local API and the library for companion apps. No wire-format or CID changes: these nodes, 0.1.6, 0.1.5, 0.1.4
 and 0.1.3 nodes work together. The local API stays compatible: every route, field and status of 0.1.6 is
@@ -11,7 +11,7 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 Upgrade notes:
 - **State:** the state database gains two tables (`pin_times`, `pin_labels`); an older rnfs can't open it
   afterwards. Pins made before the upgrade have no `added` time.
-- **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.1.7 on read the API port from
+- **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
   assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
@@ -87,7 +87,7 @@ Added, for apps:
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
-  0.1.7): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.
+  0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.
 - `POST /api/import` (and `rnfs import`) refuse anything but a regular file, without waiting on a FIFO.
 - `Config.validate` refuses `api_port` equal to a non-zero `gateway_port`.
 - A request that times out raises `ConnectionFailed` saying the daemon "didn't answer within its timeout".
@@ -211,7 +211,7 @@ Security:
   and at most 64 KiB of the proof response is read.
 - After the proof, the client sends the request on a new connection only to a daemon that proved a version below
   0.1.5 (those close every connection); a newer daemon that closes the proved connection gets
-  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.1.7.
+  `ConnectionFailed`, and nothing is sent. The fallback for 0.1.4 daemons goes in 0.2.0.
 - A followed name can no longer fill the follower's disk: its new target is fetched only if its size, and the
   bytes of its DAG's blocks, fit in `follow_quota` (default 1 GiB); otherwise the check fails, the follow's state
   says why, and the previous target stays pinned. While one target replaces another both are held, so a followed

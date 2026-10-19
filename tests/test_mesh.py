@@ -840,7 +840,7 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertEqual((p3["first_heard"], p3["online"]), (None, True))  # an open link, nothing counted
         self.assertEqual((p4["first_heard"], p4["rtt"], p4["rtt_at"], p4["online"]),
                          (50000.0, 0.4, 50000.0, False))  # its link closed longer than ONLINE_WINDOW ago
-        # Every field before 0.1.7 is still there
+        # Every field before 0.2.0 is still there
         self.assertEqual(set(p1), {"node_id", "mode", "in_table", "seniority", "senior", "hops", "interface",
                                    "bitrate", "link", "rate", "last_heard", "last_active", "banned", "sent",
                                    "received", "requests", "answered", "refused", "failed", "bad",
@@ -947,7 +947,7 @@ class PeersFeatureTest(unittest.TestCase):
         self.assertTrue(header.startswith("NODE"))
         self.assertTrue(header.endswith("FAIL     RTT ONLINE"), header)
         self.assertEqual([line.split()[-2:] for line in lines], [["85ms", "yes"], ["-", "yes"]])
-        # A daemon before 0.1.7 sends neither field
+        # A daemon before 0.2.0 sends neither field
         old = {key: value for key, value in listed[P3.hex()].items() if key not in ("rtt", "rtt_at", "online")}
         self.assertEqual(peers_feature.format_peers([old], 0)[1].split()[-2:], ["-", "-"])
         self.assertEqual(peers_feature.human_rtt(2.43), "2.4s")

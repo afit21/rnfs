@@ -762,7 +762,7 @@ class EndpointTest(ApiTestCase):
             with mock.patch.object(self.node, "stat", side_effect=error), mock.patch("rnfs.api.log"):
                 code, headers, data = self.call("GET", f"/api/stat?target={file_cid}")
             self.assertEqual(code, status, error)
-            # The message, and since 0.1.7 the machine-readable code of its status
+            # The message, and since 0.2.0 the machine-readable code of its status
             self.assertEqual(json.loads(data), {"error": str(error), "code": errors.STATUS_CODES[status]})
             self.assertEqual(headers["Content-Type"], "application/json")
             if status == 503:
@@ -983,7 +983,7 @@ class ConnectionTest(ApiTestCase):
 
 
 class AppSupportTest(ApiTestCase):
-    """What 0.1.7 added for apps: error codes, the capability list, events, shutdown, pin labels and the cache."""
+    """What 0.2.0 added for apps: error codes, the capability list, events, shutdown, pin labels and the cache."""
 
     def error(self, method, path, body=None, **kwargs) -> tuple[int, dict]:
         """(status, JSON body) of a request that must fail."""

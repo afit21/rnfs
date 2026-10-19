@@ -1,4 +1,4 @@
-"""Tests for rnfs 0.1.7's pin details and the cache (rnfs/node.py pin_ls, pin_label, cache_ls, cache_rm;
+"""Tests for rnfs 0.2.0's pin details and the cache (rnfs/node.py pin_ls, pin_label, cache_ls, cache_rm;
 rnfs/pin_names.py labels; rnfs/content/storage.py pin times, uncache and its listeners), on offline nodes, and the
 "pin" and "cache" events they publish (rnfs/events.py)."""
 import io
@@ -16,7 +16,7 @@ from tests.test_node import A_ID, NodeTest
 
 
 class PinDetailsTest(NodeTest):
-    """pin_ls's fields of 0.1.7: label, origin, size, entries and added."""
+    """pin_ls's fields of 0.2.0: label, origin, size, entries and added."""
 
     def test_file_and_directory_fields(self):
         """A file has its size and no entries; a directory its entry count; the origin is where it came from."""
@@ -34,7 +34,7 @@ class PinDetailsTest(NodeTest):
 
     def test_large_directory_counts_its_index(self):
         """A directory past MAX_CHILDREN entries (an index node at its root) still gets its entry count; its name
-        stays "(directory)", as before 0.1.7."""
+        stays "(directory)", as before 0.2.0."""
         root = os.path.join(self.tmp.name, "many")
         os.makedirs(root)
         for n in range(11):

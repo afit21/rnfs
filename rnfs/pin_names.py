@@ -8,7 +8,7 @@ database's pin_names table (rnfs.statedb): each change is one row written at onc
 (synchronous=NORMAL): the pin it names was committed durably before it, so a power loss can lose at most the
 latest names, never a pin, and an add costs one durable commit rather than two.
 
-A label (`rnfs pin label`, POST /api/pin/label; rnfs 0.1.7) is the name the user chose for a pin, kept apart from
+A label (`rnfs pin label`, POST /api/pin/label; rnfs 0.2.0) is the name the user chose for a pin, kept apart from
 where it was added from, which stays as recorded: the pin_labels table, each change written at once and durably
 (the user asked for it). Names are pruned with the pins they name; a label goes as its CID stops being pinned
 (forget_label, from the node's pin listener), and at start for one a stop left behind (prune_labels).

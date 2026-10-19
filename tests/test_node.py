@@ -172,7 +172,7 @@ class LocalFacadeTest(NodeTest):
                          self.big[70000:71000])
         self.assertTrue(self.a.is_local(cid))
         self.assertFalse(self.a.is_local(str(Cid.for_block(RAW, b"elsewhere"))))
-        # The fields of 0.1.7 too: no label yet, the origin as the name, the size and entries from the root block
+        # The fields of 0.2.0 too: no label yet, the origin as the name, the size and entries from the root block
         listed = self.a.pin_ls()
         self.assertLessEqual(abs(listed[0].pop("added") - time.time()), 60)
         origin = os.path.abspath(os.path.join(self.tmp.name, "tree"))

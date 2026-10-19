@@ -181,8 +181,8 @@ class DaemonFileTest(unittest.TestCase):
         setting); the port given still wins."""
         with open(os.path.join(self.tmp, "rnfs.toml"), "w", encoding="utf-8") as f:
             f.write("a_setting_from_the_future = 1\n")
-        self.write({"pid": os.getpid(), "api_port": 9555, "version": "0.1.7"})
-        self.assertEqual(apiclient.read_daemon_info(self.tmp)["version"], "0.1.7")
+        self.write({"pid": os.getpid(), "api_port": 9555, "version": "0.2.0"})
+        self.assertEqual(apiclient.read_daemon_info(self.tmp)["version"], "0.2.0")
         self.assertEqual(ApiConnection(self.tmp).port, 9555)
         self.assertEqual(ApiConnection(self.tmp, port=1).port, 1)
         self.assertEqual(ApiConnection(self.tmp).daemon_info()["api_port"], 9555)
@@ -266,7 +266,7 @@ class DaemonFileTest(unittest.TestCase):
 
 
 class AppSupportTest(ClientTestCase):
-    """The client side of what 0.1.7 added for apps: error codes, capabilities, events and shutdown."""
+    """The client side of what 0.2.0 added for apps: error codes, capabilities, events and shutdown."""
 
     def test_error_codes(self):
         """An error carries the daemon's code; an unknown endpoint is NoSuchEndpoint (a NotFound), as is an older
@@ -589,7 +589,7 @@ class ProofTest(ClientTestCase):
 
     def test_daemon_before_0_1_5_is_refused(self):
         """A daemon before 0.1.5 (which closes the proof's connection) is refused before the token is sent: since
-        0.1.7 the request no longer goes on a new connection."""
+        0.2.0 the request no longer goes on a new connection."""
         seen = self.tokens_seen()
         with mock.patch.object(self.server.server.RequestHandlerClass, "PROOF_ROUTE", None), \
                 mock.patch("rnfs.api.__version__", "0.1.4"):

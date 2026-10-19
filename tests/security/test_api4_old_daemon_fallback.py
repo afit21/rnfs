@@ -3,7 +3,7 @@ token) on a new connection. It did that for any daemon that closed it, which kep
 daemon could stop between the proof and the new connection, and a program taking the port then got the token.
 
 From 0.1.5 to 0.1.6 the client reconnected only for a daemon whose proved version was below 0.1.5; any other daemon
-that closed the proof's connection got ConnectionFailed. Since 0.1.7 that fallback is gone: a daemon proved older
+that closed the proof's connection got ConnectionFailed. Since 0.2.0 that fallback is gone: a daemon proved older
 than 0.1.5 is refused before the token is sent (check_daemon), and every daemon that closes the proof's connection
 gets nothing more.
 """
@@ -50,7 +50,7 @@ class OldDaemonFallbackTest(unittest.TestCase):
             self.assertEqual(listener.tokens(), [None], version)  # only the proof request: no token sent
 
     def test_older_daemon_is_refused_before_the_token(self):
-        # 0.1.7: a pre-0.1.5 daemon is refused, saying why, and gets neither the token nor a second connection
+        # 0.2.0: a pre-0.1.5 daemon is refused, saying why, and gets neither the token nor a second connection
         for version in ("0.1.4", "0.1.0", "0.1.4.post1", "0.0.9"):
             listener = FakeListener(self, closing_daemon(version))
             api = ApiConnection(self.tmp, port=listener.port)

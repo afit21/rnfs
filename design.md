@@ -385,7 +385,7 @@ chooses neither the error nor its text; it reads at most `PROOF_READ_LIMIT` (64 
 take at most `PROOF_TIMEOUT` (15 s, or the client's timeout if shorter), after which the request gets the client's
 own timeout. A daemon that closes the proved connection gets nothing more (`ConnectionFailed`): a new connection could reach
 another listener. A daemon proved older than 0.1.5 (`OLDEST_DAEMON`; such daemons close every connection) is
-refused by `check_daemon` before the token is sent; until 0.1.7 the client sent it the request on a new connection. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
+refused by `check_daemon` before the token is sent; until 0.2.0 the client sent it the request on a new connection. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
 failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
 `Stream` reads a body, raising
 `ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
@@ -522,7 +522,7 @@ files as subresources but can't read any gateway response with `fetch()`; an ear
 would let any site's sandboxed frame read the gateway. A separate origin per root (a subdomain per CID) is the
 possible future way to let pages read their own DAG.
 
-## Local API for apps (0.1.7)
+## Local API for apps (0.2.0)
 
 What a companion app needs from the daemon beyond the facade calls (specification section 11, "For apps").
 
@@ -539,7 +539,7 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   exception's own `code` (`errors.Unsupported`: a 404 `unsupported`, for something this daemon can't do).
   `ApiHandler.respond_error` sends `{"error", "code"}`; `ApiRequestError` carries its code. The client
   (`apiclient.error_for`) keeps the code on every `ApiError` (`.code`) and raises `NoSuchEndpoint` for
-  `no_such_endpoint` (or, from a daemon before 0.1.7, a 404 whose message starts "no such API endpoint") and
+  `no_such_endpoint` (or, from a daemon before 0.2.0, a 404 whose message starts "no such API endpoint") and
   `Unsupported` for `unsupported`, both `NotFound` subclasses, so existing `except NotFound` clauses still hold.
   `http.server`'s own error pages (a malformed request line) have no code.
 - **Capabilities.** `GET /api/capabilities`: `api.CAPABILITIES` (what a route list can't say: `events`,
@@ -698,11 +698,11 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Entry` | `name`, `kind` ("file", "executable", "directory"), `size`, `cid` | the name |
 | `Info` | `cid`, `type` ("file", "directory"), `size`, `executable`, `sealed`, `recipient`, `stored_size`, `name` | — |
 | `Stat` | `cid`, `size`, `blocks`, `local_blocks`, `local_bytes` | — |
-| `Pin` | `cid`, `sources: tuple[str]`, `complete`, `type`, `sealed`, `name`, and (0.1.7; None from an older daemon) `label`, `origin`, `size`, `entries`, `added` | the CID |
+| `Pin` | `cid`, `sources: tuple[str]`, `complete`, `type`, `sealed`, `name`, and (0.2.0; None from an older daemon) `label`, `origin`, `size`, `entries`, `added` | the CID |
 | `Cached` / `Uncached` | `cid`, `root`, `path: tuple[str]`, `pinned`, `complete`, `type`, `size`, `provided` / `removed_records`, `removed_blocks`, `freed_bytes` | the CID / — |
 | `Event` | `seq`, `kind` (`EVENT_KINDS`, or "lost": `lost` True), `time`, `fields: dict` (the kind's own; merged back by `to_dict`) | — |
 | `EventBatch` | `events: tuple[Event]`, `next`, `lost`, `epoch` | — |
-| `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`; empty from a daemon before 0.1.7 | — |
+| `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`; empty from a daemon before 0.2.0 | — |
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
@@ -710,7 +710,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
-| `Peer` | `node_id`, `mode`, `in_table`, `seniority`, `senior`, `hops`, `interface`, `bitrate`, `link`, `rate`, `last_heard`, `last_active`, `banned`, `sent`, `received`, `requests`, `answered`, `refused`, `failed`, `bad`, and (None from a daemon before 0.1.7) `first_heard`, `rtt`, `rtt_at`, `online` | node ID hex |
+| `Peer` | `node_id`, `mode`, `in_table`, `seniority`, `senior`, `hops`, `interface`, `bitrate`, `link`, `rate`, `last_heard`, `last_active`, `banned`, `sent`, `received`, `requests`, `answered`, `refused`, `failed`, `bad`, and (None from a daemon before 0.2.0) `first_heard`, `rtt`, `rtt_at`, `online` | node ID hex |
 | `Stats` | `since`, `totals: dict`, `refused: dict`, `interfaces: dict`, `upload_budget`, `upload_budget_left` | — |
 | `Contact` | `nick`, `kind` ("name", "node", "lxmf"), `id: bytes` | the nick |
 | `Kept` | `name: bytes`, `reasons: tuple[str]` ("user", "follow", "own"), `sequence`, `cid`, `emitted` (the record held, or None) | name hex |
@@ -880,7 +880,7 @@ It stays the protocol layer: `Client` was renamed `ApiConnection` (unreleased; t
 `tests/test_apiclient.py` changed mechanically), keeping `request`, `call`, `get`, `post`, `Stream`, the token,
 proof and version check, and its dict-returning methods, which become `rnfs.Client`'s backend. Its errors are
 re-based as above. Its module docstring and README point apps to `rnfs.Client`. The CLI's output can't change:
-it calls the same methods with the same parameters. It gained `name_watch` and `cat(from_node=)`, and in 0.1.7
+it calls the same methods with the same parameters. It gained `name_watch` and `cat(from_node=)`, and in 0.2.0
 the feature methods `rnfs.Client` uses (`peers`, `stats`, `contacts`, `contact_get`/`_add`/`_rm`,
 `name_keep`/`_unkeep`/`_kept`/`_follow`/`_unfollow`/`_following`, `lxmf_address`/`_send`/`_inbox`/`_inbox_get`/
 `_inbox_rm`/`_outbox`/`_sync`) and per-call timeouts (`timeout=`, `using_timeout`, `effective_timeout`).
@@ -1309,13 +1309,13 @@ runs while a lock is held:
 `<rnfs dir>/state/rnfs.db` (rnfs/statedb.py), one table set per store; "FULL" commits are on disk when the
 change returns, "NORMAL" ones are batched saves a power loss may lose the last of:
 - storage: `pins` (one row per source; each pin and release FULL, after the blocks are synced), `pin_times`
-  (0.1.7: when each pinned CID was first pinned by any source, written in the same transaction as the pin that
+  (0.2.0: when each pinned CID was first pinned by any source, written in the same transaction as the pin that
   made it pinned and the release that ended it; pins of earlier versions have none, and a row whose pin is gone
   is deleted at start; a table of its own so the released `pins` stays as 0.1.5 made it) and `cache` (cached
   fetches, LRU order in `used`, at most 10 000; NORMAL every 30 s and at stop, changed records only);
 - `pin_names` (rnfs/pin_names.py: where each pin was added from, local only, pruned to the pin list; NORMAL,
   each change written at once, after the pin it names was committed FULL: a power loss can lose a name, never the
-  pin, and an add costs one durable commit, not two) and `pin_labels` (0.1.7: the label its user gave a pin,
+  pin, and an add costs one durable commit, not two) and `pin_labels` (0.2.0: the label its user gave a pin,
   apart from where it came from; FULL, each change written at once; pruned with the names);
 - node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
   pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
