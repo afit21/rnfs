@@ -31,7 +31,7 @@ from rnfs.publisher import KEY_MIN_INTERVAL, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUP
 from tests.support import FakeClock
 from tests.test_names import FakeNetwork
 from tests.test_names_keep import KeeperNet
-from tests.test_publisher import FakeClient, FakeLookup
+from tests.test_publisher import FakeClient, FakeLookup, near
 
 A_ID, B_ID = bytes([0xA] * 16), bytes([0xB] * 16)
 N1, N2 = bytes([1]) * 16, bytes([2]) * 16
@@ -172,8 +172,9 @@ class FollowBackoffTest(NodeTestCase):
 class KeyCadenceTest(unittest.TestCase):
     """DS-M1: kept names' keys are republished at most every 3 days, desynchronised, and paced on slow nodes."""
 
-    def make_publisher(self, keys: set[bytes], slow: bool = False, **settings) -> Publisher:
-        """A publisher providing only keys, with fake network and clock."""
+    def make_publisher(self, keys: set[bytes], slow: bool = False, regions: bool = False, **settings) -> Publisher:
+        """A publisher providing only keys, with fake network and clock; with regions, each key's lookup finds
+        servers that make it a region of its own (sweep providing), else every lookup finds N1 and N2."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         from rnfs.content.storage import Storage
@@ -183,7 +184,8 @@ class KeyCadenceTest(unittest.TestCase):
         self.clock = FakeClock(1_000_000.0)
         self.client = FakeClient()
         publisher = Publisher(bytes(16), config, storage, ProviderStore(None), self.client,
-                              lambda key: FakeLookup([N1, N2]), slow_node=slow, clock=self.clock)
+                              lambda key: FakeLookup(near(key) if regions else [N1, N2]), slow_node=slow,
+                              clock=self.clock)
         publisher.add_key_source(lambda: set(keys))
         publisher.refresh()
         return publisher
@@ -221,8 +223,10 @@ class KeyCadenceTest(unittest.TestCase):
         self.assertEqual(publisher.publish_due()["published"], [DhtKey(key)])
 
     def test_slow_node_paces_lookups(self):
+        """At most SLOW_ROUND_LOOKUPS region lookups a round (each key a region here), and SLOW_LOOKUP_PACE per
+        lookup before the next round."""
         keys = {os.urandom(16) for _ in range(25)}
-        publisher = self.make_publisher(keys, slow=True)
+        publisher = self.make_publisher(keys, slow=True, regions=True)
         self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
         self.assertEqual(publisher.publish_due()["published"], [])
         self.assertGreaterEqual(publisher.next_due(), SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS - 1)

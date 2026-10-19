@@ -705,9 +705,26 @@ recently heard first (about 12 MB of memory when full), so a flood of new identi
 silent longer than every one of them; announces are recorded in memory and written together every 30 s.
 
 **Publishing.**
-- For each key, find the `K` closest nodes. Then send each node the keys it should store, in as few `/provide`
-  requests as the batch size allows (section 3), one at a time over a separate identified link closed
-  afterwards.
+- For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node
+  the keys it should store, in as few `/provide` requests as the batch size allows (section 3), one at a time
+  over a separate identified link closed afterwards.
+- **Sweep providing** finds the `K` closest of many keys with one lookup per *region*. It is local behaviour:
+  only which `/find` queries a publisher sends changes, and how it groups its `/provide`s. Take the due keys in
+  turn; for the first not yet covered, x, run the closest-nodes lookup. Let p be the length of the prefix x shares
+  with the farthest of the `K` closest found (of all found with fewer; 0 with none): the region is every due key
+  sharing x's first p bits. Every server closer to x than that one shares those bits, so a region holds at least
+  `K` servers and each of its keys has its `K` closest inside it. The lookup knows the half of the region holding
+  x; if the region holds 2 or more due keys, ask the known server nearest the centre of the other half about that
+  centre (`/find`), and while a reply names `K` servers inside the part asked about, ask about each half of it
+  too. Each key of the region then takes the `K` closest of every server learned, ranked as the lookup ranks them.
+  rnfs sends at most 7 such `/find` a region, and a server outside the part it was asked about hands over to the
+  one it names nearest the centre inside it (its routing table may hold only some of the part). Over a simulated
+  network of 2000 servers (Kademlia routing tables), this placed every record on its true `K` closest, against
+  about 97% for a lookup per key, for about 1.6 extra `/find` a region; a round needs about servers ÷ 12.5 lookups
+  however many keys are due (1M keys on 10,000 servers: about 800 lookups instead of 1M). rnfs takes the due keys
+  never published first, then those unpublished longest, and on nodes that aren't slow runs up to 4 lookups at
+  once, each claiming the keys sharing one bit fewer than the last region's p so that lookups running together
+  seldom find the same region.
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
   refused or failed store isn't retried until the next republish. A responder may have recorded some keys of
@@ -723,8 +740,9 @@ silent longer than every one of them; announces are recorded in memory and writt
   is providing to that node in the same round, and cancels the withdrawals still queued for a key when it
   provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
-  (rnfs: at most 10 per publish round, and after a round of n lookups the next waits 30 × n s; items never
-  published go first, then those unpublished longest). Withdrawals are not delayed by this.
+  (rnfs: at most 10 region lookups per publish round, each publishing every due key of its region, and after a
+  round of n lookups the next waits 30 × n s; items never published go first, then those unpublished longest).
+  Withdrawals are not delayed by this.
 
 **Provider records.**
 - `/provide` records the identified requester's node ID as a provider; a node can only advertise itself.

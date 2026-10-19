@@ -8,7 +8,7 @@ from unittest import mock
 
 from rnfs import publisher as publisher_module
 from rnfs.config import Config
-from rnfs.constants import PROVIDER_TTL
+from rnfs.constants import K, PROVIDER_TTL
 from rnfs.content import builder
 from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
@@ -27,15 +27,31 @@ setUpModule, tearDownModule = quiet_log()
 
 
 class FakeLookup:
-    """find_closest returns fixed nodes."""
+    """find_closest returns fixed nodes, the only ones it knows; no /find a sweep adds is answered."""
 
     def __init__(self, nodes):
         """A lookup answering nodes."""
         self.nodes = nodes
+        self.asked: list[tuple[bytes, bytes]] = []
 
     def find_closest(self):
         """The fixed nodes."""
         return list(self.nodes)
+
+    def candidates(self):
+        """The fixed nodes, none unreliable."""
+        return {node: False for node in self.nodes}
+
+    def ask(self, node_id, key):
+        """No answer (noted)."""
+        self.asked.append((node_id, key))
+        return None
+
+
+def near(key: bytes, count: int = K) -> list[bytes]:
+    """count server IDs sharing key's first 15 bytes: a lookup finding them makes key a region of its own (sweep
+    providing), as random keys share far fewer bits."""
+    return [key[:15] + bytes([(key[15] + 1 + i) % 256]) for i in range(count)]
 
 
 class Running:
@@ -596,21 +612,26 @@ class PublisherTest(unittest.TestCase):
 
     def test_lookups_run_at_once(self):
         """A round's lookups run PUBLISH_LOOKUPS at once, on threads of their own, so a round of many keys whose
-        lookups take time finishes in a fraction of the time one at a time takes (the peak count shows it)."""
+        lookups take time finishes in a fraction of the time one at a time takes (the peak count shows it). Each key
+        is a region of its own here (its K closest share 120 bits with it); the first lookup runs alone, as the
+        regions' size isn't known before it."""
         self.due_keys(20)
+        self.nodes_of = lambda key: near(key) + [N1, N2]
         self.lookup_delay = lambda key: 0.1  # 2 s one at a time
         result = self.publisher.publish_due()
         self.assertEqual(len(result["published"]), 20)
+        self.assertEqual(result["lookups"], 20)
         self.assertEqual(self.running.peak, PUBLISH_LOOKUPS)
         self.assertEqual(self.running.threads, {"rnfs-publish-lookup"})
-        self.assertEqual(len(self.client.calls), 2)  # still one /provide per node, every key in it
-        self.assertTrue(all(len(keys) == 20 for _, keys, _ in self.client.calls))
+        shared = [keys for node_id, keys, _ in self.client.calls if node_id in (N1, N2)]
+        self.assertEqual(len(shared), 2)  # still one /provide per node, every key in it
+        self.assertTrue(all(len(keys) == 20 for keys in shared))
 
     def test_lookups_at_once_send_what_one_at_a_time_sends(self):
         """Lookups finishing in any order, each finding its own nodes: every node gets the same /provide
         requests, keys and withdrawals in the same order, as when the lookups run one at a time."""
         cids = self.due_keys(20)
-        self.nodes_of = lambda key: [node for i, node in enumerate((N1, N2, N3)) if key[i] % 2] or [N1]
+        self.nodes_of = lambda key: near(key) + ([node for i, node in enumerate((N1, N2, N3)) if key[i] % 2] or [N1])
         self.lookup_delay = lambda key: 0.005 + key[3] % 5 / 200  # 5-25 ms, so they finish out of order
         gone = bytes([7]) * 16
         rounds = []
@@ -636,6 +657,7 @@ class PublisherTest(unittest.TestCase):
         publisher = self.make_publisher(slow=True)
         self.due_keys(20)
         publisher.refresh()
+        self.nodes_of = lambda key: near(key) + [N1, N2]  # each key a region of its own
         self.lookup_delay = lambda key: 0.01
         self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
         self.assertEqual(self.running.peak, 1)
@@ -649,6 +671,7 @@ class PublisherTest(unittest.TestCase):
         """should_stop is checked before each lookup starts: those started finish and are published, in due
         order, and the rest stay due."""
         self.due_keys(20)
+        self.nodes_of = lambda key: near(key) + [N1, N2]  # each key a region of its own
         self.lookup_delay = lambda key: 0.02
         # Only the lookup threads are told to stop, so the round still sends what was looked up
         result = self.publisher.publish_due(
@@ -658,8 +681,9 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(self.running.finished, len(self.lookups))
         self.assertEqual({cid.key for cid in result["published"]}, set(self.lookups))
         self.assertEqual(sorted(result["published"], key=lambda cid: cid.key), result["published"])
-        for _, keys, _ in self.client.calls:
-            self.assertEqual(keys, [cid.key for cid in result["published"]])
+        for node_id, keys, _ in self.client.calls:
+            if node_id in (N1, N2):
+                self.assertEqual(keys, [cid.key for cid in result["published"]])
         self.assertEqual(self.publisher.next_due(), 0)  # the others are still due
 
     def test_failed_lookup_ends_the_round_once_the_others_finish(self):
