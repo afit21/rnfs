@@ -181,11 +181,14 @@ class PublisherCase(unittest.TestCase):
         self.lookup_delay = None  # or key -> seconds its lookup takes (counted in self.running)
         self.running = Running()
         self.fetched_changes = 0  # what the node's fetched-targets change count would be (generation)
+        self.known_servers = 0  # the routing table's size the publisher is told
         self.publisher = self.make_publisher()
 
-    def make_publisher(self, slow: bool = False, state: str | None = None, generation: bool = False) -> Publisher:
+    def make_publisher(self, slow: bool = False, state: str | None = None, generation: bool = False,
+                       bitrate: float | None = None) -> Publisher:
         """A publisher sharing this test's state directory (or on state), closed when the test ends; with
-        generation, one as the node makes it: storage.changes() and fetched_changes."""
+        generation, one as the node makes it: storage.changes() and fetched_changes. bitrate: its slowest
+        interface's; self.known_servers: its routing table's size."""
         def make_lookup(key):
             """Remember the key; find self.nodes_of(key), after self.lookup_delay(key) seconds if set."""
             self.lookups.append(key)
@@ -197,7 +200,7 @@ class PublisherCase(unittest.TestCase):
                               state or self.state, cached_eligible=lambda: self.eligible, clock=self.clock,
                               retry_interval=30,
                               generation=(lambda: (self.storage.changes(), self.fetched_changes)) if generation
-                              else None)
+                              else None, bitrate=bitrate, known_servers=lambda: self.known_servers)
         self.addCleanup(publisher.close)
         return publisher
 

@@ -39,6 +39,9 @@ Upgrade notes:
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
 - **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
+- **Files and folders inside pins are provided** (`provide_entries`, below, on by default): after the upgrade a node
+  that isn't slow also publishes the CID of every file and folder inside its complete pins, up to 100,000, so its
+  first rounds publish more keys. Set `provide_entries = false` to keep 0.1.6's behaviour.
 
 Deprecated:
 - **LXMF** (`send`, `inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `/api/lxmf/` routes, the library's `lxmf`
@@ -324,6 +327,19 @@ The DHT (local behaviour: nothing on the wire changes):
   node sends withdrawals along with its round's stores to the same servers, and each server only withdrawals
   reach counts as one of the round's 10 lookups (up to 5 kept for them while any are queued), so the round waits
   30 s for it before the next. Other nodes still send withdrawals at once.
+- **Files and folders inside pins are provided** (new setting `provide_entries`; an entry is an ordinary provider
+  record of its CID): every file and directory a directory entry names inside a complete pin, at every depth, can
+  be found by its own CID rather than only as `<root>/<path>`, and the same file in two folders from either. Not
+  chunks or other intermediate nodes, and never inside cached downloads, which provide only their root; serving is
+  unchanged (an entry's blocks are its pin's). Unset (the default), it is on up to 100,000 entry keys: pins
+  oldest first, each pin's entries all or none, a pin that would pass the cap left out (logged). On a slow node
+  it is on only while republishing every key is estimated to take at most 2% of the channel (from the slowest
+  interface's bitrate, the keys, and the network size the publish rounds' regions show: about 1,300 keys at 100
+  servers and 40 from 1,000 at 1 kbit/s), and none are provided past that; once on, they stay on up to 2.5%.
+  `true` or `false` overrides the default; it applies at once when changed through the API. Unpinning a folder
+  withdraws its entries, except those still inside another pin. `rnfs status` (and `GET /api/status`,
+  `Status`) gains `provided_entries`, `provide_entries_off` (why none are provided) and `provide_entries_capped`;
+  `provided` counts entries too. Providing entries tells anyone looking up a file's CID that the node has it.
 - Kept names' keys take their fixed ±10% republish jitter from the key's first byte rather than the whole key: 256
   slots still spread them out, and keys sharing their leading bits (the same servers are closest to them) come due
   together. A key's interval may change once, by at most a fifth, at the upgrade; it stays below 3.5 days.

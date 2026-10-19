@@ -742,6 +742,13 @@ class Storage:
         with self._lock:
             return self._added.get(cid) if cid in self._pins else None
 
+    def pin_order(self, cids) -> list[Cid]:
+        """cids (pinned CIDs) oldest pin first: by when each was first pinned, those pinned before rnfs 0.2.0
+        recorded it (and any not pinned) first, then by CID, so the order is the same at every call."""
+        with self._lock:
+            added = self._added
+            return sorted(cids, key=lambda cid: (added.get(cid, 0.0) if cid in self._pins else 0.0, cid.binary))
+
     def pins(self) -> dict[Cid, set[str]]:
         """Every pin and its sources (a copy)."""
         with self._lock:

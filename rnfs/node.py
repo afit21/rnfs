@@ -531,7 +531,8 @@ class RnfsNode:
         self.server = self.announcer = self.announce_handler = None  # made below; stop() skips those not made
         try:
             self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
-                                 names_network=None, is_known=_rns_is_known)
+                                 names_network=None, is_known=_rns_is_known,
+                                 bitrate=rates.slowest_bitrate(self.reticulum))
         except BaseException:
             if embedded:
                 self._release_destination()  # the host's Reticulum runs on: a later node registers it again
@@ -572,15 +573,17 @@ class RnfsNode:
                     or self.publisher.provided_keys() or self.names.list())
 
     @classmethod
-    def offline(cls, config: Config, node_id: bytes, client, names_network, slow: bool = False) -> "RnfsNode":
-        """A node without Reticulum, for tests: client and names_network stand in for the network.
+    def offline(cls, config: Config, node_id: bytes, client, names_network, slow: bool = False,
+                bitrate: float | None = None) -> "RnfsNode":
+        """A node without Reticulum, for tests: client and names_network stand in for the network (bitrate: its
+        slowest interface's, as Reticulum would say).
 
         No background thread runs; tests call publisher.publish_due(), maintain() etc. themselves.
         """
         node = cls.__new__(cls)
         node.reticulum = node.links = node.server = node.announcer = node.announce_handler = None
         node.embedded = False
-        node._setup_or_close(config, node_id, client, slow, names_network=names_network,
+        node._setup_or_close(config, node_id, client, slow, names_network=names_network, bitrate=bitrate,
                              is_known=lambda node_id: True)
         node.joined.set()
         return node
@@ -594,8 +597,9 @@ class RnfsNode:
             self._close_state()
             raise
 
-    def _setup(self, config: Config, node_id: bytes, client, slow: bool, names_network, is_known):
-        """Everything that doesn't need Reticulum itself."""
+    def _setup(self, config: Config, node_id: bytes, client, slow: bool, names_network, is_known,
+               bitrate: float | None = None):
+        """Everything that doesn't need Reticulum itself. bitrate: the slowest interface's (bits/s), or None."""
         self.config = config
         self.node_id = node_id
         self.client = client
@@ -678,7 +682,8 @@ class RnfsNode:
         # Saved by its own refreshes and publish loop
         self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client, self._lookup,
                                                    slow, config.state_dir, cached_eligible=self._eligible_targets,
-                                                   generation=self._provide_generation), batched=False)
+                                                   generation=self._provide_generation, bitrate=bitrate,
+                                                   known_servers=self.routing.node_count), batched=False)
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)
         self.publisher.add_store_part(self._senior_servers)
         # Saves its state itself, and at stop (names.stop)
@@ -2606,7 +2611,8 @@ class RnfsNode:
                 "dht_mode": self.config.dht_mode, "slow": self.slow,
                 "private": self.config.private, "known_nodes": self.routing.node_count(),
                 "records": self.records.record_count(), "pins": self.storage.pin_count(),
-                "provided": len(self.publisher.provided()), "blocks": self.storage.block_count(),
+                "provided": len(self.publisher.provided()), **self.publisher.entries_status(),
+                "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}

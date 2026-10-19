@@ -35,7 +35,7 @@ from rnfs.content import builder
 from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore, shard_of
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
-from tests.support import FakeClock, state_rows
+from tests.support import FakeClock, pinned_entries, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 from tests.test_statedb import RELEASED_0_1_5_STEPS
@@ -195,7 +195,8 @@ class UpgradeTest(FixtureCase):
 
     def test_provider_standing_is_built(self):
         """Each publisher with records gets a standing counting them; this node's records are in their own tier,
-        and the one publisher 0.1.5 saw refreshing a record for days is Earned."""
+        and the one publisher 0.1.5 saw refreshing a record for days is Earned. The node also records itself for
+        each entry it provides since 0.2.0 (provide_entries) that 0.1.5 didn't provide."""
         node = self.start()
         records = node.records
         publishers = {row(values)[1] for values in EXPECTED["tables"]["provider_records"]}
@@ -203,7 +204,10 @@ class UpgradeTest(FixtureCase):
         self.assertEqual(tiers.pop(NODE_ID), "own")
         self.assertEqual(tiers.pop(bytes.fromhex("30" + "00" * 15)), "earned")
         self.assertEqual(set(tiers.values()), {"newcomer"})
-        self.assertEqual(records.record_count(), len(EXPECTED["tables"]["provider_records"]))
+        own = {row(values)[0] for values in EXPECTED["tables"]["provider_records"] if row(values)[1] == NODE_ID}
+        new = {cid.key for cid in pinned_entries(node.storage)} - own
+        self.assertTrue(new)
+        self.assertEqual(records.record_count(), len(EXPECTED["tables"]["provider_records"]) + len(new))
         records._check_consistency()
 
     def test_lxmf_pins_become_app_pins(self):

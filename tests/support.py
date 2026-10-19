@@ -115,3 +115,33 @@ def failing_commits(error: str = "disk I/O error"):
     """Within the with block, every state database commit fails as a full or failing disk makes it fail."""
     with mock.patch.object(statedb._Database, "_commit", side_effect=sqlite3.OperationalError(error)):
         yield
+
+
+def pinned_entries(storage) -> set:
+    """The CIDs a directory entry names, at any depth, inside each complete pin of storage: what provide_entries
+    provides by default on a node that isn't slow, below its cap (spec section 6), worked out here by walking every
+    path rather than as the publisher does, so a test can check the publisher against it."""
+    from rnfs.content import walker
+    from rnfs.content.dag import KIND_DIRECTORY
+    from rnfs.errors import InvalidDag, NotFound
+    get = storage.getter()
+    found = set()
+    for root in storage.pins():
+        try:
+            storage.dag_blocks(root)  # only complete pins
+            entries = []
+            stack = [walker.root_expect(root)]
+            while stack:
+                expect = stack.pop()
+                try:
+                    listed = list(walker.directory_entries(expect, get))
+                except ValueError:  # a file
+                    continue
+                for entry, child in listed:
+                    entries.append(entry.cid)
+                    if entry.kind == KIND_DIRECTORY:
+                        stack.append(child)
+        except (NotFound, InvalidDag):
+            continue
+        found.update(entries)
+    return found

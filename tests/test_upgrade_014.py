@@ -33,7 +33,7 @@ from rnfs.content.cid import Cid
 from rnfs.content.storage import upgraded_source
 from rnfs.features import lxmf
 from rnfs.node import RnfsNode
-from tests.support import FakeClock, state_rows
+from tests.support import FakeClock, pinned_entries, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
 
@@ -231,23 +231,32 @@ class UpgradeTest(unittest.TestCase):
                           for item, nodes in publisher._earlier.items() if nodes}, expected["earlier"])
         self.assertEqual({n.hex(): sorted(k.hex() for k in keys) for n, keys in publisher._withdrawals.items()
                           if keys}, expected["withdraw"])
-        # What 0.1.4 provided is still provided: every published CID and key
+        # What 0.1.4 provided is still provided: every published CID and key; and since 0.2.0 (provide_entries, on
+        # by default) the files and folders inside its complete pins too, not published yet
+        entries = pinned_entries(node.storage) - {Cid.parse(text) for text in expected["published"]
+                                                   if not text.startswith("key:")}
+        self.assertTrue(entries)
+        self.assertEqual(publisher.provided_entries(), entries)
         self.assertEqual({str(c) for c in publisher.provided()} | {"key:" + k.hex() for k in publisher.provided_keys()},
-                         set(expected["published"]))
+                         set(expected["published"]) | {str(c) for c in entries})
 
     def check_providers(self, node: RnfsNode):
         """Every publisher's first-seen time and every record, those of 0.1.4's newcomer pool included (no longer
         pooled), each publisher with a standing built from them; the node's own records are stored again at start
-        (last stored now), in their own tier. The departed and evicted publishers 0.1.4 remembered are not imported:
-        0.2.0 keeps no such memories (spec section 6)."""
+        (last stored now), in their own tier, with one for each entry it provides since 0.2.0 (provide_entries). The
+        departed and evicted publishers 0.1.4 remembered are not imported: 0.2.0 keeps no such memories (spec section
+        6)."""
         expected = fixture("providers.json")
         records = node.records
         with records._lock:
             held, standings = records._merged()
         self.assertEqual({p.hex(): standing.first_seen for p, standing in standings.items()}, expected["publishers"])
         own = NODE_ID.hex()
+        records_expected = {(k, p): [first, NOW if p == own else last] for k, p, first, last, _ in expected["records"]}
+        entries = {(cid.key.hex(), own): [NOW, NOW] for cid in pinned_entries(node.storage)}
+        self.assertTrue(set(entries) - set(records_expected))
         self.assertEqual({(k.hex(), p.hex()): [first, last] for (k, p), (first, last) in held.items()},
-                         {(k, p): [first, NOW if p == own else last] for k, p, first, last, _ in expected["records"]})
+                         entries | records_expected)
         self.assertTrue(any(pooled for *_, pooled in expected["records"]))
         self.assertTrue(expected["departed"] and expected["evicted"])
         self.assertEqual(state_rows(self.state, "SELECT * FROM provider_departed UNION ALL"

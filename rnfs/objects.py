@@ -218,7 +218,10 @@ class Status(_Object):
     known_nodes: int | None = None
     records: int | None = None
     pins: int | None = None
-    provided: int | None = None
+    provided: int | None = None  # CIDs provided, entries included
+    provided_entries: int | None = None  # of those, the files and folders inside pins (provide_entries; rnfs 0.2.0)
+    provide_entries_off: str | None = None  # why no entries are provided, or None
+    provide_entries_capped: int | None = None  # pins whose entries were left out at the cap
     blocks: int | None = None
     used_bytes: int | None = None
     max_storage: int | None = None

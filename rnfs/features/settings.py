@@ -214,6 +214,12 @@ def _airtime(feature: SettingsFeature, value):
     airtime.quiet = mesh.parse_quiet_hours(config.quiet_hours)
 
 
+def _provide_entries(feature: SettingsFeature, value):
+    """What is provided, chosen again with the new setting (the publisher reads it at each refresh, and a refresh
+    whose setting changed computes): entries provided or withdrawn now rather than at the next pin."""
+    feature.node.publisher.refresh()
+
+
 def _keep_max_names(feature: SettingsFeature, value: int):
     """The keeper store's cap. Names kept beyond a lower one stay kept, as at a start; only new ones are refused."""
     keepers = feature.dependency("keepers")
@@ -245,6 +251,7 @@ LIVE = {
     "max_upload_rate": None,  # RequestServer, at each /blocks response (effective_max_upload_rate)
     "remote_pin_quota": None,  # RnfsNode, at each remote pin
     "scan_interval": None,  # the maintenance pass
+    "provide_entries": _provide_entries,  # Publisher._choose_entries, at each refresh
     "max_jobs": _max_jobs,  # JobsFeature.max_jobs, at each scheduling
     "max_finished_jobs": None,  # JobsFeature._cap_finished, when a job finishes
     "serve_interfaces": _airtime,

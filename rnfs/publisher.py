@@ -5,7 +5,14 @@
   Only these CIDs' DAGs are served to /blocks (section 7). A CID whose DAG holds a block the deny list (the
   storage's) denies is never provided: a change to the list takes effect at the next refresh(). A refresh
   recomputes this only when something it is computed from changed (the node's generation(), the deny list,
-  the key sources' keys, the strategy), so the many refreshes that change nothing cost almost nothing.
+  the key sources' keys, the strategy, provide_entries and, on slow nodes, the network size it is judged by), so
+  the many refreshes that change nothing cost almost nothing.
+- **Entries** (provide_entries): also every CID a directory entry names inside a complete pin (its files and
+  directories at every depth, not chunks, file nodes or index nodes), so each can be found by its own CID. Never
+  those of cached downloads. Unset, it is on up to MAX_ENTRY_KEYS entry keys, pins taken oldest first and each
+  pin's entries all or none; on a slow node only while republishing every key is estimated to take at most
+  ENTRY_AIRTIME_ON of the channel (republish_airtime), and otherwise none at all. An entry's DAG is inside its
+  pin's, so the served set doesn't change.
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. The due
   CIDs' K closest nodes are found by sweep providing (rnfs.dht.sweep): one lookup per region of due keys,
   PUBLISH_LOOKUPS at once (one at a time on slow nodes). Each key is stored on its store set: its K closest, and
@@ -42,12 +49,13 @@ from typing import Callable
 
 from rnfs import statedb
 from rnfs.config import Config
-from rnfs.constants import DAY, HOUR, ID_LENGTH, PROVIDER_TTL
+from rnfs.constants import DAY, HOUR, ID_LENGTH, K, PROVIDER_TTL
+from rnfs.content import dag, walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
-from rnfs.dht.sweep import Region, Sweep, find_region
+from rnfs.dht.sweep import ID_BITS, Region, Sweep, find_region
 from rnfs.errors import InvalidDag, NotFound
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural
+from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 
 RETRY_INTERVAL = 30.0  # seconds before retrying a CID whose lookup found no nodes to publish to
 MAX_WAIT = 60.0  # the loop wakes at least this often
@@ -77,6 +85,32 @@ PUBLISH_LOOKUPS = 4
 # round for 1M keys at about 1.1 h with sweep providing and 16 at once (83 h with a lookup per key, one server at a
 # time). The airtime controls apply to /blocks only (spec section 3). Slow nodes send one at a time
 PROVIDE_PARALLEL = 16
+
+# provide_entries (spec section 6). Each entry key costs about 165 bytes a republish round (16 bytes to each of K
+# servers, and request overhead) and multiplies a node's keys 3-5x for folders of a few files, over 100x for large
+# ones: past this many, the entries of the newest pins are left out (a 70k-file folder fits, at ~11.6 MB a day)
+MAX_ENTRY_KEYS = 100_000
+# Slow nodes provide entries by default only while republishing every key is estimated (republish_airtime) to take
+# at most ENTRY_AIRTIME_ON of the channel over a republish interval; once on, they stay on up to ENTRY_AIRTIME_OFF,
+# so a network size estimate wavering around the line doesn't withdraw and provide every entry again and again
+ENTRY_AIRTIME_ON = 0.02
+ENTRY_AIRTIME_OFF = 0.025
+# Republish airtime at REFERENCE_BITRATE, from the load and topology studies (0.2.0-progress.md, finding 5): a key's
+# K stores perfectly batched take KEY_AIRTIME, and a store set holds STORES_PER_KEY servers (its K closest and about
+# 2 senior ones); a region's lookup (2 disjoint paths, its extra /find) takes REGION_AIRTIME, the slow end of 34-44 s;
+# each server contacted costs LINK_AIRTIME for its identified link. A round needs a region lookup per
+# SERVERS_PER_REGION servers at most
+REFERENCE_BITRATE = 1000.0
+KEY_AIRTIME = 2.63
+STORES_PER_KEY = K + 2
+REGION_AIRTIME = 44.0
+LINK_AIRTIME = 6.4
+SERVERS_PER_REGION = 12.5
+# The network size assumed before any region lookup has given an estimate (a lower bound: the servers known). Past
+# about 500 servers the estimate no longer changes (every key is a region of its own), so this is the cautious end
+UNKNOWN_NETWORK = 1000
+REGION_SMOOTHING = 16  # the network size estimate follows region sizes as a running mean over about this many
+META_STORE = "publisher"  # its meta values: "region_bits" (that mean), "entries_on" (the last decision)
 
 
 def _in_order(items: list, work: Callable, should_stop: Callable[[], bool], parallel: int):
@@ -198,6 +232,31 @@ def key_interval(key: bytes, base: float) -> float:
     return min(jittered, max(interval, PROVIDER_TTL / 2 - HOUR))
 
 
+def republish_airtime(keys: int, servers: int, bitrate: float | None = None) -> float:
+    """Seconds of channel airtime a round republishing keys keys to a network of servers servers takes, from a
+    node whose slowest interface runs at bitrate bits/s (None: REFERENCE_BITRATE).
+
+    keys × KEY_AIRTIME × STORES_PER_KEY / K for the stores, a REGION_AIRTIME lookup for each region (one per key,
+    up to one per SERVERS_PER_REGION servers: sweep providing) and LINK_AIRTIME for each server contacted (at most
+    STORES_PER_KEY per key, at most every server), all scaled by REFERENCE_BITRATE / bitrate."""
+    if keys <= 0:
+        return 0.0
+    servers = max(1, servers)
+    regions = min(keys, math.ceil(servers / SERVERS_PER_REGION))
+    contacted = min(servers, keys * STORES_PER_KEY)
+    seconds = keys * KEY_AIRTIME * STORES_PER_KEY / K + regions * REGION_AIRTIME + contacted * LINK_AIRTIME
+    return seconds * REFERENCE_BITRATE / (bitrate if bitrate else REFERENCE_BITRATE)
+
+
+def network_size(region_bits: float | None, known: int) -> int:
+    """The network size republish_airtime is given: from region_bits (the running mean of the prefix length regions
+    shared with their K-th closest server, so about K × 2^(bits + 0.5) servers), at least known (the servers known);
+    UNKNOWN_NETWORK at least while there is no estimate."""
+    if region_bits is None:
+        return max(known, UNKNOWN_NETWORK)
+    return max(known, round(K * 2 ** (region_bits + 0.5)))
+
+
 def _parse_item(text: str) -> ProvidedItem:
     """A provided item as str() writes it (the published tables' item). Raises ValueError."""
     return DhtKey.parse(text) if isinstance(text, str) and text.startswith(KEY_PREFIX) else Cid.parse(text)
@@ -209,6 +268,11 @@ def _item(text) -> ProvidedItem:
     if isinstance(item, DhtKey) and len(item.key) != ID_LENGTH:
         raise ValueError(f"not a provided key: {text!r}")
     return item
+
+
+def _is_number(value) -> bool:
+    """True if value is a finite int or float (not a bool)."""
+    return type(value) in (int, float) and math.isfinite(value)
 
 
 def _time(number) -> float:
@@ -275,13 +339,13 @@ def import_published(value: dict, tx) -> int:
     return sum(len(table) for table in rows)
 
 
-_ITEM, _NODE = "item", "node"  # the two kinds of key _PublishState writes
+_ITEM, _NODE, _META = "item", "node", "meta"  # the kinds of key _PublishState writes
 
 
 class _PublishState(statedb.RowStore):
-    """The publisher's three tables, saved together (not durably: NORMAL) in one transaction. A key is (_ITEM,
-    item), whose published row and published_earlier rows are written again, or (_NODE, node ID), whose
-    withdrawals rows are."""
+    """The publisher's three tables and its meta values, saved together (not durably: NORMAL) in one transaction. A
+    key is (_ITEM, item), whose published row and published_earlier rows are written again, (_NODE, node ID), whose
+    withdrawals rows are, or (_META, name), the meta value name (META_STORE)."""
 
     def __init__(self, db: statedb.StateDb, publisher: "Publisher"):
         """The saves of publisher's state, whose lock guards it."""
@@ -289,7 +353,8 @@ class _PublishState(statedb.RowStore):
         self.publisher = publisher
 
     def snapshot(self, keys) -> tuple:
-        """The rows of keys (lock held): (item texts, published rows, earlier rows, node IDs, withdrawal rows)."""
+        """The rows of keys (lock held): (item texts, published rows, earlier rows, node IDs, withdrawal rows, meta
+        values)."""
         publisher = self.publisher
         items = [key for kind, key in keys if kind == _ITEM]
         nodes = [key for kind, key in keys if kind == _NODE]
@@ -298,11 +363,17 @@ class _PublishState(statedb.RowStore):
                      for item in items if item in publisher._published]
         earlier = [(texts[item], node, at) for item in items for node, at in publisher._earlier.get(item, {}).items()]
         withdrawals = [(node, key) for node in nodes for key in publisher._withdrawals.get(node, ())]
-        return list(texts.values()), published, earlier, nodes, withdrawals
+        meta = [(name, publisher._meta_value(name)) for kind, name in keys if kind == _META]
+        return list(texts.values()), published, earlier, nodes, withdrawals, meta
 
     def write_rows(self, tx, snapshot: tuple):
-        """Replace the rows of the snapshot's items and nodes inside transaction tx."""
-        texts, published, earlier, nodes, withdrawals = snapshot
+        """Replace the rows of the snapshot's items and nodes, and its meta values, inside transaction tx."""
+        texts, published, earlier, nodes, withdrawals, meta = snapshot
+        for name, value in meta:
+            if value is None:
+                tx.execute("DELETE FROM meta WHERE store = ? AND key = ?", (META_STORE, name))
+            else:
+                statedb.set_meta(tx, META_STORE, name, value)
         tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in texts])
         tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in texts])
         tx.executemany("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", published)
@@ -317,13 +388,16 @@ class Publisher:
     def __init__(self, own_id: bytes, config: Config, storage: Storage, providers, client,
                  make_lookup: Callable[[bytes], object], slow_node: bool = False, state_dir: str | None = None,
                  cached_eligible: Callable[[], set[Cid]] = set, clock: Callable[[], float] = time.time,
-                 retry_interval: float = RETRY_INTERVAL, generation: Callable[[], object] | None = None):
+                 retry_interval: float = RETRY_INTERVAL, generation: Callable[[], object] | None = None,
+                 bitrate: float | None = None, known_servers: Callable[[], int] = lambda: 0):
         """Publisher for own_id. providers is the ProviderStore (to record ourselves), client the PeerClient.
 
         make_lookup(key) returns a dht.lookup.Lookup; cached_eligible() returns the cached targets the
         roots strategy may provide. generation(), if given, returns a value that changes whenever storage's pins,
         cached targets or blocks, or cached_eligible(), may have: refresh() skips its recompute while it, the deny
-        list and the key sources' keys are as at the last one (without it, every refresh recomputes).
+        list and the key sources' keys are as at the last one (without it, every refresh recomputes). bitrate (the
+        slowest interface's, bits/s; None if unknown) and known_servers() (the routing table's size, a lower bound
+        of the network's) decide whether a slow node provides entries by default (republish_airtime).
         """
         self.own_id = own_id
         self.config = config
@@ -336,6 +410,8 @@ class Publisher:
         self.clock = clock
         self.retry_interval = retry_interval
         self.generation = generation
+        self.bitrate = bitrate
+        self.known_servers = known_servers
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._provided: frozenset[ProvidedItem] = frozenset()
@@ -348,7 +424,19 @@ class Publisher:
         # CID -> (deny list's CID set, dag_blocks object, whether one of them is denied), so each DAG is checked
         # against the deny list once per change of either
         self._denied_dags: dict[Cid, tuple[frozenset[bytes], frozenset[Cid], bool]] = {}
-        # (generation(), deny list's CID set, keys, strategy) of the last full refresh; None: the next computes
+        # provide_entries: the entries provided that aren't provided as roots too; each complete pin's entries
+        # (_walk_entries, kept while it is a complete pin: a CID's content never changes); and what the last
+        # choice of entries was made from and gave: (pinned_cids() then, the complete pins, entries chosen, pins left
+        # out at MAX_ENTRY_KEYS), so a refresh that changed no pin chooses nothing again
+        self._entries: frozenset[Cid] = frozenset()
+        self._entries_of: dict[Cid, frozenset[Cid]] = {}
+        self._entries_from: tuple = (None, frozenset(), frozenset(), ())
+        self._entries_off: str | None = None  # why entries aren't provided (the setting, or a slow node's airtime)
+        self._estimated_off = False  # whether the slow-node estimate is why (logged when that changes)
+        self._entries_on = False  # whether the last computing refresh provided entries (persisted, as "entries_on")
+        self._region_bits_mean: float | None = None  # the network size estimate (network_size), persisted
+        # (generation(), deny list's CID set, keys, strategy, what entries depend on) of the last full refresh;
+        # None: the next computes
         self._inputs: tuple | None = None
         self._published: dict[ProvidedItem, tuple[float, list[bytes]]] = {}  # item -> (when, nodes that recorded it)
         # Other nodes that may still hold our record of an item (earlier rounds' closest nodes, or a round cut
@@ -446,6 +534,10 @@ class Publisher:
                 self._touch_node(node)
                 continue
             self._withdrawals.setdefault(node, set()).add(key)
+        bits = db.meta(META_STORE, "region_bits")
+        if _is_number(bits) and 0 <= bits <= ID_BITS:
+            self._region_bits_mean = float(bits)
+        self._entries_on = db.meta(META_STORE, "entries_on") == 1
         if malformed:
             log(f"publisher: ignoring {plural(malformed, 'malformed row')} in the state database", LOG_WARNING)
         if doomed:
@@ -475,12 +567,38 @@ class Publisher:
         if self._store is not None:
             self._store.changed((_NODE, node_id))
 
+    def _touch_meta(self, name: str):
+        """Note that the meta value name changed, for the next save. Caller holds the lock."""
+        if self._store is not None:
+            self._store.changed((_META, name))
+
+    def _meta_value(self, name: str):
+        """The meta value name as saved (META_STORE): "region_bits" (None while there is no estimate), or
+        "entries_on" (1 or 0). Lock held."""
+        if name == "region_bits":
+            return self._region_bits_mean
+        return int(self._entries_on)
+
     # The provide set
 
     def provided(self) -> frozenset[Cid]:
-        """The CIDs this node currently provides (not the DhtKeys of add_key_source)."""
+        """The CIDs this node currently provides, entries included (not the DhtKeys of add_key_source)."""
         with self._lock:
             return frozenset(item for item in self._provided if isinstance(item, Cid))
+
+    def provided_entries(self) -> frozenset[Cid]:
+        """The entries this node currently provides (provide_entries) that it doesn't provide as roots too."""
+        with self._lock:
+            return self._entries
+
+    def entries_status(self) -> dict:
+        """For the node's status: {"provided_entries": entry keys provided (not provided as roots too),
+        "provide_entries_off": why none are, or None, "provide_entries_capped": pins whose entries were left
+        out at MAX_ENTRY_KEYS}."""
+        with self._lock:
+            capped = len(self._entries_from[3]) if self._entries_off is None else 0
+            return {"provided_entries": len(self._entries), "provide_entries_off": self._entries_off,
+                    "provide_entries_capped": capped}
 
     def provided_keys(self) -> frozenset[bytes]:
         """The non-CID keys this node currently provides."""
@@ -502,16 +620,16 @@ class Publisher:
         return keys
 
     def _compute(self, keys: set[bytes], denied: frozenset[bytes]) -> tuple[frozenset[ProvidedItem], frozenset[Cid]]:
-        """(provided CIDs and DhtKeys of keys, blocks they reach) from storage, the strategy and denied (the
-        deny list's binary CIDs). Lock held.
+        """(provided CIDs, their entries (_choose_entries) and DhtKeys of keys, blocks they reach) from storage, the
+        strategy and denied (the deny list's binary CIDs). Lock held.
 
         The served set and the DhtKeys are those of the last call when what they are built from hasn't changed
         (most refreshes): the same complete CIDs with the same dag_blocks objects, and the same keys. CIDs only
         added since add their blocks to it; only one gone or changed builds it again.
         """
-        candidates = self.storage.pinned_cids()  # the same frozenset until pins change: not copied
+        pinned = candidates = self.storage.pinned_cids()  # the same frozenset until pins change: not copied
         if self.config.provide_strategy == "roots":
-            candidates |= self.storage.cached_targets() & set(self.cached_eligible())
+            candidates = pinned | (self.storage.cached_targets() & set(self.cached_eligible()))
         dags: dict[Cid, frozenset[Cid]] = {}
         for cid in candidates:
             try:
@@ -533,7 +651,123 @@ class Publisher:
         self._served_from = (dags, served)
         if keys != self._keys_from[0]:
             self._keys_from = (keys, frozenset(DhtKey(key) for key in keys))
-        return frozenset(dags) | self._keys_from[1], served
+        roots = frozenset(dags)
+        self._entries = self._choose_entries(pinned, dags, len(roots) + len(keys))
+        # An entry is a block of a complete pin's DAG, so serving needs nothing more: the entry's DAG is inside it.
+        # Entries come only from pins provided here, never on their own
+        assert self._entries <= served, "an entry was chosen outside the served set"
+        return roots | self._keys_from[1] | self._entries, served
+
+    def _choose_entries(self, pinned: frozenset[Cid], dags: dict[Cid, frozenset[Cid]],
+                        other_keys: int) -> frozenset[Cid]:
+        """The entries to provide (provide_entries) that aren't provided as roots: those of the pins (pinned, as
+        pinned_cids() gave it) among dags (the CIDs provided, with their blocks), up to MAX_ENTRY_KEYS, or none (the
+        setting is false, or a slow
+        node's default finds that republishing them with the other_keys other keys would take too much of the
+        channel). Notes why none are in _entries_off, logging when the estimate turns them off or on. Lock held."""
+        setting = self.config.provide_entries
+        reason = None
+        chosen: frozenset[Cid] = frozenset()
+        if setting is False:
+            reason = "provide_entries is false"
+        else:
+            chosen = self._capped_entries(pinned, pinned & dags.keys()) - dags.keys()
+            if setting is None and self.slow_node and chosen:
+                keys = other_keys + len(chosen)
+                servers = self._network_size()
+                share = republish_airtime(keys, servers, self.bitrate) / self.interval
+                if share > (ENTRY_AIRTIME_OFF if self._entries_on else ENTRY_AIRTIME_ON):
+                    reason = (f"slow node: republishing {plural(keys, 'key')} with entries would take about "
+                              f"{share:.1%} of the channel (at {self.bitrate or REFERENCE_BITRATE:g} bits/s, about "
+                              f"{plural(servers, 'server')}); entries are provided by default only under "
+                              f"{ENTRY_AIRTIME_ON:.0%} (provide_entries = true provides them anyway)")
+                    chosen = frozenset()
+        on = bool(chosen)
+        if on != self._entries_on:
+            self._entries_on = on
+            self._touch_meta("entries_on")
+        # The estimate's decision is logged when it changes (the setting's is the user's own: not logged)
+        estimated_off = setting is None and reason is not None
+        if estimated_off != self._estimated_off:
+            log(f"provide_entries: {reason}" if estimated_off else "provide_entries: providing the files and folders "
+                "inside pins again", LOG_NOTICE)
+            self._estimated_off = estimated_off
+        self._entries_off = reason
+        return chosen
+
+    def _capped_entries(self, pinned: frozenset[Cid], complete: frozenset[Cid]) -> frozenset[Cid]:
+        """The entries of the pins in complete (pinned is pinned_cids()), up to MAX_ENTRY_KEYS: pins oldest first
+        (Storage.pin_order), each pin's entries all or none, so adding a pin never takes away an older pin's
+        entries and a folder is findable whole or not at all; a pin that doesn't fit is left out (logged) and later
+        ones still may. The same as last time while pins and complete are. Lock held."""
+        last_pinned, last_complete, chosen, skipped = self._entries_from
+        if last_pinned is pinned and last_complete == complete:
+            return chosen
+        self._entries_of = {cid: entries for cid, entries in self._entries_of.items() if cid in complete}
+        found: set[Cid] = set()
+        left_out: list[Cid] = []
+        walked = True
+        for root in self.storage.pin_order(complete):
+            entries = self._entries_of.get(root)
+            if entries is None:
+                entries = self._walk_entries(root)
+                if entries is None:  # a block deleted meanwhile: computed again once the generation moves
+                    walked = False
+                    continue
+                self._entries_of[root] = entries
+            if len(found) + len(entries) > MAX_ENTRY_KEYS and len(found | entries) > MAX_ENTRY_KEYS:
+                left_out.append(root)
+                continue
+            found |= entries
+        chosen = frozenset(found)
+        if left_out and tuple(left_out) != skipped:
+            log(f"provide_entries: the files and folders inside {plural(len(left_out), 'pin')} (the newest) aren't "
+                f"provided: they would take this node past {MAX_ENTRY_KEYS} entry keys", LOG_NOTICE)
+        self._entries_from = (pinned if walked else None, complete, chosen, tuple(left_out))
+        return chosen
+
+    def _walk_entries(self, root: Cid) -> frozenset[Cid] | None:
+        """The CIDs directory entries name anywhere in root's DAG, which is complete: every file and directory below
+        it, not chunks, file nodes or index nodes; none for a file. None if a block went missing meanwhile.
+
+        Reads the directory and index nodes only, each directory once however often it appears."""
+        if root.is_raw:
+            return frozenset()
+        get = self.storage.getter()
+        top = walker.root_expect(root)
+        found: set[Cid] = set()
+        try:
+            if not isinstance(walker.decode_checked(top, get(top)), (dag.DirectoryNode, dag.IndexNode)):
+                return frozenset()
+            memo: dict = {}  # directory and index nodes decoded, for walker.directory_entries
+            seen = {root}
+            stack = [top]
+            while stack:
+                for entry, child in walker.directory_entries(stack.pop(), get, memo):
+                    found.add(entry.cid)
+                    if entry.kind == dag.KIND_DIRECTORY and entry.cid not in seen:
+                        seen.add(entry.cid)
+                        stack.append(child)
+        except (NotFound, InvalidDag):
+            return None
+        return frozenset(found)
+
+    def _network_size(self) -> int:
+        """The network size a slow node's entries are judged by (network_size). Lock held."""
+        try:
+            known = int(self.known_servers())
+        except Exception as e:  # noqa: BLE001 - an estimate without the routing table is still an estimate
+            log(f"publisher: the routing table's size couldn't be read: {e!r}", LOG_ERROR)
+            known = 0
+        return network_size(self._region_bits_mean, known)
+
+    def _entries_input(self) -> tuple:
+        """What the entries a refresh chooses depend on besides pins (generation()): the setting, and for a slow
+        node's default the network size and republish interval its estimate uses. Lock held."""
+        setting = self.config.provide_entries
+        if setting is None and self.slow_node:
+            return setting, self._network_size(), self.interval
+        return (setting,)
 
     def _denied(self, cid: Cid, blocks: frozenset[Cid], denied: frozenset[bytes]) -> bool:
         """True if one of blocks (cid's DAG) is in denied, the deny list's binary CIDs; memoised. Lock held."""
@@ -558,7 +792,7 @@ class Publisher:
             # Read before computing: a change made while this computes moves the generation past what is
             # remembered here, so the next refresh computes again (perhaps once more than needed), never misses it
             inputs = (None if self.generation is None
-                      else (self.generation(), denied, keys, self.config.provide_strategy))
+                      else (self.generation(), denied, keys, self.config.provide_strategy, self._entries_input()))
             last = self._inputs
             if (inputs is not None and last is not None and (last[1] is denied or last[1] == denied)
                     and last[0] == inputs[0] and last[2:] == inputs[2:]):
@@ -688,6 +922,9 @@ class Publisher:
 
         sweep = self._sweep(due, should_stop, limit)
         lookups, finds = len(sweep.regions), sum(region.finds for region in sweep.regions)
+        if sweep.regions:
+            with self._lock:
+                self._learn_network_size(sweep.regions)
         # In due's order, so a round's batches are the same however the lookups were run
         regions = {item: sweep.covered[item.key] for item in due if item.key in sweep.covered}
         for cid in regions:
@@ -824,6 +1061,17 @@ class Publisher:
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds}
 
+    def _learn_network_size(self, regions: list[Region]):
+        """Fold the prefix lengths of regions a round found (those that found a server) into the running mean the
+        network size is estimated from (network_size), saved with the publish state. Lock held."""
+        for region in regions:
+            if not region.closest:
+                continue
+            mean = self._region_bits_mean
+            self._region_bits_mean = (float(region.bits) if mean is None
+                                      else mean + (region.bits - mean) / REGION_SMOOTHING)
+            self._touch_meta("region_bits")
+
     def add_store_part(self, part: StorePart):
         """Also store each due key on the servers part(key, region) gives (the announce first-seen log's senior
         servers, say), besides its K closest from its region. Called without the lock once the round's lookups are
@@ -923,6 +1171,10 @@ class Publisher:
         while not stop_event.is_set():
             self._wake.clear()
             try:
+                if self.slow_node and self.config.provide_entries is None:
+                    # Whether a slow node provides entries follows the network's size, which no pin or fetch
+                    # changes: looked at again at each wake (a refresh with nothing changed returns at once)
+                    self.refresh()
                 if self.next_due() <= 0:
                     self.publish_due(stop_event.is_set)
             except Exception as e:  # noqa: BLE001 - the publisher thread keeps running; logged

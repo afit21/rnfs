@@ -584,15 +584,36 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names", "unexported_names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
 `fetcher.py`: `Fetcher.open(root, names, from_node, pinned)` gives a `Fetch` context (a protection session) with
 `resolve()`, `fetch_dag()`, `fetch_listing()`, `read_range()`; `publisher.py`: `Publisher.refresh()` (recompute the
-provide set, withdraw at once; skipped when the node's generation, the deny list, the key sources' keys and the
-strategy are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the first `refresh()` only
-after the features have registered their key sources, so a restart doesn't withdraw kept names' keys. `publish_due`
+provide set, withdraw at once; skipped when the node's generation, the deny list, the key sources' keys, the
+strategy and `_entries_input()` are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the
+first `refresh()` only after the features have registered their key sources, so a restart doesn't withdraw kept
+names' keys. **Entries** (`provide_entries`, `_choose_entries` inside `_compute`): the entries of the provided CIDs
+that are pins (`pinned_cids()`, read once per compute, among the complete undenied DAGs) are walked once per pin
+(`_walk_entries`: directory and index nodes only, through `walker.directory_entries`, each directory CID once;
+memoised in `_entries_of` while the pin stays complete, as a CID's content never changes) and chosen by
+`_capped_entries`: pins in `Storage.pin_order` (first pinned oldest first, those of before 0.2.0 first, then by
+CID), each pin's entries whole or not at all while the union stays within `MAX_ENTRY_KEYS` (100,000), a pin that
+doesn't fit logged and skipped. The choice is reused while `pinned_cids()` is the same object and the complete pins
+are equal, so a refresh caused by a fetch or a block stored walks and chooses nothing. Entries are `Cid`s in
+`_provided` like roots, so publishing, withdrawing (refresh's removed set) and persistence treat them alike;
+`_entries` holds those that aren't roots too (`provided_entries()`, `entries_status()` for the node's status).
+`_compute` asserts they are inside the served set, which doesn't change. On a slow node with the setting unset, the
+entries are dropped whole when `republish_airtime(roots + keys + entries, network_size(...), bitrate) /
+interval` exceeds `ENTRY_AIRTIME_ON` (2%), or `ENTRY_AIRTIME_OFF` (2.5%) while they are on (`_entries_on`); the
+reason is kept in `_entries_off` and logged when it starts or stops applying. `bitrate` is the slowest counted
+interface's (`rates.slowest_bitrate`, read once at start; the node passes it and `routing.node_count`), and the
+network size `network_size(_region_bits_mean, known)`: a running mean (weight 1/16) of the prefix length of the
+regions each round found (`_learn_network_size`, in `publish_due`), at least the routing table's size, at least
+`UNKNOWN_NETWORK` (1000) before any. Because that changes without any pin, `_entries_input()` holds the network
+size and interval on such a node, and its `run()` loop refreshes at every wake (a no-op unless they moved). The mean
+and `_entries_on` are the publish state's meta values (`publisher`, `region_bits` and `entries_on`), so a restart
+keeps the decision rather than withdrawing every entry. `publish_due`
 republishes `DhtKey`s every max(effective `republish_interval`, 3 days) with a ±10% jitter fixed by the key's first
 byte (`key_interval`: 256 slots, so a region's keys come due together; capped below `PROVIDER_TTL / 2`), drops a
 withdrawal of any key it provides to the same node in that round, and finds the K closest by sweep providing
@@ -946,7 +967,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending`, then `deprecated` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `blocks`, `used_bytes`, `max_storage`, `names`, `features: dict` (every other field) | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `features: dict` (every other field) | — |
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
@@ -1638,7 +1659,9 @@ contacts feature's lock, never the other way round. Slow work that runs while a 
   provided CID went or its DAG's blocks changed (CIDs only added are unioned in). It takes the pins as
   `Storage.pinned_cids()`, not a copy of every pin's sources, and gathers the keys withdrawals are queued for once,
   so an item newly provided searches the queues only when its key is among them (a mass re-pin, or the first
-  refresh after a start with withdrawals pending).
+  refresh after a start with withdrawals pending). With `provide_entries`, a pin's directory and index nodes are
+  read under the publisher lock once, when it first becomes a complete pin (`_walk_entries`; a 70k-file folder is
+  a few hundred directory nodes), and the choice of entries is redone only when the pins or complete pins changed.
 - `Storage.evict` and `gc` decide what to delete, and delete it, under the storage lock (after reading the DAG
   nodes outside it); `verify` checks completeness and re-reads the blocks outside it.
 - Every pin and unpin commits its row durably (`synchronous=FULL`, after the blocks are synced) under the
@@ -1665,7 +1688,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   pin served, at most 1 000, saved with the remote pins waiting; NORMAL, changed rows only; tables of their own, so
   `remote_pins` keeps its released meaning);
 - `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
-  withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
+  withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only), with the meta values
+  `(publisher, region_bits)` and `(publisher, entries_on)` (0.2.0: the network size estimate and whether entries
+  were provided, saved with them);
 - `provider_records` (read per key; indexed by publisher and last-stored time for eviction and expiry; `pooled` is
   always 0 since 0.2.0), `provider_publishers` (first-seen times) and `provider_standing` (0.2.0: each publisher's
   record count, tier, refresh days and last refresh day; indexed by tier and count), NORMAL every 30 s, when 20 000
