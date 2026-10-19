@@ -157,6 +157,12 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "CREATE TABLE routing (node BLOB PRIMARY KEY, state INTEGER NOT NULL, first_seen REAL, at REAL NOT NULL,"
         " failures INTEGER NOT NULL) WITHOUT ROWID",
     )),
+    ("scores", (
+        # Local scores (rnfs 0.2.0; rnfs.dht.scores): a peer's score as of updated, when it was last raised (NULL:
+        # never) and when it was seeded as a bootstrap node (NULL: not). Times are Unix time
+        "CREATE TABLE peer_scores (node BLOB PRIMARY KEY, score REAL NOT NULL, updated REAL NOT NULL, useful REAL,"
+        " seeded REAL) WITHOUT ROWID",
+    )),
 )
 
 

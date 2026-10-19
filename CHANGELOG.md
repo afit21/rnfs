@@ -17,8 +17,8 @@ Upgrade notes:
   assignments changed are replaced; comments and other lines are kept. Settings whose `api_port` equals a
   non-zero `gateway_port` are now refused at start (such a daemon could never listen on both).
 
-- **Routing state:** the state database gains a table for the routing table (`routing`), which is now kept across
-  restarts.
+- **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
+  restarts, and for local scores (`peer_scores`).
 
 Added, for apps:
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
@@ -100,6 +100,10 @@ The DHT (local behaviour: nothing on the wire changes):
 - The routing table is saved and loaded at start, so a restart doesn't make every server new again: servers keep
   their seniority (which ranks providers and keepers), bans last their time, and `/find` replies still leave out
   servers silent for over 2 × `announce_interval`, the time the node was down included.
+- Local scores: each node keeps a private score per peer, earned by work it checks itself (blocks served that
+  verified, `/find` answers that led to providers who served or to closer servers that answered) and lost by
+  failures, bad blocks and silence (scores halve each week). Bootstrap nodes start with a small seed they keep
+  only by earning it. Nothing is sent; at most 4096 peers are scored.
 
 ## 0.1.6
 

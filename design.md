@@ -119,6 +119,7 @@ rnfs/
   dht/                no RNS dependency
     routing.py        RoutingTable: buckets, seniority, failures, unreliable nodes, bans (section 6)
     routing_state.py  RoutingState: the routing table saved in the state database (section 6)
+    scores.py         Scores: local scores per peer, decay, bootstrap seeds, the capped saved table (section 6)
     providers.py      ProviderStore: records, TTL, max_records eviction, /find reply selection (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
@@ -339,18 +340,36 @@ outside the pool, the counts, `_pooled`, `_holders`, `_newest`) are kept in step
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
-unreliable, may_retry, max_queries)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop)
--> list[bytes]`. Besides completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries`
-(`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha,
-beta) answers in a row that leave the bit length of the beta-th closest known distance (`_reach`) unchanged ("no
-progress"). A run ranks the nodes `unreliable` named when it learnt of them (`doubtful`) after every other, for
-its queries, its termination and `find_closest`'s result; one that distance alone would rank within the query
-window is asked again when `may_retry` says so, as a query beyond `alpha` (`retrying`) that the run waits for
-only if the node comes to rank within the window by `rank` (it is then counted in flight). `is_known(id)`
-says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup (`allow_unknown(id)`, also
-used by the fetcher for provider IDs). `listing_nodes()` is the nodes that have answered with at least one
-provider, and `listers(provider)` those that listed a given provider, so the keeper search can tell who vouches
-for its candidates.
+unreliable, may_retry, max_queries, on_useful)` with `find_closest() -> list[bytes]` and
+`find_providers(on_provider, should_stop) -> list[bytes]`. Besides completion and the deadline, a run (`_iterate`)
+ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and their answers are in ("query cap"), or after
+`STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit length of the beta-th closest known
+distance (`_reach`) unchanged ("no progress"). A run ranks the nodes `unreliable` named when it learnt of them
+(`doubtful`) after every other, for its queries, its termination and `find_closest`'s result; one that distance
+alone would rank within the query window is asked again when `may_retry` says so, as a query beyond `alpha`
+(`retrying`) that the run waits for only if the node comes to rank within the window by `rank` (it is then counted
+in flight). `is_known(id)` says whether RNS knows its identity; at most `alpha` unknown IDs are tried per lookup
+(`allow_unknown(id)`, also used by the fetcher for provider IDs). `listing_nodes()` is the nodes that have answered
+with at least one provider, and `listers(provider)` those that listed a given provider, so the keeper search can
+tell who vouches for its candidates (and the fetcher whose answers led to a provider that served). `on_useful(id)`
+(local scores): a run notes which node's answer first named each node (`introduced`); when a node answers that is
+closer to the key than the node that named it, that node is passed to `on_useful`, once per lookup (`_useful`,
+`_credit`).
+
+`scores.py` — `Scores(state_dir=None, seeded=(), clock=time.time, max_rows=MAX_SCORES)`, a `node.Store`:
+`score(node_id)` (0 without a row), `band(node_id)`, `bands()`, and `served`, `useful_answer`, `failed`,
+`bad_block` adding `SERVED` (1), `USEFUL_ANSWER` (0.5), `FAILED` (−1) and `BAD_BLOCK` (−32). A row holds the score
+as of `updated` (it decays by half each `SCORE_HALF_LIFE`, 7 days, computed when read or changed: nothing runs
+on a timer), `useful` (last raised) and `seeded`. Rows sit in an `OrderedDict`, least recently useful first: a
+raise moves a row to the end, a row made by lowering goes to the front, and past `MAX_SCORES` (4096) the front is
+forgotten. `seeded` (the node's `_bootstrap_set()`: `bootstrap_nodes` and the defaults in use) gives each without a
+row `BOOTSTRAP_SEED` (6); a row seeded before whose node isn't a bootstrap node any more has the seed's decayed
+share taken off (exact, as every contribution decays alike). Saved in `peer_scores` through a SNAPSHOT `RowStore`.
+The node wires it: lookups' `on_failure` is `_query_failed` (the routing table's `failed`, then `scores.failed`),
+`on_useful` is `scores.useful_answer`, and the join's unanswered bootstrap nodes go through `_query_failed` too;
+the fetcher (`Fetcher(scores=)`, in memory only if not given) calls `served` for each response with verified
+blocks and `useful_answer` once per fetch for each of its lookup's `listers` of that provider (`Fetch._served`),
+`failed` in `_fail` and `bad_block` with the ban.
 
 ## Network layer interfaces
 
@@ -1336,7 +1355,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
   stop, changed rows only);
 - `routing` (0.2.0: the routing table, `RoutingState`: one row per node in the table, dropped with its seniority
-  kept, or banned, times as Unix time; NORMAL with the periodic saves and at stop, changed rows only);
+  kept, or banned, times as Unix time; NORMAL with the periodic saves and at stop, changed rows only) and
+  `peer_scores` (0.2.0: local scores, `Scores`: score, when it was set, last raised, seeded; at most 4096 rows;
+  NORMAL with the periodic saves and at stop, changed rows only);
 - `names_published`, `names_held` (sequences as decimal text, up to 2^64 − 1; FULL, changed rows only; a
   malformed row stops startup, as a malformed `names.json` did, since skipping it could allow rollback) and
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at

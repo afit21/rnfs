@@ -50,6 +50,7 @@ from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
 from rnfs.dht.routing_state import RoutingState
+from rnfs.dht.scores import Scores
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import RnsPaths
@@ -584,6 +585,8 @@ class RnfsNode:
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
         # Loaded from the state database, so a restart rejoins from the servers it knew; saved with the batched stores
         self._add_store(RoutingState(self.routing, config.state_dir))
+        # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
+        self.scores = self._add_store(Scores(config.state_dir, seeded=self._bootstrap_set()))
         # Saved with their expiry, every SAVE_INTERVAL (maintain): they change with every /provide
         self.records = self._add_store(ProviderStore(config.max_records, config.state_dir, own_id=node_id,
                                                      seniority=config.provider_seniority), batched=False)
@@ -619,7 +622,7 @@ class RnfsNode:
         self.pin_names.prune_labels(self.storage.pinned_cids())
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
-                                               make_room=self._make_room))
+                                               make_room=self._make_room, scores=self.scores))
         # Saved by its own refreshes and publish loop
         self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client, self._lookup,
                                                    slow, config.state_dir, cached_eligible=self._eligible_targets,
@@ -825,14 +828,19 @@ class RnfsNode:
         return Lookup(key, start, self.client.find, self.node_id,
                       alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
                       timeout=self.config.lookup_timeout, is_known=self._is_known,
-                      on_answer=self._answered, on_failure=self.routing.failed, exclude=exclude,
+                      on_answer=self._answered, on_failure=self._query_failed, exclude=exclude,
                       report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
-                      may_retry=self.routing.may_retry)
+                      may_retry=self.routing.may_retry, on_useful=self.scores.useful_answer)
 
     def _answered(self, node_id: bytes):
         """A node answered /find, proving it is a reachable server."""
         if self.routing.answered(node_id):
             self.publisher.wake()  # a CID that found no nodes may now be publishable
+
+    def _query_failed(self, node_id: bytes):
+        """A /find to node_id went unanswered: counted in the routing table, and lowering its score."""
+        self.routing.failed(node_id)
+        self.scores.failed(node_id)
 
     def _pin_event(self, change: str, cids: list[Cid], source: str):
         """Storage's pin_listener (storage lock held): pins of source added or removed, as a "pin" event; a CID
@@ -975,12 +983,20 @@ class RnfsNode:
     def bootstrap_ids(self) -> list[bytes]:
         """Bootstrap nodes in the order a join contacts them: bootstrap_nodes as given, then (unless
         default_bootstrap is off or in private mode) DEFAULT_BOOTSTRAP_NODES in a fresh random order."""
-        defaults = []
-        if self.config.default_bootstrap and not self.config.private:
-            defaults = [bytes.fromhex(text) for text in DEFAULT_BOOTSTRAP_NODES]
-            random.shuffle(defaults)
+        defaults = self._default_bootstrap()
+        random.shuffle(defaults)
         ids = list(dict.fromkeys(self._bootstrap_nodes + defaults))
         return [node_id for node_id in ids if node_id != self.node_id and not self.routing.is_banned(node_id)]
+
+    def _default_bootstrap(self) -> list[bytes]:
+        """DEFAULT_BOOTSTRAP_NODES, in their order, unless default_bootstrap is off or in private mode."""
+        if not self.config.default_bootstrap or self.config.private:
+            return []
+        return [bytes.fromhex(text) for text in DEFAULT_BOOTSTRAP_NODES]
+
+    def _bootstrap_set(self) -> set[bytes]:
+        """Every bootstrap node (the user's and the defaults in use) but this node: those seeded a score."""
+        return set(self._bootstrap_nodes + self._default_bootstrap()) - {self.node_id}
 
     def _contact_bootstrap(self) -> tuple[set[bytes], list[bytes]]:
         """Ask bootstrap nodes for our own ID, one at a time, until BOOTSTRAP_ANSWERS have answered.
@@ -1002,7 +1018,7 @@ class RnfsNode:
                 reply = None
             if reply is None:
                 log(f"bootstrap node {node_name(node_id)} didn't answer", LOG_VERBOSE)
-                self.routing.failed(node_id)
+                self._query_failed(node_id)
                 continue
             answered += 1
             self._answered(node_id)

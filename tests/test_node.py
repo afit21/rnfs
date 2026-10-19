@@ -25,6 +25,8 @@ from rnfs.features.keepers import name_key
 from rnfs.network.client import OK, BlocksResult
 from rnfs.network.identity import parse_node_id
 from rnfs import fsutil, node as node_module, statedb
+from rnfs.dht.routing import distance
+from rnfs.dht.scores import BOOTSTRAP_SEED, band
 from rnfs.node import RnfsNode
 from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, wait_for
 from tests.test_names import FakeNetwork
@@ -1163,6 +1165,29 @@ class JoinTest(NodeTest):
         private = self.make_node("p", bytes([0xF] * 16), bootstrap_nodes=user, private=True)
         self.assertEqual(private.bootstrap_ids(), [self.DEAD[0]])
         self.assertEqual(sorted(self.make_node("d", bytes([0xC] * 16)).bootstrap_ids()), sorted(self.SERVERS[1:]))
+
+    def test_bootstrap_nodes_are_seeded_a_score(self):
+        user = self.DEAD[0]
+        x = self.joiner(bootstrap_nodes=[user.hex()])
+        self.assertEqual({n: x.scores.band(n) for n in [user, *self.SERVERS]},
+                         {user: band(BOOTSTRAP_SEED), self.SERVERS[0]: 0,
+                          **{n: band(BOOTSTRAP_SEED) for n in self.SERVERS[1:]}})
+        x.stop()
+        x = self.joiner(bootstrap_nodes=[user.hex()], default_bootstrap=False)  # their seeds are dropped
+        self.assertEqual({n for n in [user, *self.SERVERS] if x.scores.score(n) > 0}, {user})
+        private = self.make_node("p", bytes([0xF] * 16), bootstrap_nodes=[user.hex()], private=True)
+        self.assertEqual({n for n in [user, *self.SERVERS] if private.scores.score(n) > 0}, {user})
+
+    def test_unanswered_queries_lower_scores_and_useful_answers_raise_them(self):
+        x = self.joiner(bootstrap_nodes=[n.hex() for n in self.DEAD], default_bootstrap=False)
+        x.join()  # no server answers
+        for dead in self.DEAD:
+            self.assertLess(x.scores.score(dead), BOOTSTRAP_SEED)
+        # A lookup from SERVERS[0]: it names the others, two of them nearer to x's ID, which then answer
+        x.routing.heard(self.SERVERS[0])
+        x._lookup(self.X_ID).find_closest()
+        self.assertLess(min(distance(n, self.X_ID) for n in self.SERVERS[1:]), distance(self.SERVERS[0], self.X_ID))
+        self.assertGreater(x.scores.score(self.SERVERS[0]), 0)
 
     def test_joins_again_while_too_few_servers_are_known(self):
         x = self.joiner(bootstrap_nodes=[self.SERVERS[0].hex()], default_bootstrap=False)

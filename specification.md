@@ -599,6 +599,26 @@ and repeat.
   retried during that fetch. When no providers are left, `/find` runs again for a fresh random half, within the
   same `lookup_timeout`.
 
+**Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
+Scores are local state: they are never sent or published, nothing on the wire changes, and nodes may score
+differently. A score can be earned quickly by serving popular blocks, so it never outranks seniority. rnfs:
+- raises a peer's score by 1 for each `/blocks` response that delivered blocks verified against their CIDs, and
+  by 0.5 for a `/find` answer that proved useful, once per fetch or lookup: it listed a provider that then
+  served verified blocks, or named a server closer to the key than the answering node that then answered;
+- lowers it by 1 for a failed query or provider (a `/find` unanswered, a provider failing in a fetch) and by 32
+  for a block not matching its CID (besides the ban);
+- halves every score each 7 days without new work, towards 0 from either side (silence lowers standing, and a bad
+  score is forgiven in time), and keeps it within ±64;
+- starts bootstrap nodes (`bootstrap_nodes`, and the defaults unless `default_bootstrap` is off or in private
+  mode) at 6 when they have no score, so a fresh node has someone to lean on. The seed decays like any score, so
+  they keep standing only by earning it; a node no longer a bootstrap node loses what is left of its seed at the
+  next start; bans apply to them as to anyone;
+- compares scores in bands a power of two wide (0 within ±1, else ±(1 + ⌊log₂ |score|⌋)), so peers of about the
+  same standing are ordered by the next key;
+- keeps scores for at most 4096 peers, forgetting the least recently raised first (a peer only ever lowered goes
+  before any raised); a peer without a score scores 0, so forgetting is always safe;
+- saves them, with wall-clock times, a time in the future when loaded counting as now.
+
 **Publishing.**
 - For each key, find the `K` closest nodes. Then send each node the keys it should store, in as few `/provide`
   requests as the batch size allows (section 3), one at a time over a separate identified link closed
