@@ -438,10 +438,11 @@ blocks and `useful_answer` once per fetch for each of its lookup's `listers` of 
 `firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
 `heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
 table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
-exclude)`: the count closest to key of the servers first heard at least min_age ago (publishers and searchers will
-pass `provider_seniority`), not excluded (`exclude` runs under the log's lock). Memory: an `OrderedDict` node ID ->
-first heard, least recently heard first (a heard moves to the end; past `MAX_FIRST_SEEN`, 65,536, the front is
-forgotten), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a new server at
+exclude, heard_within=None)`: the count closest to key of the servers first heard at least min_age ago (publishers
+and searchers pass `provider_seniority`), heard within `heard_within` seconds if given, not excluded (`exclude` runs
+under the log's lock). Memory: an `OrderedDict` node ID -> first heard, least recently heard first (a heard moves to the end; past `MAX_FIRST_SEEN`, 65,536, the front is
+forgotten), a dict node ID -> last heard (loaded as the `last_heard` the save wrote), and the same IDs in a sorted
+list (`bisect.insort`, a memory move: about 7 µs for a new server at
 65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a contiguous run
 of the sorted list, all closer to the key than any outside it: `closest` binary-searches the narrowest run holding
 count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old enough, and ranks only that
