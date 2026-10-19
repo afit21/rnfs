@@ -742,7 +742,11 @@ silent longer than every one of them; announces are recorded in memory and writt
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
   (rnfs: at most 10 region lookups per publish round, each publishing every due key of its region, and after a
   round of n lookups the next waits 30 × n s; items never published go first, then those unpublished longest).
-  Withdrawals are not delayed by this.
+  It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
+  unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
+  rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server
+  only withdrawals reach as one of the round's 10 lookups (those with the most keys queued first; while any are
+  queued, up to 5 of the 10 are kept for them). Other nodes send withdrawals at once.
 
 **Provider records.**
 - `/provide` records the identified requester's node ID as a provider; a node can only advertise itself.

@@ -14,7 +14,7 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.denylist import DenyList
 from rnfs.dht.providers import ProviderStore
-from rnfs.publisher import PUBLISH_LOOKUPS, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
+from rnfs.publisher import MAX_WAIT, PUBLISH_LOOKUPS, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
 from tests.fakes.client import FakeClient
 from tests.fakes.log import quiet_log
 from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
@@ -666,6 +666,66 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(publisher.publish_due()["published"], [])
         self.clock.now += SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
         self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
+
+    def queue_withdrawals(self, publisher: Publisher, servers: list[bytes], keys: int = 1):
+        """Queue withdrawals of keys keys at each of servers, as if their CIDs had been unpinned, and saved."""
+        with publisher._lock:
+            for n, node_id in enumerate(servers):
+                publisher._withdrawals[node_id] = {bytes([n + 1, k]) * 8 for k in range(keys)}
+                publisher._touch_node(node_id)
+        publisher.save()
+
+    def test_slow_nodes_pace_withdrawals(self):
+        """On a slow node each server only withdrawals reach costs a lookup's worth: SLOW_ROUND_LOOKUPS servers a
+        round, those with the most keys queued first, SLOW_LOOKUP_PACE each before the next round."""
+        publisher = self.make_publisher(slow=True)
+        servers = [bytes([0x80, n]) * 8 for n in range(25)]
+        self.queue_withdrawals(publisher, servers)
+        with publisher._lock:
+            publisher._withdrawals[servers[24]] |= {bytes([99]) * 16}  # two keys: first
+        self.assertEqual(publisher.next_due(), 0)
+        result = publisher.publish_due()
+        self.assertEqual(result["lookups"], 0)
+        self.assertEqual(result["nodes"], sorted([servers[24]] + servers[:SLOW_ROUND_LOOKUPS - 1]))
+        self.assertEqual(publisher.next_due(), SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
+        self.assertEqual(publisher.publish_due()["nodes"], [])  # paced: nothing sent
+        self.clock.now += SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
+        self.assertEqual(len(publisher.publish_due()["nodes"]), SLOW_ROUND_LOOKUPS)
+        self.clock.now += SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
+        self.assertEqual(len(publisher.publish_due()["nodes"]), 5)
+        self.assertEqual(publisher._next_lookup, self.clock.now + SLOW_LOOKUP_PACE * 5)  # paced by the 5 sent
+        self.assertEqual(publisher.next_due(), MAX_WAIT)  # nothing left
+        self.assertEqual(self.saved()["withdraw"], {})
+        self.assertEqual({node_id for node_id, _, _ in self.client.calls}, set(servers))
+
+    def test_slow_nodes_keep_room_for_withdrawals(self):
+        """While withdrawal-only servers are queued, up to half a slow round is kept for them; withdrawals to servers
+        the round stores to anyway cost nothing more."""
+        publisher = self.make_publisher(slow=True)
+        self.due_keys(20)
+        publisher.refresh()
+        self.nodes_of = lambda key: near(key) + [N1]  # each key a region of its own
+        alone = [bytes([0x80, n]) * 8 for n in range(3)]
+        self.queue_withdrawals(publisher, alone + [N1])
+        result = publisher.publish_due()
+        self.assertEqual(result["lookups"], SLOW_ROUND_LOOKUPS - 4)  # 4 queued, at most 5 kept
+        self.assertEqual(len(result["published"]), SLOW_ROUND_LOOKUPS - 4)
+        sent = {node_id: withdrawn for node_id, _, withdrawn in self.client.calls if withdrawn}
+        self.assertEqual(set(sent), set(alone) | {N1})
+        self.assertEqual(publisher.next_due(), SLOW_LOOKUP_PACE * (SLOW_ROUND_LOOKUPS - 4 + 3))
+        # Many queued: still half the round for lookups
+        self.queue_withdrawals(publisher, [bytes([0x90, n]) * 8 for n in range(30)])
+        self.clock.now += SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
+        result = publisher.publish_due()
+        self.assertEqual(result["lookups"], SLOW_ROUND_LOOKUPS // 2)
+        self.assertEqual(len(result["nodes"]) - len(set(result["nodes"]) & {N1}),
+                         (SLOW_ROUND_LOOKUPS // 2) * K + SLOW_ROUND_LOOKUPS // 2)
+
+    def test_fast_nodes_send_withdrawals_at_once(self):
+        servers = [bytes([0x80, n]) * 8 for n in range(25)]
+        self.queue_withdrawals(self.publisher, servers)
+        self.assertEqual(self.publisher.publish_due()["nodes"], sorted(servers))
+        self.assertEqual(self.publisher.next_due(), MAX_WAIT)
 
     def test_stopped_round_keeps_only_finished_lookups(self):
         """should_stop is checked before each lookup starts: those started finish and are published, in due

@@ -215,6 +215,10 @@ The DHT (local behaviour: nothing on the wire changes):
   lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
   1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
   not keys, so a round publishes every due key of up to 10 regions.
+- **Slow nodes pace withdrawals:** unpinning many keys no longer sends every withdrawal at once over radio. A slow
+  node sends withdrawals along with its round's stores to the same servers, and each server only withdrawals
+  reach counts as one of the round's 10 lookups (up to 5 kept for them while any are queued), so the round waits
+  30 s for it before the next. Other nodes still send withdrawals at once.
 - Kept names' keys take their fixed ±10% republish jitter from the key's first byte rather than the whole key: 256
   slots still spread them out, and keys sharing their leading bits (the same servers are closest to them) come due
   together. A key's interval may change once, by at most a fifth, at the upgrade; it stays below 3.5 days.

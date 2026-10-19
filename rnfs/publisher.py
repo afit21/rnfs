@@ -13,7 +13,7 @@
   withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed store
   isn't retried until the next republish. The node also records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
-  from the nodes it was last published to, at once, and from nodes of earlier rounds (or of a round cut
+  from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or of a round cut
   short) whose record may not have expired yet: the closest set changes as nodes come and go.
 
 Last-published nodes and times, earlier rounds' nodes and pending withdrawals are persisted in the state
@@ -27,7 +27,9 @@ whose round was stopped before every node was sent its keys stays due. Times are
   with a fixed jitter of up to +-KEY_JITTER from the key's first byte, so they don't all come due in one burst
   but a region's keys come due together; always below PROVIDER_TTL / 2.
 - **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS region lookups per round and on average one per
-  SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished.
+  SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished. Withdrawals are paced
+  too: they ride along to the servers a round stores to, and each server only withdrawals reach costs one lookup.
+  Other nodes send every withdrawal at once.
 - A key both withdrawn from and provided to a node in one round is only provided (a restart may queue
   withdrawals of keys that are still provided).
 """
@@ -568,13 +570,15 @@ class Publisher:
         self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
 
     def next_due(self) -> float:
-        """Seconds until something is due (0 if now); withdrawals pending count as due."""
+        """Seconds until something is due (0 if now); withdrawals pending count as due (paced on slow nodes)."""
         now = self.clock()
         with self._lock:
             self._clamp(now)
-            if any(self._withdrawals.values()):
-                return 0.0
             waits = []
+            if any(self._withdrawals.values()):
+                if not self.slow_node:
+                    return 0.0
+                waits.append(0.0)
             for cid in self._provided:
                 retry = self._retry_at.get(cid)
                 record = self._published.get(cid)
@@ -586,7 +590,7 @@ class Publisher:
                     waits.append(record[0] + self.interval_for(cid) - now)
             wait = min(waits, default=MAX_WAIT)
             if self.slow_node and waits:
-                wait = max(wait, self._next_lookup - now)  # lookups paced
+                wait = max(wait, self._next_lookup - now)  # lookups and withdrawals paced
         return max(0.0, wait)
 
     def publish_due(self, should_stop: Callable[[], bool] = lambda: False) -> dict:
@@ -601,10 +605,17 @@ class Publisher:
             # Never published first, then the longest unpublished: what pacing defers is the least urgent
             due = sorted((cid for cid in self._provided if self._is_due(cid, now)),
                          key=lambda item: (self._published.get(item, (float("-inf"),))[0], item.key))
-            if self.slow_node and now < self._next_lookup:
+            paced = self.slow_node and now < self._next_lookup
+            if paced:
                 due = []
+            limit = None
+            if self.slow_node:
+                # Servers only withdrawals reach cost a lookup's worth each: while any are queued, up to half the
+                # round is kept for them (those also stored to this round take them along for free)
+                queued = sum(1 for keys in self._withdrawals.values() if keys)
+                limit = SLOW_ROUND_LOOKUPS - min(queued, SLOW_ROUND_LOOKUPS // 2)
 
-        sweep = self._sweep(due, should_stop, SLOW_ROUND_LOOKUPS if self.slow_node else None)
+        sweep = self._sweep(due, should_stop, limit)
         lookups, finds = len(sweep.regions), sum(region.finds for region in sweep.regions)
         # In due's order, so a round's batches are the same however the lookups were run
         regions = {item: sweep.covered[item.key] for item in due if item.key in sweep.covered}
@@ -613,8 +624,6 @@ class Publisher:
         # Built without the lock: a part may take other locks (the first-seen log's)
         closest = {cid: self._store_set(cid, region) for cid, region in regions.items()}
         with self._lock:
-            if self.slow_node and lookups:
-                self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * lookups
             # Taken after the lookups, which can be long, so withdrawals queued meanwhile go in this round
             withdrawals = {node: set(keys) for node, keys in self._withdrawals.items() if keys}
             for cid in [cid for cid in closest if cid not in self._provided]:
@@ -637,6 +646,17 @@ class Publisher:
                     if not self._withdrawals[node_id]:
                         del self._withdrawals[node_id]
                     self._touch_node(node_id)
+            if self.slow_node:
+                # Withdrawals ride along to the servers stored to; each server only they reach takes one of the
+                # round's lookups left, those with the most keys queued first, the rest waiting for a later round
+                alone = sorted((node_id for node_id, keys in withdrawals.items() if keys and node_id not in by_node),
+                               key=lambda node_id: (-len(withdrawals[node_id]), node_id))
+                room = 0 if paced else max(0, SLOW_ROUND_LOOKUPS - lookups)
+                for node_id in alone[room:]:
+                    del withdrawals[node_id]
+                spent = lookups + min(room, len(alone))
+                if spent:
+                    self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * spent
         accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
         unsaved, saved_at = 0, self.clock()

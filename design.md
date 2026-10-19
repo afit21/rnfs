@@ -564,7 +564,10 @@ the same node in that round, and finds the K closest by sweep providing (`_sweep
 in urgency order (never published first, then the longest unpublished), one lookup per region, up to
 `PUBLISH_LOOKUPS` (4) at once on `rnfs-publish-lookup` threads (`_sweep_at_once`), the batches built in due
 order whatever order the regions finished in; on slow nodes one region lookup at a time, at most 10 per round,
-waiting 30 s × the round's lookups before the next. `_region_bits` carries the last region's p to the next round.
+waiting 30 s × the round's lookups before the next. Slow nodes pace withdrawals with them: a server only
+withdrawals reach counts as a lookup (those with the most keys queued first; while any are queued, the round's
+lookups are limited to leave up to 5 for them), the others stay queued, and `next_due` counts queued withdrawals
+as due only once the pacing allows; other nodes send them all at once. `_region_bits` carries the last region's p to the next round.
 Each item's store set (`_store_set`) is its K closest from its region (`Region.closest_to`), then each part added by
 `add_store_part(part)`, a `(key, region) -> servers` called without the lock after the lookups, without
 duplicates; an item whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The round's
