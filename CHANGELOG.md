@@ -305,7 +305,28 @@ The DHT (local behaviour: nothing on the wire changes):
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
   servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
-  next to a key can't be. Publishing and searching will use it.
+  next to a key can't be. Publishing uses it (below); searching will.
+- **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
+  due key of its region (the keys sharing as many leading bits as the key looked up shares with its 10th-closest
+  server), with about 1.6 more `/find` a region to fill in its far half; each key still gets its own 10 closest
+  servers (100% of keys on their true 10 closest over a simulated 2000-server network, against about 97% with a
+  lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
+  1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
+  not keys, so a round publishes every due key of up to 10 regions.
+- **Stores to long-known servers too:** each key is also stored on the 10 servers closest to it among those the
+  node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
+  Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
+  next to a key can't push the record off them. Withdrawals reach them too.
+- **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
+  servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
+  at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
+- **Slow nodes pace withdrawals:** unpinning many keys no longer sends every withdrawal at once over radio. A slow
+  node sends withdrawals along with its round's stores to the same servers, and each server only withdrawals
+  reach counts as one of the round's 10 lookups (up to 5 kept for them while any are queued), so the round waits
+  30 s for it before the next. Other nodes still send withdrawals at once.
+- Kept names' keys take their fixed ±10% republish jitter from the key's first byte rather than the whole key: 256
+  slots still spread them out, and keys sharing their leading bits (the same servers are closest to them) come due
+  together. A key's interval may change once, by at most a fifth, at the upgrade; it stays below 3.5 days.
 
 Faster:
 - A start no longer lists every stored block before the API answers: their sizes are kept in the state database

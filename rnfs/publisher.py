@@ -6,14 +6,15 @@
   storage's) denies is never provided: a change to the list takes effect at the next refresh(). A refresh
   recomputes this only when something it is computed from changed (the node's generation(), the deny list,
   the key sources' keys, the strategy), so the many refreshes that change nothing cost almost nothing.
-- **Publishing.** A CID is due when it has never been published or its republish_interval has passed. For
-  each due CID the K closest nodes are found, PUBLISH_LOOKUPS lookups at once (one at a time on slow nodes);
-  keys are grouped by node, and each node gets its keys (and any withdrawals for it) in as few /provide
-  requests as fit, over one identified link. A refused or failed store isn't retried until the next
-  republish. The node also records itself locally.
+- **Publishing.** A CID is due when it has never been published or its republish_interval has passed. The due
+  CIDs' K closest nodes are found by sweep providing (rnfs.dht.sweep): one lookup per region of due keys,
+  PUBLISH_LOOKUPS at once (one at a time on slow nodes). Each key is stored on its store set: its K closest, and
+  the servers of the parts add_store_part added. Keys are grouped by node, and each node gets its keys (and any
+  withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or failed store
+  isn't retried until the next republish. The node also records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
-  from the nodes it was last published to, at once, and from nodes of earlier rounds (or of a round cut
-  short) whose record may not have expired yet: the closest set changes as nodes come and go.
+  from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or
+  of a round cut short) whose record may not have expired yet: the closest set changes as nodes come and go.
 
 Last-published nodes and times, earlier rounds' nodes and pending withdrawals are persisted in the state
 database (rnfs.statedb: the published, published_earlier and withdrawals tables), each save writing only the
@@ -23,10 +24,12 @@ whose round was stopped before every node was sent its keys stays due. Times are
 (the clock was corrected) count as now.
 
 - **Feature keys** (DhtKey, e.g. kept names) are republished at max(republish interval, KEY_MIN_INTERVAL),
-  each with its own fixed jitter of up to +-KEY_JITTER, so they don't all come due in one burst; always
-  below PROVIDER_TTL / 2.
-- **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS per round and on average one per SLOW_LOOKUP_PACE
-  seconds; never-published items go first, then the longest unpublished.
+  with a fixed jitter of up to +-KEY_JITTER from the key's first byte, so they don't all come due in one burst
+  but a region's keys come due together; always below PROVIDER_TTL / 2.
+- **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS region lookups per round and on average one per
+  SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished. Withdrawals are paced
+  too: they ride along to the servers a round stores to, and each server only withdrawals reach costs one lookup.
+  Other nodes send every withdrawal at once.
 - A key both withdrawn from and provided to a node in one round is only provided (a restart may queue
   withdrawals of keys that are still provided).
 """
@@ -34,6 +37,7 @@ import hashlib
 import math
 import threading
 import time
+from collections.abc import Iterable
 from typing import Callable
 
 from rnfs import statedb
@@ -41,6 +45,7 @@ from rnfs.config import Config
 from rnfs.constants import DAY, HOUR, ID_LENGTH, PROVIDER_TTL
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
+from rnfs.dht.sweep import Region, Sweep, find_region
 from rnfs.errors import InvalidDag, NotFound
 from rnfs.log import LOG_ERROR, LOG_VERBOSE, LOG_WARNING, log, node_name, plural
 
@@ -50,7 +55,7 @@ KEY_PREFIX = "key:"  # how a DhtKey is written as a published item (str())
 # A kept name's record changes rarely and keepers answer for years-old ones; its provider record lives
 # PROVIDER_TTL (7 days), so republishing every 3 days still survives a missed round
 KEY_MIN_INTERVAL = 3 * DAY
-KEY_JITTER = 0.1  # +-10% of the interval, fixed per key
+KEY_JITTER = 0.1  # +-10% of the interval, fixed per first byte of the key (256 slots)
 # While a round sends, where it stored is saved after this many nodes or seconds, whichever comes first, so a
 # crash loses at most that much of it (a record no saved state lists can't be withdrawn: it lives PROVIDER_TTL)
 SAVE_EVERY_NODES = 10
@@ -58,13 +63,84 @@ SAVE_EVERY_SECONDS = 30.0
 # Slow nodes: a closest-nodes lookup is several /find exchanges (alpha 1, a few hops), seconds of airtime at
 # LoRa rates. One per 30 s keeps republishing a hundred keys to well under 1% of a day's airtime per hour
 SLOW_LOOKUP_PACE = 30.0
-SLOW_ROUND_LOOKUPS = 10  # lookups per round on slow nodes, so /provide batching still groups keys per node
-# Other nodes: closest-nodes lookups a round runs at once. Each keeps alpha (3) /find queries in flight, so 4
+SLOW_ROUND_LOOKUPS = 10  # region lookups per round on slow nodes, so /provide batching still groups keys per node
+# Other nodes: region lookups a round runs at once. Each keeps alpha (3) /find queries in flight, so 4
 # keep about 12, small requests (a link still carries at most MAX_REQUESTS_PER_LINK at once; the rest wait for a
 # slot); a round of a few hundred keys, each lookup a few round trips one after another, then takes about a
 # quarter of the time, with few threads. The airtime controls (upload_budget, interface rules, quiet hours)
 # apply to /blocks only (spec section 3): these send the same /find messages as one at a time would, overlapping
 PUBLISH_LOOKUPS = 4
+# Other nodes: servers a round sends /provide to at once, each over its own identified link and in its own batches
+# (withdrawals first, stopping at the first refusal), so a server sees what it would one at a time. A /provide is
+# latency-bound (path, link setup, identify, a packet a batch), not bandwidth-bound: 16 links in flight are a few
+# kilobytes, on the order of the /find the lookups already keep in flight (12). The load study puts a fast node's
+# round for 1M keys at about 1.1 h with sweep providing and 16 at once (83 h with a lookup per key, one server at a
+# time). The airtime controls apply to /blocks only (spec section 3). Slow nodes send one at a time
+PROVIDE_PARALLEL = 16
+
+
+def _in_order(items: list, work: Callable, should_stop: Callable[[], bool], parallel: int):
+    """Yield (item, work(item)) for items in their order, running work for up to parallel items at once on
+    rnfs-publish-provide threads (in the caller's, one at a time, for parallel 1). should_stop() is checked before
+    each item starts: once it is True no more start, and those running finish and are yielded. When work raises, no
+    more start; the exception is raised once the items that ran have been yielded, so what they did is recorded."""
+    if parallel <= 1:
+        for item in items:
+            if should_stop():
+                return
+            yield item, work(item)
+        return
+    cond = threading.Condition()
+    results: dict[int, tuple[bool, object]] = {}  # index -> (raised, result or exception)
+    state = {"next": 0, "ended": False}  # the next index to start; whether no more may start
+
+    def worker():
+        """Run work for the next item in turn until none is left or the round ends."""
+        while True:
+            with cond:
+                if state["ended"] or state["next"] == len(items):
+                    return
+                if should_stop():
+                    state["ended"] = True
+                    cond.notify_all()
+                    return
+                index = state["next"]
+                state["next"] += 1
+            try:
+                result = (False, work(items[index]))
+            except BaseException as e:  # noqa: BLE001 - raised in the caller's thread once the others are in
+                result = (True, e)
+            with cond:
+                results[index] = result
+                if result[0]:
+                    state["ended"] = True
+                cond.notify_all()
+
+    threads = [threading.Thread(target=worker, name="rnfs-publish-provide", daemon=True)
+               for _ in range(min(parallel, len(items)))]
+    for thread in threads:
+        thread.start()
+    failure = None
+    try:
+        for index in range(len(items)):
+            with cond:
+                # Wait for this item unless it will never start
+                while index not in results and not (state["ended"] and index >= state["next"]):
+                    cond.wait()
+                if index not in results:
+                    break
+                raised, result = results.pop(index)
+            if raised:
+                failure = failure or result
+                continue
+            yield items[index], result
+    finally:
+        with cond:
+            state["ended"] = True  # the caller may have stopped iterating (an exception of its own)
+        for thread in threads:
+            thread.join()
+    if failure is not None:
+        raise failure
 
 
 class DhtKey:
@@ -100,16 +176,23 @@ class DhtKey:
         return hash((DhtKey, self.key))
 
 
+# A part of each key's store set besides its K closest (add_store_part): (key, its region) -> servers
+StorePart = Callable[[bytes, Region], Iterable[bytes]]
+
 # What the publisher provides: a CID, or a feature's DhtKey. Both have .key, hashing, str() and parse(), but only a
 # Cid has .binary or is served, so code that needs those must check (provided() does)
 ProvidedItem = Cid | DhtKey
 
 
 def key_interval(key: bytes, base: float) -> float:
-    """The republish interval of DhtKey key: max(base, KEY_MIN_INTERVAL) with key's fixed jitter, below
-    PROVIDER_TTL / 2 (base is already below it: Config.validate)."""
+    """The republish interval of DhtKey key: max(base, KEY_MIN_INTERVAL) with a fixed jitter, below
+    PROVIDER_TTL / 2 (base is already below it: Config.validate).
+
+    The jitter comes from the key's first byte, not the whole key: keys of one region share their leading bits, so
+    they come due together and one lookup republishes them all (sweep providing), while the 256 slots still keep
+    many keys from coming due at once."""
     interval = max(base, KEY_MIN_INTERVAL)
-    fraction = int.from_bytes(hashlib.sha256(b"rnfs-republish-jitter" + key).digest()[:8], "big") / 2**64
+    fraction = int.from_bytes(hashlib.sha256(b"rnfs-republish-jitter" + key[:1]).digest()[:8], "big") / 2**64
     jittered = interval * (1 + KEY_JITTER * (2 * fraction - 1))
     # Jitter upward never reaches PROVIDER_TTL / 2: a record must survive one missed republish
     return min(jittered, max(interval, PROVIDER_TTL / 2 - HOUR))
@@ -274,6 +357,8 @@ class Publisher:
         self._withdrawals: dict[bytes, set[bytes]] = {}  # node -> keys to withdraw from it
         self._retry_at: dict[ProvidedItem, float] = {}  # items whose last lookup found no nodes
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
+        self._region_bits: int | None = None  # the prefix length of a recent region (sweep providing), or None
+        self._store_parts: list[StorePart] = []  # add_store_part
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
         # Writes what changed since the last save (_touch_item, _touch_node), when persisted
@@ -556,13 +641,15 @@ class Publisher:
         self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
 
     def next_due(self) -> float:
-        """Seconds until something is due (0 if now); withdrawals pending count as due."""
+        """Seconds until something is due (0 if now); withdrawals pending count as due (paced on slow nodes)."""
         now = self.clock()
         with self._lock:
             self._clamp(now)
-            if any(self._withdrawals.values()):
-                return 0.0
             waits = []
+            if any(self._withdrawals.values()):
+                if not self.slow_node:
+                    return 0.0
+                waits.append(0.0)
             for cid in self._provided:
                 retry = self._retry_at.get(cid)
                 record = self._published.get(cid)
@@ -574,13 +661,14 @@ class Publisher:
                     waits.append(record[0] + self.interval_for(cid) - now)
             wait = min(waits, default=MAX_WAIT)
             if self.slow_node and waits:
-                wait = max(wait, self._next_lookup - now)  # lookups paced
+                wait = max(wait, self._next_lookup - now)  # lookups and withdrawals paced
         return max(0.0, wait)
 
     def publish_due(self, should_stop: Callable[[], bool] = lambda: False) -> dict:
         """One publishing round: provide every due CID and send pending withdrawals, batched per node.
 
-        Returns {"published": CIDs published, "nodes": nodes contacted, "withdrawn": keys withdrawn}.
+        Returns {"published": CIDs published, "nodes": nodes contacted, "withdrawn": keys withdrawn, "lookups":
+        region lookups run, "finds": extra /find their regions sent}.
         """
         now = self.clock()
         with self._lock:
@@ -588,13 +676,25 @@ class Publisher:
             # Never published first, then the longest unpublished: what pacing defers is the least urgent
             due = sorted((cid for cid in self._provided if self._is_due(cid, now)),
                          key=lambda item: (self._published.get(item, (float("-inf"),))[0], item.key))
+            paced = self.slow_node and now < self._next_lookup
+            if paced:
+                due = []
+            limit = None
             if self.slow_node:
-                due = due[:SLOW_ROUND_LOOKUPS] if now >= self._next_lookup else []
+                # Servers only withdrawals reach cost a lookup's worth each: while any are queued, up to half the
+                # round is kept for them (those also stored to this round take them along for free)
+                queued = sum(1 for keys in self._withdrawals.values() if keys)
+                limit = SLOW_ROUND_LOOKUPS - min(queued, SLOW_ROUND_LOOKUPS // 2)
 
-        closest = self._lookups(due, should_stop)
+        sweep = self._sweep(due, should_stop, limit)
+        lookups, finds = len(sweep.regions), sum(region.finds for region in sweep.regions)
+        # In due's order, so a round's batches are the same however the lookups were run
+        regions = {item: sweep.covered[item.key] for item in due if item.key in sweep.covered}
+        for cid in regions:
+            self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
+        # Built without the lock: a part may take other locks (the first-seen log's)
+        closest = {cid: self._store_set(cid, region) for cid, region in regions.items()}
         with self._lock:
-            if self.slow_node and closest:
-                self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * len(closest)
             # Taken after the lookups, which can be long, so withdrawals queued meanwhile go in this round
             withdrawals = {node: set(keys) for node, keys in self._withdrawals.items() if keys}
             for cid in [cid for cid in closest if cid not in self._provided]:
@@ -617,23 +717,41 @@ class Publisher:
                     if not self._withdrawals[node_id]:
                         del self._withdrawals[node_id]
                     self._touch_node(node_id)
+            if self.slow_node:
+                # Withdrawals ride along to the servers stored to; each server only they reach takes one of the
+                # round's lookups left, those with the most keys queued first, the rest waiting for a later round
+                alone = sorted((node_id for node_id, keys in withdrawals.items() if keys and node_id not in by_node),
+                               key=lambda node_id: (-len(withdrawals[node_id]), node_id))
+                room = 0 if paced else max(0, SLOW_ROUND_LOOKUPS - lookups)
+                for node_id in alone[room:]:
+                    del withdrawals[node_id]
+                spent = lookups + min(room, len(alone))
+                if spent:
+                    self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * spent
         accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
         unsaved, saved_at = 0, self.clock()
-        for node_id in sorted(set(by_node) | set(withdrawals)):
-            if should_stop():
-                break
+
+        def send(node_id: bytes) -> tuple | None:
+            """Send node_id its keys and the withdrawals still queued for it, over one identified link: (keys,
+            withdrawn, keys it may have recorded, when it answered), or None if there was nothing to send."""
             cids = by_node.get(node_id, [])
             with self._lock:
                 # Only what is still queued: a key provided again since the snapshot had its withdrawals cancelled
                 withdrawn = withdrawals.get(node_id, set()) & self._withdrawals.get(node_id, set())
             if not cids and not withdrawn:
-                continue
+                return None
             # Not retried until the next republish whatever the outcome, so it counts as sent either way.
             # The node may hold records of the keys it got before any refusal: those are withdrawn later
             recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
+            return cids, withdrawn, recorded, self.clock()
+
+        parallel = 1 if self.slow_node else PROVIDE_PARALLEL
+        for node_id, outcome in _in_order(sorted(set(by_node) | set(withdrawals)), send, should_stop, parallel):
+            if outcome is None:
+                continue
+            cids, withdrawn, recorded, answered = outcome
             sent_withdrawals[node_id] = withdrawn
-            answered = self.clock()
             with self._lock:
                 for cid in cids:
                     if cid.key not in recorded:
@@ -699,61 +817,95 @@ class Publisher:
             self.save()
             stored = sum(len(nodes) for nodes in accepted.values())
             log(f"published {plural(len(published), 'CID')} ({stored} records on "
-                f"{plural(len(by_node), 'node')}), withdrew {sum(len(k) for k in sent_withdrawals.values())}"
+                f"{plural(len(by_node), 'node')}; {plural(lookups, 'region lookup')}, {finds} extra /find), "
+                f"withdrew {sum(len(k) for k in sent_withdrawals.values())}"
                 + (f"; stopped before sending {plural(len(unfinished), 'CID')} to every node" if unfinished else ""),
                 LOG_VERBOSE)
         return {"published": published, "nodes": sorted(set(by_node) | set(sent_withdrawals)),
-                "withdrawn": sum(len(keys) for keys in sent_withdrawals.values())}
+                "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds}
 
-    def _find_closest(self, cid: ProvidedItem) -> list[bytes]:
-        """Record this node as cid's provider locally, then look up the nodes closest to its key (but this)."""
-        self.providers.store(cid.key, self.own_id)  # providers also record themselves locally
-        return [n for n in self.make_lookup(cid.key).find_closest() if n != self.own_id]
+    def add_store_part(self, part: StorePart):
+        """Also store each due key on the servers part(key, region) gives (the announce first-seen log's senior
+        servers, say), besides its K closest from its region. Called without the lock once the round's lookups are
+        done; it must not do network I/O. A key whose region found no server is stored nowhere (retried soon)."""
+        with self._lock:
+            self._store_parts.append(part)
 
-    def _lookups(self, due: list[ProvidedItem], should_stop: Callable[[], bool]) -> dict[ProvidedItem, list[bytes]]:
-        """{item: its closest nodes} for due's items whose lookup ran, in due's order, so a round's batches are
-        the same however the lookups were run. Called without the lock: refresh() may run meanwhile.
+    def _store_set(self, cid: ProvidedItem, region: Region) -> list[bytes]:
+        """The servers cid is stored on this round: its K closest from region, then each store part's servers, without
+        duplicates or this node; none if the region found no server. Called without the lock."""
+        nodes = [n for n in region.closest_to(cid.key) if n != self.own_id]
+        if not nodes:
+            return []
+        chosen = set(nodes)
+        for part in list(self._store_parts):
+            try:
+                extra = list(part(cid.key, region))
+            except Exception as e:  # noqa: BLE001 - a broken part mustn't stop the K closest being stored to
+                log(f"a store-set part failed for {cid}: {e!r}", LOG_ERROR)
+                continue
+            for node_id in extra:
+                if node_id != self.own_id and node_id not in chosen:
+                    chosen.add(node_id)
+                    nodes.append(node_id)
+        return nodes
+
+    def _sweep(self, due: list[ProvidedItem], should_stop: Callable[[], bool], limit: int | None) -> Sweep:
+        """The regions of due's keys whose lookups ran (dht.sweep), taking keys in due's order: at most limit
+        lookups (None: no limit). Called without the lock: refresh() may run meanwhile.
 
         should_stop() is checked before each lookup starts; one running isn't interrupted. Slow nodes (and a
         single item) look up one at a time; other nodes run up to PUBLISH_LOOKUPS at once on
         rnfs-publish-lookup threads. A lookup that raises starts no more; the exception is raised once those
         running have finished, ending the round as it would one at a time.
         """
+        sweep = Sweep([item.key for item in due], self._region_bits)
+
+        def look_up(key: bytes):
+            """Run the lookup for key and cover its region."""
+            region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits))
+            sweep.cover(region)
+
         if self.slow_node or len(due) < 2 or PUBLISH_LOOKUPS < 2:
-            closest = {}
-            for cid in due:
-                if should_stop():
+            while (limit is None or len(sweep.regions) < limit) and not should_stop():
+                key = sweep.take()
+                if key is None:
                     break
-                closest[cid] = self._find_closest(cid)
-            return closest
-        lock = threading.Lock()
-        pending = iter(range(len(due)))
-        found: dict[int, list[bytes]] = {}
+                look_up(key)
+        else:
+            self._sweep_at_once(sweep, look_up, should_stop)
+        if sweep.regions:
+            self._region_bits = sweep.estimate
+        return sweep
+
+    @staticmethod
+    def _sweep_at_once(sweep: Sweep, look_up: Callable[[bytes], None], should_stop: Callable[[], bool]):
+        """Run sweep's lookups PUBLISH_LOOKUPS at once (_sweep), raising the first exception one raised."""
         ended: list[BaseException | None] = []  # None once stopped, else the exception a lookup raised
 
         def work():
             """Run lookups in turn until none is left, the round is stopped, or one has raised."""
             while True:
-                with lock:
-                    if ended:
-                        return
-                    index = next(pending, None)
-                    if index is None:
-                        return
-                    if should_stop():
-                        ended.append(None)
-                        return
-                try:
-                    nodes = self._find_closest(due[index])
-                except BaseException as e:  # noqa: BLE001 - raised by publish_due once the others finish
-                    with lock:
-                        ended.append(e)
+                if ended or should_stop():
+                    ended.append(None)
+                    sweep.stop()
                     return
-                with lock:
-                    found[index] = nodes
+                key = sweep.take()  # waits while every key left is claimed by a lookup running
+                if key is None:
+                    return
+                if ended or should_stop():
+                    sweep.release(key)
+                    continue
+                try:
+                    look_up(key)
+                except BaseException as e:  # noqa: BLE001 - raised by publish_due once the others finish
+                    ended.append(e)
+                    sweep.release(key)
+                    sweep.stop()
+                    return
 
         threads = [threading.Thread(target=work, name="rnfs-publish-lookup", daemon=True)
-                   for _ in range(min(PUBLISH_LOOKUPS, len(due)))]
+                   for _ in range(PUBLISH_LOOKUPS)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -761,7 +913,6 @@ class Publisher:
         failure = next((e for e in ended if e is not None), None)
         if failure is not None:
             raise failure
-        return {due[index]: found[index] for index in sorted(found)}
 
     def run(self, stop_event: threading.Event, ready: threading.Event | None = None):
         """The publish loop, for a thread of its own: waits for ready (the join), then publishes what's due."""

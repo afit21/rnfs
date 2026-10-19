@@ -135,6 +135,7 @@ rnfs/
     firstseen.py      FirstSeenLog: when each server's announce was first heard; closest old servers (section 6)
     providers.py      ProviderStore: records on disk, TTL, record budget and storage tiers, /find replies (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
+    sweep.py          sweep providing: regions of due keys, the far half's extra /find, Sweep (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
     rates.py          rate estimates, slow links, slow node detection (section 2); the /blocks size rules both
@@ -430,7 +431,26 @@ with at least one provider, and `listers(provider)` those that listed a given pr
 tell who vouches for its candidates (and the fetcher whose answers led to a provider that served). `on_useful(id)`
 (local scores): a run notes which node's answer first named each node (`introduced`); when a node answers that is
 closer to the key than the node that named it, that node is passed to `on_useful`, once per lookup (`_useful`,
-`_credit`).
+`_credit`). For sweep providing, `candidates()` gives every node `find_closest` chooses from (`_choices`), with
+whether it ranks last, plus the answers that came after the run ended (a run that completes leaves queries out;
+the workers keep every answer about the key in `_replies`), and `ask(node, key)` sends one more `/find` about a
+nearby key within the deadline, counted through `on_answer`/`on_failure` (a node still out at the deadline stays
+out of the candidates, `_out`) and merging the nodes it names.
+
+`sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
+the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when
+`members(p)` (due keys sharing it) is 2 or more, calls `explore`: breadth first over parts of the region, starting
+with the far half, it asks the candidate nearest each part's centre (`ask`, unreliable ones last) about that
+centre; a reply naming `K` servers inside the part queues its two halves; a server outside the part hands over to
+the one it named inside it (its bucket holding the part may have been full); a part gives up after
+`REGION_FIND_TRIES` (3) unanswered; at most `MAX_REGION_FINDS` (7) in all. `Region` holds the key, p, the
+lookup's result, every candidate learned and the finds; `closest_to(key)` ranks the candidates for any key in it
+(`heapq.nsmallest` by (unreliable, distance); never fewer than the lookup found for its own key). `Sweep(keys,
+estimate)` is one round's bookkeeping, under a condition: `take()` gives the next key in the given order that is
+neither covered nor inside a claim and claims the keys sharing `estimate − 1` of its bits (everything before any
+region is known, so the first lookup runs alone), waiting while every key left is claimed; `cover(region)` covers
+the region's uncovered keys (a bisect over the sorted keys), releases the claim and updates `estimate`;
+`members`, `release`, `stop`.
 
 `scores.py` — `Scores(state_dir=None, seeded=(), clock=time.time, max_rows=MAX_SCORES)`, a `node.Store`:
 `score(node_id)` (0 without a row), `band(node_id)`, `bands()`, and `served`, `useful_answer`, `failed`,
@@ -450,16 +470,17 @@ blocks and `useful_answer` once per fetch for each of its lookup's `listers` of 
 `firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
 `heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
 table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
-exclude)`: the count closest to key of the servers first heard at least min_age ago (publishers and searchers will
-pass `provider_seniority`), not excluded (`exclude` runs under the log's lock). Memory: an `OrderedDict` node ID ->
-first heard, least recently heard first (a heard moves to the end; past `MAX_FIRST_SEEN`, 65,536, the front is
-forgotten), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a new server at
-65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a contiguous run
-of the sorted list, all closer to the key than any outside it: `closest` binary-searches the narrowest run holding
-count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old enough, and ranks only that
-run (about 20 µs at 65,536). Saved in `announce_first_seen` through a SNAPSHOT `RowStore`: an announce only marks
-its row, and a row's `last_heard` is the time of the save writing it (within 30 s of the announce), which only
-orders forgetting after a restart.
+exclude, heard_within=None)`: the count closest to key of the servers first heard at least min_age ago (publishers
+and searchers pass `provider_seniority`), heard within `heard_within` seconds if given, not excluded (`exclude` runs
+under the log's lock). Memory: an `OrderedDict` node ID -> first heard, least recently heard first (a heard moves to
+the end; past `MAX_FIRST_SEEN`, 65,536, the front is forgotten), a dict node ID -> last heard (loaded as the
+`last_heard` the save wrote), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a
+new server at 65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a
+contiguous run of the sorted list, all closer to the key than any outside it: `closest` binary-searches the
+narrowest run holding count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old
+enough, and ranks only that run (about 20 µs at 65,536). Saved in `announce_first_seen` through a SNAPSHOT
+`RowStore`: an announce only marks its row, and a row's `last_heard` is the time of the save writing it (within 30 s
+of the announce), which orders forgetting and is the last-heard time after a restart.
 
 ## Network layer interfaces
 
@@ -567,20 +588,36 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
-`fetcher.py`: `Fetcher.open(root, names, from_node, pinned)` gives a `Fetch` context (a protection session)
-with `resolve()`, `fetch_dag()`, `fetch_listing()`, `read_range()`; `publisher.py`: `Publisher.refresh()`
-(recompute the provide set, withdraw at once; skipped when the node's generation, the deny list, the key
-sources' keys and the strategy are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the
-first `refresh()` only after the features have registered their key sources, so a restart doesn't withdraw
-kept names' keys. `publish_due` republishes `DhtKey`s every max(effective `republish_interval`, 3 days)
-with a per-key ±10% jitter (capped below `PROVIDER_TTL / 2`), drops a withdrawal of any key it provides to
-the same node in that round, runs up to `PUBLISH_LOOKUPS` (4) lookups at once, keeping the batches one at a
-time would build, and on slow nodes runs one lookup at a time, at most 10 per round, waiting 30 s × the
-round's lookups before the next (never-published items first, then the longest unpublished). When
-`refresh()` finds a key provided again, it cancels that key's queued withdrawals (their nodes join its earlier
-nodes) and re-records the node's own record, and a round sends only withdrawals still queued when it reaches
-each node, so a withdrawal queued while the key was briefly unprovided never follows a store of it.
-`protocol.provide_batches` puts withdrawals before stores, and a key in both lists is only stored.
+`fetcher.py`: `Fetcher.open(root, names, from_node, pinned)` gives a `Fetch` context (a protection session) with
+`resolve()`, `fetch_dag()`, `fetch_listing()`, `read_range()`; `publisher.py`: `Publisher.refresh()` (recompute the
+provide set, withdraw at once; skipped when the node's generation, the deny list, the key sources' keys and the
+strategy are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the first `refresh()` only
+after the features have registered their key sources, so a restart doesn't withdraw kept names' keys. `publish_due`
+republishes `DhtKey`s every max(effective `republish_interval`, 3 days) with a ±10% jitter fixed by the key's first
+byte (`key_interval`: 256 slots, so a region's keys come due together; capped below `PROVIDER_TTL / 2`), drops a
+withdrawal of any key it provides to the same node in that round, and finds the K closest by sweep providing
+(`_sweep` over `dht.sweep`): due items in urgency order (never published first, then the longest unpublished), one
+lookup per region, up to `PUBLISH_LOOKUPS` (4) at once on `rnfs-publish-lookup` threads (`_sweep_at_once`), the
+batches built in due order whatever order the regions finished in; on slow nodes one region lookup at a time, at
+most 10 per round, waiting 30 s × the round's lookups before the next. Slow nodes pace withdrawals with them: a
+server only withdrawals reach counts as a lookup (those with the most keys queued first; while any are queued, the
+round's lookups are limited to leave up to 5 for them), the others stay queued, and `next_due` counts queued
+withdrawals as due only once the pacing allows; other nodes send them all at once. `_region_bits` carries the last
+region's p to the next round. Each item's store set (`_store_set`) is its K closest from its region
+(`Region.closest_to`), then each part added by `add_store_part(part)`, a `(key, region) -> servers` called without
+the lock after the lookups (the node adds `_senior_servers`: `first_seen.closest(key, K, min_age=provider_seniority,
+exclude=banned or, in private mode, not a member, heard_within=2 × announce_interval)`), without duplicates; an item
+whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The round's result counts `lookups`
+and `finds` (extra `/find`). The `/provide`s go to up to `PROVIDE_PARALLEL` (16) servers at once on
+`rnfs-publish-provide` threads (one at a time, in the publishing thread, on slow nodes): `_in_order` runs `send`
+(which reads the withdrawals still queued for the server under the lock, then calls `client.provide`, one identified
+link and the batches in order) and yields the outcomes in server order, so the publishing thread records them, and
+saves every 10 servers or 30 s, as one at a time would. A stop or an exception starts no more; those in flight
+finish and are recorded before the exception is raised. When `refresh()` finds a key provided again, it cancels that
+key's queued withdrawals (their nodes join its earlier nodes) and re-records the node's own record, and a round
+sends only withdrawals still queued when it reaches each node, so a withdrawal queued while the key was briefly
+unprovided never follows a store of it. `protocol.provide_batches` puts withdrawals before stores, and a key in both
+lists is only stored.
 
 Errors (`errors.STATUSES`, the one table: `api.ERROR_STATUSES` is it, `apiclient.STATUS_ERRORS` and the gateway's
 `ERROR_MESSAGES` follow it): `ValueError` → 400 (with `BlockMismatch`, `SealError` and `NotRecipient`, which
@@ -1552,7 +1589,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
 | `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
-| `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's lookups (up to 4 at once, ended with the round; none on slow nodes) |
+| `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
 | `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
@@ -1741,12 +1778,13 @@ Everything in the specification is implemented, with these simplifications and a
   checks `RoutingTable.live_count()` every `REJOIN_DELAY` (300 s) and joins again while it is under
   `MIN_SERVERS` (3), doubling the wait up to `announce_interval`. `DEFAULT_BOOTSTRAP_NODES` lives in
   `rnfs/constants.py` and changes only with a release; the e2e test turns it off (`default_bootstrap = false`).
-- Publishing runs up to 4 closest-nodes lookups at once (`PUBLISH_LOOKUPS`, on `rnfs-publish-lookup` threads);
-  slow nodes run them one at a time. Lookups aren't shared between keys that have the same closest nodes, but
-  `/provide` requests are batched per node, in the same batches one at a time would build. The airtime controls
-  apply to `/blocks` only, and overlapping lookups send the same `/find` messages. Slow nodes pace these
-  lookups (at most 10 per round, 30 s per lookup on average), which only delays republishing; withdrawals
-  are sent at once.
+- Publishing runs one closest-nodes lookup per region of due keys (sweep providing), up to 4 at once
+  (`PUBLISH_LOOKUPS`, on `rnfs-publish-lookup` threads), and sends `/provide` to up to 16 servers at once
+  (`PROVIDE_PARALLEL`); slow nodes do both one at a time. `/provide` requests are batched per node, in the same
+  batches one at a time would build. The airtime controls apply to `/blocks` only. Slow nodes pace region lookups
+  and the servers only withdrawals reach (at most 10 per round, 30 s each on average), which only delays
+  republishing and withdrawing; other nodes send withdrawals at once. A region's placement is as good as its
+  lookup: a lookup that misses one of x's closest servers misses it for the region's keys near x too.
 - Withdrawals are sent once, with any provides due for the same node. One that fails isn't retried, since the
   record expires after `PROVIDER_TTL`. A CID is withdrawn from the nodes of its last round and from nodes of
   earlier rounds, or of a round cut short, that may still hold its record (`Publisher._earlier`, persisted in

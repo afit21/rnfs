@@ -699,19 +699,44 @@ differently. A score can be earned quickly by serving popular blocks, so it neve
   before any raised); a peer without a score scores 0, so forgetting is always safe;
 - saves them, with wall-clock times, a time in the future when loaded counting as now.
 
-**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in
-server mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock
-times; one in the future when loaded counts as now). Identities generated next to a key can't be old ones, so
-among the servers near a key, those first heard at least `provider_seniority` ago were there before any such
-identity was made for it; the log gives the `K` closest of them to a key. It is local state: nothing about it is
-sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting the least
-recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only servers
-silent longer than every one of them; announces are recorded in memory and written together every 30 s.
+**Announce first-seen log.** A node SHOULD record when it first heard each server's `rnfs.dht` announce in server
+mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock times; one
+in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
+near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
+the log gives the `K` closest of them to a key, which publishers also store to (below). It is local state: nothing
+about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting
+the least recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only
+servers silent longer than every one of them; announces are recorded in memory and written together every 30 s.
 
 **Publishing.**
-- For each key, find the `K` closest nodes. Then send each node the keys it should store, in as few `/provide`
-  requests as the batch size allows (section 3), one at a time over a separate identified link closed
-  afterwards.
+- For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node
+  the keys it should store, in as few `/provide` requests as the batch size allows (section 3), one at a time
+  over a separate identified link closed afterwards. A publisher MAY send to several nodes at once, each over its
+  own link and in its own order (rnfs: up to 16 on nodes that aren't slow; a slow node one at a time).
+- **The store set.** A node SHOULD store each key on its `K` closest found as above, and also on the `K` servers
+  closest to the key in its announce first-seen log that it first heard at least `provider_seniority` ago (rnfs:
+  and has heard within 2 × `announce_interval`, as `/find` replies leave out servers silent that long; not banned;
+  in private mode, members only). Without an attack these are mostly the same servers, so it costs little; against
+  identities generated next to a key it keeps the record where they can't take its place. A key's store set is the
+  union, without duplicates; every server stored to is recorded, so withdrawals reach all of them. A key whose
+  lookup found no server isn't stored this round (rnfs: retried 30 s later).
+- **Sweep providing** finds the `K` closest of many keys with one lookup per *region*. It is local behaviour:
+  only which `/find` queries a publisher sends changes, and how it groups its `/provide`s. Take the due keys in
+  turn; for the first not yet covered, x, run the closest-nodes lookup. Let p be the length of the prefix x shares
+  with the farthest of the `K` closest found (of all found with fewer; 0 with none): the region is every due key
+  sharing x's first p bits. Every server closer to x than that one shares those bits, so a region holds at least
+  `K` servers and each of its keys has its `K` closest inside it. The lookup knows the half of the region holding
+  x; if the region holds 2 or more due keys, ask the known server nearest the centre of the other half about that
+  centre (`/find`), and while a reply names `K` servers inside the part asked about, ask about each half of it
+  too. Each key of the region then takes the `K` closest of every server learned, ranked as the lookup ranks them.
+  rnfs sends at most 7 such `/find` a region, and a server outside the part it was asked about hands over to the
+  one it names nearest the centre inside it (its routing table may hold only some of the part). Over a simulated
+  network of 2000 servers (Kademlia routing tables), this placed every record on its true `K` closest, against
+  about 97% for a lookup per key, for about 1.6 extra `/find` a region; a round needs about servers ÷ 12.5 lookups
+  however many keys are due (1M keys on 10,000 servers: about 800 lookups instead of 1M). rnfs takes the due keys
+  never published first, then those unpublished longest, and on nodes that aren't slow runs up to 4 lookups at
+  once, each claiming the keys sharing one bit fewer than the last region's p so that lookups running together
+  seldom find the same region.
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
   refused or failed store isn't retried until the next republish. A responder may have recorded some keys of
@@ -727,8 +752,13 @@ silent longer than every one of them; announces are recorded in memory and writt
   is providing to that node in the same round, and cancels the withdrawals still queued for a key when it
   provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
-  (rnfs: at most 10 per publish round, and after a round of n lookups the next waits 30 × n s; items never
-  published go first, then those unpublished longest). Withdrawals are not delayed by this.
+  (rnfs: at most 10 region lookups per publish round, each publishing every due key of its region, and after a
+  round of n lookups the next waits 30 × n s; items never published go first, then those unpublished longest).
+  It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
+  unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
+  rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server
+  only withdrawals reach as one of the round's 10 lookups (those with the most keys queued first; while any are
+  queued, up to 5 of the 10 are kept for them). Other nodes send withdrawals at once.
 
 **Provider records.**
 - `/provide` records the identified requester's node ID as a provider; a node can only advertise itself.
@@ -774,8 +804,9 @@ silent longer than every one of them; announces are recorded in memory and writt
   record out of its own store.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
-  max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
-  don't come due at once; the jittered interval stays below `PROVIDER_TTL / 2`.
+  max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key's first byte, so
+  many keys don't come due at once (256 slots) while keys sharing their leading bits come due together (the
+  same servers are closest to them); the jittered interval stays below `PROVIDER_TTL / 2`.
 - **Provide strategy** (`provide_strategy`):
   - `roots` (default) provides every complete pin, and every complete fetched target while it is cached
     (so at most `max_storage` of downloads at a time). That is every complete download, whatever the command:
