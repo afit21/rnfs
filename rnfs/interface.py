@@ -600,8 +600,8 @@ class Rnfs:
 
     def get(self, target, output, *, from_node=None, raw: bool = False, no_extract: bool = False) -> Written:
         """Fetch a file or directory and write it to output (a path that must not exist), all in this call. A
-        sealed file this node can open is decrypted unless raw, and a sealed folder (a sealed .tar holding a valid
-        tar) unpacked to a directory unless no_extract (Written.extracted; a daemon older than 0.2.0 never unpacks).
+        sealed file this node can open is decrypted unless raw, and a sealed folder (as add seals a folder; a tar
+        sealed as a file stays one) unpacked to a directory unless no_extract (Written.extracted; a daemon older than 0.2.0 never unpacks).
         Raises the fetch errors (NotFound, TooLarge, InvalidDag, Denied, StorageFull, Busy), ValueError (output
         exists), OSError."""
         self._check()

@@ -477,6 +477,11 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
   names and tree visible): the folder is packed as one plain tar (POSIX pax) and that tar is sealed with the
   sealed name `<folder>.tar`. The format above is unchanged, so a reader that only decrypts (rnfs 0.1.x) gets a
   tar file it can unpack itself.
+  - **Marker.** The tar's first header MUST be a pax global extended header (typeflag `g`) holding exactly one
+    record, the POSIX keyword `comment` with the value `rnfs sealed folder` (the record
+    `30 comment=rnfs sealed folder\n`). This is how a sealed folder is recognised: a tar sealed as a file (by
+    rnfs 0.1.x, or `add --to backup.tar` now) has no such first header and stays a file. Extractors ignore
+    `comment`, so the marker adds no file and no warning (checked with GNU tar and Python's `tarfile`).
   - Every member is under one top directory named after the folder (`<folder>/…`), so extracting the tar
     creates nothing else in the directory it is extracted in. Each directory comes before what it holds.
   - The folder is walked with `add`'s rules: hidden files included; symlinks, devices, sockets, FIFOs, names
@@ -497,8 +502,11 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
     recipients, and the approximate total size (the tar's: the files' sizes rounded up to 512 bytes, plus at
     least 512 bytes per entry), which says roughly how much the folder holds.
   - **Unpacking.** `get` by a recipient unpacks a sealed file only if its sealed name ends in `.tar` (after at
-    least one character) and its plaintext is a valid tar; anything else, including a `.tar`-named file that
-    isn't one, is written as the file, as for any sealed file (with a warning for the latter). Unpacking
+    least one character), its plaintext starts with the marker (as its first header; a marker anywhere else,
+    or with other records, doesn't count) and its plaintext is a valid tar. Anything else is written as the
+    file, as rnfs 0.1.6 writes any sealed file, byte for byte: an unmarked tar (the normal case for a sealed tar
+    file) without a warning, a marked one that isn't a valid tar with one. `info` tells a recipient whether a
+    sealed file is a sealed folder (rnfs: `sealed_folder`). Unpacking
     applies both existing rule sets unchanged: the plaintext is read as `POST /api/add/stream?format=tar` reads
     an upload (regular files and directories only; symlinks, hard links, devices, FIFOs, absolute paths, `..`
     components and invalid names skipped with a warning; a later member replacing an earlier one of the same
@@ -1262,7 +1270,7 @@ are local conveniences, not part of the protocol.
 | Command | Does |
 |---|---|
 | `add <path>\|- [--wrap] [--only-hash] [--name N] [--no-pin] [--to <recipient>…] [--to-self] [--no-sealed-name] [--chunker fixed\|fastcdc] [--background]` | Import a file, a directory or stdin, pin it with source `user`, print its CID. `--wrap` puts it in a directory; `--only-hash` just prints the CID; `--no-pin` keeps it as cache (section 8); `--to` seals it for recipients (section 5, Sealed files; a directory as one tar named `<directory>.tar`); `--chunker fastcdc` uses content-defined chunks (section 5); `--background` adds a path as an `add` job (below) and prints its ID |
-| `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw] [--no-extract]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; a sealed folder (a sealed `.tar` holding a valid tar) is unpacked to a directory (section 5, Unpacking), named without `-o` (for a bare CID, or a path ending in `.tar`) after its top directory by the same rule; `--no-extract` writes it as the decrypted `.tar` instead; `--raw` writes the stored bytes |
+| `get <cid>[/path] [-o out] [--from <node ID>] [--background] [--raw] [--no-extract]` | Fetch and write out a file or directory. Without `-o` the output is, in the current directory, the target's last path name if it is printable, not hidden (no leading `.`), doesn't start with `-` (which a later command would read as an option) and is a valid file name here, else its root CID. A sealed file this node is a recipient of is decrypted, and without `-o` (for a bare CID) written under its sealed name by the same rule; a sealed folder (a sealed `.tar` starting with the sealed-folder marker, section 5) is unpacked to a directory (section 5, Unpacking), named without `-o` (for a bare CID, or a path ending in `.tar`) after the folder by the same rule, while a tar sealed as a file is written as that file; `--no-extract` writes it as the decrypted `.tar` instead; `--raw` writes the stored bytes |
 | `cat <cid>[/path] [--offset N] [--length N] [--raw] [--block]` | Fetch and write a file, or part of one, to stdout; sealed files are decrypted as by `get` (only the segments covering the range), a sealed folder giving its tar (never unpacked); `--raw` writes the stored (encrypted) bytes, which is what scripts that show content to others must use; `--block` writes the CID's own block |
 | `ls <cid>[/path]` | List a directory: name, kind, size, CID |
 | `stat <cid>[/path]` | Size, block count, and how much is held locally |

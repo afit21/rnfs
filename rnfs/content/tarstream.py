@@ -454,6 +454,43 @@ def chunks(members: list[Member], get: walker.Get, mtime: int, max_entries: int)
 
 # Packing a folder on this machine (a sealed folder: `rnfs add --to <recipient> <folder>`)
 
+# A sealed folder's tar starts with a pax global header holding only this POSIX `comment`, which extractors ignore
+# (so `tar xf` of 0.1.x recipients extracts nothing more). It tells a tar rnfs packed from a tar file someone
+# sealed: only a marked tar is unpacked by get, so a tar sealed as a file before 0.2.0 still comes back as one.
+FOLDER_MARKER = "rnfs sealed folder"
+MARKER_PEEK = 2 * BLOCK  # the plaintext bytes folder_marker takes, and is_marked reads
+
+
+def folder_marker() -> bytes:
+    """The sealed-folder marker: a pax global header (typeflag g) of one record, `comment=` FOLDER_MARKER."""
+    return tarfile.TarInfo.create_pax_global_header({"comment": FOLDER_MARKER})
+
+
+def is_marked(head: bytes) -> bool:
+    """True if a tar's first bytes (at least MARKER_PEEK of them) are the sealed-folder marker: its first header is a
+    pax global header whose records are exactly `comment=` FOLDER_MARKER. A marker anywhere else, or with other
+    records, doesn't count."""
+    if len(head) < BLOCK:
+        return False
+    try:
+        info = tarfile.TarInfo.frombuf(head[:BLOCK], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return False
+    if info.type != tarfile.XGLTYPE or not 0 < info.size <= len(head) - BLOCK:
+        return False
+    records, payload = [], head[BLOCK:BLOCK + info.size]
+    while payload:
+        # A pax record is "<length> <keyword>=<value>\n", length counting the whole record
+        length = payload.partition(b" ")[0]
+        if not length.isdigit() or not 0 < int(length) <= len(payload):
+            return False
+        record, payload = payload[:int(length)], payload[int(length):]
+        keyword, equals, value = record[len(length) + 1:].partition(b"=")
+        if not equals or not value.endswith(b"\n"):
+            return False
+        records.append((keyword, value[:-1]))
+    return records == [(b"comment", FOLDER_MARKER.encode())]
+
 
 def fixed_height(size: int) -> int:
     """The height of the DAG fixed chunking builds for a file of size bytes (builder.build_file): 0 for one chunk or
@@ -509,7 +546,8 @@ def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int,
     break the name rules, and entries that change while being opened skipped with a warning (warn(text)); a file
     with other hard links read as any file (no hard-link members, which build_tar would skip). Names a tar
     shouldn't hold (safe_name) are skipped with a warning too, as the writer of a stored DAG skips them. Members as
-    that writer makes them (_header_of: PAX, 0755/0644, dated mtime, now if None).
+    that writer makes them (_header_of: PAX, 0755/0644, dated mtime, now if None), after the sealed-folder marker
+    (folder_marker), which is how a recipient's get knows to unpack it.
 
     The tar must unpack (build_tar) where it is sent, so it is refused (TooLarge, possibly once some of it has been
     read) past max_entries files and directories, the top one included, or if the DAG of its tree, one level above
@@ -524,6 +562,9 @@ def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int,
         raise ValueError(f"{builder.display_path(top)!r} holds a character some extractors read as a path separator")
     packing = _Packing(max_entries, warn, progress, int(time.time()) if mtime is None else mtime)
     listing = builder.list_directory(handle)
+    marker = folder_marker()
+    packing.written += len(marker)
+    yield marker
     # The tar's root, made by whoever unpacks it, is depth 1: top is 2
     yield from _pack_directory(handle, listing, path, top, 2, packing)
     end = 2 * BLOCK + _padding(packing.written + 2 * BLOCK, RECORD)

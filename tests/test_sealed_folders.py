@@ -24,6 +24,8 @@ from tests.support import real, state_rows, wait_for
 from tests.test_seal import ALICE, BOB, open_all
 from tests.test_tar_stream import END, Blocks, files_of, member
 
+MARK = tarstream.folder_marker()  # what makes a sealed .tar a sealed folder that get unpacks
+
 
 def make_folder(top: str) -> str:
     """A nested folder: files in three levels (a hidden one, an executable, an empty one, one of several segments)
@@ -219,28 +221,54 @@ class GetSealedFolderTest(SealedFolderBase):
         with open(raw, "rb") as f:
             self.assertTrue(seal.is_sealed(f.read()))
 
-    def test_a_tar_name_without_a_tar_is_written_as_the_file(self):
-        """A .tar-named sealed file whose plaintext isn't a valid tar (anything at all; a tar with data after its
-        end) is written as the file, as before, with a warning; whatever was built meanwhile is collected."""
-        good = member("top/f", b"inside") + END
-        for i, data in enumerate((b"just some text", os.urandom(3 * SEGMENT_SIZE), good + b"trailing junk",
-                                  good[:-700])):
-            cid = self.seal_tar(data)
-            out = os.path.join(self.tmp.name, f"out{i}")
-            result = self.b.get(cid, out)
-            self.assertNotIn("extracted", result)
-            self.assertEqual((result["name"], len(result["warnings"])), ("x.tar", 1), result)
+    def assert_written_as_the_file(self, data: bytes, name: str = "x.tar", warned: bool = False) -> str:
+        """Seal data under name, get it on B: written as the file, byte-identical to what was sealed (with a warning
+        only if warned); the blocks of anything built meanwhile are gone. Its CID."""
+        cid = self.seal_tar(data, name)
+        out = os.path.join(self.tmp.name, f"out-{cid[-12:]}")
+        result = self.b.get(cid, out)
+        self.assertNotIn("extracted", result)
+        self.assertEqual(len(result["warnings"]), int(warned), result)
+        if warned:
             self.assertIn("isn't a valid tar", result["warnings"][0])
-            with open(out, "rb") as f:
-                self.assertEqual(f.read(), data)
-            self.assert_plaintext_gone(cid)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), data)
+        self.assert_plaintext_gone(cid)
+        return cid
+
+    def test_a_tar_sealed_as_a_file_stays_a_file(self):
+        """A valid tar sealed under x.tar without the sealed-folder marker (as `add --to backup.tar` made one with
+        0.1.x, or makes one now) is written as the file, byte-identical, with no warning: the normal case."""
+        good = member("top/f", b"inside") + END
+        cid = self.assert_written_as_the_file(good)
+        self.assertFalse(self.b.info(cid)["sealed_folder"])
+        self.assert_written_as_the_file(b"".join([member("a", b"1"), member("b", b"2")]) + bytes(20 * 512))
+        self.assert_written_as_the_file(b"just some text")
+
+    def test_only_a_first_member_marker_counts(self):
+        """The marker must be the tar's first header, holding only its comment: one later in the tar, one with other
+        records, or another comment, leaves the tar a file."""
+        good = member("top/f", b"inside") + END
+        self.assert_written_as_the_file(member("top/f", b"inside") + MARK + END)
+        for records in ({"comment": tarstream.FOLDER_MARKER, "path": "x"}, {"comment": "rnfs sealed folder!"},
+                        {"path": "rnfs sealed folder"}):
+            self.assert_written_as_the_file(tarfile.TarInfo.create_pax_global_header(records) + good)
+        cid = self.seal_tar(MARK + good)
+        self.assertTrue(self.b.info(cid)["sealed_folder"])
+        result = self.b.get(cid, os.path.join(self.tmp.name, "marked"))
+        self.assertEqual((result["extracted"], files_of(os.path.join(self.tmp.name, "marked"))),
+                         (True, {"f": (b"inside", False)}))
+
+    def test_a_marked_tar_that_isnt_valid_is_written_as_the_file(self):
+        """A marked .tar-named sealed file whose plaintext isn't a valid tar (data after its end, cut short,
+        garbage) is written as the file, with a warning; whatever was built meanwhile is collected."""
+        good = member("top/f", b"inside") + END
+        for data in (MARK + good + b"trailing junk", MARK + good[:-700], MARK + os.urandom(3 * SEGMENT_SIZE)):
+            self.assert_written_as_the_file(data, warned=True)
             self.assertFalse(self.b.storage.has(Cid.for_block(RAW, b"inside")))  # built before the junk was met
-        # Unpacked only for a name ending in .tar
-        cid = self.seal_tar(good, "x.tgz")
-        result = self.b.get(cid, os.path.join(self.tmp.name, "tgz"))
-        self.assertEqual((result["name"], result["warnings"], result.get("extracted")), ("x.tgz", [], None))
-        cid = self.seal_tar(good, ".tar")
-        self.assertNotIn("extracted", self.b.get(cid, os.path.join(self.tmp.name, "dot-tar")))
+        # Unpacked only for a name ending in .tar, after at least one character
+        self.assert_written_as_the_file(MARK + good, "x.tgz")
+        self.assert_written_as_the_file(MARK + good, ".tar")
 
     def test_unsafe_members_are_skipped(self):
         """Traversal, absolute paths, links, devices and FIFOs never reach the disk (build_tar's rules), and names
@@ -252,7 +280,7 @@ class GetSealedFolderTest(SealedFolderBase):
                    member("top/fifo", type=tarfile.FIFOTYPE), member("top/sub/deep", b"deep", mode=0o4755)]
         if os.name == "nt":
             members.append(member("top/con", b"x"))
-        cid = self.seal_tar(b"".join(members) + END)
+        cid = self.seal_tar(MARK + b"".join(members) + END)
         out = os.path.join(self.tmp.name, "out")
         result = self.b.get(cid, out)
         self.assertEqual((result["extracted"], result["name"]), (True, "top"))
@@ -266,8 +294,8 @@ class GetSealedFolderTest(SealedFolderBase):
     def test_duplicate_entries(self):
         """A path given twice is the later member (tar's own rule, as build_tar has it); a member conflicting with
         what is there as the other type is skipped."""
-        data = b"".join([member("top/f", b"first"), member("top/f", b"second"), member("top/d", type=tarfile.DIRTYPE),
-                         member("top/d", b"a file over a directory")]) + END
+        data = MARK + b"".join([member("top/f", b"first"), member("top/f", b"second"),
+                                member("top/d", type=tarfile.DIRTYPE), member("top/d", b"a file over a directory")]) + END
         out = os.path.join(self.tmp.name, "out")
         result = self.b.get(self.seal_tar(data), out)
         self.assertEqual(len(result["warnings"]), 1)
@@ -277,19 +305,18 @@ class GetSealedFolderTest(SealedFolderBase):
         """A tar holding several entries (or a file alone) is unpacked whole, as a directory named as the sealed
         name without .tar."""
         out = os.path.join(self.tmp.name, "out")
-        result = self.b.get(self.seal_tar(member("a", b"1") + member("b/c", b"2") + END, "several.tar"), out)
+        result = self.b.get(self.seal_tar(MARK + member("a", b"1") + member("b/c", b"2") + END, "several.tar"), out)
         self.assertEqual((result["extracted"], result["name"]), (True, "several"))
         self.assertEqual(files_of(out), {"a": (b"1", False), "b/": None, "b/c": (b"2", False)})
-        result = self.b.get(self.seal_tar(member("only", b"1") + END, ".hidden.tar"), os.path.join(self.tmp.name, "o"))
+        result = self.b.get(self.seal_tar(MARK + member("only", b"1") + END, ".hidden.tar"),
+                            os.path.join(self.tmp.name, "o"))
         self.assertEqual((result["extracted"], result["name"]), (True, None))  # not a name to write without asking
-        result = self.b.get(self.seal_tar(END, "empty.tar"), os.path.join(self.tmp.name, "empty"))
-        self.assertEqual((result["extracted"], os.listdir(os.path.join(self.tmp.name, "empty"))), (True, []))
 
     def test_limits(self):
         """Too many entries or too deep: refused (pointing at --no-extract), nothing written, the blocks
         collected; --no-extract still writes the tar."""
-        deep = member("/".join(["d"] * (MAX_DEPTH + 1)), b"x") + END
-        many = b"".join(member(f"top/f{i}", b"x") for i in range(6)) + END
+        deep = MARK + member("/".join(["d"] * (MAX_DEPTH + 1)), b"x") + END
+        many = MARK + b"".join(member(f"top/f{i}", b"x") for i in range(6)) + END
         self.b.config.max_output_entries = 5
         for i, data in enumerate((deep, many)):
             cid = self.seal_tar(data)
@@ -419,15 +446,37 @@ class SealedFolderCliTest(SealedFolderBase):
         code, out, err = self.run_cli("add", top, "--to-self", "--wrap")
         self.assertEqual(code, 0, err)
         self.assertEqual(real(self.get(f"{out.strip()}/photos.tar")), real(os.path.join(self.downloads, "photos")))
+        self.assertEqual(files_of(os.path.join(self.downloads, "photos")), files_of(top))
+
+    def test_a_tar_sealed_as_a_file_keeps_its_name(self):
+        """A real tar file sealed (no marker) comes back as that file, under the name it has, by CID or by path."""
+        backup = os.path.join(self.tmp.name, "backup.tar")
+        with open(backup, "wb") as f:
+            f.write(member("top/f", b"inside") + END)
+        code, out, err = self.run_cli("add", backup, "--to-self", "--wrap")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(real(self.get(f"{out.strip()}/backup.tar")), real(os.path.join(self.downloads, "backup.tar")))
+        os.remove(os.path.join(self.downloads, "backup.tar"))
+        cid = self.b.add_path(backup, to_self=True)["cid"]
+        self.assertEqual(real(self.get(cid)), real(os.path.join(self.downloads, "backup.tar")))
+        with open(os.path.join(self.downloads, "backup.tar"), "rb") as f, open(backup, "rb") as g:
+            self.assertEqual(f.read(), g.read())
 
     def test_a_daemon_without_jobs(self):
-        """Without the job manager the CLI asks for the sealed name first and drops .tar when unpacking."""
+        """Without the job manager the CLI asks for the sealed name first and drops .tar for a sealed folder it
+        unpacks, not for a tar sealed as a file."""
         cid = self.b.add_path(make_folder(os.path.join(self.tmp.name, "photos")), to_self=True)["cid"]
+        backup = os.path.join(self.tmp.name, "backup.tar")
+        with open(backup, "wb") as f:
+            f.write(member("top/f", b"inside") + END)
+        tar_cid = self.b.add_path(backup, to_self=True)["cid"]
         with mock.patch.object(jobs, "has_jobs", return_value=False):
             self.assertEqual(real(self.get(cid)), real(os.path.join(self.downloads, "photos")))
             self.assertEqual(real(self.get(cid, "--no-extract")), real(os.path.join(self.downloads, "photos.tar")))
+            self.assertEqual(real(self.get(tar_cid)), real(os.path.join(self.downloads, "backup.tar")))
         self.assertTrue(os.path.isdir(os.path.join(self.downloads, "photos")))
         self.assertTrue(tarfile.is_tarfile(os.path.join(self.downloads, "photos.tar")))
+        self.assertTrue(os.path.isfile(os.path.join(self.downloads, "backup.tar")))
 
 
 if __name__ == "__main__":

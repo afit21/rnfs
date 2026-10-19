@@ -3,8 +3,8 @@
 - `add --no-pin`: what was added is kept as a cached fetch instead of a "user" pin (keep_added).
 - Sealed files (rnfs/content/seal.py): resolving recipients to public keys, sealing a file being added,
   and opening a sealed target with the node's identity for get, cat and info. Sealed folders: a folder being
-  added is sealed as one tar named `<folder>.tar` (add_sealed_path), and get unpacks a sealed `.tar` that is a
-  valid tar (get_sealed, unpack_sealed).
+  added is sealed as one tar named `<folder>.tar`, marked as a sealed folder (add_sealed_path), and get unpacks a
+  sealed `.tar` only with that mark (is_sealed_folder, get_sealed, unpack_sealed).
 - Gateway formats: a CID's own block (?format=raw) and a target's archive streamed with its exact length
   (?format=archive, and GET /api/export/stream); a target as a tar streamed the same way (GET /api/get/stream).
 
@@ -180,15 +180,15 @@ def is_recipient(node, sealed: seal.SealedFile) -> bool:
 
 def sealed_info(node, info: dict, sealed: seal.SealedFile | None) -> dict:
     """A file's info, plus when it is sealed (sealed, as open_sealed opened it without unlocking) "sealed",
-    "recipient" and "stored_size", and when this node is a recipient its plaintext "size" and sealed "name"
-    (sealed is then unlocked)."""
+    "recipient" and "stored_size", and when this node is a recipient its plaintext "size", sealed "name" and
+    "sealed_folder" (is_sealed_folder: get would unpack it) (sealed is then unlocked)."""
     if sealed is None:
         return info
     recipient = is_recipient(node, sealed)
     info = {**info, "sealed": True, "recipient": recipient, "stored_size": info["size"]}
     if recipient:
         unlock_sealed(node, sealed)
-        info.update(size=sealed.size, name=sealed_name(sealed))
+        info.update(size=sealed.size, name=sealed_name(sealed), sealed_folder=is_sealed_folder(sealed))
     return info
 
 
@@ -236,14 +236,26 @@ def is_tar_name(name: str | None) -> bool:
     return isinstance(name, str) and len(name) > len(TAR_SUFFIX) and name.endswith(TAR_SUFFIX)
 
 
+def is_sealed_folder(sealed: seal.SealedFile) -> bool:
+    """True if an unlocked sealed file is a sealed folder, as add --to of a folder makes one: its sealed name ends in
+    .tar and its plaintext starts with the sealed-folder marker (tarstream.is_marked; decrypting its first segment
+    only). A tar sealed as a file (by 0.1.x, or anyone) has no marker: it stays a file."""
+    from rnfs.content import tarstream
+
+    if not is_tar_name(sealed.name):
+        return False
+    return tarstream.is_marked(b"".join(sealed.read(0, tarstream.MARKER_PEEK)))
+
+
 def get_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
                created: list[walker.Identity] | None = None, extract: bool = True) -> dict:
     """Write a sealed file the node opened (unlocked) to output, which must not exist: unpacked (unpack_sealed) if
-    extract, its sealed name ends in .tar and its plaintext is a valid tar; otherwise decrypted as the file
-    (write_sealed), with a warning when a .tar wasn't unpacked because it isn't one. get's {"sealed", "name",
-    "warnings"} (+ "warnings_total"; "extracted" True when unpacked). to_fetch and created as for unpack_sealed."""
+    extract and it is a sealed folder (is_sealed_folder) whose plaintext is a valid tar; otherwise decrypted as the
+    file (write_sealed), as rnfs 0.1.6 writes any sealed file, with a warning only for a marked tar that isn't valid.
+    get's {"sealed", "name", "warnings"} (+ "warnings_total"; "extracted" True when unpacked). to_fetch and
+    created as for unpack_sealed."""
     warnings = []
-    if extract and is_tar_name(sealed.name):
+    if extract and is_sealed_folder(sealed):
         try:
             return unpack_sealed(node, sealed, output, to_fetch, created)
         except NotATar as e:

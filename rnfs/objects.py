@@ -143,7 +143,8 @@ class Entry(_Object):
 @dataclass(frozen=True)
 class Info(_Object):
     """A target's own CID, type ("file" or "directory"), size and executable bit; for a sealed file, sealed,
-    recipient (this node can open it), stored_size, and its plaintext size and sealed name if a recipient."""
+    recipient (this node can open it), stored_size, and its plaintext size and sealed name if a recipient, and
+    whether it is a sealed folder get would unpack (sealed_folder; False from a daemon before 0.2.0)."""
 
     cid: Cid = _field(_cid)
     type: str = "file"
@@ -153,6 +154,7 @@ class Info(_Object):
     recipient: bool | None = None
     stored_size: int | None = None
     name: str | None = None
+    sealed_folder: bool = False
 
 
 @dataclass(frozen=True)

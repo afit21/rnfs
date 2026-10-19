@@ -89,19 +89,23 @@ Added:
   with `to`) seals a folder as one sealed file: the folder is packed as a tar, everything under one top directory
   `<folder>/`, and sealed under the name `<folder>.tar`, so its file names and structure are hidden along with
   its content (not its approximate total size). The sealed-file format is unchanged: a recipient on 0.1.x gets a
-  tar it can unpack itself. The folder is walked as `add` walks one (symlinks, devices and invalid names skipped
+  tar it can unpack itself. The tar starts with a marker, a pax global header holding only the POSIX `comment`
+  `rnfs sealed folder`, which extractors ignore. The folder is walked as `add` walks one (symlinks, devices and invalid names skipped
   with warnings; names holding `\`, `＼` or `／`, or starting as a Windows drive does, skipped too); more than
   `max_output_entries` entries or a tree deeper than `MAX_DEPTH` is refused, and so are a folder name over 251
   bytes and `--no-sealed-name` with a folder (the name is what makes a recipient's `get` unpack it).
-- **Unpacking sealed folders:** `rnfs get` of a sealed file whose sealed name ends in `.tar` and whose content is
-  a valid tar unpacks it, by a recipient: the decrypted tar is read with `POST /api/add/stream?format=tar`'s rules
+- **Unpacking sealed folders:** `rnfs get` of a sealed folder (a sealed file whose sealed name ends in `.tar` and
+  whose content is a valid tar starting with the marker) unpacks it, by a recipient. A tar sealed as a file (by
+  0.1.x, or `rnfs add --to bob backup.tar` now) has no marker and is still written as that file, byte for byte;
+  `GET /api/info` gives a recipient `sealed_folder`. The decrypted tar is read with `POST /api/add/stream?format=tar`'s rules
   (links, devices, absolute or `..` paths skipped; `max_output_entries` and `MAX_DEPTH`) and written with `get`'s
   (temporary name, unsafe names skipped). Without `-o` the output is named after the tar's top directory. The
   free-space check counts the content twice (its blocks, then the files), and the decrypted blocks are deleted
-  afterwards, never pinned or provided. A `.tar` whose content isn't a tar is written as the file, as before,
+  afterwards, never pinned or provided. A marked `.tar` whose content isn't a valid tar is written as the file,
   with a warning; one past a limit is refused. `rnfs get --no-extract` writes the `.tar` instead; `POST /api/get`,
   `POST /api/jobs` (kept with the job), `Node/Client.get` and `jobs.get` take `no_extract`, and `Written` gains
-  `extracted`. Behaviour change: `POST /api/get` without `no_extract` now unpacks such a file where it wrote it.
+  `extracted`. `POST /api/get` without `no_extract` unpacks a sealed folder; content sealed before 0.2.0 is
+  written as it always was.
   `GET /api/capabilities` lists `sealed_folders`. `cat` still gives the decrypted tar, and the gateway and
   `--raw` the sealed bytes. `POST /api/add/stream?format=tar` still can't seal (400).
 

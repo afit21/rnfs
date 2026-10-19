@@ -408,7 +408,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `add_stream(stream, size=None, name=None, only_hash=False, …)` | as above; `name` wraps it as that entry (sealed: the sealed name) |
 | `add_tar(stream, name=None, only_hash=False, pin=True, chunker=None)` | as above (+ `"warnings_total"` past 100): the directory a tar stream holds (`POST /api/add/stream?format=tar`), built by `tarstream.build_tar` as it is read; at most `max_output_entries` files and directories; recorded in pin_names as `name` or `(tar upload)` |
 | `get(target, output, from_node=None, raw=False, no_extract=False)` | `{"cid", "warnings"}` (+ `"warnings_total"` past 100; + `"sealed", "name"`, the name only if `safe_default_name` accepts it; + `"extracted"` for a sealed folder unpacked, `name` then the directory's); fetches and writes the file or directory under `.rnfs-get-<random>.partial` beside `output`, then renames it to `output` (`rename_new`), decrypting a sealed file unless `raw` and unpacking a sealed folder unless `no_extract` (`node_content.get_sealed`); a directory output is first checked to still be the one `write_out` made (`walker.check_unchanged`) and, on Windows, made to inherit its folder's access list (`winacl.inherit_from_parent`; if that fails it stays private, with a warning logged) |
-| `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`; the sealed name is None unless `safe_default_name` accepts it) |
+| `info(target, for_gateway=False, from_node=None, raw=False)` | `{"cid", "type": "file"\|"directory", "size", "executable"}` (+ `"sealed", "recipient", "stored_size", "name"`, and for a recipient `"sealed_folder"`; the sealed name is None unless `safe_default_name` accepts it) |
 | `stored_head(target, length)` | a file's first `length` bytes if stored, else None; never fetches (the user's own gateway `HEAD` and ranges not at 0); `Denied` as a read: a denied CID met, or while there are file hashes a file that fails `_check_file` (one not wholly stored gives None) |
 | `read(target, offset=0, length=None, for_gateway=False, from_node=None, raw=False)` | iterator of bytes of a file (range fetched only; sealed files decrypted unless `raw` or `for_gateway`) |
 | `read_file(target, offset=0, length=None, from_node=None, raw=False)` | `(info, chunks)`: `info()` and `read()` in one fetch, resolving the target once; `chunks` reads `[offset, offset + length)` cut to the info's size only once iterated (a directory's raises `ValueError`), and closing it ends the fetch (`GET /api/cat`, which used to call `info` and `read`: two fetches) |
@@ -698,7 +698,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Added` | `cid`, `size`, `warnings: tuple[str]`, `sealed: bool` | the CID |
 | `Written` | `cid`, `output`, `warnings`, `warnings_total`, `sealed`, `name`, `extracted` (get) | the output path |
 | `Entry` | `name`, `kind` ("file", "executable", "directory"), `size`, `cid` | the name |
-| `Info` | `cid`, `type` ("file", "directory"), `size`, `executable`, `sealed`, `recipient`, `stored_size`, `name` | — |
+| `Info` | `cid`, `type` ("file", "directory"), `size`, `executable`, `sealed`, `recipient`, `stored_size`, `name`, `sealed_folder` | — |
 | `Stat` | `cid`, `size`, `blocks`, `local_blocks`, `local_bytes` | — |
 | `Pin` | `cid`, `sources: tuple[str]`, `complete`, `type`, `sealed`, `name`, and (0.2.0; None from an older daemon) `label`, `origin`, `size`, `entries`, `added` | the CID |
 | `Cached` / `Uncached` | `cid`, `root`, `path: tuple[str]`, `pinned`, `complete`, `type`, `size`, `provided` / `removed_records`, `removed_blocks`, `freed_bytes` | the CID / — |
@@ -960,15 +960,25 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   identity hash; the node's own identity; contacts), `open_sealed` over a Fetch's `read_range`,
   `sealed_info`, `write_sealed`, `get_sealed`/`unpack_sealed`, `block`, `export_stream`, and the API option
   parser `add_options`.
-- Unpacking a sealed folder (`get_sealed`, for a sealed name ending in `.tar` unless `no_extract`):
-  `unpack_sealed` checks the free space for the plaintext twice where the blocks and the output share a
+- Recognising a sealed folder (`is_sealed_folder`): the sealed name ends in `.tar` and the plaintext's first
+  `MARKER_PEEK` (1024) bytes, from the first segment alone, are the marker `tarstream.folder_marker()` writes:
+  `tarstream.is_marked` parses the first header (`TarInfo.frombuf`) and needs typeflag `g` with exactly the one
+  pax record `comment=rnfs sealed folder`, parsed rather than compared byte for byte so another writer's header
+  layout still counts. An unmarked tar, which every tar sealed as a file is, never reaches `build_tar`: it is
+  written by `write_sealed` with no warning, byte for byte as 0.1.6 does. `sealed_info` gives recipients
+  `sealed_folder` (one more first-segment read, only for `.tar` names), which the CLI uses to name outputs before a
+  get it can't hand to a job's rename (a daemon without jobs; a path target ending in `.tar`). `build_tar` takes
+  the marker as one global header (its 47 bytes well within `MAX_GLOBAL_BYTES`), which `tarfile` keeps as the
+  stream's `pax_headers`; a marker with nothing after it but the end blocks isn't a tar to `tarfile` (it fails
+  at offset 0), but packing always writes the top directory after it.
+- Unpacking a sealed folder (`get_sealed`, for a sealed folder unless `no_extract`): `unpack_sealed` checks the free space for the plaintext twice where the blocks and the output share a
   filesystem (`_check_free_space` with the plaintext added to what is still to fetch, and `Storage.check_disk`
   for the blocks' own), then, inside a protection session of its own (within the fetch's), feeds the
   decrypted segments (`IteratorReader` over `SealedFile.read()`) to `tarstream.build_tar` through a
   `Session.writer()`, with the deny list's hash check, and writes out with `walker.write_out` from the stored
   blocks (`Storage.getter()`). The target is the root's one entry if it is a directory, else the root. A
   `ValueError` from `build_tar` (not `SealError` or `BlockMismatch`) means the plaintext isn't a valid tar:
-  `NotATar`, and `get_sealed` writes the file with `write_sealed` and a warning. `TooLarge` is raised again
+  `NotATar`, and `get_sealed` writes the file with `write_sealed` and a warning (only a marked tar gets here). `TooLarge` is raised again
   naming `--no-extract`. In every case the session ends and `storage.collect()` deletes what nothing else
   reaches, so the plaintext is never pinned, recorded as a fetch or provided.
 - Sealed folders (`add_sealed_path` of a directory): `folder_sealed_name` refuses a name `<name>.tar` couldn't
@@ -976,7 +986,8 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   a file with an invalid name is. `tarstream.folder_chunks` is a generator writing the tar as it walks
   (`builder.open_path`/`open_child`/`list_directory`, the same descriptor-relative opening and `Changed` checks
   as `_build_tree`, which it can't reuse since that builds a DAG); `tarstream.IteratorReader` turns it into the
-  stream `SealingReader` reads, so one segment of plaintext is held at a time. Its headers are `_header_of`,
+  stream `SealingReader` reads, so one segment of plaintext is held at a time. It starts with the sealed-folder
+  marker (`folder_marker`, `TarInfo.create_pax_global_header`). Its headers are `_header_of`,
   shared with the writer of stored DAGs. `Changed` is only raised by opening and listing, before an entry's
   header is written, so a skipped entry never leaves half a member. The entry limit is the sender's
   `max_output_entries` (the recipient's unpack has its own), and the depth check is exact: `fixed_height` and
@@ -1258,7 +1269,7 @@ An output without `-o` is named with `fsutil.safe_default_name`. Sent links carr
 (`{"settings": {name: value or null}}`). `POST /api/jobs`
 takes, for a get, the JSON booleans `sealed_name` (write a sealed file this node opens under its safe sealed
 name in the output's directory; the CLI sets it for `rnfs get <bare cid>` without `-o`, so it no longer calls
-`GET /api/info` first, and for a path ending in `.tar`, so an unpacked folder is named after its directory),
+`GET /api/info` first; an unpacked folder is then named after its directory),
 `fallback_dht` (a get with `from` that fails, other than by cancellation, `TooLarge` or `StorageFull`, is retried
 once through the DHT) and `no_extract` (a sealed folder written as its tar; kept in the job's record only when set,
 so other records stay as 0.1.6 wrote them); for `kind` `add`, `path` and `POST /api/add`'s options (flat, as `/api/add` takes them; kept in the job as `options`, only those set), for `import`, `path`.
@@ -1707,10 +1718,12 @@ Everything in the specification is implemented, with these simplifications and a
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.
 - **Sealed folders.** Unpacking stores the plaintext as blocks before writing the files (both rule sets
   reused as they are, rather than a second tar extractor), so it needs the space twice on one disk; they are
-  collected by `storage.collect()`, which walks every pin, right after. A `.tar`-named sealed file that isn't a
-  valid tar is decrypted twice (once into `build_tar`, once to the file); one with a malformed header fails at
-  once, before anything is stored. A daemon without the job manager can't tell the top directory's name
-  before the get, so the CLI asks for the sealed name and drops `.tar`. `POST /api/add/stream?format=tar`
+  collected by `storage.collect()`, which walks every pin, right after. A marked sealed `.tar` that isn't a
+  valid tar is decrypted twice (once into `build_tar`, once to the file); one with a malformed header after the
+  marker fails at once, before anything is stored. Where the output's name must be chosen before the get (a
+  daemon without the job manager, or a path target ending in `.tar`, whose job keeps its visible name), the CLI
+  asks `GET /api/info` first and drops `.tar` only when it says `sealed_folder`; an older daemon doesn't say
+  it, and doesn't unpack. `POST /api/add/stream?format=tar`
   can't seal (a tar uploaded by an app would have to be repacked under one top directory): sealed folders are
   added from a path.
 - **Sealed files.** `get` of a *directory* containing sealed files writes them as stored (get each with

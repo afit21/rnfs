@@ -1414,8 +1414,8 @@ class RnfsNode:
     def get(self, target: str, output: str, from_node: bytes | None = None, raw: bool = False,
             no_extract: bool = False) -> dict:
         """Fetch a file or directory and write it to output, which must not exist. A sealed file this node
-        can open is decrypted, unless raw; one whose sealed name ends in .tar and whose content is a valid tar (a
-        sealed folder) is unpacked to a directory, unless no_extract (node_content.get_sealed)."""
+        can open is decrypted, unless raw; a sealed folder (a sealed .tar starting with the sealed-folder marker,
+        node_content.is_sealed_folder) is unpacked to a directory, unless no_extract (node_content.get_sealed)."""
         root, names = self._parse_target(target)
         if os.path.lexists(output):
             raise ValueError(f"{output} already exists")

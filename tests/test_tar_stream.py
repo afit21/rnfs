@@ -2,7 +2,9 @@
 GET /api/get/stream, GET /api/export/stream, POST /api/import/stream) and their ApiConnection methods."""
 import io
 import os
+import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -402,6 +404,40 @@ class FolderTarTest(unittest.TestCase):
         self.assertEqual(files_of(os.path.join(out, "folder")), files_of(top))
         built = tarstream.build_tar(io.BytesIO(data), self.store.put, tarstream.Warnings(), 1000)
         self.assertEqual(built.cid, builder.add_path(top, self.store.put, wrap_it=True)[0].cid)
+
+    def test_the_tar_starts_with_the_sealed_folder_marker(self):
+        """The first header is the marker (a pax global header of one comment), which tarfile, GNU tar and
+        build_tar take without a warning, an extra member or an extra file."""
+        top = tree(os.path.join(self.tmp, "folder"))
+        data, _ = self.pack(top, "folder")
+        self.assertTrue(data.startswith(tarstream.folder_marker()))
+        self.assertTrue(tarstream.is_marked(data[:tarstream.MARKER_PEEK]))
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            self.assertEqual(archive.getnames()[0], "folder")
+            self.assertEqual(archive.pax_headers, {"comment": tarstream.FOLDER_MARKER})
+        warnings = tarstream.Warnings()
+        tarstream.build_tar(io.BytesIO(data), self.store.put, warnings, 1000)  # within MAX_GLOBAL_BYTES
+        self.assertEqual(warnings.total, 0)
+        tar = shutil.which("tar")
+        if tar is not None and os.name != "nt":
+            path = os.path.join(self.tmp, "folder.tar")
+            with open(path, "wb") as f:
+                f.write(data)
+            out = os.path.join(self.tmp, "gnu")
+            os.makedirs(out)
+            run = subprocess.run([tar, "xf", path], cwd=out, capture_output=True, text=True, check=False)
+            self.assertEqual((run.returncode, run.stderr, os.listdir(out)), (0, "", ["folder"]))
+            self.assertEqual(files_of(os.path.join(out, "folder")), files_of(top))
+
+    def test_is_marked(self):
+        marker = tarstream.folder_marker()
+        good = member("f", b"x") + END
+        self.assertTrue(tarstream.is_marked((marker + good)[:tarstream.MARKER_PEEK]))
+        for head in (good, member("f", b"x") + marker + END, marker[:520], b"", bytes(2048),
+                     tarfile.TarInfo.create_pax_global_header({"comment": tarstream.FOLDER_MARKER, "a": "b"}) + good,
+                     tarfile.TarInfo.create_pax_global_header({"comment": "other"}) + good,
+                     member("x", b"30 comment=rnfs sealed folder\n", type=tarfile.XHDTYPE) + good):
+            self.assertFalse(tarstream.is_marked(head[:tarstream.MARKER_PEEK]), head[:600])
 
     def test_skipped_entries(self):
         """add's skips (invalid names, links, FIFOs), and names a tar shouldn't hold, are warnings; a file with other

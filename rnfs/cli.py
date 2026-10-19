@@ -396,16 +396,33 @@ def extracting(args) -> bool:
 
 def wants_sealed_name(args) -> bool:
     """True if get, without -o, should write a sealed file it opens under its sealed name: a bare CID's
-    output name would be the CID, while a path's last name is already a name. When unpacking, a path whose last
-    name ends in .tar too: a sealed folder is written as the directory it holds, named as that directory."""
-    if args.output or getattr(args, "raw", False):
-        return False
+    output name would be the CID, while a path's last name is already a name."""
+    return not args.output and not getattr(args, "raw", False) and "/" not in args.target.strip("/")
+
+
+def folder_name(info: dict) -> str | None:
+    """The name a sealed folder GET /api/info describes is unpacked under (its sealed name without .tar, which add
+    gives its top directory), or None if it isn't one get unpacks ("sealed_folder", which a daemon before 0.2.0,
+    unpacking nothing, doesn't give)."""
+    name = info.get("name") if info.get("sealed_folder") else None
+    return name[:-4] if isinstance(name, str) and len(name) > 4 and name.endswith(".tar") else None
+
+
+def folder_output(args, output: str) -> str:
+    """get's default output for a path whose last name ends in .tar: when it is a sealed folder this node unpacks
+    (asked of GET /api/info first), the folder's name in output's directory, rather than a directory called
+    `<name>.tar`; output otherwise, a tar sealed as a file included (written as the file under the path's name)."""
     target = args.target.strip("/")
-    return "/" not in target or (extracting(args) and target.endswith(".tar"))
+    if args.output or not extracting(args) or "/" not in target or not target.endswith(".tar"):
+        return output
+    name = folder_name(client(args).get("/api/info", target=args.target, **{"from": args.from_node}))
+    # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
+    return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
 
 
 def sealed_output(args, output: str) -> str:
-    """get's default output for a sealed file this node can open: its sealed name, if it has one.
+    """get's default output for a sealed file this node can open: its sealed name, if it has one (a sealed folder
+    unpacked: the folder's name).
 
     Only for a daemon without the job manager: a get job picks the sealed name itself (sealed_name), which
     doesn't cost a separate fetch of the root before the job, ignoring --from.
@@ -414,10 +431,8 @@ def sealed_output(args, output: str) -> str:
         return output
     info = client(args).get("/api/info", target=args.target, **{"from": getattr(args, "from_node", None)})
     name = info.get("name") if info.get("sealed") else None
-    if name and extracting(args) and len(name) > 4 and name.endswith(".tar"):
-        # A sealed folder is unpacked to its top directory, which add names as the tar (and the job's result would
-        # name it exactly); a .tar that turns out not to be one is then written under the name without .tar
-        name = name[:-4]
+    if extracting(args) and folder_name(info) is not None:
+        name = folder_name(info)  # the top directory get unpacks it to, which add names after the folder
     # The sender chose the name: no dotfiles, control characters or path tricks in the current directory
     return os.path.join(os.path.dirname(output), fsutil.safe_default_name(name, os.path.basename(output)))
 
@@ -499,6 +514,11 @@ def run_get(args):
         print_warnings(result)
         print(printable(output))
         return
+    unpacked = folder_output(args, output)
+    if unpacked != output:
+        output = unpacked
+        if os.path.lexists(output):
+            fail(f"{output} already exists; remove it or choose another with -o")
     # Sent only when set, so a daemon older than 0.2.0 (which never unpacks, and ignores it) is asked as before
     no_extract = {"no_extract": True} if getattr(args, "no_extract", False) else {}
 
