@@ -53,16 +53,21 @@ class Client(interface.Rnfs):
     """The daemon using rnfs_dir (default ~/.rnfs/), on 127.0.0.1:port (default: the api_port in its rnfs.toml),
     with the token in token_file (default <rnfs_dir>/api_token). timeout bounds each request (default: none, as
     fetches can take hours; timeout() sets another for one thread's calls). Nothing is sent until the first call.
-    Raises SettingsError if rnfs.toml can't be read for the port."""
+    Raises SettingsError if rnfs.toml can't be read for the port.
+
+    As an app (rnfs 0.2.0): app is the name `rnfs app add` was given, and its token is token, or in token_file.
+    Pins it makes are then app:<app>'s (add, pin, dir_set, dir_rm, import_archive, import_stream, add_tar and
+    those jobs), and unpin releases only those; pin_key(key) makes them app:<app>:<key>'s for one thread's calls
+    inside it. ValueError for an app without its token."""
 
     events_thread = "rnfs-client-events"
     jobs_thread = "rnfs-client-job-watch"
     job_poll = 1.0  # what the CLI's progress line polls at
 
     def __init__(self, rnfs_dir: str | None = None, *, port: int | None = None, token_file: str | None = None,
-                 timeout: float | None = None):
+                 timeout: float | None = None, app: str | None = None, token: str | None = None):
         """A client of the daemon (see the class)."""
-        self._api = ApiConnection(rnfs_dir, port=port, token_file=token_file, timeout=timeout)
+        self._api = ApiConnection(rnfs_dir, port=port, token_file=token_file, timeout=timeout, app=app, token=token)
         # The longest the name poller's long poll may wait within the client's timeout (its thread has no other)
         self._long_wait = long_poll_wait(timeout)
         super().__init__(_Backend(self._api))
@@ -82,6 +87,13 @@ class Client(interface.Rnfs):
         """The API connection underneath, whose get(path, **params) and post(path, **fields) reach every endpoint.
         Unsupported: it changes with any release."""
         return self._api
+
+    def pin_key(self, key: str | None):
+        """A context manager: the pins this app makes and releases in this thread's calls inside it are
+        app:<app>:<key>'s, a group of its own it can hold and release apart (None: app:<app>'s). ValueError for a
+        client that isn't an app's (app=); the daemon refuses a key that isn't 1-128 of A-Z, a-z, 0-9, ".", "_",
+        ":" and "-" (BadRequest). rnfs.Node has none: its pins are the user's."""
+        return self._api.pin_key(key)
 
     def _report(self, message: str):
         """Log through Python's logging (logger "rnfs"), escaped: the daemon's message can quote names from

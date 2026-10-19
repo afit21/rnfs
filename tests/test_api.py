@@ -158,9 +158,10 @@ class FakeNode:
     # Facade
 
     def add_path(self, path, wrap=False, only_hash=False, pin=True, to=None, to_self=False, seal_name=True,
-                 chunker=None, progress=None):
+                 chunker=None, progress=None, source="user"):
         self.record("add_path", path, wrap=wrap, only_hash=only_hash,
-                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_path", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  source=source))
         if not os.path.isabs(path):
             raise ValueError("path must be absolute")
         if not os.path.exists(path):
@@ -169,21 +170,22 @@ class FakeNode:
         if wrap:
             cid = self.put_dir({os.path.basename(path): cid})
         if pin and not only_hash:
-            self.pins.setdefault(cid, set()).add("user")
+            self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": self._size(cid), "warnings": ["skipped a symlink"] if wrap else []}
 
     def add_stream(self, stream, size=None, name=None, only_hash=False, pin=True, to=None, to_self=False,
-                   seal_name=None, chunker=None):
+                   seal_name=None, chunker=None, source="user"):
         data = stream.read()
         self.record("add_stream", data, size=size, name=name, only_hash=only_hash,
-                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  source=source))
         if size is not None and len(data) != size:
             raise ValueError("stream shorter than its size")
         cid = self.put_file(data)
         if name:
             cid = self.put_dir({name: cid})
         if pin and not only_hash:
-            self.pins.setdefault(cid, set()).add("user")
+            self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid, "size": len(data), "warnings": []}
 
     def get(self, target, output, from_node=None, raw=False, no_extract=False):  # nothing is sealed here, so raw
@@ -276,37 +278,37 @@ class FakeNode:
             return None
         return obj[1][:length]
 
-    def dir_set(self, target, name, child_cid, executable=False):
-        self.record("dir_set", target, name, child_cid, executable=executable)
+    def dir_set(self, target, name, child_cid, executable=False, source="user"):
+        self.record("dir_set", target, name, child_cid, executable=executable, **self._given("dir_set", source=source))
         obj = self._object(self._resolve(target))
         if obj[0] != "dir":
             raise ValueError("not a directory")
         cid = self.put_dir({**obj[1], name: child_cid})
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def dir_rm(self, target):
-        self.record("dir_rm", target)
+    def dir_rm(self, target, source="user"):
+        self.record("dir_rm", target, **self._given("dir_rm", source=source))
         edit.check_entry_target(target)  # as RnfsNode.dir_rm, before anything is fetched
         parent, name = target.rsplit("/", 1)
         obj = self._object(self._resolve(parent))
         if name not in obj[1]:
             raise NotFound(f"no such entry: {name}")
         cid = self.put_dir({k: v for k, v in obj[1].items() if k != name})
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def pin_add(self, target):
-        self.record("pin_add", target)
+    def pin_add(self, target, source="user"):
+        self.record("pin_add", target, **self._given("pin_add", source=source))
         cid = self._resolve(target)
-        self.pins.setdefault(cid, set()).add("user")
+        self.pins.setdefault(cid, set()).add(source)
         return {"cid": cid}
 
-    def pin_rm(self, cid):
-        self.record("pin_rm", cid)
-        if "user" not in self.pins.get(cid, set()):
+    def pin_rm(self, cid, source="user"):
+        self.record("pin_rm", cid, **self._given("pin_rm", source=source))
+        if source not in self.pins.get(cid, set()):
             raise NotFound(f"{cid} is not pinned")
-        self.pins[cid].discard("user")
+        self.pins[cid].discard(source)
         if not self.pins[cid]:
             del self.pins[cid]
 
@@ -415,8 +417,8 @@ class FakeNode:
             f.write(b"archive")
         return {"roots": [cid], "blocks": len(self._dag(cid))}
 
-    def import_archive(self, path, progress=None):
-        self.record("import_archive", path)
+    def import_archive(self, path, progress=None, source="user"):
+        self.record("import_archive", path, **self._given("import_archive", source=source))
         if not os.path.isfile(path):
             raise NotFound(f"no such file: {path}")
         return {"roots": [self.put_file(b"from archive")], "incomplete": []}
@@ -425,6 +427,21 @@ class FakeNode:
         self.record("status")
         return {"node_id": self.node_id.hex(), "dht_mode": "server", "slow": False, "known_nodes": 4,
                 "records": 2, "pins": len(self.pins), "used_bytes": 1000, "max_storage": 10 ** 10}
+
+    # Apps: through a real AppRegistry a test sets as self.apps (rnfs/apps.py)
+
+    def app_add(self, name):
+        self.record("app_add", name)
+        return self.apps.add(name)
+
+    def app_ls(self):
+        self.record("app_ls")
+        return self.apps.list()
+
+    def app_rm(self, name):
+        self.record("app_rm", name)
+        self.apps.remove(name)
+        return {"released": 0}
 
 
 def raw_request(port, method, path, body=None, headers=None, host="default"):
@@ -984,6 +1001,137 @@ class ConnectionTest(ApiTestCase):
         self.assertIn(f"{cid}/\\x1b[2J\\n", message)
         self.assertNotIn("\x1b", message)
         self.assertEqual(loggable("plain/path"), "plain/path")
+
+
+class AppTokenTestCase(ApiTestCase):
+    """Base: the FakeNode with a real AppRegistry (rnfs/apps.py), holding apps "wiki" and "notes"."""
+
+    def setUp(self):
+        """The registry in a temporary state directory, and two apps."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.node.apps = AppRegistry(os.path.join(tmp.name, "state"))
+        self.addCleanup(self.node.apps.close)
+        self.wiki = self.node.apps.add("wiki")["token"]
+        self.notes = self.node.apps.add("notes")["token"]
+
+    def as_app(self, name: str, token: str, **headers) -> dict:
+        """The headers of app name's request with token."""
+        return {"X-Rnfs-Api": token, "X-Rnfs-App": name, **headers}
+
+
+class AppAuthTest(AppTokenTestCase):
+    """App tokens: X-Rnfs-App names the app whose token X-Rnfs-Api carries, and keys the proof."""
+
+    def test_app_token_passes_with_its_name(self):
+        """An app's token with X-Rnfs-App naming it is let through (the full status, every route); the caller is
+        "app:<name>"."""
+        status, _, data = self.call("GET", "/api/status", headers=self.as_app("wiki", f" {self.wiki} "), api=False)
+        self.assertEqual(status, 200)
+        self.assertIn("node_id", json.loads(data))
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("notes", self.notes), api=False)[0], 200)
+        seen = []
+        original = ApiHandler.api_gc
+
+        def gc(handler):
+            seen.append(handler.principal)
+            original(handler)
+
+        with mock.patch.object(ApiHandler, "api_gc", gc):
+            self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)
+            self.call("POST", "/api/gc", {})
+        self.assertEqual(seen, ["app:wiki", api.CLI])
+
+    def test_wrong_pairs_are_refused(self):
+        """Only the token of the app named passes: another app's, the API token, a wrong one, an unknown or
+        invalid name, or an app's token without its name, are all 403 unauthorized; nothing reaches the node."""
+        for headers in (self.as_app("wiki", self.notes), self.as_app("wiki", self.server.token),
+                        self.as_app("wiki", self.wiki + "x"), self.as_app("other", self.wiki),
+                        self.as_app("Wiki", self.wiki), self.as_app("", self.wiki), {"X-Rnfs-Api": self.wiki},
+                        {"X-Rnfs-App": "wiki"}):
+            with self.subTest(headers=headers):
+                status, _, data = self.call("POST", "/api/gc", {}, headers, api=False)
+                self.assertEqual(status, 403)
+                self.assertEqual(json.loads(data)["code"], "unauthorized")
+                status, _, data = self.call("GET", "/api/status", headers=headers, api=False)
+                self.assertEqual(json.loads(data), {"version": rnfs_version()})
+        self.assertEqual(self.node.called("gc"), [])
+
+    def test_removed_app_token_stops_passing(self):
+        """Once the app is removed its token is refused."""
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 200)
+        self.node.apps.remove("wiki")
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+    def test_proof_for_an_app(self):
+        """With X-Rnfs-App the proof is keyed by that app's verifier (app_proof_key of its token), which the daemon
+        has without the token; none for an app there isn't; without the header, by the API token as before."""
+        from rnfs.apiclient import app_proof_key
+        challenge = "0123456789abcdef" * 2
+        for name, token in (("wiki", self.wiki), ("notes", self.notes)):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                     "X-Rnfs-App": name}, api=False)
+            self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(app_proof_key(token), self.port, challenge))
+        for name in ("other", "Wiki", ""):
+            _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                     "X-Rnfs-App": name}, api=False)
+            self.assertIsNone(headers[cli.PROOF_HEADER], name)
+        _, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge}, api=False)
+        self.assertEqual(headers[cli.PROOF_HEADER], cli.api_proof(self.server.token, self.port, challenge))
+
+    def test_node_without_apps(self):
+        """A node with no app registry (a stand-in) lets no app in, and proves nothing for one."""
+        del self.node.apps
+        challenge = "ab" * 16
+        status, headers, _ = self.call("GET", "/api/status", headers={cli.CHALLENGE_HEADER: challenge,
+                                                                      "X-Rnfs-App": "wiki"}, api=False)
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers[cli.PROOF_HEADER])
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+
+class AppRoutesTest(AppTokenTestCase):
+    """GET /api/apps, POST /api/apps/add and /api/apps/rm: the CLI's token only."""
+
+    def test_list_add_remove(self):
+        """The apps are listed without tokens; a new app's token is given once and works; removing an app revokes
+        its token."""
+        listed = self.ok("GET", "/api/apps")["apps"]
+        self.assertEqual([app["name"] for app in listed], ["notes", "wiki"])
+        self.assertEqual(set(listed[0]), {"name", "created"})
+        added = self.ok("POST", "/api/apps/add", {"name": "gallery"})
+        self.assertEqual(set(added), {"name", "created", "token"})
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("gallery", added["token"]), api=False)[0], 200)
+        self.assertEqual(self.ok("POST", "/api/apps/rm", {"name": "gallery"}), {"released": 0})
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("gallery", added["token"]), api=False)[0], 403)
+        self.assertEqual([app["name"] for app in self.ok("GET", "/api/apps")["apps"]], ["notes", "wiki"])
+
+    def test_refusals(self):
+        """An invalid name or one taken is 400, removing an app there isn't 404."""
+        for name in ("wiki", "Wiki", "a:b", "", None, 7):
+            status, _, data = self.call("POST", "/api/apps/add", {"name": name})
+            self.assertEqual((status, json.loads(data)["code"]), (400, "bad_request"), name)
+        self.assertEqual(self.call("POST", "/api/apps/rm", {"name": "other"})[0], 404)
+        self.assertEqual(self.call("POST", "/api/apps/rm", {"name": "a:b"})[0], 400)
+
+    def test_apps_cant_manage_apps(self):
+        """An app's token is answered 403 forbidden on every app route, before the node is asked."""
+        for method, path, body in (("GET", "/api/apps", None), ("POST", "/api/apps/add", {"name": "mine"}),
+                                   ("POST", "/api/apps/rm", {"name": "notes"})):
+            status, _, data = self.call(method, path, body, self.as_app("wiki", self.wiki), api=False)
+            self.assertEqual((status, json.loads(data)["code"]), (403, "forbidden"), path)
+        self.assertEqual([call for call in self.node.calls if call[0].startswith("app_")], [])
+        self.assertIn("notes", self.node.apps)
+        self.assertIn("forbidden", errors.CODES)
+        self.assertIn("apps", api.CAPABILITIES)
+
+
+def rnfs_version() -> str:
+    """The version the open status gives."""
+    from rnfs import __version__
+    return __version__
 
 
 class AppSupportTest(ApiTestCase):

@@ -12,6 +12,10 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   helpers for settings that depend on slow nodes or links. Loaded from `<rnfs dir>/rnfs.toml` plus command-line
   overrides (and `defaults` beneath the file: an embedded node's); `validate()` checks every core setting's type and
   range (`WHOLE_NUMBERS`, `RATES`, `DURATIONS`, `FLAGS`, `IDENTITY_LISTS`), and the daemon exits on an invalid one.
+  An unknown setting is refused too, but a retired one (`RETIRED_SETTINGS`, name -> what replaced it: `max_records`
+  since 0.2.0) is left out by `Config.combine`, wherever it comes from, with a warning in `Config.warnings` (an
+  embedded node's own defaults silently), so an `rnfs.toml` an older version accepted still starts the daemon; the
+  settings schema doesn't list it, so `rnfs config set` refuses it and `unset` removes it.
   Reticulum is started from `reticulum_dir`, by default RNS's own config directory, so the node attaches to `rnsd`
   with the matching RPC key. `member_set` and `remote_pin_set` are `members` and `remote_pin_identities` as
   frozensets of lowercase hex, normalised once there for the node, the link pool and the request server.
@@ -60,7 +64,8 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 
 Node IDs, DHT keys and names are 16-byte `bytes`. Identity hashes (for `members`, `remote_pin_identities`,
 pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lxmf_*` settings, pin source
-`lxmf:<address>`) are `lxmf.delivery` destination hashes, all written as 32 hex characters.
+`app:lxmf:<address>`, `storage.LXMF_PREFIX`) are `lxmf.delivery` destination hashes, all written as 32 hex
+characters.
 
 - `rnfs/statedb.py` — the state database, `<rnfs dir>/state/rnfs.db` (standard `sqlite3`, WAL mode,
   `busy_timeout`; created 0600, which SQLite copies to its `-wal` and `-shm` files; on Windows the state
@@ -72,9 +77,11 @@ pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lx
   never part of one or one without those before it); a sqlite failure raises `StateDbError`, an `OSError`.
   Text that may hold lone surrogates (file names, remote strings) goes through `dump`/`load` (JSON text);
   sequences are decimal text, since they pass SQLite's 64-bit integers. Without `_sqlite3` the daemon stops
-  with a message saying so.
+  with a message saying so. `connect_memory(stores)` makes a private in-memory database with only the tables of
+  the schema steps of those labels (a memory-only `ProviderStore`).
 
-Persistent state lives in the state database. Each store keeps its state in memory, which is all reads use,
+Persistent state lives in the state database. Each store but the provider store (which reads its records per key,
+`providers.py` below) keeps its state in memory, which is all reads use,
 loads it once at startup (checking every row as the JSON loaders checked every record: a malformed row is
 logged, skipped and deleted) and then writes only what changed: a pin is one row inserted or deleted, batched
 stores write the records changed since their last save. The shared parts are in statedb: `open_store(state_dir,
@@ -125,7 +132,7 @@ rnfs/
     routing_state.py  RoutingState: the routing table saved in the state database (section 6)
     scores.py         Scores: local scores per peer, decay, bootstrap seeds, the capped saved table (section 6)
     firstseen.py      FirstSeenLog: when each server's announce was first heard; closest old servers (section 6)
-    providers.py      ProviderStore: records, TTL, max_records eviction, /find reply selection (section 6)
+    providers.py      ProviderStore: records on disk, TTL, record budget and storage tiers, /find replies (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
@@ -147,6 +154,7 @@ rnfs/
   publisher.py        provide strategy, batched /provide, republish, withdrawal, extra key sources (section 6)
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
+  apps.py             AppRegistry: the apps rnfs app add issued tokens to, their verifiers (section 11)
   api.py              local API, 127.0.0.1:8788 (section 11)
   apiclient.py        the local API's protocol layer (ApiConnection) under rnfs.Client and the CLI: token, proof
                       check, typed errors (section 11)
@@ -316,32 +324,62 @@ out) and returns the nodes whose saved rows must be written again or deleted. `r
 changed through a SNAPSHOT `RowStore` taking the table's lock; it imports the state database so `routing.py`,
 which lookups import, needn't.
 
-`providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
-max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
-keys, withdrawn) -> int`, `retain(keep) -> int` (drops every record of publishers `keep` rejects: private mode's
-non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `providers(key, exclude) -> list[bytes]`, `expire()`,
-`record_count()`, `allowance(publisher)`, `save()`, `close()`. Local limits against flooding: one publisher holds at most max(10,
-`max_records` // 100) records once seen for `seniority` (the node passes `provider_seniority`) and a tenth of
-that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
-swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
-from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
-one, never one of the `K/2` oldest records. The node's own record (`own_id`) isn't counted toward the 1000 and is
-never a victim, here or in the pool (`_most_pooled_by_others` steps past it when it alone holds the most), so
-Sybil stores can't push it out of its own store; its records may exceed the pool rather than evict each other. A tenth of the store is a newcomer pool evicting by fair share: each
-publisher's pooled keys sit in an ordered dict (oldest pooled first), and publishers in lists by how many they
-hold (`_holders`, with each one's index, and `_most_pooled`), so a full pool picks one of the biggest holders at
-random in O(1); one already holding the most is refused. The newest publisher with records outside the pool comes
-from a heap of (first seen, arrival) with stale entries dropped lazily. First-seen times of departed publishers
-(seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order; those of younger
-publishers whose last record the pool evicted (`_evicted`) for a TTL too, at most `pool_size` // 10 (at least
-10), forgetting the one first seen most recently when full (an O(n) scan, only on such evictions). Times later than now
-(a clock corrected backwards) are clamped to now at load and at the first `expire()` after the clock went backwards:
-the store notes the latest clock reading any time it holds came from (`_latest`, via `_now()`), and an `expire()`
-with the clock not behind it skips the clamping pass, which would change nothing (about half of a pass at 100 000
-records, held under the lock). Records are added only through
-`_insert`, by `store` and by the load alike, so the indexes beside `_records` (each publisher's keys and count
-outside the pool, the counts, `_pooled`, `_holders`, `_newest`) are kept in step in one place;
-`_check_consistency()` recomputes them from `_records`, and test_providers runs it after every test.
+`providers.py` — `ProviderStore(state_dir, record_budget=1 GiB, *, ttl=PROVIDER_TTL, clock=time.time, rng=random,
+max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None)` (`state_dir` holds the
+state database; None: a private in-memory one, `statedb.connect_memory`, so tests run the same code):
+`store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher, keys, withdrawn) -> int`,
+`retain(keep) -> int` (drops every record and the standing of publishers `keep` rejects: private mode's
+non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `providers(key, exclude) -> list[bytes]`,
+`record(key, publisher)`, `expire()`, `maintain()`, `is_full()`, `record_count()`, `publisher_count()`,
+`tier_counts()`, `first_seen(publisher)`, `standing(publisher)`, `save()`, `close()`.
+
+Records live on disk and are read per key. Nothing in memory grows with the records or publishers:
+- `_cache`: the records of recently used keys (publisher -> (first stored, last stored)), LRU, at most
+  `CACHE_KEYS` (4096) keys and `CACHE_ROWS` (50 000) rows, read through `provider_records`' primary key (joined
+  with `provider_standing`, so a record of a publisher without a standing, or malformed, is dropped and deleted).
+- `_dirty`: the records changed since the last save (None: deleted), by key, and `_dirty_by_publisher`; a key read
+  from disk gets them laid over it, so the cache can drop any key. `_pinned_standings` holds the changed standings
+  until the save, `_standings` an LRU of others (`STANDING_CACHE`, 4096).
+- `save()` writes all of it in one transaction (NORMAL), then measures (`_measure`): the node's `maintain()`
+  call, every 30 s (`RECORDS_INTERVAL`), expires and saves; a store saves itself once `FLUSH_CHANGES` (20 000)
+  changes wait, and past `MAX_CHANGES` (saves failing) refuses others' new records rather than hold more. A refresh
+  writes nothing unless it moves the last-stored time by more than an hour (`REFRESH_WRITE`), or its day is a new
+  refresh day; a refusal writes nothing.
+
+Each publisher's standing (`_Standing`: first seen, records held, tier, refresh days and the last of them) keeps
+the counts the budget and tiers need: `_tier_records` (records per tier, this node's in a tier of its own, `OWN`)
+and `_publishers`, read from `provider_standing` at load (`SUM ... GROUP BY tier`), and changed with each record
+(`_count_records`). A publisher left without records keeps its standing only if it has refresh days, until a TTL
+after the last (`maintain`'s hourly `_forget_departed`). The tier is worked out when the publisher stores
+(`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or removed since
+is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it), or by the
+hourly check of those written as Known.
+
+Room: `_capacity()` is `record_budget` over the bytes a record takes, or the records held at the last measure plus
+the free disk beyond the reserve (`free_space()`; the node passes `shutil.disk_usage` of the state directory less
+`storage.disk_reserve`) over it, whichever is less. The bytes a record takes are measured at each save as the
+database's pages in use over the records (at least `MEASURE_RECORDS`, 10 000: below that the database is mostly
+the rest of the state), so indexes, standings, fragmentation and the other state count; `record_bytes` fixes it
+(tests). A full store (`_full`) first sweeps for expired records, at most once a minute; then `_reclaim` applies
+the tiers' rules (FLOORS 10/60/30%), evicting from a tier's largest holder the record it refreshed least recently
+(`_oldest_key`, by `provider_records_publisher`). A tier's largest holder (`_largest`) is the larger of the changed
+standings' heap (`_heaps`, stale entries dropped as they surface) and the first standing on disk, by
+`provider_standing_tier`, not changed since (`_disk_top`, a page of 64 at a time, kept until the save changes the
+table); both, and `_oldest_key`'s position in each publisher's records, are reset by a save. So a flood's store
+costs a few reads and O(log n) in memory: about 70 µs on a desktop, a third of them SQLite's. Once a batch's key is
+refused for room, `provide` refuses its other new keys without looking again (NEW-8).
+
+A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the
+lowest tier among the rest gives way if that tier is below the storer's, or is the storer's and not Earned.
+This node's records are never counted there, never evicted and never refused. Expiry (`_expire`) reads expired
+records through `provider_records_last`, `SWEEP_BATCH` at a time with the lock let go between batches, and, while
+full, Newcomers' records last stored 4.5 days ago (`_NEWCOMERS_EXPIRED`, joined with their standing; the tier
+checked again before each goes). Times later than now (a clock corrected backwards) are clamped to now at load
+(if the latest last-stored time is in the future) and at the first `expire()` after the clock went backwards: the
+store notes the latest clock reading any time it holds came from (`_latest`, via `_now()`), and an `expire()`
+with the clock not behind it skips the clamping pass. `_check_consistency()` recomputes the counts and standings
+from the records on disk and in memory (`_merged`) and checks the caches against them; test_providers runs it
+after every test.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
@@ -416,7 +454,10 @@ None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs
 RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if that identity is on
 `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
 
-`announces.py` — `DhtAnnouncer(destination, config)` sets `app_data` to the mode and runs the announce schedule;
+`announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
+announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
+provides, owns names, accepts remote pins, private mode) holds, checked every `REACH_CHECK` (60 s), announcing at
+once when it starts to;
 `DhtAnnounceHandler(on_server, on_client, is_banned)`.
 
 ## Node facade (used by api.py, gateway.py and cli.py)
@@ -438,7 +479,10 @@ another listener. A daemon proved older than 0.1.5 (`OLDEST_DAEMON`; such daemon
 refused by `check_daemon` before the token is sent; until 0.2.0 the client sent it the request on a new connection. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
 failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
 `Stream` reads a body, raising
-`ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
+`ConnectionFailed` if it ends short. `ApiConnection(..., app=, token=)` (0.2.0) is an app's: its token is given
+(never read again) or in `token_file` (read and checked as `api_token` is, `read_token`), every request carries
+`X-Rnfs-App` (`APP_HEADER`, `_identity_headers`), and `verify_daemon` checks the proof keyed by
+`app_proof_key(token)`; `rnfs.Client(app=, token=)` passes them on. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
 `ls`, `stat`, `dir_set`, `dir_rm`, `export`, `import_archive`, `add_tar`, `get_tar`, `export_stream`,
 `import_stream` (uploads bytes or a binary file, chunked when their length is unknown; downloads a `Stream`), `gc`,
 `verify`, `pin_*` (with `pin_remote`),
@@ -468,8 +512,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `stat(target)` | `{"cid", "size", "blocks", "local_blocks", "local_bytes"}` |
 | `is_local(target)` | `bool`: everything needed is stored, so no network fetch |
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user`; `dir_rm` refuses a target that names no entry (`edit.check_entry_target`: ValueError, before fetching anything), so the API and `rnfs.Node` don't check it themselves |
-| `pin_add(target)` | `{"cid"}` once complete |
-| `pin_rm(cid)` | `None`; NotFound if no `user` source |
+| `pin_add(target, source="user")` | `{"cid"}` once complete |
+| `pin_rm(cid, source="user")` | `None`; NotFound if `source` doesn't hold it |
+| `source=` (0.2.0) | taken by `add_path`, `add_stream`, `add_tar`, `dir_set`, `dir_rm`, `pin_add`, `pin_rm`, `import_archive` and `import_stream`: the source their caller pins and releases with, `user` (the default: the CLI, an embedded node) or an app's `app:<name>[:<key>]` (`ApiHandler.pin_source()`; anything else is ValueError, `node._caller_source`). After pinning with an app's source the node checks the app still exists (`_app_still_there`): `app_rm` forgets an app before it looks for its pins, so a pin a request already let in makes after that is released there and then, with NotFound |
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
@@ -482,6 +527,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
+| `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
 | `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names", "unexported_names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
@@ -514,7 +560,10 @@ as a request body.
 `/api/name/watch` (a long poll for newer records: Public API, API additions);
 `POST /api/add`, `/api/add/stream`, `/api/get`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`,
 `/api/pin/remote`, `/api/gc`, `/api/verify`, `/api/name/create`, `/api/name/rm`, `/api/name/export`,
-`/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`; for clients that share no files with the
+`/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`; app tokens (`ApiHandler.CLI_ROUTES`, the
+CLI's token only: an app's gets 403 `forbidden`) `GET /api/apps`, `POST /api/apps/add`, `/api/apps/rm`
+(`app_ls`, `app_add`, `app_rm`; `ApiConnection.apps`, `app_add`, `app_rm`, which neither `rnfs.Node` nor
+`rnfs.Client` has: managing apps is the CLI's, `rnfs app`); for clients that share no files with the
 daemon (a sandboxed app), `GET /api/get/stream?format=tar`, `GET /api/export/stream`, `POST /api/import/stream`,
 and `POST /api/add/stream?format=tar`. `GET /api/info` and `POST /api/get` take
 an optional `from` (node ID), as does `GET /api/cat`; `GET /api/name/resolve?name=` takes a name or a name
@@ -594,6 +643,14 @@ URL without asking the daemon: the gateway port from `daemon.json`, else `rnfs.t
 
 What a companion app needs from the daemon beyond the facade calls (specification section 11, "For apps").
 
+- **App tokens.** `rnfs/apps.py`'s `AppRegistry` (`RnfsNode.apps`, made before the features) keeps each app's
+  name, its token's verifier (`apiclient.app_verifier`: SHA-256 of `rnfs app token ` and the token) and when it
+  was added, in the `apps` table; `add` returns the token, the only time it exists outside the app. The API's
+  `ApiHandler.caller()` answers `api.CLI` for the API token (no `X-Rnfs-App`), `"app:<name>"` for an app's token
+  with `X-Rnfs-App` naming it (`AppRegistry.verify`, constant time, also for names there aren't), None
+  otherwise; `dispatch` keeps it in `principal`. `proof_key()` keys `X-Rnfs-Proof` with the API token, or
+  (`X-Rnfs-App`) with `AppRegistry.proof_key` (the verifier in hex), None for an app there isn't. A node without
+  `apps` (a stand-in) lets no app in.
 - **Discovery.** `cli.run_daemon` writes `<rnfs dir>/daemon.json` (`apiclient.DAEMON_FILE`; `cli.write_daemon_info`,
   `fsutil.write_atomic`, 0600, private) once its servers listen and its token is written, and removes it when it
   stops if it still names its PID (`remove_daemon_info`). `apiclient.read_daemon_info` reads it without following a
@@ -603,7 +660,7 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   check is unchanged, so a stale or planted file at worst points at a port where nothing proves itself.
 - **Error codes.** `rnfs.errors.STATUS_CODES` (the node's errors, by status), `API_CODES` (the API's own
   refusals: `bad_host`, `unauthorized`, `no_such_endpoint`, `method_not_allowed`, `timeout`, `length_required`,
-  `body_too_large`, `unsupported`, `too_many_connections`) and `error_code(error, status)`, which prefers an
+  `body_too_large`, `unsupported`, `too_many_connections`, and from 0.2.0's app tokens `forbidden`) and `error_code(error, status)`, which prefers an
   exception's own `code` (`errors.Unsupported`: a 404 `unsupported`, for something this daemon can't do).
   `ApiHandler.respond_error` sends `{"error", "code"}`; `ApiRequestError` carries its code. The client
   (`apiclient.error_for`) keeps the code on every `ApiError` (`.code`) and raises `NoSuchEndpoint` for
@@ -724,8 +781,11 @@ and errors import neither RNS nor anything that does (tested, as the CLI's start
   `close()` releases the lock once the node has stopped, as a start that fails does (`fsutil.unlock`: unlocked, then
   closed, since Windows may free a closed file's locks only some time later).
 
-`Client(rnfs_dir=None, *, port=None, token_file=None, timeout=None)`: as `apiclient.ApiConnection` (default
-`~/.rnfs/`, the `api_port` in its `rnfs.toml`, the token from `<rnfs dir>/api_token`, proved before it is sent).
+`Client(rnfs_dir=None, *, port=None, token_file=None, timeout=None, app=None, token=None)`: as
+`apiclient.ApiConnection` (default `~/.rnfs/`, the `api_port` in its `rnfs.toml`, the token from
+`<rnfs dir>/api_token`, proved before it is sent). With `app` (0.2.0) it is that app's (`rnfs app add`), its
+token given or in `token_file`, and `client.pin_key(key)` (`ApiConnection.pin_key`, thread-local like
+`timeout()`) gives the calls inside it `X-Rnfs-Pin-Key`.
 Nothing is sent until the first call. Raises `SettingsError` if `rnfs.toml` can't be read or trusted; one made
 private on the way is reported as a `RuntimeWarning` (`warnings.warn`), without loading RNS.
 
@@ -941,6 +1001,7 @@ Rules, the same for both:
 | A Client's requests can be bounded (`timeout`, `timeout()`); a Node's calls make none | A Node's `timeout()` checks its argument and does nothing; `Job.wait(timeout)` bounds a wait on both |
 | LXMF is off in a Node unless `lxmf_enabled` | `lxmf.address`, `send` and `sync` raise `ValueError` saying so, as a daemon with it off answers (400) |
 | `OSError` in a Node is `ServerError` from a Client | Documented |
+| A Client can be an app's (`app=`), its pins `app:<name>[:<key>]` (`pin_key()`); a Node's are always `user`'s | Client only: an embedded node is its app's own node, with no token to tell callers apart |
 | A Client's connection errors (`DaemonNotRunning`, …) | Client only, all `ApiError` |
 
 ### What happens to `rnfs/apiclient.py`
@@ -1239,11 +1300,11 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic`; `first_heard`, `rtt`, `online` and `peer` events (Mesh) | reads `Traffic`, the routing table, links, paths |
-| `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job`, CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
+| `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job` (a pin, add or import job keeps its `source`, saved in its record only when it isn't `user`, so other records are as 0.1.6 wrote them; `app_removed` cancels an app's), CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
 | `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
-| `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `LXMF_PREFIX` in `storage.check_source` |
+| `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `storage.LXMF_PREFIX` (`app:lxmf:`, an app source to `storage.check_source`) |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 | `settings` | `settings.py` | `rnfs config`, `GET /api/config`, `POST /api/config/set`: rnfs.toml read and rewritten, `LIVE` settings applied to the running node | `config.settings_schema`, `Config.combine`, `config.edit_settings`; `Config.overrides`/`given_defaults` (set by `Config.load`); the live hooks below |
 
@@ -1383,7 +1444,8 @@ Locks are taken in this order, never the reverse: `names._lock` → `publisher._
 → the state database's lock (`statedb`, innermost: a store opens a transaction only once it holds every lock the
 change needs, and inside it takes no other lock and does no network I/O). `node._deny_lock` (one deny-list change
 applied at a time, `_apply_deny`) is taken before the publisher's lock and never with the names lock;
-`DenyList._lock` holds only the state database's. Feature locks held across `storage.pin`/`unpin`/`protect` and
+`DenyList._lock` holds only the state database's, as does `AppRegistry._lock` (`app_rm`'s release of the app's
+pins runs without it). Feature locks held across `storage.pin`/`unpin`/`protect` and
 `publisher.refresh()` (`JobsFeature._lock`, `FollowFeature._lock`, `LxmfFeature._lock`) come before the publisher's
 and storage's. The public API's locks come after these: `Rnfs._watch_lock` after the names lock (NameManager's
 record listeners run under it, and only queue), the event and job-watch conditions innermost; callbacks into the
@@ -1393,9 +1455,11 @@ in NameManager, one watch per name it holds) and never under it. `NameManager.pu
 recomputes what is provided under its own lock, reading the node's fetched targets (`node._lock`) and walking the
 pins' DAGs (`storage._lock`); the node reads storage under its lock (`_prune_fetched`). This is how the code behaves
 today, not a design goal. Batched saves write outside these locks, from the changes collected under them, one save
-at a time behind a save lock taken first (`Storage.save`, `Publisher.save`, `ProviderStore.save`, `DenyList.save`,
-the name floor, the fetched targets, the remote pins waiting), so an older snapshot never lands last. Slow work that
-runs while a lock is held:
+at a time behind a save lock taken first (`Storage.save`, `Publisher.save`, `DenyList.save`, the name floor, the
+fetched targets, the remote pins waiting), so an older snapshot never lands last. `ProviderStore` is the exception:
+its records are read from the database under its lock, so it writes under it too (a `/find` that misses its cache
+waits for a save, at most `FLUSH_CHANGES` rows); it asks the node's `_known_publisher` under it, which takes the
+contacts feature's lock, never the other way round. Slow work that runs while a lock is held:
 
 - `Publisher.refresh` checks every pin's DAG (`dag_blocks`, memoised) under the publisher lock, behind the
   names lock when a name changes, but only when something it is computed from changed: the node's generation
@@ -1430,8 +1494,11 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   `invalid` (invalid roots, oldest first; with the cache records);
 - `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
-- `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
-  stop, changed rows only);
+- `provider_records` (read per key; indexed by publisher and last-stored time for eviction and expiry; `pooled` is
+  always 0 since 0.2.0), `provider_publishers` (first-seen times) and `provider_standing` (0.2.0: each publisher's
+  record count, tier, refresh days and last refresh day; indexed by tier and count), NORMAL every 30 s, when 20 000
+  changes wait, and at stop, changed rows only; `provider_departed` and `provider_evicted` are 0.1.x's, emptied by
+  0.2.0's step (`providers_on_disk`, which also builds the standings, `statedb.PROVIDER_STANDING`) and unused;
 - `routing` (0.2.0: the routing table, `RoutingState`: one row per node in the table, dropped with its seniority
   kept, or banned, times as Unix time; NORMAL with the periodic saves and at stop, changed rows only) and
   `peer_scores` (0.2.0: local scores, `Scores`: score, when it was set, last raised, seeded; at most 4096 rows;
@@ -1458,8 +1525,14 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   CID of the version it last accepted; FULL) and `deny_hashes` (the content SHA-256 of files checked against
   `sha256:` entries, by binary CID, LRU order in `used`, at most 10 000; NORMAL with the periodic saves and at
   stop, changed rows only; a CID's content never changes, so a row never goes stale);
+- `apps` (0.2.0, rnfs/apps.py: each app's name, the SHA-256 verifier of its token (`apiclient.app_verifier`; the
+  token itself is never stored) and when it was added; FULL, each change written at once; a row that doesn't
+  parse is deleted at load);
 - `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
   requires; each box's `next_id`) and `migrated` (JSON files imported).
+- Schema steps of 0.2.0 that rewrite rows: `lxmf_app_pins` turns every valid `lxmf:<address>` pin into
+  `app:lxmf:<address>` (a case-sensitive `GLOB` spelt out, so an invalid one is still deleted at load;
+  `storage.import_pins` does the same to an older `pins.json`, imported after the steps).
 
 The node lists its stores as `_setup` makes them (`RnfsNode._add_store`; the `node.Store` protocol: `save()`
 writes what changed since the last save, raising `OSError` and keeping the change if the database fails, and

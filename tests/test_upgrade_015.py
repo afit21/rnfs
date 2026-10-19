@@ -2,10 +2,12 @@
 (tests/fixtures/rnfs-0.1.5, its state database holding rows in every table; see its README) keeps every row.
 
 The expectation is the fixture's expected.json, every table's rows as 0.1.5 left them. The current code may add
-rows and tables (its own schema steps), but none of 0.1.5's rows may change or go: the database upgrades, passes
-quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created must also be
-exactly those a fresh database gets, so a released schema step edited in place (which a database 0.1.5 wrote
-would never see) fails here as well as in test_statedb's digest.
+rows and tables (its own schema steps), but none of 0.1.5's rows may change or go, except as upgraded() says:
+the two `lxmf:<address>` pins become `app:lxmf:<address>` (0.2.0's "lxmf_app_pins", the LXMF wrapper app's
+source), and 0.2.0's provider store keeps no newcomer pool and no departed or evicted publishers. The database
+upgrades, passes quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created
+must also be exactly those a fresh database gets, so a released schema step edited in place (which a database
+0.1.5 wrote would never see) fails here as well as in test_statedb's digest.
 
 The clock is the fixture's (expected.json's "now"), so no record has expired."""
 import functools
@@ -80,6 +82,21 @@ def loadable(table: str, values: tuple) -> bool:
     return output is None or os.path.isabs(output)
 
 
+def upgraded(table: str, values: tuple) -> tuple | None:
+    """What a row of 0.1.5's becomes in this version (None: it goes). 0.2.0's step "lxmf_app_pins" rewrites a pin
+    source lxmf:<address> as app:lxmf:<address> (storage.LXMF_PREFIX). Its provider store (the step
+    "providers_on_disk") drops the newcomer pool and the memories of departed and evicted publishers, which went
+    with the per-publisher caps, replaced by the record budget and its storage tiers: a pooled record is no longer
+    pooled, and those memories are emptied. Every other row is kept as it was."""
+    if table == "pins" and values[1].startswith("lxmf:"):
+        return (values[0], "app:" + values[1])
+    if table == "provider_records":
+        return (*values[:4], 0)
+    if table in ("provider_departed", "provider_evicted"):
+        return None
+    return values
+
+
 def tables(state_dir: str) -> dict[str, set[tuple]]:
     """Every row of every table of the state database."""
     names = [r[0] for r in state_rows(state_dir, "SELECT name FROM sqlite_master WHERE type = 'table'")]
@@ -124,8 +141,10 @@ class UpgradeTest(unittest.TestCase):
 
     def start(self) -> RnfsNode:
         """An offline node on the copy (stopped before the directory is removed)."""
-        config = Config(rnfs_dir=self.root, **EXPECTED["settings"])
-        config.validate()
+        # As a start reads them from rnfs.toml: max_records, retired in 0.2.0, is left out with a warning
+        config = Config.combine(self.root, EXPECTED["settings"])
+        self.assertEqual([warning.split(":")[0] for warning in config.warnings],
+                         ["ignoring max_records in rnfs.toml"])
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
@@ -152,15 +171,43 @@ class UpgradeTest(unittest.TestCase):
                          [("shared_folder_files",)])
 
     def test_every_row_is_kept(self):
-        """Every row 0.1.5 left is still there, unchanged, in every table."""
+        """Every row 0.1.5 left is still there, unchanged but as upgraded() says, in every table."""
         node = self.start()
         node.stop()
         found = tables(self.state)
         for table, rows in EXPECTED["tables"].items():
             with self.subTest(table=table):
                 self.assertIn(table, found)
-                expected = {row(values) for values in rows if loadable(table, row(values))}
-                self.assertEqual(expected - found[table], set())
+                expected = {upgraded(table, row(values)) for values in rows if loadable(table, row(values))}
+                self.assertEqual(expected - found[table] - {None}, set())
+        self.assertTrue(EXPECTED["tables"]["provider_departed"] and EXPECTED["tables"]["provider_evicted"])
+        self.assertEqual((found["provider_departed"], found["provider_evicted"]), (set(), set()))
+        self.assertIn(1, {values[4] for values in map(row, EXPECTED["tables"]["provider_records"])})
+
+    def test_provider_standing_is_built(self):
+        """Each publisher with records gets a standing counting them; this node's records are in their own tier,
+        and the one publisher 0.1.5 saw refreshing a record for days is Earned."""
+        node = self.start()
+        records = node.records
+        publishers = {row(values)[1] for values in EXPECTED["tables"]["provider_records"]}
+        tiers = {publisher: records.standing(publisher)["tier"] for publisher in publishers}
+        self.assertEqual(tiers.pop(NODE_ID), "own")
+        self.assertEqual(tiers.pop(bytes.fromhex("30" + "00" * 15)), "earned")
+        self.assertEqual(set(tiers.values()), {"newcomer"})
+        self.assertEqual(records.record_count(), len(EXPECTED["tables"]["provider_records"]))
+        records._check_consistency()
+
+    def test_lxmf_pins_become_app_pins(self):
+        """The fixture's two lxmf:<address> pins (an auto-fetch sender's) are app:lxmf:<address> pins after the
+        upgrade, of the same CIDs, and no lxmf: source is left; the LXMF feature still counts them as its own (its
+        inbox records them), so they are kept."""
+        legacy = {row(values) for values in EXPECTED["tables"]["pins"] if values[1].startswith("lxmf:")}
+        self.assertEqual(len(legacy), 2)
+        node = self.start()
+        node.stop()
+        pins = tables(self.state)["pins"]
+        self.assertEqual({(cid, "app:lxmf:" + source[len("lxmf:"):]) for cid, source in legacy} - pins, set())
+        self.assertEqual({source for _, source in pins if source.startswith("lxmf:")}, set())
 
     def test_every_pin_is_complete(self):
         """Every pin, the deny list's own included, is complete: the stores agree with the blocks."""

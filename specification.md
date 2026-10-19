@@ -87,6 +87,15 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 **Announces and paths.**
 - A node announces `rnfs.dht` at startup, again after `startup_announce_delay` (interfaces may not have been
   up), then every `announce_interval`. Ratchets are not enabled: links are already forward secret.
+  - A client (section 6) MAY skip the periodic announces while nothing needs other nodes to reach it, but MUST
+    announce while it provides anything (section 6), owns names (it answers `/name` for them, section 9),
+    accepts remote pins (section 8) or is in private mode, and SHOULD announce at once when that starts. A
+    transport node forwards a path request only for a destination it has a path to, unless the request arrived
+    on an access-point, gateway, roaming or boundary interface, or one with `recursive_prs` (RNS 1.5.6
+    `Transport.path_request`); interfaces default to `full` mode, so a destination that never announces is
+    usually reachable from one hop away only. And private-mode servers of rnfs 0.1.4 to 0.1.6 drop at start the
+    records of publishers whose identity RNS doesn't recall. (rnfs: checked every minute; servers always
+    announce.)
 - The announce's `app_data` is the node's DHT mode as a msgpack integer: `1` server, `0` client (section 6).
   - Anything other than msgpack `1` means client. A node re-announces when its mode changes.
   - It is set with `Destination.set_default_app_data()`, so path responses carry it too.
@@ -723,27 +732,42 @@ silent longer than every one of them; announces are recorded in memory and writt
 - A record expires `PROVIDER_TTL` after it was last stored, keeps its first-stored time across republishes,
   and is removed on withdrawal. These times are wall-clock and persisted; one later than the current time (a
   clock since corrected backwards) counts as now, so a record can't outlive its TTL.
-- A node keeps at most `max_records`, a tenth of them in a *newcomer pool*. When the rest is full, a
-  publisher first seen before the most recent one there evicts a record of that most recent publisher (the
-  one it stored least recently), so a flood of new identities can't displace older publishers. Any other
-  publisher (one not seen before, or the most recent one) stores into the pool. A full pool evicts the
-  record pooled first of a publisher holding the most pooled records (one chosen at random if several hold
-  as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
-  always store something, a flood churns only the pool, and the pool is shared out evenly between
-  publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
-  republished while the rest has room. The node's own records are always accepted and never evicted to make
-  room for others' (rnfs: nor counted toward its local limit of 1000 publishers per key, a newcomer to a full
-  key evicting a random one of the others but the `K/2` oldest), so Sybil stores can't push a node's own record
-  out of its own store.
-- First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
-  (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
-  oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer
-  whose last record a full pool evicted keeps its first-seen time too, so a flood can't keep it new forever
-  (rnfs: at most `max_records / 100` such newcomers, at least 10; when more, the one first seen most recently
-  is forgotten).
-- A node SHOULD limit how many records one publisher holds, its own excepted (rnfs: `max_records / 100`, at
-  least 10, once the publisher has been seen for `provider_seniority`, and a tenth of that, at least 10,
-  before), so one identity can't fill the store and a fresh one gets little.
+- How much a node stores for others, and whose records it keeps when that is full, is local server policy:
+  nothing on the wire depends on it, and a refused store is only a `False`. RNS identities are free and carry no
+  address, so no limit keyed on an identity bounds a flood; rnfs shares freely while there is room, and once
+  there isn't, keeps the places of the publishers it has seen for days. In rnfs:
+  - **Record budget.** Records may take `record_budget` of disk, measured as the state database's size over the
+    records it holds (so their indexes, their publishers' standing and storage overhead count: about 150 bytes a
+    record, up to 250 when each has a publisher of its own; 7 million records in the default 1 GiB), and never
+    the free disk the blocks' reserve needs (section 8). The store is *full* when either is reached. While it
+    isn't, any publisher stores freely: there is no per-publisher limit.
+  - **Storage tiers**, applied only while the store is full. *Known*: contacts of kind `node`, private mode's
+    members, and the bootstrap nodes a join contacts (`bootstrap_nodes`, and the defaults unless
+    `default_bootstrap` is off). *Earned*: publishers that held a record here and refreshed it on at least 3
+    distinct UTC days (the day of a first store not counted). *Newcomer*: everyone else, 0.1.x publishers new
+    to this node included. Each tier has a floor, a share of the budget: Known 30%, Earned 60%, Newcomer 10%.
+  - **Making room.** A new record to a full store evicts a record of a tier's largest holder (the record it
+    refreshed least recently): from the lowest tier below the storer's that holds more than its floor; else,
+    if the storer's own tier holds less than its floor, from a tier above it that holds more than its floor;
+    else from the storer's own tier, unless the storer already holds as many records as that tier's largest
+    holder (so it can't churn its records), or the tier is Earned: Earned publishers never evict each other.
+    Otherwise the store is refused. Floors hold in both directions: a lower tier can't take a higher one's
+    floor, nor a higher one the lower one's for good.
+  - **Expiry while full.** While the store is full, a Newcomer's record last stored 4.5 days ago counts as
+    expired: one more way a full store makes room. The longest honest gap between republishes is just under
+    3.5 days (kept names, below), so a record republished on time never lapses this way. A store that isn't
+    full keeps every record `PROVIDER_TTL`, so a record survives one missed republish.
+  - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
+    of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
+    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.
+  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a newcomer to a full
+    key evicts a random one of the lowest tier there (never one of the `K/2` oldest records, which replies list
+    first), if that tier is below its own, or is its own and not Earned; otherwise it is refused. Refusing every
+    newcomer would let early Sybil identities hold the key, and the random half of `/find` replies relies on
+    newcomers getting stored.
+- The node's own records are always accepted and never evicted to make room for others' (rnfs: nor counted
+  toward the 1000 publishers of a key; they take room in the budget), so Sybil stores can't push a node's own
+  record out of its own store.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
   max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
@@ -866,22 +890,28 @@ silent longer than every one of them; announces are recorded in memory and writt
 **Pins.**
 - Pins are recursive: a pinned CID keeps every block of its DAG.
 - A pin is held by one or more *sources*: `user`, `folder`, `name:<alias>`, `remote:<identity>`,
-  `follow:<name>` (the latest target of a followed name, section 9), `lxmf:<address>` (links auto-fetched
-  from that LXMF sender, section 13) and `deny` (the deny lists in use, below); names, identities and
-  addresses are 32 hex characters. It lasts while
-  any source holds it.
-- `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
+  `follow:<name>` (the latest target of a followed name, section 9), `deny` (the deny lists in use, below), and
+  `app:<app>` or `app:<app>:<key>` (pins an app made through the local API with its own token, section 11),
+  among them `app:lxmf:<address>` (links auto-fetched from that LXMF sender, section 13: the LXMF wrapper app's,
+  made by the LXMF built into rnfs while it remains); names, identities and addresses are 32 hex characters.
+  Until rnfs 0.2.0 LXMF's pins were `lxmf:<address>`: the upgrade to 0.2.0 rewrites each as
+  `app:lxmf:<address>` (and those of an older version's `pins.json` as it is imported). An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
+  starting with a letter or digit (so never `:`), and a key 1–128 of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
+  A pin lasts while any source holds it.
+- `pin rm` removes only its caller's source: `user` for the CLI, and for an app only its own (`app:<app>`, or
+  `app:<app>:<key>` with its pin key; section 11). Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
-  a followed name's newer target once that is complete; removing the LXMF messages that hold it.
+  a followed name's newer target once that is complete; removing the LXMF messages that hold it; removing the
+  app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
 - Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
   names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
   `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
   `follow:` pins of
-  names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
+  names no longer followed and `app:lxmf:<address>` pins no saved inbox message records (a queued auto-fetch is fetched
   again). A followed name's check releases every other target its source holds.
 - That release needs the state read whole. If the followed names or the inbox were never saved (or were
   imported from a file that was damaged and moved aside as `.damaged`), or hold a malformed entry, such pins
-  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `lxmf:` pins get a new
+  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `app:lxmf:` pins get a new
   inbox message listing them, whose removal releases them. A name key file that is there but can't be read
   keeps its name's pins and records; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
@@ -971,7 +1001,7 @@ off their node. Nothing on the wire changes.
   withdrawn. A `/pin` of it is refused.
 - When the entries change, and at start: cached fetches reaching a denied block are dropped, and the blocks
   nothing else reaches deleted; remote pins reaching one are released, as they are kept for others, and their
-  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `lxmf:`, `deny`) are kept,
+  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `app:`, `deny`) are kept,
   stored but neither served, provided nor read, with a warning naming each, until they are removed. Every
   deletion and release is logged.
 - A file's hash is only known once its content is read, so file-hash entries are checked where content is
@@ -1187,7 +1217,7 @@ as is cheap. Rules live in the sections referenced.
 | Malformed DAG nodes | Strict msgpack types, re-encoding and per-node checks (5). The tree rule gives honest writers one CID per content; readers don't enforce it |
 | Advertising on someone else's behalf | Records name only the identified requester (6) |
 | Advertising content it doesn't have, or stale records | Failed providers removed; the search runs again; withdrawals (6, 7) |
-| Squatting or flooding provider records | Oldest-plus-random replies; long-known providers tried first; eviction of the newest publishers; no identity switching on a link (3, 6) |
+| Squatting or flooding provider records | Oldest-plus-random replies; long-known providers tried first; a record budget whose storage tiers, once it is full, keep the places of known nodes and of publishers seen refreshing for days, while strangers share a small, fast-expiring tier; no identity switching on a link (3, 6) |
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
@@ -1246,9 +1276,12 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
   answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
   sequence or reaches a keeper they don't list (one recorded locally, or listed by another established node).
-- A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
-  newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
-  while fewer than the bounded number of newcomers first seen before it were evicted too.
+- A flood of new identities that fills the record budget shares the Newcomer tier with honest newcomers: each
+  keeps about as many records as any flooding identity (the largest holders give way first), and their records
+  expire 4.5 days after they were last stored while the store is full. Identities kept refreshing records for 3
+  days become Earned: they then keep what they hold, though they can't take others' (Earned publishers never
+  evict each other), so space they hold is lost to honest newcomers until they stop. A flood can also take the
+  free space and the Newcomer floor, and absorb space honest publishers leaving the network free.
 - Private mode doesn't hide names: a member's names are announced over RNS like any other, so outsiders who
   hear them learn each `[sequence, CID]` record and when it changes, though members won't serve them the content
   (section 3). `name publish` in private mode warns of this.
@@ -1356,6 +1389,7 @@ are local conveniences, not part of the protocol.
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
+| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
 | `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
@@ -1411,6 +1445,27 @@ gateway can never reach the API.
   settings, then checks the subdirectories, then takes the directory's lock, in the daemon and in an embedded
   node alike; clients (the CLI, `rnfs.Client`) check `rnfs.toml` the same way when they read it, and show
   what was changed (the CLI prints it, `rnfs.Client` raises a `RuntimeWarning`, an embedded node logs it).
+- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications
+  tokens of their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name
+  rule). A request naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes
+  only with it; a request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never
+  taken for another's. App tokens outlive restarts. The node needn't keep the token itself: rnfs keeps
+  `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
+  a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
+  change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
+  that far. Removing an app revokes its token at once, cancels its queued and running jobs and releases every
+  pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
+  CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token, the
+  only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden`
+  there. While the LXMF built into rnfs is on, rnfs refuses an app called `lxmf`, whose pins (`app:lxmf:`) it
+  would share (section 13).
+- **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
+  `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
+  `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of
+  `user`, or `app:<app>:<key>` when the request carries `X-Rnfs-Pin-Key: <key>` (section 8's key rule; 400
+  otherwise), so an app can hold and release groups of its own. A job keeps the source it was queued with, also
+  across a restart. With the CLI's token a pin key is refused (400): its pins are always `user`'s. `pin ls`
+  shows every pin's sources to every caller.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it sends the token, a client SHOULD check this proof with a `GET /api/status` on the connection
@@ -1422,7 +1477,11 @@ gateway can never reach the API.
   this (the proof needs no token), and the second request gets a new read deadline, so one connection can hold
   a connection slot (below) about twice as long as a single request could (rnfs: about 2 × 15 s). This is
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
-  exactly one more request.
+  exactly one more request. A request carrying `X-Rnfs-App: <name>` gets its proof keyed by that app's verifier
+  (above), written as 64 lowercase hex digits, instead of the token: an app computes it from its own token, and
+  checks the proof the same way before sending that token. No proof is sent for an app the node doesn't have.
+  Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
+  app's token; they can read the CLI's token already.
 - The API never sends CORS headers.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
@@ -1544,7 +1603,8 @@ gateway can never reach the API.
 
 **Background jobs.** A node MAY run long transfers as *jobs* it owns, so a transfer doesn't depend on one API
 request or terminal staying open. A job has a kind — `get` (fetch a target and write it to an output path,
-optionally from one node), `pin` (fetch a target completely and pin it with source `user`), `export`
+optionally from one node), `pin` (fetch a target completely and pin it with source `user`, or the app's that
+queued it: App tokens, above), `export`
 (write an archive of a target to an output path), `add` (add a file or directory at a path on the node's
 machine, with `POST /api/add`'s options) or `import` (import an archive at such a path) — and a state: `queued`,
 `running`, `done`, `failed` or `cancelled`. Its result, when done, MUST be what the equivalent API call returns
@@ -1679,7 +1739,9 @@ Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_par
 sizes and counts at least 0; rates above 0; times above 0, except `startup_announce_delay`,
 `provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
 `remote_pin_identities` are lists of identity hashes (32 hex digits). A node MUST NOT start with an invalid
-setting.
+setting. A setting an earlier version had and this one retired is ignored with a warning, so settings an older
+version accepted still start the node (rnfs: `max_records`, replaced by `record_budget` in 0.2.0); it can't be set
+any more, only removed.
 
 A node MAY let local clients change its settings while it runs (rnfs: `rnfs config`, `POST /api/config/set`,
 with each setting's type, range, unit, default and description from `GET /api/config`). A change MUST be refused,
@@ -1705,7 +1767,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit) |
 | `startup_announce_delay` | 30 s | Second announce after startup |
 | `max_parallel_providers` | 3; 1 on slow nodes | |
-| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first; a publisher seen this long gets its full share of the provider store |
+| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first |
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
@@ -1718,7 +1780,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `max_blocks_responses` | 4 | `/blocks` responses in progress on slow links: half of this; the rest for other links, unless `fast_blocks_responses` is more. At least 2 |
 | `fast_blocks_responses` | 16 | `/blocks` responses in progress on links that aren't slow, if more than the rest of `max_blocks_responses` |
 | `max_upload_rate` | none; half the rate estimate on slow links that have one | An explicit value applies to every `/blocks` response, with or without a rate estimate |
-| `max_records` | 100 000 | |
+| `record_budget` | 1 GiB | Disk the provider records stored for others may take, never the free disk the blocks' reserve needs; past it, the storage tiers decide whose records stay (section 6). Replaces 0.1.x's `max_records` (a record count), which a node ignores with a warning |
 | `ban_time` | 1 h | |
 | `max_storage` | 10 GiB | |
 | `max_download_size` | none | |
@@ -1753,7 +1815,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `lxmf_propagation_node` | none | Propagation node (32 hex digits) used for `--propagate`, the fallback of failed direct messages and the periodic downloads. One only heard announcing itself is used only with `--nearest` |
 | `lxmf_sync_interval` | 1 h | Downloads from `lxmf_propagation_node`; 0: never |
 | `lxmf_accept_from` | empty: everyone | LXMF addresses whose messages are kept |
-| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`lxmf:<address>`) |
+| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`app:lxmf:<address>`; `lxmf:<address>` before 0.2.0) |
 | `lxmf_auto_fetch_quota` | 1 GiB per sender | Storage the pins of one auto-fetch sender may use |
 | `deny_lists` | empty | Deny-list sources: `<cid>[/path]` or `name/<name>[/path]`, each a file (section 8) |
 
@@ -1769,6 +1831,9 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 rnfs links can be sent and received as [LXMF](https://github.com/markqvist/LXMF) messages, so content can be
 shared with people using Sideband, NomadNet, MeshChat or any other LXMF client. This is optional and not part
 of the `rnfs.dht` protocol: a node without the LXMF package (or with `lxmf_enabled = false`) does none of it.
+Nor does rnfs while an app called `lxmf` exists (section 11, app tokens): that is an LXMF wrapper built on the
+local API, which owns the `app:lxmf:` pins and the LXMF identity, so rnfs's own LXMF then neither starts nor
+releases any of those pins at start.
 
 **Identity.** A node that uses LXMF has a separate RNS identity for it, kept at
 `<rnfs dir>/storage/lxmf_identity` (owner-only, like the node identity), so its LXMF address can't be linked
@@ -1884,7 +1949,8 @@ unreserved, pct-encoded: as in RFC 3986
   KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
+  `app:lxmf:<sender address>` (`lxmf:` before rnfs 0.2.0, section 8), one fetch at a time, taking senders in
+  turn. At most 64 links wait: when that many
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or

@@ -402,7 +402,8 @@ IP networks. It is **not** compatible with IPFS. The full comparison is in
 # Settings
 
 Settings go in `~/.rnfs/rnfs.toml`; command-line options override them. Times are in seconds, sizes in bytes,
-rates in bits/s, and an unknown setting is an error. These are the ones you're most likely to change; every
+rates in bits/s, and an unknown setting is an error (one a newer version retired, such as `max_records`, is ignored
+with a warning). These are the ones you're most likely to change; every
 setting and its default is in [specification.md, section 12](specification.md#12-constants).
 
 ```toml
@@ -425,6 +426,7 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
 | `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
+| `record_budget` | 1 GiB | Disk the provider records your node stores for others (as a DHT server) may take; when full, your node contacts and publishers seen for days keep their place, and strangers share a small part |
 | `max_jobs` | 2; 1 on slow nodes | Transfers running at once |
 | `upload_budget` | none | Bytes per hour your node uploads in total |
 | `serve_interfaces`, `no_serve_interfaces` | all, none | Reticulum interfaces to upload on, or never upload on (names or prefixes) |
@@ -550,6 +552,12 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
   `capabilities()`, pin labels (`label_pin`), the cache (`cache()`, `uncache(cid)`), settings (`config()`,
   `config_set({...})`), tars and archives as streams (`add_tar`, `get_tar`, `export_stream`, `import_stream`), and
   for a `Client` `shutdown()` and `daemon_info()`.
+- A `Client` can have a token of its own, so the user sees and removes what your app pinned: the user runs
+  `rnfs app add myapp -o ~/.myapp/token`, and you use `rnfs.Client(app="myapp", token_file="~/.myapp/token")`.
+  Its pins get the source `app:myapp` (`with client.pin_key("inbox"): ...` makes them `app:myapp:inbox`'s, a group
+  your app can hold and release on its own); `client.unpin()` releases only your app's, and `rnfs app rm myapp`
+  revokes the token and releases them all. The token isn't scoped: your app can do anything the user's `rnfs`
+  command can, but manage apps.
 - A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
   just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the

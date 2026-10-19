@@ -438,6 +438,69 @@ class OtherCommandTest(CliTestCase):
         os.close(fd)
 
 
+class AppCommandTest(CliTestCase):
+    """rnfs app add, ls and rm."""
+
+    def setUp(self):
+        """The FakeNode gets a real app registry."""
+        super().setUp()
+        from rnfs.apps import AppRegistry
+        self.node.apps = AppRegistry(os.path.join(self.tmp, "state"))
+        self.addCleanup(self.node.apps.close)
+        quiet = mock.patch("rnfs.apps.log")  # the daemon's own log lines, which go to stdout here
+        quiet.start()
+        self.addCleanup(quiet.stop)
+
+    def test_add_prints_the_token_once(self):
+        """app add prints only the token on stdout (for scripts) and on stderr that the app can do anything the
+        CLI can but manage apps; the token works as the app's."""
+        code, out, err = self.run_cli("app", "add", "wiki")
+        self.assertEqual(code, 0, err)
+        token = out.decode().strip()
+        self.assertEqual(out.decode(), token + "\n")
+        self.assertTrue(self.node.apps.verify("wiki", token))
+        self.assertIn("can do anything this command line can", err)
+        self.assertIn("except manage apps", err)
+        self.assertIn("rnfs app rm wiki", err)
+
+    def test_add_writes_the_token_to_a_new_private_file(self):
+        """-o writes the token to a new file only this user can read, which read_token accepts; an existing one is
+        refused before any app is added."""
+        from rnfs import apiclient
+        path = os.path.join(self.tmp, "wiki_token")
+        out = self.ok("app", "add", "wiki", "-o", path)
+        self.assertEqual(out, f"app wiki: its token is in {path}\n")
+        token = apiclient.read_token(path, "wiki")
+        self.assertTrue(self.node.apps.verify("wiki", token))
+        if POSIX_MODES:
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        code, _, err = self.run_cli("app", "add", "notes", "-o", path)
+        self.assertEqual((code, err.strip()), (1, f"rnfs: {path} already exists"))
+        self.assertNotIn("notes", self.node.apps)
+
+    def test_unwritable_output_leaves_no_app(self):
+        """An -o that can't be written removes the app again: nobody would have its token."""
+        path = os.path.join(self.tmp, "no such dir", "token")
+        code, _, err = self.run_cli("app", "add", "wiki", "-o", path)
+        self.assertEqual(code, 1)
+        self.assertIn("app wiki was not added", err)
+        self.assertEqual(self.node.apps.list(), [])
+
+    def test_ls_and_rm(self):
+        """app ls lists names and when added (--json too); app rm revokes one; errors are the daemon's."""
+        self.node.apps.add("wiki")
+        self.node.apps.add("notes")
+        lines = self.ok("app", "ls").splitlines()
+        self.assertEqual([line.split("\t")[0] for line in lines], ["notes", "wiki"])
+        self.assertEqual([app["name"] for app in json.loads(self.ok("app", "ls", "--json"))], ["notes", "wiki"])
+        self.assertEqual(self.ok("app", "rm", "wiki"), "removed app wiki, releasing 0 pins\n")
+        code, _, err = self.run_cli("app", "rm", "wiki")
+        self.assertEqual((code, err.strip()), (1, "rnfs: no app called wiki"))
+        code, _, err = self.run_cli("app", "add", "Bad")
+        self.assertEqual(code, 1)
+        self.assertIn("invalid app name", err)
+
+
 class TokenTest(CliTestCase):
 
     @unittest.skipUnless(POSIX_MODES and CAN_SYMLINK, "Unix permissions, symlinks")

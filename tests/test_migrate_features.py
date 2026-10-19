@@ -375,13 +375,13 @@ class InboxTest(Common, LogTests, MigrateTest):
     def test_reconcile_after_the_upgrade(self):
         """Upgrading with the inbox, a node's LXMF feature lists its messages and keeps the pins they record;
         with a damaged inbox, a pin no message records is kept and recorded in a new message; with a whole one,
-        it is released."""
-        source = "lxmf:" + SENDER
+        it is released. pins.json's lxmf: source is imported as rnfs 0.2.0's app:lxmf: (storage.upgraded_source)."""
+        legacy, source = "lxmf:" + SENDER, "app:lxmf:" + SENDER
         for inbox, kept in (("{not json", True), (written(self.VALUE), False)):
             with self.subTest(inbox=inbox):
                 self.config = Config(rnfs_dir=os.path.join(self.tmp.name, "node" + str(kept)))
                 self.state = self.config.state_dir
-                write_legacy(self.state, "pins.json", {"pins": {str(A): [source], str(C): [source]}})
+                write_legacy(self.state, "pins.json", {"pins": {str(A): [legacy], str(C): [legacy]}})
                 write_legacy(self.state, self.FILE, text=inbox)
                 node = self.node()
                 messages = node.feature("lxmf").inbox.entries()  # the records, as imported

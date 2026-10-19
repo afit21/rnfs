@@ -1,5 +1,6 @@
-"""Tests for the provider record store: TTL, republishing, withdrawal, eviction, replies and persistence (the
-state database's provider tables)."""
+"""Tests for the provider record store (rnfs/dht/providers.py): TTL, republishing, withdrawal, /find replies, the
+cap of publishers per key, the record budget and its storage tiers, and the records on disk (the state database's
+provider tables): batched writes, restarts and the upgrade of 0.1.x's tables."""
 import os
 import random
 import tempfile
@@ -9,9 +10,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest import mock
 
-from rnfs.constants import DAY, ID_LENGTH, K, PROVIDER_TTL
-from rnfs.dht.providers import MIN_PER_PUBLISHER, ProviderStore
+import RNS
+
+from rnfs import statedb
+from rnfs.constants import DAY, HOUR, ID_LENGTH, K, PROVIDER_TTL
+from rnfs.dht import providers
+from rnfs.dht.providers import EARNED_DAYS, NEWCOMER_TTL_FULL, ProviderStore
 from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
+
+T0 = 19676 * DAY + HOUR  # 01:00 UTC, so a day's refreshes fall on one UTC day
+SIZE = 100  # bytes a record takes in these tests (record_bytes): a store of capacity n has a budget of n * SIZE
 
 
 def ident(n: int) -> bytes:
@@ -20,343 +28,23 @@ def ident(n: int) -> bytes:
 
 
 KEY = ident(0xABC)
+OWN = ident(0xFFFF)
+_saved_loglevel = RNS.loglevel
 
 
-class StoreTestCase(unittest.TestCase):
-    """Base: an in-memory store with a fake clock and seeded rng; every store's indexes are checked after each test."""
-
-    max_records = 1000
-
-    def setUp(self):
-        """Create the store."""
-        self.clock = FakeClock(1_700_000_000.0)
-        self.stores: list[ProviderStore] = []
-        self.store = self.new_store(self.max_records, rng=random.Random(1))
-
-    def new_store(self, max_records: int, **settings) -> ProviderStore:
-        """An in-memory store on the fake clock, checked for consistency after the test."""
-        store = ProviderStore(max_records, None, clock=self.clock, **settings)
-        self.stores.append(store)
-        return store
-
-    def tearDown(self):
-        """Every index of every store agrees with its records."""
-        for store in self.stores:
-            store._check_consistency()
+def setUpModule():
+    """Silence the log while these tests run (failed saves and damaged files are logged)."""
+    RNS.loglevel = RNS.LOG_CRITICAL
 
 
-class RecordTest(StoreTestCase):
-    """Storing, refreshing, expiring and withdrawing records."""
-
-    def test_store_and_list(self):
-        self.assertTrue(self.store.store(KEY, ident(1)))
-        self.assertEqual(self.store.providers(KEY), [ident(1)])
-        self.assertEqual(self.store.record_count(), 1)
-        self.assertEqual(self.store.providers(ident(5)), [])
-
-    def test_rejects_malformed_ids(self):
-        with self.assertRaises(ValueError):
-            self.store.store(b"short", ident(1))
-        with self.assertRaises(ValueError):
-            self.store.store(KEY, b"short")
-
-    def test_future_times_clamped_at_expiry(self):
-        # Stored while the clock ran a day ahead: once corrected, the record lives a TTL from now, not a day more
-        self.clock.now += DAY
-        self.store.store(KEY, ident(1))
-        self.clock.now -= DAY
-        self.assertEqual(self.store.expire(), 0)
-        self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
-        self.clock.now += PROVIDER_TTL
-        self.assertEqual(self.store.expire(), 1)
-
-    def test_expiry_clamps_only_after_the_clock_went_back(self):
-        """The clamping pass runs only when the clock reads earlier than a time it gave before (S5)."""
-        with mock.patch.object(self.store, "_clamp", wraps=self.store._clamp) as clamp:
-            self.store.expire()
-            self.store.store(KEY, ident(1))
-            self.store.expire()
-            self.clock.now += 60
-            self.store.expire()
-            self.assertEqual(clamp.call_count, 0)
-            self.clock.now -= 100  # corrected backwards: the record was stored in the future
-            self.store.expire()
-            self.assertEqual(clamp.call_count, 1)
-            self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
-            self.store.expire()  # every time is now at most the clock's: nothing more to clamp
-            self.clock.now += 5
-            self.store.expire()
-            self.assertEqual(clamp.call_count, 1)
-
-    def test_departure_in_the_future_clamped_at_expiry(self):
-        """A departure time, taken when the publisher's last record went, is clamped too (S5): the withdrawal's own
-        clock reading counts as one the store has seen."""
-        self.store.store(KEY, ident(1))
-        self.clock.now += DAY
-        self.store.withdraw(KEY, ident(1))  # departs a day ahead of the corrected clock
-        self.clock.now -= DAY
-        self.store.expire()
-        self.assertEqual(self.store._departed[ident(1)], (self.clock.now, self.clock.now))
-
-    def test_expires_ttl_after_last_stored(self):
-        self.store.store(KEY, ident(1))
-        self.clock.now += PROVIDER_TTL - 1
-        self.assertEqual(self.store.providers(KEY), [ident(1)])
-        self.clock.now += 1
-        self.assertEqual(self.store.providers(KEY), [])
-        self.assertEqual(self.store.for_reply(KEY), [])
-        self.assertEqual(self.store.expire(), 1)
-        self.assertEqual(self.store.record_count(), 0)
-        self.assertEqual(self.store.publisher_count(), 0)
-
-    def test_republish_extends_expiry_and_keeps_first_stored(self):
-        self.store.store(KEY, ident(1))
-        self.clock.now += 10
-        self.store.store(KEY, ident(2))
-        self.clock.now += DAY
-        self.store.store(KEY, ident(1))  # republished, but still the older record
-        self.assertEqual(self.store.providers(KEY), [ident(1), ident(2)])
-        self.clock.now += PROVIDER_TTL - 1
-        self.assertEqual(self.store.providers(KEY), [ident(1)])
-        self.assertEqual(self.store.record_count(), 2)
-
-    def test_withdraw_removes_record_and_publisher(self):
-        self.store.store(KEY, ident(1))
-        self.assertIsNotNone(self.store.first_seen(ident(1)))
-        self.assertTrue(self.store.withdraw(KEY, ident(1)))
-        self.assertFalse(self.store.withdraw(KEY, ident(1)))
-        self.assertEqual(self.store.providers(KEY), [])
-        self.assertIsNone(self.store.first_seen(ident(1)))
-
-    def test_provide_batch(self):
-        keys = [ident(100 + i) for i in range(5)]
-        self.assertEqual(self.store.provide(ident(1), keys), 5)
-        self.assertEqual(self.store.provide(ident(1), [ident(200)], withdrawn=keys[:3]), 1)
-        self.assertEqual(self.store.record_count(), 3)
-        self.assertEqual(self.store.providers(keys[0]), [])
-        self.assertEqual(self.store.providers(keys[4]), [ident(1)])
-
-    def test_providers_exclude(self):
-        self.store.store(KEY, ident(1))
-        self.store.store(KEY, ident(2))
-        self.assertEqual(self.store.providers(KEY, exclude=lambda p: p == ident(1)), [ident(2)])
+def tearDownModule():
+    """Restore RNS's loglevel."""
+    RNS.loglevel = _saved_loglevel
 
 
-class ReplyTest(StoreTestCase):
-    """for_reply: the K/2 oldest records first, then K/2 at random from the rest."""
-
-    def fill(self, count: int):
-        """Store count providers of KEY, one second apart: ident(1) is the oldest."""
-        for i in range(1, count + 1):
-            self.store.store(KEY, ident(i))
-            self.clock.now += 1
-
-    def test_few_providers_all_listed_oldest_first(self):
-        self.fill(4)
-        self.assertEqual(self.store.for_reply(KEY), [ident(i) for i in range(1, 5)])
-
-    def test_oldest_half_then_random_half(self):
-        self.fill(50)
-        replies = [self.store.for_reply(KEY) for _ in range(30)]
-        for reply in replies:
-            self.assertEqual(len(reply), K)
-            self.assertEqual(reply[:K // 2], [ident(i) for i in range(1, K // 2 + 1)])
-            self.assertEqual(len(set(reply)), K)
-            self.assertTrue(all(p not in reply[:K // 2] for p in reply[K // 2:]))
-        # The random half varies, so later providers get listed too
-        listed = {p for reply in replies for p in reply[K // 2:]}
-        self.assertGreater(len(listed), 20)
-
-    def test_random_half_fills_up_to_k(self):
-        self.fill(K - 2)
-        self.assertEqual(sorted(self.store.for_reply(KEY)), [ident(i) for i in range(1, K - 1)])
-
-    def test_banned_and_expired_left_out(self):
-        self.fill(3)
-        self.clock.now += PROVIDER_TTL - 1.5  # ident(1) and ident(2) expired, ident(3) not
-        self.store.store(KEY, ident(4))
-        reply = self.store.for_reply(KEY, exclude=lambda p: p == ident(4))
-        self.assertEqual(reply, [ident(3)])
-
-    def test_squatters_cannot_hold_every_slot(self):
-        # Early squatters take the oldest slots, but honest later providers still appear in the random half
-        for i in range(K // 2):
-            self.store.store(KEY, ident(1000 + i))
-        self.clock.now += 1
-        honest = ident(1)
-        self.store.store(KEY, honest)
-        for i in range(30):
-            self.store.store(KEY, ident(2000 + i))
-        seen = sum(honest in self.store.for_reply(KEY) for _ in range(50))
-        self.assertGreater(seen, 0)
-
-
-class EvictionTest(StoreTestCase):
-    """When full, records of the publisher first seen most recently are evicted."""
-
-    max_records = 10
-
-    def test_new_publisher_evicts_a_pooled_record_when_full(self):
-        for i in range(10):
-            self.store.store(ident(100 + i), ident(1))
-        # ident(1)'s last record went into the newcomer pool (a tenth of the store); a new publisher evicts a
-        # random pooled record rather than being refused, and the records outside the pool stay
-        self.assertTrue(self.store.store(KEY, ident(2)))
-        self.assertEqual(self.store.record_count(), 10)
-        self.assertEqual(self.store.providers(ident(109)), [])
-        self.assertEqual([len(self.store.providers(ident(100 + i))) for i in range(9)], [1] * 9)
-
-    def test_newest_publisher_cannot_churn_its_own_records(self):
-        self.store.store(ident(100), ident(1))
-        self.clock.now += 1
-        for i in range(9):
-            self.store.store(ident(200 + i), ident(2))
-        self.assertFalse(self.store.store(ident(300), ident(2)))
-        self.assertEqual(self.store.providers(ident(300)), [])
-
-    def test_older_publisher_displaces_newest(self):
-        self.store.store(ident(100), ident(1))  # oldest publisher
-        self.clock.now += 1
-        for i in range(4):
-            self.store.store(ident(200 + i), ident(2))
-        self.clock.now += 1
-        for i in range(5):
-            self.store.store(ident(300 + i), ident(3))  # newest publisher
-            self.clock.now += 1
-        self.assertTrue(self.store.store(ident(101), ident(1)))
-        self.assertEqual(self.store.record_count(), 10)
-        # The newest publisher's least recently stored record went
-        self.assertEqual(self.store.providers(ident(300)), [])
-        # And again: the newest publisher keeps losing its least recently stored records
-        self.assertTrue(self.store.store(ident(201), ident(1)))
-        self.assertEqual(self.store.providers(ident(301)), [])
-
-    def test_flood_of_new_identities_displaces_only_pooled_records(self):
-        for i in range(5):
-            self.store.store(ident(100 + i), ident(1))
-            self.store.store(ident(100 + i), ident(2))
-        self.clock.now += 1
-        accepted = sum(self.store.store(ident(500 + i), ident(10_000 + i)) for i in range(1000))
-        # Each new identity lands in the newcomer pool (one record here), evicting the one there
-        self.assertEqual(accepted, 1000)
-        self.assertEqual(self.store.record_count(), 10)
-        for i in range(4):
-            self.assertEqual(sorted(self.store.providers(ident(100 + i))), [ident(1), ident(2)])
-        # ident(2)'s last record, stored once the rest of the store was full, was the one in the pool
-        self.assertEqual(self.store.providers(ident(104)), [ident(1)])
-
-    def test_flood_after_honest_records_only_churns_flooders(self):
-        for i in range(6):
-            self.store.store(ident(100 + i), ident(1))
-        self.clock.now += 1
-        # Flooders fill the remaining room, then established publishers still get in by evicting them
-        for i in range(4):
-            self.store.store(ident(500 + i), ident(10_000 + i))
-            self.clock.now += 1
-        self.assertEqual(self.store.record_count(), 10)
-        for i in range(4):
-            self.assertTrue(self.store.store(ident(200 + i), ident(1)))
-        self.assertEqual(self.store.record_count(), 10)
-        self.assertEqual(self.store.publisher_count(), 1)
-        self.assertEqual(len(self.store.providers(ident(103))), 1)
-
-    def test_expired_records_make_room(self):
-        for i in range(10):
-            self.store.store(ident(100 + i), ident(1))
-        self.clock.now += PROVIDER_TTL
-        self.assertTrue(self.store.store(KEY, ident(2)))
-        self.assertEqual(self.store.record_count(), 1)
-
-
-class PublisherLimitTest(StoreTestCase):
-    """One publisher can't take over the store; one key can't gather unbounded publishers."""
-
-    max_records = 100
-
-    def test_default_share(self):
-        self.assertEqual(ProviderStore(100_000, None).max_per_publisher, 1000)
-        self.assertEqual(ProviderStore(10, None).max_per_publisher, MIN_PER_PUBLISHER)
-
-    def test_aged_publisher_cannot_take_over_the_store(self):
-        attacker = ident(1)
-        self.store.store(ident(100), attacker)  # seen first, so it outranks everyone in eviction
-        self.clock.now += DAY
-        honest = [ident(10 + n) for n in range(5)]
-        for n, publisher in enumerate(honest):
-            for i in range(self.store.max_per_publisher):
-                self.store.store(ident(200 + 100 * n + i), publisher)
-        # Before: each of these evicted a record of the newest publisher, until the attacker held all 100
-        accepted = sum(self.store.store(ident(10_000 + i), attacker) for i in range(1000))
-        self.assertEqual(accepted, self.store.max_per_publisher - 1)
-        for n, publisher in enumerate(honest):
-            held = sum(len(self.store.providers(ident(200 + 100 * n + i))) for i in range(self.store.max_per_publisher))
-            self.assertEqual(held, self.store.max_per_publisher)
-        # Room is left for others
-        self.assertTrue(self.store.store(KEY, ident(3)))
-
-    def test_refresh_at_the_limit(self):
-        for i in range(self.store.max_per_publisher):
-            self.assertTrue(self.store.store(ident(100 + i), ident(1)))
-        self.assertFalse(self.store.store(KEY, ident(1)))
-        self.clock.now += DAY
-        self.assertTrue(self.store.store(ident(100), ident(1)))  # republishing is never refused
-
-    def test_own_records_are_not_limited(self):
-        store = self.new_store(self.max_records, own_id=ident(1))
-        for i in range(3 * store.max_per_publisher):
-            self.assertTrue(store.store(ident(100 + i), ident(1)))
-        self.assertTrue(store.store(KEY, ident(1)))
-        self.assertEqual(store.record_count(), 3 * store.max_per_publisher + 1)
-        # Others still are
-        for i in range(store.max_per_publisher):
-            store.store(ident(1000 + i), ident(2))
-        self.assertFalse(store.store(KEY, ident(2)))
-
-    def test_expired_records_do_not_count_toward_the_limit(self):
-        for i in range(self.store.max_per_publisher):
-            self.store.store(ident(100 + i), ident(1))
-        self.clock.now += PROVIDER_TTL
-        self.assertTrue(self.store.store(KEY, ident(1)))
-        self.assertEqual(self.store.record_count(), 1)
-
-    def test_full_key_evicts_a_random_non_senior_publisher(self):
-        store = self.new_store(1000, rng=random.Random(1), max_per_key=20)
-        accepted = [store.store(KEY, ident(i)) for i in range(1, 31)]
-        self.assertEqual(accepted, [True] * 30)  # newcomers are never locked out
-        providers = store.providers(KEY)
-        self.assertEqual(len(providers), 20)
-        self.assertEqual(providers[:K // 2], [ident(i) for i in range(1, K // 2 + 1)])  # the oldest half stays
-        self.assertIn(ident(30), providers)
-        self.assertEqual(store.record_count(), 20)
-        self.assertTrue(store.store(KEY, providers[-1]))  # a recorded publisher may still republish
-        self.assertEqual(store.providers(KEY), providers)
-        self.clock.now += PROVIDER_TTL
-        self.assertTrue(store.store(KEY, ident(31)))  # expired records make room, evicting none
-        self.assertEqual(store.providers(KEY), [ident(31)])
-
-    def test_sybils_holding_a_key_cannot_lock_out_later_providers(self):
-        store = self.new_store(100_000, rng=random.Random(1))
-        early = ident(1)
-        store.store(KEY, early)
-        for i in range(store.max_per_key - 1):
-            self.assertTrue(store.store(KEY, ident(1000 + i)))
-        late = ident(2)
-        self.assertTrue(store.store(KEY, late))
-        self.assertTrue(any(late in store.for_reply(KEY) for _ in range(1000)))  # in the random half
-        self.assertIn(early, store.for_reply(KEY)[:K // 2])  # long-standing providers are never evicted
-
-    def test_reply_asks_exclude_only_about_chosen_candidates(self):
-        store = self.new_store(10_000, rng=random.Random(1))
-        for i in range(store.max_per_key):
-            store.store(KEY, ident(i))
-        self.assertEqual(len(store.providers(KEY)), store.max_per_key)
-        asked = []
-        banned = {ident(i) for i in range(0, store.max_per_key, 2)}  # every other one, oldest included
-        reply = store.for_reply(KEY, exclude=lambda p: asked.append(p) or p in banned)
-        self.assertEqual(len(reply), K)
-        self.assertFalse(banned & set(reply))
-        self.assertEqual(reply[:K // 2], [ident(i) for i in range(1, K, 2)])
-        self.assertLess(len(asked), 100)
+def keys(start: int, count: int) -> list[bytes]:
+    """count keys from ident(start) on."""
+    return [ident(start + i) for i in range(count)]
 
 
 class Recorder:
@@ -405,11 +93,14 @@ def rows_written(transactions: list[list]) -> int:
 
 
 def saved(state_dir: str) -> dict:
-    """The provider tables in state_dir, shaped as held() gives a store's state."""
+    """The provider tables in state_dir: first-seen times, records with every column, standings (records, tier,
+    days, last day), and the memories of departed and evicted publishers 0.1.x kept (0.2.0 keeps none)."""
     return {
         "publishers": dict(state_rows(state_dir, "SELECT publisher, first_seen FROM provider_publishers")),
         "records": {(key, publisher): (first, last, pooled) for key, publisher, first, last, pooled in state_rows(
             state_dir, "SELECT key, publisher, first_stored, last_stored, pooled FROM provider_records")},
+        "standing": {publisher: tuple(row) for publisher, *row in state_rows(
+            state_dir, "SELECT publisher, records, tier, days, last_day FROM provider_standing")},
         "departed": {publisher: (seen, at) for publisher, seen, at in state_rows(
             state_dir, "SELECT publisher, first_seen, at FROM provider_departed")},
         "evicted": {publisher: (seen, at) for publisher, seen, at in state_rows(
@@ -418,256 +109,716 @@ def saved(state_dir: str) -> dict:
 
 
 def held(store: ProviderStore) -> dict:
-    """What store holds in memory: publishers' first-seen times, records with every field, departures and
-    evictions."""
+    """What store holds, as its tables and the changes it hasn't written yet make it, shaped as saved() gives it."""
     with store._lock:
-        return {
-            "publishers": {publisher: entry.first_seen for publisher, entry in store._publishers.items()},
-            "records": {(key, publisher): (record.first_stored, record.last_stored, int(record.pooled))
-                        for key, records in store._records.items() for publisher, record in records.items()},
-            "departed": dict(store._departed),
-            "evicted": dict(store._evicted),
-        }
+        records, standings = store._merged()
+    return {"publishers": {publisher: standing.first_seen for publisher, standing in standings.items()},
+            "records": {pair: (first, last, 0) for pair, (first, last) in records.items()},
+            "standing": {publisher: standing.row() for publisher, standing in standings.items()},
+            "departed": {}, "evicted": {}}
 
 
-class PersistenceTest(unittest.TestCase):
-    """Records and first-seen times survive a restart; saves write only what changed, in order."""
+class StoreTestCase(unittest.TestCase):
+    """Base: memory-only stores on a fake clock, with record_bytes SIZE, seeded picks and a set of Known publishers;
+    every store's caches and counts are checked against its records after each test."""
+
+    capacity = 10_000  # records the default store holds
 
     def setUp(self):
-        """A temporary state directory (removed after the stores on it are closed)."""
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.state = os.path.join(self.directory.name, "state")
-        self.clock = FakeClock(1_700_000_000.0)
+        """The clock, the Known set and the default store."""
+        self.clock = FakeClock(T0)
+        self.known: set[bytes] = set()
         self.stores: list[ProviderStore] = []
+        self.store = self.new_store()
 
-    def open(self, max_records: int = 100, **settings) -> ProviderStore:
-        """A store on self.state, checked for consistency and closed when the test ends."""
-        store = ProviderStore(max_records, self.state, clock=self.clock, **settings)
-        self.addCleanup(store.close)
+    def new_store(self, capacity: int | None = None, state_dir: str | None = None, **settings) -> ProviderStore:
+        """A store holding capacity records (default: the class's) on state_dir (None: memory only), checked after
+        the test (and closed then, if on disk)."""
+        settings.setdefault("known", self.known.__contains__)
+        settings.setdefault("rng", random.Random(1))
+        settings.setdefault("record_bytes", SIZE)
+        store = ProviderStore(state_dir, (self.capacity if capacity is None else capacity) * SIZE, clock=self.clock,
+                              **settings)
         self.stores.append(store)
+        if state_dir is not None:
+            self.addCleanup(store.close)
         return store
 
     def tearDown(self):
-        """Every index of every store opened agrees with its records (before cleanups close them)."""
+        """Every store's caches and counts agree with its records (those not closed yet)."""
         for store in self.stores:
+            if store._db._database is not None:
+                store._check_consistency()
+
+    def fill(self, store: ProviderStore, publisher: bytes, count: int, start: int) -> list[bytes]:
+        """Store count records of publisher, for keys from ident(start) on, each accepted; the keys."""
+        stored = keys(start, count)
+        for key in stored:
+            self.assertTrue(store.store(key, publisher), f"{publisher.hex()}'s record refused")
+        return stored
+
+    def earn(self, store: ProviderStore, publisher: bytes, count: int, start: int) -> list[bytes]:
+        """Make publisher Earned holding count records: stored, then one refreshed on each of EARNED_DAYS later UTC
+        days (the clock moves EARNED_DAYS days on). The keys."""
+        stored = self.fill(store, publisher, count, start)
+        for _ in range(EARNED_DAYS):
+            self.clock.now += DAY
+            self.assertTrue(store.store(stored[0], publisher))
+        self.assertEqual(store.standing(publisher)["tier"], "earned")
+        return stored
+
+    def held_by(self, store: ProviderStore, publisher: bytes) -> int:
+        """How many records publisher holds."""
+        standing = store.standing(publisher)
+        return 0 if standing is None else standing["records"]
+
+
+class RecordTest(StoreTestCase):
+    """Storing, refreshing, expiring and withdrawing records."""
+
+    def test_store_and_list(self):
+        self.assertTrue(self.store.store(KEY, ident(1)))
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+        self.assertEqual(self.store.record_count(), 1)
+        self.assertEqual(self.store.publisher_count(), 1)
+        self.assertEqual(self.store.first_seen(ident(1)), T0)
+        self.assertEqual(self.store.providers(ident(5)), [])
+
+    def test_rejects_malformed_ids(self):
+        for call in (lambda: self.store.store(b"short", ident(1)), lambda: self.store.store(KEY, b"short"),
+                     lambda: self.store.provide(ident(1), [b"short"]), lambda: self.store.withdraw(KEY, b"x")):
+            with self.assertRaises(ValueError):
+                call()
+
+    def test_expires_ttl_after_last_stored(self):
+        self.store.store(KEY, ident(1))
+        self.clock.now += PROVIDER_TTL - 1
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+        self.clock.now += 1
+        self.assertEqual(self.store.providers(KEY), [])
+        self.assertEqual(self.store.for_reply(KEY), [])
+        self.assertEqual(self.store.expire(), 1)
+        self.assertEqual(self.store.record_count(), 0)
+        self.assertEqual(self.store.publisher_count(), 0)
+        self.assertIsNone(self.store.standing(ident(1)))  # no refresh days to keep
+
+    def test_republish_extends_expiry_and_keeps_first_stored(self):
+        self.store.store(KEY, ident(1))
+        self.clock.now += 10
+        self.store.store(KEY, ident(2))
+        self.clock.now += DAY
+        self.store.store(KEY, ident(1))  # republished, but still the older record
+        self.assertEqual(self.store.providers(KEY), [ident(1), ident(2)])
+        self.assertEqual(self.store.record(KEY, ident(1)), (T0, self.clock.now))
+        self.clock.now += PROVIDER_TTL - 1
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+
+    def test_a_refresh_within_an_hour_moves_nothing(self):
+        """A refresh is recorded only once it moves the last-stored time by more than REFRESH_WRITE (an hour)."""
+        self.store.store(KEY, ident(1))
+        self.clock.now += HOUR
+        self.store.store(KEY, ident(1))
+        self.assertEqual(self.store.record(KEY, ident(1)), (T0, T0))
+        self.clock.now += 1
+        self.store.store(KEY, ident(1))
+        self.assertEqual(self.store.record(KEY, ident(1)), (T0, T0 + HOUR + 1))
+
+    def test_expired_record_stored_again_is_new(self):
+        self.store.store(KEY, ident(1))
+        self.clock.now += PROVIDER_TTL
+        self.assertTrue(self.store.store(KEY, ident(1)))
+        self.assertEqual(self.store.record(KEY, ident(1)), (self.clock.now, self.clock.now))
+        self.assertEqual(self.store.record_count(), 1)
+
+    def test_withdraw_removes_record_and_publisher(self):
+        self.store.store(KEY, ident(1))
+        self.assertTrue(self.store.withdraw(KEY, ident(1)))
+        self.assertFalse(self.store.withdraw(KEY, ident(1)))
+        self.assertEqual(self.store.providers(KEY), [])
+        self.assertEqual((self.store.record_count(), self.store.publisher_count()), (0, 0))
+        self.assertIsNone(self.store.first_seen(ident(1)))
+
+    def test_provide_batch(self):
+        """Withdrawals first, then stores: a key in both lists is stored."""
+        self.assertEqual(self.store.provide(ident(1), [KEY, ident(2)]), 2)
+        self.assertEqual(self.store.provide(ident(1), [KEY], withdrawn=[KEY, ident(2)]), 1)
+        self.assertEqual(self.store.providers(KEY), [ident(1)])
+        self.assertEqual(self.store.providers(ident(2)), [])
+
+    def test_providers_exclude(self):
+        self.store.store(KEY, ident(1))
+        self.store.store(KEY, ident(2))
+        self.assertEqual(self.store.providers(KEY, exclude=lambda p: p == ident(1)), [ident(2)])
+
+    def test_future_times_clamped_at_expiry(self):
+        # Stored while the clock ran a day ahead: once corrected, the record lives a TTL from now, not a day more
+        self.clock.now += DAY
+        self.store.store(KEY, ident(1))
+        self.clock.now -= DAY
+        self.assertEqual(self.store.expire(), 0)
+        self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
+        self.assertEqual(self.store.record(KEY, ident(1)), (self.clock.now, self.clock.now))
+        self.clock.now += PROVIDER_TTL
+        self.assertEqual(self.store.expire(), 1)
+
+    def test_expiry_clamps_only_after_the_clock_went_back(self):
+        """The clamping pass runs only when the clock reads earlier than a time it gave before (S5)."""
+        with mock.patch.object(self.store, "_clamp", wraps=self.store._clamp) as clamp:
+            self.store.expire()
+            self.store.store(KEY, ident(1))
+            self.store.expire()
+            self.clock.now += 60
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 0)
+            self.clock.now -= 100  # corrected backwards: the record was stored in the future
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 1)
+            self.assertEqual(self.store.first_seen(ident(1)), self.clock.now)
+            self.store.expire()  # every time is now at most the clock's: nothing more to clamp
+            self.clock.now += 5
+            self.store.expire()
+            self.assertEqual(clamp.call_count, 1)
+
+    def test_retain_drops_records_and_standing(self):
+        """retain() removes the records of publishers keep rejects, with their standing; this node's stay."""
+        store = self.new_store(own_id=OWN)
+        self.earn(store, ident(1), 3, 100)
+        self.fill(store, ident(2), 2, 200)
+        self.fill(store, OWN, 2, 300)
+        asked = []
+
+        def keep(publisher):
+            """Keeps ident(2) only."""
+            asked.append(publisher)
+            return publisher == ident(2)
+
+        self.assertEqual(store.retain(keep), 3)
+        self.assertEqual(sorted(asked), [ident(1), ident(2)])
+        self.assertIsNone(store.standing(ident(1)))  # its refresh days too
+        self.assertEqual(store.record_count(), 4)
+        self.assertEqual(store.providers(ident(300)), [OWN])
+
+
+class ReplyTest(StoreTestCase):
+    """The /find reply: the K/2 oldest records, then random ones."""
+
+    def setUp(self):
+        """20 providers of KEY, stored a second apart."""
+        super().setUp()
+        for i in range(20):
+            self.store.store(KEY, ident(100 + i))
+            self.clock.now += 1
+
+    def test_few_providers_all_listed_oldest_first(self):
+        self.store.store(ident(1), ident(2))
+        self.clock.now += 1
+        self.store.store(ident(1), ident(1))
+        self.assertEqual(self.store.for_reply(ident(1)), [ident(2), ident(1)])
+
+    def test_oldest_half_then_random_half(self):
+        reply = self.store.for_reply(KEY)
+        self.assertEqual(len(reply), K)
+        self.assertEqual(reply[:K // 2], [ident(100 + i) for i in range(K // 2)])
+        self.assertEqual(len(set(reply)), K)
+        replies = {tuple(self.store.for_reply(KEY)[K // 2:]) for _ in range(20)}
+        self.assertGreater(len(replies), 1)  # the random half varies
+
+    def test_banned_and_expired_left_out(self):
+        self.clock.now += PROVIDER_TTL - 10  # the first 10 have expired
+        reply = self.store.for_reply(KEY, exclude=lambda p: p == ident(110))
+        self.assertEqual(reply[:K // 2], [ident(111 + i) for i in range(K // 2)])
+        self.assertEqual(len(reply), 9)
+
+    def test_squatters_cannot_hold_every_slot(self):
+        """Later providers still get into the random half of replies."""
+        late = ident(999)
+        self.clock.now += DAY
+        self.store.store(KEY, late)
+        self.assertTrue(any(late in self.store.for_reply(KEY) for _ in range(50)))
+
+    def test_reply_asks_exclude_only_about_chosen_candidates(self):
+        asked = []
+        self.store.for_reply(KEY, exclude=lambda p: asked.append(p) or False)
+        self.assertEqual(len(asked), K)
+
+
+class FreeStoreTest(StoreTestCase):
+    """While there is room, anyone stores freely: no per-publisher caps, no newcomer pool."""
+
+    capacity = 100
+
+    def test_one_publisher_may_fill_the_store(self):
+        self.fill(self.store, ident(1), 100, 1000)
+        self.assertTrue(self.store.is_full())
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 100, "earned": 0, "known": 0, "own": 0})
+
+    def test_a_flood_of_identities_stores_while_there_is_room(self):
+        for i in range(99):
+            self.assertTrue(self.store.store(ident(1000 + i), ident(5000 + i)))
+        self.assertFalse(self.store.is_full())
+        self.assertEqual(self.store.publisher_count(), 99)
+
+    def test_newcomers_live_the_whole_ttl_while_not_full(self):
+        """The 4.5-day expiry of Newcomers' records applies only while the store is full."""
+        self.fill(self.store, ident(1), 10, 1000)
+        self.clock.now += NEWCOMER_TTL_FULL + DAY
+        self.assertEqual(self.store.expire(), 0)
+        self.assertEqual(len(self.store.providers(ident(1000))), 1)
+        self.store.maintain()
+        self.assertEqual(self.store.record_count(), 10)
+
+
+class KeyCapTest(StoreTestCase):
+    """A key keeps at most max_per_key publishers: a newcomer to a full key evicts one of its lowest tier, never one
+    of the K/2 oldest records, and never this node's own record."""
+
+    def setUp(self):
+        """A store of 20 publishers per key, recording OWN as this node."""
+        super().setUp()
+        self.store = self.new_store(max_per_key=20, own_id=OWN)
+
+    def full_key(self, tiers: dict[int, str]) -> list[bytes]:
+        """KEY held by 20 publishers, ident(100 + i) for i in tiers made "earned" or "known" (the rest Newcomers),
+        the earned ones first; the publishers, oldest record first."""
+        publishers = [ident(100 + i) for i in range(20)]
+        earned = [p for i, p in enumerate(publishers) if tiers.get(i) == "earned"]
+        for n, publisher in enumerate(earned):
+            self.fill(self.store, publisher, 1, 1000 + 10 * n)  # their own keys, refreshed to earn
+        for _ in range(EARNED_DAYS):
+            self.clock.now += DAY
+            for n, publisher in enumerate(earned):
+                self.store.store(ident(1000 + 10 * n), publisher)
+        self.known.update(p for i, p in enumerate(publishers) if tiers.get(i) == "known")
+        for publisher in publishers:
+            self.assertTrue(self.store.store(KEY, publisher))
+            self.clock.now += 1
+        return publishers
+
+    def test_newcomer_to_a_key_of_newcomers_evicts_a_random_non_senior_one(self):
+        publishers = self.full_key({})
+        evicted = set()
+        for n in range(30):
+            self.assertTrue(self.store.store(KEY, ident(500 + n)))
+            evicted |= set(publishers) - set(self.store.providers(KEY))
+        self.assertEqual(len(self.store.providers(KEY)), 20)
+        self.assertEqual(self.store.providers(KEY)[:K // 2], publishers[:K // 2])  # the senior half stays
+        self.assertGreater(len(evicted), 1)
+
+    def test_lowest_tier_gives_way_first(self):
+        """Earned and Known publishers of a full key stay while Newcomers are there to give way, and the senior half
+        (here Newcomers) stays too."""
+        publishers = self.full_key({i: "earned" for i in range(10, 15)} | {i: "known" for i in range(15, 20)})
+        for n in range(30):
+            self.assertTrue(self.store.store(KEY, ident(500 + n)))
+        held = self.store.providers(KEY)
+        self.assertEqual(len(held), 20)
+        self.assertEqual(held[:K // 2], publishers[:K // 2])
+        self.assertLessEqual(set(publishers[10:]), set(held))
+        self.assertIn(ident(529), held)  # the last newcomer got in
+
+    def test_earned_publishers_of_a_full_key_never_give_way_to_each_other(self):
+        """A key full of Earned publishers (past its senior half) refuses Newcomers and Earned ones alike; a Known
+        publisher evicts one."""
+        publishers = self.full_key({i: "earned" for i in range(5, 20)})
+        self.assertFalse(self.store.store(KEY, ident(500)))  # a Newcomer
+        newcomer_earned = ident(501)
+        self.earn(self.store, newcomer_earned, 1, 2000)
+        self.assertFalse(self.store.store(KEY, newcomer_earned))
+        self.known.add(ident(502))
+        self.assertTrue(self.store.store(KEY, ident(502)))
+        self.assertEqual(len(set(publishers[5:]) - set(self.store.providers(KEY))), 1)
+
+    def test_own_record_is_not_counted_and_never_evicted(self):
+        self.full_key({})
+        self.assertTrue(self.store.store(KEY, OWN))
+        self.assertEqual(len(self.store.providers(KEY)), 21)
+        for n in range(100):
+            self.assertTrue(self.store.store(KEY, ident(500 + n)))
+        self.assertIn(OWN, self.store.providers(KEY))
+        self.assertEqual(len(self.store.providers(KEY)), 21)
+
+    def test_expired_records_make_room(self):
+        self.full_key({})
+        self.clock.now += PROVIDER_TTL
+        self.assertTrue(self.store.store(KEY, ident(500)))
+        self.assertEqual(self.store.providers(KEY), [ident(500)])
+
+
+class TierTest(StoreTestCase):
+    """Once the budget is full, the tiers decide who makes room (spec section 6; the module's docstring). The
+    store holds 100 records: floors of 10 (Newcomer), 60 (Earned) and 30 (Known)."""
+
+    capacity = 100
+
+    def test_refresh_days_make_a_publisher_earned(self):
+        """Refreshes on EARNED_DAYS distinct UTC days after the first store's; refreshes on one day count once."""
+        publisher = ident(1)
+        self.fill(self.store, publisher, 2, 100)
+        for _ in range(5):
+            self.clock.now += 60
+            self.store.store(ident(100), publisher)  # the day of the first store doesn't count
+        self.assertEqual(self.store.standing(publisher)["days"], 0)
+        for day in range(1, EARNED_DAYS + 1):
+            self.clock.now += DAY
+            self.store.store(ident(100), publisher)
+            self.store.store(ident(101), publisher)
+            self.assertEqual(self.store.standing(publisher)["days"], day)
+        self.assertEqual(self.store.standing(publisher)["tier"], "earned")
+        self.assertEqual(self.store.tier_counts()["earned"], 2)
+        # A new key isn't a refresh: it holds no record of it to refresh
+        self.assertEqual(self.store.standing(ident(2)), None)
+
+    def test_known_publishers(self):
+        self.known.add(ident(1))
+        self.fill(self.store, ident(1), 3, 100)
+        self.assertEqual(self.store.standing(ident(1))["tier"], "known")
+        self.assertEqual(self.store.tier_counts()["known"], 3)
+
+    def test_newcomers_evict_the_largest_newcomer(self):
+        """A full store of Newcomers: a new one evicts a record of the one holding the most; one holding as many as
+        the largest is refused."""
+        self.fill(self.store, ident(1), 60, 1000)
+        self.fill(self.store, ident(2), 40, 2000)
+        self.assertTrue(self.store.store(ident(3000), ident(3)))
+        self.assertEqual((self.held_by(self.store, ident(1)), self.held_by(self.store, ident(2))), (59, 40))
+        self.assertFalse(self.store.store(ident(1999), ident(1)))  # the largest: no churning its own records
+        self.assertTrue(self.store.store(ident(2999), ident(2)))  # 40 < 59
+        self.assertEqual(self.held_by(self.store, ident(1)), 58)
+        # The record it evicts is the one refreshed least recently
+        self.assertNotIn(ident(1), self.store.providers(ident(1000)))
+        self.assertIn(ident(1), self.store.providers(ident(1059)))
+
+    def test_a_flood_of_newcomers_evens_out_the_newcomers(self):
+        """Fresh identities storing into a full store of Newcomers churn the largest holders down to their own
+        level, a record at a time: an honest newcomer keeps as many as any of them."""
+        honest = ident(1)
+        self.fill(self.store, honest, 50, 1000)
+        self.fill(self.store, ident(2), 50, 2000)
+        for n in range(500):
+            self.store.store(ident(10_000 + n), ident(5000 + n % 50))
+        self.assertTrue(self.store.is_full())
+        held = [self.held_by(self.store, ident(5000 + n)) for n in range(50)]
+        self.assertGreaterEqual(self.held_by(self.store, honest), min(held))
+
+    def test_earned_storer_takes_from_newcomers_above_their_floor(self):
+        earned = ident(1)
+        self.earn(self.store, earned, 50, 1000)
+        self.fill(self.store, ident(2), 50, 2000)  # Newcomers at 50, over their floor of 10
+        for n in range(40):
+            self.assertTrue(self.store.store(ident(3000 + n), earned))
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 10, "earned": 90, "known": 0, "own": 0})
+        # At their floor: Earned can't take more from them, nor from each other
+        self.assertFalse(self.store.store(ident(3999), earned))
+
+    def test_earned_publishers_never_evict_each_other(self):
+        """However many Earned identities a flood has, they take no records from other Earned publishers."""
+        honest = ident(1)
+        self.earn(self.store, honest, 60, 1000)
+        flooders = [ident(5000 + n) for n in range(30)]
+        for n, flooder in enumerate(flooders):
+            self.store.store(ident(10_000 + n), flooder)
+        for _ in range(EARNED_DAYS):
+            self.clock.now += DAY
+            for n, flooder in enumerate(flooders):
+                self.store.store(ident(10_000 + n), flooder)
+        self.fill(self.store, ident(2), 10, 2000)  # Newcomers, at their floor
+        self.assertTrue(self.store.is_full())
+        refused = sum(not self.store.store(ident(20_000 + n), flooders[n % 30]) for n in range(300))
+        self.assertEqual(refused, 300)
+        self.assertEqual(self.held_by(self.store, honest), 60)
+
+    def test_newcomers_below_their_floor_take_from_earned_above_its_own(self):
+        """Floors hold in both directions: Earned growth can't take the Newcomers' floor for good."""
+        earned = ident(1)
+        self.earn(self.store, earned, 95, 1000)
+        self.fill(self.store, ident(2), 5, 2000)
+        self.assertTrue(self.store.is_full())
+        for n in range(5):
+            self.assertTrue(self.store.store(ident(3000 + n), ident(3)))
+        self.assertEqual(self.store.tier_counts()["earned"], 90)
+        self.assertEqual(self.store.tier_counts()["newcomer"], 10)
+        # At its floor now: further Newcomers take from the largest Newcomer only
+        self.assertTrue(self.store.store(ident(3999), ident(4)))
+        self.assertEqual(self.store.tier_counts()["earned"], 90)
+        self.assertEqual(self.held_by(self.store, ident(2)), 4)
+
+    def test_earned_below_its_floor_takes_from_known_above_its_own(self):
+        self.known.add(ident(9))
+        earned = ident(1)
+        self.earn(self.store, earned, 45, 1000)
+        self.fill(self.store, ident(9), 50, 9000)
+        self.fill(self.store, ident(2), 5, 2000)  # Newcomers below their floor: not taken from
+        self.assertTrue(self.store.store(ident(3000), earned))
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 5, "earned": 46, "known": 49, "own": 0})
+        for n in range(1, 30):
+            self.store.store(ident(3000 + n), earned)
+        # Up to Earned's floor only: then within Earned, which never evicts
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 5, "earned": 60, "known": 35, "own": 0})
+        self.assertFalse(self.store.store(ident(3999), earned))
+
+    def test_known_storer_takes_from_the_lowest_tier_above_its_floor(self):
+        known = ident(9)
+        self.known.add(known)
+        self.earn(self.store, ident(1), 70, 1000)
+        self.fill(self.store, ident(2), 30, 2000)
+        for n in range(20):
+            self.assertTrue(self.store.store(ident(9000 + n), known))
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 10, "earned": 70, "known": 20, "own": 0})
+        for n in range(20, 30):
+            self.assertTrue(self.store.store(ident(9000 + n), known))
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 10, "earned": 60, "known": 30, "own": 0})
+        # Every tier at its floor: within Known, from its largest holder, which may not churn its own records
+        self.assertFalse(self.store.store(ident(9999), known))
+        other = ident(8)
+        self.known.add(other)
+        self.assertTrue(self.store.store(ident(8000), other))
+        self.assertEqual(self.held_by(self.store, known), 29)
+
+    def test_a_tier_changed_since_written_is_found_when_evicting(self):
+        """A publisher that became Known (a contact added) after its records were counted as a Newcomer's isn't
+        evicted as a Newcomer: it is moved to Known when picked."""
+        self.fill(self.store, ident(1), 60, 1000)
+        self.fill(self.store, ident(2), 40, 2000)
+        self.known.add(ident(1))
+        self.assertTrue(self.store.store(ident(3000), ident(3)))
+        self.assertEqual(self.held_by(self.store, ident(1)), 60)
+        self.assertEqual(self.held_by(self.store, ident(2)), 39)
+        self.assertEqual(self.store.tier_counts(), {"newcomer": 40, "earned": 0, "known": 60, "own": 0})
+
+    def test_a_refused_batch_looks_for_room_once(self):
+        """Once the full store refuses one key of a /provide, the rest are refused at once; refreshes still count."""
+        self.fill(self.store, ident(1), 100, 1000)
+        with mock.patch.object(self.store, "_reclaim", wraps=self.store._reclaim) as reclaim:
+            stored = self.store.provide(ident(1), keys(5000, 20) + [ident(1000)])
+        self.assertEqual((stored, reclaim.call_count), (1, 1))
+
+
+class NewcomerExpiryTest(StoreTestCase):
+    """While the budget is full, a Newcomer's record last stored NEWCOMER_TTL_FULL (4.5 days) ago counts as
+    expired; other tiers' records live PROVIDER_TTL."""
+
+    capacity = 20
+
+    def test_only_while_full_and_only_newcomers(self):
+        earned = ident(1)
+        for key in self.earn(self.store, earned, 5, 1000):
+            self.store.store(key, earned)  # all refreshed now
+        self.fill(self.store, ident(2), 5, 2000)
+        self.clock.now += 2 * DAY
+        self.assertEqual(self.store.expire(), 0)  # not full
+        self.clock.now += NEWCOMER_TTL_FULL - 2 * DAY
+        self.fill(self.store, ident(3), 10, 3000)  # fresh; now full
+        self.assertTrue(self.store.is_full())
+        self.assertEqual(self.store.expire(), 5)  # ident(2)'s: 4.5 days old
+        self.assertEqual(self.held_by(self.store, ident(2)), 0)
+        self.assertEqual(self.held_by(self.store, earned), 5)  # as old, but Earned
+
+    def test_a_full_store_expires_before_it_evicts(self):
+        """A store that finds itself full sweeps for expired records first: the stale Newcomer goes, not the
+        fresh one."""
+        self.fill(self.store, ident(2), 10, 2000)
+        self.clock.now += NEWCOMER_TTL_FULL
+        self.fill(self.store, ident(3), 10, 3000)
+        self.assertTrue(self.store.store(ident(4000), ident(4)))
+        self.assertEqual(self.held_by(self.store, ident(2)), 0)
+        self.assertEqual(self.held_by(self.store, ident(3)), 10)
+
+
+class OwnRecordsTest(StoreTestCase):
+    """This node's records: always accepted, never evicted, in a tier of their own."""
+
+    capacity = 20
+
+    def setUp(self):
+        """A store recording OWN as this node."""
+        super().setUp()
+        self.store = self.new_store(own_id=OWN)
+
+    def test_always_accepted_and_never_evicted(self):
+        own = self.fill(self.store, OWN, 30, 1000)  # beyond the budget
+        self.assertEqual(self.store.tier_counts()["own"], 30)
+        for n in range(100):
+            self.store.store(ident(5000 + n), ident(100 + n))
+        self.assertEqual([key for key in own if OWN not in self.store.providers(key)], [])
+        self.clock.now += NEWCOMER_TTL_FULL
+        self.store.expire()
+        self.assertEqual(self.store.tier_counts()["own"], 30)
+
+    def test_own_records_take_room_from_others(self):
+        self.fill(self.store, OWN, 10, 1000)
+        self.fill(self.store, ident(1), 10, 2000)
+        self.assertTrue(self.store.is_full())
+        self.assertFalse(self.store.store(ident(2999), ident(1)))
+
+    def test_budget_of_nothing_keeps_only_own_records(self):
+        store = self.new_store(capacity=0, own_id=OWN)
+        self.assertFalse(store.store(KEY, ident(1)))
+        self.assertTrue(store.store(KEY, OWN))
+
+
+class BudgetTest(StoreTestCase):
+    """The budget's measure: bytes per record from the database, and the free disk."""
+
+    def test_bytes_per_record_are_measured(self):
+        """Without record_bytes, a record's size is the database's pages over its records (at least
+        MEASURE_RECORDS of them), measured at each save: a store whose records outgrow the budget is full."""
+        store = self.new_store(record_bytes=None)
+        store.record_budget = 1 << 30
+        self.assertLess(store._record_bytes, 50)  # an empty database over MEASURE_RECORDS records
+        for n in range(12_000):
+            store.store(ident(10_000 + n), ident(1 + n % 50))
+        store.save()
+        size = store._record_bytes
+        self.assertGreater(size, 60)
+        self.assertLess(size, 400)
+        self.assertFalse(store.is_full())
+        store.record_budget = int(size * 11_999)
+        self.assertTrue(store.is_full())
+        self.assertTrue(store.store(ident(1), ident(5000)))
+        self.assertEqual(store.record_count(), 12_000)  # it made room rather than grow
+
+    def test_free_disk_bounds_the_store(self):
+        """Records never take the disk the blocks' reserve needs: free_space() is the room left beyond it."""
+        room = [50 * SIZE]
+        store = self.new_store(free_space=lambda: room[0])
+        self.fill(store, ident(1), 49, 1000)
+        self.assertFalse(store.is_full())
+        self.fill(store, ident(2), 1, 2000)
+        self.assertTrue(store.is_full())  # measured at the start: 50 records' room
+        store.save()  # measured again: 50 more records' room (they took none, here)
+        self.assertFalse(store.is_full())
+        room[0] = 0
+        store.save()
+        self.assertTrue(store.is_full())
+        room[0] = -SIZE  # below the reserve already: full however few records there are
+        store.withdraw(ident(1000), ident(1))
+        store.save()
+        self.assertTrue(store.is_full())
+
+    def test_a_free_space_error_keeps_the_last_measure(self):
+        def failing():
+            """The disk can't be asked."""
+            raise OSError("gone")
+
+        store = self.new_store(free_space=failing)
+        self.assertTrue(store.store(KEY, ident(1)))
+        store.save()
+        self.assertFalse(store.is_full())
+
+
+class CacheTest(StoreTestCase):
+    """Memory doesn't grow with the records or publishers: the caches are bounded, the rest is read per key."""
+
+    def test_caches_stay_bounded(self):
+        with mock.patch.multiple(providers, CACHE_KEYS=8, CACHE_ROWS=40, STANDING_CACHE=8):
+            store = self.new_store()
+            for n in range(400):
+                store.store(ident(10_000 + n % 100), ident(1 + n // 4))
+            store.save()
+            for n in range(100):
+                self.assertEqual(len(store.providers(ident(10_000 + n))), 4)
+            self.assertLessEqual(len(store._cache), 8)
+            self.assertLessEqual(store._cache_rows, 40)
+            self.assertLessEqual(len(store._standings), 8)
+            self.assertEqual((store._dirty, store._pinned_standings), ({}, {}))
             store._check_consistency()
 
+    def test_changes_waiting_to_be_written_are_bounded(self):
+        """Past FLUSH_CHANGES rows waiting, a store writes them itself."""
+        with mock.patch.object(providers, "FLUSH_CHANGES", 50):
+            store = self.new_store()
+            with recorded_writes(store._db) as transactions:
+                for n in range(100):
+                    store.store(ident(10_000 + n), ident(1))
+            self.assertGreaterEqual(len(transactions), 1)
+            self.assertLess(store._changes(), 50)
+
+
+class PersistenceTest(StoreTestCase):
+    """Records and standings on disk: batched writes, restarts, failures."""
+
+    def setUp(self):
+        """A temporary state directory (removed after the stores on it are closed)."""
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = os.path.join(directory.name, "state")
+
+    def open(self, **settings) -> ProviderStore:
+        """A store on self.state."""
+        return self.new_store(state_dir=self.state, **settings)
+
     def test_round_trip(self):
-        """Records and first-seen times are saved, and loaded by the next store."""
-        store = self.open()
-        store.store(KEY, ident(1))
-        self.clock.now += 5
-        store.store(KEY, ident(2))
-        store.store(ident(7), ident(2))
+        """Records, first-seen times and refresh days are saved, and read by the next store."""
+        store = self.open(own_id=OWN)
+        self.earn(store, ident(1), 2, 100)
+        self.fill(store, ident(2), 1, 200)
+        self.fill(store, OWN, 1, 300)
         store.save()
-        self.assertEqual(len(state_rows(self.state, "SELECT * FROM provider_records")), 3)
-
-        self.clock.now += 100
-        loaded = self.open()
-        self.assertEqual(loaded.providers(KEY), [ident(1), ident(2)])
-        self.assertEqual(loaded.record_count(), 3)
-        self.assertEqual(loaded.first_seen(ident(1)), store.first_seen(ident(1)))
-        self.assertEqual(loaded.first_seen(ident(2)), store.first_seen(ident(2)))
-
-    def test_own_record_beyond_a_full_key_survives_restart(self):
-        """The node's own record doesn't count toward max_per_key on load either (DHT-5)."""
-        own = ident(1)
-        store = self.open(1000, max_per_key=5, own_id=own)
-        for i in range(5):
-            store.store(KEY, ident(100 + i))
-        self.clock.now += 1
-        store.store(KEY, own)
-        store.save()
-        loaded = self.open(1000, max_per_key=5, own_id=own)
-        self.assertEqual(loaded.providers(KEY), [ident(100 + i) for i in range(5)] + [own])
-
-    def test_first_seen_order_survives_restart(self):
-        """A publisher seen first still evicts the newest one's records after a restart."""
-        store = self.open(3)
-        store.store(ident(100), ident(1))
-        self.clock.now += 1
-        store.store(ident(101), ident(2))
-        store.store(ident(102), ident(2))
-        store.save()
-        loaded = self.open(3)
-        self.assertTrue(loaded.store(ident(103), ident(1)))  # evicts a record of ident(2), the newest
-        self.assertEqual(loaded.record_count(), 3)
-        self.assertEqual(len(loaded.providers(ident(101)) + loaded.providers(ident(102))), 1)
-
-    def test_limits_applied_on_load_keeping_oldest(self):
-        """A smaller per-publisher limit at load keeps the oldest records; the next save deletes the rest."""
-        store = self.open(max_per_publisher=100)
-        for i in range(30):
-            store.store(ident(100 + i), ident(1))
-            self.clock.now += 1
-        store.save()
-        loaded = self.open(max_per_publisher=10)
-        self.assertEqual(loaded.record_count(), 10)
-        self.assertEqual([len(loaded.providers(ident(100 + i))) for i in range(30)], [1] * 10 + [0] * 20)
-        loaded.save()
-        self.assertEqual(saved(self.state), held(loaded))
-        self.assertEqual(len(saved(self.state)["records"]), 10)
-
-    def test_expired_records_dropped_on_load(self):
-        """Records expired by the time of the load aren't loaded, and the next save deletes their rows."""
-        store = self.open()
-        store.store(KEY, ident(1))
-        store.save()
-        self.clock.now += PROVIDER_TTL
-        loaded = self.open()
-        self.assertEqual(loaded.record_count(), 0)
-        self.assertIsNone(loaded.first_seen(ident(1)))
-        loaded.save()
-        self.assertEqual(saved(self.state), {"publishers": {}, "records": {}, "departed": {}, "evicted": {}})
-
-    def test_future_times_clamped_on_load(self):
-        """Times saved while the clock ran ahead load as now, and are saved so."""
-        # Saved while the clock ran a year ahead; once corrected, records still expire a TTL from now
-        self.clock.now += 365 * DAY
-        store = self.open()
-        store.store(KEY, ident(1))
-        store.save()
-        self.clock.now -= 365 * DAY
-        loaded = self.open()
-        self.assertEqual(loaded.first_seen(ident(1)), self.clock.now)
-        self.assertEqual(loaded.providers(KEY), [ident(1)])
-        loaded.save()
-        self.assertEqual(saved(self.state)["records"], {(KEY, ident(1)): (self.clock.now, self.clock.now, 0)})
-        self.clock.now += PROVIDER_TTL
-        self.assertEqual(loaded.expire(), 1)
-
-    def test_times_clamped_at_expiry_are_saved(self):
-        """Times expire() brings back to now (records, first-seen times, departures) are saved so."""
-        store = self.open(seniority=DAY)
-        store.store(KEY, ident(1))
-        self.clock.now += 2 * DAY
-        store.store(ident(7), ident(2))
-        store.withdraw(KEY, ident(1))  # departs, remembered
-        store.save()
-        self.clock.now -= 3 * DAY
-        store.expire()
-        with recorded_writes(store._db) as transactions:
-            store.save()
-        self.assertEqual(saved(self.state), held(store))
-        now = self.clock.now
-        self.assertEqual(saved(self.state)["records"], {(ident(7), ident(2)): (now, now, 0)})
-        self.assertEqual(saved(self.state)["departed"], {ident(1): (now, now)})
-        # The record, publisher and departure, the departure deleted from both its tables first
-        self.assertEqual(rows_written(transactions), 5)
-
-    def test_malformed_rows_are_ignored_and_deleted(self):
-        """Rows of the wrong type or length, or of a publisher without a row, load as nothing; the next save
-        deletes them, keeping the rest."""
-        store = self.open(seniority=DAY)
-        store.store(KEY, ident(1))
-        store.store(KEY, ident(2))
-        self.clock.now += 2 * DAY
-        store.withdraw(KEY, ident(2))  # departs, remembered
-        store.save()
-        store.close()
-        records = ("INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
-                   " VALUES (?, ?, ?, ?, ?)")
-        now = self.clock.now
-        for sql, row in ((records, (b"short", ident(1), now, now, 0)),
-                         (records, ("text key 16 long", ident(1), now, now, 0)),
-                         (records, (ident(8), ident(1), "yesterday", now, 0)),
-                         (records, (ident(9), ident(1), now, now, "pooled")),
-                         (records, (ident(10), ident(3), now, now, 0)),  # ident(3) has no publisher row
-                         ("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)", (ident(4), "x")),
-                         ("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)", (b"x", now)),
-                         ("INSERT INTO provider_departed (publisher, first_seen, at) VALUES (?, ?, ?)", (b"y", 1, now)),
-                         ("INSERT INTO provider_evicted (publisher, first_seen, at) VALUES (?, ?, ?)",
-                          (ident(5), now, "x"))):
-            state_execute(self.state, sql, row)
-        loaded = self.open(seniority=DAY)
-        self.assertEqual(loaded.providers(KEY), [ident(1)])
-        self.assertEqual(loaded.record_count(), 1)
-        self.assertEqual(loaded.allowance(ident(2)), loaded.max_per_publisher)
-        loaded.save()
-        self.assertEqual(saved(self.state), held(loaded))
-        self.assertEqual(len(saved(self.state)["records"]), 1)
-
-    def test_legacy_file_with_out_of_range_numbers_is_set_aside(self):
-        """providers.json with a number no float holds (which made rnfs 0.1.4 start empty) is moved aside."""
-        write_legacy(self.state, "providers.json",
-                     {"version": 1, "publishers": {ident(1).hex(): 10 ** 400}, "records": []})
-        self.assertEqual(self.open().record_count(), 0)
-        self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
-
-    def test_saves_never_land_out_of_order(self):
-        """A save that snapshots while another is still writing doesn't land first, overwritten by the older."""
-        store = self.open()
-        store.store(KEY, ident(1))
-        second = []
-
-        def refresh_and_save():
-            """Before the first save writes: refresh its record, and save from another thread."""
-            if not second:
-                self.clock.now += 5
-                store.store(KEY, ident(1))
-                second.append(threading.Thread(target=store.save))
-                second[0].start()
-                second[0].join(0.2)
-
-        with recorded_writes(store._db, before=refresh_and_save):
-            store.save()
-            second[0].join(5)
-        self.assertEqual(saved(self.state)["records"], {(KEY, ident(1)): (self.clock.now - 5, self.clock.now, 0)})
-
-    def test_saved_tables_are_the_whole_state(self):
-        """The tables hold every publisher, record (pooled or not), departure and eviction, as memory does."""
-        store = self.open(20, seniority=DAY)
-        for publisher in (1, 2):
-            for i in range(9):
-                store.store(ident(100 * publisher + i), ident(publisher))
-                self.clock.now += 1
-        for publisher in (3, 4, 5):  # the main part is full: newcomers share the pool, and 5 evicts 3 or 4
-            store.store(ident(1000 + publisher), ident(publisher))
-            self.clock.now += 1
-        store.store(ident(101), ident(1))  # refreshed in place
-        store.withdraw(ident(100), ident(1))
-        self.clock.now += DAY
-        store.withdraw(ident(1005), ident(5))  # 5 departs, seen for long enough to be remembered
         expected = held(store)
-        self.assertTrue(expected["departed"] and expected["evicted"])
-        self.assertIn(1, [pooled for _, _, pooled in expected["records"].values()])
-        store.save()
         self.assertEqual(saved(self.state), expected)
+        store.close()
+        loaded = self.open(own_id=OWN)
+        self.assertEqual(held(loaded), expected)
+        self.assertEqual(loaded.standing(ident(1)), store.standing(ident(1)))
+        self.assertEqual(loaded.tier_counts(), {"newcomer": 1, "earned": 2, "known": 0, "own": 1})
+        self.assertEqual(loaded.providers(ident(100)), [ident(1)])
+        self.assertEqual((loaded.record_count(), loaded.publisher_count()), (4, 3))
 
-    def test_save_writes_only_what_changed(self):
-        """With a thousand records saved, refreshing one and withdrawing another writes two rows."""
-        store = self.open(2000)
-        for i in range(1000):
-            store.store(ident(100 + i), ident(1 + i % 10))
-        store.save()
-        self.clock.now += 10
-        store.store(ident(100), ident(1))
-        store.withdraw(ident(101), ident(2))
+    def test_stores_write_nothing_until_saved(self):
+        """Stores and withdrawals change memory only; a save writes them in one transaction: each record, and each
+        publisher's standing and first-seen time."""
+        store = self.open()
         with recorded_writes(store._db) as transactions:
+            for n in range(10):
+                store.store(ident(100 + n), ident(1 + n % 2))
+            store.withdraw(ident(100), ident(1))
+            self.assertEqual(transactions, [])
             store.save()
         self.assertEqual(len(transactions), 1)
-        self.assertEqual(rows_written(transactions), 2)
+        self.assertEqual(rows_written(transactions), 10 + 2 + 2)
         self.assertEqual(saved(self.state), held(store))
 
-    def test_failed_save_is_tried_again(self):
-        """A save whose commit fails raises, and the next save writes what it held."""
+    def test_refreshes_are_written_only_past_an_hour(self):
+        store = self.open()
+        for n in range(100):
+            store.store(ident(100 + n), ident(1))
+        store.save()
+        with recorded_writes(store._db) as transactions:
+            self.clock.now += HOUR
+            for n in range(100):
+                store.store(ident(100 + n), ident(1))
+            store.save()
+            self.assertEqual(transactions, [])
+            self.clock.now += 60
+            store.store(ident(100), ident(1))
+            store.save()
+        self.assertEqual(rows_written(transactions), 1)
+
+    def test_a_new_refresh_day_writes_the_standing(self):
         store = self.open()
         store.store(KEY, ident(1))
-        with failing_commits():
-            with self.assertRaises(OSError):
-                store.save()
         store.save()
-        self.assertEqual(self.open().providers(KEY), [ident(1)])
+        with recorded_writes(store._db) as transactions:
+            self.clock.now += DAY
+            store.store(KEY, ident(1))
+            store.save()
+        self.assertEqual(rows_written(transactions), 2)  # the record and the standing
+        self.assertEqual(saved(self.state)["standing"][ident(1)][2], 1)
 
-    def test_corrupt_legacy_file_starts_empty(self):
-        """providers.json that isn't JSON is moved aside, and the store starts empty."""
-        write_legacy(self.state, "providers.json", text="{not json")
-        self.assertEqual(self.open().record_count(), 0)
-        self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
+    def test_a_refusal_writes_nothing(self):
+        store = self.open()
+        store.record_budget = 10 * SIZE
+        self.fill(store, ident(1), 10, 100)
+        store.save()
+        with recorded_writes(store._db) as transactions:
+            for n in range(50):
+                self.assertFalse(store.store(ident(1000 + n), ident(1)))  # the largest Newcomer
+            self.assertEqual(store.provide(ident(1), keys(2000, 20)), 0)
+            store.save()
+        self.assertEqual(transactions, [])
 
     def test_save_only_when_changed(self):
-        """A save with nothing changed opens no transaction."""
         store = self.open()
         with recorded_writes(store._db) as transactions:
             store.save()
@@ -676,129 +827,182 @@ class PersistenceTest(unittest.TestCase):
             store.save()
             store.save()
         self.assertEqual(len(transactions), 1)
-        self.assertEqual(len(saved(self.state)["records"]), 1)
+
+    def test_failed_save_is_tried_again(self):
+        store = self.open()
+        store.store(KEY, ident(1))
+        with failing_commits():
+            with self.assertRaises(OSError):
+                store.save()
+        self.assertEqual(store.providers(KEY), [ident(1)])
+        store.save()
+        store.close()
+        self.assertEqual(self.open().providers(KEY), [ident(1)])
+
+    def test_failing_writes_bound_the_changes_held(self):
+        """While saves fail, others' new records are refused past MAX_CHANGES (memory stays bounded); this node's and
+        refreshes still go through."""
+        store = self.open(own_id=OWN)
+        with mock.patch.multiple(providers, FLUSH_CHANGES=20, MAX_CHANGES=40), failing_commits():
+            results = [store.store(ident(100 + n), ident(1 + n)) for n in range(40)]
+            self.assertFalse(all(results))
+            self.assertTrue(store.store(ident(9), OWN))
+            self.assertTrue(store.store(ident(100), ident(1)))
+        store.save()
+        self.assertEqual(saved(self.state), held(store))
+
+    def test_future_times_clamped_on_load(self):
+        store = self.open()
+        self.clock.now += DAY
+        store.store(KEY, ident(1))
+        store.save()
+        store.close()
+        self.clock.now -= DAY
+        loaded = self.open()
+        self.assertEqual(loaded.record(KEY, ident(1)), (self.clock.now, self.clock.now))
+        self.assertEqual(loaded.first_seen(ident(1)), self.clock.now)
+        loaded.save()
+        self.assertEqual(saved(self.state)["records"][(KEY, ident(1))], (self.clock.now, self.clock.now, 0))
+
+    def test_malformed_rows_are_ignored_and_deleted(self):
+        """Records of the wrong type or length, or of a publisher with no standing, read as nothing; the next save
+        deletes them, keeping the rest and the counts right."""
+        store = self.open()
+        store.store(KEY, ident(1))
+        store.store(KEY, ident(2))
+        store.save()
+        store.close()
+        records = ("INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
+                   " VALUES (?, ?, ?, ?, ?)")
+        now = self.clock.now
+        for row in ((KEY, b"short", now, now, 0), (KEY, "text publisher 1", now, now, 0),
+                    (KEY, ident(3), now, now, 0)):  # ident(3) has no standing
+            state_execute(self.state, records, row)
+        state_execute(self.state, "UPDATE provider_records SET first_stored = 'yesterday' WHERE publisher = ?",
+                      (ident(2),))
+        loaded = self.open()
+        self.assertEqual(loaded.providers(KEY), [ident(1)])
+        self.assertEqual((loaded.record_count(), loaded.publisher_count()), (1, 1))
+        loaded.save()
+        self.assertEqual(saved(self.state), held(loaded))
+        self.assertEqual(list(saved(self.state)["records"]), [(KEY, ident(1))])
+
+    def test_corrupt_legacy_file_starts_empty(self):
+        """providers.json that isn't JSON is moved aside, and the store starts empty."""
+        write_legacy(self.state, "providers.json", text="{not json")
+        self.assertEqual(self.open().record_count(), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "providers.json.damaged")))
 
     def test_random_operations_are_saved_and_loaded_exactly(self):
-        """Many random stores, withdrawals, batches, expiries, retains and saves (some failing) with every limit
-        reached: a store loaded from the tables holds exactly what the first one holds, and so do the tables."""
+        """Many random stores, refreshes over days, withdrawals, batches, expiries, retains and saves (some failing)
+        with the budget, its tiers and the key cap at work: a store loaded from the tables holds exactly what the
+        first one holds, and answers the same."""
         rng = random.Random(7)
-        own = ident(1)
-        settings = {"max_per_key": 6, "own_id": own, "seniority": DAY, "rng": random.Random(1)}
-        store = self.open(60, **settings)
-        publishers = [ident(1 + n) for n in range(40)]
-        keys = [ident(1000 + n) for n in range(30)]
-
-        def check():
-            """Expire, save, and load another store from the tables: it, and they, hold what store does."""
-            store.expire()
-            store.save()
-            loaded = ProviderStore(60, self.state, clock=self.clock, **settings)
-            try:
-                store._check_consistency()
-                loaded._check_consistency()
-                self.assertEqual(held(loaded), held(store))
-                self.assertEqual(saved(self.state), held(store))
-                self.assertFalse(loaded._dirty_records or loaded._dirty_publishers or loaded._dirty_gone)
-            finally:
-                loaded.close()
-
-        failed = 0
-        for _ in range(4000):
-            action = rng.random()
-            publisher = rng.choice(publishers)
-            if action < 0.4:
-                store.store(rng.choice(keys), publisher)
-            elif action < 0.55:
-                store.withdraw(rng.choice(keys), publisher)
-            elif action < 0.65:
-                store.provide(publisher, rng.sample(keys, rng.randrange(1, 12)), rng.sample(keys, rng.randrange(3)))
-            elif action < 0.8:
-                self.clock.now += rng.choice((1, 60, 3600))
-            elif action < 0.83:
-                self.clock.now += rng.choice((DAY, 3 * DAY, PROVIDER_TTL))
-                store.expire()
-            elif action < 0.85:
-                banned = set(rng.sample(publishers, 3))
-                store.retain(lambda p: p not in banned)
-            elif action < 0.95:
-                store.save()
-            elif action < 0.97:
-                with failing_commits():
-                    try:
-                        store.save()
-                    except OSError:
-                        failed += 1
-            elif action < 0.98:
-                check()
-        self.assertGreater(failed, 10)
-        self.assertGreater(store._count, 0)
-        self.assertTrue(store._departed or store._evicted)
-        check()
-
-    def test_random_operations_keep_indexes_consistent(self):
-        """Random stores, withdrawals, expiries, clock corrections and reloads (some with smaller limits) in a store
-        kept full: every index agrees with the records after each step, and after expire() no time is later than
-        now."""
-        rng = random.Random(11)
-        own = ident(1)
-        publishers = [ident(1 + n) for n in range(25)]
-        keys = [ident(1000 + n) for n in range(20)]
-        limits = [{"max_records": 40}, {"max_records": 40}, {"max_records": 30, "max_per_publisher": 5},
-                  {"max_records": 20, "max_per_key": 3}]
-        settings = {"max_per_key": 5, "own_id": own, "seniority": DAY, "rng": random.Random(2)}
-        store = self.open(**(settings | limits[0]))
-        counts = {"pooled": 0, "reloads": 0, "clamped": 0}
-
-        def no_future_times(store: ProviderStore):
-            """Nothing store holds is later than now."""
-            now = self.clock.now
-            state = held(store)
-            self.assertTrue(all(seen <= now for seen in state["publishers"].values()))
-            self.assertTrue(all(first <= now and last <= now for first, last, _ in state["records"].values()))
-            for memory in ("departed", "evicted"):
-                self.assertTrue(all(seen <= now and at <= now for seen, at in state[memory].values()))
-
-        for _ in range(3000):
-            action = rng.random()
-            publisher = rng.choice(publishers)
-            if action < 0.45:
-                store.store(rng.choice(keys), publisher)
-            elif action < 0.6:
-                store.withdraw(rng.choice(keys), publisher)
-            elif action < 0.75:
-                self.clock.now += rng.choice((1, 600, 3 * 3600, DAY, 3 * DAY))
-            elif action < 0.8:
-                self.clock.now -= rng.choice((1, 600, DAY))  # corrected backwards: times are now in the future
-                counts["clamped"] += 1
-            elif action < 0.88:
-                store.expire()
-                no_future_times(store)
-            elif action < 0.9:
-                store.retain(lambda p: p not in {publisher})
-            elif action < 0.95:
-                # A restart, sometimes with expired records and future times still held (the load drops and clamps
-                # them): after an expire(), the reloaded store holds what this one did unless its limits are smaller
-                expired = rng.random() < 0.5
-                if expired:
+        settings = {"max_per_key": 6, "own_id": OWN}
+        with mock.patch.multiple(providers, CACHE_KEYS=5, CACHE_ROWS=20, STANDING_CACHE=5):
+            store = self.open(**settings)
+            store.record_budget = 60 * SIZE
+            publishers = [ident(1 + n) for n in range(40)] + [OWN]
+            self.known.update(publishers[:4])
+            all_keys = keys(1000, 30)
+            for step in range(3000):
+                action = rng.random()
+                publisher = rng.choice(publishers)
+                if action < 0.6:
+                    store.store(rng.choice(all_keys), publisher)
+                elif action < 0.7:
+                    store.withdraw(rng.choice(all_keys), publisher)
+                elif action < 0.8:
+                    store.provide(publisher, rng.sample(all_keys, 4), rng.sample(all_keys, 2))
+                elif action < 0.9:
+                    self.clock.now += rng.choice((60, HOUR, DAY / 2, DAY))
+                elif action < 0.93:
                     store.expire()
-                store.save()
-                store.close()
-                setting = rng.choice(limits)
-                reloaded = self.open(**(settings | setting))
-                if expired and setting == limits[0] and store.max_records == 40:
-                    self.assertEqual(held(reloaded), held(store))
-                no_future_times(reloaded)
-                store = reloaded
-                counts["reloads"] += 1
-            counts["pooled"] = max(counts["pooled"], store._pool_count)
-            store._check_consistency()
-        self.assertTrue(counts["pooled"] and counts["reloads"] > 50 and counts["clamped"] > 50)
+                elif action < 0.94:
+                    store.retain(lambda p: p != rng.choice(publishers))
+                elif action < 0.97:
+                    if rng.random() < 0.2 and store._changes():
+                        with failing_commits(), self.assertRaises(OSError):
+                            store.save()
+                    else:
+                        store.save()
+                else:
+                    store.maintain()
+                if step % 500 == 0:
+                    store._check_consistency()
+            store.save()
+            expected = held(store)
+            self.assertEqual(saved(self.state), expected)
+            loaded = ProviderStore(self.state, store.record_budget, clock=self.clock, record_bytes=SIZE,
+                                   known=self.known.__contains__, **settings)
+            self.addCleanup(loaded.close)
+            self.stores.append(loaded)
+            self.assertEqual(held(loaded), expected)
+            for key in all_keys:
+                self.assertEqual(loaded.providers(key), store.providers(key))
+            self.assertEqual(loaded.tier_counts(), store.tier_counts())
+            self.assertGreater(store.tier_counts()["earned"] + store.tier_counts()["known"], 0)
+
+
+class UpgradeTest(unittest.TestCase):
+    """A state database of 0.1.6 (its schema steps only) holding provider rows, opened by this version: the schema
+    step builds each publisher's standing, and the store reads them as it left them."""
+
+    NOW = T0
+
+    def setUp(self):
+        """A database with 0.1.6's schema and provider rows, as 0.1.6 saved them."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = os.path.join(directory.name, "state")
+        from tests.test_statedb import RELEASED_0_1_6_STEPS
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:RELEASED_0_1_6_STEPS]):
+            db = statedb.connect(self.state)
+        now = self.NOW
+        with db.transaction() as tx:
+            tx.executemany("INSERT INTO provider_publishers (publisher, first_seen) VALUES (?, ?)", [
+                (ident(1), now - 10 * DAY),  # refreshing for days: Earned
+                (ident(2), now - 10 * DAY),  # stored long ago, never refreshed
+                (ident(3), now - DAY),  # refreshed, but first seen a day ago
+                (ident(4), now - 10 * DAY),  # refreshed for days, but in 0.1.x's newcomer pool
+                (OWN, now - 20 * DAY)])
+            tx.executemany("INSERT INTO provider_records (key, publisher, first_stored, last_stored, pooled)"
+                           " VALUES (?, ?, ?, ?, ?)", [
+                               (ident(100), ident(1), now - 10 * DAY, now - HOUR, 0),
+                               (ident(101), ident(1), now - HOUR, now - HOUR, 0),
+                               (ident(100), ident(2), now - 6 * DAY, now - 6 * DAY, 0),
+                               (ident(102), ident(3), now - DAY, now - 60, 0),
+                               (ident(103), ident(4), now - 9 * DAY, now - 60, 1),
+                               (ident(104), OWN, now - 20 * DAY, now - 60, 0)])
+            tx.execute("INSERT INTO provider_departed (publisher, first_seen, at) VALUES (?, ?, ?)",
+                       (ident(5), now - 9 * DAY, now - DAY))
+            tx.execute("INSERT INTO provider_evicted (publisher, first_seen, at) VALUES (?, ?, ?)",
+                       (ident(6), now - DAY, now - HOUR))
+        db.close()
+
+    def test_standing_is_built_and_old_memories_go(self):
+        store = ProviderStore(self.state, clock=FakeClock(self.NOW), own_id=OWN)
+        self.addCleanup(store.close)
+        tables = saved(self.state)
+        today = int((self.NOW - HOUR) // DAY)
+        self.assertEqual(tables["standing"], {ident(1): (2, 1, 3, today), ident(2): (1, 0, 0, today - 6),
+                                              ident(3): (1, 0, 0, today), ident(4): (1, 0, 0, today),
+                                              OWN: (1, 1, 3, today)})  # this node's tier is set by its store
+        self.assertEqual({pooled for _, _, pooled in tables["records"].values()}, {0})
+        self.assertEqual((tables["departed"], tables["evicted"]), ({}, {}))
+        self.assertEqual(store.standing(ident(1))["tier"], "earned")
+        self.assertEqual(store.tier_counts(), {"newcomer": 3, "earned": 2, "known": 0, "own": 1})
+        self.assertEqual(store.first_seen(ident(2)), self.NOW - 10 * DAY)
+        self.assertEqual(store.providers(ident(100)), [ident(1), ident(2)])
+        store.save()
+        self.assertEqual(saved(self.state)["standing"][OWN][1], providers.OWN)
+        store._check_consistency()
 
 
 class ThreadSafetyTest(StoreTestCase):
-    """Concurrent stores, withdrawals and replies."""
+    """Concurrent stores, withdrawals, replies and saves."""
 
-    max_records = 200
+    capacity = 200
 
     def test_concurrent_use_keeps_counts_consistent(self):
         errors = []
@@ -814,8 +1018,10 @@ class ThreadSafetyTest(StoreTestCase):
                         self.store.store(key, publisher)
                     elif action < 0.8:
                         self.store.withdraw(key, publisher)
-                    else:
+                    elif action < 0.98:
                         self.store.for_reply(key)
+                    else:
+                        self.store.save()
             except Exception as e:  # pragma: no cover - reported below
                 errors.append(e)
 

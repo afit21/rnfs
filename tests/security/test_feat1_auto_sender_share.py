@@ -74,11 +74,11 @@ class AutoSenderShareTest(test_lxmf.FeatureTestCase):
         # FEAT-1: fails until one auto-fetch sender can't push out another's protected records
         self.assertIsNotNone(self.feature.inbox.get(self.victim),
                              "another auto-fetch sender's re-links pushed out the victim's pinned message")
-        self.assertIn(f"lxmf:{VICTIM.hex()}", self.b.storage.pins().get(self.victim_cid, set()),
+        self.assertIn(f"app:lxmf:{VICTIM.hex()}", self.b.storage.pins().get(self.victim_cid, set()),
                       "the victim's auto-fetched pin was released")
         # The attacker keeps its share of the records, and its pin
         self.assertEqual(len(self.attacker_records()), lxmf.INBOX_LIMIT // 2)
-        self.assertIn(f"lxmf:{ATTACKER.hex()}", self.b.storage.pins()[self.small.cid])
+        self.assertIn(f"app:lxmf:{ATTACKER.hex()}", self.b.storage.pins()[self.small.cid])
         self.assertTrue(all(e["auto"][0]["state"] == "pinned" for e in self.attacker_records()))
 
     def test_share_holds_by_bytes(self):

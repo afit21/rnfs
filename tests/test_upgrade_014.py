@@ -4,7 +4,9 @@
 Each store's state in memory is compared with the fixture's files read here with plain json, so the expectation
 comes from the fixture itself. The only differences allowed are those the 0.1.4 load made too: outbox messages
 not finished are failed (LXMF doesn't persist its queue), and the node's own provider records are stored again
-(the publisher records itself for everything it provides). Then: each file is kept as <name>.migrated, none is
+(the publisher records itself for everything it provides); and 0.2.0's own: the departed and evicted publishers
+providers.json remembers aren't imported, and the newcomer pool's records are no longer pooled (0.2.0's record
+budget and storage tiers replaced both). Then: each file is kept as <name>.migrated, none is
 set aside as damaged, the migrated table counts each file's records, a second start changes nothing, and a
 restart keeps everything.
 
@@ -28,6 +30,7 @@ from rnfs.config import Config
 from rnfs.content import builder
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
+from rnfs.content.storage import upgraded_source
 from rnfs.features import lxmf
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, state_rows
@@ -38,7 +41,8 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "
 T0 = 1792054800.0  # the fake clock generate.py wrote the fixture at (records span T0 - 3 days to T0 + 1 hour)
 NOW = T0 + 86400.0
 NODE_ID = bytes.fromhex("4e0de1d04e0de1d04e0de1d04e0de1d0")  # generate.py's NODE_ID
-# generate.py's SETTINGS: nothing in the fixture is filtered out by configuration
+# generate.py's SETTINGS: nothing in the fixture is filtered out by configuration. max_records is retired in 0.2.0:
+# start() leaves it out with a warning, as a start does with an rnfs.toml holding it
 SETTINGS = {"remote_pin_identities": ["0123456789abcdef0123456789abcdef"],
             "lxmf_auto_fetch_from": ["a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"], "max_records": 40, "slow": "no",
             "path_timeout": 2, "lookup_timeout": 2}
@@ -140,8 +144,9 @@ class UpgradeTest(unittest.TestCase):
 
     def start(self) -> RnfsNode:
         """An offline node on the copy (stopped before the directory is removed)."""
-        config = Config(rnfs_dir=self.root, **SETTINGS)
-        config.validate()
+        config = Config.combine(self.root, SETTINGS)
+        self.assertEqual([warning.split(":")[0] for warning in config.warnings],
+                         ["ignoring max_records in rnfs.toml"])
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
@@ -154,8 +159,12 @@ class UpgradeTest(unittest.TestCase):
     # Each store's state against the fixture
 
     def check_pins(self, node: RnfsNode):
-        """Every pin with every source, and each complete: the current code built the same CIDs (make_blocks)."""
-        expected = {Cid.parse(text): set(sources) for text, sources in fixture("pins.json")["pins"].items()}
+        """Every pin with every source, and each complete: the current code built the same CIDs (make_blocks). The
+        two lxmf:<address> pins (an auto-fetch sender's) become app:lxmf:<address> since rnfs 0.2.0, the LXMF
+        wrapper app's source (storage.upgraded_source, as the schema step "lxmf_app_pins" for the pins table)."""
+        expected = {Cid.parse(text): {upgraded_source(source) for source in sources}
+                    for text, sources in fixture("pins.json")["pins"].items()}
+        self.assertEqual(sum(source.startswith("app:lxmf:") for sources in expected.values() for source in sources), 2)
         self.assertEqual(node.storage.pins(), expected)
         roots = {Cid.parse(root) for root, _, _ in fixture("cache.json")["fetches"]}
         self.assertLessEqual(roots, self.built)
@@ -204,22 +213,26 @@ class UpgradeTest(unittest.TestCase):
                          set(expected["published"]))
 
     def check_providers(self, node: RnfsNode):
-        """Publishers, records in the main store and the pool, departed and evicted publishers; the node's own
-        records are stored again at start (last stored now)."""
+        """Every publisher's first-seen time and every record, those of 0.1.4's newcomer pool included (no longer
+        pooled), each publisher with a standing built from them; the node's own records are stored again at start
+        (last stored now), in their own tier. The departed and evicted publishers 0.1.4 remembered are not imported:
+        0.2.0 keeps no such memories (spec section 6)."""
         expected = fixture("providers.json")
         records = node.records
-        self.assertEqual({p.hex(): entry.first_seen for p, entry in records._publishers.items()},
-                         expected["publishers"])
+        with records._lock:
+            held, standings = records._merged()
+        self.assertEqual({p.hex(): standing.first_seen for p, standing in standings.items()}, expected["publishers"])
         own = NODE_ID.hex()
-        self.assertEqual({(k.hex(), p.hex()): [r.first_stored, r.last_stored, int(r.pooled)]
-                          for k, by in records._records.items() for p, r in by.items()},
-                         {(k, p): [first, NOW if p == own else last, pooled]
-                          for k, p, first, last, pooled in expected["records"]})
+        self.assertEqual({(k.hex(), p.hex()): [first, last] for (k, p), (first, last) in held.items()},
+                         {(k, p): [first, NOW if p == own else last] for k, p, first, last, _ in expected["records"]})
         self.assertTrue(any(pooled for *_, pooled in expected["records"]))
-        self.assertEqual([[p.hex(), seen, at] for p, (seen, at) in records._departed.items()], expected["departed"])
-        self.assertEqual(sorted([p.hex(), seen, at] for p, (seen, at) in records._evicted.items()),
-                         sorted(expected["evicted"]))
         self.assertTrue(expected["departed"] and expected["evicted"])
+        self.assertEqual(state_rows(self.state, "SELECT * FROM provider_departed UNION ALL"
+                                                " SELECT * FROM provider_evicted"), [])
+        for publisher, standing in standings.items():
+            self.assertEqual(standing.records, sum(p == publisher for _, p in held), publisher.hex())
+        self.assertEqual(records.standing(NODE_ID)["tier"], "own")
+        records._check_consistency()
 
     def check_names(self, node: RnfsNode):
         """Names published (one imported, never published here) with their keys, and the records held."""

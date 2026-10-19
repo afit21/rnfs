@@ -5,7 +5,8 @@ the K/2 oldest records, and the node's own record (own_id, which the node record
 one of the candidates. A handful of Sybil identities storing first take the senior places; after that about 1000
 stores to the key evicted the node's own record in 50 of 50 trials. The node's own records could likewise be the
 victim of a full newcomer pool. Now own_id's record doesn't count toward max_per_key and is never the victim, of
-either limit; everyone else's limits are unchanged.
+either limit; everyone else's limits are unchanged. Since 0.2.0 the second limit is the record budget and its tiers
+(no newcomer pool): the node's own records are in a tier of their own, never evicted to make room.
 """
 import random
 import unittest
@@ -33,10 +34,10 @@ class OwnProviderRecordTest(unittest.TestCase):
         """The clock."""
         self.clock = FakeClock(1_700_000_000.0)
 
-    def make_store(self, seed: int, max_records: int = 100_000) -> ProviderStore:
-        """A memory-only store recording OWN as this node, its eviction picks seeded."""
-        return ProviderStore(max_records, None, clock=self.clock, rng=random.Random(seed), max_per_key=MAX_PER_KEY,
-                             own_id=OWN)
+    def make_store(self, seed: int, records: int = 100_000) -> ProviderStore:
+        """A memory-only store of `records` records recording OWN as this node, its eviction picks seeded."""
+        return ProviderStore(None, records, clock=self.clock, rng=random.Random(seed), max_per_key=MAX_PER_KEY,
+                             own_id=OWN, record_bytes=1)
 
     def test_sybil_stores_to_a_key_never_evict_the_own_record(self):
         evicted = []
@@ -64,19 +65,23 @@ class OwnProviderRecordTest(unittest.TestCase):
         self.assertTrue(store.store(KEY, OWN))
         self.assertEqual(set(store.providers(KEY)), {sybil(n) for n in range(MAX_PER_KEY)} | {OWN})
 
-    def test_a_full_newcomer_pool_never_evicts_own_records(self):
-        """Own records fill the store outside the pool and spill into it; a flood of identities then fills the
-        pool and churns it, taking only each other's records."""
+    def test_a_full_store_never_evicts_own_records(self):
+        """Own records fill most of the budget; a flood of identities then fills the rest and churns it, taking
+        only each other's records; and own records stored past the budget evict no one."""
         for seed in range(SEEDS):
-            store = self.make_store(seed, max_records=100)
-            own_keys = [(1 << 100 | n).to_bytes(ID_LENGTH, "big") for n in range(store.main_size + 5)]
+            store = self.make_store(seed, records=100)
+            own_keys = [(1 << 100 | n).to_bytes(ID_LENGTH, "big") for n in range(90)]
             for key in own_keys:
                 self.assertTrue(store.store(key, OWN))
             for n in range(SYBIL_STORES):
                 store.store((2 << 100 | n).to_bytes(ID_LENGTH, "big"), sybil(n))
+            self.assertTrue(store.is_full())
+            for n in range(90, 95):
+                own_keys.append((1 << 100 | n).to_bytes(ID_LENGTH, "big"))
+                self.assertTrue(store.store(own_keys[-1], OWN))
             missing = [key for key in own_keys if OWN not in store.providers(key)]
             self.assertEqual(missing, [], f"seed {seed}: {len(missing)} own records evicted")
-            self.assertLessEqual(store.record_count(), store.max_records)
+            self.assertEqual(store.record_count(), 105)  # own records over the budget, the Sybils' within it
 
 
 if __name__ == "__main__":

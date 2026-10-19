@@ -9,9 +9,20 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`); an older rnfs can't
-  open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count as
-  never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`); an older rnfs
+  can't open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count
+  as never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
+  `app:lxmf:<address>` (`pin ls` shows the new one), the source the LXMF wrapper app will own once LXMF leaves
+  core; the LXMF built into rnfs uses it from now on, so nothing is released by the change. An older
+  `pins.json` imported at the upgrade gets the same rewrite.
+- **Provider records:** the upgrade gives each publisher of the records a node stores a standing
+  (`provider_standing`, and indexes on `provider_records`): Earned if it was first seen at least 3 days before its
+  latest store and refreshed a record outside the newcomer pool a day or more after storing it, else Newcomer. The
+  newcomer pool's records are no longer pooled, and the remembered departed and evicted publishers are dropped.
+- **`max_records` is retired:** a `max_records` left in `rnfs.toml` (or given to `rnfs.Node`) is ignored with a
+  warning instead of stopping the daemon; `record_budget` (bytes) replaces it. `rnfs config set max_records` is
+  refused as an unknown setting; `rnfs config unset max_records` removes it.
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
@@ -21,6 +32,23 @@ Upgrade notes:
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
 Added, for apps:
+- **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
+  `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's
+  verifier, which is all the daemon keeps of it (`rnfs.db`'s new `apps` table). `rnfs.Client(app=..., token=...
+  or token_file=...)` and `ApiConnection(app=, token=)`. The `api_token` stays the CLI's, unchanged, and a
+  request without `X-Rnfs-App` is checked exactly as before.
+- **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
+  scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
+  can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
+  `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
+  `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
+  `forbidden`); capability `apps`. `rnfs app add lxmf` is refused while rnfs's own LXMF is on, and while an app
+  called `lxmf` exists rnfs's own LXMF stays off (an LXMF wrapper app owns its pins and identity).
+- **An app's pins:** what an app adds, pins, imports or makes with `dir set`/`dir rm` (and its pin, add and import
+  jobs) is pinned with the source `app:<name>`, or `app:<name>:<key>` with `X-Rnfs-Pin-Key: <key>`
+  (`client.pin_key(key)`), shown by `pin ls`. Its `pin rm` releases only its own source; the CLI's still
+  releases only `user`'s, and a pin key with the CLI's token is refused (400). Removing the app releases them all
+  and cancels its jobs.
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
   daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
   attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,
@@ -129,7 +157,30 @@ Added:
   `GET /api/capabilities` lists `sealed_folders`. `cat` still gives the decrypted tar, and the gateway and
   `--raw` the sealed bytes. `POST /api/add/stream?format=tar` still can't seal (400).
 
+Provider records (DHT servers; spec section 6, all local policy: nothing on the wire changes):
+- **On disk:** records are read from the state database per `/find` through an index, with a small cache, instead
+  of all held in memory (about 500 bytes each before): memory no longer grows with the records or their publishers.
+  Changes are written together every 30 s; a republish is written only when it moves a record's last-stored time by
+  more than an hour, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
+  200 000 records cost about 70 µs a store and 112 transactions in all, on a desktop NVMe disk.
+- **A byte budget instead of a record count:** records may take `record_budget` of disk (new, default 1 GiB: about
+  7 million records at the 150 bytes a record takes, measured from the database), never the free disk the blocks'
+  reserve needs. `max_records` (100 000 records) goes.
+- **No per-publisher caps while there is room:** anyone stores freely until the budget is full, so a large
+  publisher (a mirror) is no longer held to 1% of the store, nor a new one to a tenth of that. The newcomer pool and
+  the memories of departed and evicted publishers go too.
+- **Storage tiers once the budget is full:** Known (contacts of kind `node`, private-mode members, bootstrap
+  nodes; 30% floor), Earned (publishers that refreshed a record on 3 distinct UTC days; 60%) and Newcomer (everyone
+  else; 10%). A store to a full node takes a record from a tier's largest holder: the lowest tier below the storer's
+  above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
+  within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
+  each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
+
 Changed:
+- A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
+  mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
+  announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
   0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.

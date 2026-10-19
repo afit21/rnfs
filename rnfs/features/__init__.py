@@ -153,6 +153,10 @@ class Feature:
         """Fields added to `rnfs status`."""
         return {}
 
+    def app_removed(self, name: str):
+        """App name was removed (rnfs app rm): its token no longer passes, and its pins are released once this
+        returns. Drop what the feature holds or runs for it."""
+
     def requests(self) -> dict[str, Callable]:
         """{path: handler(data, remote_identity) -> response} for new rnfs.dht request paths.
 
