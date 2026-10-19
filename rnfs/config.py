@@ -143,6 +143,11 @@ DESCRIPTIONS = {
 RETIRED_SETTINGS: MappingProxyType = MappingProxyType({
     "max_records": "since rnfs 0.2.0 provider records are bounded by record_budget, in bytes of disk",
 })
+# Why LXMF is deprecated, for every warning about it (the daemon's log, the CLI, the API, the settings schema, the
+# library): it still works in 0.2.0, but leaves rnfs for an app of its own, its lxmf_* settings with it. Here,
+# standard library only, so the CLI and rnfs.Client can say it without loading RNS
+LXMF_DEPRECATION = ("LXMF messaging is moving out of rnfs into a separate app built on the local API and the "
+                    "library, and a later release removes it from rnfs")
 _TYPE_NAMES = {int: "int", float: "float", bool: "bool", str: "string", list[str]: "list[string]"}
 MAX_TOML_INT = 2 ** 63 - 1  # TOML integers are 64-bit signed
 

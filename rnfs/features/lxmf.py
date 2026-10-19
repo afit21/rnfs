@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote_to_bytes
 
 from rnfs import events, features, fsutil, ids
+from rnfs.config import LXMF_DEPRECATION
 from rnfs.features import _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING
 from rnfs.constants import ID_LENGTH, MAX_DEPTH
@@ -868,6 +869,9 @@ class LxmfFeature(features.Feature):
     name = NAME
     # contacts: send to a nick, trust LXMF contacts, name senders in the inbox; jobs: links fetched in the background
     optional = ("contacts", "jobs")
+    # LXMF leaves rnfs for an app of its own (config.LXMF_DEPRECATION); since 2026-10-19, during 0.2.0's development
+    deprecated = LXMF_DEPRECATION
+    deprecated_since = 1792368000
 
     def __init__(self, node):
         """Load the inbox and outbox; LXMF itself is started in start()."""

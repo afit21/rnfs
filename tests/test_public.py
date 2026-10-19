@@ -660,6 +660,10 @@ class PublicTests:
         self.assertIn("pin", capabilities.event_kinds)
         self.assertIn("not_found", capabilities.error_codes)
         self.assertEqual(capabilities.has("shutdown"), self.daemon)
+        # LXMF still works, deprecated (it moves to an app of its own)
+        self.assertEqual(capabilities.deprecated, ("lxmf",))
+        self.assertTrue(capabilities.is_deprecated("lxmf"))
+        self.assertFalse(capabilities.is_deprecated("jobs"))
 
     def test_shutdown_and_daemon_info(self):
         """shutdown() is Unsupported (a Node; a daemon started without a way to stop it); daemon_info() None
@@ -1399,7 +1403,7 @@ class ObjectsTest(unittest.TestCase):
                       objects.Event(3, "pin", 1.7e9, {"change": "added", "cids": [str(cid)]}),
                       objects.EventBatch((objects.Event(1, "job", 1.0, {"id": "x"}),), 1, False, "e"),
                       objects.Capabilities("0.2.0", frozenset({"events"}), (("GET", "/api/events"),), ("lxmf",),
-                                           ("pin",), ("not_found",)),
+                                           ("pin",), ("not_found",), ("lxmf",)),
                       objects.Settings("/r/rnfs.toml", (objects.Setting("lxmf_accept_from", "lxmf", "list[string]",
                                                                         None, False, (), None, value=("a",)),),
                                        None, ("w",)),

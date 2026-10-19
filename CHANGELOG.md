@@ -39,6 +39,17 @@ Upgrade notes:
 - **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
+Deprecated:
+- **LXMF** (`send`, `inbox`, `outbox`, `lxmf address`, `lxmf sync`, the `/api/lxmf/` routes, the library's `lxmf`
+  methods, the `lxmf_*` settings and the `inbox` events) still works exactly as in 0.1.6, but is moving out of rnfs
+  into a separate app built on the local API and the library, and a later release removes it from rnfs. Nothing
+  else changes: the network sees the same messages, `rnfs:` URIs and the LXMF link-map field stay rnfs's
+  (specification section 13) for that app and other clients, and the pins of auto-fetched links already became
+  `app:lxmf:<address>` (upgrade notes above), the source the app will own.
+- The `/api/lxmf/` routes' responses, errors included, carry `Deprecation: @1792368000` (RFC 9745: deprecated since
+  2026-10-19); their bodies are unchanged. `GET /api/capabilities` gains `"deprecated": ["lxmf"]`
+  (`Capabilities.deprecated`, `is_deprecated("lxmf")`).
+
 Added, for apps:
 - **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
   `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's

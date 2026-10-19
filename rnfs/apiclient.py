@@ -777,7 +777,8 @@ class ApiConnection:
         return self.get("/api/status")
 
     def capabilities(self) -> dict:
-        """What the daemon offers: {"version", "capabilities", "routes", "features", "event_kinds", "error_codes"};
+        """What the daemon offers: {"version", "capabilities", "routes", "features", "event_kinds", "error_codes",
+        "deprecated"};
         from a daemon before 0.2.0, which has no such endpoint, {} (so every capability is absent)."""
         try:
             return self.get("/api/capabilities")

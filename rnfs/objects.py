@@ -640,8 +640,9 @@ def _routes(values) -> tuple[tuple[str, str], ...]:
 @dataclass(frozen=True)
 class Capabilities(_Object):
     """What the node offers (capabilities()): its version, its capabilities (api.CAPABILITIES: "events",
-    "pin_label", "config", ...), the API routes ((method, path)), the features loaded, the event kinds and the
-    error codes. Empty from a daemon before 0.2.0, which can't say: every has() is False."""
+    "pin_label", "config", ...), the API routes ((method, path)), the features loaded, the event kinds, the
+    error codes and the deprecated features (they still work, but a later release removes them: "lxmf"). Empty
+    from a daemon before 0.2.0, which can't say: every has() is False."""
 
     version: str | None = None
     capabilities: frozenset[str] = _field(frozenset, frozenset())
@@ -649,10 +650,15 @@ class Capabilities(_Object):
     features: tuple[str, ...] = _field(tuple, ())
     event_kinds: tuple[str, ...] = _field(tuple, ())
     error_codes: tuple[str, ...] = _field(tuple, ())
+    deprecated: tuple[str, ...] = _field(tuple, ())
 
     def has(self, capability: str) -> bool:
         """Whether the node offers capability."""
         return capability in self.capabilities
+
+    def is_deprecated(self, feature: str) -> bool:
+        """Whether feature is deprecated: it still works, but a later release removes it."""
+        return feature in self.deprecated
 
 
 def _frozen(value):

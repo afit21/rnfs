@@ -89,6 +89,11 @@ class Feature:
     name: str = ""  # unique, used for node.feature(name) and in status
     requires: tuple[str, ...] = ()  # features this one can't work without, each before it in FEATURE_MODULES
     optional: tuple[str, ...] = ()  # features this one uses when they are loaded
+    # Why this feature is deprecated (it still works, but a later release removes it), or None. Its API routes'
+    # responses then carry a Deprecation header (RFC 9745) dated deprecated_since (a Unix time, in whole seconds),
+    # and GET /api/capabilities lists it under "deprecated"
+    deprecated: str | None = None
+    deprecated_since: int = 0
 
     def __init__(self, node):
         """Set up state from node.config without touching the network."""
@@ -221,9 +226,23 @@ def checked_classes() -> list[type[Feature]]:
         for name in cls.requires:
             if name not in loaded:
                 raise _refused(cls.name, f"it requires feature {name}, which isn't loaded before it")
+        if cls.deprecated is not None and not (isinstance(cls.deprecated, str) and cls.deprecated
+                                               and type(cls.deprecated_since) is int and cls.deprecated_since >= 0):
+            raise _refused(cls.name, "deprecated must be a reason, and deprecated_since a Unix time in seconds")
         loaded.append(cls.name)
     _api_routes(classes)
     return classes
+
+
+def deprecated_features() -> list[str]:
+    """The names of the deprecated features (Feature.deprecated), sorted."""
+    return sorted(cls.name for cls in feature_classes() if cls.deprecated is not None)
+
+
+def deprecated_routes() -> dict[tuple[str, str], int]:
+    """The API routes of the deprecated features (Feature.deprecated): route -> when deprecated (deprecated_since)."""
+    return {route: cls.deprecated_since for cls in feature_classes() if cls.deprecated is not None
+            for route in cls.api_routes()}
 
 
 def api_routes() -> dict[tuple[str, str], ApiRoute]:
