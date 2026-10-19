@@ -279,6 +279,83 @@ rnfs nodes; at 100k nodes announces approach RNS's per-interface ingress limit o
   a path-answered resolve's airtime), and transport nodes answer path requests from their cached, old announce
   anyway
 
+## Pacing path requests (to do)
+
+Since RNS 1.2.5 every interface limits the path requests arriving on it, and the release notes say applications
+that send many will see their users lose path resolution, by design. In RNS 1.5.6 (`Interface.should_ingress_limit_pr`,
+`Transport.inbound`) an interface, each TCP client a hub spawns included, estimates the rate of incoming path
+requests from its last few; above 8 a second, or 3 while the interface is under 2 hours old, later ones wait in a
+queue of 8 behind all other traffic, the rest are dropped, and those let through aren't forwarded to discover an
+unknown path. The limit holds for at least 15 s after the rate falls. It counts every application's path
+requests on that interface, so an rnfs burst on a shared radio costs other users their path resolution too.
+
+rnfs paces nothing node-wide: every link it opens to a node without a known path sends one (`links.py` `_open`),
+publishing runs 16 stores at once (`PROVIDE_PARALLEL`), lookups several queries, and slow publishers now up to 10
+per lookup. A query that failed because its path request was dropped counts as the node's failure (`node.py`
+`_query_failed`), towards partition mode included, so a node newly connected to a hub could enter partition mode
+by publishing. All local; no wire change.
+
+* Spec section 3 describes RNS's path-request limits, as it does the 2% announce cap
+* One node-wide budget for path requests: lookups, link opens, name resolves, keeper queries, NomadNet adds and
+  in-core LXMF while it remains. Requests are spaced at least 1 s apart, so RNS's estimate stays under 1.5 a
+  second, below a new interface's 3 with room for other traffic. A request waiting for the budget is not a
+  failure, and its time doesn't count towards `path_timeout`
+* While a lookup waits for the budget, it queries the next candidates with a known path instead of idling. This
+  revisits "preferring nodes with a known path", not adopted above when a path request cost only airtime
+* A query that failed for want of a path doesn't count towards partition mode: during a real partition paths to
+  off-island servers stay in RNS's table and fail as links, and announce silence detects the rest. It still
+  counts in the routing table, where a wrongly dropped node regains its seniority within 2 × `announce_interval`
+* Re-run the topology simulation with the limit modelled, before the slow nodes' larger budget and sweep
+  providing ship: path requests a publish round and a join send, and how often each limit trips at a gateway and
+  a public hub
+* Spec section 6 (or Appendix A) says what announces carry and why provider records aren't announced: servers
+  are found from `rnfs.dht` announces and names live in their own, but a 1 kbit/s channel's 2% allowance (about
+  1,150 announces a day) covers node presence for about 290 nodes, not an announce for each CID
+
+## Less link and lookup traffic (to do)
+
+Traffic rnfs sends that does no work. Counts are from RNS 1.5.6's code, not yet measured. All local; no wire change.
+
+* Close idle links before RNS keeps them alive. The opener of a link sends a keepalive after `max(5 s, RTT × 206)`
+  of quiet, capped at 360 s, and the other end answers (`Link.__update_keepalive`, `Link.__watchdog_job`); rnfs
+  closes an outgoing link only after `link_idle_timeout` (5 min) without data, which keepalives don't count as. On
+  a 50 ms backbone path that is a pair every ~10 s, about 58 packets per idle link, against about 6 for the lookup
+  that opened it, and every transport node on the path relays them. On radio paths (RTT ≥ 1.75 s) the interval
+  is 360 s, so none are sent. An outgoing link with nothing in progress closes once it has been idle for its
+  keepalive interval or `link_idle_timeout`, whichever is shorter: reopening costs about 4 packets, less than two
+  keepalive pairs. Measure how often links are reopened within 5 minutes before and after (spec section 3, Links)
+* Path requests only where the node can be. A path request without an interface goes out on every interface
+  (`Transport.request_path`), so a node with a LoRa and a TCP interface sends its lookups' path requests for
+  internet nodes over its radio too. A node running its own RNS instance sends the path request for an ID named
+  in a `/find` reply only on the interface its path to the replying node uses (`Transport.next_hop_interface`,
+  `request_path(on_interface=...)`); a lookup has other candidates, so a miss isn't retried on every interface.
+  Joins, names and links to known IDs ask on every interface, as now. Through a shared instance nothing changes:
+  `rnsd` forwards a client's path request on all its interfaces (`Transport.path_request`), so scoping it there
+  needs an RNS change. RNS documents `on_interface` as not for normal use: check its behaviour on each interface
+  mode before relying on it
+* Remember providers. Nothing is kept between fetches, so fetching a CID again once its links have closed (a
+  gateway reload, `pin add` after `cat`) repeats its lookup, and a search for content nobody provides (about 13.5
+  messages) repeats on every retry. A node keeps the providers a lookup found for each CID for a few hours
+  (records live 7 days; bounded, least recently used first) and asks them in step 1 of fetching, with the nodes
+  it has open links to, before looking up; one that answers `None` is forgotten for that CID. A lookup that found
+  no providers isn't repeated for the same CID for 10 minutes, except when the user asks again explicitly (spec
+  section 7, Fetching a target)
+
+Open (owner's decision):
+* One link for publishing. A publish looks up servers over the shared anonymous link, then opens a separate
+  identified link to each server it stores to: about 5 more packets per stored server each round, on radio for a
+  slow publisher. Identifying the publishing lookup's links from the start and storing over them saves that, but
+  every server the lookup queries, not just those that store the record, learns which identity publishes which
+  key
+* Republishing less often on fast nodes: 24 h today, 3 days on slow nodes, and it MUST stay under 3.5 days
+  (`PROVIDER_TTL / 2`). Two or three days cuts fast nodes' stores 2–3×; records lost to departed servers stay lost
+  longer. Measure with the storage and topology simulations, and against the 4.5-day newcomer expiry
+* Compressed `/blocks` responses. Text (the Gutenberg mirror) would take about 2.5–3.5× less airtime, with CIDs
+  unchanged. `/blocks` can't change shape, so it needs a new optional request; a node without a handler for it
+  drops the request unanswered (`Link.handle_request`), so a requester must learn per node whether it is
+  supported, at the cost of a timeout to each older node. Decompression must be bounded before any data is kept,
+  as the NomadNet add's links are
+
 ## Providing files inside folders (done)
 
 * A `provide_entries` setting that also provides the CID of every file and folder inside a complete pin, so
@@ -481,6 +558,14 @@ Held back until there is evidence they are needed.
   `keeper_query = always`, so measure its airtime on LoRa against the announces it saves before adopting it.
   Paths at transport nodes lapse a week after a name's last announce, so even then a name needs a keepalive
   announce more often than that
+
+## Waiting on Reticulum
+
+* Traffic classes: RNS 1.5's inbound queues have classes (data, announce, path request, ingress limited), but an
+  application can't set one. If RNS lets applications mark traffic, mark `/blocks` responses as bulk so DHT
+  messages, names and other applications go first on a shared link
+* LXMF content destinations, on LXMF's roadmap since 2022 with no design published: if they ship, look at
+  whether rnfs CIDs map onto them, so LXMF clients and propagation nodes can fetch rnfs content
 
 ## Not planned
 
