@@ -207,7 +207,7 @@ The DHT (local behaviour: nothing on the wire changes):
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
   servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
-  next to a key can't be. Publishing and searching will use it.
+  next to a key can't be. Publishing uses it (below); searching will.
 - **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
   due key of its region (the keys sharing as many leading bits as the key looked up shares with its 10th-closest
   server), with about 1.6 more `/find` a region to fill in its far half; each key still gets its own 10 closest
@@ -215,6 +215,10 @@ The DHT (local behaviour: nothing on the wire changes):
   lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
   1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
   not keys, so a round publishes every due key of up to 10 regions.
+- **Stores to long-known servers too:** each key is also stored on the 10 servers closest to it among those the
+  node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
+  Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
+  next to a key can't push the record off them. Withdrawals reach them too.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

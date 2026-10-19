@@ -660,6 +660,8 @@ class RnfsNode:
         self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client, self._lookup,
                                                    slow, config.state_dir, cached_eligible=self._eligible_targets,
                                                    generation=self._provide_generation), batched=False)
+        # Each key is also stored on the closest servers heard for provider_seniority (section 6)
+        self.publisher.add_store_part(self._senior_servers)
         # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
         self.names.held_listener = self._name_event
@@ -854,6 +856,17 @@ class RnfsNode:
         reliable = [n for n in nearest if not self.routing.unreliable(n)]
         start = (reliable + [n for n in nearest if n not in reliable])[:K]
         return self._new_lookup(key, start, self.routing.is_banned)
+
+    def _senior_servers(self, key: bytes, region) -> list[bytes]:
+        """The publisher's store part from the announce first-seen log (section 6): the K servers closest to key that
+        it first heard at least provider_seniority ago and has heard within 2 × announce_interval (as /find replies
+        leave out servers silent that long), not banned, and in private mode members. Identities generated next to
+        a key can't be old ones, so these were there before any such identity was made for it; without an attack
+        they are mostly among the key's K closest already. region (the sweep's) isn't needed."""
+        banned = self.routing.is_banned
+        exclude = banned if not self.config.private else (lambda n: banned(n) or not self._is_member_node(n))
+        return self.first_seen.closest(key, K, min_age=self.config.provider_seniority, exclude=exclude,
+                                       heard_within=2 * self.config.announce_interval)
 
     def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool]) -> Lookup:
         """A Lookup for key from start, wired to the routing table (answers, failures, unreliable nodes and

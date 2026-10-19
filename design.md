@@ -570,8 +570,9 @@ withdrawals reach counts as a lookup (those with the most keys queued first; whi
 lookups are limited to leave up to 5 for them), the others stay queued, and `next_due` counts queued withdrawals
 as due only once the pacing allows; other nodes send them all at once. `_region_bits` carries the last region's p to the next round.
 Each item's store set (`_store_set`) is its K closest from its region (`Region.closest_to`), then each part added by
-`add_store_part(part)`, a `(key, region) -> servers` called without the lock after the lookups, without
-duplicates; an item whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The round's
+`add_store_part(part)`, a `(key, region) -> servers` called without the lock after the lookups (the node adds
+`_senior_servers`: `first_seen.closest(key, K, min_age=provider_seniority, exclude=banned or, in private mode, not a
+member, heard_within=2 × announce_interval)`), without duplicates; an item whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The round's
 result counts `lookups` and `finds` (extra `/find`). The `/provide`s go to up to `PROVIDE_PARALLEL` (16) servers at
 once on `rnfs-publish-provide` threads (one at a time, in the publishing thread, on slow nodes): `_in_order` runs
 `send` (which reads the withdrawals still queued for the server under the lock, then calls `client.provide`,

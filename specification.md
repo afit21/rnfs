@@ -699,8 +699,8 @@ differently. A score can be earned quickly by serving popular blocks, so it neve
 server mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock
 times; one in the future when loaded counts as now). Identities generated next to a key can't be old ones, so
 among the servers near a key, those first heard at least `provider_seniority` ago were there before any such
-identity was made for it; the log gives the `K` closest of them to a key. It is local state: nothing about it is
-sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting the least
+identity was made for it; the log gives the `K` closest of them to a key, which publishers also store to
+(below). It is local state: nothing about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting the least
 recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only servers
 silent longer than every one of them; announces are recorded in memory and written together every 30 s.
 
@@ -709,6 +709,13 @@ silent longer than every one of them; announces are recorded in memory and writt
   the keys it should store, in as few `/provide` requests as the batch size allows (section 3), one at a time
   over a separate identified link closed afterwards. A publisher MAY send to several nodes at once, each over its
   own link and in its own order (rnfs: up to 16 on nodes that aren't slow; a slow node one at a time).
+- **The store set.** A node SHOULD store each key on its `K` closest found as above, and also on the `K` servers
+  closest to the key in its announce first-seen log that it first heard at least `provider_seniority` ago (rnfs:
+  and has heard within 2 × `announce_interval`, as `/find` replies leave out servers silent that long; not banned;
+  in private mode, members only). Without an attack these are mostly the same servers, so it costs little; against
+  identities generated next to a key it keeps the record where they can't take its place. A key's store set is the
+  union, without duplicates; every server stored to is recorded, so withdrawals reach all of them. A key whose
+  lookup found no server isn't stored this round (rnfs: retried 30 s later).
 - **Sweep providing** finds the `K` closest of many keys with one lookup per *region*. It is local behaviour:
   only which `/find` queries a publisher sends changes, and how it groups its `/provide`s. Take the due keys in
   turn; for the first not yet covered, x, run the closest-nodes lookup. Let p be the length of the prefix x shares
