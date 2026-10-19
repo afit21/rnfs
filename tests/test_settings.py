@@ -95,7 +95,7 @@ class SchemaTest(unittest.TestCase):
                 self.assertEqual(entry["unit"] is not None, entry["type"] in ("int", "float") and name not in (
                     "api_port", "gateway_port", "verbosity", "alpha", "beta", "max_parallel_providers",
                     "max_failures", "max_incoming_links", "max_blocks_responses", "fast_blocks_responses",
-                    "max_records", "max_output_entries", "name_table_size", "gateway_fetches", "max_jobs",
+                    "max_output_entries", "name_table_size", "gateway_fetches", "max_jobs",
                     "max_finished_jobs", "keep_max_names"))
 
     @staticmethod

@@ -12,6 +12,10 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   helpers for settings that depend on slow nodes or links. Loaded from `<rnfs dir>/rnfs.toml` plus command-line
   overrides (and `defaults` beneath the file: an embedded node's); `validate()` checks every core setting's type and
   range (`WHOLE_NUMBERS`, `RATES`, `DURATIONS`, `FLAGS`, `IDENTITY_LISTS`), and the daemon exits on an invalid one.
+  An unknown setting is refused too, but a retired one (`RETIRED_SETTINGS`, name -> what replaced it: `max_records`
+  since 0.2.0) is left out by `Config.combine`, wherever it comes from, with a warning in `Config.warnings` (an
+  embedded node's own defaults silently), so an `rnfs.toml` an older version accepted still starts the daemon; the
+  settings schema doesn't list it, so `rnfs config set` refuses it and `unset` removes it.
   Reticulum is started from `reticulum_dir`, by default RNS's own config directory, so the node attaches to `rnsd`
   with the matching RPC key. `member_set` and `remote_pin_set` are `members` and `remote_pin_identities` as
   frozensets of lowercase hex, normalised once there for the node, the link pool and the request server.
@@ -69,9 +73,11 @@ pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lx
   never part of one or one without those before it); a sqlite failure raises `StateDbError`, an `OSError`.
   Text that may hold lone surrogates (file names, remote strings) goes through `dump`/`load` (JSON text);
   sequences are decimal text, since they pass SQLite's 64-bit integers. Without `_sqlite3` the daemon stops
-  with a message saying so.
+  with a message saying so. `connect_memory(stores)` makes a private in-memory database with only the tables of
+  the schema steps of those labels (a memory-only `ProviderStore`).
 
-Persistent state lives in the state database. Each store keeps its state in memory, which is all reads use,
+Persistent state lives in the state database. Each store but the provider store (which reads its records per key,
+`providers.py` below) keeps its state in memory, which is all reads use,
 loads it once at startup (checking every row as the JSON loaders checked every record: a malformed row is
 logged, skipped and deleted) and then writes only what changed: a pin is one row inserted or deleted, batched
 stores write the records changed since their last save. The shared parts are in statedb: `open_store(state_dir,
@@ -118,7 +124,7 @@ rnfs/
     shared_folder.py  importing <rnfs dir>/files/ with pin source "folder" (section 8)
   dht/                no RNS dependency
     routing.py        RoutingTable: buckets, seniority, failures, unreliable nodes, bans (section 6)
-    providers.py      ProviderStore: records, TTL, max_records eviction, /find reply selection (section 6)
+    providers.py      ProviderStore: records on disk, TTL, record budget and storage tiers, /find replies (section 6)
     lookup.py         iterative lookups with alpha/beta, time budget, unknown-ID budget (section 6)
   network/            everything that talks to RNS
     protocol.py       message encoding/validation, batch sizes (sections 3, 6, 7, 8)
@@ -298,32 +304,62 @@ Every `heard` forgets expired bans and dropped nodes' seniority, looking only at
 in expiry order (an entry set again is moved to the end), and their readers check expiry too, so an entry out of
 order (after a clock step or a changed setting) only lingers in memory.
 
-`providers.py` — `ProviderStore(max_records, state_dir, ttl=PROVIDER_TTL, clock=time.time, rng=random,
-max_per_publisher=None, max_per_key=1000, own_id=None, seniority=0)` (`state_dir` holds the state database): `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher,
-keys, withdrawn) -> int`, `retain(keep) -> int` (drops every record of publishers `keep` rejects: private mode's
-non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `providers(key, exclude) -> list[bytes]`, `expire()`,
-`record_count()`, `allowance(publisher)`, `save()`, `close()`. Local limits against flooding: one publisher holds at most max(10,
-`max_records` // 100) records once seen for `seniority` (the node passes `provider_seniority`) and a tenth of
-that (at least 10) before, the node's own (`own_id`) excepted. A publisher at its limit has its expired records
-swept at most once per batch, and not at all before `sweep_after` (the earliest its oldest record can expire,
-from its last sweep), so each further key of a refused `/provide` costs one check; a key keeps at most 1000 publishers: a newcomer to a full key evicts a random
-one, never one of the `K/2` oldest records. The node's own record (`own_id`) isn't counted toward the 1000 and is
-never a victim, here or in the pool (`_most_pooled_by_others` steps past it when it alone holds the most), so
-Sybil stores can't push it out of its own store; its records may exceed the pool rather than evict each other. A tenth of the store is a newcomer pool evicting by fair share: each
-publisher's pooled keys sit in an ordered dict (oldest pooled first), and publishers in lists by how many they
-hold (`_holders`, with each one's index, and `_most_pooled`), so a full pool picks one of the biggest holders at
-random in O(1); one already holding the most is refused. The newest publisher with records outside the pool comes
-from a heap of (first seen, arrival) with stale entries dropped lazily. First-seen times of departed publishers
-(seen for `seniority`) are kept for a TTL, at most `max_records` // 10, in departure order; those of younger
-publishers whose last record the pool evicted (`_evicted`) for a TTL too, at most `pool_size` // 10 (at least
-10), forgetting the one first seen most recently when full (an O(n) scan, only on such evictions). Times later than now
-(a clock corrected backwards) are clamped to now at load and at the first `expire()` after the clock went backwards:
-the store notes the latest clock reading any time it holds came from (`_latest`, via `_now()`), and an `expire()`
-with the clock not behind it skips the clamping pass, which would change nothing (about half of a pass at 100 000
-records, held under the lock). Records are added only through
-`_insert`, by `store` and by the load alike, so the indexes beside `_records` (each publisher's keys and count
-outside the pool, the counts, `_pooled`, `_holders`, `_newest`) are kept in step in one place;
-`_check_consistency()` recomputes them from `_records`, and test_providers runs it after every test.
+`providers.py` — `ProviderStore(state_dir, record_budget=1 GiB, *, ttl=PROVIDER_TTL, clock=time.time, rng=random,
+max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None)` (`state_dir` holds the
+state database; None: a private in-memory one, `statedb.connect_memory`, so tests run the same code):
+`store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher, keys, withdrawn) -> int`,
+`retain(keep) -> int` (drops every record and the standing of publishers `keep` rejects: private mode's
+non-members), `for_reply(key, exclude=lambda id: False) -> list[bytes]`, `providers(key, exclude) -> list[bytes]`,
+`record(key, publisher)`, `expire()`, `maintain()`, `is_full()`, `record_count()`, `publisher_count()`,
+`tier_counts()`, `first_seen(publisher)`, `standing(publisher)`, `save()`, `close()`.
+
+Records live on disk and are read per key. Nothing in memory grows with the records or publishers:
+- `_cache`: the records of recently used keys (publisher -> (first stored, last stored)), LRU, at most
+  `CACHE_KEYS` (4096) keys and `CACHE_ROWS` (50 000) rows, read through `provider_records`' primary key (joined
+  with `provider_standing`, so a record of a publisher without a standing, or malformed, is dropped and deleted).
+- `_dirty`: the records changed since the last save (None: deleted), by key, and `_dirty_by_publisher`; a key read
+  from disk gets them laid over it, so the cache can drop any key. `_pinned_standings` holds the changed standings
+  until the save, `_standings` an LRU of others (`STANDING_CACHE`, 4096).
+- `save()` writes all of it in one transaction (NORMAL), then measures (`_measure`): the node's `maintain()`
+  call, every 30 s (`RECORDS_INTERVAL`), expires and saves; a store saves itself once `FLUSH_CHANGES` (20 000)
+  changes wait, and past `MAX_CHANGES` (saves failing) refuses others' new records rather than hold more. A refresh
+  writes nothing unless it moves the last-stored time by more than an hour (`REFRESH_WRITE`), or its day is a new
+  refresh day; a refusal writes nothing.
+
+Each publisher's standing (`_Standing`: first seen, records held, tier, refresh days and the last of them) keeps
+the counts the budget and tiers need: `_tier_records` (records per tier, this node's in a tier of its own, `OWN`)
+and `_publishers`, read from `provider_standing` at load (`SUM ... GROUP BY tier`), and changed with each record
+(`_count_records`). A publisher left without records keeps its standing only if it has refresh days, until a TTL
+after the last (`maintain`'s hourly `_forget_departed`). The tier is worked out when the publisher stores
+(`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or removed since
+is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it), or by the
+hourly check of those written as Known.
+
+Room: `_capacity()` is `record_budget` over the bytes a record takes, or the records held at the last measure plus
+the free disk beyond the reserve (`free_space()`; the node passes `shutil.disk_usage` of the state directory less
+`storage.disk_reserve`) over it, whichever is less. The bytes a record takes are measured at each save as the
+database's pages in use over the records (at least `MEASURE_RECORDS`, 10 000: below that the database is mostly
+the rest of the state), so indexes, standings, fragmentation and the other state count; `record_bytes` fixes it
+(tests). A full store (`_full`) first sweeps for expired records, at most once a minute; then `_reclaim` applies
+the tiers' rules (FLOORS 10/60/30%), evicting from a tier's largest holder the record it refreshed least recently
+(`_oldest_key`, by `provider_records_publisher`). A tier's largest holder (`_largest`) is the larger of the changed
+standings' heap (`_heaps`, stale entries dropped as they surface) and the first standing on disk, by
+`provider_standing_tier`, not changed since (`_disk_top`, a page of 64 at a time, kept until the save changes the
+table); both, and `_oldest_key`'s position in each publisher's records, are reset by a save. So a flood's store
+costs a few reads and O(log n) in memory: about 70 µs on a desktop, a third of them SQLite's. Once a batch's key is
+refused for room, `provide` refuses its other new keys without looking again (NEW-8).
+
+A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the
+lowest tier among the rest gives way if that tier is below the storer's, or is the storer's and not Earned.
+This node's records are never counted there, never evicted and never refused. Expiry (`_expire`) reads expired
+records through `provider_records_last`, `SWEEP_BATCH` at a time with the lock let go between batches, and, while
+full, Newcomers' records last stored 4.5 days ago (`_NEWCOMERS_EXPIRED`, joined with their standing; the tier
+checked again before each goes). Times later than now (a clock corrected backwards) are clamped to now at load
+(if the latest last-stored time is in the future) and at the first `expire()` after the clock went backwards: the
+store notes the latest clock reading any time it holds came from (`_latest`, via `_now()`), and an `expire()`
+with the clock not behind it skips the clamping pass. `_check_consistency()` recomputes the counts and standings
+from the records on disk and in memory (`_merged`) and checks the caches against them; test_providers runs it
+after every test.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
@@ -1285,9 +1321,11 @@ in NameManager, one watch per name it holds) and never under it. `NameManager.pu
 recomputes what is provided under its own lock, reading the node's fetched targets (`node._lock`) and walking the
 pins' DAGs (`storage._lock`); the node reads storage under its lock (`_prune_fetched`). This is how the code behaves
 today, not a design goal. Batched saves write outside these locks, from the changes collected under them, one save
-at a time behind a save lock taken first (`Storage.save`, `Publisher.save`, `ProviderStore.save`, `DenyList.save`,
-the name floor, the fetched targets, the remote pins waiting), so an older snapshot never lands last. Slow work that
-runs while a lock is held:
+at a time behind a save lock taken first (`Storage.save`, `Publisher.save`, `DenyList.save`, the name floor, the
+fetched targets, the remote pins waiting), so an older snapshot never lands last. `ProviderStore` is the exception:
+its records are read from the database under its lock, so it writes under it too (a `/find` that misses its cache
+waits for a save, at most `FLUSH_CHANGES` rows); it asks the node's `_known_publisher` under it, which takes the
+contacts feature's lock, never the other way round. Slow work that runs while a lock is held:
 
 - `Publisher.refresh` checks every pin's DAG (`dag_blocks`, memoised) under the publisher lock, behind the
   names lock when a name changes, but only when something it is computed from changed: the node's generation
@@ -1322,8 +1360,11 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   `invalid` (invalid roots, oldest first; with the cache records);
 - `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
-- `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
-  stop, changed rows only);
+- `provider_records` (read per key; indexed by publisher and last-stored time for eviction and expiry; `pooled` is
+  always 0 since 0.2.0), `provider_publishers` (first-seen times) and `provider_standing` (0.2.0: each publisher's
+  record count, tier, refresh days and last refresh day; indexed by tier and count), NORMAL every 30 s, when 20 000
+  changes wait, and at stop, changed rows only; `provider_departed` and `provider_evicted` are 0.1.x's, emptied by
+  0.2.0's step (`providers_on_disk`, which also builds the standings, `statedb.PROVIDER_STANDING`) and unused;
 - `names_published`, `names_held` (sequences as decimal text, up to 2^64 − 1; FULL, changed rows only; a
   malformed row stops startup, as a malformed `names.json` did, since skipping it could allow rollback) and
   `name_floor` (highest sequence of names resolved for the gateway or auto-fetch and when, in `used` order, at

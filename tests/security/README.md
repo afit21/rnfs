@@ -52,12 +52,12 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | M3 | `test_m3_keeper_discovery.py` | `rnfs/features/keepers.py`, `rnfs/dht/lookup.py`, `rnfs/dht/routing.py`, `rnfs/fetcher.py` | `424b20b` |
 | M3-R1 | `test_m3r1_keeper_standing.py` | `rnfs/features/keepers.py` (`KeepersFeature.ask_keepers`), `rnfs/dht/lookup.py`, `rnfs/dht/routing.py` | `c83ceab`, `e2e78c2` (test) |
 | M3-R2 | `test_m3r2_keeper_unknown_budget.py` | `rnfs/features/keepers.py`, `rnfs/dht/lookup.py` | `c83ceab` |
-| M4 | `test_m4_provider_admission.py` | `rnfs/dht/providers.py` (`ProviderStore`), `rnfs/network/protocol.py`, `rnfs/node.py` | `641b9b2` |
-| M4-R | `test_m4r_newcomer_pool.py` | `rnfs/dht/providers.py` | `2f72d80` |
+| M4 | `test_m4_provider_admission.py` (rebuilt for 0.2.0's record budget and tiers) | `rnfs/dht/providers.py` (`ProviderStore`: `_reclaim`), `rnfs/network/protocol.py`, `rnfs/node.py` | `641b9b2` |
+| M4-R | `test_m4r_newcomer_pool.py` (rebuilt for 0.2.0: the Newcomer tier) | `rnfs/dht/providers.py` (`_reclaim`, `_largest`, the standing kept by `_remove`) | `2f72d80` |
 | NEW-1 | `test_new1_publisher_withdraw_race.py` | `rnfs/publisher.py` (`publish_due`, `refresh`) | `c3b4d45` |
 | NEW-4 | `test_new4_private_mode_records.py` | `rnfs/dht/providers.py`, `rnfs/node.py` (`NodeBackend.find`), `rnfs/network/links.py` (`LinkPool`) | `1ffc8eb` |
 | NEW-6 | `test_new6_publisher_crash_cut_round.py`; remote-pin half: `test_new6_remote_pins_restart.py`; follow-up: `test_new6_remote_pins_bad_entry.py` | `rnfs/publisher.py`; `rnfs/node.py` (`_load_remote_pins`, `_resume_remote_pins`), `rnfs/statedb.py` | `c3b4d45`; `719c1bc`; `49df3c9` |
-| NEW-8 | `test_new8_provide_at_limit.py` | `rnfs/dht/providers.py` (`ProviderStore.provide`, `_within_limits`) | `d74dcc5` |
+| NEW-8 | `test_new8_provide_at_limit.py` (rebuilt for 0.2.0: a full budget) | `rnfs/dht/providers.py` (`ProviderStore.provide`, `_store`) | `d74dcc5` |
 | L4 | `test_l4_name_rollback.py` | `rnfs/names.py` (`NameManager`, the name table) | `97b2537` |
 | L4-R | `test_l4r_name_floor.py` | `rnfs/names.py` (the gateway's name floor) | `a9c5640` |
 | NEW-2 | `test_new2_name_publish_crash.py`, `test_new2_follow_lxmf_pins.py` | `rnfs/names.py` (`NameManager.publish`), `rnfs/node.py`, `rnfs/features/follow.py`, `rnfs/features/lxmf.py`, `rnfs/content/storage.py` | `8ecad5b`, `ef3cc9d` |
@@ -66,7 +66,7 @@ and a fake CLI), and `_h1_real_helpers.py` and `_m1_real_helpers.py` (the real-R
 | DHT-1 | `test_dht1_keeper_query_budget.py` | `rnfs/features/keepers.py`, `rnfs/dht/lookup.py` | `73c8295` |
 | DHT-2 | `test_dht2_replayed_announce.py`; also `tests/test_names.py` | `rnfs/names.py` (`RnsNetwork.recalled_emission`) | `c31372b` |
 | DHT-4 | `test_dht4_private_name_announces.py`; also `tests/test_public.py` | `rnfs/names.py` (`NameManager.publish`), `rnfs/cli.py` | `509c056` |
-| DHT-5 | `test_dht5_own_provider_record.py`; also `tests/test_providers.py` | `rnfs/dht/providers.py` (`_within_limits`, `_make_room`) | `4b72ea7` |
+| DHT-5 | `test_dht5_own_provider_record.py`; also `tests/test_providers.py` | `rnfs/dht/providers.py` (`_key_room`, `_reclaim`, the own tier) | `4b72ea7` |
 | DHT-6 | none: documented only (the cost of grinding node IDs, specification section 10) | none | `4441878` (docs) |
 
 ## Network and the `/blocks` server

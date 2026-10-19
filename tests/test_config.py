@@ -34,7 +34,7 @@ class ValidateTest(unittest.TestCase):
 
     def test_whole_numbers(self):
         for name in ("max_storage", "gateway_fetches", "max_blocks_responses", "max_incoming_links", "beta",
-                     "max_records", "name_table_size", "remote_pin_quota", "max_output_entries", "verbosity"):
+                     "record_budget", "name_table_size", "remote_pin_quota", "max_output_entries", "verbosity"):
             for value in ("2", 2.0, True, None):
                 self.assert_invalid(**{name: value})
         for name, value in (("gateway_fetches", -1), ("max_output_entries", -5), ("max_incoming_links", 0),
@@ -156,6 +156,17 @@ class LoadTest(unittest.TestCase):
             self.assertEqual((config.beta, ignored(config), dict(config.given_defaults)), (5, [], {"beta": 5}))
             with self.assertRaises(ValueError):
                 self.load("old_limit = 5\nnew_thing = 1\n")
+
+    def test_max_records_is_retired(self):
+        """0.2.0 bounds provider records by record_budget (bytes): a max_records an older version's rnfs.toml holds
+        is ignored with a warning naming its replacement, and the settings schema no longer lists it."""
+        config = self.load("max_records = 40\n")
+        self.assertEqual(len(ignored(config)), 1)
+        self.assertIn("record_budget", ignored(config)[0])
+        self.assertEqual(config.record_budget, 1 << 30)
+        self.assertNotIn("max_records", [entry["name"] for entry in config_module.settings_schema()])
+        record_budget = next(e for e in config_module.settings_schema() if e["name"] == "record_budget")
+        self.assertEqual((record_budget["unit"], record_budget["minimum"]), ("bytes", 0))
 
 
 if __name__ == "__main__":

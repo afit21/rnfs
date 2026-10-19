@@ -11,6 +11,13 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 Upgrade notes:
 - **State:** the state database gains two tables (`pin_times`, `pin_labels`); an older rnfs can't open it
   afterwards. Pins made before the upgrade have no `added` time.
+- **Provider records:** the upgrade gives each publisher of the records a node stores a standing
+  (`provider_standing`, and indexes on `provider_records`): Earned if it was first seen at least 3 days before its
+  latest store and refreshed a record outside the newcomer pool a day or more after storing it, else Newcomer. The
+  newcomer pool's records are no longer pooled, and the remembered departed and evicted publishers are dropped.
+- **`max_records` is retired:** a `max_records` left in `rnfs.toml` (or given to `rnfs.Node`) is ignored with a
+  warning instead of stopping the daemon; `record_budget` (bytes) replaces it. `rnfs config set max_records` is
+  refused as an unknown setting; `rnfs config unset max_records` removes it.
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
@@ -83,6 +90,26 @@ Added, for apps:
   labels, the cache, settings, streams). A Node raises what a Client gets back.
 - **Per-call timeouts:** `with client.timeout(seconds):` bounds the calling thread's requests only, long polls
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
+
+Provider records (DHT servers; spec section 6, all local policy: nothing on the wire changes):
+- **On disk:** records are read from the state database per `/find` through an index, with a small cache, instead
+  of all held in memory (about 500 bytes each before): memory no longer grows with the records or their publishers.
+  Changes are written together every 30 s; a republish is written only when it moves a record's last-stored time by
+  more than an hour, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
+  200 000 records cost about 70 µs a store and 112 transactions in all, on a desktop NVMe disk.
+- **A byte budget instead of a record count:** records may take `record_budget` of disk (new, default 1 GiB: about
+  7 million records at the 150 bytes a record takes, measured from the database), never the free disk the blocks'
+  reserve needs. `max_records` (100 000 records) goes.
+- **No per-publisher caps while there is room:** anyone stores freely until the budget is full, so a large
+  publisher (a mirror) is no longer held to 1% of the store, nor a new one to a tenth of that. The newcomer pool and
+  the memories of departed and evicted publishers go too.
+- **Storage tiers once the budget is full:** Known (contacts of kind `node`, private-mode members, bootstrap
+  nodes; 30% floor), Earned (publishers that refreshed a record on 3 distinct UTC days; 60%) and Newcomer (everyone
+  else; 10%). A store to a full node takes a record from a tier's largest holder: the lowest tier below the storer's
+  above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
+  within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
+  each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

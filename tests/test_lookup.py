@@ -26,7 +26,7 @@ class FakeNode:
         """Empty server node_id."""
         self.node_id = node_id
         self.table = RoutingTable(node_id, CONFIG, clock=clock)
-        self.store = ProviderStore(10_000, None, clock=clock, rng=random.Random(node_id))
+        self.store = ProviderStore(None, clock=clock, rng=random.Random(node_id))
 
     def find(self, key: bytes) -> tuple[list[bytes], list[bytes]]:
         """The /find reply: providers, then the servers it knows closest to key."""

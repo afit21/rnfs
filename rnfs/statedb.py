@@ -17,7 +17,8 @@
   transaction recorded in the migrated table, then renames it to <name>.migrated. A crash between the commit and
   the rename leaves the record, so the next start only renames the file: nothing is imported twice or by half.
 
-Stores keep their state in memory and read the database only when they load (open_store), and write what changed
+Stores keep their state in memory and read the database only when they load (open_store; the provider store, which
+may hold millions of records, is the exception: it reads them per key, rnfs.dht.providers), and write what changed
 through a RowStore: it keeps the keys changed and not yet written, writes them at once (WRITE_THROUGH) or at the
 store's saves (SNAPSHOT, outside the store's lock, one save at a time), and keeps them for the next write when one
 fails. reconcile_pins makes a feature's pins match its saved state at start. Text that may hold lone
@@ -49,6 +50,22 @@ MIGRATED_SUFFIX = ".migrated"
 # wrote has them already, so an edit there would never reach it. A step's item is an SQL statement, or a callable
 # taking the transaction's connection, for a migration SQL alone can't express.
 Step = str | Callable[[object], None]
+
+# Each publisher's standing for the provider store's tiers (rnfs 0.2.0), built from the records 0.1.x left: its record
+# count, and Earned (tier 1, days 3) if it was first seen at least 3 days before its latest store and has a record
+# outside 0.1.x's newcomer pool that it refreshed a day or more after storing it, else Newcomer (tier 0, days 0). 0.1.x
+# counted no refresh days; that is the nearest it kept to them, and keeps publishers that have been refreshing for
+# days from being treated as strangers by the first flood after the upgrade. last_day is the UTC day of its latest
+# store. A schema step and the import of providers.json both run it: never change it (a new step gets a new one)
+PROVIDER_STANDING = (
+    "INSERT INTO provider_standing (publisher, records, tier, days, last_day)"
+    " SELECT publisher, records, earned, 3 * earned, last_day FROM ("
+    "SELECT r.publisher AS publisher, COUNT(*) AS records,"
+    " (MAX(r.last_stored) - MIN(p.first_seen) >= 259200"
+    " AND MAX(r.pooled = 0 AND r.last_stored - r.first_stored >= 86400)) AS earned,"
+    " CAST(MAX(r.last_stored) / 86400 AS INTEGER) AS last_day"
+    " FROM provider_records r JOIN provider_publishers p ON p.publisher = r.publisher GROUP BY r.publisher)")
+
 SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
     ("statedb", (
         # JSON state files imported, so each is imported once (migrate)
@@ -149,6 +166,21 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "CREATE TABLE pin_times (cid BLOB PRIMARY KEY, added REAL NOT NULL) WITHOUT ROWID",
         # A label the user gave a pin (pin label), kept apart from where it was added from (pin_names); dump()ed
         "CREATE TABLE pin_labels (cid BLOB PRIMARY KEY, label TEXT NOT NULL) WITHOUT ROWID",
+    )),
+    ("providers_on_disk", (
+        # rnfs 0.2.0: records are read per key rather than loaded whole, within a byte budget, in storage tiers. Each
+        # publisher's standing: records it holds, its tier (0 Newcomer, 1 Earned, 2 Known, 3 this node), the UTC days
+        # (days since the epoch) on which it refreshed a record it held, and the last of them
+        "CREATE TABLE provider_standing (publisher BLOB PRIMARY KEY, records INTEGER NOT NULL, tier INTEGER NOT NULL,"
+        " days INTEGER NOT NULL, last_day INTEGER NOT NULL) WITHOUT ROWID",
+        "CREATE INDEX provider_standing_tier ON provider_standing (tier, records)",  # a tier's largest holders
+        "CREATE INDEX provider_records_publisher ON provider_records (publisher, last_stored)",  # eviction, retain
+        "CREATE INDEX provider_records_last ON provider_records (last_stored)",  # expiry
+        PROVIDER_STANDING,
+        # The newcomer pool and the memories of departed and evicted publishers went with the per-publisher caps
+        "UPDATE provider_records SET pooled = 0 WHERE pooled != 0",
+        "DELETE FROM provider_departed",
+        "DELETE FROM provider_evicted",
     )),
 )
 
@@ -328,6 +360,29 @@ class _Database:
                     self.conn = None
 
 
+class _MemoryDatabase(_Database):
+    """A private in-memory database holding only some stores' tables, for a store that persists nothing (a node's
+    store in tests): the store runs the same code on it as on the state database."""
+
+    def __init__(self, stores: tuple[str, ...]):
+        """A new empty database with the tables of the schema steps labelled with one of stores, applied in order."""
+        self.sqlite3 = _sqlite3()
+        self.state_dir = None
+        self.path = ":memory:"
+        self.lock = threading.Lock()
+        self._owner = None
+        self.references = 0
+        self.synchronous = None
+        self.conn = self.sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
+        with self.transaction(durable=False) as tx:
+            for label, steps in SCHEMA:
+                for step in steps if label in stores else ():
+                    if callable(step):
+                        step(tx)
+                    else:
+                        tx.execute(step)
+
+
 def damaged_message(path: str, problem: str) -> str:
     """The startup error for a damaged state database: what is wrong and how to recover."""
     directory = os.path.dirname(path)
@@ -387,7 +442,8 @@ class StateDb:
         return self._db().transaction(durable)
 
     def query(self, sql: str, params=()) -> list[tuple]:
-        """Every row of a read (stores read only when they load). Raises StateDbError."""
+        """Every row of a read (stores read when they load; the provider store also as it goes). Raises
+        StateDbError."""
         return self._db().query(sql, params)
 
     def meta(self, store: str, key: str, default=None):
@@ -403,7 +459,8 @@ class StateDb:
                 return
             database.references -= 1
             if database.references == 0:
-                _open.pop(_key(database.state_dir), None)
+                if database.state_dir is not None:  # an in-memory one (connect_memory) isn't listed
+                    _open.pop(_key(database.state_dir), None)
                 database.close()
 
 
@@ -435,6 +492,15 @@ def connect(state_dir: str) -> StateDb:
         db.close()
         raise
     return db
+
+
+def connect_memory(stores: tuple[str, ...]) -> StateDb:
+    """A reference to a new private in-memory database holding only the tables of the schema steps labelled with
+    one of stores (e.g. ("providers", "providers_on_disk")), for a store that persists nothing. Not shared: each call
+    makes another, gone once closed."""
+    database = _MemoryDatabase(stores)
+    database.references = 1
+    return StateDb(database)
 
 
 def open_databases() -> list[str]:

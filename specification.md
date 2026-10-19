@@ -619,27 +619,42 @@ and repeat.
 - A record expires `PROVIDER_TTL` after it was last stored, keeps its first-stored time across republishes,
   and is removed on withdrawal. These times are wall-clock and persisted; one later than the current time (a
   clock since corrected backwards) counts as now, so a record can't outlive its TTL.
-- A node keeps at most `max_records`, a tenth of them in a *newcomer pool*. When the rest is full, a
-  publisher first seen before the most recent one there evicts a record of that most recent publisher (the
-  one it stored least recently), so a flood of new identities can't displace older publishers. Any other
-  publisher (one not seen before, or the most recent one) stores into the pool. A full pool evicts the
-  record pooled first of a publisher holding the most pooled records (one chosen at random if several hold
-  as many); a publisher that already holds as many as any other is refused instead, so a new publisher can
-  always store something, a flood churns only the pool, and the pool is shared out evenly between
-  publishers rather than emptied of a newcomer's records. A pooled record leaves the pool when it is
-  republished while the rest has room. The node's own records are always accepted and never evicted to make
-  room for others' (rnfs: nor counted toward its local limit of 1000 publishers per key, a newcomer to a full
-  key evicting a random one of the others but the `K/2` oldest), so Sybil stores can't push a node's own record
-  out of its own store.
-- First-seen times are persisted, and kept for `PROVIDER_TTL` after a publisher's last record is gone
-  (rnfs: for publishers seen for at least `provider_seniority`, at most `max_records / 10` of them, the
-  oldest departure forgotten first), so a publisher that was away for a while isn't new again. A newcomer
-  whose last record a full pool evicted keeps its first-seen time too, so a flood can't keep it new forever
-  (rnfs: at most `max_records / 100` such newcomers, at least 10; when more, the one first seen most recently
-  is forgotten).
-- A node SHOULD limit how many records one publisher holds, its own excepted (rnfs: `max_records / 100`, at
-  least 10, once the publisher has been seen for `provider_seniority`, and a tenth of that, at least 10,
-  before), so one identity can't fill the store and a fresh one gets little.
+- How much a node stores for others, and whose records it keeps when that is full, is local server policy:
+  nothing on the wire depends on it, and a refused store is only a `False`. RNS identities are free and carry no
+  address, so no limit keyed on an identity bounds a flood; rnfs shares freely while there is room, and once
+  there isn't, keeps the places of the publishers it has seen for days. In rnfs:
+  - **Record budget.** Records may take `record_budget` of disk, measured as the state database's size over the
+    records it holds (so their indexes, their publishers' standing and storage overhead count: about 150 bytes a
+    record, up to 250 when each has a publisher of its own; 7 million records in the default 1 GiB), and never
+    the free disk the blocks' reserve needs (section 8). The store is *full* when either is reached. While it
+    isn't, any publisher stores freely: there is no per-publisher limit.
+  - **Storage tiers**, applied only while the store is full. *Known*: contacts of kind `node`, private mode's
+    members, and the bootstrap nodes a join contacts (`bootstrap_nodes`, and the defaults unless
+    `default_bootstrap` is off). *Earned*: publishers that held a record here and refreshed it on at least 3
+    distinct UTC days (the day of a first store not counted). *Newcomer*: everyone else, 0.1.x publishers new
+    to this node included. Each tier has a floor, a share of the budget: Known 30%, Earned 60%, Newcomer 10%.
+  - **Making room.** A new record to a full store evicts a record of a tier's largest holder (the record it
+    refreshed least recently): from the lowest tier below the storer's that holds more than its floor; else,
+    if the storer's own tier holds less than its floor, from a tier above it that holds more than its floor;
+    else from the storer's own tier, unless the storer already holds as many records as that tier's largest
+    holder (so it can't churn its records), or the tier is Earned: Earned publishers never evict each other.
+    Otherwise the store is refused. Floors hold in both directions: a lower tier can't take a higher one's
+    floor, nor a higher one the lower one's for good.
+  - **Expiry while full.** While the store is full, a Newcomer's record last stored 4.5 days ago counts as
+    expired: one more way a full store makes room. The longest honest gap between republishes is just under
+    3.5 days (kept names, below), so a record republished on time never lapses this way. A store that isn't
+    full keeps every record `PROVIDER_TTL`, so a record survives one missed republish.
+  - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
+    of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
+    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.
+  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a newcomer to a full
+    key evicts a random one of the lowest tier there (never one of the `K/2` oldest records, which replies list
+    first), if that tier is below its own, or is its own and not Earned; otherwise it is refused. Refusing every
+    newcomer would let early Sybil identities hold the key, and the random half of `/find` replies relies on
+    newcomers getting stored.
+- The node's own records are always accepted and never evicted to make room for others' (rnfs: nor counted
+  toward the 1000 publishers of a key; they take room in the budget), so Sybil stores can't push a node's own
+  record out of its own store.
 - Providers republish every `republish_interval`, which MUST be less than `PROVIDER_TTL / 2`. Providers also
   record themselves locally. Keys that aren't CIDs' (kept names, section 9) are republished every
   max(`republish_interval`, 3 days), each with a fixed jitter of ±10% derived from the key, so many keys
@@ -1083,7 +1098,7 @@ as is cheap. Rules live in the sections referenced.
 | Malformed DAG nodes | Strict msgpack types, re-encoding and per-node checks (5). The tree rule gives honest writers one CID per content; readers don't enforce it |
 | Advertising on someone else's behalf | Records name only the identified requester (6) |
 | Advertising content it doesn't have, or stale records | Failed providers removed; the search runs again; withdrawals (6, 7) |
-| Squatting or flooding provider records | Oldest-plus-random replies; long-known providers tried first; eviction of the newest publishers; no identity switching on a link (3, 6) |
+| Squatting or flooding provider records | Oldest-plus-random replies; long-known providers tried first; a record budget whose storage tiers, once it is full, keep the places of known nodes and of publishers seen refreshing for days, while strangers share a small, fast-expiring tier; no identity switching on a link (3, 6) |
 | Hiding content near a key | Provider search doesn't stop at the first reply that lists providers (6) |
 | Routing table takeover with new identities | Only proven-reachable nodes stored; full buckets keep long-lived nodes (6) |
 | Fake node IDs in replies | Unknown IDs never stored; at most `alpha` path requests for them per lookup; lookup time budget (6) |
@@ -1142,9 +1157,12 @@ RNS's own `blackhole_identity` is not used: it is instance-wide and persistent.
   providers. Such identities, established in a resolver's routing table near a name's keeper key, can also
   answer its keeper query with a replayed older record of the name, unless the resolver knows a newer
   sequence or reaches a keeper they don't list (one recorded locally, or listed by another established node).
-- A flood of new identities with more of them than the newcomer pool has records leaves each, an honest
-  newcomer included, about one pooled record at a time; a newcomer's first-seen time outlasts that only
-  while fewer than the bounded number of newcomers first seen before it were evicted too.
+- A flood of new identities that fills the record budget shares the Newcomer tier with honest newcomers: each
+  keeps about as many records as any flooding identity (the largest holders give way first), and their records
+  expire 4.5 days after they were last stored while the store is full. Identities kept refreshing records for 3
+  days become Earned: they then keep what they hold, though they can't take others' (Earned publishers never
+  evict each other), so space they hold is lost to honest newcomers until they stop. A flood can also take the
+  free space and the Newcomer floor, and absorb space honest publishers leaving the network free.
 - Private mode doesn't hide names: a member's names are announced over RNS like any other, so outsiders who
   hear them learn each `[sequence, CID]` record and when it changes, though members won't serve them the content
   (section 3). `name publish` in private mode warns of this.
@@ -1537,7 +1555,9 @@ Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_par
 sizes and counts at least 0; rates above 0; times above 0, except `startup_announce_delay`,
 `provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
 `remote_pin_identities` are lists of identity hashes (32 hex digits). A node MUST NOT start with an invalid
-setting.
+setting. A setting an earlier version had and this one retired is ignored with a warning, so settings an older
+version accepted still start the node (rnfs: `max_records`, replaced by `record_budget` in 0.2.0); it can't be set
+any more, only removed.
 
 A node MAY let local clients change its settings while it runs (rnfs: `rnfs config`, `POST /api/config/set`,
 with each setting's type, range, unit, default and description from `GET /api/config`). A change MUST be refused,
@@ -1563,7 +1583,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `announce_interval` | 6 h | SHOULD NOT be under 1 h (RNS's per-destination announce rate limit) |
 | `startup_announce_delay` | 30 s | Second announce after startup |
 | `max_parallel_providers` | 3; 1 on slow nodes | |
-| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first; a publisher seen this long gets its full share of the provider store |
+| `provider_seniority` | 1 day | Providers (and keepers) in the routing table this long are tried first |
 | `response_target` | 60 s | Transfer time a `/blocks` response aims for |
 | `deadline_slack` | 30 s | Added to response deadlines; minimum age before a response can be displaced |
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
@@ -1576,7 +1596,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `max_blocks_responses` | 4 | `/blocks` responses in progress on slow links: half of this; the rest for other links, unless `fast_blocks_responses` is more. At least 2 |
 | `fast_blocks_responses` | 16 | `/blocks` responses in progress on links that aren't slow, if more than the rest of `max_blocks_responses` |
 | `max_upload_rate` | none; half the rate estimate on slow links that have one | An explicit value applies to every `/blocks` response, with or without a rate estimate |
-| `max_records` | 100 000 | |
+| `record_budget` | 1 GiB | Disk the provider records stored for others may take, never the free disk the blocks' reserve needs; past it, the storage tiers decide whose records stay (section 6). Replaces 0.1.x's `max_records` (a record count), which a node ignores with a warning |
 | `ban_time` | 1 h | |
 | `max_storage` | 10 GiB | |
 | `max_download_size` | none | |
