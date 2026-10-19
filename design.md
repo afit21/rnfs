@@ -708,8 +708,13 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `http.server`'s own error pages (a malformed request line) have no code.
 - **Capabilities.** `GET /api/capabilities`: `api.CAPABILITIES` (what a route list can't say: `events`,
   `pin_details`, `sealed_folders` (add seals a folder, get unpacks one and takes `no_extract`), ...), every core
-  and feature route, the loaded features, `events.EVENT_KINDS` and
-  `errors.CODES`. `ApiConnection.capabilities()` answers `{}` from an older daemon.
+  and feature route, the loaded features, `events.EVENT_KINDS`,
+  `errors.CODES` and `deprecated` (`features.deprecated_features()`, below). `ApiConnection.capabilities()` answers
+  `{}` from an older daemon.
+- **Deprecated routes.** `dispatch` sets `ApiHandler.deprecated_since` for a route of a deprecated feature
+  (`api.deprecated_routes()`, loaded once from `features.deprecated_routes()`), and `send_common_headers` then adds
+  `Deprecation: @<deprecated_since>` (RFC 9745, `DEPRECATION_HEADER`) to whatever the route answers, errors too.
+  Bodies don't change: the CLI and the library warn by their own means.
 - **Events.** `rnfs/events.py`: `EventLog`, one per node (`RnfsNode.events`, made first in `_setup`), holding the
   last `MAX_EVENTS` (1024) events, each `{"seq", "kind", "time", ...}` numbered from 1 per run, with a random
   `epoch` per run. `publish()` appends under the log's condition (the innermost lock: callers hold the names lock
@@ -872,8 +877,8 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Cached` / `Uncached` | `cid`, `root`, `path: tuple[str]`, `pinned`, `complete`, `type`, `size`, `provided` / `removed_records`, `removed_blocks`, `freed_bytes` | the CID / — |
 | `Event` | `seq`, `kind` (`EVENT_KINDS`, or "lost": `lost` True), `time`, `fields: dict` (the kind's own; merged back by `to_dict`) | — |
 | `EventBatch` | `events: tuple[Event]`, `next`, `lost`, `epoch` | — |
-| `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`; empty from a daemon before 0.2.0 | — |
-| `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
+| `Capabilities` | `version`, `capabilities: frozenset[str]` (`has(name)`), `routes: tuple[(method, path)]`, `features`, `event_kinds`, `error_codes`, `deprecated` (`is_deprecated(feature)`); empty from a daemon before 0.2.0 | — |
+| `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending`, then `deprecated` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
 | `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `blocks`, `used_bytes`, `max_storage`, `names`, `features: dict` (every other field) | — |
@@ -950,7 +955,7 @@ Client the connection errors below). "Fetch errors" = `NotFound` (no such conten
 | `contacts.list() -> list[Contact]`, `contacts.get(nick) -> Contact`, `contacts.add(nick, id, kind=None) -> Contact` (id: bytes, hex or a `Name`; kind None: the node tells), `contacts.remove(nick)` | `ValueError` (nick, id or kind invalid, a kind it can't tell, full), `NotFound` (no such contact; no contacts feature) | `ContactsFeature.list`, `get`, `add`, `remove` / `GET /api/contacts`, `/api/contacts/get`, `POST /api/contacts/add`, `/api/contacts/rm` |
 | `names.keep(name) -> Kept`, `names.unkeep(name)`, `names.kept() -> list[Kept]` (name: bytes, hex, `Name` or a name contact's nick) | `ValueError` (malformed, unknown nick, `keep_max_names`), `NotFound` (unkeep: not kept by the user; no keepers feature) | `KeepersFeature.keep`, `unkeep`, `kept` / `POST /api/name/keep`, `/api/name/unkeep`, `GET /api/name/kept` |
 | `names.follow(name) -> Followed`, `names.unfollow(name)`, `names.following() -> list[Followed]` | as keep; `NotFound` (unfollow: not followed; no follow feature) | `FollowFeature.follow`, `unfollow`, `following` / `POST /api/name/follow`, `/api/name/unfollow`, `GET /api/name/following` |
-| `lxmf.address() -> LxmfAddress`, `lxmf.send(to, target, message=None, *, propagate=False, nearest=False) -> Sent` (to: bytes, hex or an LXMF contact's nick; target a Cid, path or `rnfs:` URI, a name URI sent as a name link), `lxmf.sync(nearest=False) -> Synced` | `ValueError` (LXMF off, as by default in a Node; recipient or target invalid; no propagation node), `NotFound` (send: recipient never heard; no lxmf feature) | `LxmfFeature.address`, `send`, `sync` / `GET /api/lxmf/address`, `POST /api/lxmf/send`, `/api/lxmf/sync` |
+| (deprecated in 0.2.0: each `lxmf` method first warns `DeprecationWarning`) `lxmf.address() -> LxmfAddress`, `lxmf.send(to, target, message=None, *, propagate=False, nearest=False) -> Sent` (to: bytes, hex or an LXMF contact's nick; target a Cid, path or `rnfs:` URI, a name URI sent as a name link), `lxmf.sync(nearest=False) -> Synced` | `ValueError` (LXMF off, as by default in a Node; recipient or target invalid; no propagation node), `NotFound` (send: recipient never heard; no lxmf feature) | `LxmfFeature.address`, `send`, `sync` / `GET /api/lxmf/address`, `POST /api/lxmf/send`, `/api/lxmf/sync` |
 | `lxmf.inbox() -> list[Message]`, `lxmf.outbox() -> list[Outgoing]`, `lxmf.get(id, *, link=None, output=None, directory=None, use_sent_cid=False) -> list[Fetched]`, `lxmf.remove(id) -> int`, `lxmf.remove_all() -> int` | get: `NotFound` (no such message; a name unresolved without `use_sent_cid`), `ValueError` (id or link not a positive integer, no or a clashing output); remove: `NotFound` | `LxmfFeature.inbox_list`, `outbox_list`, `inbox_get`, `inbox_rm` / `GET /api/lxmf/inbox`, `/api/lxmf/outbox`, `POST /api/lxmf/inbox/get`, `/api/lxmf/inbox/rm` |
 
 `File` (from `open`, an `io.BufferedIOBase`): `read`, `read1`, `readinto`, `readline`, iteration, `seek`, `tell`,
@@ -1366,6 +1371,17 @@ types `node.feature("contacts")`, `self.dependency("contacts")` and `features.fi
 `tests/test_contacts.py` checks `ContactsFeature` against it, so a renamed method fails there instead of silently
 turning off LXMF's contact trust. LXMF resolves a recipient's nick with `ContactsFeature.resolve_id(nick, "lxmf")`.
 
+A feature that still works but is going away sets `deprecated` (the reason) and `deprecated_since` (a Unix time,
+checked by `checked_classes()`): its routes' responses carry a `Deprecation` header and capabilities list it
+(above, "Deprecated routes"). In 0.2.0 that is lxmf (`config.LXMF_DEPRECATION`, the one reason every warning
+gives), which also says so itself: `LxmfFeature.start()` logs it once, a notice while it runs, naming the
+`lxmf_*` settings given (`config.deprecated_given`: neither the default nor an embedded node's own default) as a
+warning while it runs as configured; its commands are wrapped (`lxmf._deprecated_command`) to print
+`cli.warn_deprecated`'s line on stderr first (unless `RNFS_NO_DEPRECATION_WARNINGS` is set) and to say
+"(deprecated)" in their help; the settings schema's `deprecated` comes from `config.DEPRECATED_GROUPS`, and
+`config.deprecation_warnings` makes the settings feature's warnings; `interface.Lxmf`'s methods warn
+`DeprecationWarning` at the caller (`_lxmf_deprecated`, stacklevel 3).
+
 The node checks the features' names too when it loads them, with one error style (`FeatureError`, "feature
 <name>: <problem>"), so nothing is shadowed or dropped silently: `checked_classes()` checks every API route
 (`features.api_routes()`: GET or POST of a path matching `API_PATH`, under `/api/`, with a handler, defined neither
@@ -1382,7 +1398,7 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
 | `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
-| `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `storage.LXMF_PREFIX` (`app:lxmf:`, an app source to `storage.check_source`) |
+| `lxmf` | `lxmf.py` | deprecated in 0.2.0 (moves to an app; above); pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `storage.LXMF_PREFIX` (`app:lxmf:`, an app source to `storage.check_source`) |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 | `settings` | `settings.py` | `rnfs config`, `GET /api/config`, `POST /api/config/set`: rnfs.toml read and rewritten, `LIVE` settings applied to the running node | `config.settings_schema`, `Config.combine`, `config.edit_settings`; `Config.overrides`/`given_defaults` (set by `Config.load`); the live hooks below |
 
@@ -1390,8 +1406,9 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 read it without a daemon): one entry per `Config` field but `rnfs_dir`, its type and nullability from the field's
 annotation, ranges from the tables `Config.validate` checks (`WHOLE_NUMBERS`, `OPTIONAL_WHOLE_NUMBERS`, `RATES`,
 `DURATIONS`, `CHOICES`, and `FEATURE_LIMITS` for what features check), units, groups (`SECTIONS`, the markers in
-`Config`), a one-line `DESCRIPTIONS` entry and `live` (`LIVE_SETTINGS`); `tests/test_settings.py` fails for a
-field without one, and checks each entry against `validate`. `Config.load` records what it was given over
+`Config`), a one-line `DESCRIPTIONS` entry, `live` (`LIVE_SETTINGS`) and `deprecated` (`DEPRECATED_GROUPS`, by
+group); `tests/test_settings.py` fails for a field without one, and checks each entry against `validate`.
+`Config.load` records what it was given over
 rnfs.toml (`overrides`: the daemon's command line, an embedded node's settings) and under it (`given_defaults`),
 so `GET /api/config` can say for each setting the running value, rnfs.toml's (`file`, null where it isn't set:
 TOML has no null), `overridden` and `pending` (a restart with the same command line would run another value),

@@ -34,7 +34,8 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   through RNS's own announce caching, or from *keepers* that store its signed announce; nobody but the owner
   can change it. A node can *follow* a name, keeping its latest target pinned.
 - **Sharing.** Content can be sealed for chosen identities (section 5) and linked from LXMF messages with
-  `rnfs:` URIs (section 13). Neither changes the protocol.
+  `rnfs:` URIs (section 13). Neither changes the protocol. rnfs's own LXMF messaging is deprecated in 0.2.0: it
+  moves to a separate app, while `rnfs:` URIs and the LXMF link-map field stay part of this specification.
 
 ## 2. Terms
 
@@ -1429,7 +1430,7 @@ are local conveniences, not part of the protocol.
 | `jobs [list]`, `jobs show\|wait\|cancel <id>`, `jobs clear [<id>]` | Background jobs (below) |
 | `contacts add <nick> <hex> [--kind name\|node\|lxmf]`, `contacts rm <nick>`, `contacts ls` | Contacts (below) |
 | `deny add\|rm <entry>…`, `deny ls` | The local deny list (CIDs, `sha256:<hex>` file hashes); `ls` also shows each `deny_lists` source, the version in use and its state (section 8) |
-| `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
+| `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13), deprecated in 0.2.0: each prints a warning on stderr (stdout unchanged; `RNFS_NO_DEPRECATION_WARNINGS=1` silences it). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
@@ -1542,8 +1543,11 @@ gateway can never reach the API.
   `{"error": message, "code": code}`, the code machine-readable and never renamed once released, so a client
   tells "no such endpoint" (`no_such_endpoint`, a daemon that predates it) from "no such content" (`not_found`),
   both `404`; `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
-  capabilities. `POST /api/shutdown` stops the daemon as SIGTERM does, after answering (Windows has no other
-  clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
+  capabilities, and the features that are deprecated (`deprecated`: they still work, but a later release removes
+  them; rnfs 0.2.0: `lxmf`, section 13). Every response of a deprecated feature's routes, errors included,
+  carries `Deprecation: @<Unix time>` (RFC 9745, the time it was deprecated; rnfs's `/api/lxmf/` routes:
+  `@1792368000`, 2026-10-19), and is otherwise unchanged. `POST /api/shutdown` stops the daemon as SIGTERM does,
+  after answering (Windows has no other clean way for a program to stop a daemon running in the background). `GET /api/events` is a long poll on the
   node's events — jobs, pins, cached fetches, the LXMF inbox, names it holds, peers and remote pins (those it asked
   for and those it serves, section 8) — numbered within a run:
   answered as soon as there is an event after the sequence the client gives, or after a wait (at most 30 s),
@@ -1848,7 +1852,9 @@ version accepted still start the node (rnfs: `max_records`, replaced by `record_
 any more, only removed.
 
 A node MAY let local clients change its settings while it runs (rnfs: `rnfs config`, `POST /api/config/set`,
-with each setting's type, range, unit, default and description from `GET /api/config`). A change MUST be refused,
+with each setting's type, range, unit, default, description and, for a setting that still works but is going
+away, why (`deprecated`: rnfs 0.2.0's `lxmf_*` settings, section 13) from `GET /api/config`, which also warns
+about the deprecated settings the file sets, as setting one through the API does). A change MUST be refused,
 leaving the settings file as it was, unless the whole resulting file is valid by itself and with the node's
 command-line options, under the same checks as at start (ownership, no symlink, size). Options given on the
 command line keep winning over the file. rnfs applies these at once, the rest at the next start: `max_storage`
@@ -1913,7 +1919,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `follow_quota` | 1 GiB per followed name | Bytes a followed name's new target may hold, its size and its DAG's blocks; 0: followed names aren't fetched. A swap holds the old and new targets, so up to twice this (section 9) |
 | `max_jobs` | 2; 1 on slow nodes | Jobs running at once (a whole number ≥ 1). Foreground `get`, `pin add` and `export` run as jobs too, so they queue beyond this |
 | `max_finished_jobs` | 100 | Finished jobs kept (a whole number ≥ 1); each is kept at least 60 s regardless (section 11) |
-| `lxmf_enabled` | on if the LXMF package is installed | A boolean. `false` turns LXMF off; `true` without the package logs a warning and stays off |
+| `lxmf_enabled` | on if the LXMF package is installed | A boolean. `false` turns LXMF off; `true` without the package logs a warning and stays off. Like every `lxmf_*` setting, deprecated in 0.2.0 (section 13) |
 | `lxmf_display_name` | `rnfs node` | Announced with the LXMF address; 1–64 printable characters |
 | `lxmf_send_from_hint` | `true` | Sent links carry `from=<node ID>` as a provider hint; this tells recipients which rnfs node the LXMF address belongs to. `false` omits it |
 | `lxmf_propagation_node` | none | Propagation node (32 hex digits) used for `--propagate`, the fallback of failed direct messages and the periodic downloads. One only heard announcing itself is used only with `--nearest` |
@@ -1931,6 +1937,19 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `DENY_HASH_SLACK` | 64 MiB | Any file up to this size can be hashed, however much it repeats |
 
 ## 13. rnfs URIs and LXMF
+
+**Deprecated (rnfs 0.2.0).** rnfs's own LXMF messaging (sending, receiving, the inbox and outbox, auto-fetch,
+the `lxmf_*` settings, and the commands, API routes, library methods and `inbox` events for them) is deprecated:
+it is moving to a separate app built on the local API (section 11) and rnfs's library, and a later release
+removes it from rnfs. Until then it works as this section says, and says it is deprecated wherever it is used:
+the node logs so at start while LXMF runs or an `lxmf_*` setting is given; each command warns on stderr; every
+response of the `/api/lxmf/` routes carries a `Deprecation` header and `GET /api/capabilities` lists `lxmf` under
+`deprecated` (section 11); the settings schema marks each `lxmf_*` setting `deprecated`; and the library's
+methods warn `DeprecationWarning`. Nothing on the network changes. The `rnfs:` URIs and the link-map field below
+stay part of this specification: they are the interop contract that app, other clients and rnfs itself (a target
+may be an `rnfs:` URI) keep using. The rules for messages, receiving and auto-fetch move to that app's
+specification once rnfs drops LXMF; its pins already use the source `app:lxmf:<address>` (section 8), which the
+app owns.
 
 rnfs links can be sent and received as [LXMF](https://github.com/markqvist/LXMF) messages, so content can be
 shared with people using Sideband, NomadNet, MeshChat or any other LXMF client. This is optional and not part
