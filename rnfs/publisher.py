@@ -70,6 +70,77 @@ SLOW_ROUND_LOOKUPS = 10  # region lookups per round on slow nodes, so /provide b
 # quarter of the time, with few threads. The airtime controls (upload_budget, interface rules, quiet hours)
 # apply to /blocks only (spec section 3): these send the same /find messages as one at a time would, overlapping
 PUBLISH_LOOKUPS = 4
+# Other nodes: servers a round sends /provide to at once, each over its own identified link and in its own batches
+# (withdrawals first, stopping at the first refusal), so a server sees what it would one at a time. A /provide is
+# latency-bound (path, link setup, identify, a packet a batch), not bandwidth-bound: 16 links in flight are a few
+# kilobytes, on the order of the /find the lookups already keep in flight (12). The load study puts a fast node's
+# round for 1M keys at about 1.1 h with sweep providing and 16 at once (83 h with a lookup per key, one server at a
+# time). The airtime controls apply to /blocks only (spec section 3). Slow nodes send one at a time
+PROVIDE_PARALLEL = 16
+
+
+def _in_order(items: list, work: Callable, should_stop: Callable[[], bool], parallel: int):
+    """Yield (item, work(item)) for items in their order, running work for up to parallel items at once on
+    rnfs-publish-provide threads (in the caller's, one at a time, for parallel 1). should_stop() is checked before
+    each item starts: once it is True no more start, and those running finish and are yielded. When work raises, no
+    more start; the exception is raised once the items that ran have been yielded, so what they did is recorded."""
+    if parallel <= 1:
+        for item in items:
+            if should_stop():
+                return
+            yield item, work(item)
+        return
+    cond = threading.Condition()
+    results: dict[int, tuple[bool, object]] = {}  # index -> (raised, result or exception)
+    state = {"next": 0, "ended": False}  # the next index to start; whether no more may start
+
+    def worker():
+        """Run work for the next item in turn until none is left or the round ends."""
+        while True:
+            with cond:
+                if state["ended"] or state["next"] == len(items):
+                    return
+                if should_stop():
+                    state["ended"] = True
+                    cond.notify_all()
+                    return
+                index = state["next"]
+                state["next"] += 1
+            try:
+                result = (False, work(items[index]))
+            except BaseException as e:  # noqa: BLE001 - raised in the caller's thread once the others are in
+                result = (True, e)
+            with cond:
+                results[index] = result
+                if result[0]:
+                    state["ended"] = True
+                cond.notify_all()
+
+    threads = [threading.Thread(target=worker, name="rnfs-publish-provide", daemon=True)
+               for _ in range(min(parallel, len(items)))]
+    for thread in threads:
+        thread.start()
+    failure = None
+    try:
+        for index in range(len(items)):
+            with cond:
+                # Wait for this item unless it will never start
+                while index not in results and not (state["ended"] and index >= state["next"]):
+                    cond.wait()
+                if index not in results:
+                    break
+                raised, result = results.pop(index)
+            if raised:
+                failure = failure or result
+                continue
+            yield items[index], result
+    finally:
+        with cond:
+            state["ended"] = True  # the caller may have stopped iterating (an exception of its own)
+        for thread in threads:
+            thread.join()
+    if failure is not None:
+        raise failure
 
 
 class DhtKey:
@@ -660,20 +731,27 @@ class Publisher:
         accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
         unsaved, saved_at = 0, self.clock()
-        for node_id in sorted(set(by_node) | set(withdrawals)):
-            if should_stop():
-                break
+
+        def send(node_id: bytes) -> tuple | None:
+            """Send node_id its keys and the withdrawals still queued for it, over one identified link: (keys,
+            withdrawn, keys it may have recorded, when it answered), or None if there was nothing to send."""
             cids = by_node.get(node_id, [])
             with self._lock:
                 # Only what is still queued: a key provided again since the snapshot had its withdrawals cancelled
                 withdrawn = withdrawals.get(node_id, set()) & self._withdrawals.get(node_id, set())
             if not cids and not withdrawn:
-                continue
+                return None
             # Not retried until the next republish whatever the outcome, so it counts as sent either way.
             # The node may hold records of the keys it got before any refusal: those are withdrawn later
             recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
+            return cids, withdrawn, recorded, self.clock()
+
+        parallel = 1 if self.slow_node else PROVIDE_PARALLEL
+        for node_id, outcome in _in_order(sorted(set(by_node) | set(withdrawals)), send, should_stop, parallel):
+            if outcome is None:
+                continue
+            cids, withdrawn, recorded, answered = outcome
             sent_withdrawals[node_id] = withdrawn
-            answered = self.clock()
             with self._lock:
                 for cid in cids:
                     if cid.key not in recorded:

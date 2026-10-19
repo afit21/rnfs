@@ -215,6 +215,9 @@ The DHT (local behaviour: nothing on the wire changes):
   lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
   1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
   not keys, so a round publishes every due key of up to 10 regions.
+- **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
+  servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
+  at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
 - **Slow nodes pace withdrawals:** unpinning many keys no longer sends every withdrawal at once over radio. A slow
   node sends withdrawals along with its round's stores to the same servers, and each server only withdrawals
   reach counts as one of the round's 10 lookups (up to 5 kept for them while any are queued), so the round waits

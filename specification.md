@@ -707,7 +707,8 @@ silent longer than every one of them; announces are recorded in memory and writt
 **Publishing.**
 - For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node
   the keys it should store, in as few `/provide` requests as the batch size allows (section 3), one at a time
-  over a separate identified link closed afterwards.
+  over a separate identified link closed afterwards. A publisher MAY send to several nodes at once, each over its
+  own link and in its own order (rnfs: up to 16 on nodes that aren't slow; a slow node one at a time).
 - **Sweep providing** finds the `K` closest of many keys with one lookup per *region*. It is local behaviour:
   only which `/find` queries a publisher sends changes, and how it groups its `/provide`s. Take the due keys in
   turn; for the first not yet covered, x, run the closest-nodes lookup. Let p be the length of the prefix x shares

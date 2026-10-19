@@ -14,7 +14,9 @@ from rnfs.content.cid import RAW, Cid
 from rnfs.content.storage import USER, Storage
 from rnfs.denylist import DenyList
 from rnfs.dht.providers import ProviderStore
-from rnfs.publisher import MAX_WAIT, PUBLISH_LOOKUPS, SLOW_LOOKUP_PACE, SLOW_ROUND_LOOKUPS, DhtKey, Publisher
+from rnfs.publisher import (MAX_WAIT, PROVIDE_PARALLEL, PUBLISH_LOOKUPS, SAVE_EVERY_NODES, SLOW_LOOKUP_PACE,
+                            SLOW_ROUND_LOOKUPS, DhtKey, Publisher)
+import tests.test_links as fake_links  # a module, so its test cases don't run twice
 from tests.fakes.client import FakeClient
 from tests.fakes.log import quiet_log
 from tests.support import FakeClock, failing_commits, state_execute, state_rows, write_legacy
@@ -90,6 +92,67 @@ class SleepingLookup(FakeLookup):
         with self.running:
             time.sleep(self.delay)
         return list(self.nodes)
+
+
+class SlowClient(FakeClient):
+    """A FakeClient whose /provide takes delay seconds, counting the requests in flight at once (the most in peak)."""
+
+    def __init__(self, delay: float):
+        """Each request takes delay seconds."""
+        super().__init__()
+        self.delay = delay
+        self.now = self.peak = 0
+
+    def provide(self, node_id, keys, withdrawn):
+        """Record the request after delay seconds."""
+        with self.lock:
+            self.now += 1
+            self.peak = max(self.peak, self.now)
+        time.sleep(self.delay)
+        with self.lock:
+            self.now -= 1
+        return super().provide(node_id, keys, withdrawn)
+
+
+class GatedClient(FakeClient):
+    """A FakeClient whose /provide requests wait for gate, once PROVIDE_PARALLEL of them are waiting (waiting)."""
+
+    def __init__(self):
+        """Nothing waiting yet."""
+        super().__init__()
+        self.gate, self.waiting = threading.Event(), threading.Event()
+        self.count = 0
+        self.results: list[dict] = []
+
+    def provide(self, node_id, keys, withdrawn):
+        """Wait for the gate, then record the request."""
+        with self.lock:
+            self.count += 1
+            if self.count == PROVIDE_PARALLEL:
+                self.waiting.set()
+        self.gate.wait(5)
+        with self.lock:
+            return super().provide(node_id, keys, withdrawn)
+
+
+class Crash(BaseException):
+    """Stands in for the process dying in the middle of a round."""
+
+
+class CrashingClient(FakeClient):
+    """A FakeClient that dies at every request once crash_at have been recorded."""
+
+    def __init__(self, crash_at: int):
+        """Crash from the crash_at'th request (0-based) on."""
+        super().__init__()
+        self.crash_at = crash_at
+
+    def provide(self, node_id, keys, withdrawn):
+        """Record the request, or crash."""
+        with self.lock:
+            if len(self.calls) >= self.crash_at:
+                raise Crash()
+            return super().provide(node_id, keys, withdrawn)
 
 
 class PublisherTest(unittest.TestCase):
@@ -296,6 +359,7 @@ class PublisherTest(unittest.TestCase):
         self.publisher.publish_due()
         self.assertEqual(self.withdrawn(), {N1: {first}, N2: {cid.key for cid in cids}})
 
+    @mock.patch.object(publisher_module, "PROVIDE_PARALLEL", 1)  # one at a time: the stop point is exact
     def test_round_stopped_midway_leaves_unsent_cids_due(self):
         cid = self.pinned(b"interrupted")
         self.publisher.refresh()
@@ -770,6 +834,96 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(self.client.calls, [])
         self.assertEqual(self.publisher.next_due(), 0)
 
+    # /provide sent to many servers at once
+
+    def test_provides_sent_at_once(self):
+        """Other nodes send /provide to up to PROVIDE_PARALLEL servers at once; each server still gets one call
+        holding all its keys and the withdrawals queued for it, and the round sends and records exactly what one
+        server at a time does."""
+        cids = self.due_keys(5)
+        self.nodes_of = lambda key: near(key) + [N1]  # 5 regions, 51 servers
+        servers = sorted({node for cid in cids for node in near(cid.key)} | {N1})
+        gone = bytes([7]) * 16
+        rounds = []
+        for parallel in (PROVIDE_PARALLEL, 1):
+            with self.subTest(parallel=parallel), mock.patch.object(publisher_module, "PROVIDE_PARALLEL", parallel):
+                self.client = SlowClient(0.02)
+                publisher = self.make_publisher(state=os.path.join(self.tmp.name, f"state {parallel}"))
+                publisher._withdrawals = {N1: {gone}, servers[3]: {gone}, N3: {gone}}  # as if queued earlier
+                publisher.refresh()
+                result = publisher.publish_due()
+                self.assertEqual(self.client.peak, parallel)
+                self.assertEqual(sorted(node for node, _, _ in self.client.calls), sorted(servers + [N3]))
+                calls = {node: (keys, withdrawn) for node, keys, withdrawn in self.client.calls}
+                self.assertEqual(calls[N1], ([cid.key for cid in result["published"]], [gone]))
+                self.assertEqual(calls[N3], ([], [gone]))
+                self.assertEqual(calls[servers[3]][1], [gone])
+                rounds.append((result, sorted(self.client.calls), self.held(publisher)))
+        self.assertEqual(rounds[0], rounds[1])
+
+    def test_slow_nodes_send_one_at_a_time(self):
+        publisher = self.make_publisher(slow=True)
+        self.due_keys(3)
+        publisher.refresh()
+        self.nodes_of = lambda key: near(key)
+        self.client = SlowClient(0.01)
+        publisher.client = self.client
+        publisher.publish_due()
+        self.assertEqual(self.client.peak, 1)
+        self.assertEqual(len(self.client.calls), 3 * K)
+
+    def test_stopped_while_sending_in_parallel(self):
+        """A stop lets the requests in flight finish and starts no more; keys some of whose servers weren't sent to
+        stay due, and are withdrawn from those that recorded them once unpinned."""
+        cids = self.due_keys(4)
+        self.nodes_of = lambda key: near(key)
+        stop = threading.Event()
+        self.client = GatedClient()
+        publisher = self.make_publisher()
+        publisher.refresh()
+        thread = threading.Thread(target=lambda: self.client.results.append(publisher.publish_due(stop.is_set)))
+        thread.start()
+        self.assertTrue(self.client.waiting.wait(5))
+        stop.set()
+        self.client.gate.set()
+        thread.join(5)
+        (result,) = self.client.results
+        sent = {node for node, _, _ in self.client.calls}
+        self.assertEqual(len(sent), PROVIDE_PARALLEL)  # those in flight when stopped, and no more
+        complete = [cid for cid in cids if set(near(cid.key)) <= sent]
+        self.assertEqual(result["published"], complete)
+        self.assertEqual(publisher.next_due(), 0)  # the others are still due
+        for cid in cids:
+            self.storage.unpin(cid, USER)
+        publisher.refresh()
+        self.client = FakeClient()
+        publisher.client = self.client
+        publisher.publish_due()
+        self.assertEqual(set(self.withdrawn()), sent)
+
+    def test_crash_while_sending_in_parallel(self):
+        """A round crashing part way through parallel sends: once restarted, every node a save listed is withdrawn
+        from when the CIDs stop being provided, at least SAVE_EVERY_NODES of those that stored, and none other."""
+        cids = self.due_keys(3)
+        self.nodes_of = lambda key: near(key)
+        self.client = CrashingClient(crash_at=SAVE_EVERY_NODES + 5)
+        publisher = self.make_publisher()
+        publisher.refresh()
+        with self.assertRaises(Crash):
+            publisher.publish_due()
+        stored = {node for node, _, _ in self.client.calls}
+        self.assertEqual(len(stored), SAVE_EVERY_NODES + 5)
+        self.client = FakeClient()
+        restarted = self.make_publisher()
+        restarted.refresh()
+        for cid in cids:
+            self.storage.unpin(cid, USER)
+        restarted.refresh()
+        restarted.publish_due()
+        withdrawn = set(self.withdrawn())
+        self.assertLessEqual(withdrawn, stored)
+        self.assertGreaterEqual(len(withdrawn), SAVE_EVERY_NODES)
+
     # Refreshes that change nothing
 
     def counting(self) -> dict[str, int]:
@@ -956,6 +1110,100 @@ class PublisherTest(unittest.TestCase):
             self.publisher.refresh()  # the item's rows deleted and its withdrawals queued, in one save
         self.assertEqual([call.args for call in opened.call_args_list], [(False,)])
         self.assertEqual(self.saved(), self.held(self.publisher))
+
+
+class ParallelSendsTest(unittest.TestCase):
+    """The real PeerClient, over fake RNS links, sending a round's /provide to many servers at once: each server
+    gets its batches in order over its own identified link, withdrawals first, and one refusing stops only its own."""
+
+    def setUp(self):
+        """A publisher whose PeerClient's links are FakeLinks recording which server they go to."""
+        from rnfs.network import client as client_module
+        from rnfs.network import links
+        rns = fake_links.fake_rns()
+        rns.Link = RecordingLink
+        patcher = mock.patch.object(links, "RNS", rns)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        fake_links.FakeLink.created = []
+        fake_links.FakeLink.establish_delay = 0.05  # so links overlap
+        self.addCleanup(setattr, fake_links.FakeLink, "establish_delay", 0.0)
+        RecordingLink.open_now = RecordingLink.peak = 0
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = Config(rnfs_dir=self.tmp.name)
+        self.storage = Storage(os.path.join(self.tmp.name, "blocks"), os.path.join(self.tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
+        pool = links.LinkPool(object(), self.config)
+        self.addCleanup(pool.close_all)
+        self.client = client_module.PeerClient(pool, self.config)
+        self.servers = [bytes([0x40, n]) * 8 for n in range(K)]
+        self.publisher = Publisher(OWN, self.config, self.storage, ProviderStore(None), self.client,
+                                   lambda key: FakeLookup(self.servers), clock=FakeClock(1_000_000.0))
+
+    def test_batches_in_order_withdrawals_first_and_stop_at_a_refusal(self):
+        from rnfs.network import protocol
+        keys = sorted(bytes([0x41, n]) * 8 for n in range(60))  # every server gets every key: 3 batches or more
+        self.publisher.add_key_source(lambda: set(keys))
+        gone = [bytes([0x42, n]) * 8 for n in range(5)]
+        refusing = self.servers[4]
+        self.publisher._withdrawals = {server: set(gone) for server in self.servers}
+        self.publisher.refresh()
+        first = {}
+
+        def respond(link, path, data):
+            """Accept every batch but the refusing server's after its first."""
+            first.setdefault(link.node_id, data)
+            return link.node_id != refusing or data == first[link.node_id]
+
+        fake_links.FakeLink.responder = staticmethod(respond)
+        result = fake_links.run(self, self.publisher.publish_due, timeout=20)
+        self.assertGreater(RecordingLink.peak, 1)  # links to several servers open at once
+        by_server = {}
+        for link in fake_links.FakeLink.created:
+            by_server.setdefault(link.node_id, []).append(link)
+        self.assertEqual(set(by_server), set(self.servers))
+        expected = protocol.provide_batches(keys, sorted(gone), 431)  # the fake links' MDU
+        self.assertGreaterEqual(len(expected), 3)
+        self.assertEqual(expected[0][1], sorted(gone))  # withdrawals ride first
+        for server, made in by_server.items():
+            self.assertEqual(len(made), 1)  # one identified link each
+            sent = [data for _, data, _ in made[0].requests]
+            if server == refusing:
+                # The first batch, then the second, refused, and its one retry: nothing after
+                self.assertEqual(sent, [list(expected[0]), list(expected[1]), list(expected[1])])
+            else:
+                self.assertEqual(sent, [list(batch) for batch in expected])
+        self.assertEqual(len(result["published"]), len(keys))
+        # The refusing server may hold the keys of the batches it was sent, the refused one included (withdrawn
+        # from later), not those after it
+        maybe_held = set(expected[0][0]) | set(expected[1][0])
+        for item, (_, nodes) in self.publisher._published.items():
+            self.assertEqual(set(nodes), set(self.servers) - ({refusing} if item.key not in maybe_held else set()))
+
+
+class RecordingLink(fake_links.FakeLink):
+    """A FakeLink that knows the server it goes to, and counts the links open at once (the most in peak)."""
+
+    open_now = peak = 0
+
+    def __init__(self, destination, established_callback, closed_callback):
+        """A link to destination's server."""
+        self.node_id = destination.hash
+        with _LINKS_LOCK:
+            RecordingLink.open_now += 1
+            RecordingLink.peak = max(RecordingLink.peak, RecordingLink.open_now)
+        super().__init__(destination, established_callback, closed_callback)
+
+    def teardown(self):
+        """Close it (counted once)."""
+        if self.status != fake_links.FakeLink.CLOSED:
+            with _LINKS_LOCK:
+                RecordingLink.open_now -= 1
+        super().teardown()
+
+
+_LINKS_LOCK = threading.Lock()
 
 
 if __name__ == "__main__":

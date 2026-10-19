@@ -571,7 +571,12 @@ as due only once the pacing allows; other nodes send them all at once. `_region_
 Each item's store set (`_store_set`) is its K closest from its region (`Region.closest_to`), then each part added by
 `add_store_part(part)`, a `(key, region) -> servers` called without the lock after the lookups, without
 duplicates; an item whose region found no server is sent nowhere and retried after `RETRY_INTERVAL`. The round's
-result counts `lookups` and `finds` (extra `/find`). When
+result counts `lookups` and `finds` (extra `/find`). The `/provide`s go to up to `PROVIDE_PARALLEL` (16) servers at
+once on `rnfs-publish-provide` threads (one at a time, in the publishing thread, on slow nodes): `_in_order` runs
+`send` (which reads the withdrawals still queued for the server under the lock, then calls `client.provide`,
+one identified link and the batches in order) and yields the outcomes in server order, so the publishing thread
+records them, and saves every 10 servers or 30 s, as one at a time would. A stop or an exception starts no more;
+those in flight finish and are recorded before the exception is raised. When
 `refresh()` finds a key provided again, it cancels that key's queued withdrawals (their nodes join its earlier
 nodes) and re-records the node's own record, and a round sends only withdrawals still queued when it reaches
 each node, so a withdrawal queued while the key was briefly unprovided never follows a store of it.
@@ -1454,7 +1459,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 |---|---|---|
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
-| `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once, ended with the round; none on slow nodes) |
+| `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
 | `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
