@@ -27,9 +27,10 @@ whose round was stopped before every node was sent its keys stays due. Times are
   with a fixed jitter of up to +-KEY_JITTER from the key's first byte, so they don't all come due in one burst
   but a region's keys come due together; always below PROVIDER_TTL / 2.
 - **Slow nodes** pace lookups: at most SLOW_ROUND_LOOKUPS region lookups per round and on average one per
-  SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished. Withdrawals are paced
-  too: they ride along to the servers a round stores to, and each server only withdrawals reach costs one lookup.
-  Other nodes send every withdrawal at once.
+  SLOW_LOOKUP_PACE seconds; never-published items go first, then the longest unpublished. Lookups outside publishing
+  that the node paces the same way (a search's fallback over disjoint paths) take their share through
+  pace_lookups. Withdrawals are paced too: they ride along to the servers a round stores to, and each server only
+  withdrawals reach costs one lookup. Other nodes send every withdrawal at once.
 - A key both withdrawn from and provided to a node in one round is only provided (a restart may queue
   withdrawals of keys that are still provided).
 """
@@ -639,6 +640,19 @@ class Publisher:
         for cid, retry in list(self._retry_at.items()):
             self._retry_at[cid] = min(retry, now + self.retry_interval)
         self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
+
+    def pace_lookups(self, count: int) -> float:
+        """Slow nodes: may count lookups outside publishing (a search's fallback over disjoint paths) start now? 0.0 if
+        the round pacing allows it, and the next round then waits for them as for its own lookups (SLOW_LOOKUP_PACE
+        each); otherwise the seconds until it would, and nothing is counted."""
+        now = self.clock()
+        with self._lock:
+            self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)  # as _clamp
+            wait = self._next_lookup - now
+            if wait > 0:
+                return wait
+            self._next_lookup = now + SLOW_LOOKUP_PACE * max(0, count)
+            return 0.0
 
     def next_due(self) -> float:
         """Seconds until something is due (0 if now); withdrawals pending count as due (paced on slow nodes)."""

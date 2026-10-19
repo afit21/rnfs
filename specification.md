@@ -647,12 +647,18 @@ and repeat.
 
   Neither bound ends an honest lookup: over a simulated network of 2000 nodes, each of 2500 lookups (`alpha`
   and `beta` 3) completed within 12 queries and at most 8 such answers in a row.
+
+  A node MAY make a lookup wait for more nodes than the `beta` closest (rnfs: the senior rule and the density
+  check, "Identities placed next to a key" below). Those queries go out within `alpha` like any other and count
+  towards the run's 80; their answers count as progress when they shorten that distance, and never as answers that
+  don't (they aren't meant to come nearer), so each run keeps both bounds.
 - **Finding the closest nodes** (for publishing) runs until the lookup is complete. The result is the `K`
   closest nodes known; the stores sent to them also show which are reachable.
 - **Finding providers.** Downloading starts with the first provider found. The search ends when
   `max_parallel_providers` providers are known and one has delivered the verified root block, when the lookup
   is complete, or at `lookup_timeout`. It does not stop at the first reply that lists providers, so one node
-  near the key can't hide content.
+  near the key can't hide content. A node SHOULD search with the density check and the senior rule, and fall back
+  to disjoint paths when that finds no provider at all (below).
 - **Choosing providers.** A node SHOULD rank providers by these keys, in this order:
   1. **Seniority.** Providers that have been in the routing table for over `provider_seniority` come first.
      This key MUST stay first: an attacker can create fresh identities that sit close in hops, or earn a score
@@ -703,10 +709,51 @@ differently. A score can be earned quickly by serving popular blocks, so it neve
 mode, whether or not the server enters its routing table, and keep the record across restarts (wall-clock times; one
 in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
 near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
-the log gives the `K` closest of them to a key, which publishers also store to (below). It is local state: nothing
-about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536 servers, forgetting
-the least recently heard first (about 12 MB of memory when full), so a flood of new identities pushes out only
-servers silent longer than every one of them; announces are recorded in memory and written together every 30 s.
+the log gives the `K` closest of them to a key, which publishers also store to and searchers ask (below). It is
+local state: nothing about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536
+servers, forgetting the least recently heard first (about 12 MB of memory when full), so a flood of new identities
+pushes out only servers silent longer than every one of them; announces are recorded in memory and written together
+every 30 s.
+
+**Identities placed next to a key.** RNS identities are free, and one closer to a key than every honest server costs
+about as many key generations as there are servers (about 4 s of one core among 10,000). `K` of them that answer
+`/find` for the key with each other only and discard stores take every place a lookup reaching the `K` closest
+stores to and asks, so 0.1.x nodes find the content 0–4% of the time (docs/simulations/eclipse). A node SHOULD
+defend against this locally, as rnfs does. All of it is local behaviour: the messages, their checks and the
+protocol constants are unchanged, and each run of a lookup keeps its termination bounds (above).
+- **Network size estimate.** Among N servers with random IDs, the distance from a key to its `K`-th closest server,
+  d_K, is about K × 2^128 / N. A node estimates N as (K − 1/3) × 2^128 over the median d_K of its last 16 complete
+  lookups for other keys (the latest lookup for each key; the key checked is always left out, so identities next to
+  it can't shrink its own yardstick). Pooled over many keys it is 2 to 4 times less noisy than the node's own
+  neighbourhood. rnfs keeps the samples in the state database (written with the periodic saves), so a restart has
+  the estimate at once, and runs no density check until it has 8.
+- **Density check** (T = 2). The servers known near a key are anomalously dense when some rank j ≥ `K` (1-based,
+  by distance) lies closer than j × 2^128 / (T × N); the *dense core* ends at the last such rank. Ranks below `K`
+  never fire: a few close servers happen by chance, and fewer than `K` identities can't take every place anyway.
+  When it fires, two *rings* count: the servers ranked after the core's last rank, and the servers beyond the radius
+  rho = K × 2^128 / (T × N), where `K` honest servers would be expected whatever was placed (the radius doesn't
+  depend on how many identities a node happened to learn of, so publisher and searcher agree on it). Unreliable
+  servers come last within a ring. In simulation it fired on about 4% of lookups without an attack, and on nearly
+  every one next to identities placed closer than every honest server.
+- **Disjoint paths** (S/Kademlia). d lookups for one key that share no node: the start nodes (and senior servers)
+  are dealt to the paths in turn, a path claims each node before querying it, drops one another path claimed first,
+  and ignores such nodes in replies. Identities that answer with each other can steer one path, but once it has
+  queried them the others never do, so they reach the key through honest servers. Each path is an ordinary run
+  (its own bounds) and all share one time budget. rnfs: d = 3, and 2 on slow nodes.
+- **Searching.** A search runs a lookup with the density check: when it fires, the lookup is complete only once 5
+  servers of each ring have answered too. It also adds the announce first-seen log's `K` servers closest to the key
+  heard at least `provider_seniority` ago (rnfs: heard within 2 × `announce_interval`, not banned, members only in
+  private mode), and is complete only once the `beta` closest of them that haven't failed have answered: at most
+  `K` extra queries, none when they are the `beta` closest anyway, as they are without an attack (*the senior
+  rule*). Only if that search ends without any provider does it fall back to d disjoint paths, each with both
+  checks, in what is left of the same `lookup_timeout` and of the first lookup's 8 × `K` queries, split among the
+  paths: a search still sends at most 8 × `K` `/find` in all however its lookups end, and identities that keep
+  naming closer ones until the first lookup's cap leave no fallback. A slow node paces the fallback like its
+  publish lookups (rnfs: it counts as d of a round's lookups, 30 s each, and waits for that pacing only if it fits
+  in the time left, else the search ends without it).
+- **Cost.** In the eclipse simulation (fast nodes, alpha 3): +0.33 `/find` per search on average (false
+  positives); a search for content nobody provides pays the fallback, about 2.5–3 times a normal lookup on top of it
+  (10,000 servers: 8.1 + 24.3 `/find`; slow nodes 5.0 + 14.4).
 
 **Publishing.**
 - For each key, find the `K` closest nodes, by a lookup per key or by sweep providing (below). Then send each node
@@ -753,7 +800,8 @@ servers silent longer than every one of them; announces are recorded in memory a
   provides that key again (it may stop and start providing it while a round is sending).
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
   (rnfs: at most 10 region lookups per publish round, each publishing every due key of its region, and after a
-  round of n lookups the next waits 30 × n s; items never published go first, then those unpublished longest).
+  round of n lookups the next waits 30 × n s, as does a search's fallback; items never published go first, then
+  those unpublished longest).
   It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
   unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
   rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server

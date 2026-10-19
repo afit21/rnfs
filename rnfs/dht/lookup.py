@@ -148,6 +148,7 @@ class Lookup:
         self.taken = taken
         self.on_complete = on_complete
         self.ended = ""  # how the last run ended ("complete", "no progress", ...; "" before the first)
+        self.sent = 0  # queries the runs sent, in all (retries included)
         self.dense = False  # the density check fired in a run
         self._useful: set[bytes] = set()  # nodes passed to on_useful, in any run
         self.deadline: float | None = None
@@ -436,6 +437,7 @@ class Lookup:
                     extras.add(node_id)
                 self._send(node_id, results)
                 sent += 1
+                self.sent += 1
                 in_flight += 1
             # An unreliable node that distance alone would rank among them is asked again once its retry is
             # due: only an answer shows it is back. On top of alpha, since nothing waits for it
@@ -451,6 +453,7 @@ class Lookup:
                     retrying.add(node_id)
                     retried += 1
                     sent += 1
+                    self.sent += 1
                     self._send(node_id, results)
                 else:
                     passed.add(node_id)

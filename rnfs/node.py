@@ -48,8 +48,10 @@ from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, seale
 from rnfs.content.shared_folder import SharedFolder
 from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, check_app_name, disk_reserve,
                                   remote_source)
+from rnfs.dht.density import SizeEstimate
 from rnfs.dht.firstseen import FirstSeenLog
 from rnfs.dht.lookup import Lookup
+from rnfs.dht.lookups import DISJOINT_PATHS, SLOW_DISJOINT_PATHS, Lookups, Search
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
 from rnfs.dht.routing_state import RoutingState
@@ -629,9 +631,18 @@ class RnfsNode:
         self._add_store(RoutingState(self.routing, config.state_dir))
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
         self.scores = self._add_store(Scores(config.state_dir, seeded=self._bootstrap_set()))
-        # When each server's announce was first heard (section 6; for publishing and searching to come); saved with
-        # the batched stores
+        # When each server's announce was first heard (section 6; for publishing and searching); saved with the
+        # batched stores
         self.first_seen = self._add_store(FirstSeenLog(config.state_dir))
+        # The network size estimate of the density check (section 6), from recent complete lookups; saved with the
+        # batched stores, so a restart has it at once
+        self.sizes = self._add_store(SizeEstimate(config.state_dir))
+        # Which lookups searching runs (section 6): density-checked searches with the senior rule, falling back to
+        # disjoint paths (paced like publish lookups on slow nodes)
+        self.lookups = Lookups(self._wired_lookup, self._start_nodes, self.sizes,
+                               lambda key: self._senior_servers(key, None),
+                               SLOW_DISJOINT_PATHS if slow else DISJOINT_PATHS,
+                               pace=self._pace_fallback if slow else None)
         # The storage tiers' Known publishers besides contacts and members: the bootstrap nodes a join may contact
         defaults = DEFAULT_BOOTSTRAP_NODES if config.default_bootstrap and not config.private else ()
         self._known_bootstrap = frozenset(self._bootstrap_nodes + [bytes.fromhex(text) for text in defaults])
@@ -676,8 +687,9 @@ class RnfsNode:
                                                slow, config.state_dir, after_store=self._enforce_storage,
                                                make_room=self._make_room, scores=self.scores))
         # Saved by its own refreshes and publish loop
-        self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client, self._lookup,
-                                                   slow, config.state_dir, cached_eligible=self._eligible_targets,
+        self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client,
+                                                   self._closest_lookup, slow, config.state_dir,
+                                                   cached_eligible=self._eligible_targets,
                                                    generation=self._provide_generation), batched=False)
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)
         self.publisher.add_store_part(self._senior_servers)
@@ -877,18 +889,34 @@ class RnfsNode:
 
     # DHT wiring
 
-    def _lookup(self, key: bytes) -> Lookup:
-        """A lookup for key starting from the routing table, counting answers and failures in it.
+    def _lookup(self, key: bytes) -> Search:
+        """A provider search for key (Lookups.search): density-checked with the senior rule, falling back to disjoint
+        paths only if it finds no provider."""
+        return self.lookups.search(key)
 
-        It starts from the closest nodes that haven't failed since last heard or gone silent (those a /find
-        reply would give), with others only to make up K, so departed nodes don't take its first queries;
-        unreliable ones (queries failing however often they announce) only if still short of K.
+    def _start_nodes(self, key: bytes) -> list[bytes]:
+        """Where a lookup for key starts in the routing table.
+
+        The closest nodes that haven't failed since last heard or gone silent (those a /find reply would give), with
+        others only to make up K, so departed nodes don't take its first queries; unreliable ones (queries failing
+        however often they announce) only if still short of K.
         """
         fresh = self.routing.closest(key, 2 * K, for_reply=True)
         nearest = fresh + [n for n in self.routing.closest(key, 2 * K) if n not in fresh]
         reliable = [n for n in nearest if not self.routing.unreliable(n)]
-        start = (reliable + [n for n in nearest if n not in reliable])[:K]
-        return self._new_lookup(key, start, self.routing.is_banned)
+        return (reliable + [n for n in nearest if n not in reliable])[:K]
+
+    def _closest_lookup(self, key: bytes) -> Lookup:
+        """A closest-nodes lookup for key from the routing table (publishing's)."""
+        return self._wired_lookup(key, self._start_nodes(key))
+
+    def _wired_lookup(self, key: bytes, start: list[bytes], **options) -> Lookup:
+        """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths)."""
+        return self._new_lookup(key, start, self.routing.is_banned, **options)
+
+    def _pace_fallback(self) -> float:
+        """Slow nodes: a search's fallback is paced like the publisher's lookups (Publisher.pace_lookups)."""
+        return self.publisher.pace_lookups(self.lookups.paths)
 
     def _senior_servers(self, key: bytes, region) -> list[bytes]:
         """The publisher's store part from the announce first-seen log (section 6): the K servers closest to key that
@@ -901,15 +929,17 @@ class RnfsNode:
         return self.first_seen.closest(key, K, min_age=self.config.provider_seniority, exclude=exclude,
                                        heard_within=2 * self.config.announce_interval)
 
-    def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool]) -> Lookup:
+    def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool], **options) -> Lookup:
         """A Lookup for key from start, wired to the routing table (answers, failures, unreliable nodes and
-        retries) and the client, leaving out the nodes exclude rejects: _lookup's and the join's."""
+        retries) and the client, leaving out the nodes exclude rejects: Lookups' and the join's. options are further
+        Lookup arguments (the checks, disjoint paths' claims, a shorter timeout)."""
+        options.setdefault("timeout", self.config.lookup_timeout)
         return Lookup(key, start, self.client.find, self.node_id,
                       alpha=self.config.effective_alpha(self.slow), beta=self.config.beta,
-                      timeout=self.config.lookup_timeout, is_known=self._is_known,
+                      is_known=self._is_known,
                       on_answer=self._answered, on_failure=self._query_failed, exclude=exclude,
                       report=lambda text: log(text, LOG_DEBUG), unreliable=self.routing.unreliable,
-                      may_retry=self.routing.may_retry, on_useful=self.scores.useful_answer)
+                      may_retry=self.routing.may_retry, on_useful=self.scores.useful_answer, **options)
 
     def _answered(self, node_id: bytes):
         """A node answered /find, proving it is a reachable server."""

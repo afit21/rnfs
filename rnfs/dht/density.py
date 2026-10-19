@@ -1,6 +1,6 @@
-"""The density check (specification section 6, "Finding content when identities are placed next to a key"): a node
-estimates how many DHT servers there are, notices when the servers found near a key are packed much more densely
-than that allows, and then looks further out. All local: nothing about it is sent, and nothing on the wire changes.
+"""The density check (specification section 6, "Identities placed next to a key"): a node estimates how many DHT
+servers there are, notices when the servers found near a key are packed much more densely than that allows, and
+then looks further out. All local: nothing about it is sent, and nothing on the wire changes.
 
 - **Size estimate.** The distance from a key to its K-th closest server, d_K, is about K × 2^128 / N among N servers
   with random IDs. SizeEstimate keeps d_K from the node's last SIZE_SAMPLES complete lookups (one per key, the latest)

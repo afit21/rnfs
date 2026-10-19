@@ -81,6 +81,11 @@ class DisjointLookup:
         return any(path.dense for path in self.paths)
 
     @property
+    def sent(self) -> int:
+        """Queries the paths sent, in all."""
+        return sum(path.sent for path in self.paths)
+
+    @property
     def ended(self) -> str:
         """How the last runs ended: "complete" if every path completed, else the first other way one ended."""
         return next((path.ended for path in self.paths if path.ended != "complete"), "complete")

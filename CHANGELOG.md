@@ -305,7 +305,7 @@ The DHT (local behaviour: nothing on the wire changes):
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
   servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
-  next to a key can't be. Publishing uses it (below); searching will.
+  next to a key can't be. Publishing and searching use it (below).
 - **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
   due key of its region (the keys sharing as many leading bits as the key looked up shares with its 10th-closest
   server), with about 1.6 more `/find` a region to fill in its far half; each key still gets its own 10 closest
@@ -317,6 +317,24 @@ The DHT (local behaviour: nothing on the wire changes):
   node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
   Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
   next to a key can't push the record off them. Withdrawals reach them too.
+- **Searches are far harder to fool by placing identities next to a key** (spec section 6, "Identities placed next
+  to a key"). Identities generated closer to a key than every honest server (about 4 s of one core each among
+  10,000 servers) can answer `/find` for it with each other only. Local behaviour, nothing on the wire changed:
+  - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
+    lookups for other keys, kept in the state database's `meta` table so a restart has it at once (the density
+    check waits for 8);
+  - the density check: when the servers found near a key are packed more than twice as densely as the estimate
+    allows (from the 10th on), a search waits until 5 servers of each of two rings beyond them have answered (those
+    ranked after the dense core, and those beyond where 10 honest servers would be expected);
+  - searches also wait for the 3 closest of the 10 servers nearest the key that the announce first-seen log heard
+    at least `provider_seniority` ago (none extra without an attack: they are the closest anyway);
+  - a search that finds no provider at all falls back to 3 lookups that share no node (2 on slow nodes), in what is
+    left of the same `lookup_timeout` and of its 80 `/find` (a search still sends at most 80 in all).
+
+  The cost (eclipse simulation): +0.3 `/find` per search on average (the density check fires on about 4% of
+  searches without an attack), and a search for content nobody provides pays the fallback, about 2.5–3 times a
+  normal lookup more. A slow node paces that fallback like its publish lookups (it counts as 2 of a round's lookups
+  and runs only if the pacing allows within the lookup's time).
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.
