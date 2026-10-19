@@ -865,6 +865,48 @@ def run_stop(args):
     print("rnfs: the daemon stopped")
 
 
+def run_app_add(args):
+    """Issue a token to a new app: print it, or write it to -o (a new file, readable by this user only); say on
+    stderr what it lets the app do."""
+    if args.output and os.path.lexists(args.output):
+        fail(f"{args.output} already exists")
+    api = client(args)
+    added = api.app_add(args.name)
+    name, token = added["name"], added["token"]
+    if args.output:
+        try:
+            fsutil.write_atomic(args.output, (token + os.linesep).encode("ascii"), mode=0o600, private=True,
+                                exclusive=True)
+        except OSError as e:
+            api.app_rm(name)  # nobody has its token: don't leave the app behind
+            fail(f"can't write {args.output}: {e}; app {name} was not added")
+        print(printable(f"app {name}: its token is in {args.output}"))
+    else:
+        print(token)
+    print(printable(f"rnfs: app {name} can do anything this command line can (fetch and pin, read local files as "
+                    f"the daemon's user, export name keys, change settings, stop the daemon), except manage apps. "
+                    f"Its pins are app:{name}'s. Give its token only to an app you trust that far; `rnfs app rm "
+                    f"{name}` revokes it and releases its pins."), file=sys.stderr)
+
+
+def run_app_ls(args):
+    """List the apps: name and when each was added."""
+    apps = client(args).apps()
+    if args.json:
+        print(json.dumps(apps, indent=2))
+        return
+    for app in apps:
+        added = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(app["created"]))
+        print(f"{printable(app['name'])}\t{added}")
+
+
+def run_app_rm(args):
+    """Revoke an app's token and release its pins."""
+    result = client(args).app_rm(args.name)
+    print(printable(f"removed app {args.name}, releasing {result['released']} pin"
+                    f"{'' if result['released'] == 1 else 's'}"))
+
+
 def run_status(args):
     """Print the daemon's status, one "name: value" per line. Without a readable API token (a health check by
     another user), only the version the daemon says without it."""
@@ -1028,6 +1070,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_.add_argument("file")
     import_.add_argument("--background", action="store_true",
                          help="start an import job, print its ID and return (rnfs jobs)")
+
+    app_commands = commands.add_parser("app", help="tokens for apps that use the API").add_subparsers(
+        dest="app_command", required=True, metavar="command")
+    app_add = command(app_commands, "add", run_app_add,
+                      "issue a token to an app (it can do anything rnfs can, but manage apps): print it once")
+    app_add.add_argument("name", help="the app's name: a-z, 0-9, '.', '_', '-'")
+    app_add.add_argument("-o", "--output", metavar="FILE", help="write the token to FILE (a new file, mode 0600)")
+    app_ls = command(app_commands, "ls", run_app_ls, "list the apps")
+    app_ls.add_argument("--json", action="store_true")
+    command(app_commands, "rm", run_app_rm, "revoke an app's token and release its pins").add_argument("name")
 
     command(commands, "status", run_status, "node ID, known nodes, records held, storage use")
     stop = command(commands, "stop", run_stop, "stop the daemon (as Ctrl+C or SIGTERM would) and wait until it has")

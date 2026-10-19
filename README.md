@@ -552,6 +552,12 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
   `capabilities()`, pin labels (`label_pin`), the cache (`cache()`, `uncache(cid)`), settings (`config()`,
   `config_set({...})`), tars and archives as streams (`add_tar`, `get_tar`, `export_stream`, `import_stream`), and
   for a `Client` `shutdown()` and `daemon_info()`.
+- A `Client` can have a token of its own, so the user sees and removes what your app pinned: the user runs
+  `rnfs app add myapp -o ~/.myapp/token`, and you use `rnfs.Client(app="myapp", token_file="~/.myapp/token")`.
+  Its pins get the source `app:myapp` (`with client.pin_key("inbox"): ...` makes them `app:myapp:inbox`'s, a group
+  your app can hold and release on its own); `client.unpin()` releases only your app's, and `rnfs app rm myapp`
+  revokes the token and releases them all. The token isn't scoped: your app can do anything the user's `rnfs`
+  command can, but manage apps.
 - A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
   just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the

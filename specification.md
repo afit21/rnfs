@@ -881,22 +881,28 @@ silent longer than every one of them; announces are recorded in memory and writt
 **Pins.**
 - Pins are recursive: a pinned CID keeps every block of its DAG.
 - A pin is held by one or more *sources*: `user`, `folder`, `name:<alias>`, `remote:<identity>`,
-  `follow:<name>` (the latest target of a followed name, section 9), `lxmf:<address>` (links auto-fetched
-  from that LXMF sender, section 13) and `deny` (the deny lists in use, below); names, identities and
-  addresses are 32 hex characters. It lasts while
-  any source holds it.
-- `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
+  `follow:<name>` (the latest target of a followed name, section 9), `deny` (the deny lists in use, below), and
+  `app:<app>` or `app:<app>:<key>` (pins an app made through the local API with its own token, section 11),
+  among them `app:lxmf:<address>` (links auto-fetched from that LXMF sender, section 13: the LXMF wrapper app's,
+  made by the LXMF built into rnfs while it remains); names, identities and addresses are 32 hex characters.
+  Until rnfs 0.2.0 LXMF's pins were `lxmf:<address>`: the upgrade to 0.2.0 rewrites each as
+  `app:lxmf:<address>` (and those of an older version's `pins.json` as it is imported). An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
+  starting with a letter or digit (so never `:`), and a key 1–128 of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
+  A pin lasts while any source holds it.
+- `pin rm` removes only its caller's source: `user` for the CLI, and for an app only its own (`app:<app>`, or
+  `app:<app>:<key>` with its pin key; section 11). Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
-  a followed name's newer target once that is complete; removing the LXMF messages that hold it.
+  a followed name's newer target once that is complete; removing the LXMF messages that hold it; removing the
+  app (`app rm`), which releases every `app:<app>` and `app:<app>:<key>` pin.
 - Pins are saved at once; the state that records why a source holds a pin (the names' records, the followed
   names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
   `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
   `follow:` pins of
-  names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
+  names no longer followed and `app:lxmf:<address>` pins no saved inbox message records (a queued auto-fetch is fetched
   again). A followed name's check releases every other target its source holds.
 - That release needs the state read whole. If the followed names or the inbox were never saved (or were
   imported from a file that was damaged and moved aside as `.damaged`), or hold a malformed entry, such pins
-  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `lxmf:` pins get a new
+  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `app:lxmf:` pins get a new
   inbox message listing them, whose removal releases them. A name key file that is there but can't be read
   keeps its name's pins and records; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
@@ -986,7 +992,7 @@ off their node. Nothing on the wire changes.
   withdrawn. A `/pin` of it is refused.
 - When the entries change, and at start: cached fetches reaching a denied block are dropped, and the blocks
   nothing else reaches deleted; remote pins reaching one are released, as they are kept for others, and their
-  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `lxmf:`, `deny`) are kept,
+  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `app:`, `deny`) are kept,
   stored but neither served, provided nor read, with a warning naming each, until they are removed. Every
   deletion and release is logged.
 - A file's hash is only known once its content is read, so file-hash entries are checked where content is
@@ -1374,6 +1380,7 @@ are local conveniences, not part of the protocol.
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
+| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
 | `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
@@ -1429,6 +1436,27 @@ gateway can never reach the API.
   settings, then checks the subdirectories, then takes the directory's lock, in the daemon and in an embedded
   node alike; clients (the CLI, `rnfs.Client`) check `rnfs.toml` the same way when they read it, and show
   what was changed (the CLI prints it, `rnfs.Client` raises a `RuntimeWarning`, an embedded node logs it).
+- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications
+  tokens of their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name
+  rule). A request naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes
+  only with it; a request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never
+  taken for another's. App tokens outlive restarts. The node needn't keep the token itself: rnfs keeps
+  `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
+  a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
+  change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
+  that far. Removing an app revokes its token at once, cancels its queued and running jobs and releases every
+  pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
+  CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token, the
+  only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden`
+  there. While the LXMF built into rnfs is on, rnfs refuses an app called `lxmf`, whose pins (`app:lxmf:`) it
+  would share (section 13).
+- **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
+  `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
+  `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of
+  `user`, or `app:<app>:<key>` when the request carries `X-Rnfs-Pin-Key: <key>` (section 8's key rule; 400
+  otherwise), so an app can hold and release groups of its own. A job keeps the source it was queued with, also
+  across a restart. With the CLI's token a pin key is refused (400): its pins are always `user`'s. `pin ls`
+  shows every pin's sources to every caller.
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's.
   Before it sends the token, a client SHOULD check this proof with a `GET /api/status` on the connection
@@ -1440,7 +1468,11 @@ gateway can never reach the API.
   this (the proof needs no token), and the second request gets a new read deadline, so one connection can hold
   a connection slot (below) about twice as long as a single request could (rnfs: about 2 × 15 s). This is
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
-  exactly one more request.
+  exactly one more request. A request carrying `X-Rnfs-App: <name>` gets its proof keyed by that app's verifier
+  (above), written as 64 lowercase hex digits, instead of the token: an app computes it from its own token, and
+  checks the proof the same way before sending that token. No proof is sent for an app the node doesn't have.
+  Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
+  app's token; they can read the CLI's token already.
 - The API never sends CORS headers.
 - **For apps** (rnfs 0.2.0). While it runs, the daemon describes itself in `<rnfs dir>/daemon.json` (written
   atomically after its API listens, mode 0600 like the token, removed when it stops): its process ID, API and
@@ -1562,7 +1594,8 @@ gateway can never reach the API.
 
 **Background jobs.** A node MAY run long transfers as *jobs* it owns, so a transfer doesn't depend on one API
 request or terminal staying open. A job has a kind — `get` (fetch a target and write it to an output path,
-optionally from one node), `pin` (fetch a target completely and pin it with source `user`), `export`
+optionally from one node), `pin` (fetch a target completely and pin it with source `user`, or the app's that
+queued it: App tokens, above), `export`
 (write an archive of a target to an output path), `add` (add a file or directory at a path on the node's
 machine, with `POST /api/add`'s options) or `import` (import an archive at such a path) — and a state: `queued`,
 `running`, `done`, `failed` or `cancelled`. Its result, when done, MUST be what the equivalent API call returns
@@ -1773,7 +1806,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `lxmf_propagation_node` | none | Propagation node (32 hex digits) used for `--propagate`, the fallback of failed direct messages and the periodic downloads. One only heard announcing itself is used only with `--nearest` |
 | `lxmf_sync_interval` | 1 h | Downloads from `lxmf_propagation_node`; 0: never |
 | `lxmf_accept_from` | empty: everyone | LXMF addresses whose messages are kept |
-| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`lxmf:<address>`) |
+| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`app:lxmf:<address>`; `lxmf:<address>` before 0.2.0) |
 | `lxmf_auto_fetch_quota` | 1 GiB per sender | Storage the pins of one auto-fetch sender may use |
 | `deny_lists` | empty | Deny-list sources: `<cid>[/path]` or `name/<name>[/path]`, each a file (section 8) |
 
@@ -1789,6 +1822,9 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 rnfs links can be sent and received as [LXMF](https://github.com/markqvist/LXMF) messages, so content can be
 shared with people using Sideband, NomadNet, MeshChat or any other LXMF client. This is optional and not part
 of the `rnfs.dht` protocol: a node without the LXMF package (or with `lxmf_enabled = false`) does none of it.
+Nor does rnfs while an app called `lxmf` exists (section 11, app tokens): that is an LXMF wrapper built on the
+local API, which owns the `app:lxmf:` pins and the LXMF identity, so rnfs's own LXMF then neither starts nor
+releases any of those pins at start.
 
 **Identity.** A node that uses LXMF has a separate RNS identity for it, kept at
 `<rnfs dir>/storage/lxmf_identity` (owner-only, like the node identity), so its LXMF address can't be linked
@@ -1904,7 +1940,8 @@ unreserved, pct-encoded: as in RFC 3986
   KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
+  `app:lxmf:<sender address>` (`lxmf:` before rnfs 0.2.0, section 8), one fetch at a time, taking senders in
+  turn. At most 64 links wait: when that many
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or

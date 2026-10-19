@@ -2,11 +2,12 @@
 (tests/fixtures/rnfs-0.1.5, its state database holding rows in every table; see its README) keeps every row.
 
 The expectation is the fixture's expected.json, every table's rows as 0.1.5 left them. The current code may add
-rows and tables (its own schema steps), but none of 0.1.5's rows may change or go, but as upgraded() says (0.2.0's
-provider store: no newcomer pool, no departed or evicted publishers): the database upgrades, passes
-quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created must also be
-exactly those a fresh database gets, so a released schema step edited in place (which a database 0.1.5 wrote
-would never see) fails here as well as in test_statedb's digest.
+rows and tables (its own schema steps), but none of 0.1.5's rows may change or go, except as upgraded() says:
+the two `lxmf:<address>` pins become `app:lxmf:<address>` (0.2.0's "lxmf_app_pins", the LXMF wrapper app's
+source), and 0.2.0's provider store keeps no newcomer pool and no departed or evicted publishers. The database
+upgrades, passes quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created
+must also be exactly those a fresh database gets, so a released schema step edited in place (which a database
+0.1.5 wrote would never see) fails here as well as in test_statedb's digest.
 
 The clock is the fixture's (expected.json's "now"), so no record has expired."""
 import functools
@@ -82,10 +83,13 @@ def loadable(table: str, values: tuple) -> bool:
 
 
 def upgraded(table: str, values: tuple) -> tuple | None:
-    """What a row of 0.1.5's becomes in this version (None: it goes). Only 0.2.0's provider store changes any
-    (its schema step, "providers_on_disk"): the newcomer pool and the memories of departed and evicted publishers
-    went with the per-publisher caps, replaced by the record budget and its storage tiers, so a pooled record is no
-    longer pooled, and those memories are emptied."""
+    """What a row of 0.1.5's becomes in this version (None: it goes). 0.2.0's step "lxmf_app_pins" rewrites a pin
+    source lxmf:<address> as app:lxmf:<address> (storage.LXMF_PREFIX). Its provider store (the step
+    "providers_on_disk") drops the newcomer pool and the memories of departed and evicted publishers, which went
+    with the per-publisher caps, replaced by the record budget and its storage tiers: a pooled record is no longer
+    pooled, and those memories are emptied. Every other row is kept as it was."""
+    if table == "pins" and values[1].startswith("lxmf:"):
+        return (values[0], "app:" + values[1])
     if table == "provider_records":
         return (*values[:4], 0)
     if table in ("provider_departed", "provider_evicted"):
@@ -192,6 +196,18 @@ class UpgradeTest(unittest.TestCase):
         self.assertEqual(set(tiers.values()), {"newcomer"})
         self.assertEqual(records.record_count(), len(EXPECTED["tables"]["provider_records"]))
         records._check_consistency()
+
+    def test_lxmf_pins_become_app_pins(self):
+        """The fixture's two lxmf:<address> pins (an auto-fetch sender's) are app:lxmf:<address> pins after the
+        upgrade, of the same CIDs, and no lxmf: source is left; the LXMF feature still counts them as its own (its
+        inbox records them), so they are kept."""
+        legacy = {row(values) for values in EXPECTED["tables"]["pins"] if values[1].startswith("lxmf:")}
+        self.assertEqual(len(legacy), 2)
+        node = self.start()
+        node.stop()
+        pins = tables(self.state)["pins"]
+        self.assertEqual({(cid, "app:lxmf:" + source[len("lxmf:"):]) for cid, source in legacy} - pins, set())
+        self.assertEqual({source for _, source in pins if source.startswith("lxmf:")}, set())
 
     def test_every_pin_is_complete(self):
         """Every pin, the deny list's own included, is complete: the stores agree with the blocks."""

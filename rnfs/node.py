@@ -38,6 +38,7 @@ from typing import BinaryIO, Callable, Iterator, Literal, NamedTuple, Protocol, 
 import RNS
 
 from rnfs import __version__, denylist, events, features, fsutil, statedb, winacl
+from rnfs.apps import AppRegistry
 from rnfs.config import LOCK_FILE, Config
 from rnfs.constants import (APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MISSED_ANNOUNCES, MODE_SERVER,
                             PARTIAL_SUFFIX)
@@ -45,7 +46,8 @@ from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_reserve, remote_source
+from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, check_app_name, disk_reserve,
+                                  remote_source)
 from rnfs.dht.firstseen import FirstSeenLog
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
@@ -88,6 +90,15 @@ NOT_SEALED_MEMO = 4096
 # past it are read each time
 PIN_MEMO = 16384
 _UNOPENED = object()  # _read's opened when nothing has been opened yet
+
+
+def _caller_source(source) -> str:
+    """source if a facade call may pin or release with it for its caller: "user" (the CLI, an embedded node), or
+    an app's app:<name>[:<key>] (an app's token, rnfs.api); ValueError otherwise, so no caller takes another
+    feature's pins (folder, name:, remote:, ...)."""
+    if source != USER and app_of(source) is None:
+        raise ValueError(f"invalid pin source {source!r} for a caller: user or app:<name>[:<key>]")
+    return source
 
 
 def import_fetched(value: list, tx) -> int:
@@ -631,6 +642,9 @@ class RnfsNode:
         # name, never the pin it names, which is committed durably first; its save writes a name whose write failed
         self.pin_names = self._add_store(PinNames(config.state_dir), batched=False)
         self.pin_names.prune_labels(self.storage.pinned_cids())
+        # The apps rnfs app add issued tokens to (the API's callers besides the CLI), written through; before the
+        # features: LXMF's start-up release of its pins checks for an app called lxmf
+        self.apps = self._add_store(AppRegistry(config.state_dir), batched=False)
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
                                                make_room=self._make_room, scores=self.scores))
@@ -1397,8 +1411,11 @@ class RnfsNode:
 
     def add_path(self, path: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
                  to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
-                 chunker: str | None = None, progress: Callable[[int], None] | None = None) -> dict:
-        """Import a file or directory on this machine, pinned "user" (cache if not pin) unless only_hash.
+                 chunker: str | None = None, progress: Callable[[int], None] | None = None,
+                 source: str = USER) -> dict:
+        """Import a file or directory on this machine, pinned with source (cache if not pin) unless only_hash.
+        source is "user", or the app's whose token asked (_caller_source), here and in every facade call taking
+        one.
 
         With to/to_self the file is sealed for those recipients first (seal.py), its name sealed inside unless not
         seal_name; a directory is sealed as one tar named `<name>.tar` (node_content.add_sealed_path, at most
@@ -1407,6 +1424,7 @@ class RnfsNode:
         given, is told the bytes read as they are (builder.BuildOptions.progress: an add job's), and may raise to
         stop the add; blocks stored by then are unreferenced, for the next collection.
         """
+        _caller_source(source)
         if not os.path.lexists(path):
             raise NotFound(f"no such file or directory: {path}")
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
@@ -1422,17 +1440,19 @@ class RnfsNode:
                                                                        options, self.config.max_output_entries)
                     else:
                         built, warnings = builder.add_path(path, put, wrap, options)
-                node_content.keep_added(self, built.cid, pin)
+                node_content.keep_added(self, built.cid, pin, source)
             if pin:
+                self._app_still_there(source, [built.cid])
                 self.pin_names.record(built.cid, os.path.abspath(path))
             self._added(built)
         return {"cid": str(built.cid), "size": built.size, "warnings": warnings, **({"sealed": True} if recipients else {})}
 
     def add_stream(self, stream: BinaryIO, size: int | None = None, name: str | None = None,
                    only_hash: bool = False, pin: bool = True, to: list[str] | None = None, to_self: bool = False,
-                   seal_name: str | None = None, chunker: str | None = None) -> dict:
-        """Import a stream (wrapped as the entry name if given), pinned "user" (cache if not pin) unless
+                   seal_name: str | None = None, chunker: str | None = None, source: str = USER) -> dict:
+        """Import a stream (wrapped as the entry name if given), pinned with source (cache if not pin) unless
         only_hash; sealed for to/to_self (with seal_name inside) if given; chunker as for add_path."""
+        _caller_source(source)
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
         stream, size = node_content.sealing_stream(stream, size, recipients, seal_name)
         options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
@@ -1443,20 +1463,23 @@ class RnfsNode:
             with self._refusing(), self.storage.protect() as session:
                 with session.writer() as put:
                     built = builder.add_stream(stream, put, size, name, options=options)
-                node_content.keep_added(self, built.cid, pin)
+                node_content.keep_added(self, built.cid, pin, source)
             if pin:
+                self._app_still_there(source, [built.cid])
                 self.pin_names.record(built.cid, name or seal_name or "(stdin)")
             self._added(built)
         return {"cid": str(built.cid), "size": built.size, "warnings": [], **({"sealed": True} if recipients else {})}
 
     def add_tar(self, stream: BinaryIO, name: str | None = None, only_hash: bool = False, pin: bool = True,
-                chunker: str | None = None) -> dict:
+                chunker: str | None = None, source: str = USER) -> dict:
         """Import the directory a tar stream holds (POST /api/add/stream?format=tar; rnfs/content/tarstream.py's
         rules and limits, max_output_entries files and directories at most), wrapped as the entry name if given,
-        pinned "user" (cache if not pin) unless only_hash; chunker as for add_path. {"cid", "size", "warnings"}
+        pinned with source (cache if not pin) unless only_hash; chunker as for add_path. {"cid", "size", "warnings"}
         (+ "warnings_total" past MAX_WARNINGS, as get caps them). Reads the stream to its end, where only zeros
         may follow the tar's own."""
         from rnfs.content import tarstream
+
+        _caller_source(source)
 
         options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
         warnings = tarstream.Warnings()
@@ -1468,8 +1491,9 @@ class RnfsNode:
             with self._refusing(), self.storage.protect() as session:
                 with session.writer() as put:
                     built = tarstream.build_tar(stream, put, warnings, max_entries, options, name)
-                node_content.keep_added(self, built.cid, pin)
+                node_content.keep_added(self, built.cid, pin, source)
             if pin:
+                self._app_still_there(source, [built.cid])
                 self.pin_names.record(built.cid, name or "(tar upload)")
             self._added(built)
         return {"cid": str(built.cid), "size": built.size, **warnings.result()}
@@ -1707,56 +1731,114 @@ class RnfsNode:
         Denied as a read does (node_content.stored_head)."""
         return node_content.stored_head(self, target, length)
 
-    def dir_set(self, target: str, name: str, child_cid: str, executable: bool = False) -> dict:
-        """A new root with entry name set to child_cid in the directory target; pinned "user".
+    def dir_set(self, target: str, name: str, child_cid: str, executable: bool = False, source: str = USER) -> dict:
+        """A new root with entry name set to child_cid in the directory target; pinned with source.
 
         The complete directory and the child are fetched first, so the new root is complete and provided.
         """
+        _caller_source(source)
         root, names = self._parse_target(target)
         child = Cid.parse(child_cid)
         with self.fetcher.open(root, pinned=True) as fetch, self.fetcher.open(child, pinned=True) as child_fetch:
             fetch.fetch_dag(fetch.resolve())
             child_fetch.fetch_dag(child_fetch.resolve())
             new_root = edit.dir_set(root, names, name, child, executable, fetch.get, fetch.session.put)
-            self.storage.pin(new_root, USER)
+            self.storage.pin(new_root, source)
+        self._app_still_there(source, [new_root])
         self.pin_names.record_if_unknown(new_root, f"dir set {target} {name}")
         self.publisher.refresh()
         return {"cid": str(new_root)}
 
-    def dir_rm(self, target: str) -> dict:
-        """A new root without the entry target names; pinned "user" (the complete directory is fetched first).
-        Raises ValueError, before fetching anything, unless target is <cid>/<path>."""
+    def dir_rm(self, target: str, source: str = USER) -> dict:
+        """A new root without the entry target names; pinned with source (the complete directory is fetched
+        first). Raises ValueError, before fetching anything, unless target is <cid>/<path>."""
+        _caller_source(source)
         edit.check_entry_target(target)
         root, names = self._parse_target(target)
         with self.fetcher.open(root, pinned=True) as fetch:
             fetch.fetch_dag(fetch.resolve())
             new_root = edit.dir_rm(root, names, fetch.get, fetch.session.put)
-            self.storage.pin(new_root, USER)
+            self.storage.pin(new_root, source)
+        self._app_still_there(source, [new_root])
         self.pin_names.record_if_unknown(new_root, f"dir rm {target}")
         self.publisher.refresh()
         return {"cid": str(new_root)}
 
+    # Facade: apps (rnfs app; rnfs/apps.py)
+
+    def app_add(self, name: str) -> dict:
+        """Issue a token to a new app called name: {"name", "created", "token"}, the only time the token is given.
+        Raises ValueError for an invalid name or one taken, and for lxmf while the LXMF built into rnfs is on: its
+        pins (app:lxmf:<address>) would be the app's too."""
+        check_app_name(name)
+        lxmf = self.features.get("lxmf")
+        if name == "lxmf" and lxmf is not None and lxmf.in_use():
+            raise ValueError("the LXMF built into rnfs is on, and pins with app:lxmf: itself: set lxmf_enabled to "
+                             "false (rnfs config set lxmf_enabled false) and restart the daemon before adding an "
+                             "app called lxmf")
+        return self.apps.add(name)
+
+    def app_ls(self) -> list[dict]:
+        """Every app: [{"name", "created"}], by name."""
+        return self.apps.list()
+
+    def app_rm(self, name: str) -> dict:
+        """Revoke app name's token and release every pin it holds (app:<name> and app:<name>:<key>): {"released"},
+        how many pins (of a CID by one source) were released. NotFound for an app there isn't."""
+        return {"released": self.apps.remove(name, lambda: self._release_app(name))}
+
+    def _release_app(self, name: str) -> int:
+        """Once app name's token no longer passes: tell the features (jobs cancels the app's), then release every
+        pin of its sources; how many were released."""
+        for feature in self.features.values():
+            feature.app_removed(name)
+        released = 0
+        for cid, sources in self.storage.pins().items():
+            for source in sorted(sources):
+                if app_of(source) == name and self.storage.unpin(cid, source):
+                    released += 1
+        if released:
+            log(f"released {plural(released, 'pin')} of app {name}", LOG_NOTICE)
+            self.publisher.refresh()
+        return released
+
     # Facade: pins
 
-    def pin_add(self, target: str) -> dict:
-        """Fetch the target completely and pin it with source "user"."""
+    def pin_add(self, target: str, source: str = USER) -> dict:
+        """Fetch the target completely and pin it with source ("user", or the caller's app's)."""
+        _caller_source(source)
         root, names = self._parse_target(target)
         with self.fetcher.open(root, names, pinned=True) as fetch:
             expect = fetch.resolve()
             fetch.fetch_dag(expect)
-            self.storage.pin(expect.cid, USER)
+            self.storage.pin(expect.cid, source)
+        self._app_still_there(source, [expect.cid])
         if target != str(expect.cid):  # a path or a contact nick says more than the CID does
             self.pin_names.record_if_unknown(expect.cid, target)
         log(f"pinned {expect.cid}", LOG_NOTICE)
         self.publisher.refresh()
         return {"cid": str(expect.cid)}
 
-    def pin_rm(self, cid: str):
-        """Remove the "user" source of a pin; withdraws the CID at once if no longer provided."""
+    def pin_rm(self, cid: str, source: str = USER):
+        """Remove source's hold on a pin ("user", or the caller's app's: an app releases only its own); withdraws
+        the CID at once if no longer provided."""
+        _caller_source(source)
         parsed = Cid.parse(cid)
-        if not self.storage.unpin(parsed, USER):
-            raise NotFound(f"{cid} is not pinned by the user")
+        if not self.storage.unpin(parsed, source):
+            raise NotFound(f"{cid} is not pinned by the user" if source == USER else f"{cid} is not pinned by {source}")
         self.publisher.refresh()
+
+    def _app_still_there(self, source: str, cids: list[Cid]):
+        """After pinning cids with source: if it is an app's and the app was removed meanwhile (app_rm took its
+        token, then released its pins, maybe before these were made), release them and raise NotFound, so a
+        request already let in never leaves a pin nobody may release. app_rm forgets the app before it looks for
+        its pins, so a pin made before that is released there, and one made after it here."""
+        name = app_of(source)
+        if name is None or name in self.apps:
+            return
+        for cid in cids:
+            self.storage.unpin(cid, source)
+        raise NotFound(f"app {name} was removed meanwhile, so its pin was released")
 
     def pin_ls(self, cid: str | None = None) -> list[dict]:
         """Pins with their sources, whether they're complete, their type, whether they're sealed files, a local
@@ -2244,8 +2326,8 @@ class RnfsNode:
                 raise
         return {"roots": [str(cid) for cid in stats["roots"]], "blocks": stats["blocks"]}
 
-    def import_archive(self, path: str, progress: Callable[[int], None] | None = None) -> dict:
-        """Import an archive on this machine, pinning its complete roots with source "user" (import_stream; progress
+    def import_archive(self, path: str, progress: Callable[[int], None] | None = None, source: str = USER) -> dict:
+        """Import an archive on this machine, pinning its complete roots with source (import_stream; progress
         as there: an import job's). Raises ValueError for anything but a regular file: opened without blocking, so a
         FIFO can't hold the call (or an import job's slot) waiting for a writer."""
         try:
@@ -2262,14 +2344,15 @@ class RnfsNode:
             os.close(fd)
             raise
         with stream:
-            return self.import_stream(stream, f"archive {os.path.abspath(path)}", progress)
+            return self.import_stream(stream, f"archive {os.path.abspath(path)}", progress, source)
 
     def import_stream(self, stream: BinaryIO, label: str = "(archive upload)",
-                      progress: Callable[[int], None] | None = None) -> dict:
+                      progress: Callable[[int], None] | None = None, source: str = USER) -> dict:
         """Import an archive read from stream to its end (POST /api/import/stream), pinning its complete roots with
-        source "user", each recorded in pin_names as label unless it has a name there. progress, if given, is told
+        source ("user", or the caller's app's), each recorded in pin_names as label unless it has a name there. progress, if given, is told
         the bytes read as they are (an import job's) and may raise to stop the import: blocks stored by then stay as
         unpinned blocks, for the next collection. {"roots", "incomplete", "blocks"}."""
+        _caller_source(source)
         stream = builder.counted(stream, progress)
 
         def check(roots: list[Cid]):
@@ -2281,7 +2364,8 @@ class RnfsNode:
                         self._check_file(file, get)  # a complete root: every block is stored and checked
 
         with self._refusing():
-            stats = archive.import_archive(stream, self.storage, check=check)
+            stats = archive.import_archive(stream, self.storage, pin_source=source, check=check)
+        self._app_still_there(source, list(stats.get("complete", [])))
         for root in stats.get("complete", []):
             self.pin_names.record_if_unknown(root, label)
         self.publisher.refresh()

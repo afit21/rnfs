@@ -13,7 +13,8 @@ startup_announce_delay and every announce_interval. LXMF keeps its router state 
   node only announcing itself is used only when the user asks (--nearest): it could be anyone's. The outbox
   records each message's state.
 - Receiving: messages with rnfs links go to a bounded inbox. Links from senders in lxmf_auto_fetch_from are
-  fetched and pinned with source `lxmf:<sender>`, within lxmf_auto_fetch_quota per sender; removing the
+  fetched and pinned with source `app:lxmf:<sender>` (storage.LXMF_PREFIX: the LXMF wrapper app's pins, which
+  it takes over; `lxmf:<sender>` until 0.2.0), within lxmf_auto_fetch_quota per sender; removing the
   message from the inbox releases those pins, and a message holding pins is never dropped to make room for
   others' (each such sender keeps at most 1/n of the inbox, so none fills it). lxmf_accept_from restricts
   senders.
@@ -33,7 +34,9 @@ printed. A message is only accepted once LXMF has validated its signature agains
 from a sender whose identity isn't known yet is held while a path request fetches it.
 
 The LXMF package is a dependency (pyproject.toml), but the node runs without it: if it can't be imported (or with
-lxmf_enabled = false), the feature stays off and says so once.
+lxmf_enabled = false), the feature stays off and says so once. It stays off too while an app called lxmf exists
+(an LXMF wrapper built on the API, rnfs app add lxmf, which rnfs refuses while this feature is on): the wrapper owns
+the app:lxmf: pins and the LXMF identity, so this feature then also never releases any of those pins at start.
 Nothing here imports RNS or LXMF at module level (CLI commands mustn't load them); LxmfNetwork, made in
 start(), holds every RNS and LXMF object, so the rest works on offline test nodes with a stand-in network.
 """
@@ -903,14 +906,29 @@ class LxmfFeature(features.Feature):
                     # LXMF doesn't persist its outbound queue
                     self.outbox.update(entry["id"], state="failed",
                                        error="the daemon stopped before it was delivered")
-            self._release_unrecorded()
+            if self.wrapped():
+                # The LXMF wrapper app owns the app:lxmf: pins now: none of them is this feature's to release
+                _log("an app called lxmf (an LXMF wrapper) holds the app:lxmf: pins; leaving them to it", LOG_VERBOSE)
+            else:
+                self._release_unrecorded()
             self._refuse_unlisted()
         except BaseException:
             self.close()
             raise
 
+    def wrapped(self) -> bool:
+        """Whether an app called lxmf exists (rnfs app add lxmf: an LXMF wrapper built on the API), which owns the
+        app:lxmf: pins: this feature then neither starts nor releases any of them."""
+        apps = getattr(self.node, "apps", None)
+        return apps is not None and "lxmf" in apps
+
+    def in_use(self) -> bool:
+        """Whether this feature is on (running, or lxmf_enabled set true), so pins with app:lxmf: itself: an app
+        called lxmf is refused then (RnfsNode.app_add)."""
+        return self.network is not None or self.config.lxmf_enabled is True
+
     def _release_unrecorded(self):
-        """Release lxmf: pins no inbox message records as pinned. Pins are saved at once and the inbox every
+        """Release app:lxmf:<sender> pins no inbox message records as pinned. Pins are saved at once and the inbox every
         few seconds, so a crash can leave a pin whose message is gone or still queued; nothing else would release
         it (`pin rm` releases only the user's pins). A queued link is fetched and pinned again at start().
 
@@ -924,8 +942,11 @@ class LxmfFeature(features.Feature):
         unrecorded: dict[str, list[Cid]] = {}
         for cid, sources in self.node.storage.pins().items():
             for source in sources:
-                if source.startswith(LXMF_PREFIX) and (source[len(LXMF_PREFIX):], str(cid)) not in recorded:
-                    unrecorded.setdefault(source[len(LXMF_PREFIX):], []).append(cid)
+                sender = source[len(LXMF_PREFIX):]
+                # Only the sources this feature makes: an app: source's key may be anything else
+                if source.startswith(LXMF_PREFIX) and ids.HEX16_LOWER.fullmatch(sender) \
+                        and (sender, str(cid)) not in recorded:
+                    unrecorded.setdefault(sender, []).append(cid)
         if not self.inbox.clean:
             for sender, cids in sorted(unrecorded.items()):
                 self._record_kept(sender, sorted(cids, key=str))
@@ -951,7 +972,7 @@ class LxmfFeature(features.Feature):
                     self._set_auto(entry["id"], index, _unlisted())
 
     def _record_kept(self, sender: str, cids: list[Cid]):
-        """Keep sender's lxmf: pins of cids, which an inbox that didn't load whole doesn't record: add an inbox
+        """Keep sender's app:lxmf: pins of cids, which an inbox that didn't load whole doesn't record: add an inbox
         message from sender recording them as pinned, and save the inbox."""
         listed = ", ".join(str(cid) for cid in cids)
         if ids.HEX16.fullmatch(sender) is None:  # not a source this feature makes: kept, never recorded
@@ -999,6 +1020,12 @@ class LxmfFeature(features.Feature):
         if self.config.lxmf_enabled is False:
             self.off_reason = "LXMF is off (lxmf_enabled = false)"
             _log("off: lxmf_enabled is false", LOG_VERBOSE)
+            return
+        if self.wrapped():
+            self.off_reason = "LXMF is off: an app called lxmf (an LXMF wrapper) holds its pins and identity"
+            _log("off: an app called lxmf (an LXMF wrapper) holds the app:lxmf: pins and the LXMF identity; remove it "
+                 "(rnfs app rm lxmf) to use the LXMF built into rnfs", LOG_WARNING if self.config.lxmf_enabled
+                 else LOG_NOTICE)
             return
         try:
             network = LxmfNetwork(self, self.config, self.node.node_id)
@@ -1391,7 +1418,7 @@ class LxmfFeature(features.Feature):
         return len(removed)
 
     def _release(self, removed: list[dict]):
-        """Release the lxmf:<sender> pins of removed entries that no remaining entry of that sender holds."""
+        """Release the app:lxmf:<sender> pins of removed entries that no remaining entry of that sender holds."""
         from rnfs.content.storage import LXMF_PREFIX
         if not removed:
             return
@@ -1597,7 +1624,7 @@ class LxmfFeature(features.Feature):
                 self._event(INBOX, "auto", id=entry_id, index=index, state=result.get("state"))
 
     def auto_fetch(self, entry_id: int, index: int):
-        """Fetch one link of an inbox message and pin it with source lxmf:<sender>, within the sender's quota.
+        """Fetch one link of an inbox message and pin it with source app:lxmf:<sender>, within the sender's quota.
 
         The sender is trusted, so a name link whose name can't be resolved falls back to the CID it was sent with;
         the result then records "sent_cid": true, which the inbox listing shows. The fetch stops (within

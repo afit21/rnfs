@@ -9,9 +9,13 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`); an older rnfs can't
-  open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count as
-  never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`); an older rnfs
+  can't open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count
+  as never exported (`rnfs status` lists them until `rnfs name export` is run).
+- **LXMF pins:** pins of links auto-fetched over LXMF change source from `lxmf:<address>` to
+  `app:lxmf:<address>` (`pin ls` shows the new one), the source the LXMF wrapper app will own once LXMF leaves
+  core; the LXMF built into rnfs uses it from now on, so nothing is released by the change. An older
+  `pins.json` imported at the upgrade gets the same rewrite.
 - **Provider records:** the upgrade gives each publisher of the records a node stores a standing
   (`provider_standing`, and indexes on `provider_records`): Earned if it was first seen at least 3 days before its
   latest store and refreshed a record outside the newcomer pool a day or more after storing it, else Newcomer. The
@@ -28,6 +32,23 @@ Upgrade notes:
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 
 Added, for apps:
+- **App tokens:** an app can have a token of its own, kept across restarts (`rnfs app add`, below), sent as
+  `X-Rnfs-Api` with `X-Rnfs-App: <name>`; the proof a client checks before sending it is keyed by the token's
+  verifier, which is all the daemon keeps of it (`rnfs.db`'s new `apps` table). `rnfs.Client(app=..., token=...
+  or token_file=...)` and `ApiConnection(app=, token=)`. The `api_token` stays the CLI's, unchanged, and a
+  request without `X-Rnfs-App` is checked exactly as before.
+- **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
+  scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
+  can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
+  `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
+  `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
+  `forbidden`); capability `apps`. `rnfs app add lxmf` is refused while rnfs's own LXMF is on, and while an app
+  called `lxmf` exists rnfs's own LXMF stays off (an LXMF wrapper app owns its pins and identity).
+- **An app's pins:** what an app adds, pins, imports or makes with `dir set`/`dir rm` (and its pin, add and import
+  jobs) is pinned with the source `app:<name>`, or `app:<name>:<key>` with `X-Rnfs-Pin-Key: <key>`
+  (`client.pin_key(key)`), shown by `pin ls`. Its `pin rm` releases only its own source; the CLI's still
+  releases only `user`'s, and a pin key with the CLI's token is refused (400). Removing the app releases them all
+  and cancels its jobs.
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
   daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
   attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,

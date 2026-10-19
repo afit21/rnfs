@@ -64,7 +64,8 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
 
 Node IDs, DHT keys and names are 16-byte `bytes`. Identity hashes (for `members`, `remote_pin_identities`,
 pin source `remote:<identity>`) are RNS identity hashes, and LXMF addresses (`lxmf_*` settings, pin source
-`lxmf:<address>`) are `lxmf.delivery` destination hashes, all written as 32 hex characters.
+`app:lxmf:<address>`, `storage.LXMF_PREFIX`) are `lxmf.delivery` destination hashes, all written as 32 hex
+characters.
 
 - `rnfs/statedb.py` — the state database, `<rnfs dir>/state/rnfs.db` (standard `sqlite3`, WAL mode,
   `busy_timeout`; created 0600, which SQLite copies to its `-wal` and `-shm` files; on Windows the state
@@ -153,6 +154,7 @@ rnfs/
   publisher.py        provide strategy, batched /provide, republish, withdrawal, extra key sources (section 6)
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
+  apps.py             AppRegistry: the apps rnfs app add issued tokens to, their verifiers (section 11)
   api.py              local API, 127.0.0.1:8788 (section 11)
   apiclient.py        the local API's protocol layer (ApiConnection) under rnfs.Client and the CLI: token, proof
                       check, typed errors (section 11)
@@ -474,7 +476,10 @@ another listener. A daemon proved older than 0.1.5 (`OLDEST_DAEMON`; such daemon
 refused by `check_daemon` before the token is sent; until 0.2.0 the client sent it the request on a new connection. `request()` maps failures to `DaemonNotRunning`, `ConnectionFailed` (`_exchange`), `AuthFailed` (a
 failed proof, or 403) and the API's statuses (`_raise_for`: `STATUS_ERRORS`, `error_for`, the one mapping);
 `Stream` reads a body, raising
-`ConnectionFailed` if it ends short. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
+`ConnectionFailed` if it ends short. `ApiConnection(..., app=, token=)` (0.2.0) is an app's: its token is given
+(never read again) or in `token_file` (read and checked as `api_token` is, `read_token`), every request carries
+`X-Rnfs-App` (`APP_HEADER`, `_identity_headers`), and `verify_daemon` checks the proof keyed by
+`app_proof_key(token)`; `rnfs.Client(app=, token=)` passes them on. Its methods (`status`, `add_path`, `add_stream`, `fetch`, `cat`, `info`,
 `ls`, `stat`, `dir_set`, `dir_rm`, `export`, `import_archive`, `add_tar`, `get_tar`, `export_stream`,
 `import_stream` (uploads bytes or a binary file, chunked when their length is unknown; downloads a `Stream`), `gc`,
 `verify`, `pin_*` (with `pin_remote`),
@@ -504,8 +509,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `stat(target)` | `{"cid", "size", "blocks", "local_blocks", "local_bytes"}` |
 | `is_local(target)` | `bool`: everything needed is stored, so no network fetch |
 | `dir_set(target, name, child_cid, executable=False)`, `dir_rm(target)` | `{"cid"}`, pinned `user`; `dir_rm` refuses a target that names no entry (`edit.check_entry_target`: ValueError, before fetching anything), so the API and `rnfs.Node` don't check it themselves |
-| `pin_add(target)` | `{"cid"}` once complete |
-| `pin_rm(cid)` | `None`; NotFound if no `user` source |
+| `pin_add(target, source="user")` | `{"cid"}` once complete |
+| `pin_rm(cid, source="user")` | `None`; NotFound if `source` doesn't hold it |
+| `source=` (0.2.0) | taken by `add_path`, `add_stream`, `add_tar`, `dir_set`, `dir_rm`, `pin_add`, `pin_rm`, `import_archive` and `import_stream`: the source their caller pins and releases with, `user` (the default: the CLI, an embedded node) or an app's `app:<name>[:<key>]` (`ApiHandler.pin_source()`; anything else is ValueError, `node._caller_source`). After pinning with an app's source the node checks the app still exists (`_app_still_there`): `app_rm` forgets an app before it looks for its pins, so a pin a request already let in makes after that is released there and then, with NotFound |
 | `pin_ls(cid=None)` | `[{"cid", "sources": [str], "complete": bool, "type": "file" \| "directory" \| None, "sealed": bool \| None, "name": str \| None}]`; `type` and `name` only when the root block is stored, `name` where the pin was added from (pin_names; for a sealed add, the local path or the name given, kept for the local user), its shared-folder entry, or a directory's single entry or entry count; `sealed` from the file's first bytes (`seal.MAGIC`), False for directories, None if the root or first chunk isn't stored. A complete pin's `type`, name from inside and `sealed` are read from its blocks once, then remembered while it stays complete (`_pin_details`, `PIN_MEMO` 16 384, forgotten when released). Callers that show pins to others must skip `sealed` entries' names and content |
 | `pin_remote(node_id, cid, pin)` | `bool` accepted |
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
@@ -518,6 +524,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
+| `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
 | `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names", "unexported_names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
@@ -550,7 +557,10 @@ as a request body.
 `/api/name/watch` (a long poll for newer records: Public API, API additions);
 `POST /api/add`, `/api/add/stream`, `/api/get`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`,
 `/api/pin/remote`, `/api/gc`, `/api/verify`, `/api/name/create`, `/api/name/rm`, `/api/name/export`,
-`/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`; for clients that share no files with the
+`/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`; app tokens (`ApiHandler.CLI_ROUTES`, the
+CLI's token only: an app's gets 403 `forbidden`) `GET /api/apps`, `POST /api/apps/add`, `/api/apps/rm`
+(`app_ls`, `app_add`, `app_rm`; `ApiConnection.apps`, `app_add`, `app_rm`, which neither `rnfs.Node` nor
+`rnfs.Client` has: managing apps is the CLI's, `rnfs app`); for clients that share no files with the
 daemon (a sandboxed app), `GET /api/get/stream?format=tar`, `GET /api/export/stream`, `POST /api/import/stream`,
 and `POST /api/add/stream?format=tar`. `GET /api/info` and `POST /api/get` take
 an optional `from` (node ID), as does `GET /api/cat`; `GET /api/name/resolve?name=` takes a name or a name
@@ -630,6 +640,14 @@ URL without asking the daemon: the gateway port from `daemon.json`, else `rnfs.t
 
 What a companion app needs from the daemon beyond the facade calls (specification section 11, "For apps").
 
+- **App tokens.** `rnfs/apps.py`'s `AppRegistry` (`RnfsNode.apps`, made before the features) keeps each app's
+  name, its token's verifier (`apiclient.app_verifier`: SHA-256 of `rnfs app token ` and the token) and when it
+  was added, in the `apps` table; `add` returns the token, the only time it exists outside the app. The API's
+  `ApiHandler.caller()` answers `api.CLI` for the API token (no `X-Rnfs-App`), `"app:<name>"` for an app's token
+  with `X-Rnfs-App` naming it (`AppRegistry.verify`, constant time, also for names there aren't), None
+  otherwise; `dispatch` keeps it in `principal`. `proof_key()` keys `X-Rnfs-Proof` with the API token, or
+  (`X-Rnfs-App`) with `AppRegistry.proof_key` (the verifier in hex), None for an app there isn't. A node without
+  `apps` (a stand-in) lets no app in.
 - **Discovery.** `cli.run_daemon` writes `<rnfs dir>/daemon.json` (`apiclient.DAEMON_FILE`; `cli.write_daemon_info`,
   `fsutil.write_atomic`, 0600, private) once its servers listen and its token is written, and removes it when it
   stops if it still names its PID (`remove_daemon_info`). `apiclient.read_daemon_info` reads it without following a
@@ -639,7 +657,7 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   check is unchanged, so a stale or planted file at worst points at a port where nothing proves itself.
 - **Error codes.** `rnfs.errors.STATUS_CODES` (the node's errors, by status), `API_CODES` (the API's own
   refusals: `bad_host`, `unauthorized`, `no_such_endpoint`, `method_not_allowed`, `timeout`, `length_required`,
-  `body_too_large`, `unsupported`, `too_many_connections`) and `error_code(error, status)`, which prefers an
+  `body_too_large`, `unsupported`, `too_many_connections`, and from 0.2.0's app tokens `forbidden`) and `error_code(error, status)`, which prefers an
   exception's own `code` (`errors.Unsupported`: a 404 `unsupported`, for something this daemon can't do).
   `ApiHandler.respond_error` sends `{"error", "code"}`; `ApiRequestError` carries its code. The client
   (`apiclient.error_for`) keeps the code on every `ApiError` (`.code`) and raises `NoSuchEndpoint` for
@@ -760,8 +778,11 @@ and errors import neither RNS nor anything that does (tested, as the CLI's start
   `close()` releases the lock once the node has stopped, as a start that fails does (`fsutil.unlock`: unlocked, then
   closed, since Windows may free a closed file's locks only some time later).
 
-`Client(rnfs_dir=None, *, port=None, token_file=None, timeout=None)`: as `apiclient.ApiConnection` (default
-`~/.rnfs/`, the `api_port` in its `rnfs.toml`, the token from `<rnfs dir>/api_token`, proved before it is sent).
+`Client(rnfs_dir=None, *, port=None, token_file=None, timeout=None, app=None, token=None)`: as
+`apiclient.ApiConnection` (default `~/.rnfs/`, the `api_port` in its `rnfs.toml`, the token from
+`<rnfs dir>/api_token`, proved before it is sent). With `app` (0.2.0) it is that app's (`rnfs app add`), its
+token given or in `token_file`, and `client.pin_key(key)` (`ApiConnection.pin_key`, thread-local like
+`timeout()`) gives the calls inside it `X-Rnfs-Pin-Key`.
 Nothing is sent until the first call. Raises `SettingsError` if `rnfs.toml` can't be read or trusted; one made
 private on the way is reported as a `RuntimeWarning` (`warnings.warn`), without loading RNS.
 
@@ -977,6 +998,7 @@ Rules, the same for both:
 | A Client's requests can be bounded (`timeout`, `timeout()`); a Node's calls make none | A Node's `timeout()` checks its argument and does nothing; `Job.wait(timeout)` bounds a wait on both |
 | LXMF is off in a Node unless `lxmf_enabled` | `lxmf.address`, `send` and `sync` raise `ValueError` saying so, as a daemon with it off answers (400) |
 | `OSError` in a Node is `ServerError` from a Client | Documented |
+| A Client can be an app's (`app=`), its pins `app:<name>[:<key>]` (`pin_key()`); a Node's are always `user`'s | Client only: an embedded node is its app's own node, with no token to tell callers apart |
 | A Client's connection errors (`DaemonNotRunning`, …) | Client only, all `ApiError` |
 
 ### What happens to `rnfs/apiclient.py`
@@ -1275,11 +1297,11 @@ its `start()` raising is logged and the others still start (`RnfsNode._start_fea
 | Feature | Module | What it does | Hooks in shared code |
 |---|---|---|---|
 | `peers` | `peers.py` | `rnfs peers`, `rnfs stats`; client-mode nodes' mode and last-heard time come from the node's `rnfs.dht` announce handler, which counts every announce in `Traffic`; `first_heard`, `rtt`, `online` and `peer` events (Mesh) | reads `Traffic`, the routing table, links, paths |
-| `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job`, CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
+| `jobs` | `jobs.py` | `JobsFeature` (the job manager), `Job` (a pin, add or import job keeps its `source`, saved in its record only when it isn't `user`, so other records are as 0.1.6 wrote them; `app_removed` cancels an app's), CLI progress formatting | `fetcher.observing(observer)`: a thread-local observer every `Fetch` picks up (`total`, `block`, `cancelled` checked at each step, raising `fetcher.Cancelled`) |
 | `keepers` | `keepers.py` | signed records (`SignedRecord`, `parse_signed`, `sign_record`, `from_announce_data`), `/name`, `KeeperClient`, `KeeperStore` | `Feature.requests`; `publisher.DhtKey` and `Publisher.add_key_source` (non-CID keys published like CIDs); `NameManager.keepers` (`published`, `heard`, `query`, `always_ask`, `local_record`), `NameManager.offer()`/`record()`; the 5-argument announce handler (packet hash) |
 | `follow` | `follow.py` | followed names: each check and fetch one at a time, `fetcher.open(pinned=True)`, pin inside the fetch's protection, old pin released after | keepers' `FOLLOW` reason |
 | `contacts` | `contacts.py` | address book; `expand_target`, `lookup(nick, kind)`, `resolve_id(text, kind)`, `node_arg` | `RnfsNode._parse_target` (never for the gateway), `JobsFeature.submit` |
-| `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `LXMF_PREFIX` in `storage.check_source` |
+| `lxmf` | `lxmf.py` | pure parts (`Link`, `parse_uri`, `format_uri`, `find_links`, `encode_field`/`decode_field`); `MessageLog` (the inbox and outbox, in the state database); `LxmfFeature` (send with direct→propagated fallback, inbox, auto-fetch, inbox get, pin release; `inbox` events with `box` "inbox" — `received` {id, from}, `removed` {ids}, `auto` {id, index, state} — or "outbox" — `queued` {id}, `state` {id, state}, `removed` {ids} — published under its lock by `_event`); `LxmfNetwork`, made in `start()`, holds every RNS/LXMF object | `lxmf.validate_settings` from `Config.validate`; `storage.LXMF_PREFIX` (`app:lxmf:`, an app source to `storage.check_source`) |
 | `deny` | `deny.py` | `deny_lists` sources (`parse_source`, `validate_settings` from `Config.validate`): `check(source)` resolves a name (persisted), fetches the target pinned, checks it is a file within `MAX_LIST_BYTES`, parses it, pins it `deny` and `accept`s it, then releases unused `deny` pins; `run_due` on `rnfs-deny`, after the join (`CHECK_INTERVAL` for names, `retry_delay` backoff); sources no longer configured are forgotten at start | `node.deny` (core); `DENY` in `storage.check_source` |
 | `settings` | `settings.py` | `rnfs config`, `GET /api/config`, `POST /api/config/set`: rnfs.toml read and rewritten, `LIVE` settings applied to the running node | `config.settings_schema`, `Config.combine`, `config.edit_settings`; `Config.overrides`/`given_defaults` (set by `Config.load`); the live hooks below |
 
@@ -1419,7 +1441,8 @@ Locks are taken in this order, never the reverse: `names._lock` → `publisher._
 → the state database's lock (`statedb`, innermost: a store opens a transaction only once it holds every lock the
 change needs, and inside it takes no other lock and does no network I/O). `node._deny_lock` (one deny-list change
 applied at a time, `_apply_deny`) is taken before the publisher's lock and never with the names lock;
-`DenyList._lock` holds only the state database's. Feature locks held across `storage.pin`/`unpin`/`protect` and
+`DenyList._lock` holds only the state database's, as does `AppRegistry._lock` (`app_rm`'s release of the app's
+pins runs without it). Feature locks held across `storage.pin`/`unpin`/`protect` and
 `publisher.refresh()` (`JobsFeature._lock`, `FollowFeature._lock`, `LxmfFeature._lock`) come before the publisher's
 and storage's. The public API's locks come after these: `Rnfs._watch_lock` after the names lock (NameManager's
 record listeners run under it, and only queue), the event and job-watch conditions innermost; callbacks into the
@@ -1499,8 +1522,14 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   CID of the version it last accepted; FULL) and `deny_hashes` (the content SHA-256 of files checked against
   `sha256:` entries, by binary CID, LRU order in `used`, at most 10 000; NORMAL with the periodic saves and at
   stop, changed rows only; a CID's content never changes, so a row never goes stale);
+- `apps` (0.2.0, rnfs/apps.py: each app's name, the SHA-256 verifier of its token (`apiclient.app_verifier`; the
+  token itself is never stored) and when it was added; FULL, each change written at once; a row that doesn't
+  parse is deleted at load);
 - `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
   requires; each box's `next_id`) and `migrated` (JSON files imported).
+- Schema steps of 0.2.0 that rewrite rows: `lxmf_app_pins` turns every valid `lxmf:<address>` pin into
+  `app:lxmf:<address>` (a case-sensitive `GLOB` spelt out, so an invalid one is still deleted at load;
+  `storage.import_pins` does the same to an older `pins.json`, imported after the steps).
 
 The node lists its stores as `_setup` makes them (`RnfsNode._add_store`; the `node.Store` protocol: `save()`
 writes what changed since the last save, raising `OSError` and keeping the change if the database fails, and

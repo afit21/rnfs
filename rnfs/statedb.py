@@ -206,6 +206,19 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "DELETE FROM provider_departed",
         "DELETE FROM provider_evicted",
     )),
+    ("lxmf_app_pins", (
+        # In-core LXMF's pins become the LXMF wrapper app's (rnfs 0.2.0): lxmf:<address> -> app:lxmf:<address>
+        # (storage.LXMF_PREFIX). Only valid ones, as GLOB is case-sensitive and spelt out: an invalid lxmf: row is
+        # still deleted when storage loads, never turned into a valid app: one. A row whose new form a pin already
+        # has (none can, short of a database edited by hand) stays as it was, and is deleted
+        "UPDATE OR IGNORE pins SET source = 'app:' || source WHERE source GLOB 'lxmf:" + "[0-9a-f]" * 32 + "'",
+        "DELETE FROM pins WHERE source GLOB 'lxmf:" + "[0-9a-f]" * 32 + "'",
+    )),
+    ("apps", (
+        # rnfs app add's apps (rnfs/apps.py; rnfs 0.2.0): name, its token's verifier (apiclient.app_verifier, never
+        # the token), when it was added
+        "CREATE TABLE apps (name TEXT PRIMARY KEY, verifier BLOB NOT NULL, created REAL NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 
@@ -686,7 +699,7 @@ class RowStore:
 def reconcile_pins(pins: dict, prefix: str, recorded: Callable[[str, object], bool], clean: bool,
                    adopt: Callable[[dict[str, list]], None], release: Callable[[str, object], None]):
     """At start, make a feature's pins match its saved state. Its pins are those whose source is prefix and an
-    owner ("lxmf:<sender>", "follow:<name>"); pins is storage.pins() (CID -> sources). A pin recorded(owner, cid)
+    owner ("follow:<name>"); pins is storage.pins() (CID -> sources). A pin recorded(owner, cid)
     says the state doesn't record was left by a crash between the pin and the save, or by state that was lost.
 
     If the state is clean (saved whole, and every row of it read), release(owner, cid) releases each such pin:

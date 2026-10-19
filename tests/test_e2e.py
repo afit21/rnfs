@@ -382,6 +382,21 @@ class NetworkTest(unittest.TestCase):
         self.assertIn("removed", c.out("jobs", "clear"))
         # --- end transfers ---
 
+        # --- apps: an app's own token (rnfs app add -o), its pins its own source, released when it is removed ---
+        import rnfs
+        token_file = self.path("app-token")
+        b.cli("app", "add", "e2e", "-o", token_file)
+        self.assertEqual(b.out("app", "ls").split()[0], "e2e")
+        with rnfs.Client(b.dir, port=b.api_port, app="e2e", token_file=token_file) as client:
+            client.pin(file_cid)
+            with client.pin_key("k"):
+                client.pin(file_cid)
+        sources = json.loads(b.out("pin", "ls", file_cid, "--json"))[0]["sources"]
+        self.assertLessEqual({"app:e2e", "app:e2e:k"}, set(sources))
+        self.assertEqual(b.out("app", "rm", "e2e"), "removed app e2e, releasing 2 pins")
+        self.assertNotIn("app:e2e", b.out("pin", "ls"))
+        # --- end apps ---
+
         # --- content: sealed files for B, FastCDC, --no-pin, trustless gateway formats ---
         secret = os.urandom(150 * 1024)
         with open(self.path("secret.bin"), "wb") as f:

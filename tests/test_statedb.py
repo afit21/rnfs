@@ -114,6 +114,26 @@ class OpenTest(StateDbTest):
         self.assertEqual(db.query("SELECT cid, source FROM pins"), [(b"x", "user")])
         self.assertEqual(db.query("SELECT count(*) FROM lxmf_messages"), [(0,)])
 
+    def test_lxmf_pins_become_app_pins(self):
+        """The 0.2.0 step "lxmf_app_pins" rewrites valid lxmf:<address> pins as app:lxmf:<address>, the LXMF wrapper
+        app's; other sources, and lxmf: ones that aren't valid (which storage deletes at load, as before), are left
+        as they are; one whose new form the CID already has is dropped rather than stopping the upgrade."""
+        address, other = "a0" * 16, "b1" * 16
+        step = next(number for number, (label, _) in enumerate(statedb.SCHEMA) if label == "lxmf_app_pins")
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:step]):
+            db = statedb.connect(self.state)
+            with db.transaction() as tx:
+                tx.executemany("INSERT INTO pins (cid, source) VALUES (?, ?)", [
+                    (b"a", "lxmf:" + address), (b"a", "user"), (b"b", "lxmf:" + other), (b"c", "lxmf:xyz"),
+                    (b"c", "LXMF:" + address), (b"c", "lxmf:" + address.upper()), (b"c", "follow:" + address),
+                    (b"d", "lxmf:" + address), (b"d", "app:lxmf:" + address)])
+            db.close()
+        db = self.connect()
+        self.assertEqual(set(db.query("SELECT cid, source FROM pins")), {
+            (b"a", "app:lxmf:" + address), (b"a", "user"), (b"b", "app:lxmf:" + other), (b"c", "lxmf:xyz"),
+            (b"c", "LXMF:" + address), (b"c", "lxmf:" + address.upper()), (b"c", "follow:" + address),
+            (b"d", "app:lxmf:" + address)})
+
     def test_released_steps_are_unchanged(self):
         """The steps 0.1.5 released are exactly as released (statedb.SCHEMA's comment): new steps are appended."""
         released = statedb.SCHEMA[:RELEASED_0_1_5_STEPS]
