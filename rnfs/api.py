@@ -2,7 +2,8 @@
 
 Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; node IDs and names are
 32 hex characters; paths are absolute paths on the daemon's machine. Successful responses are JSON
-(except cat and name export, which send bytes); errors are `{"error": message, "code": code}` (below).
+(except cat, name export, get/stream and export/stream, which send bytes); errors are `{"error": message, "code":
+code}` (below).
 
 | Method | Path | Parameters | Response / facade call |
 |---|---|---|---|
@@ -56,7 +57,7 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | Method | Path | Parameters | Response |
 |---|---|---|---|
 | GET  | /api/jobs | | `{"jobs": [job]}`, oldest first |
-| POST | /api/jobs | JSON `kind` (get, pin, export), `target`, `output`, `from`, `sealed_name`, `fallback_dht`, `no_extract` | the job queued |
+| POST | /api/jobs | JSON `kind` (get, pin, export: `target`, `output`, and for get `from`, `sealed_name`, `fallback_dht`, `no_extract`; add: `path` or `nomadnet` and `/api/add`'s options; import: `path`) | the job queued |
 | GET  | /api/jobs/get | `id`, `wait` (≤ 30 s) | the job, once it ends or after `wait` |
 | POST | /api/jobs/cancel | JSON `id` | the job |
 | POST | /api/jobs/clear | JSON `id` (optional) | `{"removed": count}` of the finished jobs forgotten |

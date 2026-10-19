@@ -640,9 +640,9 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `gc()` / `verify()` | `{"removed_blocks", "freed_bytes"}` / `{"checked", "bad": [cid]}` |
 | `providers(cid)` | `[node_id bytes]` |
 | `ping(node_id)` | round-trip seconds, or None |
-| `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name"}` |
+| `name_create(alias)`, `name_import(alias, key_bytes)` | `{"alias", "name", "warning"}` (`warning`: how to back the key up, `names.key_backup_warning`) |
 | `name_rm(alias)`, `name_export(alias)` | `None`, key bytes |
-| `name_list()` | `[{"alias", "name", "cid" or None, "sequence"}]` |
+| `name_list()` | `[{"alias", "name", "cid" or None, "sequence", "exported"}]` (`exported`: the key was exported or imported) |
 | `name_publish(alias, target)` | `{"name", "cid", "sequence"}`, plus `"warning"` in private mode (the name's announce reaches outsiders: `names.PRIVATE_NAME_WARNING`) |
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
@@ -727,7 +727,8 @@ as a request body.
 `POST /api/add`, `/api/add/stream`, `/api/get`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`,
 `/api/pin/remote`, `/api/gc`, `/api/verify`, `/api/name/create`, `/api/name/rm`, `/api/name/export`,
 `/api/name/import`, `/api/name/publish`, `/api/name/sync`, `/api/name/unsync` (Name sync, below), `/api/export`,
-`/api/import`; app tokens (`ApiHandler.CLI_ROUTES`, the
+`/api/import`; since 0.2.0 `POST /api/pin/label`, `GET /api/cache/ls`, `POST /api/cache/rm`, `GET /api/capabilities`,
+`GET /api/events` and `POST /api/shutdown` (Local API for apps, below); app tokens (`ApiHandler.CLI_ROUTES`, the
 CLI's token only: an app's gets 403 `forbidden`) `GET /api/apps`, `POST /api/apps/add`, `/api/apps/rm`
 (`app_ls`, `app_add`, `app_rm`; `ApiConnection.apps`, `app_add`, `app_rm`, which neither `rnfs.Node` nor
 `rnfs.Client` has: managing apps is the CLI's, `rnfs app`); for clients that share no files with the
@@ -881,7 +882,8 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   level-triggered: `after` absent answers `next` at once; events after `after`, or after `wait` none; `lost` (and
   every event held) when `after` is no longer held, is beyond the log (a restart) or `epoch` differs. Kinds and
   their fields: `pin` (`change`: added, removed or label; `source`; `cids`, at most `MAX_EVENT_CIDS` (100), and
-  `count`: storage's `pin_listener`, after the pins are saved; a label from `pin_label`), `cache` (`change`: added
+  `count`: storage's `pin_listener`, after the pins are saved; a label from `pin_label`, with `source` None and
+`label`, the new label or None), `cache` (`change`: added
   or removed, `cids`, `count`: storage's `cache_listener`, from `_set_record` and `_drop_records`), `name`
   (`name`, `cid`, `sequence`: `NameManager.held_listener`, for a newer record accepted for a name held — this
   node's own, kept, followed or resolved — or watched), `remote_pin` (`side` "asked": `node`, `cid`, `state`, as
@@ -1668,9 +1670,10 @@ kept in the job as `options`, only those set), for `import`, `path`.
 Add and import jobs run `add_path`/`import_archive` with `progress=Job.read`, which counts `done_bytes` (and the
 rate, of bytes read) and raises `Cancelled` once cancelled or stopping; their `total_bytes` is `builder.tree_size`
 (measured first, cancellable between entries) or the archive's size. They hold no protection session (they fetch
-nothing) and an interrupted one runs again from the start. Every job state change, removal (`removed`: true) and,
+nothing) and an interrupted one runs again from the start. Every job state change, removal and,
 at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job` event (`Job.event`: `id`,
-`job_kind`, `state`, `error` and the progress fields; never the result). `POST /api/lxmf/send` and `/api/lxmf/sync` take
+`job_kind`, `state`, `error` and the progress fields; never the result; a removal's carries only `id`, `job_kind`,
+`state` and `removed`: true). `POST /api/lxmf/send` and `/api/lxmf/sync` take
 `nearest`; `POST /api/lxmf/inbox/get` takes `use_sent_cid` (without it, an unresolvable name link is 404);
 `GET /api/lxmf/address` returns `propagation_node` (the configured one only) and `nearest_propagation_node`.
 `GET /api/lxmf/inbox` adds to each record, computed when listed, `trusted` (`LxmfFeature._trusted_hex`) and
