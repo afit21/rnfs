@@ -487,14 +487,18 @@ class GatewayHandler(TimedHandler):
                 root = str(Cid.parse(segments[2]))
             except ValueError as e:
                 raise GatewayError(400, str(e)) from None
-            immutable = True
-            # Answer a revalidation of a bare CID before touching the node at all
-            if not names and etag_matches(self.headers.get("If-None-Match"), f'"{root}"'):
-                return self.send_not_modified(root)
         else:
             root = self.resolve_name(segments[2])
-            immutable = False
+        # url.path starts with /rnfs/ or /name/, so this can't become a protocol-relative open redirect
+        location = url.path + "/" + (f"?{url.query}" if url.query else "")
+        self.serve_target(root, names, slash, segments[1] == "rnfs", f"/{segments[1]}/{segments[2]}", location)
 
+    def serve_target(self, root: str, names: list[str], slash: bool, immutable: bool, title: str, location: str):
+        """Serve root (a written CID) / names: slash if the URL ended with one, immutable for content named by
+        CID, title the listing's title for root, location the slash form a directory without one redirects to."""
+        # Answer a revalidation of a bare CID before touching the node at all
+        if immutable and not names and etag_matches(self.headers.get("If-None-Match"), f'"{root}"'):
+            return self.send_not_modified(root)
         target = "/".join([root, *names])
         if self.limited() and not self.node.is_local(target):
             self.need_network()
@@ -510,8 +514,8 @@ class GatewayHandler(TimedHandler):
 
         if info["type"] == "directory":
             if not slash:
-                return self.redirect_to_slash(url)
-            return self.serve_directory(target, segments, names, cache)
+                return self.redirect_to_slash(location)
+            return self.serve_directory(target, "/".join([title, *names]) + "/", bool(names), cache)
         filename = self.param("filename") or (names[-1] if names else None)
         self.serve_file(target, info["size"], filename, cache)
 
@@ -554,14 +558,12 @@ class GatewayHandler(TimedHandler):
         self.send_header("Cache-Control", IMMUTABLE)
         self.end_headers()
 
-    def redirect_to_slash(self, url):
-        """301 from a directory path without a trailing slash to the slash form, keeping the query."""
-        # url.path starts with /rnfs/ or /name/, so this can't become a protocol-relative open redirect
-        location = url.path + "/" + (f"?{url.query}" if url.query else "")
+    def redirect_to_slash(self, location: str):
+        """301 from a directory path without a trailing slash to location, its slash form."""
         self.send_text(301, f"see {location}", {"Location": location})
 
-    def serve_directory(self, target: str, segments: list[str], names: list[str], cache: dict):
-        """Serve a directory as its index.html, or as a listing."""
+    def serve_directory(self, target: str, title: str, has_parent: bool, cache: dict):
+        """Serve a directory as its index.html, or as a listing titled title."""
         entries = list(self.node.ls(target, for_gateway=True))
         for entry in entries:
             if entry["name"] == INDEX and entry["kind"] != "directory":
@@ -571,8 +573,7 @@ class GatewayHandler(TimedHandler):
                 log(f"gateway: serving {index_target}", LOG_DEBUG)
                 return self.serve_file(index_target, entry["size"], INDEX, cache)
         log(f"gateway: listing {target} ({len(entries)} entries)", LOG_DEBUG)
-        title = "/" + "/".join([segments[1], segments[2], *names]) + "/"
-        self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, bool(names)), cache)
+        self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, has_parent), cache)
 
     def serve_file(self, target: str, size: int, filename: str | None, cache: dict):
         """Serve a file, or the requested byte range of it."""
