@@ -818,9 +818,11 @@ and repeat.
 - Pins are recursive: a pinned CID keeps every block of its DAG.
 - A pin is held by one or more *sources*: `user`, `folder`, `name:<alias>`, `remote:<identity>`,
   `follow:<name>` (the latest target of a followed name, section 9), `lxmf:<address>` (links auto-fetched
-  from that LXMF sender, section 13) and `deny` (the deny lists in use, below); names, identities and
-  addresses are 32 hex characters. It lasts while
-  any source holds it.
+  from that LXMF sender, section 13), `deny` (the deny lists in use, below), and `app:<app>` or
+  `app:<app>:<key>` (pins an app made through the local API with its own token, section 11); names, identities
+  and addresses are 32 hex characters. An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
+  starting with a letter or digit (so never `:`), and a key 1–128 of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
+  A pin lasts while any source holds it.
 - `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
   scan; `name publish` or `name rm`; `/pin` with `false` or a remote quota being exceeded; `name unfollow`, or
   a followed name's newer target once that is complete; removing the LXMF messages that hold it.

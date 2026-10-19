@@ -1,8 +1,8 @@
 """Storage: blocks, pins, cached fetches, protection and eviction (specification section 8). No RNS dependency.
 
 - Pins are recursive and held by sources: "user", "folder", "name:<alias>", "remote:<identity hash>", "deny" (the
-  deny lists' own blocks), and the features' "follow:" and "lxmf:". A pin lasts while any source holds it. Pins
-  are never evicted.
+  deny lists' own blocks), "app:<app>" and "app:<app>:<key>" (pins an app made with its API token, rnfs.apps),
+  and the features' "follow:" and "lxmf:". A pin lasts while any source holds it. Pins are never evicted.
 - Cache is everything else. Each cached fetch is recorded as root + path + target, which keeps the path's
   nodes and the target's DAG; fetches are evicted least recently used first when storage exceeds
   max_storage, and gc() evicts them all.
@@ -25,6 +25,7 @@ eviction, gc and the size queries read the DAG nodes they will walk beforehand (
 import itertools
 import math
 import os
+import re
 import shutil
 import threading
 import time
@@ -46,6 +47,14 @@ USER, FOLDER = "user", "folder"
 DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
 LXMF_PREFIX = "lxmf:"
+APP_PREFIX = "app:"
+# An app's name (rnfs app add): an alias's characters (names.check_alias) in lowercase, so it never holds ":" and
+# two apps never differ only by case. Pin rows are checked against these and one that fails is deleted when
+# loaded, so what they accept mustn't narrow
+APP_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+# The key an app may give its pins (app:<app>:<key>), so it can hold and release groups of its own; ":" allowed, so
+# a key may nest (the name before it holds none)
+PIN_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 MAX_CACHE_RECORDS = 10_000  # cached fetches remembered; past this the least recently used record is dropped
 MISSING_MEMO = 10_000  # incomplete DAGs whose missing block dag_blocks remembers; past this the oldest is forgotten
 EVICT_MARGIN = 32  # eviction frees max_storage / EVICT_MARGIN more than it must, so it runs rarely
@@ -85,7 +94,39 @@ def check_source(source: str):
     # lxmf:<LXMF address>: links auto-fetched from that sender (rnfs/features/lxmf.py)
     if isinstance(source, str) and source.startswith(LXMF_PREFIX) and _IDENTITY_HASH.fullmatch(source[len(LXMF_PREFIX):]):
         return
+    # app:<app>[:<key>]: pins an app made through the API with its token (rnfs/apps.py)
+    if isinstance(source, str) and app_of(source) is not None:
+        return
     raise ValueError(f"invalid pin source {source!r}")
+
+
+def check_app_name(name) -> str:
+    """name if it is a valid app name (APP_NAME), else ValueError."""
+    if not isinstance(name, str) or not APP_NAME.fullmatch(name):
+        raise ValueError(f"invalid app name {name!r}: 1-64 characters of a-z, 0-9, '.', '_' and '-', starting with a "
+                         f"letter or digit")
+    return name
+
+
+def app_source(name: str, key: str | None = None) -> str:
+    """The pin source of app name's pins, of its group key if given: app:<name>[:<key>]. Raises ValueError for a
+    name or key that isn't valid."""
+    check_app_name(name)
+    if key is None:
+        return APP_PREFIX + name
+    if not isinstance(key, str) or not PIN_KEY.fullmatch(key):
+        raise ValueError(f"invalid pin key {key!r}: 1-128 characters of A-Z, a-z, 0-9, '.', '_', ':' and '-'")
+    return f"{APP_PREFIX}{name}:{key}"
+
+
+def app_of(source) -> str | None:
+    """The app whose pin source this is (app:<app> or app:<app>:<key>), or None if it is no valid app source."""
+    if not isinstance(source, str) or not source.startswith(APP_PREFIX):
+        return None
+    name, colon, key = source[len(APP_PREFIX):].partition(":")
+    if not APP_NAME.fullmatch(name) or (colon and not PIN_KEY.fullmatch(key)):
+        return None
+    return name
 
 
 def name_source(alias: str) -> str:

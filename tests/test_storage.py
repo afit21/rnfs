@@ -11,7 +11,8 @@ from rnfs import constants, fsutil, statedb
 from rnfs.content import builder, dag, storage as storage_module, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
-from rnfs.content.storage import FOLDER, USER, Storage, check_source, name_source, remote_source
+from rnfs.content.storage import (FOLDER, USER, Storage, app_of, app_source, check_app_name, check_source, name_source,
+                                  remote_source)
 from rnfs.errors import NotFound, StorageFull
 from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, write_legacy
 
@@ -198,8 +199,43 @@ class PinTest(StorageTest):
         self.storage.unpin(cid, "remote:" + IDENTITY)
         self.assertEqual(self.storage.pins(), {})
 
+    def test_app_sources(self):
+        """app:<app> and app:<app>:<key> are sources (an app's pins), kept across a reopen; app_source makes them
+        and app_of reads the app back."""
+        cid = self.add(b"x").cid
+        sources = {app_source("wiki"), app_source("wiki", "page:42"), app_source("lxmf", IDENTITY)}
+        self.assertEqual(sources, {"app:wiki", "app:wiki:page:42", "app:lxmf:" + IDENTITY})
+        for source in sources:
+            check_source(source)
+            self.storage.pin(cid, source)
+        self.assertEqual(self.open().pins(), {cid: sources})
+        self.assertEqual({app_of(source) for source in sources}, {"wiki", "lxmf"})
+        for source in ("user", "name:wiki", "app:", "app:Wiki", "app:wiki:", "app:wiki:a b", "remote:" + IDENTITY):
+            self.assertIsNone(app_of(source), source)
+
+    def test_invalid_app_sources(self):
+        """App names are lowercase alias characters (no ":"), keys 1-128 of [A-Za-z0-9._:-]: anything else is
+        refused when made and when pinned."""
+        for name in ("", "Wiki", "-wiki", "wi:ki", "wi ki", "w" * 65, None):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    check_app_name(name)
+                with self.assertRaises(ValueError):
+                    app_source(name)
+        for key in ("", "a b", "a/b", "k" * 129, "é", 7):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    app_source("wiki", key)
+        check_app_name("w" * 64)
+        app_source("wiki", "k" * 128)
+        for source in ("app:", "app:Wiki", "app:wiki:", "app:wiki:a b", "app:-x", "app::key"):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    check_source(source)
+
     def test_invalid_sources(self):
-        for source in ("", "users", "name:", "remote:xyz", "remote:" + IDENTITY.upper(), "remote:" + IDENTITY + "0"):
+        for source in ("", "users", "name:", "remote:xyz", "remote:" + IDENTITY.upper(), "remote:" + IDENTITY + "0",
+                       "app:", "app:Wiki", "app:wiki:"):
             with self.subTest(source=source):
                 with self.assertRaises(ValueError):
                     check_source(source)
