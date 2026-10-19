@@ -164,7 +164,8 @@ class Sweep:
                 if self._stopped or self._cursor == len(order):
                     return None
                 claims = [(int.from_bytes(key, "big"), bits) for key, bits in self._claims.items()]
-                for key in order[self._cursor:]:
+                for index in range(self._cursor, len(order)):
+                    key = order[index]
                     if key in self.covered or key in self._claims:
                         continue
                     value = int.from_bytes(key, "big")
