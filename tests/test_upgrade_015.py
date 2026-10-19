@@ -30,7 +30,7 @@ from rnfs import fsutil, statedb
 from rnfs import node as node_module
 from rnfs.config import Config
 from rnfs.content import builder
-from rnfs.content.blockstore import PARTIAL_PREFIX, shard_of
+from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore, shard_of
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, state_rows
@@ -244,6 +244,15 @@ class BlockLayoutTest(FixtureCase):
         self.assertEqual(self.flat_blocks(), [])
         for name in self.names:
             self.assertTrue(os.path.isfile(self.in_shard(name)), name)
+
+    def test_sizes_are_saved_and_read_by_the_next_start(self):
+        # The first start lists every block (0.1.5 left no sizes); after its clean stop, the next one reads them
+        self.start().stop()
+        self.assertEqual(state_rows(self.state, "SELECT value FROM meta WHERE store = 'block_sizes'"), [(1,)])
+        self.assertEqual(len(state_rows(self.state, "SELECT cid FROM block_sizes")), len(self.names))
+        with mock.patch.object(BlockStore, "scan", side_effect=AssertionError("listed every block")):
+            node = self.start()
+        self.check_complete(node)
 
     def test_half_moved_store(self):
         # An earlier start stopped part way through the move; one block is in both places
