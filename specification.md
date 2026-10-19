@@ -1753,7 +1753,9 @@ gateway can never reach the API.
   daemon's `rnfs.toml`; nothing else in it is trusted, and the proof above still comes first. Errors are
   `{"error": message, "code": code}`, the code machine-readable and never renamed once released, so a client
   tells "no such endpoint" (`no_such_endpoint`, a daemon that predates it) from "no such content" (`not_found`),
-  both `404`; `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
+  both `404` (rnfs: `docs/openapi.json` is an OpenAPI 3.1 reference for every route, its parameters, answers,
+  error codes and headers, checked against the code by the tests); `GET /api/capabilities` lists the daemon's
+  routes, features, event kinds, error codes and
   capabilities, and the features that are deprecated (`deprecated`: they still work, but a later release removes
   them; rnfs 0.2.0: `lxmf`, section 13). Every response of a deprecated feature's routes, errors included,
   carries `Deprecation: @<Unix time>` (RFC 9745, the time it was deprecated; rnfs's `/api/lxmf/` routes:

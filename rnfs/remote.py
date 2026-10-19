@@ -1,5 +1,5 @@
 """rnfs.Client: the user's running rnfs daemon, driven through its local API (design.md, "Public API";
-provisional until 0.2). Standard library only, and it never imports RNS.
+provisional until 1.0.0). Standard library only, and it never imports RNS.
 
 The same methods, objects and exceptions as rnfs.Node (rnfs.interface), over rnfs.apiclient's ApiConnection:
 the token is read from the rnfs dir and sent only once whatever listens on the API port has proved it knows it.

@@ -542,7 +542,8 @@ errors:
 - **`rnfs.Client`** uses the user's running daemon (their content, pins and names). It never loads Reticulum,
   so it starts fast.
 
-**The API is provisional until rnfs 0.2** (`rnfs.API_STATUS`).
+**The API is provisional until rnfs 1.0.0** (`rnfs.API_STATUS`): the library and the local API may change in
+0.2.x releases too; `capabilities()` (`GET /api/capabilities`) says what a daemon offers.
 
 ```python
 import RNS, rnfs
@@ -583,7 +584,9 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
 - A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
   just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the
-  reference. Other languages can use the local API's JSON endpoints (listed in `rnfs/api.py`).
+  reference. Other languages can use the local API's JSON endpoints: `docs/openapi.json` is an OpenAPI 3.1
+  reference for every route (parameters, answers, error codes, the token headers and the events), which OpenAPI
+  tools can read or turn into a client.
 
 # Keeping content off your node
 
