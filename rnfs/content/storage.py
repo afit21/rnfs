@@ -352,16 +352,23 @@ class Storage:
         if clean == 0:
             log("storage: listing every stored block, since rnfs didn't stop cleanly last time", LOG_NOTICE)
         sizes = dict(self.blocks.scan(tidy=True))
+        # Only the rows that differ are written: after a crash most are right, and reading them back and comparing
+        # costs less than rewriting them all (a third less with a million blocks)
+        saved = self._load_sizes(quiet=True)
         with self._db.transaction() as tx:
-            tx.execute("DELETE FROM block_sizes")
-            tx.executemany("INSERT INTO block_sizes (cid, size) VALUES (?, ?)",
-                           [(cid.binary, length) for cid, length in sizes.items()])
+            if saved is None:
+                tx.execute("DELETE FROM block_sizes")
+                saved = {}
+            tx.executemany("DELETE FROM block_sizes WHERE cid = ?", [(cid.binary,) for cid in saved.keys() - sizes])
+            tx.executemany("INSERT OR REPLACE INTO block_sizes (cid, size) VALUES (?, ?)",
+                           [(cid.binary, length) for cid, length in sizes.items() if saved.get(cid) != length])
             statedb.set_meta(tx, SIZES_STORE, "clean", 0)
         return sizes
 
-    def _load_sizes(self) -> dict[Cid, int] | None:
+    def _load_sizes(self, quiet: bool = False) -> dict[Cid, int] | None:
         """The block_sizes table, or None if a row doesn't parse (a database edited by hand): then every block is
-        listed instead."""
+        listed instead, and the table written again whole. quiet: the blocks are being listed anyway, so a bad row
+        isn't logged."""
         sizes = {}
         for binary, length in self._db.query("SELECT cid, size FROM block_sizes"):
             try:
@@ -369,8 +376,9 @@ class Storage:
             except (ValueError, TypeError):
                 cid = None
             if cid is None or type(length) is not int or not 0 <= length <= MAX_BLOCK_SIZE:
-                log(f"storage: ignoring the saved block sizes (invalid row {binary!r} {length!r}); listing every "
-                    "stored block", LOG_ERROR)
+                if not quiet:
+                    log(f"storage: ignoring the saved block sizes (invalid row {binary!r} {length!r}); listing "
+                        "every stored block", LOG_ERROR)
                 return None
             sizes[cid] = length
         return sizes

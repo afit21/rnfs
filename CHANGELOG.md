@@ -114,11 +114,12 @@ Changed:
 Faster:
 - A start no longer lists every stored block before the API answers: their sizes are kept in the state database
   (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
-  as before, and writes the table again. 100 000 small blocks on a desktop NVMe disk (warm cache): 0.65 s to
-  index them before, 0.19 s now after a clean stop, 0.98 s after an unclean one (1,024 directories listed and the
-  table rewritten); moving them out of 0.1.6's flat layout at the first start took 5.9 s. A cold cache and a
-  slow disk should gain more, as the table is one file read in order: Raspberry Pi SD-card numbers are still to
-  be measured (`tests/bench_startup.py`, `--cold` for a cache dropped as after a reboot).
+  as before, and corrects the table. Opening storage on a desktop NVMe disk (warm cache), small blocks: 100 000
+  of them 0.50 → 0.13 s after a clean stop (0.65 s after an unclean one), a million 5.4 → 1.2 s (7.2 s after an
+  unclean one: 1,024 directories listed and the table compared). The first start, moving them out of 0.1.6's flat
+  layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
+  order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
+  dropped as after a reboot).
 
 ## 0.1.6
 

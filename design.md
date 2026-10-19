@@ -273,11 +273,11 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   partial file it couldn't delete). At the next start `_index` clears the mark durably before the block store
   is opened (so the move of flat blocks, or anything after, can't be trusted to a stale table), then loads the
   table, adding the flat blocks `BlockStore` found (`found_flat`: an older rnfs may have stored some since); with
-  no mark, a 0, or a row that doesn't parse, it lists every block (`scan(tidy=True)`) and rewrites the table. A
-  row whose file is missing is found when the block is read, as a damaged block is (`get` deletes it from the
-  index). On 100 000 small blocks (NVMe, warm cache) a start indexes them in 0.19 s from the table against
-  0.65 s for 0.1.6's listing; a start after an unclean stop takes 0.98 s (the listing of 1,024 directories and the
-  table rewrite).
+  no mark, a 0, or a row that doesn't parse, it lists every block (`scan(tidy=True)`) and writes the rows that
+  differ from the table (all of them after a bad row). A row whose file is missing is found when the block is
+  read, as a damaged block is (`get` deletes it from the index). A million small blocks (NVMe, warm cache) are
+  indexed in 1.2 s from the table against 5.4 s for 0.1.6's listing; a start after an unclean stop takes 7.2 s
+  (1,024 directories listed, the table read and compared).
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.
