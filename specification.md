@@ -87,6 +87,15 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 **Announces and paths.**
 - A node announces `rnfs.dht` at startup, again after `startup_announce_delay` (interfaces may not have been
   up), then every `announce_interval`. Ratchets are not enabled: links are already forward secret.
+  - A client (section 6) MAY skip the periodic announces while nothing needs other nodes to reach it, but MUST
+    announce while it provides anything (section 6), owns names (it answers `/name` for them, section 9),
+    accepts remote pins (section 8) or is in private mode, and SHOULD announce at once when that starts. A
+    transport node forwards a path request only for a destination it has a path to, unless the request arrived
+    on an access-point, gateway, roaming or boundary interface, or one with `recursive_prs` (RNS 1.5.6
+    `Transport.path_request`); interfaces default to `full` mode, so a destination that never announces is
+    usually reachable from one hop away only. And private-mode servers of rnfs 0.1.4 to 0.1.6 drop at start the
+    records of publishers whose identity RNS doesn't recall. (rnfs: checked every minute; servers always
+    announce.)
 - The announce's `app_data` is the node's DHT mode as a msgpack integer: `1` server, `0` client (section 6).
   - Anything other than msgpack `1` means client. A node re-announces when its mode changes.
   - It is set with `Destination.set_default_app_data()`, so path responses carry it too.

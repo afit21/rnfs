@@ -534,7 +534,7 @@ class RnfsNode:
         self.fetcher.path_infos = self.paths.infos
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
-        self.announcer = DhtAnnouncer(self.destination, config)
+        self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
         self.announce_handler = DhtAnnounceHandler(self._heard_server, self._heard_client, self.routing.is_banned,
                                                    self.node_id, on_announced=self._announced)
         self.announce_handler.register()
@@ -544,6 +544,14 @@ class RnfsNode:
         log(f"storing blocks in {config.blocks_dir}, sharing everything in {config.files_dir}")
         self.announcer.start()
         self._start_threads()
+
+    def _needs_reach(self) -> bool:
+        """True if other nodes need to reach this node, so a client keeps announcing (DhtAnnouncer): it provides
+        something (CIDs, kept names' keys), owns names (it answers /name for them), accepts remote pins, or is in
+        private mode (servers of 0.1.4 to 0.1.6 drop at start the records of publishers whose identity RNS doesn't
+        recall)."""
+        return bool(self.config.private or self.config.remote_pin_set or self.publisher.provided()
+                    or self.publisher.provided_keys() or self.names.list())
 
     @classmethod
     def offline(cls, config: Config, node_id: bytes, client, names_network, slow: bool = False) -> "RnfsNode":

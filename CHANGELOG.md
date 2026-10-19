@@ -178,6 +178,9 @@ Provider records (DHT servers; spec section 6, all local policy: nothing on the 
   still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
 
 Changed:
+- A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
+  mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
+  announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
   0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.

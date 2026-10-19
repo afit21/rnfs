@@ -454,7 +454,10 @@ None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs
 RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if that identity is on
 `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
 
-`announces.py` — `DhtAnnouncer(destination, config)` sets `app_data` to the mode and runs the announce schedule;
+`announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
+announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
+provides, owns names, accepts remote pins, private mode) holds, checked every `REACH_CHECK` (60 s), announcing at
+once when it starts to;
 `DhtAnnounceHandler(on_server, on_client, is_banned)`.
 
 ## Node facade (used by api.py, gateway.py and cli.py)

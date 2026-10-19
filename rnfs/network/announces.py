@@ -37,14 +37,28 @@ def parse_mode(app_data) -> int:
     return MODE_CLIENT
 
 
-class DhtAnnouncer:
-    """Announces rnfs.dht at startup, after startup_announce_delay, then every announce_interval."""
+REACH_CHECK = 60.0  # seconds between checks of whether a client has started to need announcing
 
-    def __init__(self, destination: RNS.Destination, config: Config):
-        """Set destination's app_data to the mode (config.dht_mode); start() announces."""
+
+class DhtAnnouncer:
+    """Announces rnfs.dht at startup, after startup_announce_delay, then every announce_interval.
+
+    A client announces periodically only while needs_reach() is True (something needs other nodes to reach it:
+    it provides, keeps or owns names, accepts remote pins, or is in private mode), and at once when that starts:
+    a transport node forwards a path request only for a destination it has a path to (on its default interface
+    mode), so a node that never announces can't be reached beyond one hop. One that only fetches needs no path to
+    it, so it stops announcing after the startup announces (section 3). Servers always announce.
+    """
+
+    def __init__(self, destination: RNS.Destination, config: Config, needs_reach: Callable[[], bool] | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        """Set destination's app_data to the mode (config.dht_mode); start() announces. needs_reach: the client's
+        test (None: always announce)."""
         self.destination = destination
         self.config = config
         self.server = config.dht_mode == "server"
+        self.needs_reach = needs_reach
+        self.clock = clock
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         destination.set_default_app_data(encode_mode(self.server))
@@ -67,14 +81,30 @@ class DhtAnnouncer:
         """Stop announcing."""
         self.stop_event.set()
 
+    def _needed(self) -> bool:
+        """True if the periodic announces are due to go out: always on a server, while needs_reach() on a client."""
+        if self.server or self.needs_reach is None:
+            return True
+        try:
+            return bool(self.needs_reach())
+        except Exception as e:  # noqa: BLE001 - a failing test must not stop announcing: announce, logged
+            log(f"could not tell whether to announce: {e!r}", LOG_WARNING)
+            return True
+
     def _run(self):
-        """Announce now, again after startup_announce_delay (interfaces may not have been up), then periodically."""
+        """Announce now, again after startup_announce_delay (interfaces may not have been up), then periodically
+        while needed, and at once when a client comes to need it."""
         self.announce()
         if self.stop_event.wait(self.config.startup_announce_delay):
             return
         self.announce()
-        while not self.stop_event.wait(self.config.announce_interval):
-            self.announce()
+        last = self.clock()
+        needed = True  # the startup announces count: a client that already needs reaching isn't announced again
+        while not self.stop_event.wait(min(REACH_CHECK, self.config.announce_interval)):
+            was_needed, needed = needed, self._needed()
+            if needed and (not was_needed or self.clock() - last >= self.config.announce_interval):
+                self.announce()
+                last = self.clock()
 
 
 class DhtAnnounceHandler:

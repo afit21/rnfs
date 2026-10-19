@@ -245,6 +245,20 @@ class LocalFacadeTest(NodeTest):
         self.a.name_rm("site")
         self.assertNotIn(Cid.parse(published["cid"]), self.a.publisher.provided())
 
+    def test_needs_reach(self):
+        """A client keeps announcing only while something needs others to reach it: providing, a name, remote
+        pins, private mode."""
+        fetcher_only = self.make_node("c", bytes(range(16)), dht_mode="client")
+        self.assertFalse(fetcher_only._needs_reach())
+        cid = fetcher_only.add_path(self.tree())["cid"]
+        self.assertTrue(fetcher_only._needs_reach())
+        fetcher_only.pin_rm(cid)
+        self.assertFalse(fetcher_only._needs_reach())
+        fetcher_only.name_create("site")
+        self.assertTrue(fetcher_only._needs_reach())
+        self.assertTrue(self.make_node("d", bytes(range(1, 17)), dht_mode="client",
+                                       remote_pin_identities=["00" * 16])._needs_reach())
+
     def test_name_key_backups(self):
         """create and import remind the user to back the key up; status lists the keys never exported until the
         user's export (not a feature reading the key) or an import."""
