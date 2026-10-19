@@ -305,6 +305,76 @@ def tar_chunks(node, target: str) -> Iterator:
         yield from tarstream.chunks(members, fetch.get, mtime, max_entries)
 
 
+# Adding from NomadNet (`rnfs add <destination>:/page/<path>`, specification section 11)
+
+
+def nomadnet_identity_path(config) -> str:
+    """Where the identity `add --identify` identifies to NomadNet nodes with is kept: <rnfs dir>/storage/
+    nomadnet_identity. Its own, never the node's, so pages fetched aren't tied to the node ID."""
+    return os.path.join(os.path.dirname(config.identity_path), "nomadnet_identity")
+
+
+def nomadnet_room(node) -> int:
+    """The most bytes a NomadNet answer may have: max_download_size if set, and the free space above the disk
+    reserve where the answer is copied (the state directory, beside the blocks). Raises StorageFull if there is
+    none."""
+    import shutil
+
+    from rnfs.content.storage import disk_reserve
+    from rnfs.errors import StorageFull
+
+    usage = shutil.disk_usage(node.config.state_dir)
+    room = usage.free - disk_reserve(usage.total)
+    if room <= 0:
+        raise StorageFull(f"no free space above the disk reserve in {node.config.state_dir}")
+    limit = node.config.max_download_size
+    return room if limit is None else min(room, limit)
+
+
+def add_nomadnet(node, link: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
+                 to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
+                 chunker: str | None = None, name: str | None = None, identify: bool = False,
+                 progress: Callable[[int, int | None], None] | None = None) -> dict:
+    """Fetch what a NomadNet node serves at link (rnfs/network/nomadnet.py: its own bounded link, anonymous unless
+    identify) and add it as add_stream adds data: chunked, checked against the deny list, pinned "user" (cache if
+    not pin) unless only_hash, sealed for to/to_self. It is a file named by nomadnet.snapshot_name (the node's name
+    for a file, the path's last component for a page), wrapped under that name with wrap or under name if given (as
+    `add - --name`; sealing seals that name inside instead, unless wrap), unless not seal_name; pin ls names the
+    link as its origin. Each call takes a new
+    snapshot. progress(received, total) as the fetch takes it. {"cid", "size", "warnings", "name", "link"}
+    (+ "sealed")."""
+    from rnfs import nomadnet
+    from rnfs.network import nomadnet as fetching
+
+    target = nomadnet.parse(link)
+    if name is not None and not nomadnet.is_valid_name(name):
+        raise ValueError(f"invalid entry name {name!r}")
+    seal_recipients(node, to, to_self, only_hash)  # unknown recipients refused before anything is fetched
+    builder.BuildOptions(chunker)  # an unknown chunker too
+    identity = None
+    if identify:
+        from rnfs.network.identity import load_or_create_identity
+        identity = load_or_create_identity(nomadnet_identity_path(node.config))
+    snapshot = fetching.fetch(target, node.config, node.config.state_dir, identity=identity,
+                              max_size=nomadnet_room(node), progress=progress,
+                              stop_event=getattr(node, "stop_event", None))
+    try:
+        entry = name or nomadnet.snapshot_name(target, snapshot.sent_name)
+        sealing = bool(to or to_self)
+        # As `add - --name`: name wraps it, except that sealing seals the name inside instead, unless wrap
+        wrapper = entry if wrap or (name and not sealing) else None
+        with open(snapshot.path, "rb") as stream:
+            result = node.add_stream(stream, size=snapshot.size, name=wrapper, only_hash=only_hash, pin=pin, to=to,
+                                     to_self=to_self, seal_name=entry if sealing and seal_name else None,
+                                     chunker=chunker, origin=str(target))
+    finally:
+        try:
+            os.unlink(snapshot.path)
+        except FileNotFoundError:
+            pass
+    return {**result, "name": entry, "link": str(target)}
+
+
 # API parameters
 
 

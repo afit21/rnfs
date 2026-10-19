@@ -55,7 +55,7 @@ from rnfs.mesh import RnsPaths
 from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
 from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
-from rnfs.network import guards, rates
+from rnfs.network import guards, nomadnet, rates
 from rnfs.network.announces import DhtAnnounceHandler, DhtAnnouncer, parse_mode
 from rnfs.network.client import PeerClient
 from rnfs.network.identity import load_or_create_identity, parse_node_id
@@ -570,6 +570,7 @@ class RnfsNode:
             except ValueError as e:
                 log(f"ignoring bootstrap node: {e}", LOG_WARNING)
         _make_private_dirs(config.root)
+        nomadnet.remove_leftovers(config.state_dir)  # copies of NomadNet answers an interrupted add left there
         # Every store, in the order made, and those _save_state saves (the others save on a schedule of their own).
         # A store is added as soon as it is made, so a _setup that fails releases exactly the ones it made. The
         # features are stores too, listed by self.features (_every_store)
@@ -1315,9 +1316,10 @@ class RnfsNode:
 
     def add_stream(self, stream: BinaryIO, size: int | None = None, name: str | None = None,
                    only_hash: bool = False, pin: bool = True, to: list[str] | None = None, to_self: bool = False,
-                   seal_name: str | None = None, chunker: str | None = None) -> dict:
+                   seal_name: str | None = None, chunker: str | None = None, origin: str | None = None) -> dict:
         """Import a stream (wrapped as the entry name if given), pinned "user" (cache if not pin) unless
-        only_hash; sealed for to/to_self (with seal_name inside) if given; chunker as for add_path."""
+        only_hash; sealed for to/to_self (with seal_name inside) if given; chunker as for add_path. origin is what
+        pin ls says it was added from (default: the name, or "(stdin)")."""
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
         stream, size = node_content.sealing_stream(stream, size, recipients, seal_name)
         options = builder.BuildOptions(chunker)  # ValueError for an unknown chunker, before anything is read
@@ -1330,9 +1332,21 @@ class RnfsNode:
                     built = builder.add_stream(stream, put, size, name, options=options)
                 node_content.keep_added(self, built.cid, pin)
             if pin:
-                self.pin_names.record(built.cid, name or seal_name or "(stdin)")
+                self.pin_names.record(built.cid, origin or name or seal_name or "(stdin)")
             self._added(built)
         return {"cid": str(built.cid), "size": built.size, "warnings": [], **({"sealed": True} if recipients else {})}
+
+    def add_nomadnet(self, link: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
+                     to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
+                     chunker: str | None = None, name: str | None = None, identify: bool = False,
+                     progress: Callable[[int, int | None], None] | None = None) -> dict:
+        """Add a snapshot of what a NomadNet node serves at link (<destination>:/page/<path> or :/file/<path>), as
+        add_stream adds data, pin ls naming the link as its origin (node_content.add_nomadnet). Raises ValueError
+        (a malformed link or option), NotFound (unreachable, no answer, "Request Not Allowed"), TooLarge, Denied,
+        StorageFull, Cancelled (progress raised it, or the node is stopping)."""
+        return node_content.add_nomadnet(self, link, wrap=wrap, only_hash=only_hash, pin=pin, to=to, to_self=to_self,
+                                         seal_name=seal_name, chunker=chunker, name=name, identify=identify,
+                                         progress=progress)
 
     def add_tar(self, stream: BinaryIO, name: str | None = None, only_hash: bool = False, pin: bool = True,
                 chunker: str | None = None) -> dict:

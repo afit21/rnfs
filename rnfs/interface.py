@@ -598,6 +598,25 @@ class Rnfs:
                                               **options)
         return Added.from_dict(result)
 
+    def add_nomadnet(self, link: str, *, name: str | None = None, wrap: bool = False, pin: bool = True,
+                     only_hash: bool = False, to: list[str] | None = None, to_self: bool = False,
+                     seal_name: bool = True, chunker: str | None = None, identify: bool = False) -> Added:
+        """Add a snapshot of what a NomadNet node serves at link (<32 hex destination>:/page/<path> or :/file/<path>)
+        as add() adds data: a page as the node renders it for this request, a file as it sends it, fetched over a
+        link of its own and bounded as specification section 11 says. It is named by the node's name for a file
+        (the path's last component for a page, or one not fit to be a name), wrapped in a directory under that name
+        with wrap, or under name if given; to/to_self seal it (that name inside unless seal_name is False, as add()
+        seals data's). The link doesn't identify unless identify, then with the node's NomadNet identity (never its
+        own). Each call takes a new snapshot. Raises ValueError (a malformed link or option), NotFound (unreachable,
+        no answer, or the node's "Request Not Allowed" page), TooLarge, Denied, StorageFull."""
+        self._check()
+        if not isinstance(link, str):
+            raise ValueError(f"a NomadNet link is a string, not {type(link).__name__}")
+        options = {"wrap": bool(wrap), "pin": bool(pin), "only_hash": bool(only_hash), "to": recipients(to),
+                   "to_self": bool(to_self), "seal_name": bool(seal_name), "chunker": chunker, "name": name or None,
+                   "identify": bool(identify)}
+        return Added.from_dict(self._backend.add_nomadnet(link, **options))
+
     def get(self, target, output, *, from_node=None, raw: bool = False) -> Written:
         """Fetch a file or directory and write it to output (a path that must not exist), all in this call. A
         sealed file this node can open is decrypted unless raw. Raises the fetch errors (NotFound, TooLarge,
@@ -1191,7 +1210,8 @@ class Job:
     """A background transfer (get, pin, export, add or import) the node runs, persists and resumes after a restart:
     its record as of the last refresh(), wait() or callback. done is True once it has finished (state "done",
     "failed" or "cancelled"); result is what the matching call returns, error why it failed. An add or import job
-    has a path (and an add its options) instead of a target."""
+    has a path (and an add its options) instead of a target; an add of a NomadNet link has that link (nomadnet)
+    instead of a path."""
 
     id: str
     kind: str
@@ -1202,6 +1222,7 @@ class Job:
     fallback_dht: bool = False
     path: str | None = None
     options: dict | None = None
+    nomadnet: str | None = None
     state: str = "queued"
     created: float | None = None
     started: float | None = None
@@ -1218,8 +1239,8 @@ class Job:
     eta: float | None = None
     _owner: Rnfs | None = field(default=None, repr=False, compare=False)
 
-    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "state", "created",
-              "started",
+    FIELDS = ("id", "kind", "target", "output", "sealed_name", "fallback_dht", "path", "options", "nomadnet", "state",
+              "created", "started",
               "finished", "error", "result", "runs", "total_bytes", "done_bytes", "blocks", "blocks_total",
               "downloaded_bytes", "rate", "eta")
 
@@ -1305,6 +1326,22 @@ class Jobs:
                    "chunker": chunker}
         return self._submit("add", None, None, None, on_progress, path=_abspath(path),
                             options={name: value for name, value in options.items() if value is not None} or None)
+
+    def add_nomadnet(self, link: str, *, name: str | None = None, wrap: bool = False, pin: bool = True,
+                     only_hash: bool = False, to: list[str] | None = None, to_self: bool = False,
+                     seal_name: bool = True, chunker: str | None = None, identify: bool = False,
+                     on_progress=None) -> Job:
+        """Add a snapshot of a NomadNet link as a job: add_nomadnet()'s options, its result add_nomadnet()'s Added as
+        a dict; progress counts the bytes of the node's answer received. An interrupted one fetches a new snapshot
+        when it runs again. Raises ValueError (a malformed link or option), Busy."""
+        if not isinstance(link, str):
+            raise ValueError(f"a NomadNet link is a string, not {type(link).__name__}")
+        options = {"wrap": True if wrap else None, "pin": None if pin else False,
+                   "only_hash": True if only_hash else None, "to": recipients(to),
+                   "to_self": True if to_self else None, "seal_name": None if seal_name else False,
+                   "chunker": chunker, "name": name or None, "identify": True if identify else None}
+        return self._submit("add", None, None, None, on_progress, nomadnet=link,
+                            options={key: value for key, value in options.items() if value is not None} or None)
 
     def import_archive(self, path, *, on_progress=None) -> Job:
         """Import an archive on the node's machine as a job (import_archive()'s result as a dict); progress counts

@@ -101,6 +101,25 @@ Added:
   which keys were exported by `name export` or imported, and `rnfs status` (`GET /api/status`,
   `Status.unexported_names`) lists the names whose key never was. `name list` entries and `rnfs.Name` gain
   `exported`.
+- **Pin by NomadNet address:** `rnfs add <destination>:/page/<path>` (a page as the node renders it) or
+  `<destination>:/file/<path>` (a file it serves) fetches it from that NomadNet node over a link of rnfs's own and
+  adds it like a file, pinned `user` with the link as its origin in `pin ls`; the usual `add` options apply
+  (`--no-pin`, `--wrap`, `--name`, `--to`, `--chunker`, `--only-hash`, `--background`), and it runs as an `add`
+  job with progress. Each run takes a new snapshot. The link is anonymous unless `--identify`, which identifies
+  with an identity of its own (`storage/nomadnet_identity`, made on first use), never the node's. A page the node
+  answers with its "Request Not Allowed" page fails rather than being pinned. A local file named like such a link
+  is added as `./<name>`. `POST /api/add` takes `nomadnet` (with `name` and `identify`) instead of `path`, as do add
+  jobs (`POST /api/jobs`); capability `add_nomadnet`; `rnfs.Node`/`rnfs.Client` `add_nomadnet()` and
+  `jobs.add_nomadnet()`. Request data (a page's fields or `var_` values) isn't supported.
+
+Security:
+- **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
+  may be no larger than `max_download_size` and the free space above the disk reserve; each Resource segment may
+  decompress to one segment, and must follow the sequence an honest sender keeps (same original hash and total,
+  the next index, the segment count the total gives), else the transfer is cancelled and the link closed; what is
+  assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
+  decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
+  daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

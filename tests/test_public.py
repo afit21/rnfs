@@ -107,6 +107,28 @@ class PublicTests:
 
     # Content
 
+    def test_add_nomadnet(self):
+        """add_nomadnet and jobs.add_nomadnet: a snapshot of a NomadNet link added as add() adds data."""
+        from rnfs.network import nomadnet as fetching
+        from tests.test_nomadnet import FILE, FILE_BYTES, PAGE, FakeNomadnet
+        fake = FakeNomadnet()
+        with mock.patch.object(fetching, "fetch", fake):
+            added = self.rnfs.add_nomadnet(FILE, wrap=True, pin=False)
+            self.assertIsInstance(added, objects.Added)
+            self.assertEqual([entry.name for entry in self.rnfs.ls(added.cid)], ["song.mp3"])
+            self.assertNotIn(str(added.cid), {pin["cid"] for pin in self.b.pin_ls()})
+            plain = self.rnfs.add_nomadnet(FILE)
+            self.assertEqual(plain.size, len(FILE_BYTES))
+            self.assertEqual(self.b.pin_ls(str(plain.cid))[0]["origin"], FILE)
+            self.rnfs.add_nomadnet(PAGE, identify=True)
+            self.assertIsNotNone(fake.calls[-1]["identity"])
+            job = self.rnfs.jobs.add_nomadnet(FILE, name="tune.mp3").wait(10)
+            self.assertEqual((job.state, job.kind, job.nomadnet, job.path), ("done", "add", FILE, None))
+            self.assertEqual(job.options, {"name": "tune.mp3"})
+            for bad in ({"link": FILE, "name": "a/b"}, {"link": 5}, {"link": FILE + "/.."}):
+                with self.subTest(bad), self.assertRaises(ValueError):
+                    self.rnfs.add_nomadnet(**bad)
+
     def test_add_ls_info_stat(self):
         """add() of data returns Added; ls, info and stat describe what it stored."""
         data = os.urandom(150_000)

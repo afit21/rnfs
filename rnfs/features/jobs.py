@@ -18,6 +18,10 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   blocks stored already are kept), and what a cancelled one stored is unreferenced until the next collection.
   An add job's options are POST /api/add's (ADD_OPTIONS); a sealed add run again seals afresh, so only the run
   that finishes gives the job its CID.
+- An add job may add a NomadNet link (nomadnet, `rnfs add <destination>:/page/<path>`) instead of a path: the node's
+  add_nomadnet, with name and identify among its options too (NOMADNET_OPTIONS). Its total_bytes is the answer's
+  advertised size once a Resource brings it, done_bytes what has arrived, its rate bytes received; cancelling it, or
+  the node stopping, closes its link at the fetch's next poll. A resumed one fetches a new snapshot.
 - Every change of a job's state (queued, running, done, failed, cancelled, and forgotten: "removed") and, at
   most once a second (EVENT_INTERVAL), a running job's progress is published as a "job" event (rnfs.events) with
   the job's state and progress fields (Job.event; the job's kind as "job_kind", an event's "kind" being "job"),
@@ -69,6 +73,7 @@ LOCAL_KINDS = frozenset({"add", "import"})  # read a path on this machine rather
 # An add job's options: POST /api/add's, each with its JSON type (absent: add_path's default)
 ADD_OPTIONS = {"wrap": bool, "only_hash": bool, "pin": bool, "to": list, "to_self": bool, "seal_name": bool,
                "chunker": str}
+NOMADNET_OPTIONS = {"name": str, "identify": bool}  # what an add job of a NomadNet link takes besides ADD_OPTIONS
 MAX_RECIPIENT_TEXT = 256  # characters of one of an add job's to= recipients (a key is 128 hex digits)
 QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
 STATES = (QUEUED, RUNNING, DONE, FAILED, CANCELLED)
@@ -100,9 +105,11 @@ class Job:
 
     def __init__(self, job_id: str, kind: str, target: str | None, output: str | None = None,
                  from_node: str | None = None, created: float | None = None, sealed_name: bool = False,
-                 fallback_dht: bool = False, path: str | None = None, options: dict | None = None):
+                 fallback_dht: bool = False, path: str | None = None, options: dict | None = None,
+                 nomadnet: str | None = None):
         """A queued job; from_node is a node ID in hex. sealed_name and fallback_dht are for get jobs; path (and
-        for add, options: ADD_OPTIONS) for add and import jobs, which have no target."""
+        for add, options: ADD_OPTIONS) for add and import jobs, which have no target; an add job may have a NomadNet
+        link (nomadnet) instead of a path."""
         self.id = job_id
         self.kind = kind
         self.target = target
@@ -112,6 +119,7 @@ class Job:
         self.fallback_dht = fallback_dht  # if from_node fails, try again with ordinary DHT discovery
         self.path = path  # what an add or import job reads, on this machine
         self.options = options  # an add job's add_path options (only those set)
+        self.nomadnet = nomadnet  # an add job's NomadNet link, which it adds instead of a path
         self.state = QUEUED
         self.created = time.time() if created is None else created
         self.started: float | None = None  # when the latest run started
@@ -139,8 +147,10 @@ class Job:
 
     @property
     def subject(self) -> str:
-        """What the job works on, for messages: its target, or an add's or import's path."""
-        return self.target if self.target is not None else str(self.path)
+        """What the job works on, for messages: its target, or an add's or import's path or NomadNet link."""
+        if self.target is not None:
+            return self.target
+        return self.nomadnet if self.nomadnet is not None else str(self.path)
 
     # Observer (rnfs.fetcher.Observer), called on the job's thread
 
@@ -249,11 +259,14 @@ class Job:
 
     def to_record(self) -> dict:
         """The job as saved (a running job is saved as such, and queued again when loaded). path and options
-        only for the kinds that have them (add, import), so the record of every other job is as 0.1.6 saved it."""
+        only for the kinds that have them (add, import), and nomadnet only for an add of a NomadNet link, so the record
+        of every other job is as 0.1.6 saved it."""
         record = {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
                   "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht}
-        if self.path is not None or self.options is not None:
+        if self.path is not None or self.options is not None or self.nomadnet is not None:
             record.update(path=self.path, options=self.options)
+        if self.nomadnet is not None:
+            record["nomadnet"] = self.nomadnet
         record.update({"state": self.state, "created": self.created, "started": self.started,
                        "finished": self.finished, "error": self.error, "result": self.result, "runs": self.runs,
                        "total_bytes": self.total_bytes, "done_bytes": self.done_bytes, "blocks": self.blocks,
@@ -272,10 +285,10 @@ class Job:
         if kind not in KINDS or state not in STATES:
             raise ValueError("bad kind or state")
         sealed_name, fallback_dht = record.get("sealed_name", False), record.get("fallback_dht", False)
-        path, options = record.get("path"), record.get("options")
-        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options)
+        path, options, nomadnet = record.get("path"), record.get("options"), record.get("nomadnet")
+        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options, nomadnet)
         job = cls(job_id, kind, target, output, from_node, _number(record.get("created"), time.time()),
-                  sealed_name, fallback_dht, path, options)
+                  sealed_name, fallback_dht, path, options, nomadnet)
         job.state = state
         job.started = _number(record.get("started"), None)
         job.finished = _number(record.get("finished"), None)
@@ -317,23 +330,29 @@ def _capped(result: dict) -> dict:
 
 
 def check_job_params(kind: str, target, output, from_node, sealed_name=False, fallback_dht=False, path=None,
-                     options=None):
+                     options=None, nomadnet=None):
     """Raise ValueError unless these fit a job of kind: for get, pin and export a well-formed target, an absolute
     output path for get and export (none for pin), and from (a node ID in hex), sealed_name and fallback_dht
     (booleans) only for get; for add and import an absolute path and neither target nor output, and options
-    (check_add_options) only for add."""
+    (check_add_options) only for add; an add may have a NomadNet link (nomadnet, as written) instead of a path."""
+    from rnfs import nomadnet as nomadnet_links
     from rnfs.content import walker  # validates the root CID and every path name
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+    if nomadnet is not None:
+        if kind != "add" or path is not None:
+            raise ValueError("only an add job takes a NomadNet link, instead of a path")
+        if not isinstance(nomadnet, str) or str(nomadnet_links.parse(nomadnet)) != nomadnet:
+            raise ValueError(f"malformed NomadNet link {nomadnet!r}")
     if kind in LOCAL_KINDS:
         if target is not None or output is not None:
             raise ValueError(f"an {kind} job reads a path: it takes no target or output")
-        if not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path:
+        if nomadnet is None and (not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path):
             raise ValueError(f"path must be an absolute path: {path!r}")
         if options is not None:
             if kind != "add":
                 raise ValueError("only add jobs take options")
-            check_add_options(options)
+            check_add_options(options, nomadnet is not None)
     elif path is not None or options is not None:
         raise ValueError(f"a {kind} job takes a target, not a path")
     else:
@@ -355,15 +374,17 @@ def check_job_params(kind: str, target, output, from_node, sealed_name=False, fa
             raise ValueError(f"only get jobs take {name}")
 
 
-def check_add_options(options):
-    """Raise ValueError unless options are an add job's: a JSON object of ADD_OPTIONS, each of its type, to a list of
-    at most MAX_RECIPIENTS recipient strings, chunker a known chunker's name. What the node checks only when the
-    add runs (recipients it knows, only_hash with to) fails the job then, with the add's own message."""
+def check_add_options(options, nomadnet: bool = False):
+    """Raise ValueError unless options are an add job's: a JSON object of ADD_OPTIONS (and NOMADNET_OPTIONS for an add
+    of a NomadNet link), each of its type, to a list of at most MAX_RECIPIENTS recipient strings, chunker a known
+    chunker's name, name a valid entry name. What the node checks only when the add runs (recipients it knows,
+    only_hash with to) fails the job then, with the add's own message."""
+    from rnfs import nomadnet as nomadnet_links
     from rnfs.content import chunker, seal
     if not isinstance(options, dict):
         raise ValueError("an add job's options must be an object")
     for name, value in options.items():
-        expected = ADD_OPTIONS.get(name)
+        expected = ADD_OPTIONS.get(name) or (NOMADNET_OPTIONS.get(name) if nomadnet else None)
         if expected is None:
             raise ValueError(f"unknown add option {name!r}")
         if type(value) is not expected:
@@ -374,15 +395,20 @@ def check_add_options(options):
         raise ValueError(f"to must list at most {seal.MAX_RECIPIENTS} recipients")
     if "chunker" in options:
         chunker.check(options["chunker"])
+    if "name" in options and not nomadnet_links.is_valid_name(options["name"]):
+        raise ValueError(f"invalid entry name {options['name']!r}")
 
 
-def add_job_options(value) -> dict | None:
+def add_job_options(value, nomadnet: bool = False) -> dict | None:
     """An add job's options from a JSON body's value(name) (None when absent), as POST /api/add takes them: wrap
-    and only_hash (flags), and node_content.add_options' (pin, to, to_self, seal_name, chunker); only those set, or
-    None for none. Raises ValueError as POST /api/add does."""
+    and only_hash (flags), and node_content.add_options' (pin, to, to_self, seal_name, chunker), and for an add of a
+    NomadNet link name and identify; only those set, or None for none. Raises ValueError as POST /api/add does."""
     from rnfs import api, node_content
-    options = {name: True for name in ("wrap", "only_hash") if api.parse_bool(value(name))}
+    flags = ("wrap", "only_hash", "identify") if nomadnet else ("wrap", "only_hash")
+    options = {name: True for name in flags if api.parse_bool(value(name))}
     options.update(node_content.add_options(value))
+    if nomadnet and api.parse_entry_name(value("name")) is not None:
+        options["name"] = value("name")
     return options or None
 
 
@@ -642,7 +668,10 @@ class JobsFeature(Feature):
         return result
 
     def _add(self, job: Job) -> dict:
-        """An add job: measure what it will read, then node.add_path with its options, as POST /api/add calls it."""
+        """An add job: measure what it will read, then node.add_path with its options, as POST /api/add calls it; or
+        node.add_nomadnet of its NomadNet link, its progress what has arrived of the answer."""
+        if job.nomadnet is not None:
+            return self.node.add_nomadnet(job.nomadnet, progress=_answer_progress(job), **(job.options or {}))
         from rnfs.content import builder
         try:
             job.total(builder.tree_size(job.path, job.check_cancelled))
@@ -737,19 +766,20 @@ class JobsFeature(Feature):
 
     def submit(self, kind: str, target: str | None = None, output: str | None = None, from_node: str | None = None,
                sealed_name: bool = False, fallback_dht: bool = False, path: str | None = None,
-               options: dict | None = None) -> dict:
+               options: dict | None = None, nomadnet: str | None = None) -> dict:
         """Queue a job; its dict. Raises ValueError for bad parameters or an output in use, NotFound for an add's
         or import's path that doesn't exist, Busy when full.
 
         For get: sealed_name writes a sealed file under its sealed name beside output; fallback_dht retries
-        by DHT discovery if from_node fails. For add and import: path, and for add options (ADD_OPTIONS).
+        by DHT discovery if from_node fails. For add and import: path, and for add options (ADD_OPTIONS); or for add a
+        NomadNet link (nomadnet) instead of a path, with NOMADNET_OPTIONS among its options too.
         """
         from rnfs.errors import Busy, NotFound
         contacts = self.dependency("contacts")
         if contacts is not None and target is not None:
             # `alice/docs`: a name contact's nick becomes the CID its name points at now (rnfs.features.contacts)
             target = contacts.expand_target(target)
-        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options)
+        check_job_params(kind, target, output, from_node, sealed_name, fallback_dht, path, options, nomadnet)
         if output is not None and os.path.lexists(output):
             raise ValueError(f"{output} already exists")
         if path is not None and not os.path.lexists(path):
@@ -769,7 +799,7 @@ class JobsFeature(Feature):
             while job_id in self._jobs:
                 job_id = secrets.token_hex(4)
             job = Job(job_id, kind, target, output, from_node, sealed_name=sealed_name, fallback_dht=fallback_dht,
-                      path=path, options=options)
+                      path=path, options=options, nomadnet=nomadnet)
             job.stop_event = self._stop_event
             job.on_progress = self._publish
             job.position = self._position
@@ -869,6 +899,22 @@ class JobsFeature(Feature):
 FEATURE = JobsFeature
 
 
+def _answer_progress(job: Job):
+    """The progress callback (received, total) an add job of a NomadNet link gives the fetch: the answer's size as
+    the job's total, what has arrived as read (Job.read, which raises Cancelled once the job is cancelled)."""
+    counted = 0
+
+    def progress(received: int, total: int | None):
+        """Count what arrived since the last call; checks for cancellation even when nothing did."""
+        nonlocal counted
+        if total is not None and job.total_bytes != total:
+            job.total(total)
+        job.read(max(0, received - counted))
+        counted = max(counted, received)
+
+    return progress
+
+
 def partial_path(job: Job) -> str:
     """Where a get job writes before renaming to its output: hidden, beside it, named by the job's ID."""
     return os.path.join(os.path.dirname(job.output), f".rnfs-job-{job.id}{PARTIAL_SUFFIX}")
@@ -893,12 +939,20 @@ def _feature(handler) -> JobsFeature:
 
 def api_start(handler):
     """POST /api/jobs {"kind", "target", "output", "from", "sealed_name", "fallback_dht"} for get, pin and export;
-    {"kind": "add", "path", and POST /api/add's options} or {"kind": "import", "path"}: queue a job; the job."""
+    {"kind": "add", "path" or "nomadnet", and POST /api/add's options} or {"kind": "import", "path"}: queue a job;
+    the job."""
     from rnfs import api
     body = handler.json_body()
     kind = body.get("kind")
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+    if kind == "add" and body.get("nomadnet") is not None:
+        if body.get("path") is not None:
+            raise ValueError("give either path or nomadnet, not both")
+        handler.send_json(200, _feature(handler).submit(kind, body.get("target"), body.get("output"),
+                                                        nomadnet=api.parse_nomadnet(body.get("nomadnet")),
+                                                        options=add_job_options(body.get, nomadnet=True)))
+        return
     if kind in LOCAL_KINDS:
         path = api.parse_path(body.get("path"))
         options = add_job_options(body.get) if kind == "add" else None
@@ -986,6 +1040,8 @@ def format_progress(job: dict, width: int = 20) -> str:
     if state == RUNNING:
         rate = job.get("rate")
         speed = f"{human_size(rate)}/s" if rate is not None else "-/s"
+        if total is None and job.get("nomadnet"):
+            return f"waiting for the NomadNet node's answer: {human_size(done)}, {speed}"
         if total is None and job.get("kind") in LOCAL_KINDS:
             return f"reading: {human_size(done)}, {speed}"  # its size is being measured
         if total is None:

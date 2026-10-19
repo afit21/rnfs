@@ -173,10 +173,11 @@ class FakeNode:
         return {"cid": cid, "size": self._size(cid), "warnings": ["skipped a symlink"] if wrap else []}
 
     def add_stream(self, stream, size=None, name=None, only_hash=False, pin=True, to=None, to_self=False,
-                   seal_name=None, chunker=None):
+                   seal_name=None, chunker=None, origin=None):
         data = stream.read()
         self.record("add_stream", data, size=size, name=name, only_hash=only_hash,
-                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker))
+                    **self._given("add_stream", pin=pin, to=to, to_self=to_self, seal_name=seal_name, chunker=chunker,
+                                  origin=origin))
         if size is not None and len(data) != size:
             raise ValueError("stream shorter than its size")
         cid = self.put_file(data)

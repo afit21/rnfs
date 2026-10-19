@@ -735,6 +735,18 @@ class ApiConnection:
                           only_hash=only_hash or None, pin=None if pin else False, to=to or None,
                           to_self=to_self or None, seal_name=None if seal_name else False, chunker=chunker)
 
+    def add_nomadnet(self, link: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,
+                     to: list[str] | None = None, to_self: bool = False, seal_name: bool = True,
+                     chunker: str | None = None, name: str | None = None, identify: bool = False) -> dict:
+        """Add a snapshot of what a NomadNet node serves at link (<destination>:/page/<path> or :/file/<path>), as
+        add_path adds a file: {"cid", "size", "warnings", "name", "link"} (+ "sealed"). name wraps it in a directory
+        as that entry (with wrap, under the node's name for it); identify identifies with the daemon's NomadNet
+        identity. A daemon without the "add_nomadnet" capability (before 0.2.0) answers BadRequest (no path)."""
+        return self._post("/api/add", nomadnet=link, wrap=wrap or None, only_hash=only_hash or None,
+                          pin=None if pin else False, to=to or None, to_self=to_self or None,
+                          seal_name=None if seal_name else False, chunker=chunker, name=name,
+                          identify=identify or None)
+
     def add_stream(self, data, name: str | None = None, length: int | None = None, only_hash: bool = False,
                    pin: bool = True, to: list[str] | None = None, to_self: bool = False,
                    seal_name: str | None = None, chunker: str | None = None) -> dict:
