@@ -7,6 +7,10 @@ quick_check, sets nothing aside, and a second start changes nothing. The tables 
 exactly those a fresh database gets, so a released schema step edited in place (which a database 0.1.5 wrote
 would never see) fails here as well as in test_statedb's digest.
 
+The blocks are written in the flat layout 0.1.6 left (blocks/<cid>); BlockLayoutTest checks they are moved into
+their subdirectories from that, from a move an earlier start left half done, with partial files left over, and
+when a move fails.
+
 The clock is the fixture's (expected.json's "now"), so no record has expired."""
 import functools
 import importlib.util
@@ -22,10 +26,12 @@ from unittest import mock
 
 import RNS
 
+from rnfs import fsutil, statedb
 from rnfs import node as node_module
-from rnfs import statedb
 from rnfs.config import Config
 from rnfs.content import builder
+from rnfs.content.blockstore import PARTIAL_PREFIX, shard_of
+from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, state_rows
 from tests.test_names import FakeNetwork
@@ -94,7 +100,7 @@ def schema_sql(path: str) -> dict[str, str]:
         conn.close()
 
 
-class UpgradeTest(unittest.TestCase):
+class FixtureCase(unittest.TestCase):
     """A copy of the fixture under a temporary directory, with its blocks, started on with the clock at "now"."""
 
     def setUp(self):
@@ -128,6 +134,10 @@ class UpgradeTest(unittest.TestCase):
         node = RnfsNode.offline(config, NODE_ID, NetClient(), FakeNetwork())
         self.addCleanup(node.stop)
         return node
+
+
+class UpgradeTest(FixtureCase):
+    """Every row 0.1.5 left is kept."""
 
     def test_fixture_is_complete(self):
         """The fixture is what its README says: 0.1.5's schema, rows in every table, the 0.1.5-only ones included,
@@ -197,6 +207,87 @@ class UpgradeTest(unittest.TestCase):
         db.close()
         fresh = schema_sql(os.path.join(self.tmp.name, "fresh", statedb.DB_FILE))
         self.assertEqual({name: fresh.get(name) for name in released}, released)
+
+
+class BlockLayoutTest(FixtureCase):
+    """The blocks, written in 0.1.6's flat layout, are moved into their subdirectories by the start, whatever state an
+    earlier start left the move in, and every pin stays complete."""
+
+    def flat_blocks(self) -> list[str]:
+        """The block files directly in blocks/."""
+        return sorted(name for name in os.listdir(self.blocks) if os.path.isfile(os.path.join(self.blocks, name))
+                      and not name.startswith(PARTIAL_PREFIX))
+
+    def check_complete(self, node: RnfsNode):
+        """Every pin is complete, and every block made is stored, in its subdirectory unless still flat."""
+        pins = node.storage.pins()
+        self.assertTrue(pins)
+        for cid in pins:
+            self.assertTrue(node.storage.is_complete(cid), cid)
+        for cid in self.built:
+            self.assertTrue(node.storage.has(cid), cid)
+
+    def in_shard(self, name: str) -> str:
+        """Where the block named name goes."""
+        return os.path.join(self.blocks, shard_of(name), name)
+
+    def setUp(self):
+        """As FixtureCase, noting the blocks directory and its flat blocks."""
+        super().setUp()
+        self.blocks = os.path.join(self.root, "blocks")
+        self.names = self.flat_blocks()
+        self.assertGreater(len(self.names), 10)
+
+    def test_flat_store(self):
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [])
+        for name in self.names:
+            self.assertTrue(os.path.isfile(self.in_shard(name)), name)
+
+    def test_half_moved_store(self):
+        # An earlier start stopped part way through the move; one block is in both places
+        for name in self.names[::2]:
+            os.makedirs(os.path.dirname(self.in_shard(name)), mode=0o700, exist_ok=True)
+            os.replace(os.path.join(self.blocks, name), self.in_shard(name))
+        shutil.copy(self.in_shard(self.names[0]), os.path.join(self.blocks, self.names[0]))
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [])
+
+    def test_leftover_partial_files(self):
+        # 0.1.6 left one directly in blocks/; a 0.2.0 start that crashed, one in a subdirectory
+        shard = os.path.dirname(self.in_shard(self.names[0]))
+        os.makedirs(shard, mode=0o700)
+        for partial in (os.path.join(self.blocks, PARTIAL_PREFIX + "old"), os.path.join(shard, PARTIAL_PREFIX + "new")):
+            with open(partial, "wb") as f:
+                f.write(b"half a block")
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual([name for name in os.listdir(self.blocks) if name.startswith(PARTIAL_PREFIX)], [])
+        self.assertEqual([name for name in os.listdir(shard) if name.startswith(PARTIAL_PREFIX)], [])
+
+    def test_failed_move(self):
+        # On Windows a scanner may hold a block open: it stays where it is, readable, until a later start moves it
+        stuck = self.names[0]
+        real_replace = fsutil.replace
+
+        def replace(src, dst):
+            """Refuse to move stuck."""
+            if os.path.basename(src) == stuck:
+                raise PermissionError(13, "in use", src)
+            real_replace(src, dst)
+
+        with mock.patch.object(fsutil, "replace", replace):
+            node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [stuck])
+        self.assertIsNotNone(node.storage.get(Cid.parse(stuck)))
+        node.stop()
+        node = self.start()
+        self.check_complete(node)
+        self.assertEqual(self.flat_blocks(), [])
+        self.assertTrue(os.path.isfile(self.in_shard(stuck)))
 
 
 if __name__ == "__main__":

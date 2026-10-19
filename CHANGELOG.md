@@ -11,6 +11,12 @@ unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is auto
 Upgrade notes:
 - **State:** the state database gains two tables (`pin_times`, `pin_labels`); an older rnfs can't open it
   afterwards. Pins made before the upgrade have no `added` time.
+- **Blocks:** they move from `blocks/<cid>` into 1,024 subdirectories, `blocks/<xy>/<cid>` (the CID's third- and
+  second-to-last characters), at the first start, which takes a while on a large store (a rename per block; the
+  API answers once it is done). Each start moves whatever is left, so an interrupted upgrade loses nothing, and
+  a block Windows won't let rnfs move stays readable until a later start moves it. An older rnfs doesn't find
+  the moved blocks. A subdirectory of `blocks/` that is a link, not a directory or another user's stops the
+  start.
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the
@@ -85,6 +91,13 @@ Added, for apps:
   fitting inside it (a Node accepts it and does nothing); `ApiConnection.request/call/get/post(timeout=)`.
 
 Changed:
+- Blocks are stored in subdirectories (`blocks/<xy>/<cid>`): one directory of millions of files is slow to list,
+  and FAT32, common on the USB drives added to a Raspberry Pi, holds only about 10,900 such names per directory
+  (a 59–64 character name takes 6 of its 65,536 entries). The cost is at the durability points: storing blocks
+  syncs each subdirectory written to (up to 1,024, 16 at a time) where it synced one directory. Adding 64 MiB
+  (1,029 blocks) to a new store on a desktop NVMe disk: 1.02 → 1.41 s; a tree of 1,024 8 KiB files 0.95 → 1.43 s;
+  fetching them (each block synced on its own) unchanged at about 13.5 s (`tests/bench_block_writes.py`,
+  `today`, median of 3). Raspberry Pi SD-card numbers are still to be measured.
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
   0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.

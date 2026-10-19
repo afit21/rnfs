@@ -111,7 +111,7 @@ rnfs/
     seal.py           sealed files: SealingReader, open_sealed/SealedFile, recipients (section 5, Sealed files)
     walker.py         Expect, reader checks, path lookup, byte ranges, listing, writing out (sections 5, 7)
     edit.py           dir set / dir rm (section 11)
-    blockstore.py     one file per CID, atomic, verified (section 8)
+    blockstore.py     one file per CID in 1,024 subdirectories, atomic, verified (section 8)
     storage.py        Storage: blocks + pins (sources) + cached fetches + protection + eviction/GC (section 8)
     archive.py        export/import stream; archive_size for an exact Content-Length (section 8)
     tarstream.py      directories as tar streams: build_tar (an upload), plan/length/chunks (a download)
@@ -215,8 +215,20 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   `used_bytes()`. Adds, the shared folder and archive import store through `with session.writer() as put:`,
   which writes blocks on up to 16 threads (`WRITE_THREADS`, at most 32 queued) so their fsyncs overlap, and
   has stored every one, or raised the first error, before the block exits: nothing is pinned before its blocks
-  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the blocks directory; `Storage` calls it before saving pins or
-  cache records, so they never refer to block names a power loss could undo.
+  are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the
+  subdirectories blocks were renamed into since the last sync (16 at a time, `SYNC_THREADS`: they share the
+  filesystem's journal commits), and `blocks/` itself when a subdirectory was made; `Storage` calls it before
+  saving pins or cache records, so they never refer to block names a power loss could undo.
+- block layout (`blockstore.py`): `blocks/<xy>/<cid>`, `xy = shard_of(name)`, the written CID's `[-3:-1]`. `put`
+  writes its temporary file in the block's subdirectory, made 0700 on first use (`_shard_dir`, under a small
+  lock, since writers run in parallel). Opening the store lists `blocks/` itself only: `.partial-` files there
+  are deleted, each subdirectory is checked (`_check_shard`: `lstat`, then on POSIX an `O_NOFOLLOW` descriptor's
+  `fstat` for the owner and an `fchmod` to 0700; a link, non-directory or another user's raises RnfsError and
+  stops the start), and every canonical-CID file there (0.1.6's flat layout) is moved into its subdirectory
+  (`fsutil.replace`; if the target exists, the flat copy is deleted) before the subdirectories and `blocks/` are
+  synced. A move that fails leaves the CID in `_flat`, where `path()` looks first, until a start moves it, or
+  `delete` removes it. `scan(tidy)` lists every subdirectory (no links followed; a CID in another block's
+  subdirectory is ignored) and with `tidy` deletes the `.partial-` files it meets, which only a start may do.
 - pins: `pin(cid, source)`, `pin_many(cids, source)` (one save for them all; archive import),
   `unpin(cid, source) -> bool`, `pins() -> dict[Cid, set[str]]` (a copy), `pinned_cids() -> frozenset[Cid]` (the
   same set until pins change: the publisher's refresh reads it after every add), `has_pin(cid, source)`,

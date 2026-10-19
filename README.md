@@ -276,7 +276,7 @@ Everything else is in the rnfs directory (`--dir`, default `~/.rnfs/`), which on
 |---|---|
 | `rnfs.toml` | your [settings](#settings) |
 | `storage/identity`, `storage/lxmf_identity` | the node's identity (your node ID comes from it) and your LXMF identity |
-| `blocks/` | stored blocks |
+| `blocks/` | stored blocks, one file per block in 1,024 subdirectories (`blocks/<xy>/<cid>`) |
 | `state/rnfs.db` | pins, records, jobs, names' sequences, contacts, the LXMF inbox and outbox, deny lists (SQLite; an older version's JSON files are imported once and kept as `*.migrated`) |
 | `names/` | name keys: back them up with `rnfs name export` |
 | `files/` | the shared folder: anything put here is added, pinned and shared |

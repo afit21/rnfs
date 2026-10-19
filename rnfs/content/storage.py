@@ -40,7 +40,7 @@ from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, IndexNode
 from rnfs.errors import BlockMismatch, Denied, InvalidDag, NotFound, StorageFull
-from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
+from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, log, plural, size
 
 USER, FOLDER = "user", "folder"
 DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
@@ -270,13 +270,13 @@ class Storage:
     def __init__(self, blocks_dir: str, state_dir: str, max_storage: int):
         """Open storage, indexing the blocks on disk and loading pins and cache records from state_dir."""
         self._lock = threading.RLock()
-        self.blocks = BlockStore(blocks_dir)
+        self.blocks = BlockStore(blocks_dir, report=lambda text: log(f"storage: {text}", LOG_NOTICE))
         self.state_dir = os.path.expanduser(state_dir)
         self._db = statedb.connect(self.state_dir)
         self.max_storage = max_storage
         self._save_lock = threading.Lock()  # keeps cache saves in order without holding _lock while writing
 
-        self._sizes: dict[Cid, int] = dict(self.blocks.scan())
+        self._sizes: dict[Cid, int] = dict(self.blocks.scan(tidy=True))
         self._used = sum(self._sizes.values())
         self._pins: dict[Cid, set[str]] = {}
         # When each pinned CID was first pinned by any source (Unix time; pin_times); one pinned before rnfs 0.2.0

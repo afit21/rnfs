@@ -750,9 +750,18 @@ and repeat.
 
 ## 8. Storage
 
-- Blocks are stored in `<rnfs dir>/blocks/`, one file per CID, written atomically after verification, and
-  synced to disk before any pin or cache record that refers to them is saved, so a power loss can't leave a
-  pin without its blocks or an empty file under a CID name.
+- Blocks are stored in `<rnfs dir>/blocks/<xy>/<cid>`, one file per CID, written atomically after
+  verification, and synced to disk before any pin or cache record that refers to them is saved, so a power loss
+  can't leave a pin without its blocks or an empty file under a CID name. `<xy>` is the CID's third- and
+  second-to-last characters, in that order: 1,024 subdirectories, named in lowercase base32 for both codecs (a
+  CID's leading characters are the same for every CID of its codec, and its last carries only 2 or 3 bits).
+- Blocks rnfs 0.1.6 and earlier stored directly in `blocks/` are moved into their subdirectories at the start
+  (a rename within the filesystem; one already there makes the flat copy redundant, and it is deleted), and the
+  directories synced. Every start moves what is left, so an interrupted move loses nothing, and a block whose
+  move fails (on Windows, a file another program holds open) stays readable where it is until a later start.
+- rnfs stores blocks only in real directories of its own: a subdirectory of `blocks/` that is a link (or a
+  Windows junction), isn't a directory or belongs to another user stops the start; a loose one is made 0700.
+  Links inside `blocks/` are never followed.
 - rnfs keeps the rest of its state (pins, cache records, names, provider records, jobs, ...) in one SQLite
   database, `<rnfs dir>/state/rnfs.db`, readable by its owner only. The JSON state files earlier versions wrote
   under `<rnfs dir>/state/` are imported into it at the first start, each once and whole, and kept as
