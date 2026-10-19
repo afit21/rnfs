@@ -163,6 +163,11 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         "UPDATE OR IGNORE pins SET source = 'app:' || source WHERE source GLOB 'lxmf:" + "[0-9a-f]" * 32 + "'",
         "DELETE FROM pins WHERE source GLOB 'lxmf:" + "[0-9a-f]" * 32 + "'",
     )),
+    ("apps", (
+        # rnfs app add's apps (rnfs/apps.py; rnfs 0.2.0): name, its token's verifier (apiclient.app_verifier, never
+        # the token), when it was added
+        "CREATE TABLE apps (name TEXT PRIMARY KEY, verifier BLOB NOT NULL, created REAL NOT NULL) WITHOUT ROWID",
+    )),
 )
 
 

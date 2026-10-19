@@ -145,6 +145,7 @@ rnfs/
   publisher.py        provide strategy, batched /provide, republish, withdrawal, extra key sources (section 6)
   node.py             RnfsNode: wires everything; the facade below
   node_content.py     node side of --no-pin, sealing/unsealing, raw blocks and archive streams
+  apps.py             AppRegistry: the apps rnfs app add issued tokens to, their verifiers (section 11)
   api.py              local API, 127.0.0.1:8788 (section 11)
   apiclient.py        the local API's protocol layer (ApiConnection) under rnfs.Client and the CLI: token, proof
                       check, typed errors (section 11)
@@ -1406,8 +1407,14 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   CID of the version it last accepted; FULL) and `deny_hashes` (the content SHA-256 of files checked against
   `sha256:` entries, by binary CID, LRU order in `used`, at most 10 000; NORMAL with the periodic saves and at
   stop, changed rows only; a CID's content never changes, so a row never goes stale);
+- `apps` (0.2.0, rnfs/apps.py: each app's name, the SHA-256 verifier of its token (`apiclient.app_verifier`; the
+  token itself is never stored) and when it was added; FULL, each change written at once; a row that doesn't
+  parse is deleted at load);
 - `meta` (per-store values: follow's and each box's `clean`, set by every save, which the reconcile at start
   requires; each box's `next_id`) and `migrated` (JSON files imported).
+- Schema steps of 0.2.0 that rewrite rows: `lxmf_app_pins` turns every valid `lxmf:<address>` pin into
+  `app:lxmf:<address>` (a case-sensitive `GLOB` spelt out, so an invalid one is still deleted at load;
+  `storage.import_pins` does the same to an older `pins.json`, imported after the steps).
 
 The node lists its stores as `_setup` makes them (`RnfsNode._add_store`; the `node.Store` protocol: `save()`
 writes what changed since the last save, raising `OSError` and keeping the change if the database fails, and

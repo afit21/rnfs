@@ -34,7 +34,9 @@ printed. A message is only accepted once LXMF has validated its signature agains
 from a sender whose identity isn't known yet is held while a path request fetches it.
 
 The LXMF package is a dependency (pyproject.toml), but the node runs without it: if it can't be imported (or with
-lxmf_enabled = false), the feature stays off and says so once.
+lxmf_enabled = false), the feature stays off and says so once. It stays off too while an app called lxmf exists
+(an LXMF wrapper built on the API, rnfs app add lxmf, which rnfs refuses while this feature is on): the wrapper owns
+the app:lxmf: pins and the LXMF identity, so this feature then also never releases any of those pins at start.
 Nothing here imports RNS or LXMF at module level (CLI commands mustn't load them); LxmfNetwork, made in
 start(), holds every RNS and LXMF object, so the rest works on offline test nodes with a stand-in network.
 """
@@ -904,11 +906,26 @@ class LxmfFeature(features.Feature):
                     # LXMF doesn't persist its outbound queue
                     self.outbox.update(entry["id"], state="failed",
                                        error="the daemon stopped before it was delivered")
-            self._release_unrecorded()
+            if self.wrapped():
+                # The LXMF wrapper app owns the app:lxmf: pins now: none of them is this feature's to release
+                _log("an app called lxmf (an LXMF wrapper) holds the app:lxmf: pins; leaving them to it", LOG_VERBOSE)
+            else:
+                self._release_unrecorded()
             self._refuse_unlisted()
         except BaseException:
             self.close()
             raise
+
+    def wrapped(self) -> bool:
+        """Whether an app called lxmf exists (rnfs app add lxmf: an LXMF wrapper built on the API), which owns the
+        app:lxmf: pins: this feature then neither starts nor releases any of them."""
+        apps = getattr(self.node, "apps", None)
+        return apps is not None and "lxmf" in apps
+
+    def in_use(self) -> bool:
+        """Whether this feature is on (running, or lxmf_enabled set true), so pins with app:lxmf: itself: an app
+        called lxmf is refused then (RnfsNode.app_add)."""
+        return self.network is not None or self.config.lxmf_enabled is True
 
     def _release_unrecorded(self):
         """Release app:lxmf:<sender> pins no inbox message records as pinned. Pins are saved at once and the inbox every
@@ -1003,6 +1020,12 @@ class LxmfFeature(features.Feature):
         if self.config.lxmf_enabled is False:
             self.off_reason = "LXMF is off (lxmf_enabled = false)"
             _log("off: lxmf_enabled is false", LOG_VERBOSE)
+            return
+        if self.wrapped():
+            self.off_reason = "LXMF is off: an app called lxmf (an LXMF wrapper) holds its pins and identity"
+            _log("off: an app called lxmf (an LXMF wrapper) holds the app:lxmf: pins and the LXMF identity; remove it "
+                 "(rnfs app rm lxmf) to use the LXMF built into rnfs", LOG_WARNING if self.config.lxmf_enabled
+                 else LOG_NOTICE)
             return
         try:
             network = LxmfNetwork(self, self.config, self.node.node_id)

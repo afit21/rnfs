@@ -38,6 +38,7 @@ from typing import BinaryIO, Callable, Iterator, Literal, NamedTuple, Protocol, 
 import RNS
 
 from rnfs import __version__, denylist, events, features, fsutil, statedb, winacl
+from rnfs.apps import AppRegistry
 from rnfs.config import LOCK_FILE, Config
 from rnfs.constants import (APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MISSED_ANNOUNCES, MODE_SERVER,
                             PARTIAL_SUFFIX)
@@ -45,7 +46,8 @@ from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
 from rnfs.content.shared_folder import SharedFolder
-from rnfs.content.storage import FOLDER, REMOTE_PREFIX, USER, Storage, disk_reserve, remote_source
+from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, check_app_name, disk_reserve,
+                                  remote_source)
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.providers import ProviderStore
 from rnfs.dht.routing import RoutingTable
@@ -614,6 +616,9 @@ class RnfsNode:
         # name, never the pin it names, which is committed durably first; its save writes a name whose write failed
         self.pin_names = self._add_store(PinNames(config.state_dir), batched=False)
         self.pin_names.prune_labels(self.storage.pinned_cids())
+        # The apps rnfs app add issued tokens to (the API's callers besides the CLI), written through; before the
+        # features: LXMF's start-up release of its pins checks for an app called lxmf
+        self.apps = self._add_store(AppRegistry(config.state_dir), batched=False)
         self.fetcher = self._add_store(Fetcher(self.storage, client, config, node_id, self.routing, self._lookup,
                                                slow, config.state_dir, after_store=self._enforce_storage,
                                                make_room=self._make_room))
@@ -1622,6 +1627,44 @@ class RnfsNode:
         self.pin_names.record_if_unknown(new_root, f"dir rm {target}")
         self.publisher.refresh()
         return {"cid": str(new_root)}
+
+    # Facade: apps (rnfs app; rnfs/apps.py)
+
+    def app_add(self, name: str) -> dict:
+        """Issue a token to a new app called name: {"name", "created", "token"}, the only time the token is given.
+        Raises ValueError for an invalid name or one taken, and for lxmf while the LXMF built into rnfs is on: its
+        pins (app:lxmf:<address>) would be the app's too."""
+        check_app_name(name)
+        lxmf = self.features.get("lxmf")
+        if name == "lxmf" and lxmf is not None and lxmf.in_use():
+            raise ValueError("the LXMF built into rnfs is on, and pins with app:lxmf: itself: set lxmf_enabled to "
+                             "false (rnfs config set lxmf_enabled false) and restart the daemon before adding an "
+                             "app called lxmf")
+        return self.apps.add(name)
+
+    def app_ls(self) -> list[dict]:
+        """Every app: [{"name", "created"}], by name."""
+        return self.apps.list()
+
+    def app_rm(self, name: str) -> dict:
+        """Revoke app name's token and release every pin it holds (app:<name> and app:<name>:<key>): {"released"},
+        how many pins (of a CID by one source) were released. NotFound for an app there isn't."""
+        return {"released": self.apps.remove(name, lambda: self._release_app(name))}
+
+    def _release_app(self, name: str) -> int:
+        """Once app name's token no longer passes: tell the features (jobs cancels the app's), then release every
+        pin of its sources; how many were released."""
+        for feature in self.features.values():
+            feature.app_removed(name)
+        released = 0
+        for cid, sources in self.storage.pins().items():
+            for source in sorted(sources):
+                if app_of(source) == name and self.storage.unpin(cid, source):
+                    released += 1
+        if released:
+            log(f"released {plural(released, 'pin')} of app {name}", LOG_NOTICE)
+            self.publisher.refresh()
+        return released
 
     # Facade: pins
 

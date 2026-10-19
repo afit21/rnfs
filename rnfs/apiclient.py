@@ -293,6 +293,18 @@ def api_proof(token: str, port: int, challenge: str) -> str:
     return hmac.new(token.encode(), f"rnfs api proof {port} {challenge}".encode(), hashlib.sha256).hexdigest()
 
 
+def app_verifier(token: str) -> bytes:
+    """What the daemon keeps of an app's token (rnfs.apps) instead of the token: SHA-256 of "rnfs app token " and
+    the token. It checks a token presented, and (in hex, app_proof_key) keys the proof the daemon gives the app."""
+    return hashlib.sha256(b"rnfs app token " + token.encode("utf-8", "replace")).digest()
+
+
+def app_proof_key(token: str) -> str:
+    """The key of the proof an app checks (api_proof's token, in place of the API token): its token's verifier in
+    hex, which the daemon has without keeping the token."""
+    return app_verifier(token).hex()
+
+
 def read_token(path: str) -> str:
     """The daemon's API token from path. Raises TokenError if it is missing, unreadable or empty, or if other
     users can read it (so it can't be trusted)."""

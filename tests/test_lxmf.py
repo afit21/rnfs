@@ -1404,6 +1404,53 @@ class RestartAndCancelTest(FeatureTestCase):
         self.assertEqual(self.b.storage.pins()[target], {f"app:lxmf:{SENDER.hex()}"})
 
 
+class WrapperAppTest(FeatureTestCase):
+    """An app called lxmf (an LXMF wrapper built on the API) owns the app:lxmf: pins: it is refused while this
+    feature is on, and while it exists the feature neither starts nor releases those pins."""
+
+    def test_app_called_lxmf_is_refused_while_lxmf_is_on(self):
+        """Running (attached to a network), or lxmf_enabled set true, refuses app_add("lxmf"); other names pass."""
+        self.feature_node()
+        with self.assertRaises(ValueError) as caught:
+            self.b.app_add("lxmf")
+        self.assertIn("lxmf_enabled", str(caught.exception))
+        self.b.app_add("wiki")
+        self.assertEqual([app["name"] for app in self.b.app_ls()], ["wiki"])
+        on = self.make_node("c", NAME, lxmf_enabled=True)  # not started: the setting alone refuses it
+        with self.assertRaises(ValueError):
+            on.app_add("lxmf")
+
+    def test_app_called_lxmf_is_added_while_lxmf_is_off(self):
+        """With lxmf_enabled false the app is added, and the feature then stays off even if started."""
+        self.b = self.make_node("b", B_ID, lxmf_enabled=False)
+        self.b.app_add("lxmf")
+        feature = self.b.feature("lxmf")
+        self.assertTrue(feature.wrapped())
+        self.assertFalse(feature.in_use())
+        with mock.patch.object(self.b.config, "lxmf_enabled", None), \
+                mock.patch.object(lxmf, "LxmfNetwork", side_effect=AssertionError("started")):
+            feature.start()
+        self.assertIsNone(feature.network)
+        self.assertIn("app called lxmf", feature.off_reason)
+
+    def test_wrapper_pins_are_not_released_at_start(self):
+        """With an app called lxmf, a start-up leaves app:lxmf:<address> pins the saved inbox doesn't record (the
+        wrapper's); once the app is removed (which releases its pins itself), the release at start applies again."""
+        self.b = self.make_node("b", B_ID, lxmf_enabled=False)
+        feature = self.b.feature("lxmf")
+        feature.received(self.link_message(source=OTHER))
+        feature.save()  # a clean inbox: an unrecorded pin is released, not adopted
+        target = Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"])
+        source = f"app:lxmf:{SENDER.hex()}"
+        self.b.app_add("lxmf")
+        self.b.storage.pin(target, source)
+        self.reloaded()
+        self.assertEqual(self.b.storage.pinned_by(source), {target})
+        self.b.apps.remove("lxmf")  # the registry alone, so the pin stays for the feature to find
+        self.reloaded()
+        self.assertEqual(self.b.storage.pinned_by(source), set())
+
+
 class MessageLogBoundsTest(unittest.TestCase):
     """MessageLog's protection of pin holders and its byte bound."""
 
