@@ -393,6 +393,13 @@ The DHT (local behaviour: nothing on the wire changes):
   marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
   network finds them within hours instead of after their next republish (3 days on a slow node). The marks are kept
   across restarts (a new table, `published_heal`).
+
+  Together, over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands, an island's gateway
+  down): a neighbour found what an island node published before the partition 100% of the time instead of 67%, and
+  what it published during it 100% instead of 91%, with 0.15 timeouts and 31 s of simulated time per search instead
+  of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
+  republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
+  partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.
 - **`/provide` to 16 servers at once:** a node that isn't slow sends a publish round's `/provide`s to up to 16
   servers at once, each still over its own identified link with its batches in order (withdrawals first, stopping
   at a refusal), so a round over many servers takes a fraction of the time. Slow nodes still send one at a time.

@@ -796,7 +796,12 @@ or protocol constant changes.
   lookups took 42% less airtime while connected; asking only the one closest local server first costs nothing
   extra when the content is elsewhere. Two-level records need both the publisher and the searcher upgraded (an
   older searcher still finds a local replica when its lookup passes that server); with half the nodes upgraded,
-  content published before a partition was found 78% of the time (55% with none).
+  content published before a partition was found 78% of the time (55% with none). Over the fake network of
+  `tests/test_topology.py` (1,000 servers, 21% on 8 islands; a `/find` over LoRa taking 8 s, one to a server out of
+  reach 40 s), with partition mode and the heal republish (below): a neighbour found what an island node published
+  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.15
+  timeouts and 31 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
+  0% of the time until the heal republish, 99.5% after it.
 
 **Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
 Scores are local state: they are never sent or published, nothing on the wire changes, and nodes may score
