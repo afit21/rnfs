@@ -42,6 +42,9 @@ Every command of the CLI is one request. Targets are `<cid>[/name…]` strings; 
 | GET  | /api/capabilities | | `{"version", "capabilities": [...], "routes": [[method, path]...], "features": [...], "event_kinds": [...], "error_codes": [...]}` (below) |
 | GET  | /api/events | `after` (a sequence; absent: none, only `next`), `kinds` (comma-separated), `epoch`, `wait` (≤ 30 s) | `{"events": [event], "next", "lost", "epoch"}` (rnfs.events): the events after `after`, as soon as there is one or after `wait` |
 | POST | /api/shutdown | | `{"stopping": true}`, then the daemon stops as on SIGTERM (`unsupported` 404 where nothing can stop it) |
+| GET  | /api/apps | | `{"apps": app_ls()}`: `[{"name", "created"}]` (the CLI's token only, below) |
+| POST | /api/apps/add | JSON `name` | `app_add(name)`: `{"name", "created", "token"}`, the only time the token is given |
+| POST | /api/apps/rm | JSON `name` | `app_rm(name)`: `{"released"}`, the app's token revoked and its pins released |
 
 The features (rnfs.features, each's `api_routes()`) add these; `name` is a name or a name contact's nick:
 
@@ -114,6 +117,8 @@ Security:
   `X-Rnfs-Api` instead, and only with it (an app's token without its name, or the API token with one, doesn't
   pass); its proof is keyed by the app's verifier (apiclient.app_proof_key), and none is sent for an app there
   isn't. ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal.
+  An app's token does everything the API token does but manage apps: the /api/apps routes (CLI_ROUTES) answer it
+  403 `forbidden`.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
   error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
@@ -143,7 +148,7 @@ from rnfs import __version__, events, fsutil, ids
 from rnfs import node_content  # --- content: add options (pin, to, chunker) ---
 from rnfs.apiclient import API_HEADER, APP_HEADER, CHALLENGE_HEADER, PROOF_HEADER, api_proof
 from rnfs.content.cid import Cid
-from rnfs.content.storage import APP_PREFIX
+from rnfs.content.storage import APP_PREFIX, check_app_name
 from rnfs.errors import CODES, STATUSES, BlockMismatch, Busy, Unsupported, error_code
 from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_WARNING, log
 
@@ -162,7 +167,7 @@ MAX_EVENT_WAITERS = 8  # GET /api/events calls waiting at once
 # What this daemon offers beyond the routes themselves (GET /api/capabilities), each a promise kept once released
 CAPABILITIES = ("error_codes", "capabilities", "events", "shutdown", "daemon_json", "pin_details", "pin_label",
                 "cache", "peer_details", "config", "jobs_add", "jobs_import", "add_tar", "get_tar", "export_stream",
-                "import_stream", "sealed_folders")
+                "import_stream", "sealed_folders", "apps")
 
 # Exception class → HTTP status, checked in order (design.md); anything else is 500. The one table, rnfs.errors'
 ERROR_STATUSES = STATUSES
@@ -727,8 +732,13 @@ class ApiHandler(TimedHandler):
         ("GET", "/api/capabilities"): "api_capabilities",
         ("GET", "/api/events"): "api_events",
         ("POST", "/api/shutdown"): "api_shutdown",
+        ("GET", "/api/apps"): "api_apps",
+        ("POST", "/api/apps/add"): "api_app_add",
+        ("POST", "/api/apps/rm"): "api_app_rm",
     }
     OPEN_ROUTES = {("GET", "/api/status")}  # allowed without the token
+    # Only the CLI's token (api_token) may use these: an app can't issue itself or another app a token, nor revoke one
+    CLI_ROUTES = {("GET", "/api/apps"), ("POST", "/api/apps/add"), ("POST", "/api/apps/rm")}
     PROOF_ROUTE = ("GET", "/api/status")
     proved = False  # this connection had its proof request kept open: it is closed after the next request
     principal: str | None = None  # caller() of the request being answered, set by dispatch
@@ -868,6 +878,9 @@ class ApiHandler(TimedHandler):
                                           "unauthorized")
                 raise ApiRequestError(403, f"API requests must carry the header {API_HEADER}: <token>, with the "
                                            f"token the daemon wrote to <rnfs dir>/api_token", "unauthorized")
+            if route in self.CLI_ROUTES and self.principal != CLI:
+                raise ApiRequestError(403, "only the CLI's token (<rnfs dir>/api_token) manages apps; an app's token "
+                                           "can't", "forbidden")
             if self.command != "POST":
                 self.request_read()  # no body; POST endpoints call it once they have read theirs
             self.keep_open = (route == self.PROOF_ROUTE and not self.proved
@@ -1290,6 +1303,20 @@ class ApiHandler(TimedHandler):
         else:
             result = event_log.since(after, kinds, 0, epoch)
         self.send_json(200, result)
+
+    # Apps (rnfs app; the CLI's token only: CLI_ROUTES)
+
+    def api_apps(self):
+        """GET /api/apps: every app, by name, without its token."""
+        self.send_json(200, {"apps": self.node.app_ls()})
+
+    def api_app_add(self):
+        """POST /api/apps/add {"name"}: a new app and its token, given only this once."""
+        self.send_json(200, self.node.app_add(check_app_name(self.json_body().get("name"))))
+
+    def api_app_rm(self):
+        """POST /api/apps/rm {"name"}: revoke an app's token and release its pins; {"released"}."""
+        self.send_json(200, self.node.app_rm(check_app_name(self.json_body().get("name"))))
 
     def api_shutdown(self):
         """POST /api/shutdown: answer, then stop the daemon as SIGTERM does (ApiServer's shutdown)."""

@@ -733,6 +733,24 @@ class AppClientTest(ClientTestCase):
             missing.status()
         self.assertIn("rnfs app add wiki", str(raised.exception))
 
+    def test_managing_apps(self):
+        """apps, app_add and app_rm with the CLI's token; an app's connection is refused them (AuthFailed,
+        "forbidden")."""
+        self.assertEqual([app["name"] for app in self.api.apps()], ["wiki"])
+        added = self.api.app_add("gallery")
+        gallery = ApiConnection(self.tmp, port=self.server.port, app="gallery", token=added["token"])
+        self.assertEqual(gallery.status()["node_id"], self.node.status()["node_id"])
+        with self.assertRaises(BadRequest):
+            self.api.app_add("gallery")
+        for call in (gallery.apps, lambda: gallery.app_add("mine"), lambda: gallery.app_rm("wiki")):
+            with self.assertRaises(AuthFailed) as raised:
+                call()
+            self.assertEqual(raised.exception.code, "forbidden")
+        self.assertEqual(self.api.app_rm("gallery"), {"released": 0})
+        with self.assertRaises(NotFound):
+            self.api.app_rm("gallery")
+        self.assertEqual([app["name"] for app in self.api.apps()], ["wiki"])
+
     def test_impostor_gets_no_app_token(self):
         """A listener that can't prove it knows the app's token gets only the challenge (and the app's name)."""
         received = []

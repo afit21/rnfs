@@ -441,6 +441,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `name_resolve(name, for_gateway=False)` | `{"name", "cid", "sequence", "age"}`; NotFound if unresolved |
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
+| `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_add` refuses `lxmf` while the LXMF feature is on (`in_use()`); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
 | `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "blocks", "used_bytes", "max_storage", "names", "unexported_names"}` plus every feature's `status()` fields (traffic, jobs, LXMF); `identity_hash` is the RNS identity hash (None on offline test nodes) |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
@@ -473,7 +474,10 @@ as a request body.
 `/api/name/watch` (a long poll for newer records: Public API, API additions);
 `POST /api/add`, `/api/add/stream`, `/api/get`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`,
 `/api/pin/remote`, `/api/gc`, `/api/verify`, `/api/name/create`, `/api/name/rm`, `/api/name/export`,
-`/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`; for clients that share no files with the
+`/api/name/import`, `/api/name/publish`, `/api/export`, `/api/import`; app tokens (`ApiHandler.CLI_ROUTES`, the
+CLI's token only: an app's gets 403 `forbidden`) `GET /api/apps`, `POST /api/apps/add`, `/api/apps/rm`
+(`app_ls`, `app_add`, `app_rm`; `ApiConnection.apps`, `app_add`, `app_rm`, which neither `rnfs.Node` nor
+`rnfs.Client` has: managing apps is the CLI's, `rnfs app`); for clients that share no files with the
 daemon (a sandboxed app), `GET /api/get/stream?format=tar`, `GET /api/export/stream`, `POST /api/import/stream`,
 and `POST /api/add/stream?format=tar`. `GET /api/info` and `POST /api/get` take
 an optional `from` (node ID), as does `GET /api/cat`; `GET /api/name/resolve?name=` takes a name or a name
@@ -570,7 +574,7 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   check is unchanged, so a stale or planted file at worst points at a port where nothing proves itself.
 - **Error codes.** `rnfs.errors.STATUS_CODES` (the node's errors, by status), `API_CODES` (the API's own
   refusals: `bad_host`, `unauthorized`, `no_such_endpoint`, `method_not_allowed`, `timeout`, `length_required`,
-  `body_too_large`, `unsupported`, `too_many_connections`) and `error_code(error, status)`, which prefers an
+  `body_too_large`, `unsupported`, `too_many_connections`, and from 0.2.0's app tokens `forbidden`) and `error_code(error, status)`, which prefers an
   exception's own `code` (`errors.Unsupported`: a 404 `unsupported`, for something this daemon can't do).
   `ApiHandler.respond_error` sends `{"error", "code"}`; `ApiRequestError` carries its code. The client
   (`apiclient.error_for`) keeps the code on every `ApiError` (`.code`) and raises `NoSuchEndpoint` for

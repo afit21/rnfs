@@ -1311,6 +1311,7 @@ are local conveniences, not part of the protocol.
 | `send <address> <target> [-m text] [--propagate] [--nearest]`, `inbox`, `inbox get <n> [--link K] [-o out] [--use-sent-cid]`, `inbox rm <n>\|--all`, `outbox`, `lxmf address`, `lxmf sync [--nearest]` | LXMF (section 13). `--nearest` uses the nearest propagation node heard when `lxmf_propagation_node` isn't set; `--use-sent-cid` gets a name link's sent CID when the name can't be resolved |
 | `peers [--json]`, `stats [--json]` | Known nodes with hops, interface, traffic, the last link round-trip time and whether each is online (Peers, below); traffic since start, refusals by cause, per interface |
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
+| `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
 | `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token) |
 
@@ -1374,7 +1375,10 @@ gateway can never reach the API.
   `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
   a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
   change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
-  that far. Removing an app revokes its token at once.
+  that far. Removing an app revokes its token at once. Only the CLI's token manages apps (rnfs: `GET /api/apps`,
+  `POST /api/apps/add {"name"}`, which answers the token, the only time it is given, and `POST /api/apps/rm
+  {"name"}`); an app's token gets `403` with code `forbidden` there. While the LXMF built into rnfs is on, rnfs
+  refuses an app called `lxmf`, whose pins (`app:lxmf:`) it would share (section 13).
 - An API request carrying `X-Rnfs-Challenge: <32 hex digits>` is answered with
   `X-Rnfs-Proof: hex(HMAC-SHA256(token, "rnfs api proof <port> <challenge>"))`, `<port>` being the API's. With
   `X-Rnfs-App: <name>` the key is the app's verifier written as 64 lowercase hex digits instead of the token
@@ -1737,6 +1741,9 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 rnfs links can be sent and received as [LXMF](https://github.com/markqvist/LXMF) messages, so content can be
 shared with people using Sideband, NomadNet, MeshChat or any other LXMF client. This is optional and not part
 of the `rnfs.dht` protocol: a node without the LXMF package (or with `lxmf_enabled = false`) does none of it.
+Nor does rnfs while an app called `lxmf` exists (section 11, app tokens): that is an LXMF wrapper built on the
+local API, which owns the `app:lxmf:` pins and the LXMF identity, so rnfs's own LXMF then neither starts nor
+releases any of those pins at start.
 
 **Identity.** A node that uses LXMF has a separate RNS identity for it, kept at
 `<rnfs dir>/storage/lxmf_identity` (owner-only, like the node identity), so its LXMF address can't be linked
@@ -1852,7 +1859,8 @@ unreserved, pct-encoded: as in RFC 3986
   KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `app:lxmf:<sender address>` (`lxmf:` before rnfs 0.2.0, section 8), one fetch at a time, taking senders in turn. At most 64 links wait: when that many
+  `app:lxmf:<sender address>` (`lxmf:` before rnfs 0.2.0, section 8), one fetch at a time, taking senders in
+  turn. At most 64 links wait: when that many
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or

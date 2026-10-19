@@ -772,6 +772,21 @@ class ApiConnection:
         """What the daemon wrote about itself (read_daemon_info) in this client's rnfs dir, or None."""
         return read_daemon_info(self.rnfs_dir)
 
+    # Apps (the CLI's token only: an app's is refused, AuthFailed)
+
+    def apps(self) -> list[dict]:
+        """Every app the daemon issued a token to: [{"name", "created"}], by name."""
+        return self.get("/api/apps")["apps"]
+
+    def app_add(self, name: str) -> dict:
+        """Issue a token to a new app called name: {"name", "created", "token"}, the only time the token is given.
+        BadRequest for an invalid name, one taken, or lxmf while the daemon's own LXMF is on."""
+        return self.post("/api/apps/add", name=name)
+
+    def app_rm(self, name: str) -> dict:
+        """Revoke app name's token and release every pin it made: {"released"}. NotFound for an app there isn't."""
+        return self.post("/api/apps/rm", name=name)
+
     # Content
 
     def add_path(self, path: str, wrap: bool = False, only_hash: bool = False, pin: bool = True,

@@ -28,6 +28,13 @@ Added, for apps:
   verifier, which is all the daemon keeps of it (`rnfs.db`'s new `apps` table). `rnfs.Client(app=..., token=...
   or token_file=...)` and `ApiConnection(app=, token=)`. The `api_token` stays the CLI's, unchanged, and a
   request without `X-Rnfs-App` is checked exactly as before.
+- **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
+  scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
+  can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
+  `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
+  `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
+  `forbidden`); capability `apps`. `rnfs app add lxmf` is refused while rnfs's own LXMF is on, and while an app
+  called `lxmf` exists rnfs's own LXMF stays off (an LXMF wrapper app owns its pins and identity).
 - **Discovery:** `<rnfs dir>/daemon.json`, written atomically (0600) once the API listens and removed at stop: the
   daemon's PID, API and gateway ports, version, start time, rnfs dir, Reticulum config directory, whether it
   attached to a shared instance, and node ID. `rnfs.apiclient.read_daemon_info()` reads it, refusing a symlink,

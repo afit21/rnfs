@@ -426,6 +426,21 @@ class FakeNode:
         return {"node_id": self.node_id.hex(), "dht_mode": "server", "slow": False, "known_nodes": 4,
                 "records": 2, "pins": len(self.pins), "used_bytes": 1000, "max_storage": 10 ** 10}
 
+    # Apps: through a real AppRegistry a test sets as self.apps (rnfs/apps.py)
+
+    def app_add(self, name):
+        self.record("app_add", name)
+        return self.apps.add(name)
+
+    def app_ls(self):
+        self.record("app_ls")
+        return self.apps.list()
+
+    def app_rm(self, name):
+        self.record("app_rm", name)
+        self.apps.remove(name)
+        return {"released": 0}
+
 
 def raw_request(port, method, path, body=None, headers=None, host="default"):
     """Send exactly these headers (plus Host unless host is None) and return (status, headers, body)."""
@@ -1073,6 +1088,42 @@ class AppAuthTest(AppTokenTestCase):
         self.assertEqual(status, 200)
         self.assertIsNone(headers[cli.PROOF_HEADER])
         self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("wiki", self.wiki), api=False)[0], 403)
+
+
+class AppRoutesTest(AppTokenTestCase):
+    """GET /api/apps, POST /api/apps/add and /api/apps/rm: the CLI's token only."""
+
+    def test_list_add_remove(self):
+        """The apps are listed without tokens; a new app's token is given once and works; removing an app revokes
+        its token."""
+        listed = self.ok("GET", "/api/apps")["apps"]
+        self.assertEqual([app["name"] for app in listed], ["notes", "wiki"])
+        self.assertEqual(set(listed[0]), {"name", "created"})
+        added = self.ok("POST", "/api/apps/add", {"name": "gallery"})
+        self.assertEqual(set(added), {"name", "created", "token"})
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("gallery", added["token"]), api=False)[0], 200)
+        self.assertEqual(self.ok("POST", "/api/apps/rm", {"name": "gallery"}), {"released": 0})
+        self.assertEqual(self.call("POST", "/api/gc", {}, self.as_app("gallery", added["token"]), api=False)[0], 403)
+        self.assertEqual([app["name"] for app in self.ok("GET", "/api/apps")["apps"]], ["notes", "wiki"])
+
+    def test_refusals(self):
+        """An invalid name or one taken is 400, removing an app there isn't 404."""
+        for name in ("wiki", "Wiki", "a:b", "", None, 7):
+            status, _, data = self.call("POST", "/api/apps/add", {"name": name})
+            self.assertEqual((status, json.loads(data)["code"]), (400, "bad_request"), name)
+        self.assertEqual(self.call("POST", "/api/apps/rm", {"name": "other"})[0], 404)
+        self.assertEqual(self.call("POST", "/api/apps/rm", {"name": "a:b"})[0], 400)
+
+    def test_apps_cant_manage_apps(self):
+        """An app's token is answered 403 forbidden on every app route, before the node is asked."""
+        for method, path, body in (("GET", "/api/apps", None), ("POST", "/api/apps/add", {"name": "mine"}),
+                                   ("POST", "/api/apps/rm", {"name": "notes"})):
+            status, _, data = self.call(method, path, body, self.as_app("wiki", self.wiki), api=False)
+            self.assertEqual((status, json.loads(data)["code"]), (403, "forbidden"), path)
+        self.assertEqual([call for call in self.node.calls if call[0].startswith("app_")], [])
+        self.assertIn("notes", self.node.apps)
+        self.assertIn("forbidden", errors.CODES)
+        self.assertIn("apps", api.CAPABILITIES)
 
 
 def rnfs_version() -> str:
