@@ -428,7 +428,7 @@ rnfs add e166ecdbc405bcc9762b6767617fc949:/file/song.mp3   # a file the node ser
     callback (RNS deletes it after); a page response must be one byte string, checked from its msgpack headers
     before RNS decodes it, as `rnfs.dht` responses are
 
-## LXMF moves out of core (deprecation done; removal waits for the wrapper)
+## LXMF moves out of core (done: removed in 0.2.0, before the wrapper's first release, by the owner's decision)
 
 LXMF becomes a separate wrapper project built on the local API and the library.
 
