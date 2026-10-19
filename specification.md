@@ -817,10 +817,12 @@ and repeat.
 **Pins.**
 - Pins are recursive: a pinned CID keeps every block of its DAG.
 - A pin is held by one or more *sources*: `user`, `folder`, `name:<alias>`, `remote:<identity>`,
-  `follow:<name>` (the latest target of a followed name, section 9), `lxmf:<address>` (links auto-fetched
-  from that LXMF sender, section 13), `deny` (the deny lists in use, below), and `app:<app>` or
-  `app:<app>:<key>` (pins an app made through the local API with its own token, section 11); names, identities
-  and addresses are 32 hex characters. An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
+  `follow:<name>` (the latest target of a followed name, section 9), `deny` (the deny lists in use, below), and
+  `app:<app>` or `app:<app>:<key>` (pins an app made through the local API with its own token, section 11),
+  among them `app:lxmf:<address>` (links auto-fetched from that LXMF sender, section 13: the LXMF wrapper app's,
+  made by the LXMF built into rnfs while it remains); names, identities and addresses are 32 hex characters.
+  Until rnfs 0.2.0 LXMF's pins were `lxmf:<address>`: the upgrade to 0.2.0 rewrites each as
+  `app:lxmf:<address>` (and those of an older version's `pins.json` as it is imported). An app's name is 1–64 characters of `a-z`, `0-9`, `.`, `_` and `-`,
   starting with a letter or digit (so never `:`), and a key 1–128 of `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`.
   A pin lasts while any source holds it.
 - `pin rm` removes only the `user` source. Other sources are released by whatever created them: the folder
@@ -830,11 +832,11 @@ and repeat.
   names, the LXMF inbox) is saved separately, so a crash can leave them disagreeing. At start the node makes
   `name:` pins match the names' records (pinning a recorded target again, releasing the rest), and releases
   `follow:` pins of
-  names no longer followed and `lxmf:` pins no saved inbox message records (a queued auto-fetch is fetched
+  names no longer followed and `app:lxmf:<address>` pins no saved inbox message records (a queued auto-fetch is fetched
   again). A followed name's check releases every other target its source holds.
 - That release needs the state read whole. If the followed names or the inbox were never saved (or were
   imported from a file that was damaged and moved aside as `.damaged`), or hold a malformed entry, such pins
-  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `lxmf:` pins get a new
+  are kept and recorded again: a `follow:` pin's name is followed again, and a sender's `app:lxmf:` pins get a new
   inbox message listing them, whose removal releases them. A name key file that is there but can't be read
   keeps its name's pins and records; only a missing key file counts as a removed name.
 - A pin is provided only once it is complete. Blocks of fetches, adds and imports in progress, and of queued or
@@ -924,7 +926,7 @@ off their node. Nothing on the wire changes.
   withdrawn. A `/pin` of it is refused.
 - When the entries change, and at start: cached fetches reaching a denied block are dropped, and the blocks
   nothing else reaches deleted; remote pins reaching one are released, as they are kept for others, and their
-  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `lxmf:`, `deny`) are kept,
+  blocks deleted. The node's other pins (`user`, `folder`, `name:`, `follow:`, `app:`, `deny`) are kept,
   stored but neither served, provided nor read, with a warning naming each, until they are removed. Every
   deletion and release is logged.
 - A file's hash is only known once its content is read, so file-hash entries are checked where content is
@@ -1706,7 +1708,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `lxmf_propagation_node` | none | Propagation node (32 hex digits) used for `--propagate`, the fallback of failed direct messages and the periodic downloads. One only heard announcing itself is used only with `--nearest` |
 | `lxmf_sync_interval` | 1 h | Downloads from `lxmf_propagation_node`; 0: never |
 | `lxmf_accept_from` | empty: everyone | LXMF addresses whose messages are kept |
-| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`lxmf:<address>`) |
+| `lxmf_auto_fetch_from` | empty | LXMF addresses whose links are fetched and pinned (`app:lxmf:<address>`; `lxmf:<address>` before 0.2.0) |
 | `lxmf_auto_fetch_quota` | 1 GiB per sender | Storage the pins of one auto-fetch sender may use |
 | `deny_lists` | empty | Deny-list sources: `<cid>[/path]` or `name/<name>[/path]`, each a file (section 8) |
 
@@ -1837,7 +1839,7 @@ unreserved, pct-encoded: as in RFC 3986
   KiB as JSON: links beyond that are dropped (the
   first is always kept), then text is cut.
 - **Auto-fetch.** Links from a sender in `lxmf_auto_fetch_from` are fetched completely and pinned with source
-  `lxmf:<sender address>`, one fetch at a time, taking senders in turn. At most 64 links wait: when that many
+  `app:lxmf:<sender address>` (`lxmf:` before rnfs 0.2.0, section 8), one fetch at a time, taking senders in turn. At most 64 links wait: when that many
   do, a new link is skipped, unless its sender has at least two fewer waiting than the sender with the most,
   whose newest waiting link is skipped instead. Auto-fetches
   still waiting when the node stops are queued again, oldest first, at the next start; stopping the node or

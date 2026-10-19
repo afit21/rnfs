@@ -567,7 +567,7 @@ class AutoFetchTest(FeatureTestCase):
 
     def source(self, sender=SENDER) -> str:
         """The pin source for sender."""
-        return f"lxmf:{sender.hex()}"
+        return f"app:lxmf:{sender.hex()}"
 
     def target_cid(self) -> Cid:
         """The CID of the linked file inside A's directory."""
@@ -994,7 +994,7 @@ class DisabledTest(FeatureTestCase):
 
 
 class SettingsTest(unittest.TestCase):
-    """lxmf_* settings validation and the lxmf: pin source."""
+    """lxmf_* settings validation and the app:lxmf: pin source."""
 
     def test_validation(self):
         Config(lxmf_accept_from=[SENDER.hex(), f"<{OTHER.hex()}>"], lxmf_propagation_node=OTHER.hex()).validate()
@@ -1006,10 +1006,18 @@ class SettingsTest(unittest.TestCase):
                 Config(**settings).validate()
 
     def test_pin_source(self):
-        storage_module.check_source(f"lxmf:{SENDER.hex()}")
-        for source in ("lxmf:", "lxmf:xyz", f"lxmf:{'ab' * 16}".upper(), f"lxmf:{SENDER.hex()}0"):
+        """Auto-fetched links are pinned app:lxmf:<sender> since 0.2.0 (the LXMF wrapper app's source): lxmf:
+        sources are no longer valid, and a valid one an older pins.json holds is rewritten when imported
+        (upgraded_source), as the schema step rewrites the pins table's."""
+        self.assertEqual(storage_module.LXMF_PREFIX, "app:lxmf:")
+        storage_module.check_source(f"app:lxmf:{SENDER.hex()}")
+        for source in ("lxmf:", "lxmf:xyz", f"lxmf:{'ab' * 16}".upper(), f"lxmf:{SENDER.hex()}0",
+                       f"lxmf:{SENDER.hex()}"):
             with self.assertRaises(ValueError, msg=source):
                 storage_module.check_source(source)
+        self.assertEqual(storage_module.upgraded_source(f"lxmf:{SENDER.hex()}"), f"app:lxmf:{SENDER.hex()}")
+        for source in ("lxmf:xyz", f"lxmf:{'ab' * 16}".upper(), "user", f"app:lxmf:{SENDER.hex()}", 7):
+            self.assertEqual(storage_module.upgraded_source(source), source)
 
     def test_identity_path(self):
         config = Config(rnfs_dir="/x/rnfs")
@@ -1372,12 +1380,12 @@ class RestartAndCancelTest(FeatureTestCase):
         self.assertEqual(database.references, before)
 
     def test_constructor_sets_every_attribute_before_its_start_up_steps(self):
-        """FT1: building the feature over an inbox that isn't clean records an unrecorded lxmf: pin in a new
+        """FT1: building the feature over an inbox that isn't clean records an unrecorded app:lxmf: pin in a new
         message (_release_unrecorded -> _record_kept, which takes the lock and adds to the inbox); every attribute
         the finished feature has is already set when that runs."""
         self.feature_node()
         target = Cid.parse(self.a.info(f"{self.cid}/file.txt")["cid"])
-        self.b.storage.pin(target, f"lxmf:{SENDER.hex()}")  # the inbox was never saved, so it isn't clean
+        self.b.storage.pin(target, f"app:lxmf:{SENDER.hex()}")  # the inbox was never saved, so it isn't clean
         seen = []
         original = lxmf.LxmfFeature._release_unrecorded
 
@@ -1393,7 +1401,7 @@ class RestartAndCancelTest(FeatureTestCase):
         records = again.inbox_list()
         self.assertEqual([(e["from"], e["auto"]) for e in records],
                          [(SENDER.hex(), [{"state": "pinned", "cid": str(target)}])])
-        self.assertEqual(self.b.storage.pins()[target], {f"lxmf:{SENDER.hex()}"})
+        self.assertEqual(self.b.storage.pins()[target], {f"app:lxmf:{SENDER.hex()}"})
 
 
 class MessageLogBoundsTest(unittest.TestCase):

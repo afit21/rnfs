@@ -14,9 +14,9 @@ NomadNet. Edit `DESCRIPTIONS`, `HIDDEN` and `SHOW_UNNAMED` at the top of `index.
 Anyone who can reach your NomadNet node can open the page. It lists a pin only if all of these are true:
 
 - **You made it.** Its sources in `rnfs pin ls` include `user` (`rnfs add`, `rnfs pin add`, ...) or `folder`
-  (your shared folder). Pins that exist only because a contact sent you a file (`lxmf:`), a name you follow
-  updated (`follow`), or another node asked you to pin it (`remote:`) are never listed, so the page doesn't
-  reveal who sends you what.
+  (your shared folder). Pins that exist only because a contact sent you a file (`app:lxmf:`, `lxmf:` before
+  rnfs 0.2.0), a name you follow updated (`follow`), another node asked you to pin it (`remote:`) or an app
+  pinned it (`app:`) are never listed, so the page doesn't reveal who sends you what.
 - **It is complete** on this node.
 - **It isn't sealed.** A sealed (encrypted) file's name is meant to stay private, so sealed files are left
   off. The page recognises one by its first bytes. It reads them once per file with `rnfs cat --raw`, which

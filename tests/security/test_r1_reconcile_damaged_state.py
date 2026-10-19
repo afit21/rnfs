@@ -165,7 +165,7 @@ class LxmfDamagedStateTest(FeatureTestCase):
         feature.process_auto_fetches()
         feature.save()
         target = Cid.parse(feature.inbox.get(kept)["auto"][0]["cid"])
-        source = f"lxmf:{SENDER.hex()}"
+        source = f"app:lxmf:{SENDER.hex()}"
         # lxmf_inbox.json as rnfs 0.1.4 wrote it, with the message's record malformed: the stored records, not
         # inbox_list(), which adds computed fields (trusted, contact) 0.1.4 never wrote
         messages = feature.inbox.entries()

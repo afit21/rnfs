@@ -331,7 +331,7 @@ class PinTest(StorageTest):
     def test_has_pin(self):
         """has_pin(cid, source) agrees with pins() through pins, unpins, a failed unpin and a reopen."""
         a, b = self.add(b"a").cid, self.add(b"b").cid
-        lxmf = "lxmf:" + IDENTITY
+        lxmf = "app:lxmf:" + IDENTITY
 
         def check(storage):
             pins = storage.pins()

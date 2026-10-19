@@ -2,8 +2,10 @@
 (tests/fixtures/rnfs-0.1.5, its state database holding rows in every table; see its README) keeps every row.
 
 The expectation is the fixture's expected.json, every table's rows as 0.1.5 left them. The current code may add
-rows and tables (its own schema steps), but none of 0.1.5's rows may change or go: the database upgrades, passes
-quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created must also be
+rows and tables (its own schema steps), but none of 0.1.5's rows may change or go, except those a step rewrites,
+whose new form is stated here (upgraded): the two `lxmf:<address>` pins become `app:lxmf:<address>` (0.2.0's
+"lxmf_app_pins", the LXMF wrapper app's source). The database upgrades, passes quick_check, sets nothing aside,
+and a second start changes nothing. The tables 0.1.5 created must also be
 exactly those a fresh database gets, so a released schema step edited in place (which a database 0.1.5 wrote
 would never see) fails here as well as in test_statedb's digest.
 
@@ -69,6 +71,14 @@ def _content():
 def row(values: list) -> tuple:
     """A row of expected.json as sqlite3 gives it."""
     return tuple(bytes.fromhex(v["blob"]) if isinstance(v, dict) else v for v in values)
+
+
+def upgraded(table: str, values: tuple) -> tuple:
+    """A row of expected.json as the current schema leaves it: 0.2.0's step "lxmf_app_pins" rewrites a pin source
+    lxmf:<address> as app:lxmf:<address> (storage.LXMF_PREFIX); every other row is kept as it was."""
+    if table == "pins" and values[1].startswith("lxmf:"):
+        return (values[0], "app:" + values[1])
+    return values
 
 
 def loadable(table: str, values: tuple) -> bool:
@@ -152,15 +162,28 @@ class UpgradeTest(unittest.TestCase):
                          [("shared_folder_files",)])
 
     def test_every_row_is_kept(self):
-        """Every row 0.1.5 left is still there, unchanged, in every table."""
+        """Every row 0.1.5 left is still there, unchanged but for those a step rewrites (upgraded), in every
+        table."""
         node = self.start()
         node.stop()
         found = tables(self.state)
         for table, rows in EXPECTED["tables"].items():
             with self.subTest(table=table):
                 self.assertIn(table, found)
-                expected = {row(values) for values in rows if loadable(table, row(values))}
+                expected = {upgraded(table, row(values)) for values in rows if loadable(table, row(values))}
                 self.assertEqual(expected - found[table], set())
+
+    def test_lxmf_pins_become_app_pins(self):
+        """The fixture's two lxmf:<address> pins (an auto-fetch sender's) are app:lxmf:<address> pins after the
+        upgrade, of the same CIDs, and no lxmf: source is left; the LXMF feature still counts them as its own (its
+        inbox records them), so they are kept."""
+        legacy = {row(values) for values in EXPECTED["tables"]["pins"] if values[1].startswith("lxmf:")}
+        self.assertEqual(len(legacy), 2)
+        node = self.start()
+        node.stop()
+        pins = tables(self.state)["pins"]
+        self.assertEqual({(cid, "app:lxmf:" + source[len("lxmf:"):]) for cid, source in legacy} - pins, set())
+        self.assertEqual({source for _, source in pins if source.startswith("lxmf:")}, set())
 
     def test_every_pin_is_complete(self):
         """Every pin, the deny list's own included, is complete: the stores agree with the blocks."""

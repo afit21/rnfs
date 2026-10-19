@@ -28,6 +28,7 @@ from rnfs.config import Config
 from rnfs.content import builder
 from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
+from rnfs.content.storage import upgraded_source
 from rnfs.features import lxmf
 from rnfs.node import RnfsNode
 from tests.support import FakeClock, state_rows
@@ -154,8 +155,12 @@ class UpgradeTest(unittest.TestCase):
     # Each store's state against the fixture
 
     def check_pins(self, node: RnfsNode):
-        """Every pin with every source, and each complete: the current code built the same CIDs (make_blocks)."""
-        expected = {Cid.parse(text): set(sources) for text, sources in fixture("pins.json")["pins"].items()}
+        """Every pin with every source, and each complete: the current code built the same CIDs (make_blocks). The
+        two lxmf:<address> pins (an auto-fetch sender's) become app:lxmf:<address> since rnfs 0.2.0, the LXMF
+        wrapper app's source (storage.upgraded_source, as the schema step "lxmf_app_pins" for the pins table)."""
+        expected = {Cid.parse(text): {upgraded_source(source) for source in sources}
+                    for text, sources in fixture("pins.json")["pins"].items()}
+        self.assertEqual(sum(source.startswith("app:lxmf:") for sources in expected.values() for source in sources), 2)
         self.assertEqual(node.storage.pins(), expected)
         roots = {Cid.parse(root) for root, _, _ in fixture("cache.json")["fetches"]}
         self.assertLessEqual(roots, self.built)

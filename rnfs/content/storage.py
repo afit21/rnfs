@@ -2,7 +2,8 @@
 
 - Pins are recursive and held by sources: "user", "folder", "name:<alias>", "remote:<identity hash>", "deny" (the
   deny lists' own blocks), "app:<app>" and "app:<app>:<key>" (pins an app made with its API token, rnfs.apps),
-  and the features' "follow:" and "lxmf:". A pin lasts while any source holds it. Pins are never evicted.
+  and the features' "follow:" and LXMF's "app:lxmf:" (lxmf: until rnfs 0.2.0, whose upgrade rewrote them). A pin
+  lasts while any source holds it. Pins are never evicted.
 - Cache is everything else. Each cached fetch is recorded as root + path + target, which keeps the path's
   nodes and the target's DAG; fetches are evicted least recently used first when storage exceeds
   max_storage, and gc() evicts them all.
@@ -46,8 +47,12 @@ from rnfs.log import LOG_ERROR, LOG_VERBOSE, log, plural, size
 USER, FOLDER = "user", "folder"
 DENY = denylist.SOURCE  # the deny lists' own blocks (rnfs/features/deny.py)
 NAME_PREFIX, REMOTE_PREFIX = "name:", "remote:"
-LXMF_PREFIX = "lxmf:"
 APP_PREFIX = "app:"
+# In-core LXMF's pins (rnfs/features/lxmf.py): app:lxmf:<sender address>, the source the LXMF wrapper app takes
+# over. Until rnfs 0.2.0 they were lxmf:<sender address> (LEGACY_LXMF_PREFIX): its schema step rewrote them, and
+# import_pins rewrites those of an older pins.json, imported after that step
+LXMF_PREFIX = APP_PREFIX + "lxmf:"
+LEGACY_LXMF_PREFIX = "lxmf:"
 # An app's name (rnfs app add): an alias's characters (names.check_alias) in lowercase, so it never holds ":" and
 # two apps never differ only by case. Pin rows are checked against these and one that fails is deleted when
 # loaded, so what they accept mustn't narrow
@@ -69,8 +74,8 @@ DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unrea
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
 
-# The ID in a remote:, follow: or lxmf: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as
-# a pin row that fails is deleted
+# The ID in a remote: or follow: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as a pin
+# row that fails is deleted
 _IDENTITY_HASH = ids.HEX16_LOWER
 
 
@@ -91,10 +96,8 @@ def check_source(source: str):
     # follow:<name>: the latest target of a followed name (rnfs/features/follow.py)
     if isinstance(source, str) and source.startswith("follow:") and _IDENTITY_HASH.fullmatch(source[len("follow:"):]):
         return
-    # lxmf:<LXMF address>: links auto-fetched from that sender (rnfs/features/lxmf.py)
-    if isinstance(source, str) and source.startswith(LXMF_PREFIX) and _IDENTITY_HASH.fullmatch(source[len(LXMF_PREFIX):]):
-        return
-    # app:<app>[:<key>]: pins an app made through the API with its token (rnfs/apps.py)
+    # app:<app>[:<key>]: pins an app made through the API with its token (rnfs/apps.py), and in-core LXMF's
+    # app:lxmf:<sender> (rnfs/features/lxmf.py)
     if isinstance(source, str) and app_of(source) is not None:
         return
     raise ValueError(f"invalid pin source {source!r}")
@@ -140,9 +143,19 @@ def remote_source(identity_hash: bytes | str) -> str:
     return REMOTE_PREFIX + text
 
 
+def upgraded_source(source):
+    """source as rnfs 0.2.0 writes it: a valid lxmf:<address> (LEGACY_LXMF_PREFIX) becomes app:lxmf:<address>, as
+    the schema step "lxmf_app_pins" rewrote the pins table's; anything else is returned as it is."""
+    if isinstance(source, str) and source.startswith(LEGACY_LXMF_PREFIX) \
+            and _IDENTITY_HASH.fullmatch(source[len(LEGACY_LXMF_PREFIX):]):
+        return LXMF_PREFIX + source[len(LEGACY_LXMF_PREFIX):]
+    return source
+
+
 def import_pins(value: dict, tx) -> int:
     """Import pins.json (statedb.migrate): its pins replace the pins table, each record checked as rnfs 0.1.4
-    loaded it (an invalid one is logged and skipped). Returns the number of pins imported."""
+    loaded it (an invalid one is logged and skipped), lxmf: sources rewritten as the schema did those of the pins
+    table (upgraded_source: the files are imported after the schema steps). Returns the number of pins imported."""
     tx.execute("DELETE FROM pins")
     count = 0
     for text, sources in value.get("pins", {}).items():
@@ -150,6 +163,7 @@ def import_pins(value: dict, tx) -> int:
             cid = Cid.parse(text)
             if not isinstance(sources, list):
                 raise TypeError("sources aren't a list")
+            sources = [upgraded_source(source) for source in sources]
             for source in sources:
                 check_source(source)
             # Inside the try: a source SQLite can't store (a lone surrogate) is an invalid record too
