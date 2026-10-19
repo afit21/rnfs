@@ -102,6 +102,10 @@ Added, for apps:
   `unsupported`). So a 404 for an endpoint a daemon lacks (`no_such_endpoint`) is told from one for missing
   content (`not_found`). `ApiError.code`, and `NoSuchEndpoint` and `Unsupported` (both `NotFound`s) in the
   library, which also recognises an older daemon's unknown-endpoint 404 by its message.
+- **An OpenAPI reference for the local API:** `docs/openapi.json` (OpenAPI 3.1) describes every route, its
+  parameters and bodies (streamed ones too), its answers, the error codes, the token headers, the `Deprecation`
+  header and the event kinds, for apps in any language; tests check it against the code (routes, codes, kinds,
+  capabilities, and the fields that live answers carry). It is in the sdist too.
 - **Capabilities:** `GET /api/capabilities` lists the daemon's routes, features, event kinds, error codes and
   capabilities (`events`, `pin_details`, `cache`, `config`, `jobs_add`, `add_tar`, ...).
 - **Events:** `GET /api/events?after=&kinds=&epoch=&wait=`, a long poll on the node's events (`rnfs/events.py`),

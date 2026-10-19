@@ -86,7 +86,8 @@ The features (rnfs.features, each's `api_routes()`) add these; `name` is a name 
 | GET  | /api/config | | `{"path", "settings": [schema entry + "value", "file", "overridden", "pending"], "file_error", "warnings"}` (rnfs.features.settings) |
 | POST | /api/config/set | JSON `settings` ({name: value, or null to remove it from rnfs.toml}) | `{"path", "applied", "restart_required", "overridden", "warnings"}`; nothing written unless the whole result is valid (400) |
 
-Both tables are checked against ApiHandler.ROUTES and the features' routes (tests/test_api.py).
+Both tables are checked against ApiHandler.ROUTES and the features' routes (tests/test_api.py). docs/openapi.json
+describes every route in full (parameters, bodies, answers, errors, headers), checked by tests/test_openapi.py.
 
 Errors are `{"error": message, "code": code}`: code is machine-readable (rnfs.errors.CODES, design.md "Error
 codes"), so a client tells "no such endpoint" (`no_such_endpoint`, an older daemon) from "no such content"

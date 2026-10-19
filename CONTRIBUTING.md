@@ -153,7 +153,14 @@ route touches these places:
    tested on both by `tests/test_public.py`.
 5. The CLI command, if any (`rnfs/cli.py`, or the feature's own commands), through `ApiConnection` rather than
    a hand-written path.
-6. Tests of the handler (`tests/test_api.py` or the feature's test file), and a CHANGELOG line.
+6. The OpenAPI reference, `docs/openapi.json`: the operation (method and path, `operationId`, a feature's
+   route tagged with and `x-rnfs-feature` naming its feature), its parameters or request body, its answer's
+   schema and the statuses it answers; `X-Rnfs-Pin-Key` if it pins for the caller; a new error code, event kind or
+   capability in `ErrorCode`, `EventKind` and `Event`, or `Capabilities`. A new field in `GET /api/status` goes
+   into the status part that produces it (`StatusCore` for the node's, `Status<Feature>` for a feature's; a new
+   feature adds a part to `Status`'s `allOf`). `tests/test_openapi.py` fails, naming it, on a route, code, kind
+   or capability missing, and its live checks on a field the answers carry that isn't documented.
+7. Tests of the handler (`tests/test_api.py` or the feature's test file), and a CHANGELOG line.
 
 ## Commits
 
@@ -176,7 +183,8 @@ Steps:
 1. Go through the checklist below.
 2. Set `__version__` in `rnfs/__init__.py` to X.Y.Z, change CHANGELOG.md's first heading from
    `## X.Y.Z (unreleased)` to `## X.Y.Z`, and update README's release links and file names
-   (`tests/test_packaging.py` checks the three agree).
+   (`tests/test_packaging.py` checks the three agree), and `info.version` in `docs/openapi.json`
+   (`tests/test_openapi.py`).
 3. Commit, let CI pass on `main`, then push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow
    refuses a tag that isn't `v` + `__version__`, and a CHANGELOG whose section for it is still marked
    unreleased.

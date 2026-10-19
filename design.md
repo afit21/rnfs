@@ -891,6 +891,18 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`,
   `inbox` and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once (`ApiHandler.event_waiters`, a
   semaphore per server; 503 beyond).
+- **Reference.** `docs/openapi.json`, an OpenAPI 3.1 document (JSON, so the standard library can read it; no
+  runtime use): every core and feature route with its parameters, bodies (streamed ones too), answers, error codes
+  (`ErrorCode`), security (`X-Rnfs-Api`, `X-Rnfs-App`, `X-Rnfs-Pin-Key`, the challenge and proof), the
+  `Deprecation` header and the event kinds. Its `info` gives `rnfs.__version__` and `API_STATUS`. The status schema
+  is `allOf` one part per producer (`StatusCore`, then `Status<Feature>`), so a new status field goes into its
+  part. `tests/test_openapi.py` checks it: exactly the routes of `ApiHandler.ROUTES` and the features, each
+  feature's route marked `x-rnfs-feature`, the security of `OPEN_ROUTES` and `CLI_ROUTES`, `X-Rnfs-Pin-Key` on
+  exactly the routes whose handler calls `pin_source()`, `deprecated` and the header on exactly the deprecated
+  routes, `errors.CODES`, `events.EVENT_KINDS`, `api.CAPABILITIES`; and, over an offline node behind an
+  `ApiServer`, that status, capabilities, pin ls, name list, peers, stats, config, apps, remote pins, events and
+  the calls making them answer exactly the documented fields (no undocumented field, every required one) with
+  the documented JSON types, in list items too.
 - **Shutdown.** `ApiServer(shutdown=)`: the daemon passes its `stopping.set`, the event its signal handlers set,
   so `POST /api/shutdown` answers `{"stopping": true}`, flushes, then stops the daemon exactly as SIGTERM does
   (the servers stop, `daemon.json` and the token are removed, the node saves and stops). Without one (tests) it is

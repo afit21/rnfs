@@ -583,7 +583,9 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
 - A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
   just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the
-  reference. Other languages can use the local API's JSON endpoints (listed in `rnfs/api.py`).
+  reference. Other languages can use the local API's JSON endpoints: `docs/openapi.json` is an OpenAPI 3.1
+  reference for every route (parameters, answers, error codes, the token headers and the events), which OpenAPI
+  tools can read or turn into a client.
 
 # Keeping content off your node
 
