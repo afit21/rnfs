@@ -817,8 +817,40 @@ servers silent longer than every one of them; announces are recorded in memory a
 
   `roots` helps popular content spread; `pinned` uses less airtime and doesn't publish what a user
   downloads. Gateway fetches are never provided under either.
-  Nothing else inside a DAG is provided separately: share `<root>/<path>`, or pin the inner CID to provide
-  it. Keepers also provide the keys of the names they keep (section 9), under any strategy.
+  Keepers also provide the keys of the names they keep (section 9), under any strategy.
+- **Entries** (`provide_entries`). A node MAY also provide the CID of every file and directory inside a complete
+  pin: each CID a directory entry names, at every depth (through index nodes too), so each can be found by its
+  own CID rather than only as `<root>/<path>`, and the same file in two folders from either. Chunks, the file
+  nodes below a file's root, index nodes and a large directory's other type 2 nodes are not provided: nothing
+  names them. Providing an entry is an ordinary provider record of its CID, published, republished and
+  withdrawn as a root's is, and the blocks served (section 7) don't change: an entry's DAG is inside its pin's. It
+  works under either strategy, but only pins have their entries provided: a cached download only ever provides its
+  root. Without entries, share `<root>/<path>`, or pin the inner CID to provide it.
+  - Each entry key costs its republishing: about 165 bytes a round (16 bytes to each of `K` servers, and request
+    overhead), which sweep providing doesn't reduce, and entries multiply a node's keys 3–5× for folders of a few
+    files and over 100× for large ones (a 70k-file folder: about 11.6 MB a day from a node that isn't slow).
+  - **Defaults** (rnfs; `provide_entries` unset). A node that isn't slow provides entries, up to 100,000 entry
+    keys: pins are taken oldest first (by when each was first pinned; pins made before rnfs 0.2.0 first, then by
+    CID), each pin's entries all or none, and a pin whose entries would pass the cap is left out, logged, while a
+    later smaller one may still fit. So a folder is findable whole or not at all, and pinning something new never
+    takes an older pin's entries away. An entry under two pins counts once.
+  - A slow node provides entries by default only while republishing every key it provides (roots, entries and
+    kept names' keys) is estimated to take at most 2% of the channel over a republish interval, and otherwise none
+    of them (not a part that would change with the network's size); once on, they stay on until the estimate
+    passes 2.5%, so an estimate wavering around the line doesn't withdraw and provide them all again and again.
+    The estimate, at the slowest interface's bitrate b (1 kbit/s if unknown), for n keys on a network of N servers:
+    (n × 2.63 s × 12/10 + min(n, ⌈N / 12.5⌉) × 44 s + min(N, 12 n) × 6.4 s) × 1000 / b: each key's batched stores
+    to its 10 closest and about 2 senior servers, a region lookup (with its extra `/find`) per region, an identified
+    link to each server contacted. That is about 1,300 keys on a 100-server network and about 40 at 1,000 servers
+    or more at 1 kbit/s, with the default 3-day republish interval. N is estimated from the regions sweep providing
+    found (a running mean of their prefix length p over about 16: N ≈ 10 × 2^(p + 0.5)), at least the routing
+    table's size, and taken as 1,000 or more until a region has been found (past about 500 servers the answer no
+    longer changes). One mid-size folder already exceeds what a 1 kbit/s node can republish: past that, remote
+    pinning on a fast node (the existing `/pin`) shares it instead.
+  - `provide_entries = true` provides entries whatever the estimate (still up to the cap); `false` provides none.
+    When none are provided, the node's status says why.
+  - Privacy: each entry provided tells anyone looking up its CID that this node has that file or folder, without
+    their knowing the pin it came from.
 
 ## 7. Transfer
 
@@ -839,7 +871,7 @@ servers silent longer than every one of them; announces are recorded in memory a
     less what they are committed to send, less 1 KiB, and in any case what is left of the requester's half
     share (section 3, Airtime controls).
 - **What a node serves:** only blocks in the DAG of a CID it currently provides (the same reachability GC
-  computes). With `pinned`, cached downloads answer `None`, so a node's download history can't be read by
+  computes; an entry provided inside a pin, section 6, adds nothing, as its DAG is inside the pin's). With `pinned`, cached downloads answer `None`, so a node's download history can't be read by
   asking for it. With the default `roots`, complete cached downloads are provided and served, so they can.
 - **Before serving**, a node SHOULD re-check the block against its CID, so a damaged block on disk doesn't get
   it banned.
@@ -1502,7 +1534,7 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), storage use, traffic, jobs, deny-list entries and sources, LXMF address, inbox size and untrusted senders' messages dropped by the rate limits (`untrusted_dropped`, section 13) (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 Wherever a command takes a target, it may start with a name contact's nick (`get alice/docs/report.pdf`);
 where it takes a node ID (`get --from`, `ping`, `pin remote`), a node contact's nick works too.
@@ -1908,8 +1940,8 @@ The FastCDC parameters (`MIN_SIZE`, `AVG_SIZE`, `MAX_SIZE`, `GEAR`, the masks) a
 constants are fixed in section 5; they matter only to writers that choose them and to readers of sealed files.
 
 **Local settings.** Each node may change these. Settings have exact types: whole numbers are integers (`true`
-is not 1), flags are `true` or `false`, rates (bits/s) and times (seconds, at most 30 days) are finite numbers.
-Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_parallel_providers`,
+is not 1), flags are `true` or `false` (`provide_entries` may also be left unset, for its default), rates (bits/s)
+and times (seconds, at most 30 days) are finite numbers. Ports are 1–65535 (`gateway_port` 0: any free port); `alpha`, `beta`, `max_parallel_providers`,
 `max_failures`, `max_incoming_links`, `fast_blocks_responses` and `min_rate_sample` are at least 1; other
 sizes and counts at least 0; rates above 0; times above 0, except `startup_announce_delay`,
 `provider_seniority`, `deadline_slack`, `blocks_cooldown` and `ban_time`, which may be 0. `members` and
@@ -1926,10 +1958,11 @@ leaving the settings file as it was, unless the whole resulting file is valid by
 command-line options, under the same checks as at start (ownership, no symlink, size). Options given on the
 command line keep winning over the file. rnfs applies these at once, the rest at the next start: `max_storage`
 (enforced at once), `max_download_size`, `max_output_entries`, `max_upload_rate`, `remote_pin_quota`,
-`scan_interval`, `max_jobs`, `max_finished_jobs`, `serve_interfaces`, `no_serve_interfaces`, `quiet_hours`,
-`keep_max_names` (names kept beyond a lower cap stay, as at a start), `keeper_query`, `follow_quota`,
-`lxmf_accept_from`, `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota` and `lxmf_send_from_hint`. Settings of
-identity, ports, Reticulum, the DHT mode and private mode never apply before a restart.
+`scan_interval`, `provide_entries` (entries provided or withdrawn at once), `max_jobs`, `max_finished_jobs`,
+`serve_interfaces`, `no_serve_interfaces`, `quiet_hours`, `keep_max_names` (names kept beyond a lower cap stay, as
+at a start), `keeper_query`, `follow_quota`, `lxmf_accept_from`, `lxmf_auto_fetch_from`, `lxmf_auto_fetch_quota`
+and `lxmf_send_from_hint`. Settings of identity, ports, Reticulum, the DHT mode and private mode never apply before
+a restart.
 
 | Name | Default | Notes |
 |---|---|---|
@@ -1969,6 +2002,7 @@ identity, ports, Reticulum, the DHT mode and private mode never apply before a r
 | `members` | empty | Private mode's member identities |
 | `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9) |
 | `provide_strategy` | `roots` | `roots` (pins and complete cached downloads) or `pinned` (pins only) |
+| `provide_entries` | unset: on, up to 100,000 entry keys; on slow nodes only while republishing stays under 2% of the channel | Also provide every file and folder inside complete pins (section 6). `true` or `false` overrides the default either way |
 | `gateway_scripts` | on | |
 | `gateway_fetches` | 2 | Network fetches at a time for requests that aren't the user's own navigation |
 | `api_port`, `gateway_port` | 8788, 8789 | Local API and gateway ports, on 127.0.0.1 (section 11) |

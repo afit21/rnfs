@@ -362,7 +362,9 @@ rnfs add report.pdf --wrap      # in a directory, so the link keeps its name: <c
 `add` stores and **pins** the file and tells the DHT you have it. Files dropped into `~/.rnfs/files/` are
 shared automatically. `rnfs pin rm <cid>` stops sharing, and `rnfs gc` frees space used by downloads you
 didn't pin. By default your node also shares what you download while it's cached, so others can see what you
-fetched; `provide_strategy = "pinned"` shares only what you pin.
+fetched; `provide_strategy = "pinned"` shares only what you pin. Every file and folder inside what you pin is also
+findable by its own CID (`provide_entries`), so a file you shared in a folder can be fetched without the folder's
+CID; on a slow radio node, only while there are few of them.
 
 ### 4. Names: a link that can change
 
@@ -425,6 +427,7 @@ lxmf_accept_from = ["<a friend's LXMF address>"]
 | `slow` | `"auto"` | A slow node uses one provider at a time and fewer parallel queries; `auto` when every interface is under `slow_bitrate` (100 kbit/s) |
 | `announce_interval` | `21600` (6 h) | How often the node and its names announce; keep it ≥ 1 h |
 | `provide_strategy` | `"roots"` | `"roots"` shares pins and every complete download while it's cached (even a `cat` or `stat`), so **anyone can learn what you downloaded**; `"pinned"` shares only pins |
+| `provide_entries` | unset | Also share every file and folder inside your pins under its own CID (not inside downloads). Unset: on, for up to 100,000 of them, oldest pins first; on a slow node only while republishing them would take under 2% of the radio channel (about 40 keys in all on a large network: `rnfs status` says when they're off and why). `true` or `false` overrides it. Each one tells anyone who looks that your node has that file |
 | `max_storage` | 10 GiB | Cached downloads are evicted above this; pins never are. The disk keeps max(256 MiB, 2%) free |
 | `max_download_size` | none | Refuse fetches larger than this |
 | `record_budget` | 1 GiB | Disk the provider records your node stores for others (as a DHT server) may take; when full, your node contacts and publishers seen for days keep their place, and strangers share a small part |
@@ -654,7 +657,9 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 - Sybil attacks can make a CID hard to find (`get --from` bypasses the DHT), but data can never be forged.
 - Sealed files hide content and file name, not size or recipients, and don't prove who sealed them. `get` of a
   directory leaves sealed files inside it encrypted.
-- Under the default `provide_strategy = "roots"`, anyone can learn what your node downloaded.
+- Under the default `provide_strategy = "roots"`, anyone can learn what your node downloaded. With
+  `provide_entries` (on by default), anyone can learn which files your pinned folders hold by looking up each
+  file's CID, without knowing the folder.
 - LXMF messages over 256 kB are refused, unsent messages are lost if the daemon restarts, and offline delivery
   needs `lxmf_propagation_node`. A message rnfs can't keep (a stranger's during a flood) is lost, though the
   sender's app shows it as delivered.

@@ -28,7 +28,7 @@ from rnfs import fsutil, node as node_module, statedb
 from rnfs.dht.routing import distance
 from rnfs.dht.scores import BOOTSTRAP_SEED, band
 from rnfs.node import RnfsNode
-from tests.support import POSIX_MODES, failing_commits, state_execute, state_rows, wait_for
+from tests.support import POSIX_MODES, failing_commits, pinned_entries, state_execute, state_rows, wait_for
 from tests.test_names import FakeNetwork
 
 A_ID, B_ID, N1 = bytes([0xA] * 16), bytes([0xB] * 16), bytes([1] * 16)
@@ -243,7 +243,9 @@ class LocalFacadeTest(NodeTest):
         with self.assertRaises(NotFound):
             self.b.name_resolve(name)
         self.a.name_rm("site")
-        self.assertNotIn(Cid.parse(published["cid"]), self.a.publisher.provided())
+        # No longer provided as the name's pin; still as a folder inside the tree's pin (provide_entries)
+        self.assertNotIn(Cid.parse(published["cid"]), self.a.publisher.provided() - self.a.publisher.provided_entries())
+        self.assertIn(Cid.parse(published["cid"]), self.a.publisher.provided_entries())
 
     def test_needs_reach(self):
         """A client keeps announcing only while something needs others to reach it: providing, a name, remote
@@ -325,8 +327,13 @@ class NetworkFacadeTest(NodeTest):
         cid = self.a.add_path(self.tree())["cid"]
         self.advertise(cid)
         self.assertEqual(self.b.providers(cid), [A_ID])
-        self.assertEqual(self.b.pin_add(f"{cid}/sub")["cid"], self.a.info(f"{cid}/sub")["cid"])
-        self.assertEqual(len(self.b.publisher.provided()), 1)
+        sub = self.b.pin_add(f"{cid}/sub")["cid"]
+        self.assertEqual(sub, self.a.info(f"{cid}/sub")["cid"])
+        # The pin, and the files and folders inside it (provide_entries)
+        entries = self.b.publisher.provided_entries()
+        self.assertEqual(self.b.publisher.provided() - entries, {Cid.parse(sub)})
+        self.assertEqual(entries, pinned_entries(self.b.storage))
+        self.assertEqual(len(entries), 3)  # run.sh, deeper, deeper/note.txt
 
     def test_read_file_is_info_and_read_in_one_fetch(self):
         """read_file gives info()'s answer and read()'s bytes, cut to the file's size, from one fetch session."""

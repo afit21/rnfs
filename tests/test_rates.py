@@ -1,6 +1,7 @@
 """Tests for rate estimates, slow links, slow nodes, deadlines and requester max_bytes (section 2)."""
 import types
 import unittest
+from unittest import mock
 
 from rnfs.config import Config
 from rnfs.constants import CHUNK_SIZE, KIB, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
@@ -99,6 +100,20 @@ class SlowNodeTest(unittest.TestCase):
             """Stats that can't be read."""
             raise OSError("no shared instance")
         self.assertFalse(rates.is_slow_node(Config(), types.SimpleNamespace(get_interface_stats=broken)))
+
+    def test_slowest_bitrate(self):
+        """The slowest counted interface's bitrate, which a slow node's republish airtime estimate uses; None when
+        none reports one or the stats can't be read."""
+        stats = {"interfaces": [interface("RNodeInterface", bitrate=1200), interface("KISSInterface", bitrate=9600),
+                                interface("LocalClientInterface", bitrate=300)]}
+        self.assertEqual(rates.slowest_bitrate(types.SimpleNamespace(get_interface_stats=lambda: stats)), 1200.0)
+        self.assertIsNone(rates.slowest_bitrate(types.SimpleNamespace(get_interface_stats=lambda: {})))
+
+        def broken():
+            """Stats that can't be read."""
+            raise OSError("no shared instance")
+        with mock.patch.object(rates, "log"):
+            self.assertIsNone(rates.slowest_bitrate(types.SimpleNamespace(get_interface_stats=broken)))
 
 
 class DeadlineAndBudgetTest(unittest.TestCase):

@@ -157,6 +157,17 @@ def slow_from_stats(stats: dict, slow_bitrate: float) -> bool:
     return bool(bitrates) and all(bitrate < slow_bitrate for bitrate in bitrates)
 
 
+def slowest_bitrate(reticulum) -> float | None:
+    """The bitrate of the slowest interface counted_bitrates counts (bits/s), or None if none reports one or the
+    stats can't be read: what a slow node's republish airtime is estimated at (publisher.republish_airtime)."""
+    try:
+        bitrates = counted_bitrates(reticulum.get_interface_stats())
+    except Exception as e:  # noqa: BLE001 - the estimate then assumes the reference LoRa rate; logged
+        log(f"could not read interface stats for the slowest interface's bitrate: {e}", LOG_WARNING)
+        return None
+    return min(bitrates, default=None)
+
+
 def is_slow_node(config: Config, reticulum=None) -> bool:
     """Whether this node is slow (section 2): `slow` yes/no, or for auto, judged from its RNS interfaces.
 

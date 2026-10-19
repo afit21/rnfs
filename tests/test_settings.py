@@ -608,6 +608,31 @@ class LiveTest(SettingsBase):
         self.set({"lxmf_accept_from": None, "lxmf_auto_fetch_from": None})
         self.assertFalse(lxmf.trusted(other))
 
+    def test_provide_entries(self):
+        """Changing provide_entries provides or withdraws the files inside pins at once; the schema knows it as a
+        flag that may be unset."""
+        entry = self.setting("provide_entries")
+        self.assertEqual((entry["type"], entry["nullable"], entry["default"], entry["live"], entry["value"]),
+                         ("bool", True, None, True, None))
+        folder = os.path.join(self.tmp.name, "folder")
+        os.mkdir(folder)
+        for name in ("a", "b"):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(name.encode() * 10)
+        root = self.b.add_path(folder)["cid"]
+        provided = {str(cid) for cid in self.b.publisher.provided()}
+        self.assertEqual(len(provided), 3)
+        self.assertIn(root, provided)
+        self.assertEqual(self.b.status()["provided_entries"], 2)
+        self.assertEqual(self.set({"provide_entries": False})["applied"], ["provide_entries"])
+        self.assertEqual({str(cid) for cid in self.b.publisher.provided()}, {root})
+        self.assertEqual(self.b.status()["provide_entries_off"], "provide_entries is false")
+        self.assertEqual(self.setting("provide_entries")["value"], False)
+        self.set({"provide_entries": None})
+        self.assertEqual({str(cid) for cid in self.b.publisher.provided()}, provided)
+        self.assertIn("provide_entries must be true or false, or unset",
+                      self.set({"provide_entries": 1}, status=400)["error"])
+
     def test_plain_settings_reach_their_users(self):
         # Read from node.config at each use, which the node's parts share
         self.set({"max_output_entries": 7, "remote_pin_quota": 9, "lxmf_send_from_hint": False})

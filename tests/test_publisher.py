@@ -159,8 +159,8 @@ class CrashingClient(FakeClient):
             return super().provide(node_id, keys, withdrawn)
 
 
-class PublisherTest(unittest.TestCase):
-    """A Publisher over temporary storage with fakes for the network."""
+class PublisherCase(unittest.TestCase):
+    """A Publisher over temporary storage with fakes for the network (the helpers; no tests of its own)."""
 
     def setUp(self):
         """Storage, an in-memory provider store, and a publisher whose lookups find self.nodes."""
@@ -181,11 +181,14 @@ class PublisherTest(unittest.TestCase):
         self.lookup_delay = None  # or key -> seconds its lookup takes (counted in self.running)
         self.running = Running()
         self.fetched_changes = 0  # what the node's fetched-targets change count would be (generation)
+        self.known_servers = 0  # the routing table's size the publisher is told
         self.publisher = self.make_publisher()
 
-    def make_publisher(self, slow: bool = False, state: str | None = None, generation: bool = False) -> Publisher:
+    def make_publisher(self, slow: bool = False, state: str | None = None, generation: bool = False,
+                       bitrate: float | None = None) -> Publisher:
         """A publisher sharing this test's state directory (or on state), closed when the test ends; with
-        generation, one as the node makes it: storage.changes() and fetched_changes."""
+        generation, one as the node makes it: storage.changes() and fetched_changes. bitrate: its slowest
+        interface's; self.known_servers: its routing table's size."""
         def make_lookup(key):
             """Remember the key; find self.nodes_of(key), after self.lookup_delay(key) seconds if set."""
             self.lookups.append(key)
@@ -197,7 +200,7 @@ class PublisherTest(unittest.TestCase):
                               state or self.state, cached_eligible=lambda: self.eligible, clock=self.clock,
                               retry_interval=30,
                               generation=(lambda: (self.storage.changes(), self.fetched_changes)) if generation
-                              else None)
+                              else None, bitrate=bitrate, known_servers=lambda: self.known_servers)
         self.addCleanup(publisher.close)
         return publisher
 
@@ -235,6 +238,26 @@ class PublisherTest(unittest.TestCase):
         built = builder.build_bytes(data, self.storage.put)
         self.storage.pin(built.cid, USER)
         return built.cid
+
+    def counting(self) -> dict[str, int]:
+        """Count the calls of storage.pinned_cids and dag_blocks from now until the test ends: {name: calls}."""
+        counts = {"pinned_cids": 0, "dag_blocks": 0}
+        for name in counts:
+            original = getattr(self.storage, name)
+
+            def counted(*args, name=name, original=original):
+                """Count the call, then make it."""
+                counts[name] += 1
+                return original(*args)
+
+            patcher = mock.patch.object(self.storage, name, counted)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return counts
+
+
+class PublisherTest(PublisherCase):
+    """The publisher's provide set, publishing, withdrawals and refreshes."""
 
     def test_roots_is_the_default(self):
         from rnfs.config import Config
@@ -929,22 +952,6 @@ class PublisherTest(unittest.TestCase):
         self.assertGreaterEqual(len(withdrawn), SAVE_EVERY_NODES)
 
     # Refreshes that change nothing
-
-    def counting(self) -> dict[str, int]:
-        """Count the calls of storage.pinned_cids and dag_blocks from now until the test ends: {name: calls}."""
-        counts = {"pinned_cids": 0, "dag_blocks": 0}
-        for name in counts:
-            original = getattr(self.storage, name)
-
-            def counted(*args, name=name, original=original):
-                """Count the call, then make it."""
-                counts[name] += 1
-                return original(*args)
-
-            patcher = mock.patch.object(self.storage, name, counted)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return counts
 
     def test_refresh_skipped_when_nothing_changed(self):
         """With a generation, a refresh after which nothing it is computed from changed reads no pins or DAGs

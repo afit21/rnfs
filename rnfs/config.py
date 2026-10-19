@@ -42,6 +42,7 @@ OPTIONAL = ("republish_interval", "max_upload_rate")  # these may also be unset 
 # Some durations are waited on, and Windows can wait at most ~49 days at once (threading.TIMEOUT_MAX)
 MAX_DURATION = 30 * DAY
 FLAGS = ("private", "gateway_scripts", "default_bootstrap", "debug_log")
+OPTIONAL_FLAGS = ("provide_entries",)  # true, false, or unset (None: a default that depends on the node)
 IDENTITY_LISTS = ("members", "remote_pin_identities")  # RNS identity hashes: 32 hex digits, optionally <bracketed>
 # Settings that take one of a few words (Config.validate), core and feature ones alike
 CHOICES = {"slow": ("yes", "no", "auto"), "dht_mode": ("server", "client"), "provide_strategy": ("pinned", "roots"),
@@ -67,8 +68,8 @@ UNITS = {"min_rate_sample": "bytes", "record_budget": "bytes", "max_storage": "b
 # must name exactly these); every other one applies at the next start
 LIVE_SETTINGS = frozenset({
     "max_storage", "max_download_size", "max_output_entries", "max_upload_rate", "remote_pin_quota",
-    "scan_interval", "max_jobs", "max_finished_jobs", "serve_interfaces", "no_serve_interfaces", "quiet_hours",
-    "keep_max_names", "keeper_query", "follow_quota", "lxmf_accept_from", "lxmf_auto_fetch_from",
+    "scan_interval", "provide_entries", "max_jobs", "max_finished_jobs", "serve_interfaces", "no_serve_interfaces",
+    "quiet_hours", "keep_max_names", "keeper_query", "follow_quota", "lxmf_accept_from", "lxmf_auto_fetch_from",
     "lxmf_auto_fetch_quota", "lxmf_send_from_hint"})
 # One line per setting (specification section 12 has the full notes)
 DESCRIPTIONS = {
@@ -115,6 +116,8 @@ DESCRIPTIONS = {
     "private": "Private mode: talk to members only",
     "scan_interval": "How often the shared folder and the folders synced to names are scanned",
     "provide_strategy": "roots (pins and complete cached downloads) or pinned (pins only) are provided",
+    "provide_entries": "Also provide every file and folder inside complete pins; unset: on, but on slow nodes "
+                       "only while republishing stays under 2% of the channel",
     "gateway_scripts": "Let gateway pages run scripts",
     "gateway_fetches": "Gateway network fetches at a time for requests that aren't the user's own navigation",
     "max_jobs": "Background jobs running at once; unset: 2, or 1 on slow nodes",
@@ -224,6 +227,9 @@ class Config:
     private: bool = False  # private mode (section 3)
     scan_interval: float = 60
     provide_strategy: str = "roots"  # "roots" (pins and complete cached downloads) or "pinned" (pins only)
+    # Also provide the CID of every file and directory inside a complete pin (spec section 6). None: on, up to
+    # publisher.MAX_ENTRY_KEYS; on slow nodes only while the estimated republish airtime stays small
+    provide_entries: bool | None = None
     gateway_scripts: bool = True
     gateway_fetches: int = 2
 
@@ -395,6 +401,9 @@ class Config:
         for name in FLAGS:
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be true or false")
+        for name in OPTIONAL_FLAGS:
+            if getattr(self, name) is not None and type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be true or false, or unset")
         for name in IDENTITY_LISTS:
             values = getattr(self, name)
             if not isinstance(values, list) or not all(ids.is_hex16(value, brackets=True) for value in values):
