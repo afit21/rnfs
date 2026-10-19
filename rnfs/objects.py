@@ -515,10 +515,10 @@ class Uncached(_Object):
 @dataclass(frozen=True)
 class Event(_Object):
     """Something that changed on the node (events): seq (1, 2, ... in the node's run), kind ("job", "pin",
-    "cache", "inbox", "name", "peer"; design.md, "Events", lists each kind's fields), time (Unix), and the kind's
-    own fields in fields. kind "lost" (lost is True) is no node's: events.watch delivers it when events were missed
-    (the watch fell behind, or the daemon restarted), so what the app shows should be read again; its fields hold
-    the run's "epoch"."""
+    "cache", "inbox", "name", "peer", "remote_pin"; design.md, "Events", lists each kind's fields), time (Unix), and
+    the kind's own fields in fields. kind "lost" (lost is True) is no node's: events.watch delivers it when events
+    were missed (the watch fell behind, or the daemon restarted), so what the app shows should be read again; its
+    fields hold the run's "epoch"."""
 
     seq: int
     kind: str

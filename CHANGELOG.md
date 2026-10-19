@@ -9,8 +9,9 @@ and 0.1.3 nodes work together. The local API stays compatible: every route, fiel
 unchanged, and error bodies gain a field. The upgrade of an `<rnfs dir>` is automatic and one-way.
 
 Upgrade notes:
-- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`); an older rnfs can't
-  open it afterwards. Pins made before the upgrade have no `added` time, and name keys made before it count as
+- **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `remote_pins_asked`,
+  `remote_pins_served`); an older rnfs can't open it afterwards. Remote pins asked before the upgrade have no
+  status entry. Pins made before the upgrade have no `added` time, and name keys made before it count as
   never exported (`rnfs status` lists them until `rnfs name export` is run).
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
@@ -126,6 +127,16 @@ Added:
   written as it always was.
   `GET /api/capabilities` lists `sealed_folders`. `cat` still gives the decrypted tar, and the gateway and
   `--raw` the sealed bytes. `POST /api/add/stream?format=tar` still can't seal (400).
+
+Added:
+- **Remote pin status** (local only; `/pin` and the wire are unchanged): a node records the remote pins it asks
+  for (node, CID, pin or release, when, whether accepted) and works out whether each accepted one is done by
+  looking the node up among the CID's providers: paced (in the background at most 60 lookups an hour, 4 at
+  once, each pin hourly while waiting and daily after; on slow nodes 4 an hour, one at a time), waiting for up
+  to 24 hours after asking, then missing if not found. So "done" lags the node's publishing and is only as good as
+  the DHT. A node serving remote pins records what became of each (waiting, fetching, pinned, dropped with why:
+  quota, not found, denied, ...; refused because denied or its queue was full; released), which was only logged.
+  At most 10 000 asked entries and 1 000 served outcomes are kept. `remote_pin` events report both.
 
 Changed:
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather

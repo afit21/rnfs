@@ -901,6 +901,29 @@ a directory above the folder can be changed by other users, who could replace th
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link.
+- **Status** (rnfs 0.2.0; local only: `/pin` and every other message are unchanged).
+  - A node records each `/pin` it sends: the node, the CID, pin or release, when, and whether the node accepted
+    it, one entry per (node, CID), replaced by a later request. An accepted pin is *done* once the node is among
+    the CID's providers, as a provider lookup (or a record held locally) finds them: done is inferred from provider
+    records, so it lags the node's publishing and is only as good as the DHT. A pin not found within a grace
+    after asking (rnfs: 24 hours, a republish interval by default) is *waiting*, as it may still be fetched; a
+    check after it that doesn't find the node shows it *missing*: dropped (quota, not found), never fetched, or
+    no longer provided. A node that refused or didn't answer gives *refused*; an accepted release, *released*
+    (never checked). Pins asked before rnfs 0.2.0 have no entry.
+  - Checks are paced. rnfs checks in the background at most 60 pins an hour, 4 lookups at once, each pin first 10
+    minutes after asking, then hourly while waiting and daily once done or missing; on a slow node at most 4 an
+    hour, one lookup at a time, after an hour, then every 6 hours and every 3 days. An on-demand check
+    (`pin remote ls --check`) is one lookup per pin, at most 32 pins a call (4 on a slow node), least recently
+    checked first, skipping pins checked in the last minute (10 minutes on a slow node), its lookups sharing the
+    same limit at once. rnfs keeps at most 10 000 entries: past that the oldest released or refused go first,
+    then the oldest done, then the oldest of the rest.
+  - A node serving remote pins records what became of each pin an identity asked of it: *waiting*, *fetching*,
+    *pinned*, *dropped* (`quota`; the fetch failing: `not_found`, `denied`, `invalid_dag`, `too_large`,
+    `storage_full`, `failed`; released by the deny list, `denied`; waiting at a start from an identity no longer
+    on `remote_pin_identities`, `identity_removed`; recorded as current but lost in a crash, `lost`), *refused*
+    (`denied`, `queue_full`, `failed`) or *released* by its identity, with when. Pins and pins waiting are what it
+    holds; rnfs keeps the latest outcome of at most 1 000 others (those that ended go first, oldest first). It
+    reports each identity's use of `remote_pin_quota`, counted as the quota counts it.
 
 **Deny lists.** A node MAY refuse chosen content, so operators of public gateways and provider nodes can keep it
 off their node. Nothing on the wire changes.

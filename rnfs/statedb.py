@@ -155,6 +155,20 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # or imported from such a file (how "import"), when it last happened. A key made before 0.2.0 has no row
         "CREATE TABLE name_exports (name BLOB PRIMARY KEY, at REAL NOT NULL, how TEXT NOT NULL) WITHOUT ROWID",
     )),
+    ("remote_pin_status", (
+        # Remote pins this node asked for (rnfs 0.2.0; rnfs.remote_pins): the latest ask of each (node, CID), pin 1
+        # or 0 (release), whether accepted, when asked (Unix time), and the checks that work out whether it is done:
+        # the last one tried, the last conclusive one and what it found (1, 0, NULL never), the last finding it.
+        # Pins asked before 0.2.0 have no row
+        "CREATE TABLE remote_pins_asked (node BLOB NOT NULL, cid BLOB NOT NULL, pin INTEGER NOT NULL,"
+        " accepted INTEGER NOT NULL, asked REAL NOT NULL, tried REAL, checked REAL, found INTEGER, seen REAL,"
+        " PRIMARY KEY (node, cid)) WITHOUT ROWID",
+        # The latest outcome of each remote pin other identities asked of this node: state (waiting, fetching,
+        # pinned, dropped, refused, released), why if dropped or refused, when, and a dump()ed detail. Kept apart from
+        # remote_pins (the pins waiting), whose meaning is as released
+        "CREATE TABLE remote_pins_served (identity BLOB NOT NULL, cid BLOB NOT NULL, state TEXT NOT NULL, reason TEXT,"
+        " at REAL NOT NULL, detail TEXT, PRIMARY KEY (identity, cid)) WITHOUT ROWID",
+    )),
 )
 
 

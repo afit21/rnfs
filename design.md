@@ -579,8 +579,10 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `count`: storage's `pin_listener`, after the pins are saved; a label from `pin_label`), `cache` (`change`: added
   or removed, `cids`, `count`: storage's `cache_listener`, from `_set_record` and `_drop_records`), `name`
   (`name`, `cid`, `sequence`: `NameManager.held_listener`, for a newer record accepted for a name held — this
-  node's own, kept, followed or resolved — or watched), and `job`, `inbox` and `peer` from their features.
-  `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once (`ApiHandler.event_waiters`, a
+  node's own, kept, followed or resolved — or watched), `remote_pin` (`side` "asked": `node`, `cid`, `state`, as
+  a remote pin this node asked for is recorded or a check changes its state; `side` "served": `identity`, `cid`,
+  `state`, `reason`, for each outcome of one another identity asked of it: Remote pin status, below), and `job`,
+  `inbox` and `peer` from their features. `GET /api/events` waits at most 30 s, `MAX_EVENT_WAITERS` (8) calls at once (`ApiHandler.event_waiters`, a
   semaphore per server; 503 beyond).
 - **Shutdown.** `ApiServer(shutdown=)`: the daemon passes its `stopping.set`, the event its signal handlers set,
   so `POST /api/shutdown` answers `{"stopping": true}`, flushes, then stops the daemon exactly as SIGTERM does
@@ -1315,6 +1317,7 @@ Core routes gained options: `POST /api/add` `pin`, `to`, `to_self`, `seal_name`,
 | Thread | Owner | Does |
 |---|---|---|
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
+| `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup` | per operation | lookups, fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's lookups (up to 4 at once, ended with the round; none on slow nodes) |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
@@ -1381,6 +1384,10 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
 - node: `fetched` (targets fetched for the user, for `roots`; with the cache records) and `remote_pins` (remote
   pins accepted and not yet fetched, in order; about once a second and at stop, rewritten whole); fetcher:
   `invalid` (invalid roots, oldest first; with the cache records);
+- `remote_pins_asked` and `remote_pins_served` (0.2.0, rnfs/remote_pins.py: the remote pins this node asked for and
+  their checks, at most 10 000, saved after each ask and with the batched saves; the latest outcome of each remote
+  pin served, at most 1 000, saved with the remote pins waiting; NORMAL, changed rows only; tables of their own, so
+  `remote_pins` keeps its released meaning);
 - `published`, `published_earlier`, `withdrawals` (publisher: last rounds, earlier rounds' nodes, pending
   withdrawals; NORMAL every 10 nodes or 30 s of a round and at stop, changed items only);
 - `provider_publishers`, `provider_records`, `provider_departed`, `provider_evicted` (NORMAL every 300 s and at
@@ -1570,6 +1577,37 @@ Everything in the specification is implemented, with these simplifications and a
   wait for the first join before fetching, and a fetch cut short by stopping stays queued. Stop cancels their
   fetches (an observer bound to `stop_event`, so a fetch ends at its next step) and waits for the workers
   (`_remote_workers` maps each source to its thread) within its budget.
+- **Remote pin status** (0.2.0, `rnfs/remote_pins.py`; local only, `/pin` unchanged). `AskedPins` records each
+  `/pin` this node sends (`RnfsNode.pin_remote`): one entry per (node, CID), replaced by a later ask, with pin or
+  release, whether accepted, when, and its checks (`tried`, the last attempt, for pacing; `checked` and `found`,
+  the last conclusive one; `seen`, the last finding the node). Its state is worked out when listed: `refused` (not
+  accepted, which includes no answer: `PeerClient.pin` can't tell them apart), `released`, `done` (the last
+  conclusive check found the node), `missing` (it didn't, and it ran `GRACE`, 24 h, or more after the ask) or
+  `waiting`. A check is `RnfsNode._providing`: the provider records held here first, else a provider lookup that
+  stops once the node is among the providers (`find_providers`' `should_stop`, also bound to `stop_event`);
+  inconclusive (None, nothing recorded but `tried`) when no node answered it (`Lookup.closest_answered()` empty) or
+  the node is stopping. The `rnfs-remote-pin-checks` thread (`AskedPins.run`, after the first join) makes a pass
+  every 30 s: the accepted pins due (first `FIRST_CHECK` after asking, then every `WAITING_RECHECK` while waiting,
+  `SETTLED_RECHECK` once done or missing), most overdue first, within `CHECKS_PER_HOUR` (a deque of the last
+  hour's starts, on-demand checks counted too) and `CHECKS_AT_ONCE` less those running; values are (fast, slow):
+  10 min / 1 h, 1 h / 6 h, 1 day / 3 days, 60 / 4 an hour, 4 / 1 at once. `check_now` (`pin_remote_ls(check=True)`)
+  runs one call at a time, the least recently tried first, at most `ON_DEMAND_CHECKS` (32 / 4), skipping pins tried
+  within `FRESH` (1 / 10 min) or being checked. Every lookup, background or on demand, holds a slot of one
+  semaphore of `CHECKS_AT_ONCE`, so a slow node never runs two; a pass runs its checks on up to that many
+  `rnfs-remote-pin-check` threads and waits for them. Entries are kept to `MAX_ASKED` (10 000): past it the oldest
+  released or refused, then done, then the rest go, never the one just recorded. `ServedPins` keeps the latest
+  outcome of each (identity, CID) another identity asked of this node, recorded by `remote_pin` (waiting, refused
+  `denied`, `queue_full` or `failed`, released), `_remote_pin_fetch` (fetching, pinned, dropped `quota` or by its
+  error's class, `_FAILURE_REASONS`; a fetch failing or cancelled while stopping stays waiting), `_apply_denied`
+  (dropped `denied`) and `_load_remote_pins` / `_resume_remote_pins` (dropped `identity_removed`, or `failed` when
+  no thread starts), with a detail (a log line's reason, at most 400 characters); at most `MAX_SERVED` (1 000),
+  those that ended forgotten first, then pinned ones, never one waiting or fetching. `RnfsNode.pin_remote_served`
+  joins them with what is current, which wins: storage's `remote:<identity>` pins are `pinned`, the queue's
+  `waiting` or `fetching`; an outcome claiming one is current that isn't (a crash lost it) shows `dropped`, reason
+  `lost`; usage per identity is `Storage.source_usage`, for every identity listed in `remote_pin_identities` or
+  holding pins. Both stores are `RowStore`s in SNAPSHOT mode, NORMAL: asked entries saved after each ask and with
+  the batched saves, served outcomes with the remote pins waiting (every second, in `maintain`); each change tells
+  the node, which publishes a `remote_pin` event.
 - Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks (`WINDOW`) at a time ahead of what
   has been written out. The next window is asked for before the current one is handed to the reader, so every
   provider stays busy across window boundaries (a block that arrives after the call that asked for it is stored,
