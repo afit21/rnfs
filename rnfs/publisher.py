@@ -15,7 +15,8 @@
   pin's, so the served set doesn't change.
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. The due
   CIDs' K closest nodes are found by sweep providing (rnfs.dht.sweep): one lookup per region of due keys,
-  PUBLISH_LOOKUPS at once (one at a time on slow nodes). Each key is stored on its store set: its K closest (and
+  PUBLISH_LOOKUPS at once (one at a time on slow nodes), regions sized by the network size estimate too
+  (set_network_size). Each key is stored on its store set: its K closest (and
   each disjoint path's, when the region's lookup ran as disjoint paths), the ring servers of its widened lookup when
   the density check flags it on its region's servers (set_widening; the widened lookup counts as one of the round's
   lookups), and the servers of the parts add_store_part added. Keys are grouped by node, and each node gets its
@@ -474,6 +475,7 @@ class Publisher:
         self._region_bits: int | None = None  # the prefix length of a recent region (sweep providing), or None
         self._store_parts: list[StorePart] = []  # add_store_part
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
+        self._sizes: Callable[[bytes], float | None] | None = None  # set_network_size
         self._islands = None  # set_islands: the node's partition mode (rnfs.dht.local.PartitionMode), if any
         self._heal: set[ProvidedItem] = set()  # items whose last round reached no off-island server (persisted)
         self._heal_rows: set[ProvidedItem] = set()  # items that may have a published_heal row (ever marked)
@@ -1173,8 +1175,8 @@ class Publisher:
         """Fold the prefix lengths of regions a round found (those that found a server) into the running mean the
         network size is estimated from (network_size), saved with the publish state. Lock held."""
         for region in regions:
-            if not region.closest:
-                continue
+            if not region.closest or region.single:
+                continue  # a single region's prefix isn't a region's size (sweep.find_region)
             mean = self._region_bits_mean
             self._region_bits_mean = (float(region.bits) if mean is None
                                       else mean + (region.bits - mean) / REGION_SMOOTHING)
@@ -1199,6 +1201,12 @@ class Publisher:
         key on too. Called by the lookup threads once a region is found, without the lock."""
         with self._lock:
             self._widening = (flags, widen)
+
+    def set_network_size(self, estimate: Callable[[bytes], float | None]):
+        """Size regions by the network size estimate too: estimate(key) is it (rnfs.dht.density.SizeEstimate, leaving
+        out key's own sample), None while there is none (sweep.find_region)."""
+        with self._lock:
+            self._sizes = estimate
 
     def _widen(self, sweep: Sweep, region: Region, keys: list[bytes], limit: int | None):
         """Run the widened lookups of region's keys (those its lookup covered) that the density check flags, within
@@ -1256,7 +1264,9 @@ class Publisher:
 
         def look_up(key: bytes):
             """Run the lookup for key, cover its region and widen the lookups of the keys the density check flags."""
-            region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits))
+            sizes = self._sizes
+            region = find_region(self.make_lookup(key), key, self.own_id, lambda bits: sweep.members(key, bits),
+                                 None if sizes is None else lambda: sizes(key))
             self._widen(sweep, region, sweep.cover(region), limit)
 
         if self.slow_node or len(due) < 2 or self.lookups_at_once < 2:

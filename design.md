@@ -552,9 +552,13 @@ remainder, and `DisjointLookup` makes its paths in order, so `_disjoint`'s `make
 iterator. `None` passes no `unknowns` (alpha per Lookup). The node passes `SLOW_PUBLISH_UNKNOWNS` (10) and
 `SLOW_SEARCH_UNKNOWNS` (3) on slow nodes, `None` otherwise.
 
-`sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
-the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when
-`members(p)` (due keys sharing it) is 2 or more, calls `explore`: breadth first over parts of the region, starting
+`sweep.py` — no RNS. `find_region(lookup, key, own_id, members, size=None) -> Region` runs a `Lookup`'s
+`find_closest`, sets the region's prefix length p from the farthest of the `K` closest found (0 with none); with
+`size` (the network size estimate, read once the lookup has run), p is at least `size_bits(estimate)`
+(⌊log2(N ÷ `K`) − `SIZE_MARGIN`⌋, margin 1), and while the estimate is `None` the region is `single` (the key alone:
+`Region.__contains__`, nothing explored, its p not taken as `Sweep.estimate` nor by the publisher's network size).
+When `members(p)` (due keys sharing it) is 2 or more, it calls `explore` with p as found (the far half of the region
+the lookup found, which a narrower region's keys may reach into): breadth first over parts of the region, starting
 with the far half, it asks the candidate nearest each part's centre (`ask`, by tier first) about that
 centre; a reply naming `K` servers inside the part queues its two halves; a server outside the part hands over to
 the one it named inside it (its bucket holding the part may have been full); a part gives up after
@@ -564,7 +568,9 @@ lookup's result, every candidate learned and the finds; `closest_to(key)` ranks 
 estimate)` is one round's bookkeeping, under a condition: `take()` gives the next key in the given order that is
 neither covered nor inside a claim and claims the keys sharing `estimate − 1` of its bits (everything before any
 region is known, so the first lookup runs alone), waiting while every key left is claimed; `cover(region)` covers
-the region's uncovered keys (a bisect over the sorted keys), releases the claim and updates `estimate`;
+the region's uncovered keys that `Region.knows` (a bisect over the sorted keys, then: its `K`-th closest candidate
+by distance within `SPARSE` (1.5) × (`K` − 1/3) × 2^128 ÷ `Region.size`, always for the key looked up or without an
+estimate; the rest are taken in turn), releases the claim and updates `estimate`;
 `members`, `release`, `stop`. With disjoint paths, `find_region` also keeps each path's candidates
 (`Region.paths`, from `path_candidates()`), and `Region.path_closest(key)` gives each path's K closest together; the
 publisher fills `Region.rings` (key -> ring servers of its widened lookup) and `Region.deferred`. `Sweep.spend(limit)`
@@ -774,7 +780,10 @@ most 10 per round, waiting 30 s × the round's lookups before the next. Slow nod
 server only withdrawals reach counts as a lookup (those with the most keys queued first; while any are queued, the
 round's lookups are limited to leave up to 5 for them), the others stay queued, and `next_due` counts queued
 withdrawals as due only once the pacing allows; other nodes send them all at once. `_region_bits` carries the last
-region's p to the next round. Each item's store set (`_store_set`) is its K closest from its region
+region's p to the next round. `set_network_size(estimate)` (the node passes `SizeEstimate.estimate`) gives
+`find_region` the size estimate leaving out each key's own sample; without it regions are sized by their lookups
+alone. `lookups_at_once` (constructor; `PUBLISH_LOOKUPS` if `None`) sets the region lookups run at once, 1 for tests
+that measure placement. Each item's store set (`_store_set`) is its K closest from its region
 (`Region.closest_to`), then each part added by `add_store_part(part)`, a `(key, region) -> servers` called without
 the lock after the lookups (the node adds `_senior_servers`: `first_seen.closest(key, K, min_age=provider_seniority,
 exclude=banned or, in private mode, not a member, heard_within=2 × announce_interval)`, and on a node that may have

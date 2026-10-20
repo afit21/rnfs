@@ -755,6 +755,7 @@ class RnfsNode:
                                                    known_servers=self._known_servers), batched=False)
         # A key the density check flags on its region's servers gets a widened lookup and K more stores per ring
         self.publisher.set_widening(self.lookups.flags, self.lookups.widen)
+        self.publisher.set_network_size(self.sizes.estimate)  # sweep regions sized by it too
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)
         self.publisher.add_store_part(self._senior_servers)
         # Two-level records: and on its closest local servers (section 6, "LoRa islands")

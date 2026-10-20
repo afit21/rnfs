@@ -406,6 +406,16 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   lookup per key). A round needs about servers ÷ 12.5 lookups however many keys are due: 1,000 keys on a
   1,000-server network take about 80 lookups instead of 1,000. Slow nodes' 10 lookups a round now count regions,
   not keys, so a round publishes every due key of up to 10 regions.
+- **Sweep providing on LoRa islands and at a first start:** a node that knows few identities (on an island, or just
+  started) found a key's 10 closest among them, padded with servers far from the key, so its regions held many keys
+  its lookup knew little about. Regions are now also sized by the network size estimate: never shorter than it
+  implies, covering only the keys whose servers the lookup knows as densely as it expects (the others get lookups
+  of their own), and a key a lookup until there is an estimate. Over test_topology's world of backbone and islands
+  (1,000 / 3,000 servers), an island node's records reach 6.6 / 4.5 of their true 10 closest instead of 3.8 / 2.3 (a
+  lookup per key: 7.9 / 5.1), and a node's first round after its first start 6.3 / 4.9 instead of 0.3 / 0.1, its
+  second 7.5 / 6.8 instead of 1.9 / 0.7. It costs island nodes keys per round (1.6 / 1.2 keys a region lookup instead
+  of 6.6 / 4.9, so a slow island node's round of 10 lookups publishes fewer keys), and fast backbone nodes 15–45%
+  more lookups (1,000 servers: 79 instead of 63 for 600 keys, 114 instead of 80 for 3,000).
 - **Stores to long-known servers too:** each key is also stored on the 10 servers closest to it among those the
   node first heard at least `provider_seniority` (1 day) ago and has heard in the last 2 × `announce_interval`.
   Without an attack they are mostly the key's 10 closest already, so this adds few stores; identities generated
