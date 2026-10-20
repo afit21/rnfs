@@ -234,6 +234,7 @@ LIVE = {
     "remote_pin_quota": None,  # RnfsNode, at each remote pin
     "scan_interval": None,  # the maintenance pass
     "provide_entries": _provide_entries,  # Publisher._choose_entries, at each refresh
+    "provide_entries_max": _provide_entries,  # Publisher._capped_entries, at each refresh
     "max_jobs": _max_jobs,  # JobsFeature.max_jobs, at each scheduling
     "max_finished_jobs": None,  # JobsFeature._cap_finished, when a job finishes
     "serve_interfaces": _airtime,

@@ -28,7 +28,7 @@ WHOLE_NUMBERS = {  # name: (minimum, maximum or None). gateway_port 0: any free 
     "beta": (1, None), "max_failures": (1, None), "max_incoming_links": (1, None), "max_blocks_responses": (2, None),
     "fast_blocks_responses": (1, None), "record_budget": (0, None), "max_storage": (0, None),
     "max_output_entries": (0, None), "name_table_size": (0, None), "remote_pin_quota": (0, None),
-    "gateway_fetches": (0, None),
+    "gateway_fetches": (0, None), "provide_entries_max": (0, None),
 }
 OPTIONAL_WHOLE_NUMBERS = {"alpha": 1, "max_parallel_providers": 1, "max_download_size": 0}  # name: minimum
 RATES = ("slow_bitrate", "unmeasured_bitrate", "max_upload_rate")  # bits/s, above 0
@@ -63,12 +63,12 @@ FEATURE_LIMITS = {"max_jobs": (1, None), "max_finished_jobs": (1, None), "upload
 # Units of what the tables don't give one (DURATIONS are seconds, RATES bits/s)
 UNITS = {"min_rate_sample": "bytes", "record_budget": "bytes", "max_storage": "bytes", "max_download_size": "bytes",
          "remote_pin_quota": "bytes", "follow_quota": "bytes", "upload_budget": "bytes/hour", "local_hops": "hops",
-         "local_replicas": "servers"}
+         "local_replicas": "servers", "provide_entries_max": "keys"}
 # Settings a running node applies at once when changed through the API (rnfs/features/settings.py, whose LIVE table
 # must name exactly these); every other one applies at the next start
 LIVE_SETTINGS = frozenset({
     "max_storage", "max_download_size", "max_output_entries", "max_upload_rate", "remote_pin_quota",
-    "scan_interval", "provide_entries", "max_jobs", "max_finished_jobs", "serve_interfaces", "no_serve_interfaces",
+    "scan_interval", "provide_entries", "provide_entries_max", "max_jobs", "max_finished_jobs", "serve_interfaces", "no_serve_interfaces",
     "quiet_hours", "keep_max_names", "keeper_query", "follow_quota"})
 # One line per setting (specification section 12 has the full notes)
 DESCRIPTIONS = {
@@ -115,8 +115,11 @@ DESCRIPTIONS = {
     "private": "Private mode: talk to members only",
     "scan_interval": "How often the shared folder and the folders synced to names are scanned",
     "provide_strategy": "roots (pins and complete cached downloads) or pinned (pins only) are provided",
-    "provide_entries": "Also provide every file and folder inside complete pins; unset: on, but on slow nodes "
-                       "only while republishing stays under 2% of the channel",
+    "provide_entries": "Also provide every file and folder inside the user's own complete pins (not remote pins or "
+                       "followed names'); unset: on, but on slow nodes only while republishing stays under 2% of "
+                       "the channel",
+    "provide_entries_max": "Most entry keys provide_entries provides: pins oldest first, each pin's entries all or "
+                           "none",
     "gateway_scripts": "Let gateway pages run scripts",
     "gateway_fetches": "Gateway network fetches at a time for requests that aren't the user's own navigation",
     "max_jobs": "Background jobs running at once; unset: 2, or 1 on slow nodes",
@@ -219,9 +222,10 @@ class Config:
     private: bool = False  # private mode (section 3)
     scan_interval: float = 60
     provide_strategy: str = "roots"  # "roots" (pins and complete cached downloads) or "pinned" (pins only)
-    # Also provide the CID of every file and directory inside a complete pin (spec section 6). None: on, up to
-    # publisher.MAX_ENTRY_KEYS; on slow nodes only while the estimated republish airtime stays small
+    # Also provide the CID of every file and directory inside the user's own complete pins (spec section 6). None:
+    # on, up to provide_entries_max; on slow nodes only while the estimated republish airtime stays small
     provide_entries: bool | None = None
+    provide_entries_max: int = 100_000  # entry keys provided at most (a 70k-file folder fits)
     gateway_scripts: bool = True
     gateway_fetches: int = 2
 

@@ -51,8 +51,9 @@ Upgrade notes:
 - **Routing state:** the state database gains tables for the routing table (`routing`), which is now kept across
   restarts, for local scores (`peer_scores`) and for the announce first-seen log (`announce_first_seen`).
 - **Files and folders inside pins are provided** (`provide_entries`, below, on by default): after the upgrade a node
-  that isn't slow also publishes the CID of every file and folder inside its complete pins, up to 100,000, so its
-  first rounds publish more keys. Set `provide_entries = false` to keep 0.1.6's behaviour.
+  that isn't slow also publishes the CID of every file and folder inside its own complete pins (not remote pins or
+  followed names), up to `provide_entries_max` (100,000), so its first rounds publish more keys. Set
+  `provide_entries = false` to keep 0.1.6's behaviour.
 
 Security:
 - **NomadNet links are bounded per link** (specification sections 3 and 11), with no process-wide change: the answer
@@ -360,16 +361,18 @@ Added:
   `GET /api/name/syncs`; `ApiConnection.name_sync`, `name_unsync`, `name_syncs`; `Node/Client.names.sync`,
   `unsync` and `syncs()` (`FolderSync`); capability `name_sync`. An app's token may start and stop a sync, as it
   may publish; the name's pin stays the name's.
-- **Files and folders inside pins are provided** (new setting `provide_entries`; an entry is an ordinary provider
-  record of its CID): every file and directory a directory entry names inside a complete pin, at every depth, can
-  be found by its own CID rather than only as `<root>/<path>`, and the same file in two folders from either. Not
-  chunks or other intermediate nodes, and never inside cached downloads, which provide only their root; serving is
-  unchanged (an entry's blocks are its pin's). Unset (the default), it is on up to 100,000 entry keys: pins
-  oldest first, each pin's entries all or none, a pin that would pass the cap left out (logged). On a slow node
+- **Files and folders inside pins are provided** (new settings `provide_entries` and `provide_entries_max`; an
+  entry is an ordinary provider record of its CID): every file and directory a directory entry names inside a
+  complete pin of the user's own content (the user's, the shared folder's, names' and apps' pins: not those other
+  nodes asked for or followed names'), at every depth, can be found by its own CID rather than only as
+  `<root>/<path>`, and the same file in two folders from either. Not chunks or other intermediate nodes, and never
+  inside cached downloads, which provide only their root; serving is unchanged (an entry's blocks are its pin's).
+  Unset (the default), it is on up to `provide_entries_max` entry keys (100,000): pins oldest first, each pin's
+  entries all or none, a pin that would pass the cap left out (logged). On a slow node
   it is on only while republishing every key is estimated to take at most 2% of the channel (from the slowest
   interface's bitrate, the keys, and the network size the publish rounds' regions show: about 1,300 keys at 100
   servers and 40 from 1,000 at 1 kbit/s), and none are provided past that; once on, they stay on up to 2.5%.
-  `true` or `false` overrides the default; it applies at once when changed through the API. Unpinning a folder
+  `true` or `false` overrides the default; both settings apply at once when changed through the API. Unpinning a folder
   withdraws its entries, except those still inside another pin. `rnfs status` (and `GET /api/status`,
   `Status`) gains `provided_entries`, `provide_entries_off` (why none are provided) and `provide_entries_capped`;
   `provided` counts entries too. Providing entries tells anyone looking up a file's CID that the node has it.
@@ -531,6 +534,12 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   share kept for Newcomers (Security, above).
 
 Changed:
+- **`provide_entries` covers the user's own content only** (a changed default): the files and folders inside pins of
+  the user, the shared folder, names and apps are provided by their own CIDs, but not those inside pins other nodes
+  asked for (`remote:`) or followed names (`follow:`), so a node doesn't publish the file CIDs of content others
+  asked it to keep; a pin the user holds too counts as the user's. Its cap of 100,000 entry keys is a new setting,
+  `provide_entries_max` (applied at once, like `provide_entries`), as a large mirror passes it: a pin whose entries
+  would pass the cap provides none of them.
 - A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
   asking that provider again (the responder's upload pacing), and on LoRa a 64 KiB chunk takes about 9 minutes, so
   the wait outlasted `link_idle_timeout` (5 minutes) and the idle link was closed, taking its rate estimate with it:

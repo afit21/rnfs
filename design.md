@@ -826,13 +826,18 @@ provide set, withdraw at once; skipped when the node's generation, the deny list
 strategy and `_entries_input()` are as at the last one), `publish_due()`, `serves(cid)`, `run()`. The node calls the
 first `refresh()` only after the features have registered their key sources, so a restart doesn't withdraw kept
 names' keys. **Entries** (`provide_entries`, `_choose_entries` inside `_compute`): the entries of the provided CIDs
-that are pins (`pinned_cids()`, read once per compute, among the complete undenied DAGs) are walked once per pin
+that are pins of the user's own content (`Storage.own_pinned_cids()`: CIDs one of whose sources passes
+`storage.is_own_source`, so `user`, `folder`, `name:` and `app:`, not `remote:`, `follow:` or `deny`; memoised like
+`pinned_cids()` until any pin's sources change; read once per compute, among the complete undenied DAGs) are walked
+once per pin
 (`_walk_entries`: directory and index nodes only, through `walker.directory_entries`, each directory CID once;
 memoised in `_entries_of` while the pin stays complete, as a CID's content never changes) and chosen by
 `_capped_entries`: pins in `Storage.pin_order` (first pinned oldest first, those of before 0.2.0 first, then by
-CID), each pin's entries whole or not at all while the union stays within `MAX_ENTRY_KEYS` (100,000), a pin that
-doesn't fit logged and skipped. The choice is reused while `pinned_cids()` is the same object and the complete pins
-are equal, so a refresh caused by a fetch or a block stored walks and chooses nothing. Entries are `Cid`s in
+CID), each pin's entries whole or not at all while the union stays within `provide_entries_max` (100,000 by
+default), a pin that doesn't fit logged and skipped. The choice is reused while `own_pinned_cids()` is the same
+object, the complete pins are equal and the cap is the same, so a refresh caused by a fetch or a block stored walks
+and chooses nothing; `_entries_input()` holds both settings, so changing either (live, through the settings feature,
+whose hook refreshes) makes the next refresh compute. Entries are `Cid`s in
 `_provided` like roots, so publishing, withdrawing (refresh's removed set) and persistence treat them alike;
 `_entries` holds those that aren't roots too (`provided_entries()`, `entries_status()` for the node's status).
 `_compute` asserts they are inside the served set, which doesn't change. On a slow node with the setting unset, the

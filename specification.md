@@ -1219,8 +1219,12 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   downloads. Gateway fetches are never provided under either.
   Keepers also provide the keys of the names they keep (section 9), under any strategy.
 - **Entries** (`provide_entries`). A node MAY also provide the CID of every file and directory inside a complete
-  pin: each CID a directory entry names, at every depth (through index nodes too), so each can be found by its
-  own CID rather than only as `<root>/<path>`, and the same file in two folders from either. Chunks, the file
+  pin of the user's own content: each CID a directory entry names, at every depth (through index nodes too), so
+  each can be found by its own CID rather than only as `<root>/<path>`, and the same file in two folders from
+  either. rnfs takes the pins of the user, the shared folder, names it publishes and apps (`user`, `folder`, `name:`,
+  `app:`), not those another node asked it to keep (`remote:`, section 8), followed names' (`follow:`) or the deny
+  lists' own blocks, so it doesn't publish the files inside content others asked it to keep; a pin the user holds
+  too counts as the user's. Chunks, the file
   nodes below a file's root, index nodes and a large directory's other type 2 nodes are not provided: nothing
   names them. Providing an entry is an ordinary provider record of its CID, published, republished and
   withdrawn as a root's is, and the blocks served (section 7) don't change: an entry's DAG is inside its pin's. It
@@ -1233,8 +1237,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   - Each entry key costs its republishing: about 165 bytes a round (16 bytes to each of `K` servers, and request
     overhead), which sweep providing doesn't reduce, and entries multiply a node's keys 3–5× for folders of a few
     files and over 100× for large ones (a 70k-file folder: about 11.6 MB a day from a node that isn't slow).
-  - **Defaults** (rnfs; `provide_entries` unset). A node that isn't slow provides entries, up to 100,000 entry
-    keys: pins are taken oldest first (by when each was first pinned; pins made before rnfs 0.2.0 first, then by
+  - **Defaults** (rnfs; `provide_entries` unset). A node that isn't slow provides entries, up to
+    `provide_entries_max` entry keys (100,000 by default; a large mirror may need more): pins are taken oldest
+    first (by when each was first pinned; pins made before rnfs 0.2.0 first, then by
     CID), each pin's entries all or none, and a pin whose entries would pass the cap is left out, logged, while a
     later smaller one may still fit. So a folder is findable whole or not at all, and pinning something new never
     takes an older pin's entries away. An entry under two pins counts once.
@@ -2498,7 +2503,8 @@ refused, leaving the settings file as it was, unless the whole resulting file is
 node's command-line options, under the same checks as at start (ownership, no symlink, size). Options given on
 the command line keep winning over the file. rnfs applies these at once, the rest at the next start:
 `max_storage` (enforced at once), `max_download_size`, `max_output_entries`, `max_upload_rate`,
-`remote_pin_quota`, `scan_interval`, `provide_entries` (entries provided or withdrawn at once), `max_jobs`,
+`remote_pin_quota`, `scan_interval`, `provide_entries` and `provide_entries_max` (entries provided or withdrawn at
+once), `max_jobs`,
 `max_finished_jobs`, `serve_interfaces`, `no_serve_interfaces`, `quiet_hours`, `keep_max_names` (names kept
 beyond a lower cap stay, as at a start), `keeper_query` and `follow_quota`. Settings of identity, ports,
 Reticulum, the DHT mode and private mode never apply before a restart.
@@ -2541,7 +2547,8 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `members` | empty | Private mode's member identities |
 | `scan_interval` | 60 s | Shared folder, and folders synced to names (section 9) |
 | `provide_strategy` | `roots` | `roots` (pins and complete cached downloads) or `pinned` (pins only) |
-| `provide_entries` | unset: on, up to 100,000 entry keys; on slow nodes only while republishing stays under 2% of the channel | Also provide every file and folder inside complete pins (section 6). `true` or `false` overrides the default either way |
+| `provide_entries` | unset: on, up to `provide_entries_max` entry keys; on slow nodes only while republishing stays under 2% of the channel | Also provide every file and folder inside the user's own complete pins (section 6: not remote pins or followed names'). `true` or `false` overrides the default either way |
+| `provide_entries_max` | 100,000 | Entry keys `provide_entries` provides at most: pins oldest first, each pin's entries all or none (section 6). 0: none |
 | `gateway_scripts` | on | |
 | `gateway_fetches` | 2 | Network fetches at a time for requests that aren't the user's own navigation |
 | `api_port`, `gateway_port` | 8788, 8789 | Local API and gateway ports, on 127.0.0.1 (section 11) |

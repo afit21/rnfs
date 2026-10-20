@@ -7,12 +7,13 @@
   recomputes this only when something it is computed from changed (the node's generation(), the deny list,
   the key sources' keys, the strategy, provide_entries and, on slow nodes, the network size it is judged by), so
   the many refreshes that change nothing cost almost nothing.
-- **Entries** (provide_entries): also every CID a directory entry names inside a complete pin (its files and
-  directories at every depth, not chunks, file nodes or index nodes), so each can be found by its own CID. Never
-  those of cached downloads. Unset, it is on up to MAX_ENTRY_KEYS entry keys, pins taken oldest first and each
-  pin's entries all or none; on a slow node only while republishing every key is estimated to take at most
-  ENTRY_AIRTIME_ON of the channel (republish_airtime), and otherwise none at all. An entry's DAG is inside its
-  pin's, so the served set doesn't change.
+- **Entries** (provide_entries): also every CID a directory entry names inside a complete pin of the user's own
+  content (storage.is_own_source: the user's, the shared folder's, names' and apps' pins; not those other nodes
+  asked for or followed names'), its files and directories at every depth (not chunks, file nodes or index nodes),
+  so each can be found by its own CID. Never those of cached downloads. Up to provide_entries_max entry keys, pins
+  taken oldest first and each pin's entries all or none; unset, on, but on a slow node only while republishing
+  every key is estimated to take at most ENTRY_AIRTIME_ON of the channel (republish_airtime), and otherwise none at
+  all. An entry's DAG is inside its pin's, so the served set doesn't change.
 - **Publishing.** A CID is due when it has never been published or its republish_interval has passed. The due
   CIDs' K closest nodes are found by sweep providing (rnfs.dht.sweep): one lookup per region of due keys,
   PUBLISH_LOOKUPS at once (one at a time on slow nodes), regions sized by the network size estimate too
@@ -120,8 +121,8 @@ PROVIDE_PARALLEL = 16
 
 # provide_entries (spec section 6). Each entry key costs about 165 bytes a republish round (16 bytes to each of K
 # servers, and request overhead) and multiplies a node's keys 3-5x for folders of a few files, over 100x for large
-# ones: past this many, the entries of the newest pins are left out (a 70k-file folder fits, at ~11.6 MB a day)
-MAX_ENTRY_KEYS = 100_000
+# ones: past provide_entries_max (default 100,000; a 70k-file folder fits, at ~11.6 MB a day), the entries of the
+# newest pins are left out
 # Slow nodes provide entries by default only while republishing every key is estimated (republish_airtime) to take
 # at most ENTRY_AIRTIME_ON of the channel over a republish interval; once on, they stay on up to ENTRY_AIRTIME_OFF,
 # so a network size estimate wavering around the line doesn't withdraw and provide every entry again and again
@@ -607,11 +608,11 @@ class Publisher:
         self._denied_dags: dict[Cid, tuple[frozenset[bytes], frozenset[Cid], bool]] = {}
         # provide_entries: the entries provided that aren't provided as roots too; each complete pin's entries
         # (_walk_entries, kept while it is a complete pin: a CID's content never changes); and what the last
-        # choice of entries was made from and gave: (pinned_cids() then, the complete pins, entries chosen, pins left
-        # out at MAX_ENTRY_KEYS), so a refresh that changed no pin chooses nothing again
+        # choice of entries was made from and gave: (own_pinned_cids() then, the complete pins, the cap, entries
+        # chosen, pins left out at the cap), so a refresh that changed no pin chooses nothing again
         self._entries: frozenset[Cid] = frozenset()
         self._entries_of: dict[Cid, frozenset[Cid]] = {}
-        self._entries_from: tuple = (None, frozenset(), frozenset(), ())
+        self._entries_from: tuple = (None, frozenset(), None, frozenset(), ())
         self._entries_off: str | None = None  # why entries aren't provided (the setting, or a slow node's airtime)
         self._estimated_off = False  # whether the slow-node estimate is why (logged when that changes)
         self._entries_on = False  # whether the last computing refresh provided entries (persisted, as "entries_on")
@@ -954,9 +955,9 @@ class Publisher:
     def entries_status(self) -> dict:
         """For the node's status: {"provided_entries": entry keys provided (not provided as roots too),
         "provide_entries_off": why none are, or None, "provide_entries_capped": pins whose entries were left
-        out at MAX_ENTRY_KEYS}."""
+        out at provide_entries_max}."""
         with self._lock:
-            capped = len(self._entries_from[3]) if self._entries_off is None else 0
+            capped = len(self._entries_from[4]) if self._entries_off is None else 0
             return {"provided_entries": len(self._entries), "provide_entries_off": self._entries_off,
                     "provide_entries_capped": capped}
 
@@ -1012,26 +1013,26 @@ class Publisher:
         if keys != self._keys_from[0]:
             self._keys_from = (keys, frozenset(DhtKey(key) for key in keys))
         roots = frozenset(dags)
-        self._entries = self._choose_entries(pinned, dags, len(roots) + len(keys))
+        self._entries = self._choose_entries(dags, len(roots) + len(keys))
         # An entry is a block of a complete pin's DAG, so serving needs nothing more: the entry's DAG is inside it.
         # Entries come only from pins provided here, never on their own
         assert self._entries <= served, "an entry was chosen outside the served set"
         return roots | self._keys_from[1] | self._entries, served
 
-    def _choose_entries(self, pinned: frozenset[Cid], dags: dict[Cid, frozenset[Cid]],
-                        other_keys: int) -> frozenset[Cid]:
-        """The entries to provide (provide_entries) that aren't provided as roots: those of the pins (pinned, as
-        pinned_cids() gave it) among dags (the CIDs provided, with their blocks), up to MAX_ENTRY_KEYS, or none (the
-        setting is false, or a slow
-        node's default finds that republishing them with the other_keys other keys would take too much of the
-        channel). Notes why none are in _entries_off, logging when the estimate turns them off or on. Lock held."""
+    def _choose_entries(self, dags: dict[Cid, frozenset[Cid]], other_keys: int) -> frozenset[Cid]:
+        """The entries to provide (provide_entries) that aren't provided as roots: those of the pins of the user's own
+        content (own_pinned_cids()) among dags (the CIDs provided, with their blocks), up to provide_entries_max, or
+        none (the setting is false, or a slow node's default finds that republishing them with the other_keys other
+        keys would take too much of the channel). Notes why none are in _entries_off, logging when the estimate turns
+        them off or on. Lock held."""
         setting = self.config.provide_entries
         reason = None
         chosen: frozenset[Cid] = frozenset()
         if setting is False:
             reason = "provide_entries is false"
         else:
-            chosen = self._capped_entries(pinned, pinned & dags.keys()) - dags.keys()
+            own = self.storage.own_pinned_cids()  # the same frozenset until pins change: not copied
+            chosen = self._capped_entries(own, own & dags.keys()) - dags.keys()
             if setting is None and self.slow_node and chosen:
                 keys = other_keys + len(chosen)
                 servers = self._network_size()
@@ -1062,12 +1063,13 @@ class Publisher:
         return chosen
 
     def _capped_entries(self, pinned: frozenset[Cid], complete: frozenset[Cid]) -> frozenset[Cid]:
-        """The entries of the pins in complete (pinned is pinned_cids()), up to MAX_ENTRY_KEYS: pins oldest first
-        (Storage.pin_order), each pin's entries all or none, so adding a pin never takes away an older pin's
+        """The entries of the pins in complete (pinned is own_pinned_cids()), up to provide_entries_max: pins oldest
+        first (Storage.pin_order), each pin's entries all or none, so adding a pin never takes away an older pin's
         entries and a folder is findable whole or not at all; a pin that doesn't fit is left out (logged) and later
-        ones still may. The same as last time while pins and complete are. Lock held."""
-        last_pinned, last_complete, chosen, skipped = self._entries_from
-        if last_pinned is pinned and last_complete == complete:
+        ones still may. The same as last time while pins, complete and the cap are. Lock held."""
+        cap = self.config.provide_entries_max
+        last_pinned, last_complete, last_cap, chosen, skipped = self._entries_from
+        if last_pinned is pinned and last_complete == complete and last_cap == cap:
             return chosen
         self._entries_of = {cid: entries for cid, entries in self._entries_of.items() if cid in complete}
         found: set[Cid] = set()
@@ -1081,15 +1083,15 @@ class Publisher:
                     walked = False
                     continue
                 self._entries_of[root] = entries
-            if len(found) + len(entries) > MAX_ENTRY_KEYS and len(found | entries) > MAX_ENTRY_KEYS:
+            if len(found) + len(entries) > cap and len(found | entries) > cap:
                 left_out.append(root)
                 continue
             found |= entries
         chosen = frozenset(found)
         if left_out and tuple(left_out) != skipped:
             log(f"provide_entries: the files and folders inside {plural(len(left_out), 'pin')} (the newest) aren't "
-                f"provided: they would take this node past {MAX_ENTRY_KEYS} entry keys", LOG_NOTICE)
-        self._entries_from = (pinned if walked else None, complete, chosen, tuple(left_out))
+                f"provided: they would take this node past {cap} entry keys (provide_entries_max)", LOG_NOTICE)
+        self._entries_from = (pinned if walked else None, complete, cap, chosen, tuple(left_out))
         return chosen
 
     def _walk_entries(self, root: Cid) -> frozenset[Cid] | None:
@@ -1128,12 +1130,13 @@ class Publisher:
         return network_size(self._region_bits_mean, known)
 
     def _entries_input(self) -> tuple:
-        """What the entries a refresh chooses depend on besides pins (generation()): the setting, and for a slow
-        node's default the network size and republish interval its estimate uses. Lock held."""
-        setting = self.config.provide_entries
+        """What the entries a refresh chooses depend on besides pins (generation()): the settings, and for a slow
+        node's default the network size and republish interval its estimate uses and whether the radio measured it
+        busy. Lock held."""
+        setting, cap = self.config.provide_entries, self.config.provide_entries_max
         if setting is None and self.slow_node:
-            return setting, self._network_size(), self.interval, self._measured_busy()
-        return (setting,)
+            return setting, cap, self._network_size(), self.interval, self._measured_busy()
+        return setting, cap
 
     def _measured_busy(self) -> bool:
         """True if the radio measured this node's own airtime over the last hour above ENTRY_AIRTIME_ON."""
