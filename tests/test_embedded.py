@@ -263,6 +263,15 @@ HOST_CONFIG = """
     target_port = {port}
 """
 
+ALONE_CONFIG = """
+[reticulum]
+  enable_transport = No
+  share_instance = No
+[logging]
+  loglevel = 2
+[interfaces]
+"""
+
 APP = "rnfstest"  # the host programs' own app name
 BIG = 3_000_000  # over RNS's 1 MiB segment: a multi-segment Resource, and very compressible (zeros)
 REQUEST = 600_000  # a request over the link MDU, so RNS sends it as a Resource (one segment, compressible)
@@ -460,6 +469,51 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
     os._exit(0)
 
 
+def run_links_gate(configdir: str, rnfs_dir: str):
+    """A node on a Reticulum of its own without interfaces: whether its rnfs.dht destination accepted links while it
+    was set up, and once it had started. Prints RESULT and a JSON object."""
+    import rnfs
+    from rnfs.node import RnfsNode
+
+    reticulum = RNS.Reticulum(configdir=configdir)
+    seen = {}
+    setup = RnfsNode._setup_or_close
+
+    def recording(node, *args, **kwargs):
+        """RnfsNode._setup_or_close, noting whether links were accepted meanwhile."""
+        seen["during_setup"] = node.destination.accepts_links()
+        return setup(node, *args, **kwargs)
+
+    with mock.patch.object(RnfsNode, "_setup_or_close", recording):
+        node = rnfs.Node(rnfs_dir, reticulum=reticulum, settings={"default_bootstrap": False})
+    seen["started"] = node.internal.destination.accepts_links()
+    node.close()
+    print("RESULT", json.dumps(seen), flush=True)
+    os._exit(0)
+
+
+class LinkGateTest(unittest.TestCase):
+    """A node accepts links on its rnfs.dht destination only once it can answer requests on them."""
+
+    def test_no_links_while_the_node_is_set_up(self):
+        """RNS accepts a link to a destination as soon as it exists and drops requests without a handler: through a
+        node's setup (a minute on a large store, minutes at an upgrade's first start), every request other nodes sent
+        waited out its timeout. Links are refused until the request server is in place."""
+        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(directory.cleanup)
+        configdir = os.path.join(directory.name, "rns")
+        os.makedirs(configdir)
+        with open(os.path.join(configdir, "config"), "w", encoding="utf-8") as f:
+            f.write(ALONE_CONFIG)
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": ROOT}
+        done = subprocess.run([sys.executable, os.path.abspath(__file__), "--links-gate", configdir,
+                               os.path.join(directory.name, "rnfs")], capture_output=True, encoding="utf-8",
+                              errors="replace", env=env, timeout=120)
+        lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
+        self.assertTrue(lines, done.stdout + done.stderr)
+        self.assertEqual(json.loads(lines[-1][len("RESULT "):]), {"during_setup": False, "started": True})
+
+
 @unittest.skipUnless(os.environ.get("RNFS_E2E") == "1", "set RNFS_E2E=1 to run")
 class HostProgramTest(unittest.TestCase):
     """A host program's own destinations beside an embedded node, against a plain RNS peer."""
@@ -581,5 +635,7 @@ if __name__ == "__main__":
         run_peer(sys.argv[2])
     elif sys.argv[1:2] == ["--host"]:
         run_host(*sys.argv[2:6])
+    elif sys.argv[1:2] == ["--links-gate"]:
+        run_links_gate(*sys.argv[2:4])
     else:
         unittest.main()

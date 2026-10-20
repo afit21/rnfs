@@ -191,6 +191,11 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   in and out). A link with a rate estimate, which carried `/blocks`, keeps `link_idle_timeout`: closing it would
   reset the responder's rate estimate (its next response held to one chunk) and RNS's Resource window. These
   links don't identify, so lookups and downloads don't reveal who is asking.
+- A node SHOULD accept links on its `rnfs.dht` destination only once it can answer requests on them (rnfs 0.2.0:
+  `Destination.accepts_links`, off from the destination's creation until the request server is in place). RNS
+  accepts a link to a destination as soon as it exists and drops requests for paths without handlers, so through a
+  node's start (a minute with 857k blocks, minutes at the first start after an upgrade) every request others sent
+  waited out its timeout; a link request it drops fails theirs in seconds.
 - A requester SHOULD close a shared link once a request on it goes unanswered (RNS times it out, nothing of an answer
   started) with nothing at all received on the link since the request was sent, unless another request is in
   progress on it (rnfs 0.2.0). The other end has most likely lost the link: its `rnsd`, or a transport node on the

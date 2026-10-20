@@ -184,6 +184,12 @@ INTERNALS = [
     # Identities and announces RNS remembers
     Internal("node.py, names.py, features/peers.py", "Identity.known_destinations entries: [time heard, packet "
              "hash, public key, app_data, ...]", lambda: _known_destinations()),
+    Internal("node.py", "Destination.accepts_links(False) makes Destination.incoming_link_request drop a link "
+             "request (no link is made), and accepts_links(True) accept them again",
+             lambda: (_source(RNS.Destination.incoming_link_request, "if self.accept_link_requests:",
+                              "RNS.Link.validate_request(self, data, packet)"),
+                      _source(RNS.Destination.accepts_links, "self.accept_link_requests = True",
+                              "self.accept_link_requests = False"))),
     Internal("node.py", "announce handlers called only for an announce that takes the path (should_add), and only "
              "after its path table entry is written, so the path's newest emission is that announce's",
              lambda: _handlers_after_path()),

@@ -747,6 +747,12 @@ Fixed:
   so a search during the partition that followed found nothing in 3.5 minutes. A link that received nothing at all
   while a request on it went unanswered is now closed, unless another request is using it, and the next request
   opens a new one.
+- **No links accepted until the node can answer on them** (spec section 3, Links): the `rnfs.dht` destination
+  accepted links from its creation, at the start of the daemon, but requests only once the node was set up; RNS drops
+  a request without a handler, so through a start (80 s on a cloud node with 857k blocks working out what it
+  provides, minutes at the first start after this upgrade) every request other nodes sent waited out its timeout.
+  Over LoRa a slow node's join asked a gateway restarting meanwhile and waited 20 s for nothing. Links are refused
+  (RNS drops the link request, which fails in seconds) until the request server is in place.
 - **A fetch uses the provider records its own node holds** (spec section 6, Finding providers): a search started
   with nothing, though a DHT server holds records for the keys near it, and on an island a node holds the local
   replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its

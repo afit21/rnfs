@@ -542,6 +542,11 @@ class RnfsNode:
         self.identity = load_or_create_identity(config.identity_path)
         self.destination = RNS.Destination(self.identity, RNS.Destination.IN, RNS.Destination.SINGLE,
                                            APP_NAME, DHT_ASPECT)
+        # No links until the request server answers on them (_start_network): RNS accepts a link to a registered
+        # destination at once, and drops requests for paths without handlers, so through setup (a minute on a node
+        # with 857k blocks, minutes at the first start after an upgrade) every request other nodes sent was dropped
+        # and waited out its timeout; a link request dropped fails theirs in seconds instead
+        self.destination.accepts_links(False)
         slow = rates.is_slow_node(config, self.reticulum)
         # Local servers (section 6, "LoRa islands") only on a node naming local_interfaces or with a slow interface
         local = bool(config.local_interfaces) or rates.has_slow_interface(self.reticulum, config.slow_bitrate)
@@ -591,6 +596,7 @@ class RnfsNode:
             self.publisher.stretch = self.channel.stretch_wait
             self.publisher.measured_airtime = self.channel.airtime_share
             self.server.airtime.over_airtime = self.channel.over_budget
+        self.destination.accepts_links(True)  # the server's handlers and checks are in place
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
         self.announce_handler = DhtAnnounceHandler(self._heard_server, self._heard_client, self.routing.is_banned,
                                                    self.node_id, on_announced=self._announced)
