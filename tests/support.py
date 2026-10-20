@@ -121,15 +121,16 @@ def failing_commits(error: str = "disk I/O error"):
 
 
 def pinned_entries(storage) -> set:
-    """The CIDs a directory entry names, at any depth, inside each complete pin of storage: what provide_entries
-    provides by default on a node that isn't slow, below its cap (spec section 6), worked out here by walking every
-    path rather than as the publisher does, so a test can check the publisher against it."""
+    """The CIDs a directory entry names, at any depth, inside each complete pin of storage's user's own content
+    (own_pinned_cids: not remote pins or followed names'): what provide_entries provides by default on a node that
+    isn't slow, below its cap (spec section 6), worked out here by walking every path rather than as the publisher
+    does, so a test can check the publisher against it."""
     from rnfs.content import walker
     from rnfs.content.dag import KIND_DIRECTORY
     from rnfs.errors import InvalidDag, NotFound
     get = storage.getter()
     found = set()
-    for root in storage.pins():
+    for root in storage.own_pinned_cids():
         try:
             storage.dag_blocks(root)  # only complete pins
             entries = []

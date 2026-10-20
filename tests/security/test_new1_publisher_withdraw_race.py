@@ -105,8 +105,8 @@ class WithdrawRaceTest(unittest.TestCase):
         """What is wrong once settled with the CID provided: records the publisher counts on that are gone."""
         key = self.cid.key
         found = []
-        published = self.publisher._published.get(self.cid)
-        for node_id in (published[1] if published else []):
+        state = self.publisher.states().get(self.cid)  # the servers of its last round (none if cut short)
+        for node_id in (state["nodes"] if state else []):
             if key not in self.client.held.get(node_id, set()):
                 found.append(f"{node_id.hex()[:4]} was sent a withdrawal after storing it")
         if OWN not in self.records.providers(key):

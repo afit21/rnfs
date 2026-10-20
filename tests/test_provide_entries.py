@@ -1,19 +1,20 @@
 """Tests for provide_entries (rnfs/publisher.py; specification section 6, "Provide strategy"): the files and folders
-inside complete pins provided by their own CIDs, the cap, a slow node's airtime estimate and its default."""
+inside the user's own complete pins provided by their own CIDs, the cap (provide_entries_max), a slow node's airtime
+estimate and its default."""
 import math
 from unittest import mock
 
 from rnfs import publisher as publisher_module
+from rnfs.config import Config
 from rnfs.constants import DAY, K
 from rnfs.content import builder
 from rnfs.content import storage as storage_module
 from rnfs.content.cid import Cid
 from rnfs.content.dag import Entry
-from rnfs.content.storage import USER
-from rnfs.publisher import (ENTRY_AIRTIME_OFF, ENTRY_AIRTIME_ON, MAX_ENTRY_KEYS, UNKNOWN_NETWORK, network_size,
-                            republish_airtime)
+from rnfs.content.storage import DENY, FOLDER, USER, is_own_source
+from rnfs.publisher import ENTRY_AIRTIME_OFF, ENTRY_AIRTIME_ON, UNKNOWN_NETWORK, network_size, republish_airtime
 from tests.fakes.log import quiet_log
-from tests.support import state_rows
+from tests.support import state_execute, state_rows
 from tests.test_publisher import N1, N2, PublisherCase, near
 
 setUpModule, tearDownModule = quiet_log()
@@ -95,10 +96,13 @@ class EntriesTest(PublisherCase):
         files = {f"f{i:05d}": self.file() for i in range(count)}
         return self.folder(files), {built.cid for built in files.values()}
 
-    def slow_publisher(self, servers: int | None = None, bitrate: float | None = None, generation: bool = False):
+    def slow_publisher(self, servers: int | None = None, bitrate: float | None = None, generation: bool = False,
+                       fresh: bool = False):
         """A slow publisher at the default republish interval (3 days), whose network size estimate is servers (or
-        none yet)."""
+        none yet); fresh: one whose entries were never on (an earlier publisher's saved decision forgotten)."""
         self.config.republish_interval = None
+        if fresh:
+            state_execute(self.state, "DELETE FROM meta WHERE store = 'publisher' AND key = 'entries_on'")
         publisher = self.make_publisher(slow=True, bitrate=bitrate, generation=generation)
         if servers is not None:
             publisher._region_bits_mean = math.log2(servers / K) - 0.5  # network_size gives servers back
@@ -270,8 +274,8 @@ class EntriesTest(PublisherCase):
         self.pin(new, at=300.0)
         self.pin(middle, at=200.0)
         self.pin(old, at=100.0)
-        with mock.patch.object(publisher_module, "MAX_ENTRY_KEYS", 5), \
-                mock.patch.object(publisher_module, "log") as logged:
+        self.config.provide_entries_max = 5
+        with mock.patch.object(publisher_module, "log") as logged:
             self.publisher.refresh()
             # The oldest pin's 3, then the middle one's 4 don't fit (7 > 5) and are left out whole; the newest's 2 do
             self.assertEqual(self.publisher.provided(), {old.cid, middle.cid, new.cid} | old_files | new_files)
@@ -296,13 +300,70 @@ class EntriesTest(PublisherCase):
         two = self.folder({**shared, "extra": self.file()})
         self.pin(one, at=100.0)
         self.pin(two, at=200.0)
-        with mock.patch.object(publisher_module, "MAX_ENTRY_KEYS", 4):
-            self.publisher.refresh()
+        self.config.provide_entries_max = 4
+        self.publisher.refresh()
         self.assertEqual(len(self.publisher.provided_entries()), 4)
         self.assertEqual(self.publisher.entries_status()["provide_entries_capped"], 0)
 
-    def test_cap_is_100k(self):
-        self.assertEqual(MAX_ENTRY_KEYS, 100_000)
+    def test_cap_is_100k_by_default(self):
+        self.assertEqual(Config().provide_entries_max, 100_000)
+
+    def test_cap_is_a_setting_a_refresh_reads(self):
+        """provide_entries_max is read at each refresh, which computes again when it changed (generation or not): a
+        pin past a lower cap loses its entries whole, and gets them back under a higher one; 0 provides none."""
+        self.publisher = self.make_publisher(generation=True)
+        folder, files = self.flat(4)
+        self.pin(folder)
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided_entries(), files)
+        for cap, expected in ((3, set()), (4, files), (0, set()), (100_000, files)):
+            with self.subTest(cap=cap):
+                self.config.provide_entries_max = cap
+                self.publisher.refresh()
+                self.assertEqual(self.publisher.provided_entries(), expected)
+                self.assertEqual(self.publisher.entries_status()["provide_entries_capped"], 0 if expected else 1)
+                self.assertEqual(self.publisher.provided(), {folder.cid} | expected)
+
+    # Whose pins
+
+    def test_entries_only_of_the_users_own_pins(self):
+        """Only pins of the user's own content have their entries provided: the user's, the shared folder's, a name's
+        and an app's; not those another node asked for (remote:), a followed name's (follow:) or the deny lists'.
+        Every complete pin is still provided itself."""
+        identity = "ab" * 16
+        sources = {USER: True, FOLDER: True, "name:site": True, "app:photos": True, "app:photos:album": True,
+                   "remote:" + identity: False, "follow:" + identity: False, DENY: False}
+        expected, roots = set(), set()
+        for source, own in sources.items():
+            folder, files = self.flat(2)
+            self.storage.pin(folder.cid, source)
+            roots.add(folder.cid)
+            self.assertEqual(is_own_source(source), own, source)
+            if own:
+                expected |= files
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided_entries(), expected)
+        self.assertEqual(self.publisher.provided(), roots | expected)
+
+    def test_a_remote_pin_gains_and_loses_its_entries_with_the_users_hold(self):
+        """A pin another node asked for has its entries provided while the user pins it too, and withdrawn (the root
+        still provided) once only the remote pin holds it; a pin's sources changing makes the next refresh compute."""
+        self.publisher = self.make_publisher(generation=True)
+        remote = "remote:" + "cd" * 16
+        folder, files = self.flat(3)
+        self.storage.pin(folder.cid, remote)
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {folder.cid})
+        self.storage.pin(folder.cid, USER)
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {folder.cid} | files)
+        self.publisher.publish_due()
+        self.client.calls.clear()
+        self.storage.unpin(folder.cid, USER)
+        self.publisher.refresh()
+        self.assertEqual(self.publisher.provided(), {folder.cid})
+        self.publisher.publish_due()
+        self.assertEqual(self.withdrawn()[N1], {cid.key for cid in files})
 
     # Slow nodes
 
@@ -319,7 +380,7 @@ class EntriesTest(PublisherCase):
         self.storage.unpin(folder.cid, USER)
         bigger, bigger_files = self.flat(on_limit)  # one key too many
         self.pin(bigger)
-        publisher = self.slow_publisher(servers=1000)  # fresh: never on yet
+        publisher = self.slow_publisher(servers=1000, fresh=True)  # never on yet
         publisher.refresh()
         self.assertEqual(publisher.provided(), {bigger.cid})
         reason = publisher.entries_status()["provide_entries_off"]
@@ -343,7 +404,7 @@ class EntriesTest(PublisherCase):
         self.assertEqual(len(publisher.provided_entries()), on_limit - 1)
         extra = self.file()
         self.pin(extra)  # one key more
-        publisher = self.slow_publisher(servers=100)
+        publisher = self.slow_publisher(servers=100, fresh=True)
         publisher.refresh()
         self.assertEqual(publisher.provided(), {folder.cid, extra.cid})
 
@@ -489,8 +550,8 @@ class EntriesTest(PublisherCase):
         self.assertEqual(restarted.provided(), {folder.cid} | files)
         self.assertEqual(restarted.publish_due()["published"], [])  # not due again
         self.assertEqual(self.client.calls, [])
-        published = {item for item, _, _ in state_rows(self.state, "SELECT item, at, nodes FROM published")}
-        self.assertEqual(published, {str(cid) for cid in {folder.cid} | files})
+        published = {item for (item,) in state_rows(self.state, "SELECT item FROM publish_items WHERE at IS NOT NULL")}
+        self.assertEqual(published, {cid.binary for cid in {folder.cid} | files})
 
     def test_entries_are_served_with_their_pin(self):
         """Entries are chosen from complete pins provided here only (_compute asserts it), so each is in the served

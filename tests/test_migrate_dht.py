@@ -6,13 +6,14 @@ damaged one is moved aside, an import interrupted after its commit isn't repeate
 nothing, a .migrated file left behind is ignored, and a failed commit imports nothing."""
 import json
 import os
+import struct
 import tempfile
 import unittest
 from unittest import mock
 
 import RNS
 
-from rnfs import statedb
+from rnfs import publisher as publisher_module, statedb
 from rnfs.config import Config
 from rnfs.constants import DAY, ID_LENGTH
 from rnfs.content.cid import RAW, Cid
@@ -256,14 +257,33 @@ class PublishedTest(MigrateTest):
         return publisher
 
     def load(self) -> tuple:
-        """(published, earlier, withdrawals) as a publisher on the state directory loads them."""
+        """(published, earlier, withdrawals) once a publisher on the state directory has loaded: its rows
+        (publish_items), as {item: (at, nodes)} and {item: {node: at}}, and the withdrawals it holds."""
         publisher = self.publisher()
-        return publisher._published, publisher._earlier, publisher._withdrawals
+        published, earlier = {}, {}
+        for item, at, nodes, servers in self.items():
+            if at is not None:
+                published[item] = (at, [nodes[i:i + ID_LENGTH] for i in range(0, len(nodes), ID_LENGTH)])
+            if servers:
+                earlier[item] = servers
+        return published, earlier, publisher._withdrawals
+
+    def items(self) -> list[tuple]:
+        """The publish_items rows: (item, at, nodes, {earlier node: at})."""
+        return [(publisher_module._from_id(item), at, nodes,
+                 {blob[i:i + ID_LENGTH]: struct.unpack(">d", blob[i + ID_LENGTH:i + ID_LENGTH + 8])[0]
+                  for i in range(0, len(blob), ID_LENGTH + 8)})
+                for item, at, nodes, blob in state_rows(self.state, "SELECT item, at, nodes, earlier FROM publish_items")]
 
     def rows(self) -> tuple:
-        """The publisher's tables, sorted."""
-        return tuple(sorted(state_rows(self.state, f"SELECT * FROM {table}"))
-                     for table in ("published", "published_earlier", "withdrawals"))
+        """The publisher's rows, sorted and shaped as rnfs 0.1.x's tables held them (published, published_earlier,
+        withdrawals); those tables themselves are empty (the import moves their rows into publish_items)."""
+        for table in ("published", "published_earlier"):
+            self.assertEqual(state_rows(self.state, f"SELECT * FROM {table}"), [])
+        items = self.items()
+        return (sorted((str(item), at, nodes) for item, at, nodes, _ in items if at is not None),
+                sorted((str(item), node, at) for item, _, _, servers in items for node, at in servers.items()),
+                sorted(state_rows(self.state, "SELECT * FROM withdrawals")))
 
     def test_valid_file_imports_exactly(self):
         """Every last round (CIDs and feature keys), earlier node and withdrawal is imported as written and
@@ -340,7 +360,8 @@ class PublishedTest(MigrateTest):
         with publisher._lock:
             publisher._withdrawals[N2] = {K3}
             publisher._touch_node(N2)
-            del publisher._published[A]
+            state = publisher._get(A)  # its last round forgotten, its earlier servers kept
+            state.at, state.nodes = None, []
             publisher._touch_item(A)
         with failing_commits():
             with self.assertRaises(OSError):
