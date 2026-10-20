@@ -747,6 +747,11 @@ Fixed:
   so a search during the partition that followed found nothing in 3.5 minutes. A link that received nothing at all
   while a request on it went unanswered is now closed, unless another request is using it, and the next request
   opens a new one.
+- **A fetch uses the provider records its own node holds** (spec section 6, Finding providers): a search started
+  with nothing, though a DHT server holds records for the keys near it, and on an island a node holds the local
+  replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its
+  search to find the provider it named. The providers this node's own `/find` answer would list are now candidates
+  as the search starts; the search still runs, so a record held here can't hide other providers.
 
 ## 0.1.6
 

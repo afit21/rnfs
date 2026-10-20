@@ -580,6 +580,9 @@ class Fetcher:
         # Whether a node is behind a slow path (mesh.SlowPaths: more than SLOW_PATH_HOPS hops, or this node's last link
         # to it was slow); the node sets its own. Without it, rate estimates and next-hop bitrates alone tell slow links
         self.slow_path: Callable[[bytes], bool] = lambda node_id: False
+        # The providers of a key this node holds records of, as a DHT server (rnfs.dht.providers.ProviderRecords);
+        # the node sets its own. Each search starts with them as candidates (Fetch._discover)
+        self.held_providers: Callable[[bytes], list[bytes]] = lambda key: []
         self._lock = threading.Lock()
         self._db = None if state_dir is None else statedb.connect(state_dir)
         self._invalid: OrderedDict[Cid, None] = OrderedDict()  # oldest first
@@ -1670,6 +1673,18 @@ class Fetch:
             self._lookup = self.fetcher.make_lookup(self.root.key)
             log(f"looking for providers of {self.root}", LOG_VERBOSE)
             self._start_lookup()
+            # The records this node holds of the root's key are candidates at once, never a reason to skip the search
+            # (its own /find answer, which it would give anyone): on a slow node a search takes a minute, and on an
+            # island a local replica is most often held by the node searching for it
+            try:
+                held = self.fetcher.held_providers(self.root.key)
+            except Exception as e:  # noqa: BLE001 - a failing record store leaves it to the search; logged
+                log(f"couldn't read the records held of {self.root}: {e!r}", LOG_WARNING)
+                held = []
+            for node_id in held:
+                if node_id not in self._providers:
+                    log(f"{node_name(node_id)} provides {self.root}, by a record held here", LOG_VERBOSE)
+                self._add_provider(node_id)
 
     def _start_lookup(self):
         """Run find_providers on a thread of its own; providers and its end arrive as events."""

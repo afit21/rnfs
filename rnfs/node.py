@@ -776,6 +776,8 @@ class RnfsNode:
                                                make_room=self._make_room, scores=self.scores))
         # A provider behind a slow path gets one request at a time per interface, and no probes or duplicates
         self.fetcher.slow_path = self.slow_paths
+        # A search starts with the providers this node holds records of, as it would answer a /find
+        self.fetcher.held_providers = lambda key: self.records.for_reply(key, exclude=self.excluded_provider)
         # Saved by its own refreshes and publish loop
         self.publisher = self._add_store(Publisher(node_id, config, self.storage, self.records, client,
                                                    self.lookups.publish, slow, config.state_dir,

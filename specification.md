@@ -849,7 +849,10 @@ and repeat.
   `max_parallel_providers` providers are known and one has delivered the verified root block, when the lookup
   is complete, or at `lookup_timeout`. It does not stop at the first reply that lists providers, so one node
   near the key can't hide content. A node SHOULD search with the density check and the senior rule, and fall back
-  to disjoint paths when that finds no provider at all (below).
+  to disjoint paths when that finds no provider at all (below). The providers of the key that a server holds records
+  of, those its own `/find` answer would list, SHOULD be candidates from the start (rnfs 0.2.0), never a reason to
+  skip the search: on a slow node a search takes a minute, and on an island (below) the node searching most often
+  holds the local replica itself.
 - **Choosing providers.** A node SHOULD rank providers by these keys, in this order:
   1. **Seniority.** Providers that have been in the routing table for over `provider_seniority` come first.
      This key MUST stay first: an attacker can create fresh identities that sit close in hops, or earn a score

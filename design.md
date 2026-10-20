@@ -2404,7 +2404,12 @@ Everything in the specification is implemented, with these simplifications and a
   `pending` (requeued by `_handle_event` if no probe brings it). A remembered provider probed (`_remembered_asked`)
   that answers without the block and isn't `BUSY` is forgotten for the root (`Fetcher.forget`), as is any provider
   `_fail` fails. A `/find` reply's providers aren't remembered until they serve, so an attacker's reply can't plant
-  entries.
+  entries. A probe uses `/range` where a provider would (`Fetch._plan`, which `_range_plan` calls with the provider's
+  state); one that sends part of the block makes its node a provider owning the partial, and one left unanswered as
+  an older node leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`.
+- Records held here (0.2.0): when `_discover` starts the search it adds, as providers, `Fetcher.held_providers(key)`
+  (the node's `ProviderRecords.for_reply`, what its own `/find` answer lists), so a record this node holds names a
+  provider at once; the search runs all the same.
 - Searches that found none (0.2.0): the lookup thread queues `LookupDone(found, answered)`, `answered` when the fetch
   didn't end meanwhile and `closest_answered()` isn't empty; one with nothing found, in a fetch with no provider at
   all, calls `Fetcher.note_unfound(root)` (`_unfound`, at most `MAX_UNFOUND`, 4,096, oldest dropped). A fetch opened

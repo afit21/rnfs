@@ -140,6 +140,32 @@ class ProviderDiscoveryTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertEqual(len(self.lookups), 1)
 
+    def test_providers_of_records_held_here_are_used_while_the_search_runs(self):
+        """A record this node holds names a provider at once (over LoRa the laptop held an island record of a file and
+        still waited 51 s for its search to find the provider it named); the search still runs, so a record held here
+        can't hide other providers."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        held = []
+        self.fetcher.held_providers = lambda key: held.append(key) or [P1, OWN]
+        self.fetch_all(built.cid)  # the search (no runs) finds nobody
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(held, [built.cid.key])
+        self.assertEqual(len(self.lookups), 1)
+        self.assertEqual(self.client.asked(P1)[0], built.cid)
+
+    def test_a_failing_record_store_leaves_it_to_the_search(self):
+        built = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P2)
+        self.runs.append([P2])
+
+        def broken(key):
+            """The record store fails."""
+            raise OSError("disk gone")
+        self.fetcher.held_providers = broken
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+
     def test_open_link_nodes_are_asked_first(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P1)
