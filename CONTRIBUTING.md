@@ -51,7 +51,9 @@ variables:
 says how, including on a Raspberry Pi SD card). So is `tests/bench_startup.py`, which times opening a large block
 store at startup (after a clean stop, after a crash, and the first start on 0.1.6's layout), and
 `tests/bench_publisher.py`, which measures what each provided key costs the publisher (memory, disk, writes per
-round) and how long a wake takes. Performance changes
+round) and how long a wake takes, and `tests/bench_refresh.py`, which times a start's first walk of every pin for
+what the node serves and provides (a store of about 565,000 blocks, a Gutenberg-like folder among its pins).
+Performance changes
 record their before and after numbers in CHANGELOG.md.
 
 `tests/interop.py` is a manual cross-version check, not a test either: it runs this tree's daemons against daemons

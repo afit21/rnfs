@@ -8,7 +8,8 @@ beyond its bundled msgpack.
 
 Writers produce exactly what umsgpack.packb produces: str as str, bytes as bin, shortest headers.
 Readers accept nothing else: the decoder below understands only the few msgpack forms a node can
-contain, and a node must re-encode to identical bytes, which rules out non-shortest headers.
+contain, and only in the shortest form umsgpack.packb writes for each (_SHORTEST), which is the same as
+requiring a node to re-encode to identical bytes (decode() checks headers instead of encoding again).
 
 Decoding is a pure function of the block's bytes and nodes are immutable, so decode() remembers the nodes of
 the blocks it decoded last (MEMO_BLOCKS of them, MEMO_BYTES of blocks): a read walks the same file and
@@ -188,6 +189,15 @@ _ARRAY_LENGTHS = {0xDC: struct.Struct(">H"), 0xDD: struct.Struct(">I")}
 _UINTS = {0xCC: struct.Struct(">B"), 0xCD: struct.Struct(">H"), 0xCE: struct.Struct(">I"), 0xCF: struct.Struct(">Q")}
 _BIN_LENGTHS = {0xC4: struct.Struct(">B"), 0xC5: struct.Struct(">H"), 0xC6: struct.Struct(">I")}
 _STR_LENGTHS = {0xD9: struct.Struct(">B"), 0xDA: struct.Struct(">H"), 0xDB: struct.Struct(">I")}
+# The least length or integer each of those type bytes may carry: what umsgpack.packb writes it for (anything
+# less it writes in a shorter form, fixarray, fixint, fixstr or a shorter header; bin8 is its shortest bin). A
+# block read under these and the reader's types re-encodes to identical bytes, and every block that does is read:
+# nothing else in a node can be written two ways (a str read is valid UTF-8, which encodes back to the same bytes;
+# a CID is the bin it was read from), so this check accepts exactly the blocks a re-encode check does
+_SHORTEST = {0xDC: 16, 0xDD: 1 << 16,
+             0xCC: 1 << 7, 0xCD: 1 << 8, 0xCE: 1 << 16, 0xCF: 1 << 32,
+             0xC4: 0, 0xC5: 1 << 8, 0xC6: 1 << 16,
+             0xD9: 32, 0xDA: 1 << 8, 0xDB: 1 << 16}
 
 
 class _Reader:
@@ -215,12 +225,15 @@ class _Reader:
         self.pos = pos + 1
         return self.data[pos]
 
-    def _length(self, size_format: struct.Struct) -> int:
-        """A big-endian length or integer of the given compiled struct format."""
+    def _length(self, size_format: struct.Struct, tag: int) -> int:
+        """A big-endian length or integer of the given compiled struct format, after the type byte tag: at least
+        _SHORTEST[tag], or the header isn't the shortest form."""
         end = self.pos + size_format.size
         if end > len(self.data):
             raise InvalidDag("DAG node is truncated")
         value = size_format.unpack_from(self.data, self.pos)[0]
+        if value < _SHORTEST[tag]:
+            raise InvalidDag(f"msgpack header 0x{tag:02x} isn't in its shortest form")
         self.pos = end
         return value
 
@@ -231,7 +244,7 @@ class _Reader:
             return tag & 0x0F
         size_format = _ARRAY_LENGTHS.get(tag)
         if size_format is not None:
-            return self._length(size_format)
+            return self._length(size_format, tag)
         raise InvalidDag(f"expected a msgpack array, found type byte 0x{tag:02x}")
 
     def uint(self) -> int:
@@ -241,7 +254,7 @@ class _Reader:
             return tag
         size_format = _UINTS.get(tag)
         if size_format is not None:
-            return self._length(size_format)
+            return self._length(size_format, tag)
         raise InvalidDag(f"expected a non-negative msgpack integer, found type byte 0x{tag:02x}")
 
     def bin(self) -> bytes:
@@ -250,7 +263,7 @@ class _Reader:
         size_format = _BIN_LENGTHS.get(tag)
         if size_format is None:
             raise InvalidDag(f"expected msgpack bin, found type byte 0x{tag:02x}")
-        return bytes(self._take(self._length(size_format)))
+        return bytes(self._take(self._length(size_format, tag)))
 
     def text(self) -> str:
         """A str holding valid UTF-8."""
@@ -258,7 +271,7 @@ class _Reader:
         if 0xA0 <= tag <= 0xBF:
             length = tag & 0x1F
         elif tag in _STR_LENGTHS:
-            length = self._length(_STR_LENGTHS[tag])
+            length = self._length(_STR_LENGTHS[tag], tag)
         else:
             raise InvalidDag(f"expected msgpack str, found type byte 0x{tag:02x}")
         try:
@@ -365,9 +378,7 @@ def _decode(block: bytes) -> Node:
         raise InvalidDag("trailing bytes after DAG node")
 
     _check_node(node)
-    # Rules out non-shortest headers (and anything else the reader let through that a writer wouldn't write)
-    if encode(node) != block:
-        raise InvalidDag("DAG node does not re-encode to identical bytes")
+    # The reader took only shortest headers (_SHORTEST), so the node re-encodes to block: not encoded again to check
     return node
 
 

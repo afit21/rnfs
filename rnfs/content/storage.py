@@ -81,6 +81,7 @@ WRITE_QUEUE = 32  # blocks a writer holds waiting to be written, at most (2 MiB 
 DAMAGED = object()  # Storage._node's answer for a stored DAG node that is unreadable or no longer matches its CID
 MISSING = object()  # Storage._read_node's answer for a block that isn't stored (or was deleted meanwhile)
 _NO_MEMO = object()  # a memo's answer for a key it has no entry for (None is a memoised answer)
+_NO_ENTRIES: frozenset = frozenset()  # dag_entries of a file, shared by every one memoised
 
 # The ID in a remote: or follow: pin source, as bytes.hex() writes it: exactly what loaded before rnfs.ids, as a pin
 # row that fails is deleted
@@ -378,6 +379,9 @@ class Storage:
         # Where a path step leads from a stored DAG node: node -> {name: _step_in's answer}; memoised like _links
         self._steps: dict[Cid, dict[str, tuple[Cid, bool] | None]] = {}
         self._complete: dict[Cid, frozenset[Cid]] = {}  # dag_blocks memo, complete DAGs only
+        # dag_entries memo: the entries of each of _complete's DAGs, found by the same walk (_NO_ENTRIES for a
+        # file); kept and forgotten with _complete
+        self._complete_entries: dict[Cid, frozenset[Cid]] = {}
         self._complete_bytes: dict[Cid, int] = {}  # dag_bytes memo: the bytes of _complete's DAGs, as asked for
         # dag_blocks memo for incomplete DAGs: root -> a block of its DAG found missing. A CID's content never
         # changes, so the DAG is incomplete for as long as that block isn't stored (checked at each lookup)
@@ -1143,6 +1147,8 @@ class Storage:
             self._allocated -= released
             self._generation += 1
             self._complete = {root: blocks for root, blocks in self._complete.items() if not blocks & deleted}
+            self._complete_entries = {root: entries for root, entries in self._complete_entries.items()
+                                      if root in self._complete}
             self._complete_bytes = {root: n for root, n in self._complete_bytes.items() if root in self._complete}
         if deleted or deferred:
             # A deleted DAG node no longer reaches its children; a deferred block is still garbage
@@ -1208,9 +1214,20 @@ class Storage:
         Raises NotFound if a block is missing, InvalidDag if the DAG breaks a reader check. A missing block is
         remembered (_missing), so asking again while it is still missing walks nothing.
         """
+        return self._complete_dag(cid)[0]
+
+    def dag_entries(self, cid: Cid) -> frozenset[Cid]:
+        """The CIDs directory entries name anywhere in cid's DAG, which must be completely stored and valid: every
+        file and folder below it (not chunks, file nodes or index nodes); none for a file. Found by dag_blocks' walk
+        and memoised with it, so a DAG dag_blocks walked isn't read again. Raises as dag_blocks."""
+        return self._complete_dag(cid)[1]
+
+    def _complete_dag(self, cid: Cid) -> tuple[frozenset[Cid], frozenset[Cid]]:
+        """(dag_blocks, dag_entries) of cid: the DAG walked once, every occurrence of each block checked, and
+        memoised unless a block was deleted meanwhile."""
         with self._lock:
             if cid in self._complete:
-                return self._complete[cid]
+                return self._complete[cid], self._complete_entries[cid]
             missing = self._missing.get(cid)
             if missing is not None:
                 if missing not in self._sizes:
@@ -1218,31 +1235,37 @@ class Storage:
                 del self._missing[cid]  # stored since: walk again
             generation = self._generation
         found: set[Cid] = set()
+        entries: set[Cid] = set()  # what the directory nodes met list (each directory's entries, through its index)
+        # The DAG node expectations checked. Raw blocks' aren't kept: checking one again (its stored length against
+        # the expectation) costs no more than looking it up, and they are most of a large DAG's blocks
         seen: set[walker.Expect] = set()
         stack = [walker.root_expect(cid)]
         while stack:
             expect = stack.pop()
-            if expect in seen:
-                continue
-            seen.add(expect)
             if expect.cid.is_raw:
                 length = self.block_size(expect.cid)
                 if length is None:
                     self._lacks(cid, expect.cid)
                 walker.check_raw(expect, length)  # stored blocks were verified, so their length is enough
             else:
+                if expect in seen:
+                    continue
+                seen.add(expect)
                 block = self.get(expect.cid)
                 if block is None:
                     self._lacks(cid, expect.cid)
-                stack.extend(walker.expand(expect, block))
+                node = walker.decode_checked(expect, block)  # a DAG node, as its CID isn't raw
+                if isinstance(node, DirectoryNode):
+                    entries.update(entry.cid for entry in node.entries)
+                stack.extend(walker.children(expect, node))
             found.add(expect.cid)
-        result = frozenset(found)
+        result = frozenset(found), frozenset(entries) if entries else _NO_ENTRIES
         with self._lock:
             # A deletion during the walk may have removed a block already counted
             if self._generation == generation:
-                self._complete[cid] = result
+                self._complete[cid], self._complete_entries[cid] = result
             else:
-                gone = next((block for block in result if block not in self._sizes), None)
+                gone = next((block for block in result[0] if block not in self._sizes), None)
                 if gone is not None:
                     self._lacks(cid, gone, f"a block of {cid} was deleted")
         return result

@@ -143,6 +143,21 @@ class EntriesTest(PublisherCase):
         self.assertEqual(self.publisher.entries_status(),
                          {"provided_entries": len(entries), "provide_entries_off": None, "provide_entries_capped": 0})
 
+    def test_entries_are_found_by_the_served_walk(self):
+        """A refresh reads each DAG node of a pin once: its entries come from the walk that finds what it serves
+        (Storage.dag_entries), not from reading its directories again."""
+        sub = self.folder({"b.txt": self.file(), "big.bin": self.file(200_000)})
+        root = self.folder({"a.txt": self.file(), "sub": sub, "wide": self.flat(300)[0]})
+        self.pin(root)
+        self.assertEqual(self.storage._complete, {})  # nothing memoised: as at a start
+        reads = []
+        real = self.storage.blocks.get
+        with mock.patch.object(self.storage.blocks, "get", lambda cid: (reads.append(cid), real(cid))[1]):
+            self.publisher.refresh()
+        nodes = {cid for cid in self.storage.dag_blocks(root.cid) if not cid.is_raw}
+        self.assertEqual(sorted(reads), sorted(nodes))
+        self.assertEqual(len(self.publisher.provided_entries()), 2 + 2 + 1 + 300)
+
     def test_a_pinned_file_has_no_entries(self):
         built = self.file(200_000)
         self.pin(built)

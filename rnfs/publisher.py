@@ -76,7 +76,6 @@ from typing import Callable
 from rnfs import statedb
 from rnfs.config import Config
 from rnfs.constants import DAY, HOUR, ID_LENGTH, K, PROVIDER_TTL
-from rnfs.content import dag, walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
 from rnfs.dht.sweep import ID_BITS, Region, Sweep, find_region
@@ -1116,27 +1115,12 @@ class Publisher:
         """The CIDs directory entries name anywhere in root's DAG, which is complete: every file and directory below
         it, not chunks, file nodes or index nodes; none for a file. None if a block went missing meanwhile.
 
-        Reads the directory and index nodes only, each directory once however often it appears."""
-        if root.is_raw:
-            return frozenset()
-        get = self.storage.getter()
-        top = walker.root_expect(root)
-        found: set[Cid] = set()
+        Storage.dag_entries: found by the walk dag_blocks made of root's DAG (memoised with it), so nothing is
+        read again."""
         try:
-            if not isinstance(walker.decode_checked(top, get(top)), (dag.DirectoryNode, dag.IndexNode)):
-                return frozenset()
-            memo: dict = {}  # directory and index nodes decoded, for walker.directory_entries
-            seen = {root}
-            stack = [top]
-            while stack:
-                for entry, child in walker.directory_entries(stack.pop(), get, memo):
-                    found.add(entry.cid)
-                    if entry.kind == dag.KIND_DIRECTORY and entry.cid not in seen:
-                        seen.add(entry.cid)
-                        stack.append(child)
+            return self.storage.dag_entries(root)
         except (NotFound, InvalidDag):
             return None
-        return frozenset(found)
 
     def _network_size(self) -> int:
         """The network size a slow node's entries are judged by (network_size). Lock held."""

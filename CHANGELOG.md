@@ -724,6 +724,16 @@ Faster:
   layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
   order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
   dropped as after a reboot).
+- A start works out what the node provides faster, before the API answers. Its first refresh walked every pin's
+  DAG for the blocks the node serves, then read the folders of each of the user's own pins again for the files and
+  folders it provides (`provide_entries`); they now come from the first walk. That walk no longer remembers every
+  chunk it checked, only the DAG nodes, and DAG nodes decode without being encoded again to check they were written
+  in their one canonical form: the decoder takes each header only in its shortest form instead, which accepts
+  exactly the same blocks (a file node of 6 chunks 16.2 → 9.2 µs, of 256 chunks 588 → 346 µs, for every read).
+  Measured with `tests/bench_refresh.py` (565,000 blocks in 28 pins, one a Gutenberg-like folder of 70,000 files;
+  desktop NVMe disk, warm cache): the first refresh 6.26 → 3.81 s (5.30 s with the decoder alone, 4.33 s with the
+  one walk too), its peak memory 178 → 160 MB. A 2-vCPU cloud VM with 857,325 blocks spent about 79 s of an 88 s
+  start there: 54 s in the walk, 23 s reading the folders again.
 - The publisher's state is on disk: where and when each provided key was last published lives in the state
   database (`publish_items`, indexed by when each is next due) and is read per round, rather than held in memory
   for every key. A wake asks the index when the next key is due, and a round reads the due keys only, at most

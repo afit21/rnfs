@@ -1368,6 +1368,52 @@ class CompletenessMemoTest(StorageTest):
         check(pinned.cid, False)
         self.assertEqual(self.storage.dag_bytes(pinned.cid), 0)
 
+    def test_entries_come_from_the_completeness_walk(self):
+        """dag_entries: the CIDs directory entries name anywhere in a complete DAG (through index nodes, a repeated
+        directory's once), found by dag_blocks' walk and memoised with it; none for a file; forgotten with it."""
+        def entries_walked(cid: Cid) -> set[Cid]:
+            """Every entry's CID below cid, by walking its directories."""
+            found, stack, get = set(), [walker.root_expect(cid)], self.storage.getter()
+            while stack:
+                for entry, child in walker.directory_entries(stack.pop(), get):
+                    found.add(entry.cid)
+                    if entry.kind == dag.KIND_DIRECTORY:
+                        stack.append(child)
+            return found
+
+        root, a, b = self.tree()
+        files = [self.add(b"w%d" % i) for i in range(300)]
+        wide = builder.build_directory([Entry(f"w{i:03d}", built.cid, built.size, 0) for i, built in enumerate(files)],
+                                       self.storage.put)  # an index node's root
+        top = builder.build_directory([Entry("tree", root.cid, root.size, 2), Entry("again", root.cid, root.size, 2),
+                                       Entry("wide", wide.cid, wide.size, 2), Entry("a", a.cid, a.size, 0)],
+                                      self.storage.put)
+        expected, blocks = entries_walked(top.cid), frozenset(self.blocks_of(top.cid))
+        self.assertEqual(len(expected), 3 + 1 + 300)  # tree (twice) wide a, then b below tree, then wide's
+        self.assertEqual(self.storage.dag_entries(top.cid), expected)
+        self.assertIn(top.cid, self.storage._complete)  # the walk memoised dag_blocks too
+        with mock.patch.object(self.storage.blocks, "get", side_effect=AssertionError("read")):
+            self.assertEqual(self.storage.dag_entries(top.cid), expected)
+            self.assertEqual(self.storage.dag_blocks(top.cid), blocks)
+        self.assertEqual(self.storage.dag_entries(root.cid), entries_walked(root.cid))
+        self.assertEqual(self.storage.dag_entries(a.cid), frozenset())  # a file
+        self.assertEqual(self.storage.dag_entries(self.add(b"raw").cid), frozenset())
+        # A block deleted: forgotten with the DAG's blocks, and NotFound as dag_blocks
+        self.storage._delete({dag.decode(self.storage.get(a.cid)).children[0].cid})
+        self.assertNotIn(top.cid, self.storage._complete_entries)
+        with self.assertRaises(NotFound):
+            self.storage.dag_entries(top.cid)
+
+    def test_a_repeated_chunk_is_checked_at_each_occurrence(self):
+        """Raw blocks' expectations aren't remembered by the walk, but each occurrence is still checked."""
+        chunk = self.add(b"abcde").cid
+        good = dag.encode(FileNode([Child(chunk, 5), Child(chunk, 5)]))
+        bad = dag.encode(FileNode([Child(chunk, 5), Child(chunk, 6)]))
+        for block, complete in ((good, True), (bad, False)):
+            cid = Cid.for_block(DAG, block)
+            self.storage.put(cid, block)
+            self.assertEqual(self.storage.is_complete(cid), complete)
+
     def test_missing_block_is_remembered(self):
         """An incomplete DAG stays incomplete while the block found missing is: asked again it reads nothing,
         and it is walked again once that block is back."""

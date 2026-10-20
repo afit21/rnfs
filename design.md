@@ -215,7 +215,10 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
   nodes `FileNode(children)`, `DirectoryNode(entries)`, `IndexNode(children)`, each with `child_cids` (the CIDs it
   lists, in order) and `names` (its entries' names or children's first names; none for a file node).
 - `encode(node) -> bytes`; `decode(block) -> node`, strict (types, shortest headers, re-encodes identically),
-  raising `InvalidDag`. Nodes are immutable and decoding is a pure function of the bytes, so `decode` remembers
+  raising `InvalidDag`. Re-encoding identically is checked without encoding: the reader takes each length or
+  integer only in the form `umsgpack.packb` writes it (`_SHORTEST`, the least value each longer header carries),
+  and nothing else in a node can be written two ways, so it accepts exactly the blocks a re-encode check would
+  (tests/test_dag.py `ShortestHeaderTest` compares the two on every header form and every byte changed). Nodes are immutable and decoding is a pure function of the bytes, so `decode` remembers
   the nodes of the blocks it decoded last (`MEMO_BLOCKS` 256, `MEMO_BYTES` 2 MiB of blocks, least recently used
   forgotten first; a block that fails is checked again each time): a read meets the same nodes many times.
   `check_name(name)` raises `ValueError`.
@@ -322,7 +325,11 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - A stored DAG node that no longer matches its CID (`DAMAGED`) has unknown children: while anything live
   reaches one, `evict()` and `gc()` delete nothing and log it once (`_held_back`) until `verify()` removes it or
   a fetch replaces it. Fetches treat such a block as not stored: deleted and fetched again.
-- `dag_blocks(cid) -> frozenset[Cid]` the blocks of a complete DAG (memoised), used for "what a node serves".
+- `dag_blocks(cid) -> frozenset[Cid]` the blocks of a complete DAG (memoised), used for "what a node serves";
+  `dag_entries(cid)` the CIDs its directory entries name (every file and folder below it, none for a file), which
+  the same walk collects from the directory nodes it decodes and memoises beside it (`_complete_entries`, forgotten
+  with `_complete`), so the publisher's entries need no second walk. The walk keeps the DAG node expectations it
+  checked, not raw blocks' (checking one again is a size lookup, and they are most of a large DAG).
   For an incomplete DAG it remembers the block it found missing (`_missing`, `MISSING_MEMO` 10 000, oldest
   forgotten first): a CID's content never changes, so the DAG stays incomplete while that block isn't stored,
   and `is_complete` is a lookup until it arrives. The walks under the lock take a DAG memoised as complete
@@ -856,10 +863,10 @@ first `refresh()` only after the features have registered their key sources, so 
 names' keys. **Entries** (`provide_entries`, `_choose_entries` inside `_compute`): the entries of the provided CIDs
 that are pins of the user's own content (`Storage.own_pinned_cids()`: CIDs one of whose sources passes
 `storage.is_own_source`, so `user`, `folder`, `name:` and `app:`, not `remote:`, `follow:` or `deny`; memoised like
-`pinned_cids()` until any pin's sources change; read once per compute, among the complete undenied DAGs) are walked
+`pinned_cids()` until any pin's sources change; read once per compute, among the complete undenied DAGs) are found
 once per pin
-(`_walk_entries`: directory and index nodes only, through `walker.directory_entries`, each directory CID once;
-memoised in `_entries_of` while the pin stays complete, as a CID's content never changes) and chosen by
+(`_walk_entries`: `Storage.dag_entries`, found by the walk `dag_blocks` made for the served set, so no block is
+read again; memoised in `_entries_of` while the pin stays complete, as a CID's content never changes) and chosen by
 `_capped_entries`: pins in `Storage.pin_order` (first pinned oldest first, those of before 0.2.0 first, then by
 CID), each pin's entries whole or not at all while the union stays within `provide_entries_max` (100,000 by
 default), a pin that doesn't fit logged and skipped. The choice is reused while `own_pinned_cids()` is the same
