@@ -1089,7 +1089,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 
 **Fetching a target** (`get`, `cat`, `pin add`, `export`):
 1. Ask up to `max_parallel_providers` nodes with an open outgoing link for the root with `/blocks`; if none
-   has it, find providers (section 6).
+   has it, find providers (section 6). A node that isn't slow asks none over a slow link (item 7): on a radio each
+   would hold the search up a round trip, and several would each send the root. A slow node, whose links are all
+   slow, asks its one (`max_parallel_providers` is 1 there): a hit saves a whole lookup over the radio for one
+   request on a link already open.
 2. Fetch the root block and decode it. Fetch the blocks not already stored: those along the requested path,
    then every block of the target's DAG — or, for a byte range (`cat --offset`, gateway Range requests), only
    the chunks covering it and the nodes above them. Each block is fetched once, even if it appears several
@@ -1128,7 +1131,12 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    reader is handed the current one's bytes, so the providers don't wait for the reader; a reader that stops
    early has had at most one window fetched that it didn't read.
 7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only
-   contend for the same channel). A response *stalls* if it makes no progress for `stall_timeout`, or misses the
+   contend for the same channel). Whether a link is slow is judged per provider, not per node, so a node with a
+   fast and a slow interface (a gateway) isn't slow but doesn't run parallel transfers over its radio either: a
+   provider is reached over a *slow link* when the link's rate estimate is below `slow_bitrate`, or, without one,
+   when the next-hop interface of the path to it runs below `slow_bitrate` or it is behind a slow path (section 6);
+   the providers over slow links whose paths leave through the same next-hop interface (an unknown one counts as
+   one) have one request in flight between them. A response *stalls* if it makes no progress for `stall_timeout`, or misses the
    same deadline the responder uses (section 3). A stalled provider's link is closed, which cancels the transfer,
    and its blocks are requested again from another provider; providers that keep failing are handled as in
    section 6. A fetch that fails or is cancelled, or whose reader stops early (item 6), closes the links of its
@@ -1137,9 +1145,11 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    left to finish. It never cancels their Resources (section 3, Cooldown). When nothing is left to ask for and a
    provider is idle, a requester MAY ask it too for a batch that has been in flight for longer than
    `deadline_slack` (end-game duplication), so a response that keeps making just enough progress not to stall
-   doesn't hold up the fetch. The first verified copy wins; the request still sending blocks that have arrived
+   doesn't hold up the fetch; rnfs waits, on a link with a rate estimate, also for 1.5 times the transfer time of
+   the batch's blocks at it, and duplicates only onto a provider that isn't over a slow link. The first verified copy wins; the request still sending blocks that have arrived
    then has its link closed (left to finish, under the same rule), which doesn't count as a stall of its
-   provider. rnfs duplicates each request at most once, and not on slow nodes, which use one provider at a time.
+   provider. rnfs duplicates each request at most once, and never over a slow link (so never on slow nodes),
+   where it would spend the channel's airtime twice.
 8. Blocks are stored as they arrive, so an interrupted fetch resumes where it stopped. An RNS Resource is only
    delivered when complete, so a response lost mid-transfer yields nothing and its blocks are requested again.
 9. When the target is complete, the node provides it if its strategy says so (section 6).

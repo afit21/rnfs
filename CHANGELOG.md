@@ -421,6 +421,14 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
 
 Changed:
+- Slow links are judged per provider, not per node: a gateway with a TCP and a LoRa interface isn't a slow node,
+  so it ran 3 parallel `/blocks`, probed open links for the root and duplicated any batch out for 30 s, all over
+  the radio. Now a provider is reached over a slow link when the link's rate estimate is below `slow_bitrate` (or,
+  without one, the next-hop interface is, or the provider is behind a slow path); providers over slow links
+  behind one next-hop interface share one request at a time, a node that isn't slow probes no open link over a
+  slow link (a slow node still probes one, as before: a hit saves a lookup over the radio), nothing is duplicated
+  onto a slow link, and on fast links a batch is duplicated only once it has taken 1.5 times its blocks' transfer
+  time at the rate estimate (and `deadline_slack`, as before).
 - A lost packet no longer drops a provider: a `/blocks` request RNS times out (its packet or its answer's lost,
   which RNS doesn't resend), whose link times out under it, or whose new link isn't established, failed its
   provider for the rest of the fetch at once, so at 5% packet loss most 1 MiB fetches from one provider failed.

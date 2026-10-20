@@ -2062,8 +2062,16 @@ Everything in the specification is implemented, with these simplifications and a
   stored or downloaded, not one tree level at a time, and `max_entries` is counted per block. A parent is stored
   before its children are asked for, so an interrupted fetch resumes from what it stored, as before.
 - End game (NET-4): when nothing is left to ask for and a provider is idle, a batch in flight longer than
-  `deadline_slack` is asked of it too (once, not on slow nodes, within `max_parallel`); the first verified copy
-  wins, and the slower request's link is closed as above, without counting as a stall.
+  `deadline_slack` and `DUPLICATE_AFTER` (1.5) times its expected time (`Fetch._expected_time`: its blocks'
+  guessed bytes at the rate estimate it was sent with; none without one) is asked of it too (once, within
+  `max_parallel`, and only of a provider not over a slow link); the first verified copy wins, and the slower
+  request's link is closed as above, without counting as a stall.
+- Slow links per provider: `Fetch._slow(node_id, path)` is true on a slow node, else by the link's rate estimate
+  if it has one (below `slow_bitrate`), else if the cached `PathInfo`'s next-hop bitrate is below it or
+  `Fetcher.slow_path` (the node's `SlowPaths`) says so. `_assign` gives the providers over slow links behind one
+  next-hop interface one slot (`Fetch._slot`, `("slow", interface)`), and on a node that isn't slow `_discover`
+  probes no open link that is slow, so a gateway with TCP and LoRa interfaces fetches in parallel over TCP only. A
+  slow node still probes its `max_parallel` (by default one) open links, as before: a hit saves a lookup.
 - Archive import pins only roots whose every block was in the archive, and reads at most 1024 roots. It
   verifies every block, including ones already stored, and stops with `StorageFull` like a fetch when a block
   not yet stored would leave less than the disk reserve free (`Storage.check_disk`).

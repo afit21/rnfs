@@ -19,7 +19,7 @@ from rnfs.content.storage import Storage
 from rnfs.dht import scores as scoring
 from rnfs.dht.routing import RoutingTable
 from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
-from rnfs import fetcher as fetcher_module
+from rnfs import fetcher as fetcher_module, mesh
 from rnfs.fetcher import Fetcher
 from rnfs.network import client as client_module, links, protocol, server
 from rnfs.network.client import BUSY, FAILED, LOST, OK, STALLED, BlocksResult
@@ -494,6 +494,175 @@ def old_take_batch(fetch, pending, node_id, wanted, mdu):
         batch.append(pending.popleft())
         total += guess
     return batch
+
+
+class SlowLinkTest(FetcherTest):
+    """Parallelism, probes and duplication follow each provider's link, not the node (section 7, item 7): a node
+    with a fast and a slow interface (a gateway) isn't slow, but its providers behind the slow one share one request
+    at a time, and nothing is probed or duplicated over a slow link."""
+
+    LORA = mesh.PathInfo(1, "LoRa", 1200)
+    OTHER_LORA = mesh.PathInfo(1, "LoRa 2", 1200)
+    TCP = mesh.PathInfo(1, "TCP", 10_000_000)
+
+    def paths(self, table: dict):
+        """Have path_info answer from table (nothing known for the rest)."""
+        self.fetcher.path_info = lambda node_id: table.get(node_id, mesh.NO_PATH)
+
+    def concurrency(self, groups: dict[bytes, str], company: bool = False) -> dict[str, int]:
+        """Serve every provider as usual, a little slowly, recording the most requests each group (by node) had in
+        flight at once. With company, a request waits (5 s at most) until its group has had two in flight at once,
+        so a slow runner starting the request threads late can't hide that they may overlap."""
+        lock = threading.Condition()
+        now: dict[str, int] = {}
+        most: dict[str, int] = {}
+
+        def serve(node_id):
+            """A behaviour counting node_id's group in flight while it answers."""
+            group = groups[node_id]
+
+            def behaviour(cids):
+                """Count, wait a little (or for company), and serve as usual."""
+                with lock:
+                    now[group] = now.get(group, 0) + 1
+                    most[group] = max(most.get(group, 0), now[group])
+                    lock.notify_all()
+                    if company:
+                        lock.wait_for(lambda: most[group] >= 2, timeout=5)
+                time.sleep(0.02)  # how long the provider takes to answer
+                with lock:
+                    now[group] -= 1
+                return None
+            return behaviour
+        for node_id in groups:
+            self.hold(node_id)
+            self.client.behaviour[node_id] = serve(node_id)
+        return most
+
+    def test_providers_behind_one_slow_interface_share_one_request(self):
+        built = self.file(os.urandom(24 * CHUNK_SIZE))
+        self.paths({P1: self.LORA, P2: self.LORA, P3: self.TCP, P4: self.OTHER_LORA})
+        most = self.concurrency({P1: "lora", P2: "lora", P3: "tcp", P4: "lora 2"})
+        self.config.max_parallel_providers = 4
+        self.runs.append([P1, P2, P3, P4])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(most["lora"], 1)  # P1 and P2: one at a time
+        self.assertEqual(set(most), {"lora", "tcp", "lora 2"})  # each interface was used
+
+    def test_a_slow_rate_estimate_shares_the_slot_of_an_unknown_interface(self):
+        built = self.file(os.urandom(12 * CHUNK_SIZE))
+        self.client.rate = 50_000  # every link measured slow; no path known
+        most = self.concurrency({P1: "all", P2: "all", P3: "all"})
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(most["all"], 1)
+
+    def test_a_fast_rate_estimate_is_its_own_slot(self):
+        built = self.file(os.urandom(24 * CHUNK_SIZE))
+        self.client.rate = 10_000_000  # measured fast, whatever the interface says
+        self.paths({P1: self.LORA, P2: self.LORA, P3: self.LORA})
+        most = self.concurrency({P1: "all", P2: "all", P3: "all"}, company=True)
+        self.storage.put(built.cid, self.network[built.cid])  # so the first request isn't the root's, alone
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(built.cid)
+        self.assertGreater(most["all"], 1)
+
+    def test_a_slow_path_shares_a_slot(self):
+        built = self.file(os.urandom(12 * CHUNK_SIZE))
+        self.fetcher.slow_path = lambda node_id: node_id in (P1, P2)  # e.g. more than 3 hops away
+        most = self.concurrency({P1: "far", P2: "far", P3: "near"})
+        self.runs.append([P1, P2, P3])
+        self.fetch_all(built.cid)
+        self.assertEqual(most["far"], 1)
+
+    def test_open_links_over_slow_links_are_not_probed(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+        self.client.links = [P1, P2]
+        self.paths({P1: self.LORA, P2: self.TCP})
+        self.fetch_all(built.cid)
+        self.assertEqual(self.client.asked(P1), [])
+        self.assertEqual(self.client.requests[0], (P2, [built.cid]))
+        # Only slow links open: no probe, the lookup at once
+        self.client.links = [P1]
+        self.client.requests.clear()
+        other = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P3)
+        self.runs.append([P3])
+        self.fetch_all(other.cid)
+        self.assertEqual(self.client.asked(P1), [])
+        self.assertEqual(len(self.lookups), 1)
+
+    def test_a_slow_node_probes_one_open_link(self):
+        # Every link of a slow node is slow; one probe that hits saves a whole lookup over the radio
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None  # a slow node's default: one at a time
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        for node_id in (P1, P2):
+            self.hold(node_id)
+        self.client.links = [P1, P2]  # most recently used first
+        self.paths({P1: self.LORA, P2: self.LORA})
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.requests[0], (P1, [built.cid]))  # the one probe, which found the root
+        self.assertEqual(self.client.asked(P2), [])
+        self.assertEqual(self.lookups, [])
+
+    def test_nothing_is_duplicated_over_a_slow_link(self):
+        self.config.deadline_slack = 0.1
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        dripped = walker.expand(walker.root_expect(built.cid), self.network[built.cid])[0].cid  # P1 is asked first
+        released = threading.Event()
+        self.addCleanup(released.set)
+        for node_id in (P1, P2):
+            self.hold(node_id)
+
+        def drip(cids):
+            """Take a while over the dripped chunk."""
+            if dripped in cids:
+                released.wait(1.0)
+            return None
+        self.client.behaviour[P1] = drip
+        self.paths({P1: self.TCP, P2: self.LORA})  # the idle provider is behind the radio
+        self.runs.append([P1, P2])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.client.asked(P1) + self.client.asked(P2),
+                         list(dict.fromkeys(self.client.asked(P1) + self.client.asked(P2))))  # nothing asked twice
+
+    def test_a_batch_on_a_measured_link_is_duplicated_after_one_and_a_half_times_its_expected_time(self):
+        self.config.deadline_slack = 1
+        self.client.rate = 1_000_000  # fast: a chunk takes about 0.52 s
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = walker.expand(walker.root_expect(built.cid), self.network[built.cid])[0]
+        now = [1000.0]
+        self.fetcher.clock = lambda: now[0]
+        release = threading.Event()
+        self.addCleanup(release.set)
+        for node_id in (P1, P2):
+            self.hold(node_id)
+            self.client.behaviour[node_id] = lambda cids: (release.wait(5), None)[1]
+        with self.fetcher.open(built.cid) as fetch:
+            providers = [fetch._new_provider(P1), fetch._new_provider(P2)]
+            wanted = {chunk.cid: [chunk]}
+            pending = fetcher_module._Pending([chunk.cid])
+            fetch._assign(pending, fetch._in_flight, {chunk.cid}, wanted, fetch.budget)
+            self.assertEqual(list(fetch._in_flight), [P1])
+            expected = fetch._expected[P1]
+            self.assertAlmostEqual(expected, chunk.size * 8 / 1_000_000)
+            # 10 s expected: duplicated after 15 s, not after deadline_slack
+            fetch._expected[P1] = 10.0
+            now[0] += 14
+            fetch._duplicate(providers, fetch._in_flight, 1, now[0])
+            self.assertEqual(list(fetch._in_flight), [P1])
+            now[0] += 2
+            fetch._duplicate(providers, fetch._in_flight, 1, now[0])
+            self.assertEqual(sorted(fetch._in_flight), [P1, P2])
+            # Without a rate estimate, deadline_slack alone
+            self.assertEqual(fetch._duplicate_after(P3), 1)
+            release.set()
 
 
 class BatchTest(FetcherTest):
