@@ -5,7 +5,7 @@ import random
 
 from sim import K, World
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+OUT = "out"  # relative: run from this folder (docs/simulations/README.md)
 DAY = 86400.0
 
 
