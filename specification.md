@@ -496,7 +496,10 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
 - **What it protects.** The confidentiality of the content and, if sealed, of the file name. It does not hide
   the recipients' identity hashes, the approximate size, or (with `--wrap`) the wrapper's entry name, and it
   says nothing about who sealed it: anyone with a recipient's public key can seal a file for them, and any
-  recipient can seal different content for the others.
+  recipient can seal different content for the others. A sealed file is readable by whoever holds a
+  recipient's identity: rnfs's recipient is its node identity, which a running node keeps in memory and
+  stores unencrypted in the rnfs dir (`storage/identity`), so sealing protects the content against the network
+  and other nodes, not against someone who can read a recipient's rnfs dir or disk.
 - **Folders.** `add --to` of a folder seals it as one sealed file, never file by file (which would leave its
   names and tree visible): the folder is packed as one plain tar (POSIX pax) and that tar is sealed with the
   sealed name `<folder>.tar`. The format above is unchanged, so a reader that only decrypts (rnfs 0.1.x) gets a
@@ -540,10 +543,16 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
     taken from the tar. A tar past a limit is refused (rnfs: 413, naming `--no-extract`) rather than written in
     part. The output is the tar's one top directory, or the whole tar as a directory when it holds anything else;
     without `-o` it is named by `get`'s default-name rule (section 11) after that directory (or the sealed name
-    without `.tar`). The node MUST check that its free space holds the plaintext twice where its blocks and the
-    output share a filesystem (rnfs builds the tar into its block store, then writes the files), and MUST NOT
-    pin, cache or provide those plaintext blocks: rnfs holds them in a protection session (section 8) while
-    unpacking and collects them at once after, so none stays stored unless something else keeps the same block.
+    without `.tar`). Before storing anything the node MUST check that its free space holds what the entries take
+    on disk, counted in the filesystem's allocation unit rather than in bytes, in its block store and again as
+    written where the two share a filesystem (rnfs builds the tar into its block store, then writes the files):
+    every file and directory takes at least one unit on each side (rnfs reads the tar's headers first and
+    counts each file's chunks and each directory's listing rounded up to the unit, at least 4 KiB), since a tar
+    spends only 512 bytes on an empty file or directory. It MUST NOT pin, cache or provide those plaintext
+    blocks: rnfs holds them in a protection session (section 8) while unpacking and collects them at once
+    after, so none stays stored unless something else keeps the same block; and it marks its state database
+    while an unpack runs, so a start after the process died mid-unpack collects every block nothing reaches
+    before serving anything.
     `--no-extract` writes the decrypted `.tar` instead, as `get` of a 0.1.x node does.
 
   Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).

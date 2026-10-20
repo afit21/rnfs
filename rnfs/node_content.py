@@ -15,6 +15,7 @@ import os
 import stat
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import BinaryIO
 
 from rnfs.content import archive, builder, dag, seal, walker
@@ -272,36 +273,40 @@ def unpack_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
     max_output_entries and MAX_DEPTH, the deny list's file hashes), then written out by walker.write_out (get's
     rules: unsafe names skipped, the same limits); created gets the output directory's identity, as write_out
     gives it. Everything happens inside a protection session, so no collection takes the blocks meanwhile, and they
-    are never pinned, recorded as a fetch or provided: once it ends (unpacked or not) they are collected.
+    are never pinned, recorded as a fetch or provided: once it ends (unpacked or not) they are collected. The state
+    database is marked meanwhile (_unpacking), so a start after the process died mid-unpack collects them then.
 
     The output is the tar's one top directory (`<folder>/`, as add packs a folder), or, for a tar holding anything
     else, the whole tar as a directory; "name" is that directory's name (the top one's, or the sealed name without
-    .tar), only if safe_default_name accepts it. Raises NotATar (having written nothing) if the plaintext isn't a
-    valid tar, TooLarge past a limit or if the disk can't hold both the plaintext's blocks and the files written
-    (they may be on one filesystem: counted twice then, with the to_fetch bytes still to fetch), and what the
-    decryption raises (SealError, NotRecipient)."""
+    .tar), only if safe_default_name accepts it. Before anything is stored, the tar's headers are read
+    (tarstream.scan_tar, decrypting only the segments holding them) and the disk checked for what its entries take
+    (_check_unpack_space). Raises NotATar (having written nothing) if the plaintext isn't a valid tar, TooLarge past
+    a limit or if the disk can't hold both the plaintext's blocks and the files written, and what the decryption
+    raises (SealError, NotRecipient)."""
     from rnfs import fsutil
     from rnfs.content import tarstream
     from rnfs.errors import BlockMismatch, TooLarge
-    from rnfs.log import LOG_ERROR, log
-    from rnfs.node import _check_free_space  # rnfs.node imports this module
 
-    plain = sealed.size
-    blocks_dir = node.config.blocks_dir
-    # The blocks and the files: the second is counted on the output's filesystem only if the blocks are there too
-    _check_free_space(output, plain, blocks_dir, to_fetch + plain)
-    node.storage.check_disk(plain + to_fetch)
     max_entries = node.config.max_output_entries
+    try:
+        extent = tarstream.scan_tar(_PlainReader(sealed), max_entries)
+    except (seal.SealError, BlockMismatch):
+        raise  # ValueErrors, but a damaged sealed file or a bug, not a plaintext that isn't a tar
+    except TooLarge as e:
+        raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
+    except ValueError as e:
+        raise NotATar(str(e)) from None
+    _check_unpack_space(node, extent, output, to_fetch)
     warnings = tarstream.Warnings()
     tar = tarstream.IteratorReader(sealed.read())
     try:
-        with node.storage.protect() as session:
+        with _unpacking(node), node.storage.protect() as session:
             try:
                 with session.writer() as put:
                     built = tarstream.build_tar(tar, put, warnings, max_entries,
                                                 builder.BuildOptions(check=node._hash_check()))
             except (seal.SealError, BlockMismatch):
-                raise  # ValueErrors, but a damaged sealed file or a bug, not a plaintext that isn't a tar
+                raise
             except TooLarge as e:
                 raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
             except ValueError as e:
@@ -320,14 +325,119 @@ def unpack_sealed(node, sealed: seal.SealedFile, output: str, to_fetch: int = 0,
                 raise TooLarge(f"can't unpack it: {e} (get --no-extract writes the tar itself)") from None
     finally:
         tar.close()
-        # Nothing reaches the plaintext's blocks now (unless the same blocks are kept for another reason)
-        try:
-            node.storage.collect()
-        except Exception as e:  # noqa: BLE001 - never hide the get's own outcome; the next collection retries
-            log(f"get: collecting an unpacked tar's blocks failed: {e!r}", LOG_ERROR)
     for warning in written:
         warnings(warning)
     return {"sealed": True, "name": fsutil.safe_default_name(name, None), "extracted": True, **warnings.result()}
+
+
+def _check_unpack_space(node, extent, output: str, to_fetch: int):
+    """Raise TooLarge unless the disk holds what unpacking extent (a tarstream.Extent) takes, leaving the reserve:
+    its blocks (extent.stored, in the block store's allocation unit) and its files (extent.written, in the output's),
+    counted on one filesystem if they share it, with the to_fetch bytes still to fetch into the block store.
+    Allocation units, not bytes: a tar spends 512 bytes on an empty file or directory and 1 KiB on a tiny file, each
+    of which takes a block file in the store and a file or directory on output, at least 4 KiB each."""
+    from rnfs import fsutil
+    from rnfs.node import _check_free_space  # rnfs.node imports this module
+
+    blocks_dir = node.config.blocks_dir
+    stored = extent.stored(fsutil.allocation_unit(blocks_dir))
+    written = extent.written(fsutil.allocation_unit(os.path.dirname(os.path.abspath(output))))
+    _check_free_space(output, written, blocks_dir, to_fetch + stored)
+    node.storage.check_disk(stored + to_fetch)
+
+
+class _PlainReader:
+    """A sealed file's plaintext as a seekable binary file for tarfile (tarstream.scan_tar), decrypting a segment
+    only when a read reaches it and keeping the last one read: the headers of a tar of many small files share
+    segments."""
+
+    def __init__(self, sealed: seal.SealedFile):
+        """A reader at the start of sealed's plaintext."""
+        self._sealed = sealed
+        self._size = sealed.size
+        self._position = 0
+        self._segment: tuple[int, bytes] | None = None  # (index, plaintext) of the last segment decrypted
+
+    def tell(self) -> int:
+        """The position."""
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Move to offset (from the start, the position or the end, as whence says); the new position."""
+        base = {os.SEEK_SET: 0, os.SEEK_CUR: self._position, os.SEEK_END: self._size}[whence]
+        if base + offset < 0:
+            raise ValueError("negative seek position")
+        self._position = base + offset
+        return self._position
+
+    def read(self, size: int = -1) -> bytes:
+        """Up to size bytes from the position (to the end if size is negative); b"" at the end."""
+        end = self._size if size is None or size < 0 else min(self._size, self._position + size)
+        parts = []
+        while self._position < end:
+            index, offset = divmod(self._position, seal.SEGMENT_SIZE)
+            if self._segment is None or self._segment[0] != index:
+                self._segment = index, b"".join(self._sealed.read(index * seal.SEGMENT_SIZE, seal.SEGMENT_SIZE))
+            data = self._segment[1][offset:offset + end - self._position]
+            if not data:
+                raise seal.SealError("sealed file is shorter than its size")
+            parts.append(data)
+            self._position += len(data)
+        return b"".join(parts)
+
+
+UNPACK_STORE = "sealed_unpack"  # its meta value "open" is 1 while an unpack's plaintext blocks may be stored
+
+
+@contextmanager
+def _unpacking(node) -> Iterator[None]:
+    """Around an unpack's protection session: the first of the unpacks running marks the state database (meta
+    UNPACK_STORE "open": 1), durably, before any of its blocks is stored; when it ends, what nothing reaches is
+    collected, and once no unpack is running and that collection succeeded the mark is cleared. A start that finds
+    the mark (the process died mid-unpack, or a collection failed) collects instead (collect_unpack_leftovers): the
+    plaintext of a sealed folder never stays in the block store for want of a collection."""
+    from rnfs import statedb
+    from rnfs.log import LOG_ERROR, log
+
+    with node._unpacks_lock:
+        if node._unpacks == 0:
+            with node._db.transaction(durable=True) as tx:
+                statedb.set_meta(tx, UNPACK_STORE, "open", 1)
+        node._unpacks += 1
+    try:
+        yield
+    finally:
+        with node._unpacks_lock:
+            node._unpacks -= 1
+        try:
+            # Nothing reaches the plaintext's blocks now (unless the same blocks are kept for another reason)
+            node.storage.collect()
+            with node._unpacks_lock:
+                if node._unpacks == 0:  # one started meanwhile keeps the mark, and clears it when it ends
+                    with node._db.transaction(durable=True) as tx:
+                        statedb.set_meta(tx, UNPACK_STORE, "open", 0)
+        except Exception as e:  # noqa: BLE001 - never hide the get's own outcome; the next start collects them
+            log(f"get: collecting an unpacked tar's blocks failed: {e!r}", LOG_ERROR)
+
+
+def collect_unpack_leftovers(node):
+    """At start, if the state database is marked as an unpack running (_unpacking: the process died during one, or
+    its collection failed), delete every block nothing reaches, which includes that unpack's decrypted blocks, then
+    clear the mark. A failure is logged and leaves the mark, for the next start."""
+    from rnfs import statedb
+    from rnfs.log import LOG_ERROR, LOG_NOTICE, log, plural
+
+    if node._db.meta(UNPACK_STORE, "open", 0) != 1:
+        return
+    try:
+        removed = node.storage.collect()
+        with node._db.transaction(durable=True) as tx:
+            statedb.set_meta(tx, UNPACK_STORE, "open", 0)
+    except Exception as e:  # noqa: BLE001 - the start goes on; the mark stays, so the next start tries again
+        log(f"collecting the blocks an interrupted sealed-folder unpack left failed: {e!r}", LOG_ERROR)
+        return
+    log(f"deleted {plural(removed, 'block')} nothing reaches, as a sealed-folder unpack rnfs stopped in may have "
+        f"left its decrypted blocks", LOG_NOTICE)
 
 
 def stored_head(node, target: str, length: int, deny: bool = True) -> bytes | None:

@@ -79,6 +79,21 @@ Security:
   can, managing apps included in effect. The `/api/apps` routes refuse its token, but it reads and writes files as
   the daemon's user, which reaches the CLI's token; `rnfs app add` now says so. Give a token only to software you
   would trust with the CLI.
+- **Unpacking a sealed folder counts what its entries take on disk** (REV10; specification section 5,
+  Unpacking): the tar's headers are read first, before anything is stored, and every file and directory counts
+  at least one filesystem allocation unit (4 KiB or the filesystem's own, if larger) in the block store and
+  again as written, where the plaintext's bytes were counted before. A sender could seal a folder of many tiny
+  files that passed the check and then took 4 to 8 times as much, twice, filling the recipient's disk past the
+  reserve (1,000 one-byte files: 10.9 MB written where 2 MB was checked). Such a get is now refused (413, naming
+  `--no-extract`).
+- **An unpack the process died in no longer leaves the plaintext stored** (REV10): its decrypted blocks used to
+  stay in the block store, unpinned, until a gc or an eviction. An unpack now marks the state database while it
+  runs, and a start that finds the mark deletes every block nothing reaches before serving anything (the
+  unrecorded blocks of a fetch the same crash interrupted too: a retry fetches them again).
+- **Documented: a sealed file is only as safe as the recipient's node identity** (REV12), which is online while
+  the node runs and stored unencrypted in the rnfs dir (`storage/identity`): sealing protects against the
+  network, not against someone who can read the recipient's disk (README, Known limitations; specification
+  section 5).
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

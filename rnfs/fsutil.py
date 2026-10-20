@@ -27,6 +27,9 @@ PARTIAL_PREFIX = ".partial-"
 # Seconds slept between attempts while Windows reports a file in use: about 1 s in all
 RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25)
 
+# The least allocation_unit gives: what ext4, APFS and NTFS allocate a file's data in by default
+MIN_ALLOCATION_UNIT = 4096
+
 _REPARSE_JUNCTION = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
 # Reparse tags with this bit are name surrogates: they stand for another file or directory (symlinks,
 # junctions, WSL symlinks), unlike placeholders such as OneDrive's that hold the file itself
@@ -282,6 +285,43 @@ def _windows_final_path(fd: int) -> str:
         if length < size:
             return strip_windows_prefix(buffer.value)
         size = length + 1  # the buffer was too small, and length is what it needs
+
+
+def allocation_unit(path: str) -> int:
+    """The bytes the filesystem holding path (which must exist) allocates a file's data in (its fragment or cluster
+    size), at least MIN_ALLOCATION_UNIT: a smaller unit doesn't make an entry cheaper than that, since a file or
+    directory costs an inode or a directory record too. MIN_ALLOCATION_UNIT if it can't be read."""
+    unit = 0
+    try:
+        if hasattr(os, "statvfs"):
+            result = os.statvfs(path)  # noqa: TID251 - guarded by the hasattr: not on Windows
+            unit = result.f_frsize or result.f_bsize
+        elif os.name == "nt":
+            unit = _windows_cluster_size(path)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return max(unit, MIN_ALLOCATION_UNIT)
+
+
+def _windows_cluster_size(path: str) -> int:
+    """allocation_unit on Windows: the cluster size of path's volume (GetVolumePathNameW, GetDiskFreeSpaceW)."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    volume_path = kernel32.GetVolumePathNameW
+    volume_path.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    volume_path.restype = wintypes.BOOL
+    free_space = kernel32.GetDiskFreeSpaceW
+    free_space.argtypes = (wintypes.LPCWSTR, *(ctypes.POINTER(wintypes.DWORD),) * 4)
+    free_space.restype = wintypes.BOOL
+    root = ctypes.create_unicode_buffer(1024)
+    if not volume_path(os.path.abspath(path), root, len(root)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    sectors, sector_size, free, total = (wintypes.DWORD() for _ in range(4))
+    if not free_space(root.value, ctypes.byref(sectors), ctypes.byref(sector_size), ctypes.byref(free),
+                      ctypes.byref(total)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return sectors.value * sector_size.value
 
 
 def is_link(st: os.stat_result) -> bool:

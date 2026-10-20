@@ -652,6 +652,9 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 - Sybil attacks can make a CID hard to find (`get --from` bypasses the DHT), but data can never be forged.
 - Sealed files hide content and file name, not size or recipients, and don't prove who sealed them. `get` of a
   directory leaves sealed files inside it encrypted.
+- A sealed file is readable by whoever holds the recipient's node identity, which is online whenever the node
+  runs and stored unencrypted in the rnfs dir (`storage/identity`): sealing protects against the network, not
+  against someone with access to the recipient's disk.
 - Under the default `provide_strategy = "roots"`, anyone can learn what your node downloaded. With
   `provide_entries` (on by default), anyone can learn which files your pinned folders hold by looking up each
   file's CID, without knowing the folder.
