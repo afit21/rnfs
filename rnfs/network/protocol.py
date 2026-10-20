@@ -6,9 +6,15 @@
 | /blocks   | [max_bytes, [cid, ...]]           | [block or None, ...]           |
 | /pin      | [cid, pin]                        | True if accepted               |
 | /name     | name                              | the record's fields, or []     |
+| /range    | [cid, offset, max_bytes, flags]   | [size, encoding, bytes], or [] |
 
 Keys, node IDs and names are 16-byte bin, CIDs binary CIDs as bin, blocks bin, max_bytes a non-negative integer
 (never a boolean), pin a boolean. Any other shape, or a refusal, is answered False.
+
+/range (rnfs 0.2.0, optional) is a byte range of one block, its bytes bz2-compressed if flags asks (RANGE_BZ2) and
+that makes them smaller; [] if the block isn't served (RNS sends nothing for a handler's None). Nodes before 0.2.0
+have no handler for it, so RNS leaves it unanswered there: requesters learn which nodes answer it (fetcher, section
+7). A requester decompresses an answer itself, to at most the range asked for plus one byte (decompress_range).
 
 /name is the keepers feature's path (rnfs.features.keepers encodes and parses it). Its response is a kept
 record's [public_key, name_hash, random_hash, ratchet, signature, app_data], every field bin, or [] if the node
@@ -18,16 +24,17 @@ Everything parsed here comes from other nodes, so parsers are strict and return 
 Every request must fit in one packet: at most min(link MDU, MAX_REQUEST_SIZE) bytes including RNS's request
 framing, which is computed exactly here the way Link.request packs it.
 """
+import bz2
 import time
 
 import RNS
 from RNS.vendor import umsgpack
 
 from rnfs.constants import (BLOCKS_PATH, FIND_PATH, ID_LENGTH, K, KIB, MAX_BLOCK_SIZE, MAX_PROVIDE_KEYS,
-                            MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH)
+                            MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RANGE_BZ2, RANGE_PATH)
 from rnfs.content.cid import RAW, Cid
 
-__all__ = ["FIND_PATH", "PROVIDE_PATH", "BLOCKS_PATH", "PIN_PATH"]
+__all__ = ["FIND_PATH", "PROVIDE_PATH", "BLOCKS_PATH", "PIN_PATH", "RANGE_PATH"]
 
 DEFAULT_MDU = RNS.Link.MDU  # packet MDU of a link at the default 500-byte MTU (431 bytes)
 # RNS's request timeout without RTT (11.25 s): what it adds to rtt × traffic_timeout_factor (Link.request with
@@ -223,6 +230,102 @@ def encode_blocks_response(entries: list[bytes | None]) -> list:
     return list(entries)
 
 
+# /range (rnfs 0.2.0, section 7)
+
+RANGE_RAW = 0  # a /range answer's encoding: the bytes as they are (RANGE_BZ2: one bz2 stream of them)
+BZ2_LEVEL = 9  # what RNS compresses Resources with (bz2.compress's default)
+
+
+def encode_range(cid: Cid, offset: int, max_bytes: int, flags: int = 0) -> list:
+    """/range request for at most max_bytes bytes of cid's block from offset, compressed if flags asks (RANGE_BZ2)."""
+    return [cid.binary, int(offset), int(max_bytes), int(flags)]
+
+
+def parse_range_request(data) -> tuple[Cid, int, int, int] | None:
+    """(CID, offset, max_bytes, flags) from a /range request, or None if malformed: offset at most MAX_BLOCK_SIZE,
+    max_bytes 1 to MAX_BLOCK_SIZE, flags any non-negative integer (its reserved bits are ignored, not refused, so a
+    later flag can be added without older responders refusing it)."""
+    if type(data) is not list or len(data) != 4:
+        return None
+    binary, offset, max_bytes, flags = data
+    cid = parse_cid(binary)
+    if cid is None or not is_count(offset) or not is_count(max_bytes) or not is_count(flags):
+        return None
+    if offset > MAX_BLOCK_SIZE or not 1 <= max_bytes <= MAX_BLOCK_SIZE:
+        return None
+    return cid, offset, max_bytes, flags
+
+
+def range_length(size: int, offset: int, max_bytes: int) -> int:
+    """How many bytes a /range answer carries: max_bytes, or what is left of a block of size bytes after offset."""
+    return max(0, min(max_bytes, size - offset))
+
+
+def encode_range_response(size: int, encoding: int, data: bytes) -> list:
+    """/range answer: the block's size, the encoding of data (RANGE_RAW or RANGE_BZ2) and data."""
+    return [int(size), int(encoding), bytes(data)]
+
+
+def range_max_response_size(max_bytes: int) -> int:
+    """The max_response_size a requester passes to RNS for a /range request (section 7): the range, its framing."""
+    return min(max_bytes + KIB, MAX_RESPONSE_SIZE)
+
+
+def compress_range(data: bytes) -> bytes:
+    """data as one bz2 stream, as a responder sends a range asked for compressed."""
+    return bz2.compress(data, BZ2_LEVEL)
+
+
+def decompress_range(stream: bytes, limit: int) -> bytes | None:
+    """What the bz2 stream holds, if it is one complete stream of at most limit bytes with nothing after it; else
+    None (also for a corrupt one).
+
+    The decompressor is asked for at most limit + 1 bytes, so a stream expanding to far more (a decompression bomb:
+    64 MiB of zeros is about 50 bytes of bz2) costs that much output and is refused there, at its first call.
+    """
+    decompressor = bz2.BZ2Decompressor()
+    try:
+        data = decompressor.decompress(stream, max_length=limit + 1)
+    except (OSError, ValueError, EOFError):
+        return None
+    if len(data) > limit or not decompressor.eof or decompressor.unused_data:
+        return None
+    return data
+
+
+def is_range_unserved(data) -> bool:
+    """True if a /range answer says the node doesn't hold or serve the block: an empty list."""
+    return type(data) is list and not data
+
+
+def parse_range_response(data, offset: int, max_bytes: int, compressed: bool,
+                         size: int | None = None) -> tuple[int, bytes] | None:
+    """(the block's size, the range's bytes) from a /range answer to a request for max_bytes from offset, or None if
+    malformed (including False, a refusal, and [], unserved: is_range_unserved tells those apart first).
+
+    The size must be at most MAX_BLOCK_SIZE and, if given (what the parent declares, or earlier ranges said), equal to
+    it; the encoding RANGE_RAW, or RANGE_BZ2 if compressed (the request asked for it); and the bytes, decompressed
+    to at most their expected length (decompress_range), exactly range_length(size, offset, max_bytes) of them.
+    """
+    if type(data) is not list or len(data) != 3:
+        return None
+    total, encoding, payload = data
+    if not is_count(total) or not is_count(encoding) or type(payload) is not bytes:
+        return None
+    if total > MAX_BLOCK_SIZE or (size is not None and total != size) or offset > total:
+        return None
+    expected = range_length(total, offset, max_bytes)
+    if encoding == RANGE_RAW:
+        raw = payload
+    elif encoding == RANGE_BZ2 and compressed:
+        raw = decompress_range(payload, expected)
+    else:
+        return None
+    if raw is None or len(raw) != expected:
+        return None
+    return total, raw
+
+
 # /pin
 
 def encode_pin(cid: Cid, pin: bool) -> list:
@@ -358,6 +461,39 @@ def _entries_end(packed: bytes, position: int) -> tuple[int | None, str | None]:
     return position, None
 
 
+_UINT_WIDTHS = {0xCC: 1, 0xCD: 2, 0xCE: 4, 0xCF: 8}  # uint8 to uint64: bytes after the code (fixint: 0x00-0x7f)
+
+
+def _uint_end(packed: bytes, position: int) -> int | None:
+    """Position after a non-negative integer at position, or None if there's none."""
+    if position >= len(packed):
+        return None
+    code = packed[position]
+    if code <= 0x7F:
+        return position + 1
+    width = _UINT_WIDTHS.get(code)
+    if width is None or position + 1 + width > len(packed):
+        return None
+    return position + 1 + width
+
+
+def _range_answer_end(packed: bytes, position: int) -> int | None:
+    """Position after a /range answer ([size, encoding, data]: two non-negative integers and a bin of at most
+    MAX_BLOCK_SIZE) at position, or None."""
+    outer = _array_at(packed, position)
+    if outer is None or outer[0] != 3:
+        return None
+    position = outer[1]
+    for _ in range(2):
+        position = _uint_end(packed, position)
+        if position is None:
+            return None
+    data = _bin_at(packed, position)
+    if data is None or data[0] > MAX_BLOCK_SIZE:
+        return None
+    return data[1]
+
+
 def response_refusal(packed: bytes) -> str | None:
     """Why packed (RNS's response framing, [request_id, response], as received) can't hold any rnfs.dht
     response, judged from msgpack headers alone without decoding it; None if it may.
@@ -375,9 +511,10 @@ def body_refusal(packed: bytes, position: int = 0) -> str | None:
     """Why the packed response at position (to the end of packed) can't be any rnfs.dht response, from msgpack
     headers alone; None if it may.
 
-    The response may be True, False or None (a /provide or /pin answer, or a refusal), a /find answer, or a
-    /blocks answer (also the shape of a /name one). Nothing may follow it. Requesters check every response
-    with this (through response_refusal), so a node checks its features' responses with it before sending.
+    The response may be True, False or None (a /provide or /pin answer, or a refusal), a /find answer, a /blocks
+    answer (also the shape of a /name one, and of an empty /range answer), or a /range answer. Nothing may follow it.
+    Requesters check every response with this (through response_refusal), so a node checks its features' responses
+    with it before sending.
     """
     if position >= len(packed):
         return "no response"
@@ -388,7 +525,9 @@ def body_refusal(packed: bytes, position: int = 0) -> str | None:
         if end is None:
             end, reason = _entries_end(packed, position)
             if end is None:
-                return reason
+                end = _range_answer_end(packed, position)
+                if end is None:
+                    return reason
     if end != len(packed):
         return f"{len(packed) - end} bytes after the response"
     return None

@@ -16,8 +16,10 @@ MAX_DEPTH = 64
 K = 10  # bucket size, /find reply size and replication
 PROVIDER_TTL = 7 * DAY
 MAX_REQUEST_SIZE = 1 * KIB  # including RNS request framing
-MAX_REQUESTS_PER_LINK = 2  # at most one of them /blocks
+MAX_REQUESTS_PER_LINK = 2  # at most one of them /blocks or /range
 MAX_RESPONSE_SIZE = 1 * MIB - 1  # encoded response; one RNS Resource segment
+# /range (rnfs 0.2.0, section 7): the flag bit asking for bz2, and the encoding of an answer in bz2
+RANGE_BZ2 = 1
 
 # Not tunable, but fixed by the spec's text rather than its constants table
 ID_LENGTH = 16  # node IDs and DHT keys: RNS destination hashes, 128 bits
@@ -41,6 +43,7 @@ FIND_PATH = "/find"
 PROVIDE_PATH = "/provide"
 BLOCKS_PATH = "/blocks"
 PIN_PATH = "/pin"
+RANGE_PATH = "/range"  # rnfs 0.2.0, optional: older nodes leave it unanswered (section 7)
 
 # DHT mode carried in the rnfs.dht announce's app_data (section 3)
 MODE_CLIENT = 0

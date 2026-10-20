@@ -25,3 +25,14 @@ Only when adding cases: the bytes must never change. From the repository root:
 
 A new kind that 0.1.3 doesn't have can't be generated this way; give it its own generator run on the release that
 introduced it.
+
+## /range (0.2.0)
+
+`/range`, the one request 0.2.0 added (specification section 7), has vectors of its own: `range_cases.py` (the cases,
+in `wire_cases.py`'s form, using its fixed blocks) and `range_vectors.json`, written by the tree that introduced the
+request (`introduced_in`; `generated_by` is that tree's `__version__`, still 0.1.6 while 0.2.0 was being built):
+
+    python3 tests/fixtures/wire/generate.py --range .
+
+As with the others, only when adding cases: the bytes must never change. The bz2 answer's stream is fixed bytes in
+`range_cases.py`, so a compressor giving other bytes for the same text can't change the vectors.
