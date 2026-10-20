@@ -2411,10 +2411,13 @@ Everything in the specification is implemented, with these simplifications and a
   and one left unanswered as an older node leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`,
   for what no other probe brought meanwhile.
 - Searching again (0.2.0): `Fetch._search_again`, each pass of `_download`, on a node that isn't slow and without a
-  `from_node`, starts a new lookup (`make_lookup`; the old one's budget is spent) when none runs, fewer than
-  `max_parallel` providers are live, and `_search_wait` has passed since the last `LookupDone` (`_searched_at`):
-  `SEARCH_AGAIN_AFTER` (60 s), doubling to `SEARCH_AGAIN_MAX` (600 s). `_lookups` keeps every search, whose listers
-  `_served` credits; `_lookup` is the latest.
+  `from_node`, starts a new lookup (`make_lookup`; the old one's time budget is spent) when none runs, some provider is
+  live but fewer than `max_parallel` can be asked now (not failed, `busy_until` passed), and `_search_wait` has passed
+  since the last `LookupDone` (`_searched_at`, the fetch's start until one): `SEARCH_AGAIN_AFTER` (60 s), doubling to
+  `SEARCH_AGAIN_MAX` (600 s). `_lookups` keeps the searches that found someone (the first always), whose listers
+  `_served` credits; `_lookup` is the latest; every search shares the first one's unknown-identity budget
+  (`allow_unknown`). A provider with no path (`"unreachable"`) is set aside for `UNREACHABLE_RETRY` (60 s, counted as
+  progress) the first time (`_Provider.unreached`) and fails the second time in a row.
 - Records held here (0.2.0): when `_discover` starts the search it adds, as providers, `Fetcher.held_providers(key)`
   (the node's `ProviderRecords.for_reply`, what its own `/find` answer lists), so a record this node holds names a
   provider at once; the search runs all the same.

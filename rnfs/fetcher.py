@@ -171,10 +171,10 @@ UNFOUND_FOR = 600
 # Searching again during a long fetch (Fetch._search_again): on a node that isn't slow, with fewer providers usable than
 # max_parallel, a search starts this long after the last one ended, the wait doubling each time up to SEARCH_AGAIN_MAX
 SEARCH_AGAIN_AFTER = 60.0
+SEARCH_AGAIN_MAX = 600.0
 # A provider no path was found to is asked again this long after, and fails only if it is unreachable again then: on a
 # radio a node is out of reach for a minute when its rnsd restarts or a path request is lost
 UNREACHABLE_RETRY = 60.0
-SEARCH_AGAIN_MAX = 600.0
 MAX_UNFOUND = 4096
 # Ranges (the module docstring): raw chunks declared this large or larger are fetched in ranges over slow links, and a
 # provider that stalled gets ranges of at most STALLED_RANGE on the wire
@@ -792,7 +792,9 @@ class Fetch:
         self._lookup_running = False
         self._lookup_found = 0  # providers the last lookup run reported
         self._lookups: list = []  # every search of this fetch, the latest last (their listers earn the credit)
-        self._searched_at: float | None = None  # when the last search ended (the fetch thread's clock)
+        # When the last search ended (the fetch thread's clock); until one has, when the fetch began, so a fetch whose
+        # first request brought the root (a probe) also looks for more providers if it runs long
+        self._searched_at: float = fetcher.clock()
         self._search_wait = SEARCH_AGAIN_AFTER  # how long after it the next may start (_search_again)
         self._events: queue.Queue = queue.Queue()
         # provider -> (CIDs asked for, is a probe); kept across _download calls, since a request may outlive one
@@ -1263,6 +1265,8 @@ class Fetch:
             self._lookup_running = False
             self._lookup_found = event.found
             self._searched_at = self.fetcher.clock()
+            if event.found == 0 and len(self._lookups) > 1 and self._lookups[-1] is self._lookup:
+                self._lookups.pop()  # a later search that found nobody has nobody to credit (_served)
             if event.answered and event.found == 0 and not self._providers:
                 self.fetcher.note_unfound(self.root)  # nobody provides it, as far as the DHT knows
         elif isinstance(event, ResultEvent):
@@ -1737,11 +1741,15 @@ class Fetch:
         SEARCH_AGAIN_AFTER after the last search ended, the wait doubling each time up to SEARCH_AGAIN_MAX. A new
         lookup (the last one's time budget is spent by then), stopped as the first is once enough providers are known;
         what it finds joins the fetch, ranked as any provider is."""
-        if (self.fetcher.slow_node or self.from_node is not None or self.closed or self._lookup_running
-                or self._searched_at is None or self._live >= self.fetcher.max_parallel):
+        if self.fetcher.slow_node or self.from_node is not None or self.closed or self._lookup_running:
             return
         now = self.fetcher.clock()
         if now - self._searched_at < self._search_wait:
+            return
+        # Providers that can be asked now: one waiting out a delay (busy, unreachable) doesn't fill a place. With none
+        # left at all, the fetch searches again or fails as it always did (_rerun_lookup)
+        usable = sum(1 for p in self._providers.values() if not p.failed and p.busy_until <= now)
+        if not self._live or usable >= self.fetcher.max_parallel:
             return
         self._search_wait = min(2 * self._search_wait, SEARCH_AGAIN_MAX)
         log(f"still fetching {self.root} from {plural(self._live, 'provider')}: looking for more", LOG_VERBOSE)
@@ -1767,7 +1775,10 @@ class Fetch:
         banned, known, or over the unknown-ID budget."""
         if node_id == self.fetcher.own_id or node_id in self._providers or self.fetcher.routing.is_banned(node_id):
             return
-        if self._lookup is not None and not self._lookup.allow_unknown(node_id):
+        # Every search of the fetch shares the first one's budget of unknown identities (path requests): a later search
+        # (_search_again) doesn't bring a budget of its own
+        budget = self._lookups[0] if self._lookups else self._lookup
+        if budget is not None and not budget.allow_unknown(node_id):
             log(f"skipping provider {node_name(node_id)}: identity unknown and the path request budget is spent",
                 LOG_VERBOSE)
             return
@@ -1867,8 +1878,8 @@ class Fetch:
             provider.lost = 0  # it answered (or failed outright)
         if result.ratio is not None:
             provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
-        if result.status not in (peer_client.FAILED, peer_client.LOST):
-            provider.unreached = False  # reached
+        if result.reason != "unreachable":
+            provider.unreached = False  # no path twice in a row (consecutive results) fails it
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
@@ -1915,6 +1926,7 @@ class Fetch:
             # LoRa a fetch from its one provider failed so when the provider's rnsd restarted, a minute's outage)
             provider.unreached = True
             provider.busy_until = now + UNREACHABLE_RETRY
+            self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
             log(f"no path to {node_name(provider.node_id)}; asking it again in {UNREACHABLE_RETRY:.0f}s", LOG_VERBOSE)
         else:
             self._fail(provider, result.reason or "request failed")

@@ -217,6 +217,7 @@ class ProviderDiscoveryTest(FetcherTest):
             self.fetcher.clock = lambda: now[0]
             started = []
             fetch._start_lookup = lambda: started.append(now[0])
+            fetch._new_provider(P1)  # one provider, fewer than max_parallel
             fetch._searched_at = now[0]
             for wait in (60, 120, 240, 480, 600, 600):
                 before = len(started)
@@ -260,6 +261,41 @@ class ProviderDiscoveryTest(FetcherTest):
         with mock.patch.object(fetcher_module, "UNREACHABLE_RETRY", 0.05), self.assertRaises(NotFound):
             self.fetch_all(built.cid)
         self.assertEqual(len(tries), 2)
+
+    def test_a_fetch_whose_first_request_brought_the_root_searches_again_too(self):
+        """A remembered provider, asked first, brought the root: no search ran, and a long fetch from it still looks for
+        more providers, counting from the fetch's start."""
+        built, made = self.search_again_setup()
+        self.fetcher.remember(built.cid, P1)
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertGreaterEqual(len(made), 1)
+        self.assertTrue(self.client.asked(P2))
+
+    def test_no_search_again_once_every_provider_failed(self):
+        """With none left the fetch fails as before (a search that found nothing new isn't run again), rather than start
+        a whole new search because the wait for one had passed."""
+        built = self.file(os.urandom(CHUNK_SIZE))
+        with self.fetcher.open(built.cid) as fetch:
+            started = []
+            fetch._start_lookup = lambda: started.append(1)
+            fetch._fail(fetch._new_provider(P1), "test")
+            fetch._searched_at -= 10 * fetcher_module.SEARCH_AGAIN_MAX
+            fetch._search_again()
+            self.assertEqual(started, [])
+
+    def test_a_provider_waiting_out_a_delay_leaves_room_for_more(self):
+        built = self.file(os.urandom(CHUNK_SIZE))
+        self.config.max_parallel_providers = 2
+        self.fetcher = self.make_fetcher()
+        with self.fetcher.open(built.cid) as fetch:
+            started = []
+            fetch._start_lookup = lambda: started.append(1)
+            fetch._new_provider(P1)
+            fetch._new_provider(P2).busy_until = self.fetcher.clock() + 60  # unreachable, asked again later
+            fetch._searched_at -= 10 * fetcher_module.SEARCH_AGAIN_MAX
+            fetch._search_again()
+            self.assertEqual(started, [1])
 
     def test_open_link_nodes_are_asked_first(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))

@@ -2833,7 +2833,7 @@ unreserved, pct-encoded: as in RFC 3986
 | Kademlia DHT, providers | Section 6. 128-bit keys; `K` 10; servers and clients as in IPFS, with the mode carried in the announce; `beta` termination as in IPFS; one find message; batched publishing with withdrawal; no PUT/GET values |
 | DHT routing table refresh, IP diversity filter | Replaced by RNS announces and failure counting; no IP addresses exist to diversify on, so Sybil resistance rests on seniority (section 6) |
 | DHT key (SHA-256 of the multihash) | SHA-256 of the whole binary CID, truncated to 128 bits, so a raw block and a DAG node with identical bytes stay apart |
-| Reprovider strategies | `roots` (default), `pinned`; `all` dropped to save airtime |
+| Reprovider strategies | `roots`, `pinned`, and `auto` (default: `pinned` on a slow node, `roots` on others); `all` dropped to save airtime |
 | Bitswap, multi-source and resumable download | Section 7; providers ranked by seniority, then local score, hops and next-hop bitrate (section 6) |
 | Bandwidth limits | Upload budget, interface rules and quiet hours for `/blocks` (section 3) |
 | `swarm peers`, `stats bw` | `peers`, `stats` |
