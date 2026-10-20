@@ -33,9 +33,11 @@ the lowest tier below the storer's that holds more than its floor (FLOORS, share
 storer's own tier holds less than its floor, from a tier above it that holds more than its floor; else from the
 storer's own tier, unless the storer holds as many records as that tier's largest holder (refused), or the tier is
 Earned (Earned publishers never evict each other: refused). While full, a Newcomer's record last stored
-NEWCOMER_TTL_FULL ago counts as expired. A key keeps at most max_per_key publishers: a newcomer to a full key evicts a
-random one of the lowest tier there, if that tier is below the newcomer's, or is the newcomer's and not Earned; never
-one of the K/2 oldest records, which /find replies list first. Otherwise it is refused.
+NEWCOMER_TTL_FULL ago counts as expired. A key keeps at most max_per_key publishers, and a new publisher of a full key
+evicts a random record there, never one of the K/2 oldest, which /find replies list first. Newcomers keep a share of
+the key (KEY_NEWCOMER_SHARE): a Newcomer evicts an Earned record while they hold less, else a Newcomer one; an Earned
+or Known storer evicts an Earned record while they hold no more, else a Newcomer one first; only a Known storer evicts
+a Known record, and only when no other is left. Otherwise it is refused.
 
 This node's own records (own_id) are always accepted, never evicted, and not counted toward max_per_key: they are
 what the node provides, and its /find replies list it as a provider from them. They take room in the budget.
@@ -74,6 +76,10 @@ NEWCOMER_TTL_FULL = 4.5 * DAY  # while full, a Newcomer's record last stored thi
 REFRESH_WRITE = 6 * HOUR  # a refresh moving a record's last-stored time by less is not written (TTL: 7 days)
 DEFAULT_RECORD_BUDGET = GIB  # bytes (Config.record_budget's default)
 MAX_PUBLISHERS_PER_KEY = 1000  # publishers recorded per key, besides this node
+# Newcomers' share of a full key's publishers (as of the Newcomer tier's floor): below it a Newcomer evicts a random
+# Earned record, so new providers always get in and the random half of /find replies has newcomers to pick; past
+# it Newcomers give way first, so a flood of fresh identities holds at most this share of a key
+KEY_NEWCOMER_SHARE = 0.10
 # The write budget: new records and withdrawals a WRITE_WINDOW (the node's save interval, RECORDS_INTERVAL) by pool:
 # WRITE_BUDGET[NEWCOMER] is open to every tier, the others are kept for Earned and for Known publishers, who spend
 # their own first. Unused budget is carried over for up to WRITE_CARRY windows (6 h). So new records are written at
@@ -513,7 +519,7 @@ class ProviderStore:
 
     def _key_room(self, records: dict, tier: int, now: float) -> tuple[bool, bytes | None]:
         """Whether a new publisher of tier may join a key holding records, and the publisher it evicts if the key is
-        full (None if not full). Lock held."""
+        full (None if not full; the module's docstring has the rules). Lock held."""
         others = [p for p, (_, last) in records.items() if p != self.own_id and now - last < self.ttl]
         if len(others) < self.max_per_key:
             return True, None
@@ -521,11 +527,25 @@ class ProviderStore:
         others.sort(key=lambda p: (records[p][0], p))
         candidates = others[min(K // 2, self.max_per_key - 1):]
         tiers = self._tiers(candidates)
-        lowest = min(tiers.values())
-        if lowest > tier or lowest == EARNED == tier:
-            return False, None
-        pool = [p for p in candidates if tiers[p] == lowest]
-        return True, pool[self.rng.randrange(len(pool))]
+        by_tier: dict[int, list[bytes]] = {NEWCOMER: [], EARNED: [], KNOWN: []}
+        for publisher in candidates:
+            by_tier[tiers[publisher]].append(publisher)
+        # Newcomers keep a share of the key: below it a Newcomer evicts an Earned record, and Earned or Known storers
+        # spare them; past it they give way first. Earned records give way to Earned storers too, so identities that
+        # earned their tier can't hold the key against everyone but Known publishers
+        share = KEY_NEWCOMER_SHARE * self.max_per_key
+        newcomers = len(by_tier[NEWCOMER])
+        if tier == NEWCOMER:
+            order = (EARNED, NEWCOMER) if newcomers < share else (NEWCOMER,)
+        else:
+            order = (NEWCOMER, EARNED) if newcomers > share else (EARNED, NEWCOMER)
+            if tier == KNOWN:
+                order += (KNOWN,)
+        for victim_tier in order:
+            pool = by_tier[victim_tier]
+            if pool:
+                return True, pool[self.rng.randrange(len(pool))]
+        return False, None
 
     def _tiers(self, publishers: list[bytes]) -> dict[bytes, int]:
         """The tier of each of publishers (each holds a record here), read together. Lock held."""

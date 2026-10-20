@@ -422,8 +422,12 @@ table); both, and `_oldest_key`'s position in each publisher's records, are rese
 costs a few reads and O(log n) in memory: about 70 µs on a desktop, a third of them SQLite's. Once a batch's key is
 refused for room, `provide` refuses its other new keys without looking again (NEW-8).
 
-A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the
-lowest tier among the rest gives way if that tier is below the storer's, or is the storer's and not Earned.
+A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the rest
+gives way, by tier in an order the storer's tier and the Newcomers' share of the key (`KEY_NEWCOMER_SHARE`, 10%,
+counted among the rest) set: a Newcomer takes Earned then Newcomer records while Newcomers are below their share, else
+only Newcomer ones; an Earned storer Earned then Newcomer ones while Newcomers are within their share, else Newcomer
+then Earned ones; a Known storer the same, then Known ones (REV3: Earned records never gave way to each other, so
+1000 Earned identities could hold a key against all but Known publishers).
 This node's records are never counted there, never evicted and never refused. Expiry (`_expire`) reads expired
 records through `provider_records_last`, `SWEEP_BATCH` at a time with the lock let go between batches, and, while
 full, Newcomers' records last stored 4.5 days ago (`_NEWCOMERS_EXPIRED`, joined with their standing; the tier

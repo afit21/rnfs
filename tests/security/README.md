@@ -171,3 +171,4 @@ A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
 | REV2 | `test_rev2_provider_write_budget.py`; also `tests/test_providers.py` (`WriteBudgetTest`) | `rnfs/dht/providers.py` (`_WriteBudget`, `ProviderStore._store`, `_withdraw`, `REFRESH_WRITE`) | the REV2 commit |
+| REV3 | `test_rev3_full_key_takeover.py`; also `tests/test_providers.py` (`KeyCapTest`) | `rnfs/dht/providers.py` (`ProviderStore._key_room`, `KEY_NEWCOMER_SHARE`) | the REV3 commit |

@@ -998,11 +998,15 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
     of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
     never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.
-  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a newcomer to a full
-    key evicts a random one of the lowest tier there (never one of the `K/2` oldest records, which replies list
-    first), if that tier is below its own, or is its own and not Earned; otherwise it is refused. Refusing every
-    newcomer would let early Sybil identities hold the key, and the random half of `/find` replies relies on
-    newcomers getting stored.
+  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a new publisher of a
+    full key evicts a random record there, never one of the `K/2` oldest records, which replies list first.
+    Newcomers keep a share of the key, a tenth of its publishers: a Newcomer evicts an Earned record while
+    Newcomers hold less, else a Newcomer one; an Earned or Known publisher evicts an Earned record while Newcomers
+    hold no more than their share, else a Newcomer one first; only a Known publisher evicts a Known record, and
+    only when no other is left. Otherwise it is refused. Refusing every newcomer would let early Sybil identities
+    hold the key, and the random half of `/find` replies relies on newcomers getting stored; Earned records give
+    way too, or about 1000 identities that each refreshed the key on 3 days (about 48 hours) would hold it against
+    every publisher but Known ones, while a flood of fresh identities holds at most the Newcomers' share.
 - The node's own records are always accepted and never evicted to make room for others' (rnfs: nor counted
   toward the 1000 publishers of a key; they take room in the budget), so Sybil stores can't push a node's own
   record out of its own store.

@@ -68,6 +68,12 @@ Security:
   withdrawal followed by a store of the same key before the next save is a refresh, and a refresh is written once
   it moves a record's last-stored time by 6 hours rather than 1. A Newcomer flood now makes the store write at most
   about 150 kB/s (fresh identities, inserted and withdrawn, on a 1M-record database), a hundredth of what it did.
+- **A full key can't be taken over** (REV3; specification section 6): Earned publishers never gave way to each other
+  at a full key, so about 1000 identities that each refreshed one key on 3 UTC days (from about 48 hours) held all
+  its 1000 publishers, and every new provider of it but Known ones was refused. Now Earned records give way to
+  Earned and Known storers (a random one outside the `K/2` oldest), and Newcomers keep a tenth of the key: below it
+  a Newcomer evicts a random Earned record, past it Newcomers give way first, so a flood of fresh identities holds
+  at most that share.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -426,7 +432,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
   within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
   each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
-  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way by tier, with a
+  share kept for Newcomers (Security, above).
 
 Changed:
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
