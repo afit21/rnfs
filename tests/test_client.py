@@ -278,12 +278,56 @@ class PeerClientTest(unittest.TestCase):
         result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
         self.assertEqual(result.status, client.LOST)
 
-    def test_blocks_on_a_link_closed_by_an_end_fails(self):
-        for reason in (links.DESTINATION_CLOSED, links.INITIATOR_CLOSED):
+    def test_blocks_on_a_link_closed_by_this_node_fails(self):
+        self.close_under_request(links.INITIATOR_CLOSED)
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual(result.status, client.FAILED)
+
+    def test_blocks_on_a_link_the_provider_closed_is_busy(self):
+        # A server with no room for another incoming link closes it (RNS: DESTINATION_CLOSED at the opener): a
+        # refusal, retried on a new link after the busy delay, as a False is
+        self.close_under_request(links.DESTINATION_CLOSED)
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual((result.status, result.reason), (client.BUSY, "closed"))
+        self.assertEqual(self.client.traffic.snapshot()["totals"]["refused"], 1)
+
+    def find_closed(self, node_id: bytes = NODE) -> tuple:
+        """/find to NODE on a thread: (its answer, closed_by_node(node_id) on that thread afterwards)."""
+        return self.call(lambda: (self.client.find(NODE, KEY), self.client.closed_by_node(node_id)))
+
+    def test_find_on_a_link_the_server_closed_is_a_refusal(self):
+        """closed_by_node tells the lookup's failure callback, on the querying thread, that the server closed the link:
+        not counted against it (specification section 6)."""
+        self.close_under_request(links.DESTINATION_CLOSED)
+        self.assertEqual(self.find_closed(), (None, True))
+        self.assertEqual(self.find_closed(KEY), (None, False))  # asked about another node
+        self.assertFalse(self.client.closed_by_node(NODE))  # another thread
+        self.assertEqual(self.client.traffic.snapshot()["totals"]["refused"], 2)
+        for reason in (links.LINK_TIMEOUT, links.INITIATOR_CLOSED):
             with self.subTest(reason=reason):
                 self.close_under_request(reason)
-                result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
-                self.assertEqual(result.status, client.FAILED)
+                self.assertEqual(self.find_closed(), (None, False))
+        self.respond(lambda link, path, data: [[KEY], [NODE]])
+        self.assertEqual(self.find_closed(), (([KEY], [NODE]), False))
+
+    def test_link_closed_as_it_is_established_is_a_refusal(self):
+        def refuse(link):
+            """The server tears the link down as it establishes it."""
+            link.teardown_reason = links.DESTINATION_CLOSED
+            link.teardown()
+            return True
+        fakes.FakeLink.establishes = staticmethod(refuse)
+        self.addCleanup(setattr, fakes.FakeLink, "establishes", None)
+        charged = self.pool.paths.charged
+        self.assertEqual(self.find_closed(), (None, True))
+        self.assertTrue(self.pool.refused(NODE) and not self.pool.unestablished(NODE))
+        self.assertEqual(self.pool.paths.charged, charged)  # RNS doesn't ask for the path again
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual((result.status, result.reason), (client.BUSY, "closed"))
+        fakes.FakeLink.establishes = None
+        self.respond(lambda link, path, data: [[KEY], [NODE]])
+        self.assertIsNotNone(self.call(lambda: self.client.find(NODE, KEY)))
+        self.assertFalse(self.pool.refused(NODE))
 
     def test_blocks_link_not_established_is_lost_no_path_fails(self):
         cid = block_of(10, 1)[0]

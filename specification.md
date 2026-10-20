@@ -690,6 +690,10 @@ announced once a day, would take all of it).
 - A node is dropped after `max_failures` queries in a row go unanswered; hearing from it resets the count.
   Lossy links can drop a live server this way, so a dropped node's first-seen time is kept for
   `2 × announce_interval`, and it regains its seniority if it comes back within that time.
+- A query whose link the server closed (RNS's `teardown_reason`, `DESTINATION_CLOSED` at the end that opened it: a
+  server with no room for another incoming link closes it, or one going away) is a refusal, not a failure: it counts
+  neither here, nor against the node's local score, nor towards partition mode ("LoRa islands"), and a partition
+  probe it ends has reached the island's outside. Such a node is up; one going away fails its next query.
 - **Saved across restarts.** A node SHOULD save its routing table: each entry's first-seen and last-heard times
   and whether it failed a query since, the first-seen times of dropped nodes until they expire, and bans until
   they end. Times are saved as wall clock; one later than the current time when loaded (a clock since corrected
@@ -836,9 +840,9 @@ and repeat.
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
 
-  A provider *fails* when its link fails (there is no path to it, or the link is closed under a request by either end),
-  its answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
-  `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
+  A provider *fails* when its link fails (there is no path to it, or this node closed the link under a request), its
+  answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
+  or closes the link (`DESTINATION_CLOSED`, a refusal: above; asked again on a new link) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
   7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times it out with the link up (on a
   lossy path its packet or its answer's was lost: RNS resends neither), the link times out under it, or a new link to a
   node RNS has a path to isn't established (its link request or proof lost); the requester closes that link (which

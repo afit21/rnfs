@@ -630,6 +630,11 @@ Changed:
   peers count as one interface), so a gateway's lookups no longer send requests for internet nodes over its radio.
   A node named over a slow interface, joins, names, providers and links to known nodes ask on every interface, and
   nothing changes through a shared instance.
+- A server closing a link (RNS's `DESTINATION_CLOSED`: no room for another incoming link, or going away) is a
+  refusal, not a failure: a lookup's `/find` on such a link no longer counts against the server in the routing table,
+  its score or partition mode (a partition probe it ends counts as reaching the outside), and a `/blocks` provider
+  that closes the link is busy, asked again on a new link after the busy delay and failed after `max_failures` in a
+  row, instead of failing at once. A link that timed out, or that this node closed, counts as before.
 - A slow node paces by its radio's measured load: RNodes report their own airtime and the channel's load (over 15 s
   and an hour, through rnsd too), which a slow node reads at most every 15 s while it has paced work. While the
   channel's load is above 25% its path requests and publishing rounds (the heal republish's too) are spaced further

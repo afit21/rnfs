@@ -666,7 +666,12 @@ BlocksResult` (status OK / BUSY / FAILED / STALLED / LOST, unanswered as a lossy
 link to a node with a path and identity wasn't established, `LinkPool.unestablished`), which the fetcher retries on a
 new link; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None, `.unsent` cut by
 the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which the fetcher paces by),
-`link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`,
+`link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `closed_by_node(node_id)` (this thread's
+last `find` went to node_id and failed because it closed the link, `links.closed_by_other`: RNS's `teardown_reason`
+naming the other end by its role, or `LinkPool.refused`, a link closed as it was established, which charges no path
+request; a thread-local `(node ID, closed)`, read by the node's `_query_failed`, which then counts nothing, and by
+`probe_off_island`, which takes it as reached; a `/blocks` on such a link is `BUSY` with `.reason` "closed", which the
+fetcher counts as busy, never as pacing), `pin(node_id, cid, pin) -> bool`,
 `ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
 that identity is on `members`); the idle sweep (`LinkPool.sweep`) closes a shared link with no request in progress

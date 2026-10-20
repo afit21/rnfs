@@ -649,6 +649,9 @@ class RnfsNode:
         self.config = config
         self.node_id = node_id
         self.client = client
+        # Whether this thread's last /find to a node failed because the node closed the link (a refusal, not a failure)
+        closed_by = getattr(client, "closed_by_node", None)
+        self._closed_by: Callable[[bytes], bool] = lambda node_id: callable(closed_by) and closed_by(node_id) is True
         # What changed, for local clients (GET /api/events, rnfs.events); first, so every part may publish
         self.events = events.EventLog()
         self.slow = slow
@@ -1142,7 +1145,8 @@ class RnfsNode:
         if answered:
             self.routing.answered(target)
             self._contact(target)
-        self.partition.probed(target, answered)
+        # A server closing the link (busy) was reached all the same: the island isn't cut off
+        self.partition.probed(target, answered or self._closed_by(target))
         return answered
 
     def _partition_changed(self, active: bool):
@@ -1187,7 +1191,11 @@ class RnfsNode:
 
     def _query_failed(self, node_id: bytes):
         """A /find to node_id went unanswered: counted in the routing table, and lowering its score (and towards
-        partition mode's probe, if it is an off-island server this node knows: PartitionMode's known)."""
+        partition mode's probe, if it is an off-island server this node knows: PartitionMode's known). Not if node_id
+        closed the link (PeerClient.closed_by_node, of this thread's last /find): a refusal (busy, or going away)."""
+        if self._closed_by(node_id):
+            log(f"{node_name(node_id)} closed the link: a refusal, not counted as a failure", LOG_DEBUG)
+            return
         self.routing.failed(node_id)
         self.scores.failed(node_id)
         if self.local_on:

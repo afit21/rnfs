@@ -293,6 +293,18 @@ INTERNALS = [
                       _source(_rnode(), "self.r_airtime_short = ats/100.0", "self.r_airtime_long = atl/100.0",
                               "self.r_channel_load_short = cus/100.0", "self.r_channel_load_long = cul/100.0"))),
 
+    # Why a link closed
+    Internal("network/links.py, network/client.py", "Link.teardown_reason naming the end that closed a link by its "
+             "role: teardown() sets INITIATOR_CLOSED at the opener (DESTINATION_CLOSED at the other end), a LINKCLOSE "
+             "received sets DESTINATION_CLOSED at the opener, the watchdog sets TIMEOUT",
+             lambda: (_true((RNS.Link.TIMEOUT, RNS.Link.INITIATOR_CLOSED, RNS.Link.DESTINATION_CLOSED) == (1, 2, 3),
+                            "teardown reasons changed"),
+                      _source(RNS.Link.teardown, "if self.initiator: self.teardown_reason = Link.INITIATOR_CLOSED",
+                              "else: self.teardown_reason = Link.DESTINATION_CLOSED"),
+                      _source(RNS.Link.teardown_packet, "if self.initiator: self.teardown_reason = "
+                              "Link.DESTINATION_CLOSED", "else: self.teardown_reason = Link.INITIATOR_CLOSED"),
+                      _source(RNS.Link._Link__watchdog_job, "self.teardown_reason = Link.TIMEOUT"))),
+
     # Blackholed identities
     Internal("network/blackhole.py", "Reticulum.get_blackholed_identities() returning Transport.blackholed_identities "
              "({identity hash: {source, until, reason}}), through a shared instance by the blackholed_identities RPC; "
