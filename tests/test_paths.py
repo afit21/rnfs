@@ -203,6 +203,49 @@ class BudgetTest(unittest.TestCase):
         self.assertTrue(self.budget.await_path(A, 30))
         self.assertAlmostEqual(self.transport.requests[0][0] - started, paths.CEILING_HOLD)
 
+    def answer_after(self, seconds: float):
+        """Paths arrive seconds after each request (virtual time), for every destination."""
+        def answer(destination):
+            """The answer, seconds later."""
+            self.clock.now += seconds
+            return True
+        self.transport.answer = answer
+
+    def test_candidate_wait_from_measured_path_responses(self):
+        """path_timeout until MIN_SAMPLES answers are measured, then their 95th percentile within RNS's 15 s and
+        path_timeout."""
+        self.answer_after(2.0)
+        for n in range(paths.MIN_SAMPLES - 1):
+            self.budget.await_path(bytes([n + 1]) * 16, 30)
+        self.assertEqual(self.budget.candidate_wait(30), 30)  # too few
+        self.budget.await_path(bytes([99]) * 16, 30)
+        self.assertEqual(self.budget.candidate_wait(30), paths.PATH_REQUEST_TIMEOUT)  # 2 s answers: RNS's 15 s
+        self.assertEqual(self.budget.candidate_wait(10), 10)  # never past path_timeout
+        # Slow answers past 95% of them lengthen it, up to path_timeout
+        self.answer_after(22.0)
+        for n in range(paths.MAX_SAMPLES // 10):
+            self.budget.await_path(bytes([n + 1, 7]) * 8, 30)
+        self.assertEqual(self.budget.candidate_wait(30), 22.0)
+        self.assertEqual(self.budget.candidate_wait(20), 20)
+
+    def test_what_isnt_measured(self):
+        self.answer_after(25.0)
+        for n in range(paths.MIN_SAMPLES):
+            self.budget.await_path(bytes([n + 1]) * 16, 15, measure=False)  # a shortened wait: not measured
+        self.transport.answer = lambda destination: False  # unanswered: no time to measure
+        for n in range(paths.MIN_SAMPLES):
+            self.budget.await_path(bytes([n + 1, 9]) * 8, 30)
+        self.transport.paths.add(A)  # known already: nothing requested
+        self.budget.await_path(A, 30)
+        self.assertEqual(self.budget.candidate_wait(30), 30)
+        # The identity a path response carries counts as its answer (here at once)
+        for n in range(paths.MIN_SAMPLES):
+            destination = bytes([n + 1, 5]) * 8
+            asked_at = len(self.transport.requests)
+            self.budget.await_known(destination, lambda asked_at=asked_at: len(self.transport.requests) > asked_at,
+                                    30)
+        self.assertEqual(self.budget.candidate_wait(30), paths.PATH_REQUEST_TIMEOUT)
+
     def test_stats_that_cant_be_read_hold_nothing(self):
         self.budget._reticulum = lambda: types.SimpleNamespace(get_interface_stats=lambda: 1 / 0)
         self.assertTrue(self.budget.await_path(A, 30))

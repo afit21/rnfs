@@ -257,6 +257,16 @@ class LinkPoolTest(unittest.TestCase):
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertFalse(self.pool.await_path(OTHER))
 
+    def test_await_path_with_a_shorter_wait(self):
+        """A lookup candidate's measured wait (PathRequests.candidate_wait): used, and not measured itself."""
+        measured = []
+        self.pool.paths = mock.Mock(await_path=lambda node_id, timeout, cancel, measure: measured.append(
+            (timeout, measure)) or True)
+        links.RNS.Transport.has_path = lambda node_id: False
+        self.assertTrue(self.pool.await_path(NODE, 15.0))
+        self.assertTrue(self.pool.await_path(NODE))
+        self.assertEqual(measured, [(15.0, False), (self.pool.config.path_timeout, True)])
+
     def test_awaited_identity_marked_used_once(self):
         # Polls for an identity still on its way don't mark the destination used; contacting it does, once (C2)
         calls = []

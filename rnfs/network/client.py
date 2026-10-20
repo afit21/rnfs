@@ -4,6 +4,7 @@ Every method blocks until it has a result, so never call one from an RNS callbac
 downloads use the node's shared unidentified link; /provide and /pin use a separate identified link,
 closed when done.
 """
+import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -12,14 +13,15 @@ from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import protocol, rates
-from rnfs.network.links import Exchange, LinkPool, timed_out
+from rnfs.network.links import Exchange, LinkPool, closed_by_other, timed_out
 from rnfs import mesh
 
 # BlocksResult statuses
 OK = "ok"  # the node answered; see blocks, missing, unsent and bad
 BUSY = "busy"  # refused (False) under the node's limits, or the node cancelled the response (displaced or
-#               past its deadline, .reason "cancelled"); retry after a short delay. The link stays open
-FAILED = "failed"  # no link (no path, or closed by the other node or this one), or a malformed answer
+#               past its deadline, .reason "cancelled"), or closed the link (.reason "closed": no room for another
+#               incoming link, say); retry after a short delay. The link stays open unless the node closed it
+FAILED = "failed"  # no link (no path, or closed by this node), or a malformed answer
 # No answer the way a lossy link loses one: RNS timed the request out (the request or its answer lost), the response
 # transfer failed, the link timed out under it, or a new link to a node with a path wasn't established. Retry it on
 # a new link after a short delay (the fetcher closes this one)
@@ -50,6 +52,21 @@ class PeerClient:
         self.traffic = mesh.Traffic()  # requests and bytes per peer (mesh); the node shares it with the server
         # Every link opened (shared, ping's, identified) records its round trip, and that the node is up, there
         links.on_rtt = self.traffic.measured
+        # Per thread, (node ID, whether the node closed the link) of the last /find it sent (closed_by_node): a lookup
+        # tells its failure callback on the thread that queried
+        self._last_find = threading.local()
+
+    def closed_by_node(self, node_id: bytes) -> bool:
+        """True if this thread's last /find went to node_id and failed because node_id closed the link (a refusal:
+        busy, or going away), not because it didn't answer: it then doesn't count against the node in the routing
+        table, its score or partition mode (specification section 6)."""
+        return getattr(self._last_find, "outcome", None) == (node_id, True)
+
+    def _closed(self, node_id: bytes, peer) -> bool:
+        """True if node_id closed the link a request went on (peer), or the new one get() tried to open (peer None)."""
+        if peer is None:
+            return self.links.refused(node_id)
+        return not peer.is_active() and peer.link is not None and closed_by_other(peer.link)
 
     # Links
 
@@ -88,9 +105,10 @@ class PeerClient:
         open, its request left to finish. Never cancels a Resource: closing the link stops it (section 3)."""
         return self.links.close_unless_used(node_id, own)
 
-    def await_path(self, node_id: bytes) -> bool:
-        """Wait for a path to node_id, requesting one if RNS has none: True once there is one (LinkPool.await_path)."""
-        return self.links.await_path(node_id)
+    def await_path(self, node_id: bytes, timeout: float | None = None) -> bool:
+        """Wait up to timeout (path_timeout if None) for a path to node_id, requesting one if RNS has none: True once
+        there is one (LinkPool.await_path)."""
+        return self.links.await_path(node_id, timeout)
 
     # /find
 
@@ -100,17 +118,21 @@ class PeerClient:
         (providers, nodes), or None if the node couldn't be reached, didn't answer, refused (a DHT client
         answers False) or answered something malformed.
         """
+        self._last_find.outcome = (node_id, False)
         peer = self.links.get(node_id)
-        if peer is None:
-            self.traffic.request(node_id, mesh.FAILED)
-            return None
-        # Honest answers fit one packet; a larger one is refused at its advertisement (and links.py gives up
-        # on one that is trickled)
-        exchange = self.links.call(peer, FIND_PATH, protocol.encode_find(key),
-                                   max_response_size=protocol.MAX_FIND_RESPONSE_SIZE)
-        if not exchange.answered:
-            log(f"no answer from {node_name(node_id)} to /find", LOG_VERBOSE)
-            self.traffic.request(node_id, mesh.FAILED)
+        exchange = None
+        if peer is not None:
+            # Honest answers fit one packet; a larger one is refused at its advertisement (and links.py gives up on
+            # one that is trickled)
+            exchange = self.links.call(peer, FIND_PATH, protocol.encode_find(key),
+                                       max_response_size=protocol.MAX_FIND_RESPONSE_SIZE)
+        if exchange is None or not exchange.answered:
+            closed = self._closed(node_id, peer)
+            self._last_find.outcome = (node_id, closed)
+            if peer is not None:
+                log(f"{node_name(node_id)} closed the link before answering /find" if closed
+                    else f"no answer from {node_name(node_id)} to /find", LOG_VERBOSE)
+            self.traffic.request(node_id, mesh.REFUSED if closed else mesh.FAILED)
             return None
         result = protocol.parse_find_response(exchange.response)
         if result is None:
@@ -217,6 +239,8 @@ class PeerClient:
         if peer is None:
             if self.links.unestablished(node_id):
                 return BlocksResult(LOST, unsent=wanted, reason="link not established")
+            if self._closed(node_id, None):
+                return BlocksResult(BUSY, unsent=wanted, reason="closed")
             return BlocksResult(FAILED, unsent=wanted, reason="unreachable")
 
         rate = peer.rate
@@ -240,6 +264,11 @@ class PeerClient:
             # transit: like a refusal, not a stall
             log(f"{name}'s /blocks response stopped arriving (cancelled by it, or lost in transit)", LOG_VERBOSE)
             return BlocksResult(BUSY, unsent=wanted, reason="cancelled")
+        if not exchange.answered and self._closed(node_id, peer):
+            # Busy (no room for another incoming link) or going away: a refusal, retried on a new link after the busy
+            # delay, max_failures times in a row at most
+            log(f"{name} closed the link before answering /blocks", LOG_VERBOSE)
+            return BlocksResult(BUSY, unsent=wanted, reason="closed")
         if not exchange.answered:
             log(f"no answer from {name} to /blocks", LOG_VERBOSE)
             return BlocksResult(LOST if self._lost(peer, exchange) else FAILED, unsent=wanted, reason="no answer")

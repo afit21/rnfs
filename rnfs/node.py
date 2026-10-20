@@ -68,6 +68,8 @@ from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, nomadnet, rates
 from rnfs.network.announces import DhtAnnounceHandler, DhtAnnouncer, parse_mode
+from rnfs.network.blackhole import Blackhole
+from rnfs.network.channel import ChannelLoad
 from rnfs.network.client import PeerClient
 from rnfs.network.identity import load_or_create_identity, parse_node_id
 from rnfs.network.links import LinkPool
@@ -578,6 +580,16 @@ class RnfsNode:
         self._path_named = self.links.paths.named
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
+        self.server.blackholed = self.blackhole.identity_listed  # links identified as a blackholed identity: False
+        if slow:
+            # A slow node paces by its radios' measured load (spec section 3, "Measured airtime"): path requests and
+            # publishing rounds spaced further while the channel is busy, /blocks refused while its own airtime is over
+            # budget, and entries not turned on by default while it transmits more than their estimate allows
+            self.channel = ChannelLoad(lambda: self.reticulum)
+            self.links.paths.stretch = self.channel.stretch
+            self.publisher.stretch = self.channel.stretch_wait
+            self.publisher.measured_airtime = self.channel.airtime_share
+            self.server.airtime.over_airtime = self.channel.over_budget
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
         self.announce_handler = DhtAnnounceHandler(self._heard_server, self._heard_client, self.routing.is_banned,
                                                    self.node_id, on_announced=self._announced)
@@ -637,9 +649,13 @@ class RnfsNode:
         self.config = config
         self.node_id = node_id
         self.client = client
+        # Whether this thread's last /find to a node failed because the node closed the link (a refusal, not a failure)
+        closed_by = getattr(client, "closed_by_node", None)
+        self._closed_by: Callable[[bytes], bool] = lambda node_id: callable(closed_by) and closed_by(node_id) is True
         # What changed, for local clients (GET /api/events, rnfs.events); first, so every part may publish
         self.events = events.EventLog()
         self.slow = slow
+        self.channel: ChannelLoad | None = None  # a slow node's radios' measured load, once Reticulum runs
         self._is_known = is_known
         self.members = config.member_set
         # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)
@@ -663,6 +679,10 @@ class RnfsNode:
         self._add_store(_StoreParts(close=self._db.close), batched=False)
 
         self.routing = RoutingTable(node_id, config, admit=self._is_member_node if config.private else None)
+        # RNS's identity blackhole (section 10): a listed identity's node ID counts as banned while listed. Read by the
+        # maintenance thread every few minutes (maintain); nothing is listed without Reticulum
+        self.blackhole = Blackhole(lambda: self.reticulum)
+        self.routing.blackholed = self.blackhole.node_listed
         # Loaded from the state database, so a restart rejoins from the servers it knew; saved with the batched stores
         self._add_store(RoutingState(self.routing, config.state_dir))
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
@@ -1023,9 +1043,17 @@ class RnfsNode:
         again before a link is opened). False if no path came (the query fails as it would have); None to ask it."""
         if self.paths.hops(node_id) is not None:
             return None  # ranked with its path known
-        if not self.client.await_path(node_id):
+        # A lookup has other candidates: once path-response times are measured, waited for as long as 95% of them took
+        # (at least RNS's 15 s) rather than path_timeout (spec section 3, "Path requests"). Only on a node that isn't
+        # slow: a slow node's lookups don't check paths
+        if not self.client.await_path(node_id, self._candidate_wait()):
             return False
         return True if self.slow_paths(node_id) else None
+
+    def _candidate_wait(self) -> float:
+        """How long a lookup's path check waits for a path (PathRequests.candidate_wait; path_timeout without one)."""
+        paths = getattr(self.links, "paths", None)
+        return self.config.path_timeout if paths is None else paths.candidate_wait(self.config.path_timeout)
 
     def _pace_fallback(self) -> float:
         """Slow nodes: a search's fallback is paced like the publisher's lookups (Publisher.pace_lookups)."""
@@ -1125,7 +1153,8 @@ class RnfsNode:
         if answered:
             self.routing.answered(target)
             self._contact(target)
-        self.partition.probed(target, answered)
+        # A server closing the link (busy) was reached all the same: the island isn't cut off
+        self.partition.probed(target, answered or self._closed_by(target))
         return answered
 
     def _partition_changed(self, active: bool):
@@ -1170,7 +1199,11 @@ class RnfsNode:
 
     def _query_failed(self, node_id: bytes):
         """A /find to node_id went unanswered: counted in the routing table, and lowering its score (and towards
-        partition mode's probe, if it is an off-island server this node knows: PartitionMode's known)."""
+        partition mode's probe, if it is an off-island server this node knows: PartitionMode's known). Not if node_id
+        closed the link (PeerClient.closed_by_node, of this thread's last /find): a refusal (busy, or going away)."""
+        if self._closed_by(node_id):
+            log(f"{node_name(node_id)} closed the link: a refusal, not counted as a failure", LOG_DEBUG)
+            return
         self.routing.failed(node_id)
         self.scores.failed(node_id)
         if self.local_on:
@@ -1497,7 +1530,9 @@ class RnfsNode:
             self._prune_fetched()
 
     def maintain(self, now: float, last: dict) -> None:
-        """One maintenance pass: shared folder, provider records, storage. last holds when each ran."""
+        """One maintenance pass: shared folder, provider records, storage, RNS's blackhole. last holds when each ran."""
+        for node_id in self.blackhole.refresh_if_due():
+            self.routing.remove(node_id)  # and kept out while it is listed (RoutingTable.blackholed)
         if now - last.get("scan", float("-inf")) >= self.config.scan_interval:
             last["scan"] = now
             try:

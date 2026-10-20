@@ -5,8 +5,8 @@ interface rules and quiet hours; design.md, "Mesh").
   are tried first, then those fewer hops away, then those whose next hop goes out on a faster interface
   (provider_rank). RNS is reached only through RnsPaths, which the
   node hands to the fetcher as path_info, so the fetcher stays testable without RNS.
-- Airtime controls for /blocks (AirtimePolicy): a node-wide upload budget (a token bucket), interface rules
-  and quiet hours. /find, /provide and /pin are tiny and never refused by them.
+- Airtime controls for /blocks (AirtimePolicy): a node-wide upload budget (a token bucket), interface rules,
+  quiet hours and, on a slow node, its radio's measured airtime (rnfs.network.channel). /find, /provide and /pin are tiny and never refused by them.
 - Traffic: bounded, thread-safe counters of bytes and requests per peer and per interface, for `rnfs peers`,
   `rnfs stats` and `rnfs status`, with each peer's last link round-trip time and rate estimate and the last sign it
   was up, from which online() tells whether it is online.
@@ -65,7 +65,8 @@ MAX_LOCAL_REPLICAS = 5
 REFUSED_BUDGET = "budget"
 REFUSED_INTERFACE = "interface"
 REFUSED_QUIET = "quiet_hours"
-REFUSALS = (REFUSED_BUDGET, REFUSED_INTERFACE, REFUSED_QUIET)
+REFUSED_AIRTIME = "airtime"  # a slow node's radio measured its own airtime over budget (rnfs.network.channel)
+REFUSALS = (REFUSED_BUDGET, REFUSED_INTERFACE, REFUSED_QUIET, REFUSED_AIRTIME)
 
 # Outcomes of a request we sent (Traffic.request)
 ANSWERED = "answered"
@@ -456,7 +457,8 @@ class TokenBucket:
 
 
 class AirtimePolicy:
-    """The airtime controls on /blocks: upload_budget, serve_interfaces / no_serve_interfaces, quiet_hours.
+    """The airtime controls on /blocks: upload_budget, serve_interfaces / no_serve_interfaces, quiet_hours, and on a
+    slow node its radio's measured airtime (over_airtime: rnfs.network.channel.ChannelLoad.over_budget, set by the node).
 
     clock is monotonic seconds (the bucket); minute_of_day gives local minutes since midnight (quiet hours).
     """
@@ -469,6 +471,7 @@ class AirtimePolicy:
         self.quiet = parse_quiet_hours(config.quiet_hours)
         self.minute_of_day = minute_of_day
         self.bucket = TokenBucket(config.upload_budget, HOUR, clock) if config.upload_budget else None
+        self.over_airtime: Callable[[], bool] | None = None  # True while the radio measures this node over budget
 
     def refusal(self, interface_names_: list[str]) -> str | None:
         """Why a /blocks request arriving on an interface with these names is refused now, or None."""
@@ -476,6 +479,8 @@ class AirtimePolicy:
             return REFUSED_INTERFACE
         if self.quiet and in_quiet_hours(self.quiet, self.minute_of_day()):
             return REFUSED_QUIET
+        if self.over_airtime is not None and self.over_airtime():
+            return REFUSED_AIRTIME
         # Nothing at all left: refuse before building a response (RequestServer._admit, through reserve(),
         # decides once its size is known)
         if self.bucket is not None and self.bucket.available() <= 0:

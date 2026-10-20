@@ -494,6 +494,33 @@ class PartitionWiringTest(IslandCase):
         self.node.lookups.search(ident(0x5555)).find_providers(lambda provider: None)
         self.assertTrue(self.node.partition.active or self.node.partition.probe_due())
 
+    def test_servers_closing_links_are_refusals(self):
+        # A server with no room for another incoming link closes it (RNS's DESTINATION_CLOSED): a refusal, not a
+        # failure, in partition mode, the routing table and the scores alike (PeerClient.closed_by_node)
+        closed = set(self.backbone)
+        self.node._closed_by = closed.__contains__
+        for n in self.backbone:
+            self.node._answered(n)  # the backbone answered before its servers filled up: probe targets
+        scores = {node_id: self.node.scores.score(node_id) for node_id in self.backbone}
+        self.cut()
+        self.node.lookups.search(ident(0x4444)).find_providers(lambda provider: None)
+        self.assertGreaterEqual(self.off_island(), FAILURES_TO_ENTER)
+        self.assertFalse(self.node.partition.active or self.node.partition.probe_due())
+        in_table = [node_id for node_id in self.backbone if self.node.routing.contains(node_id)]
+        self.assertTrue(in_table)
+        for node_id in in_table:
+            self.assertEqual(self.node.routing.row(node_id)[4], 0)  # no failed query counted
+        for node_id in self.backbone:
+            self.assertFalse(self.node.routing.unreliable(node_id))
+            self.assertEqual(self.node.scores.score(node_id), scores[node_id])
+        # A probe of a server that closes the link reached it: the island isn't cut off
+        self.assertIs(self.node.probe_off_island(), False)
+        self.assertFalse(self.node.partition.active)
+        # Servers that don't answer at all still count
+        closed.clear()
+        self.node.lookups.search(ident(0x5555)).find_providers(lambda provider: None)
+        self.assertTrue(self.node.partition.active or self.node.partition.probe_due())
+
     def test_a_probe_ends_it(self):
         clock = FakeClock()
         self.node.partition.clock = clock
