@@ -1029,6 +1029,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   withdrawn as a root's is, and the blocks served (section 7) don't change: an entry's DAG is inside its pin's. It
   works under either strategy, but only pins have their entries provided: a cached download only ever provides its
   root. Without entries, share `<root>/<path>`, or pin the inner CID to provide it.
+  - What it publishes: every file and folder inside a provided pin becomes findable by its own CID, so anyone who
+    has a file (or can guess it: a known document, a common photo, a default config file) can look up its CID and
+    learn that this node holds it, without knowing the folder it is in or the folder's CID. Pin only what may be
+    known to be on the node, or turn `provide_entries` off.
   - Each entry key costs its republishing: about 165 bytes a round (16 bytes to each of `K` servers, and request
     overhead), which sweep providing doesn't reduce, and entries multiply a node's keys 3–5× for folders of a few
     files and over 100× for large ones (a 70k-file folder: about 11.6 MB a day from a node that isn't slow).
