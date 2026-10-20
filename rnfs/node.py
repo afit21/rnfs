@@ -2913,7 +2913,8 @@ class RnfsNode:
 
     def cache_rm(self, cid: str) -> dict:
         """Evict the cached fetches leading to cid now (as gc does for all of them), deleting the blocks nothing
-        else needs: {"removed_records", "removed_blocks", "freed_bytes"}. A pin of the same content keeps its
+        else needs: {"removed_records", "removed_blocks", "freed_bytes", and "unreferenced_blocks",
+        "unreferenced_bytes": blocks nothing used before, collected with them}. A pin of the same content keeps its
         blocks. NotFound if no cached fetch leads to cid."""
         parsed = Cid.parse(cid)
         stats = self.storage.uncache({parsed})
@@ -2922,10 +2923,12 @@ class RnfsNode:
         self.publisher.refresh()
         self._prune_fetched()
         self._save_state()
-        log(f"cache rm {parsed} removed {plural(stats['removed_blocks'], 'block')} ({size(stats['freed_bytes'])})",
-            LOG_NOTICE)
+        log(f"cache rm {parsed} removed {plural(stats['removed_blocks'], 'block')} ({size(stats['freed_bytes'])})"
+            + (f", and {plural(stats['unreferenced_blocks'], 'other block')} nothing used "
+               f"({size(stats['unreferenced_bytes'])})" if stats["unreferenced_blocks"] else ""), LOG_NOTICE)
         return {"removed_records": stats["removed_records"], "removed_blocks": stats["removed_blocks"],
-                "freed_bytes": stats["freed_bytes"]}
+                "freed_bytes": stats["freed_bytes"], "unreferenced_blocks": stats["unreferenced_blocks"],
+                "unreferenced_bytes": stats["unreferenced_bytes"]}
 
     def verify(self) -> dict:
         """Re-check every stored block against its CID, deleting bad ones."""

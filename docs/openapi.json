@@ -6848,6 +6848,13 @@
           },
           "freed_bytes": {
             "type": "integer"
+          },
+          "unreferenced_blocks": {
+            "type": "integer",
+            "description": "Blocks nothing used before (an unpinned add's, say), collected with the records' own."
+          },
+          "unreferenced_bytes": {
+            "type": "integer"
           }
         },
         "required": [

@@ -199,6 +199,18 @@ class CacheTest(NodeTest):
         with self.assertRaises(NotFound):
             self.b.cache_rm(cid)
 
+    def test_cache_rm_counts_what_nothing_used_apart(self):
+        """Blocks nothing reached before (an add just unpinned) are collected too, but counted apart: they were
+        reported as the first CID's own (a 435 B cached file "removed 670 blocks, freed 42 MB")."""
+        cid = self.fetched()
+        own = self.b.stat(cid)["local_blocks"]
+        unpinned = self.b.add_stream(io.BytesIO(os.urandom(5000)))["cid"]
+        self.b.pin_rm(unpinned)
+        result = self.b.cache_rm(cid)
+        self.assertEqual(result["removed_blocks"], own)
+        self.assertEqual((result["unreferenced_blocks"], result["unreferenced_bytes"]), (1, 5000))
+        self.assertFalse(self.b.storage.has(Cid.parse(unpinned)))
+
     def test_cache_rm_keeps_a_pin_of_the_same_content(self):
         """Content both cached and pinned keeps its blocks: only the cache record goes."""
         cid = self.fetched()

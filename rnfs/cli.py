@@ -747,7 +747,11 @@ def run_cache_rm(args):
     api = client(args)
     for cid in args.cids:
         result = api.cache_rm(cid)
-        print(printable(f"{cid}: removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes"))
+        line = f"{cid}: removed {result['removed_blocks']} blocks, freed {result['freed_bytes']} bytes"
+        if result.get("unreferenced_blocks"):  # a daemon before 0.2.0's last changes counted them all as the CID's
+            line += (f"; also {result['unreferenced_blocks']} blocks nothing used, {result['unreferenced_bytes']} "
+                     "bytes")
+        print(printable(line))
 
 
 def run_pin_remote(args):

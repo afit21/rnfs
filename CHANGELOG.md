@@ -758,6 +758,10 @@ Faster:
   (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
 
 Fixed:
+- **`cache rm` counts only the cached fetch's own blocks as its own**: blocks nothing used before (an add just
+  unpinned) are collected with it, and were all counted as the first CID's: on a cloud node a 435 B cached file
+  "removed 670 blocks, freed 42973080 bytes". They are counted apart, as `unreferenced_blocks` and
+  `unreferenced_bytes` (new in the answer of `POST /api/cache/rm` and `Uncached`), and `rnfs cache rm` says so.
 - **A collection after a start no longer reads every pin's DAG again**: a sealed folder's unpack ends with one, and on
   a cloud node with 857k blocks the first unpack after a start held its result for 3 minutes, its files written at
   once. The DAGs the start's first refresh found complete are taken whole without being read.

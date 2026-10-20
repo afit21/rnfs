@@ -1334,15 +1334,16 @@ class Storage:
         """Drop every cached fetch leading to one of cids (cache rm), then delete every block nothing reaches, as
         gc() does for every fetch. A pin of the same content keeps its blocks.
 
-        Returns {"uncached": set[Cid] targets no longer cached, "removed_records", "removed_blocks",
-        "freed_bytes", "incomplete": set[Cid] no longer complete}.
+        Returns {"uncached": set[Cid] targets no longer cached, "removed_records", "removed_blocks", "freed_bytes"
+        (the records' own blocks), "unreferenced_blocks", "unreferenced_bytes" (blocks nothing reached before, an
+        unpinned add's say, collected with them), "incomplete": set[Cid] no longer complete}.
         """
         with self._lock:
             records = {key: target for key, target in self._cache.items() if target in cids}
             targets = self._targets()
         if not records:
             return {"uncached": set(), "removed_records": 0, "removed_blocks": 0, "freed_bytes": 0,
-                    "incomplete": set()}
+                    "unreferenced_blocks": 0, "unreferenced_bytes": 0, "incomplete": set()}
         stats = {}
 
         def act(before: dict[Cid, frozenset[Cid]]) -> set[Cid]:
@@ -1355,11 +1356,17 @@ class Storage:
                        [key for key, target in rest.items() if key[1] and target not in cids])
             with self._lock:
                 self._add_memoised(before)
+                # Blocks nothing reached before the records were dropped are collected with them, but aren't theirs:
+                # counted apart, or the content just unpinned was reported as the first CID's own blocks
+                orphans = {cid: self._sizes[cid] for cid in self._sizes.keys() - self._live()}
                 dropped = [key for key, target in self._cache.items() if target in cids]
                 uncached = set(self._drop_records(dropped)) - set(self._cache.values())
                 deleted, freed = self._collect() if dropped else (set(), 0)
-                stats.update(uncached=uncached, removed_records=len(dropped), removed_blocks=len(deleted),
-                             freed_bytes=freed)
+                stray = deleted & orphans.keys()
+                stray_bytes = sum(orphans[cid] for cid in stray)
+                stats.update(uncached=uncached, removed_records=len(dropped), removed_blocks=len(deleted) - len(stray),
+                             freed_bytes=freed - stray_bytes, unreferenced_blocks=len(stray),
+                             unreferenced_bytes=stray_bytes)
                 return deleted
 
         stats["incomplete"] = self._newly_incomplete(targets, act)

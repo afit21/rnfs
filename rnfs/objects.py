@@ -525,6 +525,9 @@ class Uncached(_Object):
     removed_records: int = 0
     removed_blocks: int = 0
     freed_bytes: int = 0
+    # Blocks nothing used before (an unpinned add's), collected with them
+    unreferenced_blocks: int = 0
+    unreferenced_bytes: int = 0
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,7 @@ code}` (below).
 | GET  | /api/pin/remote/served | | `pin_remote_served()`: `{"pins": [{"identity", "cid", "state", "reason", "at", "detail", "retry_at"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | POST | /api/pin/label | JSON `cid`, `label` (null or "" clears it) | `pin_label(cid, label)`: the pin's `pin_ls` entry |
 | GET  | /api/cache/ls | | `{"cache": cache_ls()}`: the cached fetches, most recently used first |
-| POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes"}` |
+| POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes", "unreferenced_blocks", "unreferenced_bytes"}` |
 | POST | /api/gc, /api/verify | | `gc()`, `verify()` |
 | POST | /api/name/create | JSON `alias` | `name_create(alias)` |
 | POST | /api/name/rm | JSON `alias` | `{}` after `name_rm(alias)` |
