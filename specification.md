@@ -445,6 +445,14 @@ identical bytes.
   deeper tree.
 - `add` includes hidden files, and skips symlinks, devices and sockets with a warning. Modification times and
   other metadata are not stored, so identical content always gets an identical CID.
+- `add` never adds the rnfs dir (rnfs 0.2.0), which holds the node's keys, its API token and its state: it MUST
+  refuse a path that resolves to the rnfs dir, to a directory holding it (`add ~`), into `storage/`, `names/`,
+  `state/`, `blocks/` or `lxmf/` (each resolved, as the shared folder's check in section 8 does), or to anything else
+  inside the rnfs dir but outside `files/` (such as `api_token`, `rnfs.toml` or the Reticulum `config`); what is in
+  `files/` is shared anyway. A walk (`add`, the shared folder, name sync, a sealed folder's packing) MUST also skip,
+  with a warning, a directory whose device and inode are those of the rnfs dir or one of those subdirectories, taken
+  when the walk starts: another way to them, such as a bind mount, which a path check can't see. A root that is one
+  is refused.
 
 ### Sealed files (a content convention)
 
@@ -512,7 +520,8 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
   - Every member is under one top directory named after the folder (`<folder>/…`), so extracting the tar
     creates nothing else in the directory it is extracted in. Each directory comes before what it holds.
   - The folder is walked with `add`'s rules: hidden files included; symlinks, devices, sockets, FIFOs, names
-    that break the name rules and entries that change while being opened skipped with a warning; a file with
+    that break the name rules, the rnfs dir reached another way (above) and entries that change while being
+    opened skipped with a warning; a file with
     other hard links is an ordinary file (members are regular files and directories only, never links). Names
     holding `\`, `＼` or `／`, or starting as a Windows drive does (`C:`), are skipped with a warning too, as
     `GET /api/get/stream` skips them (section 11).
@@ -1029,6 +1038,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   withdrawn as a root's is, and the blocks served (section 7) don't change: an entry's DAG is inside its pin's. It
   works under either strategy, but only pins have their entries provided: a cached download only ever provides its
   root. Without entries, share `<root>/<path>`, or pin the inner CID to provide it.
+  - What it publishes: every file and folder inside a provided pin becomes findable by its own CID, so anyone who
+    has a file (or can guess it: a known document, a common photo, a default config file) can look up its CID and
+    learn that this node holds it, without knowing the folder it is in or the folder's CID. Pin only what may be
+    known to be on the node, or turn `provide_entries` off.
   - Each entry key costs its republishing: about 165 bytes a round (16 bytes to each of `K` servers, and request
     overhead), which sweep providing doesn't reduce, and entries multiply a node's keys 3–5× for folders of a few
     files and over 100× for large ones (a 70k-file folder: about 11.6 MB a day from a node that isn't slow).
@@ -1235,8 +1248,10 @@ symlink, but a scan MUST NOT import from a folder that resolves, as opened, to t
 holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/` (the LXMF state of rnfs before 0.2.0,
 section 13), which hold the node's keys and state:
 rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin
-with source `folder` is released (including those an earlier version made from it). rnfs also warns, once, when
-a directory above the folder can be changed by other users, who could replace the folder with another.
+with source `folder` is released (including those an earlier version made from it). So is a folder that is the
+rnfs dir or one of those subdirectories by device and inode (a bind mount), and an entry or a directory inside one
+that is one is skipped with a warning (section 5). rnfs also warns, once, when a directory above the folder can be
+changed by other users, who could replace the folder with another.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
@@ -1500,7 +1515,9 @@ one of its names pointing at a local folder's current content (rnfs: `name sync 
 - Every `scan_interval` the folder is imported as the shared folder's entries are (section 8), the whole folder
   as one directory: unchanged content is recognised by its metadata rather than read, links, devices, sockets and
   files with other hard links are left out, and a folder that resolves, as opened, to the rnfs dir, a directory
-  holding it, or into the folders holding its keys and state is refused. Files are cut with FastCDC (section 5),
+  holding it, or into the folders holding its keys and state is refused, as is one that is one of them by device
+  and inode, while a directory inside the folder that is one is skipped (section 5). Files are cut with FastCDC
+  (section 5),
   so an edited file shares most of its blocks with the version before: the root is the CID
   `add --chunker fastcdc` gives the folder.
 - When the root differs from the one the sync last published and from the name's target, the name is published to

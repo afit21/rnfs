@@ -2138,6 +2138,18 @@ Everything in the specification is implemented, with these simplifications and a
   the check can't redirect it. On POSIX, the first directory above it owned by another user (not root) or writable
   by group or others (unless sticky and what is below it is the user's or root's) is warned about once
   (`loose_ancestor`).
+- `add` never adds the rnfs dir (audit REV1). `RnfsNode.add_path`, and the jobs feature's `submit` before queueing,
+  refuse (`ValueError`) a path `shared_folder.add_refused_reason` rejects: `refused_reason` of its real path (the
+  rnfs dir, a directory holding it, inside a `PRIVATE_SUBDIRS` one), or inside the rnfs dir but outside `files/`
+  (`api_token`, `rnfs.toml`, the Reticulum `config`). The path check misses another way to those directories, such
+  as a bind mount, so every walk also carries `BuildOptions.skip_dirs`, the `(st_dev, st_ino)` of the rnfs dir and
+  each private subdirectory, resolved (`shared_folder.private_dirs`, taken at the start of each add, scan and name
+  sync scan; one with `st_ino` 0 is left out): `_build_tree` and the sealed folder's `tarstream._pack_directory`
+  skip a listed directory in it with a warning (`builder.is_skipped_dir`, `PRIVATE_DIR`) before opening it,
+  `build_path` and `add_sealed_path` refuse a root in it (`check_root`), the shared folder refuses a folder in it
+  (`_check_target`) and skips a top-level entry in it (`_scan_item`), name sync refuses a folder in it
+  (`_opened_problem`), and an add job's `tree_size` doesn't count it. On Windows the listed stat comes from the
+  path (`listed_stat`), which has the file index as `st_ino`.
 - The identity file (`network/identity.py`) is opened with `O_NOFOLLOW | O_NONBLOCK` after an lstat that must
   show a regular file, not a link; the descriptor must be that same regular file (device and inode), owned by
   the user, and is tightened through `fchmod` if loose. The key is read from it (`RNS.Identity.from_bytes`),
