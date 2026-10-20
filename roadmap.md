@@ -854,7 +854,7 @@ Fetching files of a few hundred KiB over LoRa is the use to keep working well. A
     what others make the node store still count bytes, as in 0.1.x
   - The last bullet waits on the Raspberry Pi measurement
 
-## Using more of Reticulum (to do)
+## Using more of Reticulum (implemented)
 
 rnfs already uses most of what RNS 1.5.6 offers an application. Worth adopting, all local:
 
@@ -876,6 +876,23 @@ rnfs already uses most of what RNS 1.5.6 offers an application. Worth adopting, 
   return airtime on LoRa); physical-layer stats (three RPCs per packet through rnsd, and only the last hop);
   PLAIN and GROUP destinations and single-packet `/find` (they reveal who asks); `get_establishment_rate`
   (latency-driven: I2P looks like LoRa)
+* As implemented:
+  - Radio load (`rnfs/network/channel.py`): a slow node reads its busiest radio's airtime and channel load at most
+    every 15 s when paced work asks (no thread), 0.0 or anything outside (0, 100] counting as unknown, the 15 s
+    channel figure while known else the hour's. Above 25% channel load path-request spacing and publishing rounds
+    (heal republish included) stretch with the load, ×2 at 50%, at most ×4, never past `PROVIDER_TTL / 2`.
+    `/blocks` is refused while the node's own airtime over the last hour is above 50% (upload pacing's own cap;
+    `blocks_refused_airtime`, `refused.airtime` in stats). The measured airtime only keeps `provide_entries` from
+    turning on (above 2%); it never withdraws entries already on
+  - Blackhole (`rnfs/network/blackhole.py`): read every 5 minutes (through rnsd too); a listed identity's node ID
+    is banned while listed (routing table, lookups, provider records, fetches; not persisted) and its identified
+    links answered `False`. RNS already drops its announces and paths and tears down links that identify as it
+  - A link the server closed is a refusal: `/find` on it counts nowhere (routing table, scores, partition mode), a
+    probe it ends counts as reaching the outside, and a `/blocks` provider closing it is busy (asked again on a new
+    link, failed after `max_failures` in a row). The publisher was already unaffected
+  - Path waits: a node that isn't slow measures its path-response times; once 20 are measured a lookup's path
+    check waits their 95th percentile within [15 s, `path_timeout`]. Shortened waits aren't measured; everything
+    else (names, nodes a user or remote pin names, stores, fetches, joins) keeps `path_timeout`
 
 ## Scale (to do)
 
