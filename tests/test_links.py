@@ -350,6 +350,79 @@ class LinkPoolTest(unittest.TestCase):
         self.assertEqual(self.pool.sweep(), 1)
         self.assertEqual(peer.link.status, FakeLink.CLOSED)
 
+    def test_idle_limit_closes_before_the_first_keepalive(self):
+        # RNS 1.5.6's interval: max(5 s, RTT × 360 / 1.75), at most 360 s
+        backbone = 0.05 * 360 / 1.75  # 10.3 s on a 50 ms path
+        self.assertAlmostEqual(links.idle_limit(300, backbone, 0.05, False), backbone - 1 - 0.1)
+        self.assertAlmostEqual(links.idle_limit(300, 5, 0.002, False), 5 - 1 - 0.004)  # the 5 s floor, on a LAN
+        self.assertEqual(links.idle_limit(300, 360, 2.0, False), 300)  # radio: no keepalive within 5 minutes anyway
+        self.assertEqual(links.idle_limit(300, backbone, 0.05, True), 300)  # a rate estimate keeps the link
+        self.assertEqual(links.idle_limit(300, None, 0.05, False), 300)  # no keepalive interval known
+        self.assertEqual(links.idle_limit(3, backbone, 0.05, False), 3)  # a shorter link_idle_timeout wins
+        self.assertEqual(links.idle_limit(300, 1.0, 0.4, False), links.KEEPALIVE_MARGIN)  # never below the margin
+
+    def test_sweep_closes_a_link_without_a_rate_estimate_before_its_keepalive(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.keepalive, peer.link.rtt = 10.3, 0.05
+        peer.link.idle = 5.0
+        self.now[0] += 5
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertAlmostEqual(self.pool.next_sweep, 10.3 - 1 - 0.1 - 5)  # when it is due
+        peer.link.idle = 9.3
+        self.now[0] += 4.3
+        self.assertEqual(self.pool.sweep(), 1)
+        self.assertEqual(peer.link.status, FakeLink.CLOSED)
+
+    def test_sweep_keeps_a_link_with_a_rate_estimate_for_link_idle_timeout(self):
+        # Closing it would reset the provider's estimate (its next response held to one chunk) and RNS's window
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.keepalive, peer.link.rtt = 10.3, 0.05
+        peer.rate = 1_000_000
+        peer.link.idle = 299
+        self.now[0] += 299
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertAlmostEqual(self.pool.next_sweep, 1)
+        peer.link.idle = 301
+        self.now[0] += 2
+        self.assertEqual(self.pool.sweep(), 1)
+
+    def test_sweep_keeps_a_short_lived_link_while_handed_out_or_held(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.keepalive, peer.link.rtt = 10.3, 0.05
+        peer.link.idle = 60
+        self.now[0] += 5  # handed out 5 s ago: its caller may yet send a request
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertAlmostEqual(self.pool.next_sweep, 10.3 - 1 - 0.1 - 5)
+        self.now[0] += 5
+        self.assertTrue(self.pool.hold(NODE, 30))  # a pacing wait holds it for link_idle_timeout after it
+        self.now[0] += 30 + 299
+        self.assertEqual(self.pool.sweep(), 0)
+        self.now[0] += 2
+        self.assertEqual(self.pool.sweep(), 1)
+
+    def test_sweep_keeps_a_busy_link(self):
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.keepalive, peer.link.rtt = 10.3, 0.05
+        peer.link.idle = 60
+        self.now[0] += 60
+        peer.acquire(blocks=True)  # a response still on its way
+        self.assertEqual(self.pool.sweep(), 0)
+        peer.release(blocks=True)
+        self.assertEqual(self.pool.sweep(), 1)
+
+    def test_sweeper_closes_a_link_when_it_is_due(self):
+        # The sweeper's longest wait is 30 s here; a link due in about a second is closed then, not at the next one
+        pool = links.LinkPool(self.identity, Config(link_idle_timeout=300))
+        self.addCleanup(pool.close_all)
+        peer = run(self, lambda: pool.get(NODE))
+        used = time.monotonic()
+        peer.link.keepalive, peer.link.rtt = 2.0, 0.01  # closed after 0.98 s without data
+        peer.link.no_data_for = lambda: time.monotonic() - used
+        run(self, lambda: pool.request(peer, "/find", b"x"))  # ends with a wake-up: the sweep sees the link due soon
+        wait_for(lambda: peer.link.status == FakeLink.CLOSED, timeout=10, what="the idle link closed")
+        self.assertLess(time.monotonic() - used, 10)
+        self.assertFalse(pool.has_link(NODE))
+
     def test_sweep_rechecks_under_the_lock(self):
         # get() hands the link out after sweep() found it idle but before it is closed
         peer = run(self, lambda: self.pool.get(NODE))

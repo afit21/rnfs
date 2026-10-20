@@ -7,9 +7,12 @@ fetch_listing() fetch what the operation needs. Blocks already stored are never 
 CID is fetched once however often it appears.
 
 Providers, in the order they are tried:
-1. up to max_parallel_providers nodes with an open outgoing link (on a node that isn't slow, none over a slow
-   link, below), asked for the first missing block; a fetch's hint first, link or not and whatever its link's
-   speed (the node that asked for a remote pin, which may not have published its records yet);
+1. up to max_parallel_providers nodes asked for the first missing block (probes): a fetch's hint first, link or not
+   and whatever its link's speed (the node that asked for a remote pin, which may not have published its records
+   yet); then the providers remembered for the root (Fetcher.remembered: nodes that served verified blocks of it
+   within REMEMBER_FOR), then the nodes with an open outgoing link, each group ranked as providers are; on a node that
+   isn't slow, none of the last two over a slow link (below). A remembered provider that answers None, or whose
+   request fails, is forgotten for the root; one that is busy is kept;
 2. if none has it, providers found by a Lookup running in the background, so downloading starts with
    the first one found; the search ends once max_parallel_providers providers are known and the root
    block has arrived, when the lookup is complete, or at lookup_timeout. Providers in the routing table
@@ -18,6 +21,16 @@ Providers, in the order they are tried:
    order. Open links are ranked the same way. Hops and bitrates come from path_info (the node passes RNS's;
    by default none are known).
 `get --from` uses only the given node.
+
+Remembered providers and searches that found none (Fetcher, in memory only): every node that serves verified blocks of a
+fetch's root is remembered for it, for REMEMBER_FOR after it last did (K per root, MAX_REMEMBERED roots, the least
+recently used forgotten first); one that fails during a fetch, answers None when asked first, or is banned is forgotten.
+Only a provider that served verified blocks is remembered, never one a /find reply names, so no other node can make
+this one ask a node again. A search whose lookup ran to its end, heard from at least one node and found no provider,
+in a fetch that found none either, is remembered for UNFOUND_FOR (MAX_UNFOUND roots): a fetch that isn't explicit
+(Fetcher.open: the gateway's, and the node's own retries of followed names and deny lists) still asks its step 1
+nodes, but doesn't search again within it and fails with NotFound. An explicit fetch (the user's get, cat, pin add and
+the rest of the CLI and API, a remote pin's) always searches. Only this node's own lookups set it, keyed on the root.
 
 A provider fails, and isn't used again during the fetch, when its link fails (no path, closed by the provider, a
 malformed answer), it answers None for a block of the root it advertised, it is busy max_failures times in a row (each
@@ -107,7 +120,7 @@ from typing import Callable, Iterator, NamedTuple
 
 from rnfs import statedb
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, KIB, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
+from rnfs.constants import CHUNK_SIZE, KIB, K, MAX_BLOCK_SIZE, MAX_CHILDREN, MAX_DEPTH, MAX_REQUEST_SIZE
 from rnfs.content import walker
 from rnfs.content.cid import Cid
 from rnfs.content.storage import Storage
@@ -130,6 +143,15 @@ MAX_INVALID = 10_000  # roots remembered as invalid; past this the oldest is for
 # End-game duplication: a batch on a link with a rate estimate is asked of another provider too only once it has
 # been in flight this many times as long as its bytes take at that rate (and deadline_slack at least)
 DUPLICATE_AFTER = 1.5
+# Remembered providers (Fetcher.remembered): asked first when a root is fetched again, for this long after they last
+# served verified blocks of it (provider records live 7 days, republished daily), K per root, for at most MAX_REMEMBERED
+# roots, the least recently used forgotten first
+REMEMBER_FOR = 3 * 3600
+MAX_REMEMBERED = 4096
+# A search that found no provider of a root isn't repeated by a fetch that isn't explicit for this long
+# (Fetcher.unfound); at most MAX_UNFOUND roots are remembered so, the oldest forgotten first
+UNFOUND_FOR = 600
+MAX_UNFOUND = 4096
 
 
 def import_invalid(value: list, tx) -> int:
@@ -382,6 +404,7 @@ class LookupDone(NamedTuple):
     """A lookup run ended, queued by the lookup thread."""
 
     found: int  # providers it reported
+    answered: bool = False  # it ran to its end (the fetch didn't stop it) and some node answered it
 
 
 class _Pending:
@@ -544,6 +567,9 @@ class Fetcher:
                 self._invalid.popitem(last=False)
         # Changed since the last save; a row that didn't parse, or past MAX_INVALID, is deleted by the next
         self._invalid_dirty = len(self._invalid) != len(self._invalid_saved)
+        # root -> {provider: when it last served verified blocks of it}, least recently used root first (remembered)
+        self._remembered: OrderedDict[Cid, dict[bytes, float]] = OrderedDict()
+        self._unfound: OrderedDict[Cid, float] = OrderedDict()  # root -> when a search found no provider; oldest first
 
     @property
     def max_parallel(self) -> int:
@@ -551,11 +577,13 @@ class Fetcher:
         return max(1, self.config.effective_max_parallel_providers(self.slow_node))
 
     def open(self, root: Cid, names: list[str] | tuple[str, ...] = (), from_node: bytes | None = None,
-             pinned: bool = False, hint: bytes | None = None) -> "Fetch":
+             pinned: bool = False, hint: bytes | None = None, explicit: bool = True) -> "Fetch":
         """A fetch of <root>/<names>, to use as `with fetcher.open(...) as fetch:`.
 
-        hint is a node likely to hold it (a remote pin's asker), asked first along with the nodes with an open
-        link, as they are: one that hasn't it isn't penalised, and the lookup follows. Ignored with from_node.
+        hint is a node likely to hold it (a remote pin's asker), asked first along with the remembered providers and
+        the nodes with an open link, as they are: one that hasn't it isn't penalised, and the lookup follows. Ignored
+        with from_node. explicit is False for a fetch the user didn't ask for just now (a gateway request, a retry the
+        node makes itself): it doesn't search again for a root a search found no provider of within UNFOUND_FOR.
 
         Raises InvalidDag if root was found invalid before. Its traversals raise StorageFull if what they
         would store doesn't fit on the disk (never because of max_storage).
@@ -567,7 +595,7 @@ class Fetcher:
             error.root = root
             raise error
         self.check_denied(root)
-        return Fetch(self, root, list(names), from_node, pinned, hint)
+        return Fetch(self, root, list(names), from_node, pinned, hint, explicit)
 
     def check_denied(self, cid: Cid):
         """Raise Denied if the deny list (the storage's) denies cid."""
@@ -615,12 +643,74 @@ class Fetcher:
         if self._db is not None:
             self._db.close()
 
+    # Remembered providers, and searches that found none (the module docstring)
+
+    def remembered(self, root: Cid) -> list[bytes]:
+        """The providers remembered for root, the one that served most recently first; those remembered for longer
+        than REMEMBER_FOR, or banned since, are forgotten."""
+        now = self.clock()
+        with self._lock:
+            providers = self._remembered.get(root)
+            if providers is None:
+                return []
+            for node_id, served in list(providers.items()):
+                if now - served >= REMEMBER_FOR or self.routing.is_banned(node_id):
+                    del providers[node_id]
+            if not providers:
+                del self._remembered[root]
+                return []
+            self._remembered.move_to_end(root)
+            return list(reversed(providers))
+
+    def remember(self, root: Cid, node_id: bytes):
+        """node_id served verified blocks of root: remember it for REMEMBER_FOR (keeping the K that served most
+        recently), and forget that a search found no provider of root."""
+        with self._lock:
+            providers = self._remembered.get(root)
+            if providers is None:
+                providers = self._remembered[root] = {}
+                while len(self._remembered) > MAX_REMEMBERED:
+                    self._remembered.popitem(last=False)
+            providers.pop(node_id, None)
+            providers[node_id] = self.clock()  # insertion order is serving order: the oldest goes first
+            while len(providers) > K:
+                del providers[next(iter(providers))]
+            self._remembered.move_to_end(root)
+            self._unfound.pop(root, None)
+
+    def forget(self, root: Cid, node_id: bytes):
+        """Stop remembering node_id as a provider of root (it failed, or answered None)."""
+        with self._lock:
+            providers = self._remembered.get(root)
+            if providers is not None and providers.pop(node_id, None) is not None and not providers:
+                del self._remembered[root]
+
+    def note_unfound(self, root: Cid):
+        """This node's search for root ran to its end, heard from some node and found no provider."""
+        with self._lock:
+            self._unfound.pop(root, None)
+            self._unfound[root] = self.clock()
+            while len(self._unfound) > MAX_UNFOUND:
+                self._unfound.popitem(last=False)
+
+    def unfound(self, root: Cid) -> float | None:
+        """Seconds since a search found no provider of root, if within UNFOUND_FOR; else None."""
+        with self._lock:
+            since = self._unfound.get(root)
+            if since is None:
+                return None
+            ago = self.clock() - since
+            if ago >= UNFOUND_FOR:
+                del self._unfound[root]
+                return None
+            return ago
+
 
 class Fetch:
     """One fetch of a target: its protection session, providers, lookup and the blocks it has stored."""
 
     def __init__(self, fetcher: Fetcher, root: Cid, names: list[str], from_node: bytes | None, pinned: bool,
-                 hint: bytes | None = None):
+                 hint: bytes | None = None, explicit: bool = True):
         """Use Fetcher.open."""
         self.fetcher = fetcher
         self.storage = fetcher.storage
@@ -630,7 +720,10 @@ class Fetch:
         self.names = names
         self.from_node = from_node
         self.pinned = pinned
-        self.hint = hint  # asked first, with the open links (_discover)
+        self.hint = hint  # asked first, with the remembered providers and the open links (_discover)
+        self.explicit = explicit  # searches even if a search found no provider within UNFOUND_FOR (Fetcher.unfound)
+        self._unfound_ago: float | None = None  # set when it didn't search for that reason: how long ago that was
+        self._remembered_asked: set[bytes] = set()  # remembered providers asked first (_discover)
         self.target: Expect | None = None  # set by resolve()
         self.observer: Observer | None = getattr(_observers, "current", None)  # progress and cancel hook
         self.downloaded_blocks = 0
@@ -1115,6 +1208,8 @@ class Fetch:
         elif isinstance(event, LookupDone):
             self._lookup_running = False
             self._lookup_found = event.found
+            if event.answered and event.found == 0 and not self._providers:
+                self.fetcher.note_unfound(self.root)  # nobody provides it, as far as the DHT knows
         elif isinstance(event, ResultEvent):
             cids = event.cids
             _, probe = in_flight.pop(event.node_id, (cids, False))
@@ -1158,6 +1253,9 @@ class Fetch:
         what = self.root if self.root in outstanding or not self._providers else f"{len(outstanding)} blocks of {self.root}"
         if self.from_node is not None:
             return f"{node_name(self.from_node)} could not supply {what}"
+        if not self._providers and self._unfound_ago is not None:
+            return (f"no provider found for {self.root} (a search {self._unfound_ago:.0f}s ago found none; it isn't "
+                    f"repeated within {UNFOUND_FOR // 60} minutes but for a get, cat or pin add)")
         if not self._providers:
             return f"no provider found for {self.root}"
         return f"no provider could supply {what} ({plural(len(self._providers), 'provider')} tried)"
@@ -1420,34 +1518,53 @@ class Fetch:
     # Finding providers
 
     def _discover(self, pending: _Pending, in_flight: dict):
-        """No usable provider: ask nodes with open links, else start the lookup."""
+        """No usable provider: ask the hint, the remembered providers and the nodes with open links, else start the
+        lookup (unless a search found none lately and the fetch isn't explicit)."""
         if not self._probed:
             self._probed = True
-            banned = self.fetcher.routing.is_banned
-            hinted = [n for n in [self.hint] if n is not None and n != self.fetcher.own_id and not banned(n)]
-            linked = [n for n in self.client.open_links() if n != self.fetcher.own_id and not banned(n)
-                      and n not in hinted]
-            # Ranked like providers; most recently used breaks ties. Their paths in one go: attached to a shared
-            # instance, that is one RPC rather than one per link before the first request (plan C1). A node that
-            # isn't slow probes none over a slow link: each would hold the lookup up by a radio round trip, and
-            # several would each send the root. A slow node, whose every link is slow, keeps its one probe (it
-            # probes max_parallel links): one that hits saves a whole lookup over the radio
-            paths = self._paths(linked)
+            own, banned = self.fetcher.own_id, self.fetcher.routing.is_banned
+            hinted = [n for n in [self.hint] if n is not None and n != own and not banned(n)]
+            remembered = [n for n in self.fetcher.remembered(self.root) if n != own and n not in hinted]
+            linked = [n for n in self.client.open_links() if n != own and not banned(n) and n not in hinted
+                      and n not in remembered]
+            # Ranked like providers; the most recent to serve (remembered) or be used (open links) breaks ties. Their
+            # paths in one go: attached to a shared instance, that is one RPC rather than one per link before the
+            # first request (plan C1). A node that isn't slow asks none over a slow link, remembered or not: each would
+            # hold the lookup up by a radio round trip, several would each send the root, and the lookup may find
+            # providers over fast links. A slow node, whose every link is slow, keeps its one probe (it probes
+            # max_parallel nodes): one that hits saves a whole lookup over the radio
+            paths = self._paths(remembered + linked)
             if not self.fetcher.slow_node:
+                remembered = [node_id for node_id in remembered if not self._slow(node_id, paths[node_id])]
                 linked = [node_id for node_id in linked if not self._slow(node_id, paths[node_id])]
+
+            def ranked(node_ids: list[bytes]) -> list[bytes]:
+                """node_ids in the order providers are tried, their own order breaking ties."""
+                return [node_id for _, node_id in sorted(enumerate(node_ids),
+                                                         key=lambda item: self._rank(item[1], paths[item[1]], item[0]))]
             # The hint goes first, taking one of the probe slots, over any link: one request that saves a lookup,
-            # to the one node known to hold the content before its records are out (a remote pin's asker)
-            ranked = sorted(enumerate(linked), key=lambda item: self._rank(item[1], paths[item[1]], item[0]))
-            candidates = (hinted + [node_id for _, node_id in ranked])[:self.fetcher.max_parallel]
+            # to the one node known to hold the content before its records are out (a remote pin's asker). The
+            # remembered providers come next: each served this root, while an open link is only a guess
+            candidates = (hinted + ranked(remembered) + ranked(linked))[:self.fetcher.max_parallel]
             if candidates and pending:
-                # Each is asked for just the first block missing, which is the root at the start
-                first = pending[0]
-                log(f"asking {plural(len(candidates), 'node')} with an open link for {first}", LOG_VERBOSE)
+                # Each is asked for just the first block missing, which is the root at the start. Taken from pending as
+                # any request's are, so a probe that brings it doesn't leave it to be asked for again; if none does, it
+                # goes back to the front once the last probe has answered (_handle_event)
+                first = pending.popleft()
+                self._remembered_asked = set(candidates).intersection(remembered)
+                log(f"asking {plural(len(candidates), 'node')} for {first} before searching"
+                    + (f" ({len(self._remembered_asked)} remembered)" if self._remembered_asked else ""), LOG_VERBOSE)
                 for node_id in candidates:
                     in_flight[node_id] = ([first], True)
                     self._send(node_id, [first])
                 return
-        if self._lookup is None and self.from_node is None:
+        if self._lookup is None and self.from_node is None and self._unfound_ago is None:
+            ago = None if self.explicit else self.fetcher.unfound(self.root)
+            if ago is not None:
+                # The gateway or a retry of the node's own: a search ago seconds back found nobody providing it
+                self._unfound_ago = ago
+                log(f"not searching for {self.root} again: a search {ago:.0f}s ago found no provider", LOG_VERBOSE)
+                return
             self._lookup = self.fetcher.make_lookup(self.root.key)
             log(f"looking for providers of {self.root}", LOG_VERBOSE)
             self._start_lookup()
@@ -1462,13 +1579,16 @@ class Fetch:
             return self.closed or (self.root_delivered and self._live >= self.fetcher.max_parallel)
 
         def work():
-            """Search, reporting each provider as its reply arrives."""
+            """Search, reporting each provider as its reply arrives, and whether it ran to its end and was answered
+            (so that finding nothing means nobody provides it, not that the fetch ended or nobody could be asked)."""
             found = []
+            answered = False
             try:
                 found = lookup.find_providers(lambda node_id: self._events.put(ProviderEvent(node_id)), should_stop)
+                answered = not self.closed and bool(lookup.closest_answered())
             except Exception as e:  # noqa: BLE001 - a failed lookup ends with the providers found so far
                 log(f"provider lookup for {self.root} failed: {e}", LOG_WARNING)
-            self._events.put(LookupDone(len(found)))
+            self._events.put(LookupDone(len(found), answered))
 
         threading.Thread(target=work, name="rnfs-find-providers", daemon=True).start()
 
@@ -1508,6 +1628,7 @@ class Fetch:
         /find answers listed it (local scores, section 6)."""
         scores = self.fetcher.scores
         scores.served(node_id)
+        self.fetcher.remember(self.root, node_id)  # asked first when the root is fetched again
         if self._lookup is None:
             return
         for lister in self._lookup.listers(node_id) - self._credited:
@@ -1515,10 +1636,12 @@ class Fetch:
             scores.useful_answer(lister)
 
     def _fail(self, provider: _Provider, why: str):
-        """A provider failed: it isn't used again during this fetch, and its score falls."""
+        """A provider failed: it isn't used again during this fetch, its score falls, and it is no longer remembered
+        as a provider of the root."""
         if not provider.failed:
             provider.failed = True
             self.fetcher.scores.failed(provider.node_id)
+            self.fetcher.forget(self.root, provider.node_id)
             self._live -= 1
             log(f"provider {node_name(provider.node_id)} failed for {self.root}: {why}", LOG_VERBOSE)
 
@@ -1556,11 +1679,15 @@ class Fetch:
         if result.blocks:
             self._served(node_id)
         if probe:
-            # A node with an open link that has the block becomes a provider; one that hasn't isn't penalised
+            # A node asked first that has the block becomes a provider; one that hasn't isn't penalised
             if result.blocks and provider is None:
                 provider = self._new_provider(node_id)
-                log(f"{node_name(node_id)} (open link) has {self.root}", LOG_VERBOSE)
+                log(f"{node_name(node_id)} (asked first) has {self.root}", LOG_VERBOSE)
                 self._pace(provider, sent_at, rate)
+            elif not result.blocks and node_id in self._remembered_asked and result.status != peer_client.BUSY:
+                # A remembered provider that answered None (it no longer has it) or failed: not asked first again for
+                # this root. One that was busy may still have it
+                self.fetcher.forget(self.root, node_id)
             return
         if provider is None or provider.failed or not counted:
             return

@@ -1703,9 +1703,12 @@ class RnfsNode:
 
         Storage may go over max_storage while it runs (its blocks are protected); once its session has ended,
         eviction brings storage back to max_storage, which may evict what it fetched if pins alone fill it.
+
+        A gateway fetch isn't explicit (Fetcher.open): a page reloaded, or one a site's page asks for, doesn't search
+        again for a root a search found no provider of within the last 10 minutes; the CLI's and API's fetches do.
         """
         try:
-            with self.fetcher.open(root, names, from_node) as fetch:
+            with self.fetcher.open(root, names, from_node, explicit=not for_gateway) as fetch:
                 try:
                     yield fetch
                 finally:
@@ -1718,10 +1721,12 @@ class RnfsNode:
 
     @contextmanager
     def pinned_fetch(self, root: Cid, names: list[str] | tuple[str, ...] = (),
-                     hint: bytes | None = None) -> Iterator[Fetch]:
+                     hint: bytes | None = None, explicit: bool = True) -> Iterator[Fetch]:
         """A fetch to pin what it fetches (pin add, dir set and rm, remote pins, followed names, deny lists): its
         caller pins inside it, so nothing it fetched is unprotected. hint is a node to ask first (Fetcher.open: a
-        remote pin's asker).
+        remote pin's asker); explicit is False for the retries of followed names and deny lists, which don't search
+        again for a root a search found no provider of within the last 10 minutes (Fetcher.open). A remote pin's fetch
+        is explicit: another node asked for it, and its own retries are 10 minutes or more apart.
 
         A fetch that fails keeps what it got as a cached fetch of <root>/<names>, as get's and cat's do, so trying
         again resumes from there rather than from nothing (a 4 MiB pin over LoRa failing at 90%), unless it failed
@@ -1732,7 +1737,7 @@ class RnfsNode:
         """
         recorded = False
         try:
-            with self.fetcher.open(root, names, pinned=True, hint=hint) as fetch:
+            with self.fetcher.open(root, names, pinned=True, hint=hint, explicit=explicit) as fetch:
                 try:
                     yield fetch
                 except (Denied, InvalidDag, TooLarge):
