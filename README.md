@@ -342,6 +342,12 @@ nodes farther out find only the servers whose announces their neighbours heard, 
 send, as a relay with one radio can't pass a request on. (In Reticulum 1.5.6 write `mode = gateway`:
 `interface_mode = gateway` isn't read correctly.)
 
+**A node one radio hop from its gateway.** By default every server within 3 hops over a slow interface counts as
+your island's (`local_hops`), which suits a mesh of relays; but a node whose only way out is one gateway reaches
+the servers on the gateway's internet hub in 2 or 3 hops too, and counts them as local. It then asks them first and,
+while the island is cut off, keeps asking them in vain. On such a node set `local_hops = 1`, or name the radio
+interface (`local_interfaces`) on the gateway itself, where rnfs sees which servers are behind the radio.
+
 Your node then joins the DHT through the project's built-in bootstrap nodes and the rnfs nodes it hears
 announcing. `rnfs status` shows your node ID and `known_nodes`, and once a few lookups have completed, about how
 many DHT servers the whole network has (`network_size`); `rnfs peers` lists the nodes it knows. To also

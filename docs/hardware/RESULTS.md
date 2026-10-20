@@ -57,8 +57,8 @@ servers); the PC's was its serving, its own records and the announces it relays 
 At this rate one node's own work fills the channel: a fetch, its search running on until the root arrives, and the
 publisher storing the roots of what was just fetched (`provide_strategy = "roots"`: each cached download is
 published, an identified link to each of about 10 servers, about 6.4 s of airtime each at 1 kbit/s by the load
-study's figures). `provide_strategy = "pinned"` avoids the last; the specification leaves the default to `roots` for
-every node.
+study's figures). `provide_strategy = "pinned"` avoids the last; since `d95a2d8` it is what a slow node does unless
+set (the new default, `auto`).
 
 ## Partition: the island cut off from the backbone
 
@@ -90,7 +90,10 @@ not count itself slow; here they were removed, which made some of what follows h
   off-island servers are known.
 - With the default `local_hops` (3), the laptop counts servers on the PC's backbone hub (2–3 hops away, through the
   PC) as local, and its local-first search asked one of those before the PC. The specification names this limit
-  ("Limits of a hop radius") and advises `local_interfaces` or a lower `local_hops` on such nodes.
+  ("Limits of a hop radius") and advises `local_interfaces` or a lower `local_hops` on such nodes. The default stays
+  3, which the topology simulation measured on meshes of relays (nothing in RNS's path data tells a radio hop from an
+  internet one beyond the first); the README now says to set `local_hops = 1` on a node one radio hop from its
+  gateway.
 
 ## Upgrading cloud nodes from 0.1.6
 
@@ -116,8 +119,9 @@ rnfs's to change; the API answers only after it.
 - A 30 MB file from Montreal to three development nodes at once: US central 26.6 s (about 1.2 MB/s), Madrid 1,715 s
   and Johannesburg 2,903 s, bytes identical. The slow two are Reticulum's routes: Madrid reached Montreal in 4 hops
   through the Broken Hill gateway in Australia, Johannesburg through Cape Town at a 3.2 s round trip. US central,
-  done in 26 s and providing the file from then on (2 hops from Madrid), wasn't used: a fetch searches again only
-  once every provider it has failed, not when the one it has is slow.
+  done in 26 s and providing the file from then on (2 hops from Madrid), wasn't used: a fetch searched again only
+  once every provider it had failed, not when the one it had was slow. Fixed by `17bc360`: a long fetch looks for
+  more providers.
 - `tests/interop.py` against 0.1.6, with every fix here (`cb89212`): every scenario passes both ways (providers,
   fetch, bulk and small with and without an upload cap, ranges learnt after two silences, names, keepers).
 - The NomadNet gateway's `rnfs.Client` (0.1.5) against a development daemon: `node_id`, `ls`, `get(raw=True)`,
