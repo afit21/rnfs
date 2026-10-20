@@ -24,6 +24,15 @@ Watching (rnfs.Node's names.watch, GET /api/name/watch): a watched name's announ
 table never refuses them, and record listeners are told, with the lock held, of each newer record accepted for one
 (an announce, a path response, a keeper's answer, a publish here); they only queue it.
 
+Announces and the clock: RNS drops an announce emitted (by the sender's clock, signed) no later than the newest one
+it holds a path from, so while this node's clock is behind its last announce of a name, nodes holding a path to the
+name drop its announces until that path lapses, a week after they took it. The emission of each name's last
+announce is persisted (name_announces), and the name's announces, a publish's included, are held while the clock is
+behind it: rechecked every HOLD_RECHECK, sent once the clock passes it, or anyway after HOLD_LIMIT held in all
+(counted across restarts), when those paths have lapsed. A held publish is committed and kept by keepers like any
+other; its result says the announce is held, and `status` lists the held names. clock_skew (rnfs.clockskew)
+estimates the clock's offset from the announces heard, for a warning only.
+
 Every RNS call goes through `RnsNetwork`, so tests swap in a fake and run without Reticulum.
 """
 import json
@@ -40,6 +49,7 @@ import RNS
 from RNS.vendor import umsgpack
 
 from rnfs import fsutil, ids, statedb
+from rnfs.clockskew import ClockSkew, duration_text, offset_text
 from rnfs.config import Config
 from rnfs.constants import APP_NAME, ID_LENGTH, MISSED_ANNOUNCES, NAME_ASPECT
 from rnfs.content.cid import Cid
@@ -77,6 +87,12 @@ _PATH_RANDOM_BLOBS = 4  # RNS's IDX_PT_RANDBLOBS: where a path table entry holds
 _PATH_PACKET = 6  # RNS's IDX_PT_PACKET: where a path table entry holds the packet hash of the path's announce
 _MAX_LOOP_WAIT = 60  # the announce loop wakes at least this often, so new schedules are picked up
 REFRESHED_SIZE = 4096  # how many names' last network refresh a resolve remembers (E1), least recent forgotten first
+# A name's announces are held while the clock is behind its last announce, which RNS would take them as replays of
+# (Announces and the clock, above): rechecked this often (seconds), and held at most HOLD_LIMIT in all, RNS's
+# Transport.DESTINATION_TIMEOUT, after which a transport node has dropped a path it took from the last one
+HOLD_RECHECK = 60.0
+HOLD_LIMIT = 7 * 24 * 3600.0
+HOLD_SAVE = 900.0  # how much held time may go unsaved (it only shortens a hold after a crash)
 
 
 # Records and names
@@ -167,6 +183,24 @@ class _Published:
     def unsettled(self) -> bool:
         """Imported and not yet published here: its records elsewhere are unknown."""
         return self.imported and self.cid is None
+
+
+@dataclass(frozen=True)
+class _Announced:
+    """This node's last announce of one of its names: its emission time (Unix time in whole seconds, as RNS signs it;
+    None if this node never announced it, held for a path RNS took from the key's announces elsewhere), and how long
+    (seconds) its announces have been held since."""
+
+    emitted: int | None
+    held: float = 0.0
+
+
+@dataclass
+class _Hold:
+    """A name whose announces are held: when its hold was last counted (monotonic), and why it is held."""
+
+    checked: float
+    reason: str
 
 
 # State
@@ -426,9 +460,10 @@ class NameAnnounceHandler:
         """RNS calls this on its own new thread per announce; the work done is bounded and cheap.
 
         Five parameters, so RNS also passes the announce's packet hash: keepers use it to find the signed
-        announce in RNS's packet cache (rnfs.features.keepers).
+        announce in RNS's packet cache (rnfs.features.keepers); and whether it answers a path request, which says
+        nothing of the sender's clock now (ClockSkew).
         """
-        self._on_announce(destination_hash, app_data, announce_packet_hash)
+        self._on_announce(destination_hash, app_data, announce_packet_hash, is_path_response)
 
 
 # The floor
@@ -740,6 +775,15 @@ class NameManager:
         # Names whose key is known to exist outside this node: name -> (when, "export" or "import"), saved at once
         # (name_exports). A key whose loss would lose the name for good has no entry (unexported())
         self._exports: dict[bytes, tuple[float, str]] = {}
+        # Each local name's last announce from here, and how long its announces have been held since (name_announces;
+        # kept for removed names too, for when the key comes back), what the rows say, and the names held now, by
+        # alias (Announces and the clock, in the module docstring)
+        self._announced: dict[bytes, _Announced] = {}
+        self._saved_announced: dict[bytes, _Announced] = {}
+        self._holding: dict[str, _Hold] = {}
+        # The clock's offset from the network's, from the announces heard (rnfs.dht's through RnfsNode._announced)
+        self.clock_skew = ClockSkew(2 * config.announce_interval, clock, monotonic,
+                                    report=lambda text, warning: log(text, LOG_WARNING if warning else LOG_NOTICE))
 
         self._remove_old_temps()
         self._db = statedb.connect(config.state_dir)
@@ -823,6 +867,9 @@ class NameManager:
             self._release(alias, held)
             self._stale.pop(alias, None)  # one that failed is released at the next start (reconcile_pins)
             self._next_announce.pop(alias, None)
+            if alias in self._holding:
+                self._count_hold(alias)
+                del self._holding[alias]
             destination = self._destinations.pop(alias, None)
             if destination is not None:
                 self._network.close_destination(destination)
@@ -938,8 +985,9 @@ class NameManager:
     # Publishing
 
     def publish(self, alias: str, cid: Cid) -> dict:
-        """Point alias's name at cid, pin it, announce it. Returns {"name", "cid", "sequence"}, and in private mode
-        a "warning" (PRIVATE_NAME_WARNING): the announce reaches outsiders all the same."""
+        """Point alias's name at cid, pin it, announce it. Returns {"name", "cid", "sequence"}, in private mode
+        a "warning" (PRIVATE_NAME_WARNING): the announce reaches outsiders all the same, and "announce_held" (why)
+        if the clock is behind the name's last announce: the publish is committed, and announced once it passes."""
         if not isinstance(cid, Cid):
             raise ValueError("publish needs a CID")
         with self._lock:
@@ -984,15 +1032,20 @@ class NameManager:
             self._hold(name)
             self._release(alias, ({previous.cid} | self._stale.pop(alias, set())) - {cid, None})
             self._announce(alias)
+            self._save_announced()
+            hold = self._holding.get(alias)
             identity = self._keys[alias]
             self._accepted(name, self._held[name])
-        log(f"published {name.hex()} ({alias}) -> {cid}, sequence {sequence}", LOG_NOTICE)
+        log(f"published {name.hex()} ({alias}) -> {cid}, sequence {sequence}"
+            + (", its announce held" if hold is not None else ""), LOG_NOTICE)
         if self.keepers is not None:
             # This node keeps its own names, so they resolve through it while the owner's announce is gone
             self.keepers.published(name, identity, encode_record(sequence, cid))
         result = {"name": name.hex(), "cid": str(cid), "sequence": sequence}
         if self.config.private:
             result["warning"] = PRIVATE_NAME_WARNING
+        if hold is not None:
+            result["announce_held"] = hold.reason
         return result
 
     def start(self):
@@ -1009,6 +1062,7 @@ class NameManager:
             for alias in sorted(self._destinations):
                 if self._announce(alias):
                     self._next_announce[alias] = first
+            self._save_announced()
 
     def stop(self):
         """Deregister from RNS, wake waiting resolves and save state."""
@@ -1020,6 +1074,10 @@ class NameManager:
                     self._network.close_destination(destination)
                 self._destinations.clear()
                 self._next_announce.clear()
+                for alias in self._holding:
+                    self._count_hold(alias)
+                self._holding.clear()
+                self._save_announced(force=True)
             for events in self._waiters.values():
                 for event in events:
                     event.set()
@@ -1040,6 +1098,7 @@ class NameManager:
             for alias, due in sorted(self._next_announce.items()):
                 if due <= now:
                     self._announce(alias)
+            self._save_announced()
             if self._held_dirty:
                 self._save()
             if not self._next_announce:
@@ -1311,7 +1370,7 @@ class NameManager:
             heard = min(heard, emitted if emitted is not None else path_emitted)
         return min(heard, path_emitted + ANNOUNCE_VALIDITY * self.config.announce_interval), suspect
 
-    def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None):
+    def _heard(self, name: bytes, app_data, packet_hash: bytes | None = None, is_path_response: bool = False):
         """Announce handler: apply a heard record and wake resolves waiting for it."""
         name = bytes(name)
         parsed = parse_record(app_data)
@@ -1319,6 +1378,11 @@ class NameManager:
         kept = parsed is not None and self.keepers is not None and self.keepers.local_record(name) is not None
         # Read before taking the lock: it may read RNS's announce cache on disk
         heard = self._announce_heard(name, bytes(app_data), self._clock())[0] if parsed is not None else None
+        # A clock sample from an announce heard live, unasked: a resolve waiting for the name may be answered by a
+        # path response a shared instance passes on as an announce, which says nothing of the owner's clock now.
+        # RNS calls handlers only for an announce that takes the path, so the path's newest emission is its own
+        if parsed is not None and not is_path_response and name not in self._waiters:
+            self.clock_skew.name_announced(name, self._network.emitted_time(name))
         with self._lock:
             if parsed is not None:
                 # Unasked: not being resolved (a path response would have a waiter), kept nor watched
@@ -1475,6 +1539,10 @@ class NameManager:
         if destination is None or published is None or published.cid is None:
             self._next_announce.pop(alias, None)
             return False
+        name = self._names[alias]
+        if self._announce_held(alias, name):
+            self._next_announce[alias] = self._monotonic() + HOLD_RECHECK
+            return False
         self._next_announce[alias] = self._monotonic() + self.config.announce_interval
         try:
             destination.set_default_app_data(encode_record(published.sequence, published.cid))
@@ -1482,8 +1550,66 @@ class NameManager:
         except Exception as e:  # noqa: BLE001 - one name's failure doesn't stop the others; logged
             log(f"could not announce name {alias}: {e}", LOG_ERROR)
             return False
-        log(f"announced name {self._names[alias].hex()} ({alias}), sequence {published.sequence}", LOG_VERBOSE)
+        # Read after the announce, so it is never earlier than the time RNS signed into it
+        self._announced[name] = _Announced(int(self._clock()))
+        log(f"announced name {name.hex()} ({alias}), sequence {published.sequence}", LOG_VERBOSE)
         return True
+
+    def _announce_held(self, alias: str, name: bytes) -> bool:
+        """True if alias's announces are held now: the clock is behind the name's last announce (this node's, or the
+        newest RNS holds a path to the name from: a key used elsewhere before), so RNS would drop the announce,
+        and the hold hasn't lasted HOLD_LIMIT in all. Starts, counts and ends the hold, logging each. Lock held."""
+        own = self._announced.get(name)
+        last = own.emitted if own is not None else None
+        heard = self._network.emitted_time(name)
+        if heard is not None and (last is None or heard > last):
+            last = heard
+        hold = self._holding.get(alias)
+        now = self._clock()
+        if last is None or now >= last:
+            if hold is not None:
+                del self._holding[alias]
+                log(f"name {alias}: the clock has passed its last announce; announcing it", LOG_NOTICE)
+            return False
+        held = self._count_hold(alias)
+        if held >= HOLD_LIMIT:
+            if hold is not None:
+                del self._holding[alias]
+            log(f"name {alias}: announcing it although the clock is still {duration_text(last - now)} behind its last "
+                f"announce: held {duration_text(held)}, by when every path taken from that announce has lapsed",
+                LOG_WARNING)
+            return False
+        offset, _ = self.clock_skew.estimate()
+        reason = (f"announce held: this node's clock is {duration_text(last - now)} behind the name's last announce, "
+                  "and RNS drops an announce emitted no later than the one a node took its path from; it goes out "
+                  "once the clock passes it" + ("" if offset is None else
+                                                f" (going by the announces heard, it is {offset_text(offset)})"))
+        if hold is None:
+            self._holding[alias] = _Hold(self._monotonic(), reason)
+            log(f"name {alias}: {reason}", LOG_WARNING)
+        else:
+            hold.reason = reason
+        return True
+
+    def _count_hold(self, alias: str) -> float:
+        """Add the time since alias's hold was last counted to its name's held time, and return that. Lock held."""
+        name = self._names[alias]
+        own = self._announced.get(name, _Announced(None))
+        hold = self._holding.get(alias)
+        if hold is None:
+            return own.held
+        now = self._monotonic()
+        held = own.held + max(0.0, now - hold.checked)
+        hold.checked = now
+        self._announced[name] = _Announced(own.emitted, held)
+        return held
+
+    def announce_status(self) -> dict:
+        """The node's status fields of names' announces and the clock: {"announces_held": the aliases whose announces
+        are held (the clock is behind their last announce), "clock_offset": ClockSkew.status()}."""
+        with self._lock:
+            held = sorted(self._holding)
+        return {"announces_held": held, **self.clock_skew.status()}
 
     # Key files; callers hold the lock
 
@@ -1583,6 +1709,11 @@ class NameManager:
             for name, at, how in self._db.query("SELECT name, at, how FROM name_exports"):
                 # Only ever read for a reminder: a malformed row counts as an export rather than stop startup
                 self._exports[name] = (at, how)
+            for name, emitted, held in self._db.query("SELECT name, emitted, held FROM name_announces"):
+                # Only a reason to hold announces: a malformed row is dropped rather than stop startup
+                if (isinstance(name, bytes) and len(name) == NAME_LENGTH and (emitted is None or type(emitted) is int)
+                        and type(held) in (int, float) and math.isfinite(held)):
+                    self._announced[name] = self._saved_announced[name] = _Announced(emitted, max(0.0, float(held)))
         except (TypeError, ValueError) as e:
             raise RnfsError(f"malformed name record in {self._db.path} ({e}); rnfs won't start on it, since starting "
                             "without it would let a name go back to an older record") from None
@@ -1617,3 +1748,25 @@ class NameManager:
                 del self._saved_held[name]
             self._saved_held.update(held)
         self._held_dirty = False
+
+    def _save_announced(self, force: bool = False):
+        """Write the names' last announces that changed, durably (a lost one could let an announce out that RNS
+        drops), and held times that grew HOLD_SAVE or more since saved (all of them with force). A failure is logged,
+        and the save retried at the next announce pass."""
+        changed = []
+        for name, announced in self._announced.items():
+            saved = self._saved_announced.get(name)
+            if saved is None or saved.emitted != announced.emitted or announced.held < saved.held:
+                changed.append((name, announced, True))
+            elif announced.held != saved.held and (force or announced.held - saved.held >= HOLD_SAVE):
+                changed.append((name, announced, False))
+        if not changed:
+            return
+        try:
+            with self._db.transaction(durable=any(durable for _, _, durable in changed)) as tx:
+                tx.executemany("INSERT OR REPLACE INTO name_announces (name, emitted, held) VALUES (?, ?, ?)",
+                               [(name, a.emitted, a.held) for name, a, _ in changed])
+        except OSError as e:
+            log(f"could not save names' last announces: {e}", LOG_ERROR)
+            return
+        self._saved_announced.update((name, announced) for name, announced, _ in changed)

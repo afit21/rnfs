@@ -1,6 +1,8 @@
 # Topology-aware lookups for rnfs: simulation study
 
 Status: complete (all experiments below were run; numbers are means over 900 trials = 300 x 3 seeds unless noted).
+Section 11 (added for 0.2.0) re-runs the configurations with RNS 1.5.6's ingress limit for path requests modelled,
+for rnfs as built and with the planned pacing.
 
 ## Summary
 
@@ -122,7 +124,7 @@ backbone paths of <= 3 hops; deeper backbones need the RTT signal instead.
 
 # Details
 
-Code: `sim.py` (world, lookup engine mirroring rnfs/dht/lookup.py and node.py start nodes), `experiments.py` (scenarios; `python experiments.py connected|partition|mixed|fsweep|local|prs 300`), `learning.py`, `analysis.py` (load, recovery, PNS exposure), `tables.py`.
+Code: `sim.py` (world, lookup engine mirroring rnfs/dht/lookup.py and node.py start nodes), `experiments.py` (scenarios; `python experiments.py connected|partition|mixed|fsweep|local|prs 300`), `learning.py`, `analysis.py` (load, recovery, PNS exposure), `tables.py`; section 11: `prlimit.py`, `prsim.py`, `exp_prlimit.py`, `validate_prlimit.py`.
 Raw outputs: `out/*.json`, `out/*.txt`.
 
 ## Model (summary)
@@ -794,3 +796,345 @@ Displacing healthy incumbents for proximity (textbook PNS) lets ~10 ground IDs p
 once; it must not be done. Choosing by proximity only when a slot opens keeps rnfs's incumbency rule but still
 lets a nearby attacker win every opened slot, so over months its share approaches that of displacement. Capping
 proximity-chosen slots at half a bucket (PNS50) bounds that; provider ranking already puts seniority before hops.
+
+## 11. Path requests under RNS's ingress limit (0.2.0 as built, and with the planned pacing)
+
+Since RNS 1.2.5 every interface limits the path requests arriving on it. This section re-runs the topology
+configurations with that limit modelled exactly, for rnfs 0.2.0 as built (sweep providing, disjoint paths, slow nodes'
+budgets of 10 per publish lookup and 3 per search, two-level records, partition mode, slow-path demotion), and with
+the pacing `roadmap.md` plans ("Pacing path requests"). Code: `prlimit.py` (RNS's limit and queue, and the planned
+pacer), `prsim.py` (an engine running rnfs's operations as concurrent processes on one clock, on `sim.py`'s world),
+`exp_prlimit.py` (the experiments and tables), `validate_prlimit.py` (the port checked against RNS's own code).
+
+### 11.1 What is modelled, and how it matches RNS 1.5.6
+
+**The limit** (`prlimit.PRIngress`, a line-for-line port with time passed in):
+
+- `Interface.received_path_request` appends each arrival time to the receiving interface's `ip_freq_deque` (at most
+  `IA_FREQ_SAMPLES` = 48), and to its parent's (a hub's server interface). `Transport.inbound` counts a path request only
+  after dropping duplicate tags, so a request flooded over an island is counted once by each node.
+- `Interface.incoming_pr_frequency`: 0 while the deque holds 2 times or fewer, else n / (now − oldest), with the oldest
+  popped (one per call, after n is counted) when it is over `PR_FREQ_DECAY` (10 s) old.
+- `Interface.should_ingress_limit_pr`: threshold `IC_PR_BURST_FREQ_NEW` = 3 while the interface is under
+  `IC_NEW_TIME` (2 h) old, else `IC_PR_BURST_FREQ` = 8; activates above it; releases only after a call that sees the
+  estimate below it more than `IC_BURST_HOLD` (15 s) after activation and after the last call at or above it, and then
+  three more such calls (the cooldown); any other call resets the cooldown.
+- It is evaluated where RNS evaluates it, since each evaluation pops: in `Transport.inbound` for every path request, again
+  in `Transport.path_request` when that request wasn't limited, and for every interface in `Transport.jobs` each
+  `interface_jobs_interval` (5 s).
+- A limited request is queued as `TC_INGRESS_LIMITED` in `InboundQueues` (`prlimit.InboundQueue`): strict priority
+  behind data, announces and other path requests, one queue of `INBOUND_IL_QUEUE_LENGTH` = 8 shared by every interface
+  of the instance, dropped when full. The drainer (`Transport.inbound_job`) takes 2 ms a packet at a hub (each answer
+  reads the cached announce from disk and scans the interface list in `Transport.get_cached_packet`), with 20% of its
+  time taken by data and announces; 0.5 and 10 ms are tried too.
+- `Transport.path_request` answers a limited request from the path table as any other (the cached announce, after
+  `PATH_REQUEST_GRACE` = 0.4 s on the next 0.25 s job run), but doesn't forward it to discover an unknown path.
+- `validate_prlimit.py` feeds 2,000 random arrival sequences (bursts, paced, Poisson at 0.2–20/s; new and old
+  interfaces) through RNS 1.5.6's own `Interface` methods with `time.time` mocked and through the port: all 657,231
+  evaluations agree, and the deques match after every arrival.
+
+**Where it applies.** The gateway's LoRa interface counts every path request flooded over its island (the island's
+first copy to reach it, at least one PR airtime apart: 0.6 s at ~1 kbit/s); the gateway answers from its path table
+(it hears every announce). A backbone node's path requests go over its TCP link to its hub, counted on the hub's
+spawned interface for that client (new for 2 h after the client connects) and on the hub's server interface (the
+parent, which shows in `get_interface_stats` but limits nothing: `Transport.inbound` checks the receiving interface).
+A request dropped from the queue, or not answered, fails after rnfs's `path_timeout` (30 s).
+
+**RNS's own path requests.** After a link that never established, a node that isn't a transport node expires the path
+and, if it last asked more than `PATH_REQUEST_MI` (20 s) ago, requests it again, at most one every 0.5 s
+(`Transport.jobs`, RNS 1.5.6 `Transport.py` ~697–720, `handle_disovery_path_requests`). Half of each island's nodes
+are transport nodes; backbone nodes aren't.
+
+**rnfs as built** (`prsim.Engine`): lookups as `sim.Sim.lookup`, run as disjoint paths sharing no node (2 on slow
+nodes, 3 elsewhere; start nodes dealt in turn), with `rnfs.dht.lookups`' budgets of path requests (`split_budget`:
+a slow node's publish lookup 10 over its 2 paths, its search 3 and its fallback 3; elsewhere alpha = 3 per path). A
+publish round is `rnfs.dht.sweep.Sweep` as built: a lookup takes the next due key not covered and not within
+estimate − 1 leading bits of a key being looked up (the first lookup of a round on a node that knows no region yet
+runs alone), and covers every due key sharing the bits its key shares with the 10th closest server it found; 4 lookups
+at once on fast nodes, one at a time and 10 a round on slow nodes. Each key's store set: its 10 closest from what its
+region learned, each path's 10 closest, the 10 closest senior servers of the announce first-seen log and the 3 local
+replicas. Stores need no path request (every target answered or has a known path), so records are placed when the
+lookups end. A join: bootstrap nodes one at a time until 2 answer, then a lookup for the node's own ID (alpha
+unknowns). A node starting for the first time knows its island (if on one) and nothing else; its routing table holds
+the servers that answered it.
+
+**The planned pacing** (`PACE1`): one node-wide budget, rnfs's path requests at least 1 s apart (0.5 and 2 s tried); a
+lookup waiting for it asks candidates with a known path meanwhile (`PACE1-idle`: it waits instead; `PACE1-k`: only
+among its 10 closest candidates); a failed link charges the budget (RNS will re-request); a query failed for want of a
+path doesn't count towards partition mode. `PACE1-ceilact`: island nodes also hold back while their own LoRa interface
+limits path requests (`pr_burst_active`; `-b`: with a random backoff of up to 20 s).
+
+**Configurations.** Connected networks of 1,000 and 3,000 servers (5 world seeds × 100 trials); an island-wide load
+on every island of the 1,000-server worlds (24 h steady: every island server publishes a round every 12 h and searches
+10 times a day; cold start: every island server starts for the first time within 10 minutes, joins and publishes its
+first round), at ~1 kbit/s and at 5.6× that (SF7 at 125 kHz), gateway interface new (3/s) or older than 2 h (8/s); a
+public hub (hub 0 of the 1,000-server worlds, ~100 clients) that fast nodes join for the first time at 2–30 an hour
+for 2 h; the gateway down (section 2's early scenarios). `RNS-full`, `PACE1-full`: island transport nodes in RNS's
+default interface mode (`full`), which doesn't forward a request for an unknown path, so an island node more than one
+hop from its gateway gets a path only from a neighbour that has it. Cells give the mean over all trials and, in
+brackets, the lowest and highest of the 5 seeds' means.
+
+### 11.2 Results
+
+Modes: OFF = no limit (the study so far; what the limit would have done is still counted), RNS = RNS 1.5.6's limit with rnfs as built, PACE* = with the planned pacing (11.1). Mean (lowest–highest of the 5 seed means).
+
+**An island server publishes: one sweep round of 100 due keys** (connected)
+
+| S | mode | region lookups | keys covered | path requests (rnfs) | per region lookup | RNS re-requests | limited | dropped | path failures | placement (of 10) | round s | LoRa s | partition mode entered |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1000 | OFF | 10.0 | 57.7 (55.3–60.1) | 54.3 (53.9–55.0) | 5.4 (5.4–5.5) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1473 (1358–1613) | 2795 (2528–3053) | 0% |
+| 1000 | PACE0.5 | 10.0 | 56.0 (54.1–58.4) | 53.9 (53.5–54.4) | 5.4 (5.3–5.4) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1530 (1412–1668) | 2864 (2590–3116) | 0% |
+| 1000 | PACE1 | 10.0 | 56.0 (54.1–58.2) | 53.9 (53.5–54.4) | 5.4 (5.3–5.4) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1534 (1415–1671) | 2869 (2595–3120) | 0% |
+| 1000 | PACE1-full | 9.6 (9.3–9.8) | 78.8 (75.1–81.4) | 75.6 (72.7–78.0) | 8.0 (7.7–8.1) | 0.0 | 0.0 | 0.0 | 55.4 (50.3–60.5) | 2.4 (2.3–2.6) | 2072 (1853–2274) | 2664 (2297–2951) | 0% |
+| 1000 | PACE1-idle | 10.0 | 57.7 (55.3–60.1) | 54.3 (53.9–55.0) | 5.4 (5.4–5.5) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1474 (1360–1614) | 2795 (2528–3053) | 0% |
+| 1000 | PACE1-k | 10.0 | 57.0 (54.8–59.4) | 53.9 (53.5–54.5) | 5.4 (5.4–5.5) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1517 (1399–1650) | 2846 (2575–3092) | 0% |
+| 1000 | PACE2 | 10.0 | 56.0 (54.1–58.2) | 53.9 (53.4–54.4) | 5.4 (5.3–5.4) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1537 (1417–1675) | 2873 (2598–3126) | 0% |
+| 1000 | RNS | 10.0 | 57.7 (55.3–60.1) | 54.3 (53.9–55.0) | 5.4 (5.4–5.5) | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 (3.5–3.9) | 1473 (1358–1613) | 2795 (2528–3053) | 0% |
+| 1000 | RNS-full | 6.7 (6.3–7.2) | 85.5 (82.7–87.5) | 22.6 (19.9–26.0) | 2.7 (2.5–3.0) | 0.0 | 0.0 | 0.0 | 3.4 (3.0–3.8) | 2.4 (2.3–2.6) | 611 (566–655) | 989 (899–1072) | 65% (58%–70%) |
+| 3000 | OFF | 10.0 | 54.9 (51.2–59.7) | 67.1 (66.5–67.5) | 6.7 (6.7–6.8) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.3) | 1873 (1716–2151) | 3567 (3250–4087) | 0% |
+| 3000 | PACE0.5 | 10.0 | 53.1 (49.4–56.6) | 66.4 (66.0–66.9) | 6.6 (6.6–6.7) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.4) | 1947 (1784–2229) | 3658 (3336–4192) | 0% |
+| 3000 | PACE1 | 10.0 | 53.0 (49.4–56.7) | 66.3 (65.9–66.9) | 6.6 (6.6–6.7) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.4) | 1952 (1788–2233) | 3666 (3343–4200) | 0% |
+| 3000 | PACE1-full | 9.2 (8.8–9.4) | 82.4 (78.7–85.0) | 81.6 (77.7–84.4) | 9.0 (8.7–9.2) | 0.0 | 0.0 | 0.0 | 62.4 (54.3–70.4) | 1.0 (0.9–1.2) | 2236 (2101–2501) | 2911 (2582–3262) | 0% |
+| 3000 | PACE1-idle | 10.0 | 54.9 (51.2–59.7) | 67.1 (66.5–67.5) | 6.7 (6.7–6.8) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.3) | 1874 (1718–2152) | 3567 (3251–4087) | 0% |
+| 3000 | PACE1-k | 10.0 | 54.5 (50.9–59.5) | 66.7 (66.3–67.1) | 6.7 (6.6–6.7) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.3) | 1902 (1738–2184) | 3601 (3275–4129) | 0% |
+| 3000 | PACE2 | 10.0 | 53.0 (49.3–56.7) | 66.3 (66.0–66.9) | 6.6 (6.6–6.7) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.4) | 1957 (1791–2241) | 3672 (3346–4208) | 0% |
+| 3000 | RNS | 10.0 | 54.9 (51.2–59.7) | 67.1 (66.5–67.5) | 6.7 (6.7–6.8) | 0.0 | 0.0 | 0.0 | 0.0 | 2.2 (2.1–2.3) | 1873 (1716–2151) | 3567 (3250–4087) | 0% |
+| 3000 | RNS-full | 6.1 (5.7–6.9) | 87.7 (84.1–90.7) | 22.1 (16.6–29.2) | 2.7 (2.2–3.3) | 0.0 | 0.0 | 0.0 | 3.3 (2.8–3.7) | 1.0 (0.9–1.1) | 607 (516–688) | 978 (831–1177) | 72% (61%–81%) |
+
+**Searches and joins** (the island searcher is a neighbour of the publisher, searching for one of its keys)
+
+| S | mode | island searcher: found / s / path requests | backbone searcher: found / s / path requests | island fetches backbone content: found / s | backbone publisher's path requests | island node's first join: path requests / path failures | fast node's first join: path requests |
+|---|---|---|---|---|---|---|---|
+| 1000 | OFF | 100% / 27.4 / 0.0 | 95% / 1.5 / 0.0 | 100% / 49.0 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | PACE0.5 | 100% / 28.0 / 0.0 | 95% / 1.5 / 0.0 | 100% / 48.8 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | PACE1 | 100% / 27.9 / 0.0 | 95% / 1.5 / 0.0 | 100% / 48.8 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | PACE1-full | 100% / 27.8 / 0.0 | 91% / 1.8 / 0.0 | 98% / 57.0 | 0.0 | 4.2 / 2.3 | 5.0 |
+| 1000 | PACE1-idle | 100% / 27.4 / 0.0 | 95% / 1.5 / 0.0 | 100% / 49.0 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | PACE1-k | 100% / 27.8 / 0.0 | 95% / 1.4 / 0.0 | 100% / 48.8 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | PACE2 | 100% / 27.9 / 0.0 | 95% / 1.4 / 0.0 | 100% / 48.8 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | RNS | 100% / 27.4 / 0.0 | 95% / 1.5 / 0.0 | 100% / 49.0 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 1000 | RNS-full | 100% / 28.0 / 0.0 | 91% / 1.7 / 0.0 | 96% / 53.5 | 0.0 | 3.9 / 2.3 | 5.0 |
+| 3000 | OFF | 100% / 29.6 / 0.0 | 75% / 2.4 / 0.0 | 100% / 69.1 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | PACE0.5 | 100% / 29.1 / 0.0 | 75% / 2.5 / 0.0 | 100% / 67.8 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | PACE1 | 100% / 29.2 / 0.0 | 75% / 2.5 / 0.0 | 100% / 67.8 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | PACE1-full | 100% / 29.2 / 0.0 | 61% / 3.0 / 0.0 | 83% / 122 | 0.0 | 4.4 / 2.7 | 5.0 |
+| 3000 | PACE1-idle | 100% / 29.6 / 0.0 | 75% / 2.4 / 0.0 | 100% / 69.1 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | PACE1-k | 100% / 29.6 / 0.0 | 76% / 2.5 / 0.0 | 100% / 69.2 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | PACE2 | 100% / 29.3 / 0.0 | 75% / 2.5 / 0.0 | 100% / 67.6 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | RNS | 100% / 29.6 / 0.0 | 75% / 2.4 / 0.0 | 100% / 69.1 | 0.0 | 3.0 / 0.0 | 5.0 |
+| 3000 | RNS-full | 100% / 29.3 / 0.0 | 58% / 3.0 / 0.0 | 79% / 104 | 0.0 | 3.8 / 2.7 | 5.0 |
+
+**A fast node starts for the first time: its first publish round after joining its hub (100 due keys)**
+
+| S | mode | region lookups | path requests | limited | dropped | path failures | trips of its hub interface | peak estimate /s | placement (of 10) | round s | 3 failures in a row |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1000 | OFF | 4.2 (3.5–4.8) | 37.4 (31.8–43.5) | 35.4 (29.8–41.5) | 0.0 | 0.0 | 1.0 (1.0–1.0) | 2226 | 0.5 (0.4–0.5) | 8.2 (7.2–10.0) | 0% |
+| 1000 | PACE0.5 | 4.0 (3.4–4.7) | 36.2 (30.3–42.0) | 0.0 | 0.0 | 0.0 | 0.0 | 3.0 | 0.4 (0.4–0.5) | 23.1 (19.7–26.5) | 0% |
+| 1000 | PACE1 | 4.3 (3.7–4.8) | 38.4 (33.3–42.8) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.6 (0.5–0.6) | 41.3 (36.1–45.4) | 0% |
+| 1000 | PACE1-full | 4.3 (3.8–4.8) | 38.4 (33.7–42.9) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.6 (0.5–0.6) | 41.2 (36.4–45.6) | 0% |
+| 1000 | PACE1-idle | 4.3 (3.8–4.8) | 38.6 (33.8–43.5) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.6 (0.5–0.6) | 41.5 (35.8–46.6) | 0% |
+| 1000 | PACE1-k | 4.3 (3.7–4.8) | 38.3 (33.5–43.2) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.5 (0.5–0.6) | 41.2 (35.7–46.1) | 0% |
+| 1000 | PACE2 | 4.4 (3.8–4.9) | 39.2 (34.4–44.1) | 0.0 | 0.0 | 0.0 | 0.0 | 0.8 | 0.6 (0.5–0.7) | 78.9 (69.4–88.5) | 0% |
+| 1000 | RNS | 3.8 (3.5–4.4) | 34.4 (31.0–39.4) | 32.4 (29.0–37.3) | 6.1 (5.1–7.0) | 6.1 (5.1–7.0) | 1.0 (1.0–1.0) | 2222 | 0.4 (0.4–0.4) | 23.6 (20.0–27.1) | 59% (50%–69%) |
+| 1000 | RNS-full | 3.8 (3.4–4.4) | 34.4 (30.9–39.6) | 32.4 (28.9–37.5) | 6.1 (5.1–7.0) | 6.1 (5.1–7.0) | 1.0 (1.0–1.0) | 2222 | 0.4 (0.4–0.4) | 23.6 (20.0–27.0) | 59% (50%–69%) |
+| 3000 | OFF | 4.0 (3.5–5.1) | 35.6 (31.2–45.5) | 33.6 (29.2–43.5) | 0.0 | 0.0 | 1.0 | 2565 | 0.2 (0.1–0.2) | 5.1 (4.4–6.4) | 0% |
+| 3000 | PACE0.5 | 3.8 (3.3–4.9) | 34.4 (29.4–43.7) | 0.0 | 0.0 | 0.0 | 0.0 | 3.0 | 0.2 (0.1–0.2) | 20.0 (17.4–25.4) | 0% |
+| 3000 | PACE1 | 4.0 (3.4–4.9) | 35.6 (30.8–43.9) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.2 (0.2–0.3) | 37.0 (32.1–45.7) | 0% |
+| 3000 | PACE1-full | 4.0 (3.4–4.9) | 35.8 (30.7–44.1) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.2 (0.2–0.3) | 37.2 (32.0–45.9) | 0% |
+| 3000 | PACE1-idle | 4.1 (3.5–5.0) | 36.5 (31.8–45.0) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.3 (0.2–0.3) | 38.0 (33.4–46.8) | 0% |
+| 3000 | PACE1-k | 4.0 (3.5–5.0) | 36.2 (31.8–44.6) | 0.0 | 0.0 | 0.0 | 0.0 | 1.5 | 0.2 (0.2–0.3) | 37.8 (33.3–46.4) | 0% |
+| 3000 | PACE2 | 4.1 (3.6–5.1) | 36.7 (32.3–45.5) | 0.0 | 0.0 | 0.0 | 0.0 | 0.8 | 0.3 (0.3–0.4) | 73.4 (64.5–90.9) | 0% |
+| 3000 | RNS | 3.9 (3.5–5.0) | 34.8 (31.1–44.9) | 32.8 (29.1–42.9) | 7.5 (6.3–9.9) | 7.5 (6.3–9.9) | 1.0 | 2565 | 0.1 (0.1–0.2) | 20.5 (17.5–25.4) | 57% (48%–71%) |
+| 3000 | RNS-full | 3.9 (3.5–5.0) | 34.8 (31.1–44.9) | 32.8 (29.1–42.9) | 7.4 (6.2–9.9) | 7.4 (6.2–9.9) | 1.0 | 2565 | 0.1 (0.1–0.2) | 20.5 (17.5–25.4) | 57% (48%–71%) |
+
+**A gateway's LoRa interface under island-wide load** (1,000 servers; every island of 5 worlds)
+
+| S | mode | load | LoRa | gateway interface | path requests an hour at the gateway | trips an hour (mean, max island) | limited seconds an hour | limited share | peak estimate /s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1000 | OFF | cold | 5.6x faster | new (3/s) | 584 | 0.84 (3.3) | 99 | 39.5% | 8.30 |
+| 1000 | OFF | cold | 1 kbit/s | new (3/s) | 588 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | OFF | steady | 5.6x faster | over 2 h (8/s) | 129 | 0.05 (0.2) | 1 | 0.2% | 13.89 |
+| 1000 | OFF | steady | 5.6x faster | new (3/s) | 129 | 0.06 (0.3) | 1 | 0.3% | 13.89 |
+| 1000 | OFF | steady | 1 kbit/s | over 2 h (8/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | OFF | steady | 1 kbit/s | new (3/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | PACE1 | cold | 5.6x faster | new (3/s) | 577 | 0.87 (4.0) | 94 | 36.9% | 7.45 |
+| 1000 | PACE1 | cold | 1 kbit/s | new (3/s) | 582 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | PACE1 | steady | 5.6x faster | over 2 h (8/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 3.75 |
+| 1000 | PACE1 | steady | 5.6x faster | new (3/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 3.75 |
+| 1000 | PACE1 | steady | 1 kbit/s | over 2 h (8/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | PACE1 | steady | 1 kbit/s | new (3/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | PACE1-ceilact | cold | 5.6x faster | new (3/s) | 540 | 9.76 (19.0) | 413 | 31.2% | 13.89 |
+| 1000 | PACE1-ceilact | cold | 1 kbit/s | new (3/s) | 582 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | PACE1-ceilact-b | cold | 5.6x faster | new (3/s) | 385 | 19.15 (49.0) | 654 | 19.5% | 13.89 |
+| 1000 | PACE1-ceilact-b | cold | 1 kbit/s | new (3/s) | 582 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | RNS | cold | 5.6x faster | new (3/s) | 582 | 0.90 (4.7) | 99 | 39.1% | 7.98 |
+| 1000 | RNS | cold | 1 kbit/s | new (3/s) | 587 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | RNS | steady | 5.6x faster | over 2 h (8/s) | 129 | 0.05 (0.2) | 1 | 0.2% | 13.89 |
+| 1000 | RNS | steady | 5.6x faster | new (3/s) | 129 | 0.07 (0.3) | 2 | 0.3% | 13.89 |
+| 1000 | RNS | steady | 1 kbit/s | over 2 h (8/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+| 1000 | RNS | steady | 1 kbit/s | new (3/s) | 128 | 0.00 (0.0) | 0 | 0.0% | 2.50 |
+
+**A public hub (~100 clients) that fast nodes join for the first time** (1,000 servers, 5 worlds, 2 h; per joining node unless named)
+
+| S | mode | joins an hour | keys | hub ms a packet | path requests (join + first round) | limited | dropped | trips of its interface in its first hour | limited seconds in its first hour | peak estimate /s | placement | round s | 3 failures in a row | hub's ingress-limited queue drops | parent interface trips an hour |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1000 | OFF | 2 | 100 | 2 | 46 | 35 | 0.0 | 1.0 | 43 | 2500.0 | 0.50 | 7 | 0% | 0 | 0.7 |
+| 1000 | OFF | 10 | 100 | 0.5 | 44 | 33 | 0.0 | 1.0 | 44 | 2500.0 | 0.48 | 7 | 0% | 0 | 3.2 |
+| 1000 | OFF | 10 | 100 | 2 | 44 | 33 | 0.0 | 1.0 | 44 | 2500.0 | 0.48 | 7 | 0% | 0 | 3.2 |
+| 1000 | OFF | 10 | 100 | 10 | 44 | 33 | 0.0 | 1.0 | 44 | 2500.0 | 0.48 | 7 | 0% | 0 | 3.2 |
+| 1000 | OFF | 10 | 1000 | 2 | 46 | 36 | 0.0 | 1.0 | 44 | 2500.0 | 0.43 | 7 | 0% | 0 | 3.7 |
+| 1000 | OFF | 30 | 100 | 2 | 41 | 31 | 0.0 | 1.0 | 43 | 2500.0 | 0.46 | 7 | 0% | 0 | 7.7 |
+| 1000 | PACE1 | 2 | 100 | 2 | 45 | 0 | 0.0 | 0.0 | 0 | 1.5 | 0.57 | 41 | 0% | 0 | 0.0 |
+| 1000 | PACE1 | 10 | 100 | 0.5 | 47 | 0 | 0.0 | 0.0 | 0 | 1.5 | 0.61 | 44 | 0% | 0 | 0.0 |
+| 1000 | PACE1 | 10 | 100 | 2 | 47 | 0 | 0.0 | 0.0 | 0 | 1.5 | 0.62 | 44 | 0% | 0 | 0.0 |
+| 1000 | PACE1 | 10 | 100 | 10 | 47 | 0 | 0.0 | 0.0 | 0 | 1.5 | 0.61 | 44 | 0% | 0 | 0.0 |
+| 1000 | PACE1 | 10 | 1000 | 2 | 48 | 0 | 0.0 | 0.0 | 0 | 1.5 | 0.43 | 45 | 0% | 0 | 0.0 |
+| 1000 | PACE1 | 30 | 100 | 2 | 44 | 0 | 0.0 | 0.0 | 0 | 1.5 | 0.57 | 41 | 0% | 0 | 0.0 |
+| 1000 | RNS | 2 | 100 | 2 | 47 | 36 | 8.0 | 1.0 | 42 | 2500.0 | 0.51 | 23 | 62% | 39 | 0.6 |
+| 1000 | RNS | 10 | 100 | 0.5 | 44 | 33 | 0.0 | 1.0 | 44 | 2666.7 | 0.48 | 7 | 0% | 0 | 3.2 |
+| 1000 | RNS | 10 | 100 | 2 | 43 | 32 | 7.1 | 1.0 | 43 | 2500.0 | 0.43 | 22 | 58% | 160 | 2.8 |
+| 1000 | RNS | 10 | 100 | 10 | 41 | 30 | 10.3 | 1.0 | 42 | 2500.0 | 0.36 | 23 | 62% | 231 | 2.2 |
+| 1000 | RNS | 10 | 1000 | 2 | 44 | 33 | 7.5 | 1.0 | 43 | 2500.0 | 0.36 | 25 | 68% | 168 | 2.7 |
+| 1000 | RNS | 30 | 100 | 2 | 40 | 29 | 7.0 | 1.0 | 42 | 2500.0 | 0.39 | 22 | 59% | 421 | 7.0 |
+
+**The gateway is down** (PD_early: an island server publishes a round; OFF_search: a neighbour searches for backbone content)
+
+| S | scenario | mode | path requests (rnfs + RNS re-requests) | path failures | link failures | entered partition mode | s until it did (or the operation ended) | operation s |
+|---|---|---|---|---|---|---|---|---|
+| 1000 | OFF_search | OFF | 0.2 + 1.0 | 0.2 | 1.9 | 72% (66%–77%) | 106 (101–109) | 162 (146–170) |
+| 1000 | OFF_search | PACE1 | 0.2 + 1.1 | 0.2 | 2.2 | 72% (66%–77%) | 113 (109–117) | 170 (157–178) |
+| 1000 | OFF_search | RNS | 0.2 + 1.0 | 0.2 | 1.9 | 72% (66%–77%) | 106 (101–109) | 162 (146–170) |
+| 1000 | PD_early | OFF | 0.2 + 1.8 | 0.2 | 3.7 | 100% | 75.2 (71.9–76.4) | 328 (259–409) |
+| 1000 | PD_early | PACE1 | 0.2 + 1.8 | 0.2 | 3.8 | 100% | 77.6 (73.1–80.6) | 330 (260–406) |
+| 1000 | PD_early | RNS | 0.2 + 1.8 | 0.2 | 3.7 | 100% | 75.2 (71.9–76.4) | 328 (259–409) |
+| 3000 | OFF_search | OFF | 0.3 + 1.2 | 0.3 | 2.3 | 88% (85%–90%) | 131 (126–140) | 215 (201–225) |
+| 3000 | OFF_search | PACE1 | 0.3 + 1.4 | 0.3 | 2.7 | 88% (85%–90%) | 145 (139–153) | 228 (215–239) |
+| 3000 | OFF_search | RNS | 0.3 + 1.2 | 0.3 | 2.3 | 88% (85%–90%) | 131 (126–140) | 215 (201–225) |
+| 3000 | PD_early | OFF | 0.1 + 1.9 | 0.1 | 3.7 | 100% | 80.1 (76.3–86.5) | 359 (273–414) |
+| 3000 | PD_early | PACE1 | 0.2 + 2.0 | 0.2 | 3.8 | 100% | 82.5 (76.7–90.7) | 361 (273–419) |
+| 3000 | PD_early | RNS | 0.1 + 1.9 | 0.1 | 3.7 | 100% | 80.1 (76.3–86.5) | 359 (273–414) |
+
+**An island server publishes: sweep regions against one lookup per key** (OFF, 5 seeds × 40 trials)
+
+| S | keys a round of 10 region lookups covers | their placement (of 10) | one lookup per key: placement |
+|---|---|---|---|
+| 1000 | 57.1 (55.2–61.9) | 3.6 (3.4–3.7) | 7.0 (7.0–7.1) |
+| 3000 | 55.9 (53.3–60.2) | 2.1 (2.0–2.2) | 6.6 (6.5–6.6) |
+
+### 11.3 Conclusions
+
+**Path requests an operation sends** (0.2.0 as built, connected network):
+
+| operation | 1,000 servers | 3,000 servers |
+|---|---|---|
+| island node, one publish round (10 region lookups, budget 10 each over 2 paths) | 54 (5.4 a region lookup) | 67 (6.7) |
+| island node's search (local first, then budget 3) | 0 (the local server has it) | 0 |
+| fast node that has heard every announce: publish round, search | 0 | 0 |
+| island node's first join (2 bootstrap nodes + own-ID lookup, alpha 1) | 3 | 3 |
+| fast node's first join (2 + alpha 3) | 5 | 5 |
+| fast node's first publish round after its first join (about 4 region lookups, 9 each at once) | 36–38 | 35–36 |
+| restart with saved routing table and RNS paths (not simulated: both are kept, so few are unknown) | about 0 | about 0 |
+| gateway down: RNS's own re-requests after failed links, a publish round / a search | 1.8 / 1.0 | 1.9 / 1.2 |
+
+**How often the limit trips.**
+
+- *A gateway's LoRa interface at ~1 kbit/s: never.* Arrivals on one channel are at least one path-request airtime apart
+  (0.6 s), and RNS's estimate n / (now − oldest) is then at most 3 / 1.2 s = 2.5 a second, below even a new
+  interface's 3. Measured peak: 2.50 under every load, cold start included.
+- *At 5.6× that (SF7, 125 kHz)*: steady load, 0.05–0.07 trips an hour per gateway (one a day at most; peak estimate
+  13.9 from three requests back to back), 0 with pacing (peak 3.75). An island-wide cold start with the gateway's
+  interface new: 0.8–0.9 trips an hour, about 95–100 limited seconds an hour, **with or without pacing**: each node
+  paces itself, but the gateway counts the island's sum (580 requests an hour). A limited request on a gateway is still
+  answered (the gateway has every path), so rnfs loses nothing; other applications' requests for paths the gateway
+  lacks aren't forwarded while it lasts.
+- *A public hub's spawned interface for an established client: never* (such a node has every path from announces).
+  **Every fast node that starts for the first time trips its own interface once** (its join already sends 5 requests in
+  about 1.5 s, and its first region lookup 9 at once, against a threshold of 3 while the interface is new); the limit
+  holds about 43 s each time. The hub's server (parent) interface trips about 0.3 times per join, but limits nothing.
+- *What a trip costs at a hub* depends on how fast the hub drains its queue: a limited request waits in the shared
+  ingress-limited queue (8). At 0.5 ms a packet nothing is dropped; at 2 ms (with 20% of the drainer busy elsewhere) a
+  fresh node loses 7–8 of its ~45 requests, at 10 ms 10. Each loss is a query failing after `path_timeout` (30 s),
+  counted against the node, and **58–68% of such joins have 3 failures in a row**: a node with local servers (a
+  gateway starting for the first time, say) would enter partition mode on a connected network. Its first round then
+  takes 22–25 s instead of 7 s.
+
+**With the planned pacing (1 s, node-wide):** no hub interface trips (peak estimate 1.5), nothing is dropped, and no
+node has 3 failures in a row. It costs time where requests are many and fast: a fresh fast node's first round takes
+41–45 s instead of 7 s. On islands it costs 60–80 s on a 25–31 minute round (4%), since a slow node's requests are
+already seconds apart; searches are unchanged (they need none). Placement and findability are unchanged within the
+spread (island 3.7 / 2.2 of 10, backbone finds island content 95% / 75%).
+
+**Is 1 s the right spacing?** Yes. RNS's estimate of requests spaced s apart peaks at 1.5 / s (three within 2s), so 1 s
+gives 1.5 a second, half a new interface's threshold, leaving room for jitter, RNS's own re-requests and other
+applications. 0.5 s peaks at exactly 3.0, which doesn't trip (the test is "above") but has no margin at all: two
+requests bunched by the network, or one from another application, trip it. 2 s halves the rate and doubles the
+waiting for nothing measurable (a fresh node's round 79 s instead of 41 s). A shorter spacing once the node's own
+interface is older than 2 h (threshold 8: 0.19 s would do) would gain little, since established nodes send almost
+none.
+
+**What the results say about the planned design.**
+
+1. *"Requests spaced at least 1 s apart, so RNS's estimate stays under 1.5 a second"* holds for a hub's spawned
+   interface (only this node's requests reach it) but not for a shared radio channel: the gateway counts every node's.
+   At 1 kbit/s the channel itself keeps the estimate under 2.5; on faster LoRa an island-wide cold start trips it with
+   pacing as often as without. That is harmless for rnfs (the gateway answers known paths).
+2. *The ceiling* ("the busiest interface's `outgoing_pr_frequency` and `pr_burst_active`"): `outgoing_pr_frequency`
+   is right (it counts this instance's requests, other applications' included, which is what the next hop's interface
+   counts). **Holding back on `pr_burst_active` is harmful on a shared channel**: that state comes from other nodes'
+   requests, so every node waits on the same signal and they all resume together when it clears. In the cold start it
+   raised trips from 0.9 to 9.8 an hour (19 with a random backoff of up to 20 s, which spreads the releases into more
+   short bursts), and limited seconds from 94 to 413–654 an hour. Use the outgoing estimate only.
+3. *"While a lookup waits for the budget, it queries the next candidates with a known path"*: neither helps nor hurts
+   here (`PACE1-idle`, `PACE1-k` within the spread). Slow nodes' requests are seconds apart anyway, and a fresh fast
+   node's lookups hit their budget of 3 a path whatever they ask meanwhile. It can stay, or be dropped as unneeded.
+4. *"During a real partition paths to off-island servers stay in RNS's table and fail as links"* is true only on
+   transport nodes. A node that isn't one expires the path after the first link that fails to establish and requests it
+   again (`Transport.jobs`, ~697–720); with the gateway down nobody answers, so later queries to that server fail for
+   want of a path. Detection still works, because each server's first failure is a link failure: not counting path
+   failures delays partition mode by 2–14 s (75 → 78 s, 131 → 145 s), and every partitioned publisher still enters it.
+5. *Island relays in RNS's default interface mode (`full`)* answer a path request only for paths they have and never
+   forward one, so an island node more than one hop from its gateway gets paths only for servers a neighbour heard.
+   The study so far (and every row above but the `-full` ones) assumed requests flood the island and reach the
+   gateway, which holds only if island transport nodes run `gateway` (or `access_point`, `roaming`) mode or
+   `recursive_prs`. With `full` relays and **today's rule (path failures count towards partition mode), 65–72% of island
+   publish rounds enter partition mode on a connected network**, and the round stops reaching off-island servers. With
+   the planned rule none does, but each of the 55–62 failed requests costs 30 s (round 35–37 min instead of 25–31),
+   placement falls to 2.4 / 1.0 of 10 and backbone searchers find island content 91% / 61%. The planned rule is
+   needed whatever the limit does, and the slow nodes' budget of 10 buys little beyond one hop of the gateway unless the
+   island's relays forward requests; the documentation should say so (gateway mode on island transport nodes).
+6. Not about the limit, but measured on the way, with `rnfs.dht.sweep.find_region`'s sizing (a region is the keys
+   sharing the bits a key shares with the 10th closest server its lookup found, the closest known, not only answered):
+   - *Islands*: an island lookup's result is padded with island servers far from the key, so each region lookup covers
+     about 5.5 due keys and their records land on 3.7 / 2.2 of their 10 closest. One lookup per key in the same engine
+     gives 7.0 / 6.6 (the roadmap's measured 6.9; the earlier sections' UB, without senior servers, 4.4 / 3.7). Sweep
+     thus trades about half the placement accuracy on islands for 5.5 times fewer lookups; backbone searchers find
+     island content 95% / 75% (UB in section 1: 99% / 99%). The extra `/find` to a region's far half (`explore`) isn't
+     modelled and may narrow the gap a little (an island node can store only to servers whose identity it knows).
+   - *A node's first round after its first start*: the first lookup runs alone, its result is padded with whatever few
+     servers the node knows, and its region covers most due keys: about 4 region lookups for 100 or 1,000 keys,
+     records on 0.5 / 0.2 of their 10 closest, until the next round. Worth a guard (a floor on the region prefix from
+     the network size estimate, or a first round that waits until the node has heard announces for a while).
+
+### 11.4 Caveats
+
+The island channel is modelled only as far as path requests need: each request's first copy reaches the gateway at
+least one airtime after the previous one, and other traffic, collisions and the announce cap are left out (all of
+which spread requests further apart, so trip counts at the gateway are an upper bound). A node's own LoRa interface is
+taken to hear what its gateway hears (`PACE1-ceilact`). Hub queue speeds (0.5–10 ms a packet, 20% busy) are assumed,
+not measured. Other applications' path requests aren't modelled. The rest of sections 1–10's caveats apply.
+
+### 11.5 Re-running
+
+From this folder (Python 3.11 or later, standard library only; `PROCS` sets the processes, default 8), with world
+seeds 1–5:
+
+    python3 exp_prlimit.py ops 100 5          # 11.2 ops tables (both sizes, every mode; ~5 min on 6 processes)
+    python3 exp_prlimit.py partition 100 5
+    python3 exp_prlimit.py hub 5
+    python3 exp_prlimit.py gateway 5          # ~3 min
+    python3 exp_prlimit.py perkey 40 5
+    python3 exp_prlimit.py tables             # print every table from out/prlimit_*.json
+
+Each trial's seed is world seed × 100003 + trial. `MODES=OFF,RNS,PACE1 python3 exp_prlimit.py ops ...` runs a subset.
+The port's check needs RNS 1.5.6: `../../../.venv/bin/python validate_prlimit.py` (in a checkout whose `.venv` has
+it).

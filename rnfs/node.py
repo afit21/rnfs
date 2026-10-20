@@ -45,7 +45,7 @@ from rnfs.constants import (APP_NAME, DEFAULT_BOOTSTRAP_NODES, DHT_ASPECT, K, MI
 from rnfs.content import archive, builder, dag, edit, seal, walker
 from rnfs.content.cid import Cid
 from rnfs import node_content  # --- content: add --no-pin/--to/--chunker, sealed files, gateway formats ---
-from rnfs.content.shared_folder import SharedFolder
+from rnfs.content.shared_folder import SharedFolder, add_refused_reason, private_dirs
 from rnfs.content.storage import (FOLDER, REMOTE_PREFIX, USER, Storage, app_of, check_app_name, disk_reserve,
                                   remote_source)
 from rnfs.dht.density import SizeEstimate
@@ -806,6 +806,11 @@ class RnfsNode:
         # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
         # name pins are made to match the names state, which a crash inside a publish can leave them disagreeing with
         self.names.reconcile_pins(self.storage.pins())
+        # Sealed-folder unpacks running (node_content._unpacking); once every pin is in place, the decrypted blocks
+        # of one the process died in are deleted, before anything is served
+        self._unpacks = 0
+        self._unpacks_lock = threading.Lock()
+        node_content.collect_unpack_leftovers(self)
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
         self.publisher.refresh()
@@ -1192,9 +1197,11 @@ class RnfsNode:
         then the newest may be an earlier announce's, which counts only if no later one was). An in-memory read: no
         disk, unlike the
         announce cache, which a shared instance's client doesn't write and whose packet hash a path answer passed on
-        as an announce doesn't match."""
+        as an announce doesn't match. It is a sample of the clock's offset too (NameManager.clock_skew)."""
+        emitted = RnsNetwork().emitted_time(node_id)
+        self.names.clock_skew.node_announced(node_id, emitted)
         traffic = getattr(self.client, "traffic", None)
-        if traffic is not None and traffic.announced(node_id, RnsNetwork().emitted_time(node_id)):
+        if traffic is not None and traffic.announced(node_id, emitted):
             self._fresh_announce(node_id)
 
     def _fresh_announce(self, node_id: bytes):
@@ -1715,16 +1722,25 @@ class RnfsNode:
         "fastcdc". progress, if
         given, is told the bytes read as they are (builder.BuildOptions.progress: an add job's), and may raise to
         stop the add; blocks stored by then are unreferenced, for the next collection.
+
+        The rnfs dir is never added (audit REV1): a path in it, other than in its shared folder, or holding it is
+        refused (ValueError, shared_folder.add_refused_reason), and so is one that is the rnfs dir or a private
+        subdirectory of it by another path, such as a bind mount; a directory inside the tree that is one is skipped
+        with a warning (shared_folder.private_dirs, builder.BuildOptions.skip_dirs).
         """
         _caller_source(source)
         if not os.path.lexists(path):
             raise NotFound(f"no such file or directory: {path}")
+        refused = add_refused_reason(path, self.config.root)
+        if refused is not None:
+            raise ValueError(f"refusing to add {path}: {refused}")
         recipients = node_content.seal_recipients(self, to, to_self, only_hash)
-        options = builder.BuildOptions(chunker, progress=progress)  # ValueError for an unknown chunker, at once
+        # ValueError for an unknown chunker, at once
+        options = builder.BuildOptions(chunker, progress=progress, skip_dirs=private_dirs(self.config.root))
         if only_hash:
             built, warnings = builder.add_path(path, builder.NO_PUT, wrap, options)
         else:
-            options = builder.BuildOptions(options.chunker, self._hash_check(), progress)
+            options = builder.BuildOptions(options.chunker, self._hash_check(), progress, options.skip_dirs)
             with self._refusing(), self.storage.protect() as session:
                 with session.writer() as put:
                     if recipients:
@@ -2829,6 +2845,7 @@ class RnfsNode:
                 "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
+                **self.names.announce_status(),
                 "local_servers": len(self.local), **self.partition.state(),
                 "network": self._network_status(), "record_store": self.records.usage(),
                 **{key: value for feature in self.features.values() for key, value in feature.status().items()}}

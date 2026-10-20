@@ -284,6 +284,17 @@ class LocalFacadeTest(NodeTest):
         self.assertIn("rnfs name export moved", self.b.name_import("moved", key)["warning"])
         self.assertEqual(self.b.status()["unexported_names"], [])
 
+    def test_clock_offset_from_dht_announces(self):
+        """Each rnfs.dht announce heard live is a sample of the clock's offset, read from the emission RNS holds the
+        node's path from; status gives the estimate once enough nodes were heard, and the names held (none here)."""
+        status = self.a.status()
+        self.assertEqual((status["clock_offset"], status["announces_held"]), (None, []))
+        emitted = time.time() + 900
+        with mock.patch("rnfs.node.RnsNetwork.emitted_time", return_value=emitted):
+            for i in range(5):
+                self.a._announced(bytes([0x40 + i]) * 16)
+        self.assertAlmostEqual(self.a.status()["clock_offset"], 900, delta=5)
+
 
 class NetworkFacadeTest(NodeTest):
     """B fetching from A through the backend."""

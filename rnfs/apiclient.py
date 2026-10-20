@@ -10,7 +10,8 @@ Standard library only, and it never imports RNS, so a program using it starts qu
 - An app (rnfs app add; 0.2.0) uses its own token instead, given (token=) or in a file it names (token_file=,
   checked as api_token is), and names itself (app=) in `X-Rnfs-App` on every request: the proof is then keyed
   by its token's verifier (app_proof_key), which is what the daemon keeps of it. An app's token is not scoped:
-  it does all the CLI's does but manage apps. Its pins get the source app:<app>, or app:<app>:<key> for the
+  it does all the CLI's does, managing apps included in effect (the app routes refuse it, but it reads and writes
+  files as the daemon's user, which reaches api_token). Its pins get the source app:<app>, or app:<app>:<key> for the
   requests made inside pin_key(key) (PIN_KEY_HEADER).
 - Before sending the token, the client makes whatever listens on the API port prove it knows it (api_proof,
   verify_daemon), since while the daemon is down any local user could listen there. Nothing else is sent to a
@@ -1050,8 +1051,9 @@ class ApiConnection:
         self.post("/api/name/rm", alias=alias)
 
     def name_publish(self, alias: str, target: str) -> dict:
-        """Point a name of this node at a target: {"name", "cid", "sequence"}, and "warning" in private mode (the
-        name's announce is visible outside the private network)."""
+        """Point a name of this node at a target: {"name", "cid", "sequence"}, "warning" in private mode (the
+        name's announce is visible outside the private network), and "announce_held" while the node's clock is behind
+        the name's last announce (why: the announce goes out once the clock passes it)."""
         return self.post("/api/name/publish", alias=alias, target=target)
 
     def name_sync(self, alias: str, path: str) -> dict:

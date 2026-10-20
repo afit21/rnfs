@@ -18,7 +18,7 @@ status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
-  `name_syncs`, `name_sync_files`, `published_heal`); an older rnfs can't open it afterwards. Pins made before the
+  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`); an older rnfs can't open it afterwards. Pins made before the
   upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
@@ -60,6 +60,66 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **A NomadNet page answer may be at most 16 MiB** (specification section 11): RNS reads an answer without metadata
+  (a page) whole into memory and decodes it, so a "page" as large as the free disk could exhaust a small node's
+  memory. One advertised larger is refused at its first segment, before any of it is transferred (the add fails
+  with too large); files, written to disk, keep the bound above.
+- **Gateway sites don't render uploads as pages** (specification section 11, Sites). A site's pages run script in
+  its own origin, so a file someone else got into a site's DAG could be made to run script there: on site hosts
+  `?filename=` now only names a download (`Content-Disposition: attachment`; the type comes from the path's own
+  name), and a file inside the site's DAG whose name gives no type is sniffed only to an image, audio, video, font,
+  wasm or plain text, else served as `application/octet-stream`, never as HTML, SVG or PDF. A site's `index.html`,
+  the files its DAG names `.html` or `.svg`, and a site whose root is itself a file render as before; the path
+  gateway is unchanged.
+- **App names stay private** (specification section 11): a request naming an app that doesn't exist in
+  `X-Rnfs-App` gets an `X-Rnfs-Proof` too, keyed by an HMAC of a secret made at each start and the name, which no
+  client can check, instead of none; so every answer, the open `GET /api/status` and the 403s included, looks the
+  same whether or not the app exists, and anyone who can reach the API port can no longer list the installed apps.
+- **What an app's token can do, said plainly** (specification section 11, README): an app can do anything the CLI
+  can, managing apps included in effect. The `/api/apps` routes refuse its token, but it reads and writes files as
+  the daemon's user, which reaches the CLI's token; `rnfs app add` now says so. Give a token only to software you
+  would trust with the CLI.
+- **Unpacking a sealed folder counts what its entries take on disk** (REV10; specification section 5,
+  Unpacking): the tar's headers are read first, before anything is stored, and every file and directory counts
+  at least one filesystem allocation unit (4 KiB or the filesystem's own, if larger) in the block store and
+  again as written, where the plaintext's bytes were counted before. A sender could seal a folder of many tiny
+  files that passed the check and then took 4 to 8 times as much, twice, filling the recipient's disk past the
+  reserve (1,000 one-byte files: 10.9 MB written where 2 MB was checked). Such a get is now refused (413, naming
+  `--no-extract`).
+- **An unpack the process died in no longer leaves the plaintext stored** (REV10): its decrypted blocks used to
+  stay in the block store, unpinned, until a gc or an eviction. An unpack now marks the state database while it
+  runs, and a start that finds the mark deletes every block nothing reaches before serving anything (the
+  unrecorded blocks of a fetch the same crash interrupted too: a retry fetches them again).
+- **Documented: a sealed file is only as safe as the recipient's node identity** (REV12), which is online while
+  the node runs and stored unencrypted in the rnfs dir (`storage/identity`): sealing protects against the
+  network, not against someone who can read the recipient's disk (README, Known limitations; specification
+  section 5).
+- **`add` refuses the rnfs dir** (specification section 5): `rnfs add ~` pinned and provided the node identity, the
+  name keys, `api_token` and `rnfs.db`, each findable by its own CID with `provide_entries`, and an app token could
+  read the CLI's token through `add`. `add` (the CLI, the API, add jobs, sealed folders) now refuses the rnfs dir, a
+  directory holding it, anything inside `storage/`, `names/`, `state/`, `blocks/` or `lxmf/`, and anything else in
+  the rnfs dir but outside `files/`. Every walk (`add`, the shared folder, `name sync`, sealed folders) also skips,
+  with a warning, a directory that is the rnfs dir or one of those subdirectories by device and inode, which catches
+  a bind mount of them; one given as the root is refused.
+- **Provider records have a write budget** (REV2; specification section 6, "Provider records"): with no
+  per-publisher cap left, one identity storing and withdrawing records in a loop made the store write about
+  100,000 rows a second in-process, and 9.5 MB/s at 100 requests a second. New records and withdrawals now spend a
+  budget of 60 rows every 30 s open to all, plus 30 each kept for Earned and Known publishers, carried over for up
+  to 6 hours; past it new records are refused (`False`), withdrawals never are, and refreshes cost nothing. A
+  withdrawal followed by a store of the same key before the next save is a refresh, and a refresh is written once
+  it moves a record's last-stored time by 6 hours rather than 1. A Newcomer flood now makes the store write at most
+  about 150 kB/s (fresh identities, inserted and withdrawn, on a 1M-record database), a hundredth of what it did.
+- **A full key can't be taken over** (REV3; specification section 6): Earned publishers never gave way to each other
+  at a full key, so about 1000 identities that each refreshed one key on 3 UTC days (from about 48 hours) held all
+  its 1000 publishers, and every new provider of it but Known ones was refused. Now Earned records give way to
+  Earned and Known storers (a random one outside the `K/2` oldest), and Newcomers keep a tenth of the key: below it
+  a Newcomer evicts a random Earned record, past it Newcomers give way first, so a flood of fresh identities holds
+  at most that share.
+- **Provider standings without records are capped** (REV11; specification section 6): a publisher left without
+  records keeps its refresh days a week, and nothing else bounded those rows, so identities that each refreshed one
+  record a day later and withdrew it grew the state database (and took room from the record budget, which measures
+  it). At most 50,000 are kept (about 5 MB); past that the hourly pass forgets those with the fewest refresh days
+  first, so Earned publishers that left outlast such a flood.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -102,7 +162,7 @@ Added, for apps:
   request without `X-Rnfs-App` is checked exactly as before.
 - **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
   scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
-  can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
+  can (export name keys, change settings, stop the daemon), managing apps included in effect; `rnfs app ls [--json]`;
   `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
   `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
   `forbidden`); capability `apps`. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF left
@@ -201,6 +261,16 @@ Added:
   which keys were exported by `name export` or imported, and `rnfs status` (`GET /api/status`,
   `Status.unexported_names`) lists the names whose key never was. `name list` entries and `rnfs.Name` gain
   `exported`.
+- **Clock problems are noticed:** RNS drops an announce emitted (by its sender's clock) no later than the one it took
+  a path from, so a Raspberry Pi without a clock that came back on an older time lost its name updates silently, for
+  up to a week. The node now remembers each name's last announce (`name_announces`) and holds the name's announces
+  while its clock is behind it: a publish is committed as usual, its result says why the announce is held
+  (`announce_held`, printed by `rnfs name publish`, a `RuntimeWarning` from `Name.publish`), and the announce goes
+  out once the clock passes the last one, or after a week held in all. `GET /api/status` (`Status`) gains
+  `announces_held` and `clock_offset`, the clock's offset from the network's estimated from the emission times of
+  the announces heard (the median over senders, so a few wrong clocks don't move it); a warning is logged, and
+  printed by `rnfs status`, while it is over 5 minutes off. The estimate never changes the clock or what the node
+  does. Name syncs publish through the same path.
 - **Pin by NomadNet address:** `rnfs add <destination>:/page/<path>` (a page as the node renders it) or
   `<destination>:/file/<path>` (a file it serves) fetches it from that NomadNet node over a link of rnfs's own and adds
   it like a file, pinned `user` (with an app's token, that app's source) with the link as its origin in `pin ls`; the
@@ -404,7 +474,7 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 - **On disk:** records are read from the state database per `/find` through an index, with a small cache, instead
   of all held in memory (about 500 bytes each before): memory no longer grows with the records or their publishers.
   Changes are written together every 30 s; a republish is written only when it moves a record's last-stored time by
-  more than an hour, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
+  more than 6 hours, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
   200 000 records cost about 70 µs a store and 112 transactions in all, on a desktop NVMe disk.
 - **A byte budget instead of a record count:** records may take `record_budget` of disk (new, default 1 GiB: about
   7 million records at the 150 bytes a record takes, measured from the database), never the free disk the blocks'
@@ -418,7 +488,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
   within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
   each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
-  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way by tier, with a
+  share kept for Newcomers (Security, above).
 
 Changed:
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private

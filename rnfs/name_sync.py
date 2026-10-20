@@ -3,7 +3,9 @@
 A synced folder is imported as the shared folder imports its entries (rnfs.content.shared_folder.FolderImporter),
 the whole folder as one entry: an unchanged folder is recognised by its signature (names, sizes, modification times
 and execute bits) and not read, and inside a changed one a file known by its state isn't read either (FolderFiles);
-links, special files and files with other hard links are skipped; a folder that leads into the rnfs dir is refused.
+links, special files and files with other hard links are skipped; a folder that leads into the rnfs dir is refused,
+and so is one that is the rnfs dir or a private subdirectory of it by another path, such as a bind mount; a directory
+inside the folder that is one is skipped with a warning (shared_folder.private_dirs, audit REV1).
 Files are cut with FastCDC, so an edited file shares most of its blocks with the version before.
 
 When the folder's root CID differs from the one the sync last published (and from the name's target), the name is
@@ -274,7 +276,8 @@ class NameSync:
 
     def _scan(self, alias: str, entry: _Sync):
         """Import entry's folder and publish alias's name to it if it is time to."""
-        options = builder.BuildOptions(chunker.FASTCDC, check=self._check())
+        options = builder.BuildOptions(chunker.FASTCDC, check=self._check(),
+                                       skip_dirs=shared_folder.private_dirs(self._config.root))
         with self._storage.protect() as session:  # the import's blocks, until it is published
             root, reason = self._import(alias, entry, options, session)
             target = self._target(alias)
@@ -321,6 +324,8 @@ class NameSync:
         reason = shared_folder.refused_reason(real, self._config.root)
         if reason is not None:
             return f"{reason}, where nothing may be shared from", real
+        if builder.is_skipped_dir(st, shared_folder.private_dirs(self._config.root)):
+            return builder.PRIVATE_DIR, real
         return None, real
 
     @staticmethod

@@ -2,7 +2,8 @@
 POST /api/add/stream?format=tar builds a directory from an uploaded tar (build_tar), GET /api/get/stream?format=tar
 sends a target back as one (plan, length, chunks). Sealed folders use both ends too: `add --to <folder>` packs a
 folder on this machine as one tar (folder_chunks) and seals that, and a recipient's `get` builds the decrypted tar
-with build_tar before writing it out. No RNS beyond rnfs.log's, through walker.
+with build_tar before writing it out, having read its headers first (scan_tar) to count what that takes on disk.
+No RNS beyond rnfs.log's, through walker.
 
 Reading treats the stream as untrusted input, read once, in order, never held whole (tarfile's stream mode):
 - Regular files and directories become the tree, under the name rules of `add` (builder._build_tree): a member
@@ -267,15 +268,26 @@ def build_tar(stream: BinaryIO, put: Put, warn: Callable[[str], None], max_entri
 def _add_member(archive: tarfile.TarFile, member: tarfile.TarInfo, tree: _Tree, put: Put,
                 warn: Callable[[str], None], options: BuildOptions | None):
     """Put one member into tree (or warn why it is skipped); a file's data is built as it is read."""
+    placed = _place(member, tree, warn)
+    if placed is not None:
+        parent, name = placed
+        kind = dag.KIND_EXECUTABLE if member.mode & 0o100 else dag.KIND_FILE
+        parent[name] = builder.build_file(archive.extractfile(member), put, member.size, kind, options)
+
+
+def _place(member: tarfile.TarInfo, tree: _Tree, warn: Callable[[str], None]) -> tuple[dict, str] | None:
+    """Make the directory a member is, or those a file member goes in, in tree (or warn why it is skipped): for a file
+    to build, (the directory it goes in, its name); None for anything else. Raises TooLarge past MAX_DEPTH or the
+    tree's max_entries."""
     shown = _shown(builder.display_path(member.name))
     parts = _parts(member.name)
     if isinstance(parts, str):
         warn(f"skipped {shown}: {parts}")
-        return
+        return None
     if not parts:  # "." or "./": the root itself
         if not member.isdir():
             warn(f"skipped {shown}: not a valid entry name")
-        return
+        return None
     if len(parts) > constants.MAX_DEPTH:
         raise TooLarge(f"{shown} is nested deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     if member.issym():
@@ -291,9 +303,97 @@ def _add_member(archive: tarfile.TarFile, member: tarfile.TarInfo, tree: _Tree, 
         parent = tree.file_parent(parts)  # checked before its data is read: a skipped file's is passed over
         if isinstance(parent, str):
             warn(f"skipped {shown}: {parent}")
-            return
-        kind = dag.KIND_EXECUTABLE if member.mode & 0o100 else dag.KIND_FILE
-        parent[parts[-1]] = builder.build_file(archive.extractfile(member), put, member.size, kind, options)
+            return None
+        return parent, parts[-1]
+    return None
+
+
+# What unpacking takes on disk
+
+ENTRY_BYTES = 64  # a directory listing's bytes per entry besides its name, at most (a CID, a size, a kind)
+
+
+def allocated(size: int, unit: int) -> int:
+    """What size bytes take on a filesystem allocating unit bytes at a time: rounded up, and one unit for nothing,
+    since an empty file or a directory takes a block file, an inode or a directory record."""
+    return max(-(-size // unit), 1) * unit
+
+
+class Extent:
+    """What building a tar into a block store and writing it out take on disk (scan_tar): sizes, every file member's
+    size (one that a later member of the same path replaces too: its blocks stay stored until the unpack ends), and
+    root, the tree build_tar makes (nested dicts of name to a dict, a directory, or the file's size)."""
+
+    def __init__(self, sizes: list[int], root: dict):
+        """An extent of these file sizes and this tree."""
+        self.sizes = sizes
+        self.root = root
+
+    def stored(self, unit: int) -> int:
+        """About what the blocks take in a block store allocating unit bytes at a time (one file per block): each
+        file's chunks, cut every CHUNK_SIZE bytes as build_tar's fixed chunker does, and the file nodes listing them,
+        and each directory's listing, every block rounded up to a unit."""
+        return sum(_file_blocks(size, unit) for size in self.sizes) + self._tree(unit, files=False)
+
+    def written(self, unit: int) -> int:
+        """About what writing the tree out takes on a filesystem allocating unit bytes at a time: each file's size
+        and each directory's listing, rounded up to a unit."""
+        return self._tree(unit, files=True)
+
+    def _tree(self, unit: int, files: bool) -> int:
+        """Every directory's listing (one unit per MAX_CHILDREN entries more, the blocks a large one is split into),
+        and with files each file in the tree, allocated in units."""
+        total, stack = 0, [self.root]
+        while stack:
+            directory = stack.pop()
+            listing = sum(len(name.encode("utf-8", "surrogateescape")) + ENTRY_BYTES for name in directory)
+            total += allocated(listing, unit) + unit * (len(directory) // constants.MAX_CHILDREN)
+            for child in directory.values():
+                if isinstance(child, dict):
+                    stack.append(child)
+                elif files:
+                    total += allocated(child, unit)
+        return total
+
+
+def _file_blocks(size: int, unit: int) -> int:
+    """What a file of size bytes takes as blocks (Extent.stored): its chunks and the nodes above them, each rounded
+    up to a unit (MAX_CHILDREN children a node, a node's listing at most ENTRY_BYTES a child)."""
+    full, rest = divmod(size, constants.CHUNK_SIZE)
+    total = full * allocated(constants.CHUNK_SIZE, unit) + (allocated(rest, unit) if rest or not full else 0)
+    chunks = full + (1 if rest else 0)
+    if chunks > 1:
+        nodes = -(-(chunks - 1) // (constants.MAX_CHILDREN - 1))  # a tree of that fan-out over chunks leaves
+        total += nodes * allocated(constants.MAX_CHILDREN * ENTRY_BYTES, unit)
+    return total
+
+
+def scan_tar(stream: BinaryIO, max_entries: int) -> Extent:
+    """The Extent of what build_tar would build from a tar, read from a seekable stream: only its headers (the data
+    tarfile seeks past isn't read) and what follows its end. A member counts only if build_tar would build it, by
+    the same rules (_place). Raises as build_tar does, before anything is stored: ValueError for a stream that isn't
+    a valid plain tar or ends early or has data after its end, TooLarge past max_entries or MAX_DEPTH."""
+    tree = _Tree(max_entries)
+    sizes = []
+    try:
+        archive = tarfile.open(fileobj=stream, mode="r:", tarinfo=_header_class(), encoding="utf-8",
+                               errors="surrogateescape")
+        with archive:
+            while (member := archive.next()) is not None:
+                archive.members.clear()  # as in build_tar: nothing needs them, and there may be many
+                placed = _place(member, tree, lambda text: None)  # build_tar warns: this only counts
+                if placed is not None:
+                    parent, name = placed
+                    parent[name] = member.size
+                    sizes.append(member.size)
+            # tarfile stops at the first zero block (archive.offset): the rest must be the end blocks and padding
+            stream.seek(archive.offset)
+            while data := stream.read(COPY_SIZE):
+                if data.count(0) != len(data):
+                    raise ValueError("not a valid tar stream: data after its end (a damaged header?)")
+    except tarfile.TarError as e:
+        raise ValueError(f"not a valid tar stream: {e}") from None
+    return Extent(sizes, tree.root)
 
 
 # Writing
@@ -516,12 +616,13 @@ class _Packing:
     """What folder_chunks keeps while it walks: the entries met, the bytes written, and the options."""
 
     def __init__(self, max_entries: int, warn: Callable[[str], None], progress: Callable[[int], None] | None,
-                 mtime: int):
+                 mtime: int, skip_dirs: frozenset[builder.DirId] = frozenset()):
         """Nothing written yet."""
         self.max_entries = max_entries
         self.warn = warn
         self.progress = progress
         self.mtime = mtime
+        self.skip_dirs = skip_dirs
         self.entries = 0
         self.written = 0
 
@@ -539,11 +640,13 @@ class _Packing:
 
 
 def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int, warn: Callable[[str], None],
-                  progress: Callable[[int], None] | None = None, mtime: int | None = None) -> Iterator[bytes]:
+                  progress: Callable[[int], None] | None = None, mtime: int | None = None,
+                  skip_dirs: frozenset[builder.DirId] = frozenset()) -> Iterator[bytes]:
     """The tar of the folder open as handle (builder.open_path of path), everything under one top directory top/, so
     that `tar xf` puts nothing else in the directory it is run in. The folder is walked as `add` walks one
     (builder._build_tree): hidden files included; symlinks, devices, sockets, FIFOs, names that aren't valid UTF-8 or
-    break the name rules, and entries that change while being opened skipped with a warning (warn(text)); a file
+    break the name rules, the directories of skip_dirs (builder.BuildOptions.skip_dirs: the rnfs dir's, by another
+    path) and entries that change while being opened skipped with a warning (warn(text)); a file
     with other hard links read as any file (no hard-link members, which build_tar would skip). Names a tar
     shouldn't hold (safe_name) are skipped with a warning too, as the writer of a stored DAG skips them. Members as
     that writer makes them (_header_of: PAX, 0755/0644, dated mtime, now if None), after the sealed-folder marker
@@ -560,7 +663,7 @@ def folder_chunks(handle: builder.Handle, path: str, top: str, max_entries: int,
         raise ValueError(f"{builder.display_path(top)!r} isn't valid as an entry name")
     if not safe_name(top):
         raise ValueError(f"{builder.display_path(top)!r} holds a character some extractors read as a path separator")
-    packing = _Packing(max_entries, warn, progress, int(time.time()) if mtime is None else mtime)
+    packing = _Packing(max_entries, warn, progress, int(time.time()) if mtime is None else mtime, skip_dirs)
     listing = builder.list_directory(handle)
     marker = folder_marker()
     packing.written += len(marker)
@@ -597,6 +700,9 @@ def _pack_directory(handle: builder.Handle, listing: list, path: str, member: st
             continue
         if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
             packing.warn(f"skipped {shown}: not a regular file or directory")
+            continue
+        if builder.is_skipped_dir(st, packing.skip_dirs):
+            packing.warn(f"skipped {shown}: {builder.PRIVATE_DIR}")
             continue
         # Changed is raised only by opening and listing, before anything of the entry is written, so skipping it
         # never leaves part of a member in the tar

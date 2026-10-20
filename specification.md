@@ -445,6 +445,14 @@ identical bytes.
   deeper tree.
 - `add` includes hidden files, and skips symlinks, devices and sockets with a warning. Modification times and
   other metadata are not stored, so identical content always gets an identical CID.
+- `add` never adds the rnfs dir (rnfs 0.2.0), which holds the node's keys, its API token and its state: it MUST
+  refuse a path that resolves to the rnfs dir, to a directory holding it (`add ~`), into `storage/`, `names/`,
+  `state/`, `blocks/` or `lxmf/` (each resolved, as the shared folder's check in section 8 does), or to anything else
+  inside the rnfs dir but outside `files/` (such as `api_token`, `rnfs.toml` or the Reticulum `config`); what is in
+  `files/` is shared anyway. A walk (`add`, the shared folder, name sync, a sealed folder's packing) MUST also skip,
+  with a warning, a directory whose device and inode are those of the rnfs dir or one of those subdirectories, taken
+  when the walk starts: another way to them, such as a bind mount, which a path check can't see. A root that is one
+  is refused.
 
 ### Sealed files (a content convention)
 
@@ -496,7 +504,10 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
 - **What it protects.** The confidentiality of the content and, if sealed, of the file name. It does not hide
   the recipients' identity hashes, the approximate size, or (with `--wrap`) the wrapper's entry name, and it
   says nothing about who sealed it: anyone with a recipient's public key can seal a file for them, and any
-  recipient can seal different content for the others.
+  recipient can seal different content for the others. A sealed file is readable by whoever holds a
+  recipient's identity: rnfs's recipient is its node identity, which a running node keeps in memory and
+  stores unencrypted in the rnfs dir (`storage/identity`), so sealing protects the content against the network
+  and other nodes, not against someone who can read a recipient's rnfs dir or disk.
 - **Folders.** `add --to` of a folder seals it as one sealed file, never file by file (which would leave its
   names and tree visible): the folder is packed as one plain tar (POSIX pax) and that tar is sealed with the
   sealed name `<folder>.tar`. The format above is unchanged, so a reader that only decrypts (rnfs 0.1.x) gets a
@@ -509,7 +520,8 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
   - Every member is under one top directory named after the folder (`<folder>/…`), so extracting the tar
     creates nothing else in the directory it is extracted in. Each directory comes before what it holds.
   - The folder is walked with `add`'s rules: hidden files included; symlinks, devices, sockets, FIFOs, names
-    that break the name rules and entries that change while being opened skipped with a warning; a file with
+    that break the name rules, the rnfs dir reached another way (above) and entries that change while being
+    opened skipped with a warning; a file with
     other hard links is an ordinary file (members are regular files and directories only, never links). Names
     holding `\`, `＼` or `／`, or starting as a Windows drive does (`C:`), are skipped with a warning too, as
     `GET /api/get/stream` skips them (section 11).
@@ -540,10 +552,16 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
     taken from the tar. A tar past a limit is refused (rnfs: 413, naming `--no-extract`) rather than written in
     part. The output is the tar's one top directory, or the whole tar as a directory when it holds anything else;
     without `-o` it is named by `get`'s default-name rule (section 11) after that directory (or the sealed name
-    without `.tar`). The node MUST check that its free space holds the plaintext twice where its blocks and the
-    output share a filesystem (rnfs builds the tar into its block store, then writes the files), and MUST NOT
-    pin, cache or provide those plaintext blocks: rnfs holds them in a protection session (section 8) while
-    unpacking and collects them at once after, so none stays stored unless something else keeps the same block.
+    without `.tar`). Before storing anything the node MUST check that its free space holds what the entries take
+    on disk, counted in the filesystem's allocation unit rather than in bytes, in its block store and again as
+    written where the two share a filesystem (rnfs builds the tar into its block store, then writes the files):
+    every file and directory takes at least one unit on each side (rnfs reads the tar's headers first and
+    counts each file's chunks and each directory's listing rounded up to the unit, at least 4 KiB), since a tar
+    spends only 512 bytes on an empty file or directory. It MUST NOT pin, cache or provide those plaintext
+    blocks: rnfs holds them in a protection session (section 8) while unpacking and collects them at once
+    after, so none stays stored unless something else keeps the same block; and it marks its state database
+    while an unpack runs, so a start after the process died mid-unpack collects every block nothing reaches
+    before serving anything.
     `--no-extract` writes the decrypted `.tar` instead, as `get` of a 0.1.x node does.
 
   Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
@@ -985,14 +1003,31 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     expired: one more way a full store makes room. The longest honest gap between republishes is just under
     3.5 days (kept names, below), so a record republished on time never lapses this way. A store that isn't
     full keeps every record `PROVIDER_TTL`, so a record survives one missed republish.
+  - **Write budget.** Full or not, the rows a node writes for others' records are budgeted, so no publisher can
+    make it write without bound (one identity storing and withdrawing records in a loop could make a store write
+    megabytes a second). In rnfs, new records and withdrawals spend a budget of 60 rows every 30 s open to every
+    publisher, plus 30 kept for Earned and 30 for Known publishers (the tiers above, by the same tests, though the
+    store needn't be full), who spend their own first; unused budget is carried over for up to 6 hours. Past it,
+    new records are refused; withdrawals spend what is left but are never refused, and refreshes cost nothing:
+    one is written only once it moves the record's last-stored time by more than 6 hours. A withdrawal followed by
+    a store of the same key by the same publisher before the node next writes its changes (every 30 s) is a
+    refresh, keeping its first-stored time. A 0.1.x publisher stores at most a few new keys a second, so the
+    budget carried over covers its first round to a server; republishing every day or every 3 days is refreshes.
   - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
     of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
-    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.
-  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a newcomer to a full
-    key evicts a random one of the lowest tier there (never one of the `K/2` oldest records, which replies list
-    first), if that tier is below its own, or is its own and not Earned; otherwise it is refused. Refusing every
-    newcomer would let early Sybil identities hold the key, and the random half of `/find` replies relies on
-    newcomers getting stored.
+    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state. rnfs keeps at
+    most 50,000 standings of publishers without records (about 5 MB), forgetting those with the fewest refresh days
+    first, so identities that refreshed a record once and withdrew it can't grow that state either, nor push out
+    Earned publishers that left.
+  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a new publisher of a
+    full key evicts a random record there, never one of the `K/2` oldest records, which replies list first.
+    Newcomers keep a share of the key, a tenth of its publishers: a Newcomer evicts an Earned record while
+    Newcomers hold less, else a Newcomer one; an Earned or Known publisher evicts an Earned record while Newcomers
+    hold no more than their share, else a Newcomer one first; only a Known publisher evicts a Known record, and
+    only when no other is left. Otherwise it is refused. Refusing every newcomer would let early Sybil identities
+    hold the key, and the random half of `/find` replies relies on newcomers getting stored; Earned records give
+    way too, or about 1000 identities that each refreshed the key on 3 days (about 48 hours) would hold it against
+    every publisher but Known ones, while a flood of fresh identities holds at most the Newcomers' share.
 - The node's own records are always accepted and never evicted to make room for others' (rnfs: nor counted
   toward the 1000 publishers of a key; they take room in the budget), so Sybil stores can't push a node's own
   record out of its own store.
@@ -1020,6 +1055,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   withdrawn as a root's is, and the blocks served (section 7) don't change: an entry's DAG is inside its pin's. It
   works under either strategy, but only pins have their entries provided: a cached download only ever provides its
   root. Without entries, share `<root>/<path>`, or pin the inner CID to provide it.
+  - What it publishes: every file and folder inside a provided pin becomes findable by its own CID, so anyone who
+    has a file (or can guess it: a known document, a common photo, a default config file) can look up its CID and
+    learn that this node holds it, without knowing the folder it is in or the folder's CID. Pin only what may be
+    known to be on the node, or turn `provide_entries` off.
   - Each entry key costs its republishing: about 165 bytes a round (16 bytes to each of `K` servers, and request
     overhead), which sweep providing doesn't reduce, and entries multiply a node's keys 3–5× for folders of a few
     files and over 100× for large ones (a 70k-file folder: about 11.6 MB a day from a node that isn't slow).
@@ -1226,8 +1265,10 @@ symlink, but a scan MUST NOT import from a folder that resolves, as opened, to t
 holding it, or into `storage/`, `names/`, `state/`, `blocks/` or `lxmf/` (the LXMF state of rnfs before 0.2.0,
 section 13), which hold the node's keys and state:
 rnfs logs a warning (once, while it stays so) and scans it as an empty folder: nothing is imported and every pin
-with source `folder` is released (including those an earlier version made from it). rnfs also warns, once, when
-a directory above the folder can be changed by other users, who could replace the folder with another.
+with source `folder` is released (including those an earlier version made from it). So is a folder that is the
+rnfs dir or one of those subdirectories by device and inode (a bind mount), and an entry or a directory inside one
+that is one is skipped with a warning (section 5). rnfs also warns, once, when a directory above the folder can be
+changed by other users, who could replace the folder with another.
 
 **Archives** move content without a network (the equivalent of IPFS CAR files).
 - `export` fetches the target if needed, then writes a msgpack stream: `["rnfs-archive", 1, [root CIDs]]`,
@@ -1352,7 +1393,33 @@ A **name** is a mutable pointer to a CID, owned by a key pair: the IPNS equivale
    names pinned; any other pin of the source is released at the next start, section 8).
 5. Announce, and re-announce every `announce_interval`. In private mode the announce reaches outsiders all the
    same (section 3), and the publish warns of it: rnfs adds a `warning` to the result (`POST /api/name/publish`
-   and `rnfs name publish`, which prints it to stderr).
+   and `rnfs name publish`, which prints it to stderr). While the clock is behind the name's last announce, the
+   announce is held (below), and the result says so in `announce_held`.
+
+**Announces and the clock** (rnfs 0.2.0). An announce carries the time it was emitted, by its sender's clock,
+signed (bytes 5–10 of its random blob). RNS 1.5.6 replaces a path with a later announce of no more hops only if it
+was emitted strictly later than every announce the path holds (`Transport.inbound`), and an announce that doesn't
+change the path never reaches announce handlers. So a node whose clock went back (a Raspberry Pi without a clock,
+restarted on the time it last saved) has its name announces dropped silently by every node holding a path to the
+name, until that path lapses: a week after the node took it (`DESTINATION_TIMEOUT`; a day on access point
+interfaces, 6 hours on roaming ones).
+- A publisher SHOULD keep, per name, the emission time of its last announce, and not announce the name while its
+  clock is behind it (holding the announce rather than sending one RNS drops). rnfs persists it in whole seconds,
+  as RNS signs it; the newest emission RNS holds a path to the name from (the key announced on another machine
+  before) counts too. A publish while held is committed as usual (persisted, pinned, kept by keepers, resolvable
+  here and through keepers); its result carries `announce_held`, why, and `status` lists the held names in
+  `announces_held`. The held announce goes out once the clock passes the last one (rechecked every minute), or
+  anyway once the name has been held a week in all, counted across restarts, by when the paths that would drop
+  it have lapsed. A clock in the same second as the last announce isn't held (RNS drops that announce too, until
+  the next re-announce, as before 0.2.0).
+- A node SHOULD estimate its clock's offset from the emission times of announces it hears live (rnfs.dht announces
+  and names' announces, not path responses, and not those of names it is resolving, which a shared instance may
+  pass on as announces): per sender its least delayed announce over 2 × `announce_interval`, and the median over
+  senders, so that a few wrong or lying clocks can't move it. A node publishing many names has one clock, so
+  names count for fewer senders than nodes do, except to make up the 5 an estimate needs. Late and replayed
+  announces can only make the clock look ahead, never behind. rnfs reports the estimate in `status`
+  (`clock_offset`, seconds, positive when this node's clock is behind; null until 5 senders were heard) and logs a
+  warning while it is over 5 minutes off; it never changes the clock or what the node does.
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.
@@ -1491,7 +1558,9 @@ one of its names pointing at a local folder's current content (rnfs: `name sync 
 - Every `scan_interval` the folder is imported as the shared folder's entries are (section 8), the whole folder
   as one directory: unchanged content is recognised by its metadata rather than read, links, devices, sockets and
   files with other hard links are left out, and a folder that resolves, as opened, to the rnfs dir, a directory
-  holding it, or into the folders holding its keys and state is refused. Files are cut with FastCDC (section 5),
+  holding it, or into the folders holding its keys and state is refused, as is one that is one of them by device
+  and inode, while a directory inside the folder that is one is skipped (section 5). Files are cut with FastCDC
+  (section 5),
   so an edited file shares most of its blocks with the version before: the root is the CID
   `add --chunker fastcdc` gives the folder.
 - When the root differs from the one the sync last published and from the name's target, the name is published to
@@ -1705,7 +1774,7 @@ are local conveniences, not part of the protocol.
 | `providers <cid>` | Find nodes providing a CID |
 | `ping <node ID>` | Open a link and report its round-trip time (`rnprobe` can't probe `rnfs.dht`, which doesn't send delivery proofs) |
 | `name create\|rm\|export\|import <alias>`, `name list` | Manage name keys; `rm` releases the name's pin. A name can't move to another key, so losing its key loses the name for good: `create` and `import` say so and give the `export` command, the node remembers which keys were exported (by `name export`) or imported, and `status` lists the others (`unexported_names`; keys made before rnfs 0.2.0 count as never exported) |
-| `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick |
+| `name publish <alias> <cid>[/path]`, `name resolve <name>` | Mutable names. Every `<name>` argument is 32 hex digits or a name contact's nick. `publish` says on stderr when the name's announce is held because the clock is behind its last announce (`announce_held`, section 9) |
 | `name keep\|unkeep <name>`, `name kept` | Keep a name's signed record and serve it (section 9) |
 | `name follow\|unfollow <name>`, `name following` | Keep a name's latest target pinned (section 9) |
 | `name sync <alias> <folder>`, `name unsync <alias>`, `name syncs [--json]` | Keep a name pointing at a folder's current content, published at most once an hour once it has been unchanged a minute (section 9, Syncing a folder); `syncs` lists each sync's folder, state (`new`, `settling`, `waiting`, `synced`, `paused` and why), the root last imported and the one last published and when (rnfs: `POST /api/name/sync {"alias", "path"}`, `POST /api/name/unsync {"alias"}`, `GET /api/name/syncs`) |
@@ -1717,7 +1786,7 @@ are local conveniences, not part of the protocol.
 | `config [list] [--json]`, `config get <name>`, `config set <name> <value>`, `config unset <name>` | The settings (section 12): each with the value running, marked if `rnfs.toml` sets it, if a restart would change it, or if the daemon's command line sets it (which wins); `set` takes a TOML value (a bare word is text) and `unset` removes the setting from `rnfs.toml`, back to its default. Both edit `rnfs.toml` in place (other lines and comments kept), only once the whole result is valid, and say whether the change applied at once or needs a restart |
 | `app add <name> [-o file]`, `app ls [--json]`, `app rm <name>` | Tokens for apps (below): `add` issues a token to an app and prints it once (only it, on stdout), or writes it to a new file only the user can read, saying on stderr what it lets the app do; `rm` revokes it and releases every pin the app made. Only the CLI's token may run these |
 | `stop [--wait S]` | Ask the daemon to stop, as Ctrl+C or SIGTERM would (it saves its state first), and wait until its API no longer answers (rnfs: 30 s) |
-| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
+| `status` | Node ID, RNS identity hash (the value other nodes list in `members` and `remote_pin_identities`), known nodes, records held, CIDs provided and how many of them are entries inside pins (`provided_entries`; `provide_entries_off`: why none are, `provide_entries_capped`: pins left out at the cap, section 6), the local servers it knows of (`local_servers`, section 6 "LoRa islands") and whether it is in partition mode and since when (`partition`, `partition_since`: Unix time, or null), the clock's estimated offset from the network's and the names whose announces are held (`clock_offset`, `announces_held`: section 9, "Announces and the clock"; `rnfs status` warns on stderr of an offset over 5 minutes and of held names), what it sees of the network (`network`, `record_store`: Network status, below), storage use, traffic, jobs, deny-list entries and sources (only the version without a readable API token). While the daemon starts, before its API listens, it and every other command say the daemon is starting, with its process ID (below) |
 
 **Network status** (rnfs 0.2.0). `status` (`GET /api/status`, the library's `Status`) also reports what the node can
 see of the network from its own state, with nothing sent to learn it: the cheapest way to learn how big the network
@@ -1796,20 +1865,22 @@ gateway can never reach the API.
   settings, then checks the subdirectories, then takes the directory's lock, in the daemon and in an embedded
   node alike; clients (the CLI, `rnfs.Client`) check `rnfs.toml` the same way when they read it, and show
   what was changed (the CLI prints it, `rnfs.Client` raises a `RuntimeWarning`, an embedded node logs it).
-- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications
-  tokens of their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name
-  rule). A request naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes
-  only with it; a request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never
-  taken for another's. App tokens outlive restarts. The node needn't keep the token itself: rnfs keeps
-  `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
-  a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
-  change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
-  that far. Removing an app revokes its token at once, cancels its queued and running jobs and releases every
-  pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
-  CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token, the
-  only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden`
-  there. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF made before 0.2.0 (section 13): adding
-  it, then removing it, releases them.
+- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications tokens of
+  their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name rule). A request
+  naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes only with it; a
+  request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never taken for another's. App
+  tokens outlive restarts. The node needn't keep the token itself: rnfs keeps `SHA-256("rnfs app token " + token)`
+  (the app's *verifier*), from which the token can't be found, and checks a presented token against it. App tokens are
+  not scoped: an app can do anything the CLI can (export name keys, change settings, stop the daemon), and in effect
+  manage apps too. The app routes below refuse it, but that is no boundary: an app's token reads files as the node's
+  user (`add`, then `cat`) and writes new files wherever that user can (`get`, `export`), which is enough to run
+  programs as that user and so to read the CLI's token. An app's token is to be given only to software the user would
+  trust with the CLI itself. Removing an app revokes its token at once, cancels its queued and running jobs and
+  releases every pin it holds (a pin a request let in before the removal makes after it is released as it is made).
+  Only the CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token,
+  the only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden` there.
+  An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF made before 0.2.0 (section 13): adding it, then
+  removing it, releases them.
 - **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
   `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
   `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of
@@ -1830,7 +1901,11 @@ gateway can never reach the API.
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
   exactly one more request. A request carrying `X-Rnfs-App: <name>` gets its proof keyed by that app's verifier
   (above), written as 64 lowercase hex digits, instead of the token: an app computes it from its own token, and
-  checks the proof the same way before sending that token. No proof is sent for an app the node doesn't have.
+  checks the proof the same way before sending that token. The answer MUST NOT say whether the app exists: for a
+  name the node has no app by, the proof is keyed by a value no client can know, the same for that name until the
+  node restarts (rnfs: hex(HMAC-SHA256(secret, name)), the secret 32 random bytes made at each start), so every
+  response looks the same (status, headers, body, a proof of the same length) whether or not the app exists, and
+  anyone who can reach the port can't list the installed apps. The client's check then fails as for a wrong token.
   Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
   app's token; they can read the CLI's token already.
 - The API never sends CORS headers.
@@ -1889,6 +1964,18 @@ gateway can never reach the API.
     `gateway_scripts` off, `allow-scripts` and `'unsafe-eval'` are dropped and `script-src 'none'` added, as on
     the path gateway. `allow-same-origin` keeps the page's own origin (the sandbox still stops it navigating
     its top window or opening unsandboxed popups), and only its own origin's pages may frame it.
+  - A file is a page there only if its DAG names it so. A site's pages run script in its own origin, and a site
+    may hold files other people supplied (uploads, attachments, a mirror), so one of those must not be made to
+    render as HTML, SVG or XML there. `?filename=` only names a download: it sets `Content-Disposition:
+    attachment; filename*=UTF-8''<name>` and never the type, which comes from the path's own last name as
+    below. A file reached by a path inside the site's DAG whose name gives no type is sniffed only to a passive
+    type: an image, audio, video, font, `application/wasm` or `text/plain; charset=utf-8` (rnfs:
+    `gateway.SITE_SNIFFED_TYPES`); content that would sniff as anything else (HTML, SVG, PDF) is
+    `application/octet-stream`. With `nosniff` on every response, the browser doesn't second-guess either. A
+    site's `index.html`, and the files its DAG names `.html`, `.svg` or another page type, render as before:
+    those are the site. A site whose root is itself a file (no path) is sniffed as on the path gateway, HTML
+    included: that file is its origin's only content, so whoever made it could have published it as a site of
+    its own, and a name can point straight at a one-page HTML file.
   - Everything else is as on the path gateway: no CORS headers (a page's `fetch()` of its own site is
     same-origin and needs none, and every other origin is refused for want of one), sealed files never
     decrypted, the deny list, sizes, `gateway_fetches` and the caching rules.
@@ -1896,7 +1983,9 @@ gateway can never reach the API.
     gateway. Links between sites must be absolute (`http://<other>.rnfs.localhost:<port>/`), and the cookie
     caveat of section 10 applies.
 - **Files.**
-  - Content-Type comes from the path's file name or `?filename=`, or else from sniffing the content.
+  - Content-Type comes from the path's file name or `?filename=`, or else from sniffing the content. On the path
+    gateway, `?filename=` also gives `Content-Disposition: inline; filename*=UTF-8''<name>`; sites use the path's
+    name only and sniff a file inside their DAG only to passive types (above).
   - Range requests for one `bytes=` range are supported; another or malformed `Range` header is ignored and
     the whole file sent.
   - `/rnfs/` responses carry `ETag: "<cid>"` and `Cache-Control: immutable`.
@@ -2062,6 +2151,9 @@ the library). Never through the gateway: web pages must not make the node fetch.
     metadata (stored by RNS before it decodes it) must be a map of at most 16 entries whose keys are strings and
     whose values are strings, integers, booleans or nil, at most 4 KiB in all; otherwise it is removed unread and
     the link closed;
+  - an answer without metadata (a page) whose advertised total size is over 16 MiB is refused at its first segment,
+    before any part is requested (the add fails as too large): RNS reads such an answer whole into memory and
+    decodes it before handing it over, while a file comes as an open file, so files keep only the bound above;
   - a page answer must be `[request_id, page]` with the page one `bin` or `str` (or `nil` or `False`, which fail the
     add), checked from its msgpack headers before RNS decodes it, as `rnfs.dht` responses are (section 3); a file
     answer is copied, no larger than the advertised total, inside the response callback (RNS deletes it after);

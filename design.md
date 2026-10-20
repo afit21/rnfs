@@ -151,13 +151,16 @@ rnfs/
                       same for NomadNet links this node opened, against a page's shape; the half-open
                       incoming link cap per destination (3)
     nomadnet.py       fetching a page or file from a NomadNet node over a link of its own, bounded per link
-                      (Transfer: segment sequence and decompression bound, metadata check) (11)
+                      (Transfer: segment sequence and decompression bound, a page's size, metadata check) (11)
     server.py         RequestServer: handlers, every section 3 limit, airtime policy, feature paths (3, 7)
     client.py         PeerClient: /find, /provide, /blocks (with stall detection), /pin, ping (sections 3, 6, 7)
     announces.py      rnfs.dht announces carrying the DHT mode, and the announce handler (section 3)
     identity.py       node identity file, node ID helpers
   mesh.py             provider ranking (PathInfo, provider_rank, RnsPaths), airtime policy, Traffic (3, 6)
-  names.py            NameManager: name keys, records, publish, resolve, sequences, keeper hook (section 9)
+  names.py            NameManager: name keys, records, publish, resolve, sequences, keeper hook, announces
+                      held while the clock is behind a name's last announce (section 9)
+  clockskew.py        ClockSkew: the clock's offset from heard announces' emission times, for a warning; no
+                      RNS (section 9)
   name_sync.py        NameSync: names kept pointing at a folder's content, settle time, hourly limit (section 9)
   denylist.py         DenyList: denied CIDs and file hashes, local entries, accepted lists (section 8)
   fetcher.py          fetching a target from providers; observing() for job progress (sections 6, 7)
@@ -365,7 +368,8 @@ changed through a SNAPSHOT `RowStore` taking the table's lock; it imports the st
 which lookups import, needn't.
 
 `providers.py` — `ProviderStore(state_dir, record_budget=1 GiB, *, ttl=PROVIDER_TTL, clock=time.time, rng=random,
-max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None)` (`state_dir` holds the
+max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None, monotonic=time.monotonic,
+write_budget=WRITE_BUDGET)` (`state_dir` holds the
 state database; None: a private in-memory one, `statedb.connect_memory`, so tests run the same code):
 `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher, keys, withdrawn) -> int`,
 `retain(keep) -> int` (drops every record and the standing of publishers `keep` rejects: private mode's
@@ -383,17 +387,32 @@ Records live on disk and are read per key. Nothing in memory grows with the reco
 - `save()` writes all of it in one transaction (NORMAL), then measures (`_measure`): the node's `maintain()`
   call, every 30 s (`RECORDS_INTERVAL`), expires and saves; a store saves itself once `FLUSH_CHANGES` (20 000)
   changes wait, and past `MAX_CHANGES` (saves failing) refuses others' new records rather than hold more. A refresh
-  writes nothing unless it moves the last-stored time by more than an hour (`REFRESH_WRITE`), or its day is a new
+  writes nothing unless it moves the last-stored time by more than 6 hours (`REFRESH_WRITE`), or its day is a new
   refresh day; a refusal writes nothing.
+- The write budget (`_WriteBudget`, REV2), full or not: new records and withdrawals spend rows from pools refilled
+  on `monotonic` per `WRITE_WINDOW` (30 s, the node's save interval), `WRITE_BUDGET` = (60, 30, 30): the first
+  open to every tier, the others kept for Earned and Known, who spend their own first; each pool starts full and
+  carries at most `WRITE_CARRY` (720) windows, 6 hours. `_store` refuses a new record of another publisher when its
+  pools are empty, as `_FULL` (so `provide` stops looking for the rest of the batch), and spends a row once it is
+  added; `_withdraw` spends one if any is left, never refusing. Every record inserted is deleted at most once, so
+  the rows written stay within twice the budget. A withdrawn record is kept in `_withdrawn` until the save (each is
+  a deleted row in `_dirty`, so bounded with it): stored again before then, `_store` adds it back with its
+  first-stored time (its last-stored time moved only past `REFRESH_WRITE`) as a refresh, spending nothing.
+  Measured on a 1M-record database, a new record costs about 12 kB of writes (WAL and checkpoint) for one publisher's
+  and 36 kB for a fresh identity's (its standing rows too), so a Newcomer flood writes at most about 150 kB/s;
+  without the budget one identity's store-and-withdraw loop wrote 10-20 MB/s.
 
 Each publisher's standing (`_Standing`: first seen, records held, tier, refresh days and the last of them) keeps
 the counts the budget and tiers need: `_tier_records` (records per tier, this node's in a tier of its own, `OWN`)
 and `_publishers`, read from `provider_standing` at load (`SUM ... GROUP BY tier`), and changed with each record
 (`_count_records`). A publisher left without records keeps its standing only if it has refresh days, until a TTL
-after the last (`maintain`'s hourly `_forget_departed`). The tier is worked out when the publisher stores
-(`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or removed since
-is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it), or by the
-hourly check of those written as Known.
+after the last (`maintain`'s hourly `_forget_departed`), and at most `MAX_DEPARTED` (50,000, about 5 MB) of them:
+right after the hourly pass's save, `_cap_departed` counts them on disk (by `provider_standing_tier`) and forgets the
+excess, fewest refresh days first, then the longest unrefreshed (REV11: they were capped only by the TTL, so
+identities refreshing one record a day later and withdrawing it grew them). The tier is worked out when the
+publisher stores (`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or
+removed since is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it),
+or by the hourly check of those written as Known.
 
 Room: `_capacity()` is `record_budget` over the bytes a record takes, or the records held at the last measure plus
 the free disk beyond the reserve (`free_space()`; the node passes `shutil.disk_usage` of the state directory less
@@ -409,8 +428,12 @@ table); both, and `_oldest_key`'s position in each publisher's records, are rese
 costs a few reads and O(log n) in memory: about 70 µs on a desktop, a third of them SQLite's. Once a batch's key is
 refused for room, `provide` refuses its other new keys without looking again (NEW-8).
 
-A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the
-lowest tier among the rest gives way if that tier is below the storer's, or is the storer's and not Earned.
+A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the rest
+gives way, by tier in an order the storer's tier and the Newcomers' share of the key (`KEY_NEWCOMER_SHARE`, 10%,
+counted among the rest) set: a Newcomer takes Earned then Newcomer records while Newcomers are below their share, else
+only Newcomer ones; an Earned storer Earned then Newcomer ones while Newcomers are within their share, else Newcomer
+then Earned ones; a Known storer the same, then Known ones (REV3: Earned records never gave way to each other, so
+1000 Earned identities could hold a key against all but Known publishers).
 This node's records are never counted there, never evicted and never refused. Expiry (`_expire`) reads expired
 records through `provider_records_last`, `SWEEP_BATCH` at a time with the lock let go between batches, and, while
 full, Newcomers' records last stored 4.5 days ago (`_NEWCOMERS_EXPIRED`, joined with their standing; the tier
@@ -689,7 +712,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "announces_held", "clock_offset", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -860,7 +883,16 @@ the request is read). `serve` hands a site request to
 every segment with `decode_segment` (an empty one is 400), resolves a name through `resolve_name` (the same cache
 and `gateway_fetches` slot) and calls `serve_target`, the path gateway's own serving, with a redirect location
 rebuilt from the decoded names (`quote(name, safe="")`), so it is always a path on the site. Logs name the site
-by its base32 CID or name (`path_for_log`, and `host_for_log` for the debug log's Host). No Origin header is
+by its base32 CID or name (`path_for_log`, and `host_for_log` for the debug log's Host). A site's page has a real
+origin, so a file someone else put into the site's DAG must not render there (REV6): on a site `serve_target`
+passes `serve_file` the path's own last name, never `?filename=`, which only sets `Content-Disposition: attachment`
+(the path gateway keeps `inline` and the type from it), and for a file reached by a path inside the site's DAG
+(`serve_file(..., passive_only=True)`) `file_type` turns a sniffed type outside `SITE_SNIFFED_TYPES` (images,
+audio, video, `font/woff2`, `application/wasm`, UTF-8 plain text) into `application/octet-stream`. An allow-list
+rather than a deny-list, so a type `sniff` learns later is passive on sites until added. A site whose root is
+itself a file is sniffed freely, HTML included: it is its origin's only content, so an attacker gains nothing they
+couldn't with a CID of their own, and a name can point straight at a one-page HTML file. The HEAD and range paths, which use the name alone when the first bytes aren't stored, get the
+same name. No Origin header is
 checked: a page's `fetch()` of its own site is same-origin and needs no CORS header, and every other origin is
 refused by the browser for want of one, as on the path gateway. `rnfs url` (`cli.site_url`) prints a target's site
 URL without asking the daemon: the gateway port from `daemon.json`, else `rnfs.toml`.
@@ -900,8 +932,11 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `ApiHandler.caller()` answers `api.CLI` for the API token (no `X-Rnfs-App`), `"app:<name>"` for an app's token
   with `X-Rnfs-App` naming it (`AppRegistry.verify`, constant time, also for names there aren't), None
   otherwise; `dispatch` keeps it in `principal`. `proof_key()` keys `X-Rnfs-Proof` with the API token, or
-  (`X-Rnfs-App`) with `AppRegistry.proof_key` (the verifier in hex), None for an app there isn't. A node without
-  `apps` (a stand-in) lets no app in.
+  (`X-Rnfs-App`) with `AppRegistry.proof_key`: the verifier in hex, or for an app there isn't
+  HMAC-SHA256(`_secret`, name) in hex, `_secret` being random bytes made when the registry is (each start). Both
+  are computed for every name, so the answer and its time are the same whether or not the app exists, and anyone
+  who can reach the port can't list the apps (REV9). A node without `apps` (a stand-in) lets no app in and sends
+  no proof for one.
 - **Discovery.** `cli.run_daemon` writes `<rnfs dir>/daemon.json` (`apiclient.DAEMON_FILE`; `cli.write_daemon_info`,
   `fsutil.write_atomic`, 0600, private) once its servers listen and its token is written, and removes it when it
   stops if it still names its PID (`remove_daemon_info`). `apiclient.read_daemon_info` reads it without following a
@@ -1101,7 +1136,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
@@ -1358,16 +1393,32 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   the marker as one global header (its 47 bytes well within `MAX_GLOBAL_BYTES`), which `tarfile` keeps as the
   stream's `pax_headers`; a marker with nothing after it but the end blocks isn't a tar to `tarfile` (it fails
   at offset 0), but packing always writes the top directory after it.
-- Unpacking a sealed folder (`get_sealed`, for a sealed folder unless `no_extract`): `unpack_sealed` checks the free space for the plaintext twice where the blocks and the output share a
-  filesystem (`_check_free_space` with the plaintext added to what is still to fetch, and `Storage.check_disk`
-  for the blocks' own), then, inside a protection session of its own (within the fetch's), feeds the
+- Unpacking a sealed folder (`get_sealed`, for a sealed folder unless `no_extract`): `unpack_sealed` first reads
+  the tar's headers (`tarstream.scan_tar` over a seekable `_PlainReader`, which decrypts a segment only when a
+  read reaches it and keeps the last one, so the data `tarfile` seeks past isn't decrypted), placing members by
+  `build_tar`'s own rules (`_place`) without storing anything: an invalid tar is `NotATar`, a limit `TooLarge`,
+  before the first block. Its `Extent` gives what the entries take in allocation units, not bytes
+  (`fsutil.allocation_unit`: `statvfs`'s `f_frsize`, the cluster size on Windows, at least 4 KiB): in the store
+  each file's 64 KiB chunks and the nodes above them and each directory's listing, every block rounded up to a
+  unit; on output each file's size and each directory's listing rounded up the same way, at least a unit each.
+  `_check_unpack_space` checks both where they share a filesystem (`_check_free_space` with the stored part
+  added to what is still to fetch, and `Storage.check_disk` for the blocks' own); a tar of tiny files takes
+  about 8 KiB an entry on 4 KiB filesystems where the plaintext's bytes, counted twice, said 2 KiB. Then,
+  inside `_unpacking` (below) and a protection session of its own (within the fetch's), it feeds the
   decrypted segments (`IteratorReader` over `SealedFile.read()`) to `tarstream.build_tar` through a
   `Session.writer()`, with the deny list's hash check, and writes out with `walker.write_out` from the stored
   blocks (`Storage.getter()`). The target is the root's one entry if it is a directory, else the root. A
   `ValueError` from `build_tar` (not `SealError` or `BlockMismatch`) means the plaintext isn't a valid tar:
   `NotATar`, and `get_sealed` writes the file with `write_sealed` and a warning (only a marked tar gets here). `TooLarge` is raised again
   naming `--no-extract`. In every case the session ends and `storage.collect()` deletes what nothing else
-  reaches, so the plaintext is never pinned, recorded as a fetch or provided.
+  reaches, so the plaintext is never pinned, recorded as a fetch or provided. The session is in memory, so
+  `_unpacking` keeps a mark in the state database for a process that dies before that collection: the first of
+  the unpacks running sets meta `sealed_unpack`/`open` to 1, durably, before any block is stored, and after each
+  collection the mark is cleared once no unpack is running (a count under `node._unpacks_lock`). A start that
+  finds it set (`collect_unpack_leftovers`, in `_setup` once the name pins are reconciled, before anything is
+  provided) runs `storage.collect()` and clears it; a failure is logged and leaves it for the next start. That
+  collection takes every unreached block, so the unrecorded blocks of a fetch the same crash interrupted go too
+  (a retry fetches them again), as any collection would take them. No schema step: the meta table holds it.
 - Sealed folders (`add_sealed_path` of a directory): `folder_sealed_name` refuses a name `<name>.tar` couldn't
   carry (over 251 bytes, invalid) and `seal_name=False` before anything is read, rather than sealing unnamed as
   a file with an invalid name is. `tarstream.folder_chunks` is a generator writing the tar as it walks
@@ -1396,7 +1447,10 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   `guards.mark_nomadnet` right after `RNS.Link` is made), identifies if asked, and sends one request; a "Request
   Not Allowed" answer on an identified link is retried once after identifying again. Per request a `Transfer` holds
   the state RNS's callbacks fill in, hooked on the link: `set_resource_started_callback` (`resource_started`:
-  `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1, then `segment_refusal`), and on the link instance
+  `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1, then `segment_refusal`, then on the first segment of an
+  answer without metadata its total against `MAX_PAGE_SIZE`, 16 MiB, reported as `TooLarge`: RNS's
+  `Link.response_resource_concluded` reads such an answer whole and unpacks it, about twice its size in memory,
+  whereas a file arrives as an open file and is copied in chunks), and on the link instance
   `resource_concluded` (RNS's, then the assembled size against the total and, on segment 1, `metadata_refusal` on
   the `.meta` file RNS wrote, removed if refused so RNS never decodes it) and `receive` (notes an advertised size
   over the bound, which RNS rejects silently, to report `TooLarge`). Refusing cancels the Resource and tears the
@@ -1783,6 +1837,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   raising it, at most every 5 s, and by the re-announce loop when changed); `name_exports` (keys known to exist
   outside this node: exported by `name export` (`NameManager.mark_exported`, called by the node's
   `name_export`, not by `export_key`, which keepers also use) or imported, and when; FULL, at each);
+  `name_announces` (0.2.0: each local name's last announce from here, its emission in whole seconds, and the
+  seconds its announces have been held since; kept when the name is removed; FULL when an emission changes, after
+  the announce, NORMAL for held time grown 15 minutes and at stop; a malformed row is dropped);
 - `shared_folder` (FULL) and `shared_folder_files` (the shared folder's per-file cache, `FolderFiles`: one row per
   file per top-level entry, the `dump()`ed entry name and `[device, inode, size, mtime_ns, execute bit]` as text,
   the CID, its height and the content SHA-256 if one was computed; a `RowStore` in SNAPSHOT mode, NORMAL with the
@@ -2107,6 +2164,18 @@ Everything in the specification is implemented, with these simplifications and a
   the check can't redirect it. On POSIX, the first directory above it owned by another user (not root) or writable
   by group or others (unless sticky and what is below it is the user's or root's) is warned about once
   (`loose_ancestor`).
+- `add` never adds the rnfs dir (audit REV1). `RnfsNode.add_path`, and the jobs feature's `submit` before queueing,
+  refuse (`ValueError`) a path `shared_folder.add_refused_reason` rejects: `refused_reason` of its real path (the
+  rnfs dir, a directory holding it, inside a `PRIVATE_SUBDIRS` one), or inside the rnfs dir but outside `files/`
+  (`api_token`, `rnfs.toml`, the Reticulum `config`). The path check misses another way to those directories, such
+  as a bind mount, so every walk also carries `BuildOptions.skip_dirs`, the `(st_dev, st_ino)` of the rnfs dir and
+  each private subdirectory, resolved (`shared_folder.private_dirs`, taken at the start of each add, scan and name
+  sync scan; one with `st_ino` 0 is left out): `_build_tree` and the sealed folder's `tarstream._pack_directory`
+  skip a listed directory in it with a warning (`builder.is_skipped_dir`, `PRIVATE_DIR`) before opening it,
+  `build_path` and `add_sealed_path` refuse a root in it (`check_root`), the shared folder refuses a folder in it
+  (`_check_target`) and skips a top-level entry in it (`_scan_item`), name sync refuses a folder in it
+  (`_opened_problem`), and an add job's `tree_size` doesn't count it. On Windows the listed stat comes from the
+  path (`listed_stat`), which has the file index as `st_ino`.
 - The identity file (`network/identity.py`) is opened with `O_NOFOLLOW | O_NONBLOCK` after an lstat that must
   show a regular file, not a link; the descriptor must be that same regular file (device and inode), owned by
   the user, and is tightened through `fchmod` if loose. The key is read from it (`RNS.Identity.from_bytes`),
@@ -2157,6 +2226,24 @@ Everything in the specification is implemented, with these simplifications and a
   unsettled with batches left, `resume` runs `find_providers` again, but only if the last search was stopped
   early (`cut_short`) and some of its candidates were asked, so resumes stay within the batch bound and the
   lookup's deadline.
+- **Announces and the clock.** `NameManager._announce` asks `_announce_held` first: the name's last announce is the
+  later of its `name_announces` emission (written after each announce, from the clock read after
+  `Destination.announce()` returns, so never earlier than what RNS signed) and `RnsNetwork.emitted_time(name)` (a
+  path RNS took from the key's announces elsewhere, before it was registered here). While the wall clock is
+  before it, nothing is announced, the name is in `_holding` (alias: `_Hold`, whose reason a publish returns as
+  `announce_held`), and `_next_announce` rechecks it in `HOLD_RECHECK` (60 s), so an NTP step is seen within a
+  minute. The hold is counted in monotonic time into `_Announced.held` (`_count_hold`, at each recheck, removal
+  and stop), saved across restarts, and ends at `HOLD_LIMIT` (7 days, RNS's `DESTINATION_TIMEOUT`): a Pi whose
+  clock resets to the same old time at every boot would otherwise hold for ever, while RNS's paths have lapsed by
+  then. The same second as the last announce isn't held (RNS drops that one too: an announce must be strictly
+  later), so a frozen test clock and quick publishes behave as before. `NameManager.clock_skew` (`ClockSkew`)
+  takes samples from `_heard` (live announces of names no resolve is waiting for: through a shared instance a
+  path answer arrives as an announce) and from `RnfsNode._announced` (rnfs.dht announces, not path responses),
+  both reading the path's newest emission, which is the announce's own since RNS calls handlers only for one that
+  takes the path. Each sample is kept as emission less monotonic arrival, per sender its largest in a window of
+  2 × `announce_interval`, at most 128 nodes and 128 names; the estimate is the median over the nodes and as many
+  names as make up 5 senders, otherwise fewer than the nodes. It is reported (`report`, logged by names) past
+  300 s, and again once back within 240 s.
 - **Names.** A key imported, or found without a `names_published` row, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins the new
   target, saves its row (the commit point; a failed commit rolls the record back and releases the new pin) and only
@@ -2219,10 +2306,13 @@ Everything in the specification is implemented, with these simplifications and a
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.
 - **Sealed folders.** Unpacking stores the plaintext as blocks before writing the files (both rule sets
-  reused as they are, rather than a second tar extractor), so it needs the space twice on one disk; they are
-  collected by `storage.collect()`, which walks every pin, right after. A marked sealed `.tar` that isn't a
-  valid tar is decrypted twice (once into `build_tar`, once to the file); one with a malformed header after the
-  marker fails at once, before anything is stored. Where the output's name must be chosen before the get (a
+  reused as they are, rather than a second tar extractor), so it needs the space twice on one disk, counted in
+  allocation units; they are collected by `storage.collect()`, which walks every pin, right after (or at the
+  next start, if the process died first). The header scan decrypts the segments holding headers once more: for
+  a tar of large files a few segments, for one of small files all of it (bounded by `max_output_entries`
+  entries). A marked sealed `.tar` that isn't a valid tar is found so by the scan, before anything is stored,
+  and decrypted again to the file. The disk count is an estimate: filesystem metadata beyond a unit per entry
+  (a fresh block store's shard directories, up to 4 MiB once) falls within the disk reserve. Where the output's name must be chosen before the get (a
   daemon without the job manager, or a path target ending in `.tar`, whose job keeps its visible name), the CLI
   asks `GET /api/info` first and drops `.tar` only when it says `sealed_folder`; an older daemon doesn't say
   it, and doesn't unpack. `POST /api/add/stream?format=tar`
@@ -2230,7 +2320,9 @@ Everything in the specification is implemented, with these simplifications and a
   added from a path.
 - **Sealed files.** `get` of a *directory* containing sealed files writes them as stored (get each with
   `get <cid>/<path>`). Sealing hides content and name but not size, recipients or wrapper names, and gives no
-  sender authentication. A sealed file's 65600-byte segments don't align with 64 KiB chunks, so a
+  sender authentication. A recipient opens it with its node identity's private key, which the node holds
+  while it runs and keeps unencrypted in `storage/identity`: sealing protects against the network, not
+  against someone who can read the recipient's rnfs dir. A sealed file's 65600-byte segments don't align with 64 KiB chunks, so a
   one-segment range read may fetch two chunks. Jobs (`get` without `--raw`) decrypt as plain `get` does.
 - **Mesh.** Attached to a shared `rnsd` instance, every incoming link arrives on the local shared-instance
   interface, so `serve_interfaces`/`no_serve_interfaces` can't tell radios apart (a warning is logged); run

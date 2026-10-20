@@ -64,7 +64,9 @@ class AppRegistryTest(unittest.TestCase):
         self.assertFalse(self.apps.verify("wiki", token + "x"))
         self.assertFalse(self.apps.verify("other", token))
         self.assertEqual(self.apps.proof_key("wiki"), app_proof_key(token))
-        self.assertIsNone(self.apps.proof_key("other"))
+        # An app there isn't gets a key too, which no token gives (REV9: the API's answer mustn't say it is missing)
+        self.assertRegex(self.apps.proof_key("other"), "^[0-9a-f]{64}$")
+        self.assertNotEqual(self.apps.proof_key("other"), app_proof_key(token))
         rows = state_rows(self.state, "SELECT name, verifier, created FROM apps")
         self.assertEqual(rows, [("wiki", app_verifier(token), added["created"])])
         with open(os.path.join(self.state, statedb.DB_FILE), "rb") as f:

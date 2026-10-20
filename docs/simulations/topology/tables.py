@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+OUT = "out"  # relative: run from this folder (docs/simulations/README.md)
 
 FMT = {
     "found": lambda v: f"{100 * v:.0f}%",

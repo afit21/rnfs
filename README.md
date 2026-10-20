@@ -365,7 +365,10 @@ shared automatically. `rnfs pin rm <cid>` stops sharing, and `rnfs gc` frees spa
 didn't pin. By default your node also shares what you download while it's cached, so others can see what you
 fetched; `provide_strategy = "pinned"` shares only what you pin. Every file and folder inside what you pin is also
 findable by its own CID (`provide_entries`), so a file you shared in a folder can be fetched without the folder's
-CID; on a slow radio node, only while there are few of them.
+CID; on a slow radio node, only while there are few of them. That also lets anyone who has one of those files look
+up its CID and see that your node holds it, so pin only what may be known to be on your node, or set
+`provide_entries = false`. `add` refuses the rnfs dir (`~/.rnfs`) and any folder holding it, such as `~`: it holds
+your node's keys and API token.
 
 ### 4. Names: a link that can change
 
@@ -521,8 +524,8 @@ you can open, and unpacks a sealed folder to its directory (`--no-extract` keeps
 stored bytes, which is what scripts that show content to others should use.
 
 **Gateway** (`http://127.0.0.1:8789`): `/rnfs/<cid>[/path]` and `/name/<name>[/path]` serve files and
-directories; `?filename=` sets the type and download name; `?format=raw` and `?format=archive` return data you
-can check against the CID. Pages are sandboxed and can't read the gateway's responses, and sealed files are
+directories; `?filename=` sets the type and download name (on a site, below, only the download name);
+`?format=raw` and `?format=archive` return data you can check against the CID. Pages are sandboxed and can't read the gateway's responses, and sealed files are
 never decrypted there. Each CID and name also has a site of its own, `http://<k-cid>.rnfs.localhost:8789/[path]`
 (`rnfs url <cid>` prints it) and `http://<name>.name.localhost:8789/[path]`, whose pages can read their own
 files; browsers resolve `*.localhost` themselves, other tools should use the paths above.
@@ -571,7 +574,9 @@ with rnfs.Node("~/.myapp/rnfs") as node:          # or: rnfs.Client(), for the d
   Its pins get the source `app:myapp` (`with client.pin_key("inbox"): ...` makes them `app:myapp:inbox`'s, a group
   your app can hold and release on its own); `client.unpin()` releases only your app's, and `rnfs app rm myapp`
   revokes the token and releases them all. The token isn't scoped: your app can do anything the user's `rnfs`
-  command can, but manage apps.
+  command can, and so in effect manage apps too. `rnfs app` itself refuses an app's token, but an app can read
+  and write files as the daemon's user (`add`, `get`, `export`), which is enough to reach the command line's own
+  token. Give a token only to software you would trust with `rnfs` itself.
 - A `Client` waits as long as each request takes unless given `timeout=`; `with client.timeout(5): ...` bounds
   just the calls your thread makes inside it (a `Node` accepts it too, and does nothing).
 - `examples/rnfs_share.py` is a runnable example using either class; design.md's "Public API" section is the
@@ -650,6 +655,9 @@ rnfs --dir /tmp/b --api-port 9002 get <cid> -o out
 - Sybil attacks can make a CID hard to find (`get --from` bypasses the DHT), but data can never be forged.
 - Sealed files hide content and file name, not size or recipients, and don't prove who sealed them. `get` of a
   directory leaves sealed files inside it encrypted.
+- A sealed file is readable by whoever holds the recipient's node identity, which is online whenever the node
+  runs and stored unencrypted in the rnfs dir (`storage/identity`): sealing protects against the network, not
+  against someone with access to the recipient's disk.
 - Under the default `provide_strategy = "roots"`, anyone can learn what your node downloaded. With
   `provide_entries` (on by default), anyone can learn which files your pinned folders hold by looking up each
   file's CID, without knowing the folder.

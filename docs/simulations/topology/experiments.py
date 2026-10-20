@@ -9,7 +9,7 @@ from collections import defaultdict
 
 from sim import K, Sim, Stats, World, true_closest
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+OUT = "out"  # relative: run from this folder (docs/simulations/README.md)
 os.makedirs(OUT, exist_ok=True)
 
 STRATS = {

@@ -330,6 +330,31 @@ class SafeDefaultNameTest(unittest.TestCase):
         self.assertEqual(fsutil.printable(5), "5")
 
 
+class AllocationUnitTest(unittest.TestCase):
+    """allocation_unit: the filesystem's fragment or cluster size, at least MIN_ALLOCATION_UNIT."""
+
+    def test_the_real_filesystem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = fsutil.allocation_unit(tmp)
+        self.assertGreaterEqual(unit, fsutil.MIN_ALLOCATION_UNIT)
+        self.assertEqual(unit % 512, 0)
+
+    def test_large_and_small_units_and_failures(self):
+        def statvfs(units):
+            """An os.statvfs giving f_frsize units (raising OSError for None)."""
+            def answer(path):
+                """The statvfs result."""
+                if units is None:
+                    raise OSError("unsupported")
+                return types.SimpleNamespace(f_frsize=units, f_bsize=4096)
+            return answer
+
+        for units, expected in ((128 * 1024, 128 * 1024), (1024, fsutil.MIN_ALLOCATION_UNIT),
+                                (None, fsutil.MIN_ALLOCATION_UNIT), (0, fsutil.MIN_ALLOCATION_UNIT)):
+            with self.subTest(units), mock.patch.object(os, "statvfs", statvfs(units), create=True):
+                self.assertEqual(fsutil.allocation_unit("."), expected)
+
+
 
 class LockTest(unittest.TestCase):
     """lock_exclusive and lock_holder, across processes as daemons use them."""

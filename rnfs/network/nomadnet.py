@@ -19,7 +19,9 @@ links keep every rule they have, and an embedded node leaves its host's settings
   every segment to carry the first one's original hash and total size, the next segment index (the previous one
   complete), and the segment count an honest sender computes from that total (segment_refusal). RNS checks neither
   the sequence nor the decompressed size against the total, so a node could otherwise send segments without end.
-  Anything else cancels the transfer and closes the link.
+  An answer without metadata (a page) is refused at its first segment if its total is over MAX_PAGE_SIZE: RNS reads
+  such an answer whole into memory and decodes it (Link.response_resource_concluded), while a file is handed over
+  as an open file. Anything else cancels the transfer and closes the link.
 - After each segment (Transfer.resource_concluded, which RNS calls as a segment completes, before it decodes a
   file's metadata): what RNS has assembled must be no larger than the advertised total, and a file's metadata must
   be a small flat map (protocol.metadata_refusal), else it is removed unread and the link closed.
@@ -48,6 +50,9 @@ from rnfs.network import guards, links, protocol
 
 SEGMENT_SIZE = RNS.Resource.MAX_EFFICIENT_SIZE  # the most an honest Resource segment holds, metadata included
 SEGMENT_LIMIT = SEGMENT_SIZE + 1  # each segment's max_decompressed_size: RNS refuses one that reaches it unfinished
+# The largest answer without metadata (a page): RNS reads one whole and decodes it into a second copy before rnfs
+# sees it, so this, not the free disk, bounds its memory. NomadNet pages are micron text, a few KiB
+MAX_PAGE_SIZE = 16 * 1024 * 1024
 FLOOR_RATE = 32  # bytes/s: an answer slower than this overall fails (about 256 bit/s, below the slowest LoRa)
 COPY_CHUNK = 1024 * 1024  # bytes copied at a time from RNS's file
 PARTIAL_PREFIX, PARTIAL_SUFFIX = ".rnfs-nomadnet-", ".partial"  # the copy's name in the caller's directory
@@ -111,6 +116,7 @@ class Transfer:
         self.first = self.previous = None  # the answer's first and latest Resource segments
         self.refused: str | None = None  # why the answer was refused, if it was
         self.too_large: int | None = None  # an answer's advertised size over max_size, which RNS rejected
+        self.page_too_large: int | None = None  # a page answer's advertised size over MAX_PAGE_SIZE, refused here
         self.answered = False
         self.empty = False  # answered None or False: nothing, or an answer the guards refused
         self.size = 0  # bytes of the answer copied
@@ -137,10 +143,15 @@ class Transfer:
 
     def resource_started(self, resource):
         """RNS's resource_started callback (before any of the segment arrives): bound its decompression and check
-        its place in the sequence (segment_refusal); refuse it otherwise."""
+        its place in the sequence (segment_refusal) and, for a page, its total (MAX_PAGE_SIZE: later segments must
+        carry the first's total and metadata flag); refuse it otherwise."""
         resource.max_decompressed_size = SEGMENT_LIMIT
         with self.lock:
             reason = segment_refusal(resource, self.first, self.previous)
+            if reason is None and self.first is None and not resource.has_metadata \
+                    and resource.total_size > MAX_PAGE_SIZE:
+                self.page_too_large = resource.total_size
+                reason = f"a page of {resource.total_size} bytes, over the {MAX_PAGE_SIZE} a page may have"
             if reason is None:
                 if self.first is None:
                     self.first, self.total, self.started = resource, resource.total_size, self.clock()
@@ -341,7 +352,7 @@ def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, 
     progress(received, total) is called from this thread about every links.POLL_INTERVAL while the answer arrives
     (total None until it is known), and may raise to stop the fetch (a job's Cancelled); stop_event, once set, stops
     it too. Raises NotFound (unreachable, no answer, an answer refused, or NomadNet's "Request Not Allowed" page),
-    TooLarge (the answer is over max_size), Cancelled, OSError.
+    TooLarge (the answer is over max_size, or a page over MAX_PAGE_SIZE), Cancelled, OSError.
     """
     link = open_link(target, config.path_timeout)
     try:
@@ -432,6 +443,10 @@ def _outcome(target: nomadnet.NomadnetLink, transfer: Transfer, max_size: int | 
     if transfer.too_large is not None and not transfer.answered:
         raise TooLarge(f"NomadNet node {name}'s answer to {path} is {size(transfer.too_large)}, over the "
                        f"{size(max_size)} allowed (max_download_size, or the free space above the disk reserve)")
+    if transfer.page_too_large is not None:
+        raise TooLarge(f"NomadNet node {name}'s answer to {path} is a page (an answer without file "
+                       f"metadata) of {size(transfer.page_too_large)}, over the {size(MAX_PAGE_SIZE)} a page may "
+                       f"have: RNS reads a page into memory whole")
     if transfer.refused is not None:
         raise NotFound(f"refused NomadNet node {name}'s answer to {path}: {transfer.refused}")
     if not transfer.answered:
