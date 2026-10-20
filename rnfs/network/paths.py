@@ -23,6 +23,9 @@ resolution too. A node therefore paces its own:
 - **A link that fails to establish costs a turn** (charge): RNS then expires the path and requests it again by itself
   (RNS 1.5.6 Transport.jobs, and rnsd for its local clients' links), which also counts as a request for its
   destination.
+- lacked(destination): whether the last wait for its path (or identity) ended without it, so a query that failed
+  for want of a path can be told from one whose link failed (partition mode leaves the former out,
+  rnfs.dht.local.PartitionMode).
 
 Blocking: never call it from an RNS callback thread.
 """
@@ -42,7 +45,7 @@ CEILING = 1.5  # path requests a second the busiest interface may already be sen
 CEILING_HOLD = 15.0  # seconds the ceiling holds a request back at most (RNS's IC_BURST_HOLD: a limit lasts that long)
 PATH_REQUEST_MI = 20  # RNS.Transport.PATH_REQUEST_MI: nothing is sent again for a destination within it
 POLL = 0.1  # seconds between checks while waiting for a turn or an identity
-MAX_TRACKED = 4096  # destinations the table of requests sent remembers at most
+MAX_TRACKED = 4096  # destinations each table (requests sent, paths lacked) remembers at most
 
 
 def _rns_transport():
@@ -93,6 +96,7 @@ class PathRequests:
         self._next_turn = -math.inf  # the earliest time the next turn may be
         self._waits: dict[bytes, threading.Event] = {}  # destination -> set when its owner's wait ends
         self._sent: OrderedDict[bytes, float] = OrderedDict()  # destination -> when last requested, oldest first
+        self._lacked: OrderedDict[bytes, None] = OrderedDict()  # destinations whose last wait found no path
         self._failure_log = ThrottledLog()
         # Counts, for tests and measurements
         self.requests = 0  # path requests sent
@@ -110,16 +114,21 @@ class PathRequests:
         caller's request (False)."""
         transport = self._transport()
         if transport.has_path(destination):
+            self._settle(destination, True)
             return True
-        return self._wait(destination, transport, lambda: bool(transport.has_path(destination)), timeout, cancel,
-                          rns_wait=True)
+        found = self._wait(destination, transport, lambda: bool(transport.has_path(destination)), timeout, cancel,
+                           rns_wait=True)
+        self._settle(destination, found)
+        return found
 
     def await_known(self, destination: bytes, known: Callable[[], bool], timeout: float,
                     cancel: threading.Event | None = None) -> bool:
         """Request a path to destination in its turn (its answer carries the identity) and wait until known() (polled
         every POLL) holds: True if it did within timeout of the request. For a node RNS has a path to but no identity
         for; as await_path otherwise."""
-        return self._wait(destination, self._transport(), known, timeout, cancel, rns_wait=False)
+        found = self._wait(destination, self._transport(), known, timeout, cancel, rns_wait=False)
+        self._settle(destination, found)
+        return found
 
     def send(self, destination: bytes, cancel: threading.Event | None = None) -> bool:
         """Request a path to destination in its turn on every interface, without waiting for the answer (names: the
@@ -141,6 +150,11 @@ class PathRequests:
             self._next_turn = max(now, self._next_turn) + self.spacing
             self._remember_sent(destination, now)
             self.charged += 1
+
+    def lacked(self, destination: bytes) -> bool:
+        """True if the last wait for destination's path (or identity) ended without it."""
+        with self._lock:
+            return destination in self._lacked
 
     # Internals
 
@@ -256,3 +270,14 @@ class PathRequests:
             if len(self._sent) <= MAX_TRACKED and now - oldest < PATH_REQUEST_MI:
                 break
             self._sent.popitem(last=False)
+
+    def _settle(self, destination: bytes, found: bool):
+        """Record how a wait for destination ended (lacked)."""
+        with self._lock:
+            if found:
+                self._lacked.pop(destination, None)
+                return
+            self._lacked[destination] = None
+            self._lacked.move_to_end(destination)
+            while len(self._lacked) > MAX_TRACKED:
+                self._lacked.popitem(last=False)

@@ -139,6 +139,21 @@ class PartitionModeTest(unittest.TestCase):
         self.assertFalse(mode.active or mode.probe_due())
         self.assertIsNone(mode.probe_target())
 
+    def test_failures_for_want_of_a_path_dont_count(self):
+        pathless = {ident(0x200 + n) for n in range(FAILURES_TO_ENTER)}
+        mode = PartitionMode(lambda n: False, clock=self.clock, no_path=pathless.__contains__,
+                             on_change=self.changes.append)
+        mode.answered(ident(0x400))  # a server to probe
+        for node_id in sorted(pathless):
+            mode.failed(node_id)
+        self.assertFalse(mode.active or mode.probe_due())
+        # A link failure counts, as before; and a probe's outcome counts whatever the reason
+        for n in range(FAILURES_TO_ENTER):
+            mode.failed(ident(0x300 + n))
+        self.assertTrue(mode.probe_due())
+        mode.probed(mode.probe_target(), False)
+        self.assertTrue(mode.active)
+
     def test_an_off_island_answer_resets_the_count(self):
         self.mode.failed(ident(0x200))
         self.mode.failed(ident(0x201))
@@ -462,6 +477,22 @@ class PartitionWiringTest(IslandCase):
         self.assertIn(self.backbone[0], self.node.publisher._withdrawals)
 
     write = LocalWiringTest.write
+
+    def test_not_entered_by_queries_without_a_path(self):
+        # Island relays in RNS's default full mode don't forward a request for a path they lack, and a hub drops those
+        # over its limit: such failures don't count towards partition mode, but still count in the routing table
+        lacked = set(self.backbone)
+        self.node._path_lacked = lacked.__contains__
+        self.cut()
+        self.node.lookups.search(ident(0x4444)).find_providers(lambda provider: None)
+        self.assertGreaterEqual(self.off_island(), FAILURES_TO_ENTER)
+        self.assertFalse(self.node.partition.active or self.node.partition.probe_due())
+        for node_id in set(self.backbone) & set(self.asked):
+            self.assertGreaterEqual(self.node.routing.row(node_id)[4], 1)  # its failed queries since last heard
+        # Link failures still enter it
+        lacked.clear()
+        self.node.lookups.search(ident(0x5555)).find_providers(lambda provider: None)
+        self.assertTrue(self.node.partition.active or self.node.partition.probe_due())
 
     def test_a_probe_ends_it(self):
         clock = FakeClock()

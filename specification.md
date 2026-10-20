@@ -840,7 +840,16 @@ or protocol constant changes.
   - after 3 failures in a row reaching off-island servers it knows (a `/find` unanswered, or a `/provide` for which
     no identified link could be opened; any off-island answer between resets the count; local ones don't count).
     A server it knows is one in its routing table or announce first-seen log, or whose identity or path RNS knows:
-    a `/find` reply can name made-up IDs, which always fail, and they don't count. The probe goes at once, to a
+    a `/find` reply can name made-up IDs, which always fail, and they don't count. Nor does a failure for want of a
+    path (rnfs: the last path request for the server went unanswered), which still counts in the routing table:
+    island relays in RNS's default `full` mode never forward a request for a path they lack, and a hub drops
+    requests over its limit (section 3), so on a connected network such failures are common (counted, 65–72% of
+    island publish rounds in the topology simulation entered partition mode with `full` relays). In a real
+    partition each off-island server's first failure is a link failure (a node that isn't a transport node then
+    expires the path and asks again, so later queries fail for want of one), so it is still detected: measured,
+    partition mode comes 2–14 s later (75 → 78 s, 131 → 145 s), and every partitioned publisher still enters it.
+    A probe's outcome counts whatever the reason. A node dropped wrongly from the routing table regains its
+    seniority within 2 × `announce_interval`. The probe goes at once, to a
     server that answered or announced itself recently (with none, nothing beyond the island having been heard since
     the start, the failures enter partition mode without one); or
   - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the

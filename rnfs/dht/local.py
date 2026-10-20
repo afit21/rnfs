@@ -26,7 +26,12 @@ records and the local-first search. No RNS dependency: the node judges each serv
   IDs, which fail, and 3 of them used to enter partition mode at once. Known servers' failures too only ask for a
   probe, as a server can name 3 identities it announced and lets fail: the probe goes to an off-island server that
   answered or announced itself recently, never to an ID that only ever failed. With none to probe (nothing beyond the
-  island answered or announced this run) the failures enter partition mode. In it, lookups and publishes use local
+  island answered or announced this run) the failures enter partition mode. A failure for want of a path doesn't count
+  either (`no_path`: the node's path request went unanswered, rnfs.network.paths.PathRequests.lacked): an island relay
+  in RNS's default `full` mode never forwards a request for a path it lacks, and a hub drops requests over its limit,
+  so on a connected network such failures are common. In a real partition each off-island server's first failure is a
+  link failure (a node that isn't a transport node then expires the path and asks again, so later ones lack a path),
+  so it is still detected; the probe's outcome counts whatever the reason. In it, lookups and publishes use local
   servers only (`allows`), so a lookup doesn't spend minutes on timeouts. Any off-island answer or fresh off-island
   announce ends it, and a probe (those recently heard or answered in turn, those that failed since after the rest)
   every PROBE_INTERVAL (slow nodes: SLOW_PROBE_INTERVAL, doubling to SLOW_PROBE_MAX, as each probe on radio costs a
@@ -172,7 +177,7 @@ class PartitionMode:
     """Whether this node is cut off from the servers beyond its island (see the module docstring). Thread-safe.
 
     is_local(id) says which servers are local; the rest are off-island. known(id) says which servers the node knows:
-    only their failures count. The node reports off-island answers (answered), failures (failed) and fresh announces
+    only their failures count; no_path(id) says a failure was for want of a path, which doesn't count. The node reports off-island answers (answered), failures (failed) and fresh announces
     (announced), asks probe_due() and probe_target() and reports the probe's outcome (probed); on_change(active) is
     called, without the lock, on entering and leaving, and on_probe() when failures make a probe due (so the node can
     send it at once). clock is monotonic, wall_clock gives since's wall time."""
@@ -180,10 +185,12 @@ class PartitionMode:
     def __init__(self, is_local: Callable[[bytes], bool], slow: bool = False,
                  on_change: Callable[[bool], object] = lambda active: None,
                  clock: Callable[[], float] = time.monotonic, wall_clock: Callable[[], float] = time.time,
-                 known: Callable[[bytes], bool] = _always, on_probe: Callable[[], object] = lambda: None):
+                 known: Callable[[bytes], bool] = _always, on_probe: Callable[[], object] = lambda: None,
+                 no_path: Callable[[bytes], bool] = _never):
         """Not in partition mode, nothing heard yet."""
         self.is_local = is_local
         self.known = known
+        self.no_path = no_path
         self.slow = slow
         self.on_change = on_change
         self.on_probe = on_probe
@@ -225,9 +232,9 @@ class PartitionMode:
 
     def failed(self, node_id: bytes):
         """A /find or /provide to node_id failed. Only an off-island server the node knows counts (a reply can name
-        made-up IDs): the FAILURES_TO_ENTER-th such failure in a row asks for a probe (on_probe), or with no server to
-        probe enters partition mode."""
-        if self.is_local(node_id) or not self.known(node_id):
+        made-up IDs), and only if the failure wasn't for want of a path (no_path): the FAILURES_TO_ENTER-th such failure
+        in a row asks for a probe (on_probe), or with no server to probe enters partition mode."""
+        if self.is_local(node_id) or not self.known(node_id) or self.no_path(node_id):
             return
         with self._lock:
             self._failures += 1

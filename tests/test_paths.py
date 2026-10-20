@@ -1,6 +1,7 @@
 """The node's path-request budget (rnfs/network/paths.py, specification section 3, "Path requests"), over a fake
 RNS.Transport: requests spaced, the wait outside path_timeout, one wait per destination, nothing sent again within
-PATH_REQUEST_MI, failed links charged, and the busiest interface's outgoing estimate as a ceiling."""
+PATH_REQUEST_MI, failed links charged, the busiest interface's outgoing estimate as a ceiling, and which waits ended
+without a path."""
 import threading
 import types
 import unittest
@@ -153,6 +154,18 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(self.times(), [0, 1])
         self.assertFalse(self.budget.await_known(C, lambda: False, 2))
         self.assertEqual(len(self.transport.requests), 3)
+
+    def test_lacked_tells_a_failure_for_want_of_a_path(self):
+        self.transport.answer = lambda destination: destination != A
+        self.assertFalse(self.budget.await_path(A, 5))
+        self.assertTrue(self.budget.await_path(B, 5))
+        self.assertTrue(self.budget.lacked(A))
+        self.assertFalse(self.budget.lacked(B) or self.budget.lacked(C))
+        self.transport.paths.add(A)  # heard since: no longer lacked
+        self.assertTrue(self.budget.await_path(A, 5))
+        self.assertFalse(self.budget.lacked(A))
+        self.assertFalse(self.budget.await_known(C, lambda: False, 2))  # an identity that never came
+        self.assertTrue(self.budget.lacked(C))
 
     def test_names_take_their_turn(self):
         self.budget.await_path(A, 30)

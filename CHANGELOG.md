@@ -580,6 +580,11 @@ Changed:
   concurrent waits for one destination share one request, and none is sent again within 20 s of the last. In the
   topology simulation a fresh fast node's hub no longer drops any of its requests and its first publish round takes
   41–45 s instead of 7 s (22–25 s with drops); island rounds take 60–80 s more of 25–31 minutes.
+- A query that failed for want of a path no longer counts towards partition mode (it still counts in the routing
+  table): island relays in RNS's default `full` mode never forward a request for a path they lack, and a hub drops
+  requests over its limit, so a node with local servers could enter partition mode on a connected network (in the
+  topology simulation 65–72% of island publish rounds with `full` relays). A real partition is still detected, a
+  few seconds later (the first failure for each server is a link failure).
 
 Faster:
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks

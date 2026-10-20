@@ -594,8 +594,9 @@ becomes exactly those it found local, and earlier local ones it didn't see are j
 `PathInfo`s of the destinations that are known servers. `first_count(named)`: `LOCAL_FIRST` (1) when
 `local_interfaces` names the island, else `LOCAL_FIRST_RADIUS` (3). `Lookups(local_first=)` passes those nodes as a
 search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock, known,
-on_probe)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)` (off-island:
-resets the failures, notes contact, ends it), `failed(id)` (off-island and `known(id)`: the `FAILURES_TO_ENTER`-th in
+on_probe, no_path)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)`
+(off-island: resets the failures, notes contact, ends it), `failed(id)` (off-island, `known(id)` and not
+`no_path(id)`, a failure for want of a path: the `FAILURES_TO_ENTER`-th in
 a row sets `_wanted`, a probe due at once, and calls `on_probe()`, or with no `_targets()` enters it), `announced(id)`
 (a fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the
 last (`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`,
@@ -669,7 +670,8 @@ link not established: a turn taken, and the destination counted as requested). A
 At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5), else it
 reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later callers
 wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than `PATH_REQUEST_MI`
-forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without sending. Counters
+forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without sending.
+`lacked(destination)`: the last `await_path` or `await_known` for it ended without (`_lacked`, at most `MAX_TRACKED`). Counters
 `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
@@ -1991,7 +1993,9 @@ Everything in the specification is implemented, with these simplifications and a
   (`local.judged(id) is False`); the publisher (`set_islands`) each `/provide` that recorded keys or opened no link.
   `_wired_lookup` adds `allowed=partition.allows`, and `_start_nodes` puts the K closest local servers first while it
   is active. Its `known` is `_knows_server` (`_is_server`, or RNS knows the identity, `_is_known`, or a path,
-  `_path_hops`), so made-up IDs a reply names don't count; its `on_probe` sets `_local_wake`, which `_run_local` waits
+  `_path_hops`), so made-up IDs a reply names don't count; its `no_path` is `_lacked_path` (`_path_lacked`:
+  `LinkPool.paths.lacked` once Reticulum runs, never before), so a query whose path request went unanswered doesn't
+  count either (the routing table still counts it); its `on_probe` sets `_local_wake`, which `_run_local` waits
   on between checks (`LOCAL_CHECK`), so the probe failures ask for goes at once; `stop` sets it too. `check_local`
   probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
   `rnfs-local` thread; an answer goes to `routing.answered`, a failure isn't counted there). `_partition_changed` logs
