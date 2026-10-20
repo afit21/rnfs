@@ -7,8 +7,8 @@ import unittest
 
 from rnfs.constants import ID_LENGTH, K
 from rnfs.dht import density
-from rnfs.dht.density import (MIN_SIZE_SAMPLES, RING_ANSWERS, SIZE_SAMPLES, SPACE, SizeEstimate, dense_core,
-                              kth_distance, radius, rings)
+from rnfs.dht.density import (MIN_SIZE_SAMPLES, MIN_VERIFIED, RING_ANSWERS, SIZE_SAMPLES, SPACE, SizeEstimate,
+                              dense_core, radius, rings, verified_sample)
 from rnfs.dht.lookup import Lookup
 from rnfs.dht.routing import distance
 from tests.fakes.log import quiet_log
@@ -88,9 +88,15 @@ class SizeEstimateTest(unittest.TestCase):
         self.assertEqual(state_rows(tmp.name, "SELECT value FROM meta WHERE store = ?", (density.META_STORE,)),
                          [(b"",)])
 
-    def test_kth_distance(self):
-        self.assertIsNone(kth_distance(list(range(K - 1))))
-        self.assertEqual(kth_distance(list(reversed(range(1, 2 * K)))), K)
+    def test_verified_sample(self):
+        distances = {ident(n): n * 1000 for n in range(1, 2 * K)}
+        self.assertEqual(verified_sample(distances, lambda node_id: True), K * 1000)  # d_K
+        # The run ends at the first node not verified (the 5th): d_4, scaled to rank K
+        unverified = {ident(5), ident(7)}
+        self.assertEqual(verified_sample(distances, lambda node_id: node_id not in unverified),
+                         round(4000 * (K - 1 / 3) / (4 - 1 / 3)))
+        self.assertIsNone(verified_sample(distances, lambda node_id: node_id != ident(MIN_VERIFIED)))
+        self.assertIsNone(verified_sample({ident(1): 1000, ident(2): 2000}, lambda node_id: True))
 
 
 class DensityCheckTest(unittest.TestCase):

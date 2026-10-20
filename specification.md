@@ -858,8 +858,17 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   d_K, is about K × 2^128 / N. A node estimates N as (K − 1/3) × 2^128 over the median d_K of its last 16 complete
   lookups for other keys (the latest lookup for each key; the key checked is always left out, so identities next to
   it can't shrink its own yardstick). Pooled over many keys it is 2 to 4 times less noisy than the node's own
-  neighbourhood. rnfs keeps the samples in the state database (written with the periodic saves), so a restart has
-  the estimate at once, and runs no density check until it has 8.
+  neighbourhood. A lookup's sample SHOULD count only servers it verified, those that answered or whose identity
+  is known: a `/find` reply can name made-up IDs just beyond the closest that answered,
+  which a lookup completes without querying, and they shrank d_K and inflated the estimate about 3 times. rnfs takes
+  the run of verified servers closest to the key, up to the first that isn't verified and at most `K` long, and
+  scales its last distance d_j to rank `K` (d_j × (K − 1/3) / (j − 1/3), the medians of Gamma(j) and Gamma(K)); a
+  run shorter than 3 gives no sample. Counting every verified server instead would skip the servers a node doesn't
+  know the identity of too: a node on a LoRa island, hearing few announces, underestimated the network about 4 times
+  and flagged 93% of its searches in the topology simulation. An attacker that knows the true distances and is asked
+  in every lookup can still end the runs where they bias the estimate most, by about 1.3 times (1.6 for 1 estimate in
+  20). rnfs keeps the samples in the state database (written with the periodic saves), so a restart has the
+  estimate at once, and runs no density check until it has 8.
 - **Density check** (T = 2). The servers known near a key are anomalously dense when some rank j ≥ `K` (1-based,
   by distance) lies closer than j × 2^128 / (T × N); the *dense core* ends at the last such rank. Ranks below `K`
   never fire: a few close servers happen by chance, and fewer than `K` identities can't take every place anyway.

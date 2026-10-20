@@ -73,6 +73,13 @@ Security:
   from the start at the earliest), then the server not yet senior that it first heard most recently (in a flood, the
   newcomer itself), and a senior server heard lately only when nothing else can go. At a tenth of the scale (6,553
   rows, 200 honest servers, a fresh identity every 3.3 s for 2 days) every honest server became senior, against none.
+- **Made-up IDs can't inflate the network size estimate** (spec section 6, "Identities placed next to a key"; REV8):
+  a lookup took its sample, the distance to the 10th-closest server, over every ID replies named, so a server naming
+  made-up IDs just beyond the 3 closest (which a lookup completes without asking) inflated the estimate about 3
+  times, weakening the density check. A sample now counts only servers that answered or whose identity is known,
+  from the closest up to the first that isn't (its distance scaled to the 10th), so a node that knows few identities,
+  on a LoRa island, doesn't underestimate the network instead. Over 300 servers with such a server in every lookup:
+  288 -> 743 before, 288 -> 318 now.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -338,8 +345,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   nodes and 90.8% on slow ones across every attack of the eclipse simulation). Four local mechanisms, nothing on
   the wire changed:
   - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
-    lookups for other keys, kept in the state database's `meta` table so a restart has it at once (the density
-    check waits for 8);
+    lookups for other keys, counting only servers the lookup verified (Security above), kept in the state
+    database's `meta` table so a restart has it at once (the density check waits for 8);
   - the density check: when the servers found near a key are packed more than twice as densely as the estimate
     allows (from the 10th on), a search waits until 5 servers of each of two rings beyond them have answered (those
     ranked after the dense core, and those beyond where 10 honest servers would be expected), and a publisher gives

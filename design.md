@@ -465,8 +465,14 @@ which turns the density check on) make `required()` name the nodes that must ans
 by distance, ordered by tier; `dense` notes that it fired). They are queried among the window's nodes in rank order;
 those sent outside the window (`extras`) count towards `max_queries` but never against the stall rule. `claim`/`taken`
 (a disjoint lookup's) drop a node another path owns before querying it and leave such nodes out of replies.
-`on_complete(key, kth)` is told the K-th closest known distance after each run that ended "complete" (`ended` holds how
-the last run ended); the size estimate samples it. `first` (a search's closest local servers, specification section 6
+`on_complete(key, kth)` is told the run's sample after each run that ended "complete" (`ended` holds how the last run
+ended); the size estimate samples it. The sample is `density.verified_sample(known, verified())`: over the known
+nodes by distance (failed ones are out of `known`), the run of those `verified()` accepts (answered in any run, or
+`is_known`: a node still out at completion counts if known, as real servers often answer late), from the closest up
+to the first it doesn't, at most K long, its last distance d_j scaled by (K − 1/3) / (j − 1/3); none under
+`MIN_VERIFIED` (3). Made-up IDs a reply names just beyond the beta closest, left unqueried by completion, end the run
+instead of counting (REV8); `known_distances()` and `verified()` give the same view to `DisjointLookup`. `first` (a
+search's closest local servers, specification section 6
 "LoRa islands") are added to the first run's known nodes and launched before the window's while any is left unqueried;
 a reply listing a provider empties them (`first.clear()`), and a later run doesn't have them (`_first` is emptied).
 They skip `check_path`, and count as `extras` when outside the window. `allowed(id)` (partition mode's local-only rule)
@@ -482,6 +488,8 @@ and `rnfs.statedb` loads RNS. `dense_core(distances, size)` (last rank j >= K cl
 stopping past 2K once a rank lies 4 times further out), `radius(size)` and `rings(nodes, distances, size, count,
 later)`: `count` from the rank after the core and from the first node beyond the radius, each ring ordered by
 `later` (a lookup's tier), stably, without duplicates. `DENSITY_THRESHOLD` (2), `RING_ANSWERS` (5).
+`verified_sample(distances, verified)`: a lookup's sample, d_j of the verified run from the closest (at most K,
+none under `MIN_VERIFIED`, 3) scaled to rank K; the samples stay d_K's stand-ins, so the saved blob is unchanged.
 `CheckCounts(clock=time.monotonic)`: `checked` and `flagged`, two `recent.RecentCounts`; `note(flagged)` counts one
 check, `status()` gives the four `density_*` fields of the node's status.
 
@@ -495,7 +503,8 @@ reporting into one queue; the caller's thread passes providers on (once each, `_
 `should_stop`, setting the paths' stop flag and waking them. `candidates()` merges the paths' (a node takes the
 lowest tier a path knowing it gives it); `path_candidates()` each path's own; `ask` goes through the path knowing
 the node; `remaining`, `allow_unknown` (the first path's budget), `listing_nodes`, `listers`, `closest_answered`,
-`dense`, `ended`. It samples the size estimate once per call, from the merged candidates, if every path completed.
+`dense`, `ended`. It samples the size estimate once per call if every path completed: `verified_sample` over the
+paths' `known_distances()` merged, a node verified if any path's `verified()` accepts it.
 
 `lookups.py` — `Lookups(new_lookup, start, sizes, seniors, paths=DISJOINT_PATHS, pace=None, publish_unknowns=None,
 search_unknowns=None)`: the node's recipe.

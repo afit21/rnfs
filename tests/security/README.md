@@ -173,3 +173,4 @@ the roadmap's "Security fixes from the 0.2.0 review".
 |---|---|---|---|
 | REV4 | `test_rev4_forced_partition.py` | `rnfs/dht/local.py` (`PartitionMode.failed`, `probe_target`), `rnfs/node.py` (`_knows_server`, `_run_local`) | "Partition mode can't be forced from outside (REV4)" |
 | REV7 | `test_rev7_firstseen_seniors.py` | `rnfs/dht/firstseen.py` (`FirstSeenLog._evict`, `_victim`), `rnfs/node.py` (the log's settings) | "The announce first-seen log keeps its senior servers (REV7)" |
+| REV8 | `test_rev8_size_estimate_inflation.py` | `rnfs/dht/density.py` (`verified_sample`), `rnfs/dht/lookup.py` (`Lookup._sample`, `verified`), `rnfs/dht/disjoint.py` (`DisjointLookup._sample`) | "Made-up IDs can't inflate the network size estimate (REV8)" |
