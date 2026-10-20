@@ -5,6 +5,8 @@ import types
 import unittest
 from unittest import mock
 
+import RNS
+
 from rnfs.config import Config
 from rnfs.network import links
 from tests.support import wait_for
@@ -122,6 +124,39 @@ class FakeLink:
             progress_callback(receipt)
             response_callback(receipt)
         threading.Thread(target=answer, daemon=True).start()
+        return receipt
+
+
+class RacingLink(FakeLink):
+    """FakeLink whose requests go as RNS 1.5.6's Link.request sends them, with RNS's own handle_response and
+    RequestReceipt: the packet first, the receipt registered in pending_requests after. FakeLink.responder's answer
+    reaches handle_response in between, as a fast link's answer can while the requesting thread waits for the GIL."""
+
+    handle_response = RNS.Link.handle_response
+    timeout = 1.0  # seconds before a request still pending fails, as RNS's own timeout (11 s at least) would
+
+    def __init__(self, *args, **kwargs):
+        """A link with RNS's pending requests."""
+        self.pending_requests = []
+        super().__init__(*args, **kwargs)
+
+    def request(self, path, data, response_callback=None, failed_callback=None, progress_callback=None,
+                timeout=None, max_response_size=None):
+        """Answer before the receipt is registered, then register it."""
+        self.requests.append((path, data, max_response_size))
+        request_id = len(self.requests).to_bytes(16, "big")
+        self.handle_response(request_id, FakeLink.responder(self, path, data), 10, 10, update_sizes=True,
+                             check_size=True)
+        packet_receipt = types.SimpleNamespace(truncated_hash=request_id, set_timeout_callback=lambda callback: None,
+                                               status=None, proved=False, concluded_at=None,
+                                               callbacks=types.SimpleNamespace(delivery=None))
+        receipt = RNS.RequestReceipt(self, packet_receipt=packet_receipt, response_callback=response_callback,
+                                     failed_callback=failed_callback, progress_callback=progress_callback,
+                                     timeout=RacingLink.timeout, max_response_size=max_response_size)
+        # RNS's timeout, shortened: it fails a request still pending then (an answered one is left as it is)
+        timer = threading.Timer(RacingLink.timeout, receipt.request_timed_out, args=(None,))
+        timer.daemon = True
+        timer.start()
         return receipt
 
 
@@ -459,6 +494,18 @@ class LinkPoolTest(unittest.TestCase):
         self.assertTrue(exchange.answered)
         self.assertEqual(exchange.response, ["/find", b"k"])
 
+    def test_answer_arriving_before_rns_registers_the_request(self):
+        # RNS drops a response no pending request matches: without EarlyResponses this request would wait out RNS's
+        # timeout (RacingLink's, shortened) and end unanswered
+        links.RNS.Link = RacingLink
+        FakeLink.responder = staticmethod(lambda link, path, data: [path, data])
+        peer = run(self, lambda: self.pool.get(NODE))
+        exchange = run(self, lambda: self.pool.request(peer, "/find", b"k"))
+        self.assertTrue(exchange.answered)
+        self.assertEqual(exchange.response, ["/find", b"k"])
+        self.assertEqual(peer.link.pending_requests, [])
+        self.assertEqual(len(peer.early.kept), 0)
+
     def test_request_failure(self):
         FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
         peer = run(self, lambda: self.pool.get(NODE))
@@ -526,6 +573,46 @@ class LinkPoolTest(unittest.TestCase):
         peer = run(self, lambda: self.pool.get(NODE))
         self.assertIs(run(self, lambda: self.pool.call(peer, "/blocks", [0, []])).response, False)
         self.assertEqual(len(peer.link.requests), 1)
+
+
+class EarlyResponsesTest(unittest.TestCase):
+    """EarlyResponses on a stand-in link: what it keeps and hands over."""
+
+    def setUp(self):
+        """A link with no pending request, whose own handle_response records what it is given."""
+        self.handled = []
+        self.link = types.SimpleNamespace(pending_requests=[],
+                                          handle_response=lambda *args, **kwargs: self.handled.append(args))
+        self.now = [100.0]
+        self.early = links.EarlyResponses(self.link, clock=lambda: self.now[0])
+
+    def test_a_pending_request_is_answered_at_once(self):
+        self.link.pending_requests.append(types.SimpleNamespace(request_id=b"a"))
+        self.link.handle_response(b"a", "answer", 6, 6)
+        self.assertEqual(self.handled, [(b"a", "answer", 6, 6)])
+        self.assertFalse(self.early.deliver(types.SimpleNamespace(request_id=b"a")))
+
+    def test_an_early_answer_is_kept_until_its_request_is_registered(self):
+        self.link.handle_response(b"a", "answer", 6, 6)
+        self.assertEqual(self.handled, [])
+        self.assertFalse(self.early.deliver(types.SimpleNamespace(request_id=b"b")))
+        self.assertTrue(self.early.deliver(types.SimpleNamespace(request_id=b"a")))
+        self.assertEqual(self.handled, [(b"a", "answer", 6, 6)])
+        self.assertFalse(self.early.deliver(types.SimpleNamespace(request_id=b"a")))  # handed over once
+
+    def test_unmatched_answers_are_kept_within_bounds(self):
+        for i in range(links.MAX_EARLY_RESPONSES + 5):
+            self.link.handle_response(bytes([i]), "late", 4, 4)
+        self.assertEqual(len(self.early.kept), links.MAX_EARLY_RESPONSES)
+        self.assertNotIn(bytes([0]), self.early.kept)  # the oldest go first
+        self.now[0] += links.EARLY_RESPONSE_LIFE + 1
+        self.link.handle_response(b"new", "late", 4, 4)
+        self.assertEqual(list(self.early.kept), [b"new"])
+
+    def test_installed_only_on_a_link_with_rns_pending_requests(self):
+        self.assertIsNone(links.EarlyResponses.install(types.SimpleNamespace(handle_response=lambda *args: None)))
+        self.assertIsNotNone(links.EarlyResponses.install(types.SimpleNamespace(pending_requests=[],
+                                                                                handle_response=lambda *a: None)))
 
 
 class PeerLinkSlotsTest(unittest.TestCase):

@@ -156,6 +156,22 @@ INTERNALS = [
     Internal("network/links.py", "RequestReceipt link, response_size, get_response() and get_progress()",
              lambda: (_assigns(RNS.RequestReceipt.__init__, "link", "response_size"),
                       _has(RNS.RequestReceipt, "get_response", "get_progress"))),
+    Internal("network/links.py", "a response packet handed to self.handle_response (looked up on the link, so "
+             "replaceable per link: EarlyResponses) with (request_id, response_data, response_size, "
+             "response_transfer_size, metadata, update_sizes, check_size), which answers the link.pending_requests "
+             "entry of that request_id; Link.request registering the RequestReceipt (request_id its packet's "
+             "truncated hash) only after sending the packet",
+             lambda: (_params(RNS.Link.handle_response, "request_id", "response_data", "response_size",
+                              "response_transfer_size", "metadata", "update_sizes", "check_size"),
+                      _source(RNS.Link._Link__receive,
+                              "self.handle_response(request_id, response_data, transfer_size, transfer_size, "
+                              "update_sizes=True, check_size=True)"),
+                      _source(RNS.Link.handle_response, "for pending_request in self.pending_requests:",
+                              "if pending_request.request_id == request_id:"),
+                      _source(RNS.Link.request, "packet_receipt = request_packet.send()",
+                              "return RequestReceipt(self, packet_receipt=packet_receipt"),
+                      _source(RNS.RequestReceipt.__init__, "self.hash = packet_receipt.truncated_hash",
+                              "self.request_id = self.hash", "self.link.pending_requests.append(self)"))),
     Internal("network/protocol.py", "request framing [time.time(), truncated path hash, data] (umsgpack packs a "
              "float in 9 bytes), response framing [request_id, response] with truncated-hash request IDs",
              lambda: (_source(RNS.Link.request, "unpacked_request = [time.time(), request_path_hash, data]",

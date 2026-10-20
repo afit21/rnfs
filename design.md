@@ -691,6 +691,11 @@ once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its
 not within `link_idle_timeout` of the end of a `hold`. The `rnfs-link-sweeper` thread sweeps when the next link kept
 is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quarter of `link_idle_timeout` within 1 to
 30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
+Every link `LinkPool` opens gets an `EarlyResponses` (`PeerLink.early`, 0.2.0) in place of its `handle_response`
+(RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept (at most
+`MAX_EARLY_RESPONSES`, 16, for `EARLY_RESPONSE_LIFE`, 30 s), and `LinkPool._request`, once `Link.request` has
+returned the registered receipt, hands RNS the one kept for it (`deliver`), both under one lock, so an answer that
+beat its receipt (RNS registers it only after sending) isn't dropped. NomadNet fetches (`nomadnet.py`) don't use it.
 
 `paths.py` — `PathRequests(transport=lambda: RNS.Transport, reticulum=RNS.Reticulum.get_instance, clock, sleep,
 spacing=SPACING, slow_bitrate=None)`, the node's path-request budget (spec section 3, "Path requests"): `LinkPool` makes

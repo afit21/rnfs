@@ -25,11 +25,16 @@
   refuse (network/guards.py) and RNS may compress.
 - Every path request goes through the node's budget (LinkPool.paths, network/paths.py), whose wait doesn't count
   towards path_timeout; a link that fails to establish costs a turn of it, as RNS then requests the path again.
+- A response that arrives before RNS has registered its request is kept and handed over once it is (EarlyResponses):
+  RNS (1.5.6) adds a request's RequestReceipt to the link's pending requests only after Link.request has sent the
+  packet, and drops a response no pending request matches, so on a fast link (a 1 ms round trip, a busy process)
+  an answer could be lost and its request wait out RNS's whole timeout, 11 s at least.
 
 Everything here blocks its caller, so never call it from an RNS callback thread.
 """
 import threading
 import time
+from collections import OrderedDict
 from typing import Callable
 
 import RNS
@@ -56,6 +61,10 @@ MAX_NOT_ESTABLISHED = 1024  # nodes LinkPool remembers a link not established to
 # interval has passed (idle_limit): room for the sweep's own timing
 KEEPALIVE_MARGIN = 1.0
 MIN_SWEEP_WAIT = 0.25  # the idle sweep runs at most this often, however soon a link is due
+# Responses no pending request matched (EarlyResponses): kept this many seconds, at most this many per link. One
+# arriving early is handed over within moments; the rest are late answers to requests RNS already gave up on
+EARLY_RESPONSE_LIFE = 30.0
+MAX_EARLY_RESPONSES = 16
 
 
 def close_reason(link) -> str:
@@ -184,6 +193,56 @@ class Exchange:
             self.last_progress = now
 
 
+class EarlyResponses:
+    """Responses to requests on one RNS link that arrived before RNS registered the request (see the module
+    docstring): installed in place of the link's handle_response, which RNS looks up on the link for every response.
+    Thread-safe."""
+
+    def __init__(self, link, clock: Callable[[], float] = time.monotonic):
+        """Take over link's handle_response."""
+        self.link = link
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.kept: OrderedDict[bytes, tuple[float, tuple, dict]] = OrderedDict()  # request ID -> (when, arguments)
+        self.handle = link.handle_response  # RNS's own
+        link.handle_response = self.on_response
+
+    @classmethod
+    def install(cls, link) -> "EarlyResponses | None":
+        """An EarlyResponses for link, or None if link isn't one (a test's stand-in without RNS's pending requests)."""
+        if not isinstance(getattr(link, "pending_requests", None), list) or not callable(
+                getattr(link, "handle_response", None)):
+            return None
+        return cls(link)
+
+    def on_response(self, request_id, *args, **kwargs):
+        """Link.handle_response: handled by RNS if a pending request matches it, else kept for deliver()."""
+        with self.lock:
+            # Under the lock: deliver() looks for a kept response only once its request is pending, so a response
+            # is either seen pending here or kept before deliver() looks
+            if not any(getattr(pending, "request_id", None) == request_id
+                       for pending in list(self.link.pending_requests)):
+                now = self.clock()
+                self.kept[request_id] = (now, args, kwargs)
+                self.kept.move_to_end(request_id)
+                while self.kept and (len(self.kept) > MAX_EARLY_RESPONSES
+                                     or now - next(iter(self.kept.values()))[0] > EARLY_RESPONSE_LIFE):
+                    self.kept.popitem(last=False)
+                return None
+        return self.handle(request_id, *args, **kwargs)
+
+    def deliver(self, receipt) -> bool:
+        """Hand RNS the response kept for receipt's request, which Link.request has just registered: True if there
+        was one (its callbacks then run on this thread)."""
+        request_id = getattr(receipt, "request_id", None)
+        with self.lock:
+            kept = self.kept.pop(request_id, None)
+        if kept is None:
+            return False
+        self.handle(request_id, *kept[1], **kept[2])
+        return True
+
+
 class PeerLink:
     """One outgoing link to a node and the requests in progress on it."""
 
@@ -193,6 +252,7 @@ class PeerLink:
         self.identified = identified
         self.shared = shared
         self.link = None
+        self.early: EarlyResponses | None = None  # the link's responses that came before their request was registered
         self.rate: float | None = None  # rate estimate in bits/s (section 2)
         self.requests = 0
         self.blocks = 0
@@ -456,6 +516,7 @@ class LinkPool:
         log(f"connecting to {name}", LOG_VERBOSE)
         started = time.monotonic()
         link = RNS.Link(destination, established_callback=lambda _: settled.set(), closed_callback=on_closed)
+        peer.early = EarlyResponses.install(link)
         peer.link = link
         timeout = getattr(link, "establishment_timeout", None) or self.config.path_timeout
         settled.wait(timeout + ESTABLISH_GRACE)
@@ -724,6 +785,9 @@ class LinkPool:
                 return exchange
             exchange.receipt = receipt
             exchange.sent_at = exchange.last_progress = self.clock()
+            if peer.early is not None and peer.early.deliver(receipt):
+                log(f"{node_name(peer.node_id)} answered {path} before RNS had registered the request; handed the "
+                    f"answer over", LOG_VERBOSE)
             try:
                 self._wait(peer, path, exchange, receipt, deadline, watchdog, on_progress)
             finally:

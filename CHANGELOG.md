@@ -716,6 +716,12 @@ Faster:
   key order, and an item's row once a round instead of at each save). A first round of 1M keys took 20 rounds of
   50,000 and 175 region lookups, against one round of 157 (the same with the network size estimate given, as a
   node's regions are sized: 176 and 159). Raspberry Pi SD-card numbers are still to be measured.
+- An answer that comes back before RNS has registered its request is no longer lost. RNS registers a request only
+  after sending it and drops an answer it can't match, so on a fast link with a busy process (about 1 request in
+  800 with 16 at once over local TCP and the CPU busy) the request waited out RNS's whole timeout, 11 s at least,
+  and failed. One such `/find` held back a whole publishing round: `tests/interop.py` sometimes took 10 to 25 s
+  longer to find a node providing what it had just added. The answer is now kept and handed over once the request
+  is registered.
 
 ## 0.1.6
 
