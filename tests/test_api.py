@@ -526,6 +526,10 @@ class ApiTestCase(unittest.TestCase):
 
 class SecurityTest(ApiTestCase):
 
+    def test_server_header_is_just_rnfs(self):
+        _, headers, _ = self.call("GET", "/api/status")
+        self.assertEqual(headers["Server"], "rnfs")  # not "rnfs " (BaseHTTPRequestHandler's empty sys_version)
+
     def test_host_check(self):
         for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}", f"LocalHost:{self.port}"):
             self.assertEqual(self.call("GET", "/api/status", host=host)[0], 200, host)

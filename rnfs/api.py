@@ -438,6 +438,11 @@ class TimedHandler(BaseHTTPRequestHandler):
             raise RequestTimeout("timed out reading the request")
         return remaining
 
+    def version_string(self) -> str:
+        """The Server header: server_version (BaseHTTPRequestHandler appends a space and sys_version, which the
+        handlers leave empty, so it read "rnfs ")."""
+        return f"{self.server_version} {self.sys_version}".strip()
+
     def reading_body(self):
         """Allow body_timeout between reads from now on: an upload may be large, so no overall deadline."""
         self.phase = "body"
