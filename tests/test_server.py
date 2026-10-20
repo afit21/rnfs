@@ -12,7 +12,8 @@ from RNS.vendor import umsgpack
 
 from rnfs.config import Config
 from rnfs.constants import (BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, ID_LENGTH, K, KIB, MAX_REQUEST_SIZE,
-                            MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RESPONSE_OVERHEAD)
+                            MAX_REQUESTS_PER_LINK, MAX_RESPONSE_SIZE, PIN_PATH, PROVIDE_PATH, RANGE_PATH,
+                            RESPONSE_OVERHEAD)
 from rnfs.content.cid import RAW, Cid
 from rnfs.network import guards, protocol, server
 from rnfs.network.identity import node_id_for_identity
@@ -427,7 +428,7 @@ class RequestServerTest(unittest.TestCase):
     def test_registration(self):
         self.assertEqual(RNS.Resource.AUTO_COMPRESS_MAX_SIZE, 0)
         self.assertEqual(self.destination.max_request_size, MAX_REQUEST_SIZE)
-        self.assertEqual(set(self.destination.handlers), {FIND_PATH, PROVIDE_PATH, BLOCKS_PATH, PIN_PATH})
+        self.assertEqual(set(self.destination.handlers), {FIND_PATH, PROVIDE_PATH, BLOCKS_PATH, PIN_PATH, RANGE_PATH})
         for _, allow, auto_compress in self.destination.handlers.values():
             self.assertEqual(allow, RNS.Destination.ALLOW_ALL)
             self.assertIs(auto_compress, False)
@@ -435,7 +436,7 @@ class RequestServerTest(unittest.TestCase):
     def test_malformed_requests_get_false(self):
         link = self.connect(b"a")
         for path, data in ((FIND_PATH, b"short"), (PROVIDE_PATH, [KEY]), (BLOCKS_PATH, [True, []]),
-                           (PIN_PATH, [b"x", True])):
+                           (PIN_PATH, [b"x", True]), (RANGE_PATH, [b"x", 0, 1, 0])):
             with self.subTest(path=path):
                 self.assertIs(self.ask(path, data, link, self.identity), False)
 

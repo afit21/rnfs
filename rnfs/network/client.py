@@ -1,4 +1,5 @@
-"""Requests to other nodes (sections 3, 6, 7): /find, /provide, /blocks with stall detection, /pin, and ping.
+"""Requests to other nodes (sections 3, 6, 7): /find, /provide, /blocks and /range with stall detection, /pin, and
+ping.
 
 Every method blocks until it has a result, so never call one from an RNS callback thread. Lookups and
 downloads use the node's shared unidentified link; /provide and /pin use a separate identified link,
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from rnfs.config import Config
-from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH
+from rnfs.constants import BLOCKS_PATH, FIND_PATH, PIN_PATH, PROVIDE_PATH, RANGE_BZ2, RANGE_PATH
 from rnfs.content.cid import Cid
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, plural, size
 from rnfs.network import protocol, rates
@@ -27,6 +28,9 @@ FAILED = "failed"  # no link (no path, or closed by this node), or a malformed a
 # a new link after a short delay (the fetcher closes this one)
 LOST = "lost"
 STALLED = "stalled"  # the response stopped making progress or missed its deadline; the link was closed
+# The node left a /range unanswered, as nodes before 0.2.0 do (they have no handler for it): the fetcher asks for the
+# block with /blocks instead, at once, and remembers that the node doesn't answer /range (rnfs.ranges)
+UNSUPPORTED = "unsupported"
 
 
 @dataclass
@@ -40,6 +44,28 @@ class BlocksResult:
     bad: list[Cid] = field(default_factory=list)  # blocks that didn't match their CID: ban the provider
     reason: str = ""  # why the request stalled or failed, for logs
     elapsed: float | None = None  # seconds from sending the request to its answer, if OK (local, not on the wire)
+    # A /range request's (rnfs.ranges): the blocks it brought part of, with the bytes now held of each, and the
+    # compression its answer achieved (bytes / bytes on the wire), if it came compressed
+    partial: dict[Cid, int] = field(default_factory=dict)
+    ratio: float | None = None
+
+
+@dataclass
+class RangeResult:
+    """Outcome of one /range request (rnfs 0.2.0). Its bytes passed protocol.parse_range_response's checks; a block in
+    .block, the range completing it, has been verified whole against its CID."""
+
+    status: str  # OK, BUSY, FAILED, LOST or STALLED, as for /blocks
+    size: int | None = None  # the block's length, from an OK answer
+    data: bytes = b""  # the range's bytes, decompressed
+    block: bytes | None = None  # the whole block, verified, if this range completed it
+    bad: bool = False  # this range completed the block, and it didn't match its CID: ban the provider
+    missing: bool = False  # answered []: the node doesn't hold or serve the block
+    wire: int = 0  # bytes of the answer, as RNS reported them (compressed, framing included)
+    compressed: bool = False  # the bytes came as bz2
+    silent: bool = False  # RNS timed it out with the link up, nothing of an answer seen: as an older node leaves /range
+    reason: str = ""
+    elapsed: float | None = None  # seconds from sending the request to its answer, if OK
 
 
 class PeerClient:
@@ -287,6 +313,84 @@ class PeerClient:
         result = self._check_blocks(name, batch, entries, rest)
         # From when it was sent: not opening the link or waiting for its /blocks slot
         result.elapsed = max(0.0, self.links.clock() - exchange.sent_at)
+        return result
+
+    # /range (rnfs 0.2.0)
+
+    def block_range(self, node_id: bytes, cid: Cid, held: bytes = b"", max_bytes: int = 0, compress: bool = False,
+                    block_size: int | None = None, on_progress: Callable[[float], None] | None = None) -> RangeResult:
+        """Ask node_id for at most max_bytes of cid's block after the held bytes (the start of the block, received
+        from node_id before), compressed if compress, over its shared link; counted in traffic (mesh).
+
+        The answer is checked (protocol.parse_range_response: its size against block_size, if known, and the length
+        of its bytes, decompressed within that bound); a range that completes the block has the whole block, held
+        and data, verified against cid. on_progress(fraction) is called from this thread as the answer arrives.
+        """
+        result = self._range(node_id, cid, held, max_bytes, compress, block_size, on_progress)
+        if result.status != OK or result.block is not None or result.missing or result.bad:
+            outcome = {OK: mesh.ANSWERED, BUSY: mesh.REFUSED}.get(result.status, mesh.FAILED)
+            if not result.silent:  # an older node's silence isn't its failure (rnfs.ranges)
+                self.traffic.request(node_id, outcome, len(result.block or b""), self._interface(node_id),
+                                     int(result.bad))
+        else:
+            self.traffic.request(node_id, mesh.ANSWERED, 0, self._interface(node_id))
+        return result
+
+    def _range(self, node_id: bytes, cid: Cid, held: bytes, max_bytes: int, compress: bool, block_size: int | None,
+               on_progress: Callable[[float], None] | None) -> RangeResult:
+        """block_range(), uncounted."""
+        peer = self.links.get(node_id)
+        if peer is None:
+            if self.links.unestablished(node_id):
+                return RangeResult(LOST, reason="link not established")
+            if self._closed(node_id, None):
+                return RangeResult(BUSY, reason="closed")
+            return RangeResult(FAILED, reason="unreachable")
+        rate = peer.rate
+        offset = len(held)
+        request = protocol.encode_range(cid, offset, max_bytes, RANGE_BZ2 if compress else 0)
+        exchange = self.links.call(peer, RANGE_PATH, request, blocks=True,
+                                   max_response_size=protocol.range_max_response_size(max_bytes),
+                                   watchdog=self._stall_watchdog(rate), on_progress=on_progress)
+        name = node_name(node_id)
+        if exchange.stalled:
+            log(f"/range from {name} stalled ({exchange.stalled}); closing the link", LOG_WARNING)
+            self.links.close_link(peer)
+            return RangeResult(STALLED, reason=exchange.stalled)
+        if exchange.cancelled:
+            log(f"{name}'s /range answer stopped arriving (cancelled by it, or lost in transit)", LOG_VERBOSE)
+            return RangeResult(BUSY, reason="cancelled")
+        if not exchange.answered and self._closed(node_id, peer):
+            log(f"{name} closed the link before answering /range", LOG_VERBOSE)  # a refusal, as for /blocks
+            return RangeResult(BUSY, reason="closed")
+        if not exchange.answered:
+            # Nothing at all came back, the link up: not an answer that started and failed on the way
+            silent = peer.is_active() and exchange.receipt is not None and exchange.response_started is None
+            log(f"no answer from {name} to /range", LOG_VERBOSE)
+            return RangeResult(LOST if self._lost(peer, exchange) else FAILED, silent=silent, reason="no answer")
+        if exchange.response is False:
+            log(f"{name} is busy and refused /range", LOG_VERBOSE)
+            return RangeResult(BUSY, reason="busy")
+        if protocol.is_range_unserved(exchange.response):
+            return RangeResult(OK, missing=True)
+        parsed = protocol.parse_range_response(exchange.response, offset, max_bytes, compress, block_size)
+        if parsed is None:
+            log(f"{name} sent a malformed /range answer", LOG_WARNING)
+            return RangeResult(FAILED, reason="malformed response")
+        if peer.record_rate(exchange, self.config.min_rate_sample):
+            log(f"link to {name} measured at {size(peer.rate / 8)}/s", LOG_VERBOSE)
+            self.traffic.rated(node_id, peer.rate)
+        total, data = parsed
+        result = RangeResult(OK, size=total, data=data, wire=exchange.response_size or 0,
+                             compressed=exchange.response[1] == RANGE_BZ2,
+                             elapsed=max(0.0, self.links.clock() - exchange.sent_at))
+        if offset + len(data) == total:
+            block = held + data
+            if cid.verify(block):
+                result.block = block
+            else:
+                log(f"{name} sent ranges of {cid} not matching it", LOG_WARNING)
+                result.bad = True
         return result
 
     @staticmethod

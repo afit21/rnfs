@@ -884,6 +884,205 @@ class SlowLinkTest(FetcherTest):
             release.set()
 
 
+TEXT = (b"It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want "
+        b"of a wife. However little known the feelings or views of such a man may be on his first entering a "
+        b"neighbourhood, this truth is so well fixed in the minds of the surrounding families. ")
+
+
+def text_of(size: int) -> bytes:
+    """size bytes of English-like text, varied enough that bz2 doesn't make it vanish."""
+    rng = random.Random(size)
+    words = TEXT.split()
+    out = bytearray()
+    while len(out) < size:
+        out += b" ".join(rng.choice(words) for _ in range(12)) + b"\n"
+    return bytes(out[:size])
+
+
+class RangeTransferTest(FetcherTest):
+    """/range (rnfs 0.2.0): large chunks over slow links come in ranges, compressed, into a partial block that a stall
+    doesn't lose; fast links keep /blocks; an older node's silence is learnt once, persisted, and costs one request."""
+
+    def ranges_of(self, node_id: bytes, cid: Cid) -> list[tuple[int, int, bool]]:
+        """(offset, max_bytes, compress) of every range node_id was asked for of cid."""
+        return [(offset, max_bytes, compress) for node, c, offset, max_bytes, compress in self.client.ranges
+                if node == node_id and c == cid]
+
+    def chunks(self, built) -> list[walker.Expect]:
+        """The chunk expectations under a built file's root."""
+        return walker.expand(walker.root_expect(built.cid), self.network[built.cid])
+
+    def test_a_slow_link_fetches_large_chunks_in_compressed_ranges(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        data = text_of(3 * CHUNK_SIZE)
+        built = self.file(data)
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        first = self.ranges_of(P1, self.chunks(built)[0].cid)
+        self.assertGreater(len(first), 1)  # several ranges, not one whole chunk
+        self.assertEqual(first[0][:2], (0, self.config.min_rate_sample))  # no rate: what gives an estimate
+        for chunk in self.chunks(built):
+            self.assertTrue(all(compress for _, _, compress in self.ranges_of(P1, chunk.cid)))
+        # The root, a DAG node, came with /blocks; the later chunks' ranges were scaled by the compression achieved
+        self.assertEqual(self.ranges_of(P1, built.cid), [])
+        last = self.ranges_of(P1, self.chunks(built)[-1].cid)
+        self.assertGreater(last[0][1], 2 * self.config.min_rate_sample)
+        self.assertEqual(self.fetcher.ranges.partials.count(), 0)  # every partial dropped once its block is stored
+
+    def test_a_fast_link_keeps_blocks(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.ranges, [])
+
+    def test_small_chunks_and_dag_nodes_keep_blocks_on_a_slow_link(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        files = [(f"f{i}", builder.build_bytes(os.urandom(1000), self.put)) for i in range(5)]
+        built = builder.build_directory([Entry(name, file.cid, file.size, 0) for name, file in files], self.put)
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.client.ranges, [])
+
+    def test_a_stall_mid_chunk_resumes_where_it_stopped(self):
+        """A range that stalls loses only itself: the chunk resumes from the bytes held, where /blocks would send the
+        whole chunk again."""
+        self.fetcher = self.make_fetcher(slow=True)
+        data = os.urandom(2 * CHUNK_SIZE)  # random: no compression, so the ranges are exactly min_rate_sample each
+        built = self.file(data)
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+        stalled = []
+
+        def stall_once(cid, offset, max_bytes, compress):
+            """The third range of the chunk stalls once (the link closed under it)."""
+            if cid == chunk and offset == 2 * self.config.min_rate_sample and not stalled:
+                stalled.append(offset)
+                return client_module.RangeResult(STALLED, reason="no progress for 120s")
+            return None
+        self.client.range_behaviour[P1] = stall_once
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        step = self.config.min_rate_sample
+        self.assertEqual([offset for offset, _, _ in self.ranges_of(P1, chunk)],
+                         [0, step, 2 * step, 2 * step, 3 * step])
+        # Bytes asked for again after the stall: the stalled range only (16 KiB), not the 32 KiB already held
+        offsets = [offset for offset, _, _ in self.ranges_of(P1, chunk)]
+        self.assertEqual(len(offsets) - len(set(offsets)), 1)
+
+    def test_an_old_providers_silence_costs_one_request_a_fetch_and_is_learnt_after_two(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        first, second = self.file(os.urandom(3 * CHUNK_SIZE)), self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        self.client.no_range.add(P1)  # an rnfs 0.1.x node
+        self.runs.extend([[P1], [P1], [P1]])
+        self.fetch_all(first.cid)
+        self.assertEqual(len(self.client.ranges), 1)  # asked once, then /blocks for the rest of the fetch
+        self.assertTrue(self.storage.is_complete(first.cid))
+        self.assertIsNone(self.fetcher.ranges.support.answers(P1))  # one silence: maybe a lost packet
+        self.assertFalse(self.routing.is_banned(P1))  # not penalised: its silence isn't a failure
+        self.fetch_all(second.cid)
+        self.assertEqual(len(self.client.ranges), 2)  # the second silence in a row: learnt
+        self.assertTrue(self.storage.is_complete(second.cid))
+        self.assertIs(self.fetcher.ranges.support.answers(P1), False)
+        # Persisted: a restarted fetcher doesn't ask it again
+        self.fetcher.close()
+        self.fetcher = self.make_fetcher(slow=True)
+        self.assertIs(self.fetcher.ranges.support.answers(P1), False)
+        third = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        self.fetch_all(third.cid)
+        self.assertEqual(len(self.client.ranges), 2)
+
+    def test_one_lost_range_doesnt_mark_a_node_that_answers(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        first, second = self.file(os.urandom(2 * CHUNK_SIZE)), self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        lost = []
+
+        def lose_one(cid, offset, max_bytes, compress):
+            """The first /range is lost on the way (RNS times it out with the link up)."""
+            if not lost:
+                lost.append(cid)
+                return client_module.RangeResult(LOST, silent=True, reason="no answer")
+            return None
+        self.client.range_behaviour[P1] = lose_one
+        self.runs.extend([[P1], [P1]])
+        self.fetch_all(first.cid)
+        self.assertTrue(self.storage.is_complete(first.cid))
+        self.assertIsNone(self.fetcher.ranges.support.answers(P1))
+        self.fetch_all(second.cid)  # ranges again, answered: the silence is forgotten
+        self.assertTrue(self.storage.is_complete(second.cid))
+        self.assertGreater(len(self.client.ranges), 1)
+        self.assertIs(self.fetcher.ranges.support.answers(P1), True)
+
+    def test_a_provider_that_stalled_gets_ranges_on_a_fast_link(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+        answers = []
+
+        def stall_first(cids):
+            """The first /blocks with the chunk stalls."""
+            if chunk in cids and not answers:
+                answers.append(1)
+                return BlocksResult(STALLED, unsent=list(cids), reason="stalled")
+            return None
+        self.client.behaviour[P1] = stall_first
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        asked = self.ranges_of(P1, chunk)
+        self.assertTrue(asked)
+        self.assertTrue(all(not compress and max_bytes <= fetcher_module.STALLED_RANGE
+                            for _, max_bytes, compress in asked))
+
+    def test_a_block_held_in_part_is_left_to_its_provider(self):
+        self.config.max_parallel_providers = 2
+        self.fetcher = self.make_fetcher()
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        chunk = self.chunks(built)[0].cid
+        self.hold(P1)
+        self.hold(P2)
+        with self.fetcher.open(built.cid) as fetch:
+            fetch._new_provider(P1)
+            fetch._new_provider(P2)
+            fetch._owners[chunk] = P1
+            pending = fetcher_module._Pending([chunk, self.chunks(built)[1].cid])
+            self.assertEqual(fetch._others_owned(pending, P2), [chunk])  # P2 takes what follows
+            self.assertEqual(list(pending), [self.chunks(built)[1].cid])
+            pending.push_front([chunk])
+            self.assertEqual(fetch._others_owned(pending, P1), [])  # its owner takes it
+            fetch._fail(fetch._providers[P1], "test")
+            self.assertEqual(fetch._others_owned(pending, P2), [])  # a failed owner's blocks go to the others
+
+    def test_a_mismatching_block_from_ranges_bans_its_provider(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        data = os.urandom(2 * CHUNK_SIZE)
+        built = self.file(data)
+        chunk = self.chunks(built)[0].cid
+        forged = bytearray(self.network[chunk])
+        forged[-1] ^= 1
+        self.hold(P1)
+        self.client.holdings[P1][chunk] = bytes(forged)
+        self.hold(P2)
+        self.paths({})
+        self.runs.append([P1, P2])
+        self.config.max_parallel_providers = 1
+        self.fetch_all(built.cid)
+        self.assertEqual(self.read(built.cid), data)
+        self.assertTrue(self.routing.is_banned(P1))
+
+    def paths(self, table: dict):
+        """Have path_info answer from table (nothing known for the rest)."""
+        self.fetcher.path_info = lambda node_id: table.get(node_id, mesh.NO_PATH)
+
+
 class BatchTest(FetcherTest):
     """What one request asks for: no more than a response can carry, or the provider's link can send."""
 
