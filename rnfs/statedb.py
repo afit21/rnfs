@@ -267,9 +267,11 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         " since REAL NOT NULL, PRIMARY KEY (source, cid)) WITHOUT ROWID",
     )),
     ("range_support", (
-        # Whether each node answers /range (rnfs 0.2.0; rnfs.ranges): answers 1 or 0, and when that was last found
-        # (Unix time). A 0 is forgotten after 7 days, so the node is asked once more; at most 10,000 rows
-        "CREATE TABLE range_support (node BLOB PRIMARY KEY, answers INTEGER NOT NULL, at REAL NOT NULL) WITHOUT ROWID",
+        # Whether each node answers /range (rnfs 0.2.0; rnfs.ranges): answers 1 if it answered the last, else 0 with the
+        # /range requests it left unanswered in a row since (2 mark it as not answering), and when last found (Unix
+        # time). The silences are forgotten 7 days after the last, so the node is asked afresh; at most 10,000 rows
+        "CREATE TABLE range_support (node BLOB PRIMARY KEY, answers INTEGER NOT NULL, silences INTEGER NOT NULL,"
+        " at REAL NOT NULL) WITHOUT ROWID",
     )),
 )
 

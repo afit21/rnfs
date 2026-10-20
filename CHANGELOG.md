@@ -544,8 +544,10 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   exactly as `/blocks`: the same response slots, pools, cooldowns, upload pacing, airtime controls and
   `upload_budget`, and compresses at most 256 KiB a second.
   Nodes before 0.2.0 leave `/range` unanswered (RNS drops a request for a path without a handler, which costs them
-  nothing and counts against nothing): a node learns that from one RNS request timeout per such node, asks it with
-  `/blocks` from then on, and keeps that in the new `range_support` table, asking again after 7 days.
+  nothing and counts against nothing): a node asks such a provider with `/blocks` for the rest of the fetch after one
+  silence, which may be a lost packet, and records it as not answering after two silences in a row (in one fetch or
+  several; any answer clears a silence), in the new `range_support` table, asking afresh after 7 days: an older node
+  costs two request timeouts a week.
 
 Changed:
 - A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before

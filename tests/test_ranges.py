@@ -40,6 +40,33 @@ class RangeSupportTest(unittest.TestCase):
         self.assertIs(support.answers(P1), False)
         self.assertIs(support.answers(P2), True)
 
+    def test_two_silences_in_a_row_mark_a_node(self):
+        support = self.support()
+        self.assertFalse(support.silent(P1))  # one: a lost packet looks the same
+        self.assertIsNone(support.answers(P1))
+        self.assertTrue(support.silent(P1))  # two in a row: an older node
+        self.assertIs(support.answers(P1), False)
+
+    def test_an_answer_forgets_a_silence(self):
+        support = self.support()
+        self.assertFalse(support.silent(P1))
+        support.answered(P1)
+        self.assertIs(support.answers(P1), True)
+        self.assertFalse(support.silent(P2))
+        support.answered(P2)
+        self.assertFalse(support.silent(P2))  # the count starts again
+        self.assertIsNone(support.answers(P2))
+
+    def test_a_silence_is_persisted_and_forgotten_after_a_week(self):
+        support = self.support()
+        support.silent(P1)
+        self.assertTrue(self.support().silent(P1))  # the second, after a restart: marked
+        self.assertIs(self.support().answers(P1), False)
+        self.now[0] += ranges.RECHECK
+        again = self.support()
+        self.assertIsNone(again.answers(P1))
+        self.assertFalse(again.silent(P1))  # asked afresh: one silence is one again
+
     def test_persisted_across_restarts(self):
         support = self.support()
         support.record(P1, False)
@@ -68,14 +95,14 @@ class RangeSupportTest(unittest.TestCase):
             writes.append(1)
             return real(*args, **kwargs)
         support.db.transaction = counting
-        support.record(P1, True)
-        support.record(P1, True)
-        support.record(P1, True)
+        support.answered(P1)
+        support.answered(P1)
+        support.answered(P1)
         self.assertEqual(len(writes), 1)
         self.now[0] += DAY
-        support.record(P1, True)
+        support.answered(P1)
         self.assertEqual(len(writes), 2)
-        support.record(P1, False)
+        support.silent(P2)
         self.assertEqual(len(writes), 3)
 
     def test_capped(self):
@@ -207,12 +234,16 @@ class RangesFetchTest(unittest.TestCase):
         asked = [(compress, max_bytes) for _, c, _, max_bytes, compress in self.client.ranges if c == noise_cid]
         self.assertEqual(asked, [(True, 48 * KIB), (False, 16 * KIB)])  # it came back raw: the rest asked raw
 
-    def test_an_old_nodes_silence_is_learnt_once(self):
+    def test_an_old_nodes_silence_is_learnt_after_two(self):
         cid, block = raw(os.urandom(20 * KIB))
         self.client.holdings[P1] = {cid: block}
         self.client.no_range.add(P1)
         result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
         self.assertEqual((result.status, result.unsent), (peer_client.UNSUPPORTED, [cid]))
+        self.assertIsNone(self.ranges.support.answers(P1))  # once: maybe a lost packet
+        self.assertTrue(self.ranges.usable(P1))
+        result = self.ranges.fetch(self.client, P1, cid, 16 * KIB, 1.0, False, len(block))
+        self.assertEqual(result.status, peer_client.UNSUPPORTED)
         self.assertIs(self.ranges.support.answers(P1), False)
         self.assertFalse(self.ranges.usable(P1))
 

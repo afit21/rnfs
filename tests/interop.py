@@ -25,10 +25,10 @@ Every scenario runs in both directions, "A -> B" meaning A serves (or publishes)
 - bulk-cap,  bulk and small from the *-cap node of A's version, whose max_upload_rate paces every /blocks
   small-cap  response, single-packet ones included since 0.1.6 (NET-2): an honest fetcher must see no refusals.
 - ranges     (rnfs 0.2.0's /range) a node of this tree set slow = "yes" (new-slow, so it asks for chunks in
-             ranges over every link) fetches text files: from old, it learns from one unanswered /range that the
-             node doesn't answer it, falls back to /blocks with no refusal, failure or ban on either side, and asks
-             no more /range of it, in the same run or after a restart (the answer is persisted); from new, it gets
-             the chunks in compressed ranges.
+             ranges over every link) fetches text files: from old, each of two fetches has one /range left
+             unanswered and falls back to /blocks, with no refusal, failure or ban on either side; the second
+             silence in a row marks the node as not answering, so a third fetch, after a restart (the answer is
+             persisted), asks no /range of it; from new, it gets the chunks in compressed ranges.
 - names      a name published on A resolves on B, and B's gateway serves a file through it.
 - keepers    publisher -> keeper -> resolver across versions (old-cap -> new -> a fresh old node, new-cap -> old
              -> a fresh new node): the keeper keeps the name, the publisher stops, then the resolver starts (so
@@ -72,6 +72,7 @@ BULK_SIZE = 3 * MIB // 2
 SMALL_FILES, SMALL_SIZE = 64, 4 * KIB
 TEXT_SIZE = 200 * KIB  # the ranges scenario's text files: about four chunks each
 UNANSWERED = "doesn't answer /range"  # what a fetching node of this tree logs as it learns a node doesn't
+SILENT_ONCE = "left /range unanswered once"  # ... and as a node leaves its first /range unanswered
 CAP_RATE = 2_000_000  # bits/s: max_upload_rate on the *-cap nodes, so BULK_SIZE takes seconds (4 to 6)
 # Lines in a fetching node's log that mean a provider let it down, and in a serving node's log that mean it
 # refused (or cooled down) a requester. Both need RNS's loglevel at 5 (verbose), which every node here runs at
@@ -475,17 +476,19 @@ class Network:
         return detail, b.log_since(b_log), a.log_since(a_log)
 
     def ranges_old(self, a: Daemon, b: Daemon) -> str:
-        """b (this tree, slow) fetches from a (an old release): one /range left unanswered teaches it that a doesn't
-        answer /range, every block comes with /blocks, nothing is refused, failed or banned on either side (checked by
-        honest_transfer), and no /range goes to a again: in a second fetch, nor after b restarts."""
+        """b (this tree, slow) fetches from a (an old release) twice: in each, one /range is left unanswered and the
+        rest comes with /blocks, nothing refused, failed or banned on either side (checked by honest_transfer); the
+        second silence in a row teaches b that a doesn't answer /range, and after b restarts no /range goes to a."""
         detail, b_lines, _ = self.text_transfer(a, b)
+        once = [line for line in b_lines if SILENT_ONCE in line]
         learnt = [line for line in b_lines if UNANSWERED in line]
-        if len(learnt) != 1:
-            raise AssertionError(f"{b.name} logged {len(learnt)} lines saying {UNANSWERED!r}, not 1: {detail}")
+        if (len(once), len(learnt)) != (1, 0):
+            raise AssertionError(f"{b.name}'s first fetch logged {len(once)} lines saying {SILENT_ONCE!r} and "
+                                 f"{len(learnt)} saying {UNANSWERED!r}, not 1 and 0: {detail}")
         again, b_lines, _ = self.text_transfer(a, b)
-        asked = [line for line in b_lines if "/range" in line]
-        if asked:
-            raise AssertionError(f"{b.name} asked {a.name} /range again in the same run: {asked[:3]}")
+        learnt = [line for line in b_lines if UNANSWERED in line]
+        if len(learnt) != 1 or any(SILENT_ONCE in line for line in b_lines):
+            raise AssertionError(f"{b.name}'s second fetch logged {len(learnt)} lines saying {UNANSWERED!r}, not 1")
         b.stop()
         restarted = self.daemon(b.name, b.tree, b.label, NODE_CONFIG, self.tcp_port, SETTINGS + 'slow = "yes"\n',
                                 "--bootstrap", self.hub.node_id)
@@ -493,7 +496,7 @@ class Network:
         asked = [line for line in b_lines if "/range" in line]
         if asked:
             raise AssertionError(f"{b.name} asked {a.name} /range again after a restart: {asked[:3]}")
-        return f"learnt once ({learnt[0].split('rnfs ', 1)[-1][:60]}...); {detail}"
+        return f"learnt after 2 silences ({learnt[0].split('rnfs ', 1)[-1][:60]}...); {detail}"
 
     def ranges_new(self, a: Daemon, b: Daemon) -> str:
         """b (this tree, slow) fetches a text file from a (this tree): a sends the chunks as /range answers, bz2

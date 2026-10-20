@@ -115,9 +115,10 @@ response_target of transfer at the link's rate estimate) bytes on the wire, time
 range achieved (Fetch._range_plan). A range that doesn't complete its block comes back as progress
 (BlocksResult.partial): the block goes back to the front of the queue, owned by that provider while it is usable
 (Fetch._owners: no other provider is given it, so two partials of one block don't both cross the channel), and the
-provider is paced as after any response. A provider that leaves its first /range unanswered (an older node) is
-recorded as not answering it, and the block asked for again at once with /blocks, without counting against it
-(peer_client.UNSUPPORTED).
+provider is paced as after any response. A provider that leaves a /range unanswered (an older node, or a lost packet)
+is asked with /blocks for the rest of the fetch, the block at once, without counting against it
+(peer_client.UNSUPPORTED); two such silences in a row, in one fetch or several, record the node as not answering /range
+(rnfs.ranges.RangeSupport).
 
 Within `with observing(observer):`, every fetch the thread opens reports its total size and each block it
 meets to the Observer, and raises Cancelled once observer.cancelled() is true (background jobs use this).
@@ -521,7 +522,7 @@ class _Provider:
     """What a fetch knows about one provider."""
 
     __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "lost", "failed", "path", "pacing_until",
-                 "pacing_retry", "ratio")
+                 "pacing_retry", "ratio", "no_ranges")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
         """A provider found order-th, path hops away (looked up once, when found)."""
@@ -536,6 +537,7 @@ class _Provider:
         self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
         self.pacing_retry = 0.0  # ...and is retried after this many seconds
         self.ratio = 1.0  # the compression its last compressed /range answer achieved (ranges)
+        self.no_ranges = False  # it left a /range unanswered (UNSUPPORTED): /blocks for the rest of the fetch
 
 
 class Fetcher:
@@ -1387,7 +1389,7 @@ class Fetch:
         provider that stalled before, the same chunks in ranges of at most STALLED_RANGE; and any block a partial is
         held of from provider. Never to a node known not to answer /range."""
         store = self.fetcher.ranges
-        if not store.usable(provider.node_id):
+        if provider.no_ranges or not store.usable(provider.node_id):
             return None
         expects = wanted.get(cid)
         declared = expects[0].size if expects and cid.is_raw else None
@@ -1791,7 +1793,9 @@ class Fetch:
                     self._progress_at = now  # a range arrived: not hung, though no block is stored yet
                 self._pace(provider, sent_at, rate)
         elif result.status == peer_client.UNSUPPORTED:
-            # A node left /range unanswered, as an older one does (rnfs.ranges): asked with /blocks at once, not counted
+            # It left /range unanswered, as an older node does (rnfs.ranges counts the silence): asked with /blocks at
+            # once and for the rest of the fetch, not counted against it
+            provider.no_ranges = True
             provider.busy_until = 0.0
         elif result.status == peer_client.BUSY and result.reason not in ("cancelled", "closed") \
                 and now < provider.pacing_until:

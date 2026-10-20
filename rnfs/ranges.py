@@ -2,11 +2,14 @@
 blocks received from each, and one range fetched into a partial block.
 
 RangeSupport. A node before 0.2.0 has no handler for /range, and RNS leaves a request for a path without a handler
-unanswered, so whether a node answers it is learnt: a /range that RNS times out with the link up, to a node not known to
-answer it, records that it doesn't (the fetcher then asks for the block with /blocks at once); any answer records that
-it does. Kept per node ID in the state database (range_support), at most MAX_NODES, the least recently checked dropped
-first; a "doesn't" is forgotten after RECHECK, so the node is asked once more. Written only when a node's answer changes
-(or its record is a day old), not on every range.
+unanswered, so whether a node answers it is learnt. A /range that RNS times out with the link up and nothing of an
+answer started, to a node not known to answer it, is a silence: the fetcher asks that provider with /blocks for the rest
+of the fetch, at once and without counting it against it (UNSUPPORTED), and SILENCES of them in a row, in one fetch or
+several, record that the node doesn't answer /range; any answer records that it does and forgets the silences. One
+silence alone is what a lost packet on a lossy path looks like, which is where ranges pay most, so it marks nothing: an
+older node costs SILENCES request timeouts per RECHECK. Kept per node ID in the state database (range_support), at most
+MAX_NODES, the least recently checked dropped first; a "doesn't" and its silences are forgotten RECHECK after the last
+silence, and the node asked afresh. Written only when a record changes (or is a day old), not on every range.
 
 Partials. The bytes of a block received from one provider, in order, until the block is complete and verified whole
 against its CID (PeerClient.block_range). One per (block, provider), at most MAX_PARTIALS, the least recently written
@@ -26,7 +29,8 @@ from rnfs.content.cid import Cid
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import client as peer_client
 
-RECHECK = 7 * DAY  # a node recorded as not answering /range is asked once more after this
+SILENCES = 2  # /range requests left unanswered in a row (link up, nothing of an answer started) that mark a node
+RECHECK = 7 * DAY  # a node recorded as not answering /range is asked afresh this long after its last silence
 REFRESH = DAY  # a record whose answer hasn't changed is written again (its time) at most this often
 MAX_NODES = 10_000  # nodes whose answer is kept
 MAX_PARTIALS = 64  # partial blocks kept (at most MAX_BLOCK_SIZE each: 8 MiB)
@@ -36,46 +40,71 @@ MAX_RATIO = 4.0  # the most a range asked for compressed is scaled up by the com
 
 
 class RangeSupport:
-    """Whether each node answers /range: True, False (within RECHECK), or None (not known). Thread-safe."""
+    """Whether each node answers /range: True, False (SILENCES silences in a row, within RECHECK of the last), or None
+    (not known, perhaps with one silence counted). Thread-safe."""
 
     def __init__(self, db=None, clock: Callable[[], float] = time.time):
         """The records in db's range_support table (a statedb.StateDb; None: in memory only). clock is Unix time."""
         self.db = db
         self.clock = clock
         self.lock = threading.Lock()
-        self.records: OrderedDict[bytes, tuple[bool, float]] = OrderedDict()  # least recently checked first
+        # node -> (answered /range last, silences in a row since, when last found), least recently checked first
+        self.records: OrderedDict[bytes, tuple[bool, int, float]] = OrderedDict()
         if db is not None:
-            for node, answers, at in db.query("SELECT node, answers, at FROM range_support ORDER BY at"):
-                if isinstance(node, bytes) and isinstance(at, (int, float)):
-                    self.records[node] = (bool(answers), float(at))
+            for node, answers, silences, at in db.query(
+                    "SELECT node, answers, silences, at FROM range_support ORDER BY at"):
+                if isinstance(node, bytes) and isinstance(silences, int) and isinstance(at, (int, float)):
+                    self.records[node] = (bool(answers), max(0, silences), float(at))
+
+    def _silences(self, record, now: float) -> int:
+        """The silences in a row a record counts now: none once RECHECK has passed since the last (asked afresh)."""
+        answers, silences, at = record
+        return 0 if answers or now - at >= RECHECK else silences
 
     def answers(self, node_id: bytes) -> bool | None:
-        """True if node_id answers /range, False if it doesn't (recorded within RECHECK), None if not known."""
+        """True if node_id answers /range, False if it doesn't (SILENCES silences in a row, the last within RECHECK),
+        None if not known."""
         with self.lock:
             record = self.records.get(node_id)
         if record is None:
             return None
-        answers, at = record
-        if not answers and self.clock() - at >= RECHECK:
-            return None  # asked once more
-        return answers
+        if record[0]:
+            return True
+        return False if self._silences(record, self.clock()) >= SILENCES else None
+
+    def answered(self, node_id: bytes):
+        """node_id answered a /range (False and [] included): it answers, and any silence counted is forgotten."""
+        self._set(node_id, True, 0)
+
+    def silent(self, node_id: bytes) -> bool:
+        """node_id, not known to answer /range, left one unanswered with the link up: one more silence in a row.
+        True if it now counts as not answering (SILENCES of them)."""
+        with self.lock:
+            record = self.records.get(node_id)
+            silences = 1 + (self._silences(record, self.clock()) if record is not None else 0)
+        self._set(node_id, False, silences)
+        return silences >= SILENCES
 
     def record(self, node_id: bytes, answers: bool):
-        """node_id answered /range (True), or left one unanswered while not known to answer it (False)."""
+        """Record outright that node_id answers /range (True) or doesn't (False, as after SILENCES silences)."""
+        self._set(node_id, answers, 0 if answers else SILENCES)
+
+    def _set(self, node_id: bytes, answers: bool, silences: int):
+        """Keep node_id's record, writing it if it changed or is REFRESH old."""
         now = self.clock()
         with self.lock:
             previous = self.records.pop(node_id, None)
-            self.records[node_id] = (answers, now)
+            self.records[node_id] = (answers, silences, now)
             dropped = []
             while len(self.records) > MAX_NODES:
                 dropped.append(self.records.popitem(last=False)[0])
-            changed = previous is None or previous[0] != answers or now - previous[1] >= REFRESH
+            changed = previous is None or previous[:2] != (answers, silences) or now - previous[2] >= REFRESH
         if self.db is None or not (changed or dropped):
             return
         try:
             with self.db.transaction() as tx:
-                tx.execute("INSERT OR REPLACE INTO range_support (node, answers, at) VALUES (?, ?, ?)",
-                           (node_id, int(answers), now))
+                tx.execute("INSERT OR REPLACE INTO range_support (node, answers, silences, at) VALUES (?, ?, ?, ?)",
+                           (node_id, int(answers), silences, now))
                 tx.executemany("DELETE FROM range_support WHERE node = ?", [(node,) for node in dropped])
         except OSError as e:
             log(f"could not save whether {node_name(node_id)} answers /range: {e}", LOG_WARNING)
@@ -256,7 +285,8 @@ class Ranges:
               block_size: int | None, on_progress=None) -> peer_client.BlocksResult | None:
         """Ask node_id for the next range of cid's block after what is held from it (a request thread's work), and
         return what came of it as a /blocks request's result: the block (verified whole), progress (.partial), a
-        status, or UNSUPPORTED if node_id left the request unanswered and isn't known to answer /range. None if the
+        status, or UNSUPPORTED if node_id left the request unanswered and isn't known to answer /range (a silence,
+        RangeSupport.silent). None if the
         partial is in use by another request: ask with /blocks instead.
 
         target is the range's size on the wire; with compress, the bytes asked for are target times ratio (the
@@ -288,13 +318,17 @@ class Ranges:
             max_bytes = max(1, min(max_bytes, known - len(held)))
         result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress)
         if result.silent and self.support.answers(node_id) is not True:
-            # As an older node leaves it: no handler for /range (section 3). Asked with /blocks from now on
-            self.support.record(node_id, False)
-            log(f"{node_name(node_id)} doesn't answer /range (rnfs before 0.2.0, most likely): asking it with "
-                "/blocks", LOG_VERBOSE)
+            # As an older node leaves it (no handler for /range, section 3), or a lost packet on a lossy path: asked
+            # with /blocks for the rest of this fetch; twice in a row and it is taken for an older node
+            if self.support.silent(node_id):
+                log(f"{node_name(node_id)} doesn't answer /range (rnfs before 0.2.0, most likely): asking it with "
+                    "/blocks", LOG_VERBOSE)
+            else:
+                log(f"{node_name(node_id)} left /range unanswered once (a second time in a row would mark it as not "
+                    "answering): asking it with /blocks for now", LOG_VERBOSE)
             return peer_client.BlocksResult(peer_client.UNSUPPORTED, unsent=[cid], reason="no answer to /range")
         if result.status in (peer_client.OK, peer_client.BUSY) or result.reason == "malformed response":
-            self.support.record(node_id, True)
+            self.support.answered(node_id)
         if result.status != peer_client.OK:
             if result.reason == "malformed response":
                 self.partials.forget(partial)

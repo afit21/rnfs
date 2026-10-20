@@ -1346,15 +1346,19 @@ link in about a third of the airtime.
   handler, unanswered (section 3), so the requester waits out RNS's request timeout. It costs the older node
   nothing more: its per-link request rate and slots are counted inside rnfs's handlers, which never run, so no
   refusal, cooldown or ban follows, and nothing is logged. So a requester learns per node whether it answers
-  `/range`: a `/range` that RNS times out with the link up, to a node not known to answer it, records that it
-  doesn't, and the block is asked for again at once with `/blocks`, on the same link and from the same provider,
-  without counting it against the provider; any answer (`False` and `[]` included) records that it does. The
-  record is kept across restarts (rnfs: up to 10,000 nodes, the least recently checked dropped first); one saying
-  a node doesn't answer is forgotten after 7 days, and the node is asked once more. One answer covers ranges and
-  compression, which is asked per request. A `/range` left unanswered by a node known to answer it is unanswered
-  as any request is (section 6). On a lossy path a node that answers `/range` may be recorded as not, its request
-  or its answer lost: it is then asked with `/blocks` until the record lapses, which is how it was fetched from
-  before 0.2.0.
+  `/range`. A *silence* is a `/range` that RNS times out with the link up and nothing of an answer started, from a
+  node not known to answer it: the block is asked for again at once with `/blocks`, on the same link and from the
+  same provider, without counting it against the provider, and that provider is asked with `/blocks` for the rest
+  of the fetch. One silence alone marks nothing, as it is also what a lost packet on a lossy path looks like, and
+  that is where ranges pay most: two in a row, in one fetch or several, record that the node doesn't answer
+  `/range`, and any answer (`False` and `[]` included) records that it does and forgets a silence. So an older node
+  costs two request timeouts per 7 days. The record is kept across restarts (rnfs: up to 10,000 nodes, the least
+  recently checked dropped first); a node's silences are forgotten 7 days after the last, and it is asked afresh.
+  One answer covers ranges and compression, which is asked per request. A `/range` left unanswered by a node known
+  to answer it is unanswered as any request is (section 6), and one the node closed the link under is a refusal, as
+  for `/blocks`. On a lossy path a node that answers `/range` may still be recorded as not, two requests or answers
+  in a row lost: it is then asked with `/blocks` until the record lapses, which is how it was fetched from before
+  0.2.0.
 - **When rnfs uses it.** Over slow links (item 7 below), for raw chunks whose parent declares at least 4 KiB (or
   doesn't declare a size: a single-chunk file's root), one block a request, asking for compression; over any link,
   for the raw chunks of a provider whose response stalled earlier in the fetch, without compression; and for any

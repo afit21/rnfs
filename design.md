@@ -1930,8 +1930,9 @@ change returns, "NORMAL" ones are batched saves a power loss may lose the last o
   `remote_pin_retries` (0.2.0: those whose content wasn't found, when each is tried again and was first not found;
   rewritten in the same transaction); fetcher:
   `invalid` (invalid roots, oldest first; with the cache records) and `range_support` (0.2.0, rnfs/ranges.py: whether
-  each node answers `/range` and when that was found, at most 10 000; NORMAL, written as an answer changes or is a
-  day old). The partial blocks of `/range` are files in `<rnfs dir>/state/partial`, not the database, deleted at
+  each node answered its last `/range`, its silences in a row since, and when, at most 10 000; NORMAL, written as a
+  record changes or is a day old). The partial blocks of `/range` are files in `<rnfs dir>/state/partial`, not the
+  database, deleted at
   start;
 - `remote_pins_asked` and `remote_pins_served` (0.2.0, rnfs/remote_pins.py: the remote pins this node asked for and
   their checks, at most 10 000, saved after each ask and with the batched saves; the latest outcome of each remote
@@ -2292,15 +2293,19 @@ Everything in the specification is implemented, with these simplifications and a
   the block), `bad`, `missing`, a status, `partial` (bytes now held) and `ratio`, or `UNSUPPORTED`. `_handle` sets
   `_owners[cid]` for a partial (`_others_owned` keeps the block from other providers while its owner is usable;
   `_fail` releases them), counts it as progress, paces as after a served response, and on `UNSUPPORTED` clears the
-  provider's busy wait so the block goes out again at once with `/blocks`. `_accept` drops a stored block's
-  partials (`Partials.drop`). `rnfs/ranges.py`: `RangeSupport` (`answers(node_id)`: True, False within `RECHECK`,
-  7 days, or None; `record`, written to `range_support` only when the answer changes or is a day old, at most
-  `MAX_NODES`, 10,000, least recently checked dropped), `Partials` (per `(cid, node)` key, files
+  provider's busy wait so the block goes out again at once with `/blocks`, and sets `_Provider.no_ranges` (`/blocks`
+  only for the rest of the fetch). `_accept` drops a stored block's
+  partials (`Partials.drop`). `rnfs/ranges.py`: `RangeSupport` (`answers(node_id)`: True, False after `SILENCES` (2)
+  silences in a row the last within `RECHECK`, 7 days, or None; `answered` clears the silences, `silent` counts one
+  and says whether the node is now marked, `record` sets either outright; written to `range_support`, `(node,
+  answers, silences, at)`, only when a record changes or is a day old, at most `MAX_NODES`, 10,000, least recently
+  checked dropped), `Partials` (per `(cid, node)` key, files
   `<state>/partial/<key>.part` or memory; `acquire`/`release` so one request uses a partial at a time; at most
   `MAX_PARTIALS`, 64, least recently written evicted; `reset` on an inconsistent answer or unreadable file; every
   `.part` deleted when the Fetcher starts) and `Ranges.fetch` (sizes the range from `target`, `ratio` and what is
-  held, sends it, records the node's answer: `silent`, RNS's timeout with the link up, from a node not known to
-  answer means it doesn't, `UNSUPPORTED`; any answer means it does; then appends the bytes, or forgets the partial
+  held, sends it, records the node's answer: `silent`, RNS's timeout with the link up and nothing of an answer
+  started, from a node not known to answer, is a silence, `UNSUPPORTED`; any answer means it does; then appends
+  the bytes, or forgets the partial
   on `missing`, `bad`, a malformed answer or the completed block). Server side, `_handle_range` parses
   (`protocol.parse_range_request`), and `_serve`, the path `_handle_blocks` takes too, applies every `/blocks` rule
   before its `build(limit)` makes the answer: the served block's range, whole, compressed (`protocol.compress_range`,

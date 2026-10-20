@@ -975,28 +975,51 @@ class RangeTransferTest(FetcherTest):
         offsets = [offset for offset, _, _ in self.ranges_of(P1, chunk)]
         self.assertEqual(len(offsets) - len(set(offsets)), 1)
 
-    def test_an_old_providers_silence_costs_one_request_and_is_remembered(self):
+    def test_an_old_providers_silence_costs_one_request_a_fetch_and_is_learnt_after_two(self):
         self.fetcher = self.make_fetcher(slow=True)
         first, second = self.file(os.urandom(3 * CHUNK_SIZE)), self.file(os.urandom(2 * CHUNK_SIZE))
         self.hold(P1)
         self.client.no_range.add(P1)  # an rnfs 0.1.x node
         self.runs.extend([[P1], [P1], [P1]])
         self.fetch_all(first.cid)
-        self.assertEqual(len(self.client.ranges), 1)  # asked once, then /blocks
+        self.assertEqual(len(self.client.ranges), 1)  # asked once, then /blocks for the rest of the fetch
         self.assertTrue(self.storage.is_complete(first.cid))
-        self.assertIs(self.fetcher.ranges.support.answers(P1), False)
+        self.assertIsNone(self.fetcher.ranges.support.answers(P1))  # one silence: maybe a lost packet
         self.assertFalse(self.routing.is_banned(P1))  # not penalised: its silence isn't a failure
         self.fetch_all(second.cid)
-        self.assertEqual(len(self.client.ranges), 1)  # not asked again
+        self.assertEqual(len(self.client.ranges), 2)  # the second silence in a row: learnt
         self.assertTrue(self.storage.is_complete(second.cid))
-        # Persisted: a restarted fetcher doesn't ask it again either
+        self.assertIs(self.fetcher.ranges.support.answers(P1), False)
+        # Persisted: a restarted fetcher doesn't ask it again
         self.fetcher.close()
         self.fetcher = self.make_fetcher(slow=True)
         self.assertIs(self.fetcher.ranges.support.answers(P1), False)
         third = self.file(os.urandom(2 * CHUNK_SIZE))
         self.hold(P1)
         self.fetch_all(third.cid)
-        self.assertEqual(len(self.client.ranges), 1)
+        self.assertEqual(len(self.client.ranges), 2)
+
+    def test_one_lost_range_doesnt_mark_a_node_that_answers(self):
+        self.fetcher = self.make_fetcher(slow=True)
+        first, second = self.file(os.urandom(2 * CHUNK_SIZE)), self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        lost = []
+
+        def lose_one(cid, offset, max_bytes, compress):
+            """The first /range is lost on the way (RNS times it out with the link up)."""
+            if not lost:
+                lost.append(cid)
+                return client_module.RangeResult(LOST, silent=True, reason="no answer")
+            return None
+        self.client.range_behaviour[P1] = lose_one
+        self.runs.extend([[P1], [P1]])
+        self.fetch_all(first.cid)
+        self.assertTrue(self.storage.is_complete(first.cid))
+        self.assertIsNone(self.fetcher.ranges.support.answers(P1))
+        self.fetch_all(second.cid)  # ranges again, answered: the silence is forgotten
+        self.assertTrue(self.storage.is_complete(second.cid))
+        self.assertGreater(len(self.client.ranges), 1)
+        self.assertIs(self.fetcher.ranges.support.answers(P1), True)
 
     def test_a_provider_that_stalled_gets_ranges_on_a_fast_link(self):
         built = self.file(os.urandom(2 * CHUNK_SIZE))
