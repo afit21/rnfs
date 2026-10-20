@@ -365,7 +365,8 @@ changed through a SNAPSHOT `RowStore` taking the table's lock; it imports the st
 which lookups import, needn't.
 
 `providers.py` — `ProviderStore(state_dir, record_budget=1 GiB, *, ttl=PROVIDER_TTL, clock=time.time, rng=random,
-max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None)` (`state_dir` holds the
+max_per_key=1000, own_id=None, known=lambda id: False, free_space=None, record_bytes=None, monotonic=time.monotonic,
+write_budget=WRITE_BUDGET)` (`state_dir` holds the
 state database; None: a private in-memory one, `statedb.connect_memory`, so tests run the same code):
 `store(key, publisher) -> bool`, `withdraw(key, publisher)`, `provide(publisher, keys, withdrawn) -> int`,
 `retain(keep) -> int` (drops every record and the standing of publishers `keep` rejects: private mode's
@@ -383,17 +384,32 @@ Records live on disk and are read per key. Nothing in memory grows with the reco
 - `save()` writes all of it in one transaction (NORMAL), then measures (`_measure`): the node's `maintain()`
   call, every 30 s (`RECORDS_INTERVAL`), expires and saves; a store saves itself once `FLUSH_CHANGES` (20 000)
   changes wait, and past `MAX_CHANGES` (saves failing) refuses others' new records rather than hold more. A refresh
-  writes nothing unless it moves the last-stored time by more than an hour (`REFRESH_WRITE`), or its day is a new
+  writes nothing unless it moves the last-stored time by more than 6 hours (`REFRESH_WRITE`), or its day is a new
   refresh day; a refusal writes nothing.
+- The write budget (`_WriteBudget`, REV2), full or not: new records and withdrawals spend rows from pools refilled
+  on `monotonic` per `WRITE_WINDOW` (30 s, the node's save interval), `WRITE_BUDGET` = (60, 30, 30): the first
+  open to every tier, the others kept for Earned and Known, who spend their own first; each pool starts full and
+  carries at most `WRITE_CARRY` (720) windows, 6 hours. `_store` refuses a new record of another publisher when its
+  pools are empty, as `_FULL` (so `provide` stops looking for the rest of the batch), and spends a row once it is
+  added; `_withdraw` spends one if any is left, never refusing. Every record inserted is deleted at most once, so
+  the rows written stay within twice the budget. A withdrawn record is kept in `_withdrawn` until the save (each is
+  a deleted row in `_dirty`, so bounded with it): stored again before then, `_store` adds it back with its
+  first-stored time (its last-stored time moved only past `REFRESH_WRITE`) as a refresh, spending nothing.
+  Measured on a 1M-record database, a new record costs about 12 kB of writes (WAL and checkpoint) for one publisher's
+  and 36 kB for a fresh identity's (its standing rows too), so a Newcomer flood writes at most about 150 kB/s;
+  without the budget one identity's store-and-withdraw loop wrote 10-20 MB/s.
 
 Each publisher's standing (`_Standing`: first seen, records held, tier, refresh days and the last of them) keeps
 the counts the budget and tiers need: `_tier_records` (records per tier, this node's in a tier of its own, `OWN`)
 and `_publishers`, read from `provider_standing` at load (`SUM ... GROUP BY tier`), and changed with each record
 (`_count_records`). A publisher left without records keeps its standing only if it has refresh days, until a TTL
-after the last (`maintain`'s hourly `_forget_departed`). The tier is worked out when the publisher stores
-(`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or removed since
-is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it), or by the
-hourly check of those written as Known.
+after the last (`maintain`'s hourly `_forget_departed`), and at most `MAX_DEPARTED` (50,000, about 5 MB) of them:
+right after the hourly pass's save, `_cap_departed` counts them on disk (by `provider_standing_tier`) and forgets the
+excess, fewest refresh days first, then the longest unrefreshed (REV11: they were capped only by the TTL, so
+identities refreshing one record a day later and withdrawing it grew them). The tier is worked out when the
+publisher stores (`_tier_of`: `own_id`, then `known(publisher)`, then `EARNED_DAYS` refresh days); a contact added or
+removed since is noticed when the publisher stores, when it is picked to evict from (`_largest` checks and moves it),
+or by the hourly check of those written as Known.
 
 Room: `_capacity()` is `record_budget` over the bytes a record takes, or the records held at the last measure plus
 the free disk beyond the reserve (`free_space()`; the node passes `shutil.disk_usage` of the state directory less
@@ -409,8 +425,12 @@ table); both, and `_oldest_key`'s position in each publisher's records, are rese
 costs a few reads and O(log n) in memory: about 70 µs on a desktop, a third of them SQLite's. Once a batch's key is
 refused for room, `provide` refuses its other new keys without looking again (NEW-8).
 
-A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the
-lowest tier among the rest gives way if that tier is below the storer's, or is the storer's and not Earned.
+A key keeps at most `max_per_key` publishers (`_key_room`): the K/2 oldest records stay, and a random one of the rest
+gives way, by tier in an order the storer's tier and the Newcomers' share of the key (`KEY_NEWCOMER_SHARE`, 10%,
+counted among the rest) set: a Newcomer takes Earned then Newcomer records while Newcomers are below their share, else
+only Newcomer ones; an Earned storer Earned then Newcomer ones while Newcomers are within their share, else Newcomer
+then Earned ones; a Known storer the same, then Known ones (REV3: Earned records never gave way to each other, so
+1000 Earned identities could hold a key against all but Known publishers).
 This node's records are never counted there, never evicted and never refused. Expiry (`_expire`) reads expired
 records through `provider_records_last`, `SWEEP_BATCH` at a time with the lock let go between batches, and, while
 full, Newcomers' records last stored 4.5 days ago (`_NEWCOMERS_EXPIRED`, joined with their standing; the tier

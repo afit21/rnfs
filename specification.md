@@ -1003,14 +1003,31 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     expired: one more way a full store makes room. The longest honest gap between republishes is just under
     3.5 days (kept names, below), so a record republished on time never lapses this way. A store that isn't
     full keeps every record `PROVIDER_TTL`, so a record survives one missed republish.
+  - **Write budget.** Full or not, the rows a node writes for others' records are budgeted, so no publisher can
+    make it write without bound (one identity storing and withdrawing records in a loop could make a store write
+    megabytes a second). In rnfs, new records and withdrawals spend a budget of 60 rows every 30 s open to every
+    publisher, plus 30 kept for Earned and 30 for Known publishers (the tiers above, by the same tests, though the
+    store needn't be full), who spend their own first; unused budget is carried over for up to 6 hours. Past it,
+    new records are refused; withdrawals spend what is left but are never refused, and refreshes cost nothing:
+    one is written only once it moves the record's last-stored time by more than 6 hours. A withdrawal followed by
+    a store of the same key by the same publisher before the node next writes its changes (every 30 s) is a
+    refresh, keeping its first-stored time. A 0.1.x publisher stores at most a few new keys a second, so the
+    budget carried over covers its first round to a server; republishing every day or every 3 days is refreshes.
   - A publisher's refresh days are persisted with its first-seen time, and kept `PROVIDER_TTL` after the last
     of them once its last record is gone, so one that was away for a while is still Earned; a publisher that
-    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state.
-  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a newcomer to a full
-    key evicts a random one of the lowest tier there (never one of the `K/2` oldest records, which replies list
-    first), if that tier is below its own, or is its own and not Earned; otherwise it is refused. Refusing every
-    newcomer would let early Sybil identities hold the key, and the random half of `/find` replies relies on
-    newcomers getting stored.
+    never refreshed a record leaves nothing behind, so a flood of fresh identities grows no state. rnfs keeps at
+    most 50,000 standings of publishers without records (about 5 MB), forgetting those with the fewest refresh days
+    first, so identities that refreshed a record once and withdrew it can't grow that state either, nor push out
+    Earned publishers that left.
+  - A key keeps at most 1000 publishers besides this node, so `/find` replies stay cheap: a new publisher of a
+    full key evicts a random record there, never one of the `K/2` oldest records, which replies list first.
+    Newcomers keep a share of the key, a tenth of its publishers: a Newcomer evicts an Earned record while
+    Newcomers hold less, else a Newcomer one; an Earned or Known publisher evicts an Earned record while Newcomers
+    hold no more than their share, else a Newcomer one first; only a Known publisher evicts a Known record, and
+    only when no other is left. Otherwise it is refused. Refusing every newcomer would let early Sybil identities
+    hold the key, and the random half of `/find` replies relies on newcomers getting stored; Earned records give
+    way too, or about 1000 identities that each refreshed the key on 3 days (about 48 hours) would hold it against
+    every publisher but Known ones, while a flood of fresh identities holds at most the Newcomers' share.
 - The node's own records are always accepted and never evicted to make room for others' (rnfs: nor counted
   toward the 1000 publishers of a key; they take room in the budget), so Sybil stores can't push a node's own
   record out of its own store.

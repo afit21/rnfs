@@ -46,9 +46,11 @@ class FullStoreTest(unittest.TestCase):
     """A store of RECORDS records: one established publisher, then FLOODERS fresh identities filling it."""
 
     def setUp(self):
-        """The store, filled; every flooder stores a hundredth of it, a second after the one before."""
+        """The store, filled; every flooder stores a hundredth of it, a second after the one before. (The write budget,
+        REV2, would spread such a flood over hours; this test is about the full store's tiers, so it has none.)"""
         self.clock = FakeClock(1_700_000_000.0)
-        self.store = ProviderStore(None, RECORDS * SIZE, clock=self.clock, own_id=OWN, record_bytes=SIZE)
+        self.store = ProviderStore(None, RECORDS * SIZE, clock=self.clock, own_id=OWN, record_bytes=SIZE,
+                                   write_budget=None)
         earn(self.store, self.clock, HONEST_OLD, ident(1))
         key = 1 << 64
         for flooder in range(FLOODERS):

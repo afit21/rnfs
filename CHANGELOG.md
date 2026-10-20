@@ -101,6 +101,25 @@ Security:
   the rnfs dir but outside `files/`. Every walk (`add`, the shared folder, `name sync`, sealed folders) also skips,
   with a warning, a directory that is the rnfs dir or one of those subdirectories by device and inode, which catches
   a bind mount of them; one given as the root is refused.
+- **Provider records have a write budget** (REV2; specification section 6, "Provider records"): with no
+  per-publisher cap left, one identity storing and withdrawing records in a loop made the store write about
+  100,000 rows a second in-process, and 9.5 MB/s at 100 requests a second. New records and withdrawals now spend a
+  budget of 60 rows every 30 s open to all, plus 30 each kept for Earned and Known publishers, carried over for up
+  to 6 hours; past it new records are refused (`False`), withdrawals never are, and refreshes cost nothing. A
+  withdrawal followed by a store of the same key before the next save is a refresh, and a refresh is written once
+  it moves a record's last-stored time by 6 hours rather than 1. A Newcomer flood now makes the store write at most
+  about 150 kB/s (fresh identities, inserted and withdrawn, on a 1M-record database), a hundredth of what it did.
+- **A full key can't be taken over** (REV3; specification section 6): Earned publishers never gave way to each other
+  at a full key, so about 1000 identities that each refreshed one key on 3 UTC days (from about 48 hours) held all
+  its 1000 publishers, and every new provider of it but Known ones was refused. Now Earned records give way to
+  Earned and Known storers (a random one outside the `K/2` oldest), and Newcomers keep a tenth of the key: below it
+  a Newcomer evicts a random Earned record, past it Newcomers give way first, so a flood of fresh identities holds
+  at most that share.
+- **Provider standings without records are capped** (REV11; specification section 6): a publisher left without
+  records keeps its refresh days a week, and nothing else bounded those rows, so identities that each refreshed one
+  record a day later and withdrew it grew the state database (and took room from the record budget, which measures
+  it). At most 50,000 are kept (about 5 MB); past that the hourly pass forgets those with the fewest refresh days
+  first, so Earned publishers that left outlast such a flood.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -445,7 +464,7 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 - **On disk:** records are read from the state database per `/find` through an index, with a small cache, instead
   of all held in memory (about 500 bytes each before): memory no longer grows with the records or their publishers.
   Changes are written together every 30 s; a republish is written only when it moves a record's last-stored time by
-  more than an hour, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
+  more than 6 hours, and a refused store writes nothing. A flood of 300 000 fresh identities into a full store of
   200 000 records cost about 70 µs a store and 112 transactions in all, on a desktop NVMe disk.
 - **A byte budget instead of a record count:** records may take `record_budget` of disk (new, default 1 GiB: about
   7 million records at the 150 bytes a record takes, measured from the database), never the free disk the blocks'
@@ -459,7 +478,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   above its floor first, then, if the storer's own tier is below its floor, a higher tier above its own; else
   within its own tier, refused for one holding as many as the largest, and for Earned publishers, which never evict
   each other. While full, a Newcomer's record expires 4.5 days after it was last stored (otherwise every record
-  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
+  still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way by tier, with a
+  share kept for Newcomers (Security, above).
 
 Changed:
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
