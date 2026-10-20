@@ -382,9 +382,10 @@ Added:
   `Status.network` and `Status.record_store`) reports what the node sees of the network, with nothing sent to learn
   it: `network` gives the number of DHT servers the density check estimates (`size_estimate`, null until 8 lookups
   completed; `known_nodes` is the routing table's, to compare) and how many searches and published keys the check ran
-  on and fired on in the last hour and day; `record_store` gives the provider records' bytes against `record_budget`,
-  the capacity, whether it is full, and for each storage tier (Known, Earned, Newcomer) its records and share against
-  its floor and the new records refused and records evicted in the last hour and day. `rnfs status` sums these up in
+  on and fired on in the last hour and day; `record_store` gives what counts against `record_budget` (the state
+  database's size), the records the store would hold when full, whether it is full, and for each storage tier
+  (Known, Earned, Newcomer) its records and share against its floor and the new records refused and records evicted
+  in the last hour and day. `rnfs status` sums these up in
   a few lines after the other fields (`network_size`, `density_check`, `partition_for` while in partition mode,
   `record_store`, `record_tiers`, `records_refused`, `records_evicted`); every existing field and line is unchanged.
   The counts are kept in memory (per minute over the last day; a restart starts them afresh), and the status reads

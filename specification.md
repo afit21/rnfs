@@ -2136,9 +2136,10 @@ The counts of recent events are kept per minute over the last day, in memory onl
   published key once per round it is checked, flagged when it gets a widened lookup). Without an attack a few percent
   fire (section 6); many more point at identities placed next to keys, or an estimate gone wrong. The local servers
   and partition mode are `local_servers`, `partition` and `partition_since`.
-- `record_store`: the provider records stored for others (section 6, "Provider records"): `bytes`, what they count for
-  against `record_budget` (the records held times the bytes a record takes, as last measured), `budget`, `capacity`
-  (the records the store holds when full: fewer than the budget allows while the free disk is short), `full`,
+- `record_store`: the provider records stored for others (section 6, "Provider records"): `bytes`, what counts
+  against `record_budget` (the state database's size in use, its other state included, as last measured), `budget`,
+  `capacity` (the records the store would hold when full: those held plus the room left at about 180 bytes a record,
+  fewer while the free disk is short), `full`,
   `publishers` and `own_records` (this node's own; `records` is every record held), and `tiers`: for each of `known`,
   `earned` and `newcomer`, its `records`, their `share` of the capacity and its `floor`, and the new records of its
   publishers refused and the records of its publishers evicted to make room (from a full budget or a key's 1000

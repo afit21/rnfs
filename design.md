@@ -457,9 +457,15 @@ For the node's status (`usage()`, specification section 11 "Network status"): `_
 `recent.RecentCounts` per tier (on `monotonic`, `time.monotonic` unless given), fed by `_refuse` (every `_FULL` or
 `_REFUSED` `_store` returns for another's new record, by the storer's tier; also the keys of a batch refused without
 looking for room again) and `_count_eviction` (`_evict_from`'s record and a full key's victim, by the evicted
-publisher's tier as last worked out). `usage()` takes `_count()`, `_capacity()`, the bytes a record takes,
-`_tier_records` and `_publishers` under the lock and reads nothing from the database: `bytes` is the records times
-the bytes a record takes, `capacity` `_capacity()` rounded down, each tier's `share` its records over it.
+publisher's tier as last worked out). `usage()` takes `_count()`, `_capacity()`, `_tier_records` and `_publishers`
+under the lock and reads nothing from the database (`_reported_usage`): `bytes` is the state database's pages in use
+at the last `_measure` plus `RECORD_BYTES_ESTIMATE` (180, measured about 171) for each record stored since, which is
+what counts against `record_budget`; `capacity` is the records held plus the budget's room left (within the free
+disk) at `RECORD_BYTES_ESTIMATE` a record, or the records held once full; each tier's `share` is its records over it.
+`_capacity()` itself divides the database by at least `MEASURE_RECORDS` records, so while the records are few next to
+the rest of rnfs's state (a million blocks' sizes take tens of megabytes) it is a fraction of the real capacity:
+right for deciding when the database reaches the budget, wrong as a figure to show. With a fixed `record_bytes`
+(tests), `bytes` and `capacity` are the records times it and `_capacity()`.
 
 `lookup.py` — network access is injected:
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).

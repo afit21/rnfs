@@ -104,6 +104,9 @@ CACHE_KEYS = 4096  # ... of at most this many keys
 STANDING_CACHE = 4096  # standings kept in memory besides those changed since the last save
 SWEEP_BATCH = 1000  # rows an expiry pass reads at a time (the lock is let go between batches)
 MEASURE_RECORDS = 10_000  # bytes per record are measured over at least this many records (_measure)
+# What one more record adds to the state database, for usage()'s capacity (measured: about 171 bytes, with 100 or
+# 1000 keys a publisher). Only reported: whether the store is full goes by the database itself (_capacity)
+RECORD_BYTES_ESTIMATE = 180
 _EXPIRE_INTERVAL = 60  # when full, a store sweeps for expired records at most this often (seconds)
 _HOURLY = HOUR  # how often maintain() forgets old standings and checks the Known tier
 _STORED, _REFUSED, _FULL = "stored", "refused", "full"  # what _store did
@@ -351,6 +354,7 @@ class ProviderStore:
         self._record_bytes = 1.0  # measured (_measure) unless fixed
         self._room: int | None = None  # bytes free beyond the reserve when last measured (None: not checked)
         self._measured = 0  # records held then
+        self._db_bytes: int | None = None  # the state database's pages in use then (None: not measured)
         self._retry_at = 0  # after a failed save, the changes waiting before a store tries again (_save_due)
         self._last_sweep = float("-inf")
         self._last_hourly = float("-inf")
@@ -951,6 +955,7 @@ class ProviderStore:
         if self.fixed_record_bytes is None:
             page_size = self._db.query("PRAGMA page_size")[0][0]
             pages = self._db.query("PRAGMA page_count")[0][0] - self._db.query("PRAGMA freelist_count")[0][0]
+            self._db_bytes = pages * page_size
             # Over fewer records the database is mostly the rest of rnfs's state, and the ratio says nothing about
             # records; a store that small is far below any budget but a tiny one
             self._record_bytes = max(1.0, pages * page_size / max(MEASURE_RECORDS, self._count()))
@@ -1179,15 +1184,16 @@ class ProviderStore:
 
     def usage(self) -> dict:
         """The store against its budget, for the node's status, from counts kept in memory (no read of the records):
-        {"bytes": what the records count for against record_budget (records held × the bytes a record takes, as
-        measured at the last save), "budget": record_budget, "capacity": the records it holds when full (fewer than
-        the budget allows while the free disk is short), "full", "publishers": publishers holding records here
+        {"bytes": what counts against record_budget (the state database's size in use, records and the rest of rnfs's
+        state, as measured at the last save, with the records stored since), "budget": record_budget, "capacity": the
+        records it would hold when full (_reported_capacity), "full", "publishers": publishers holding records here
         (this node too, if it does), "own_records": this node's, "tiers": {"known"|"earned"|"newcomer": {"records",
         "share" (of the capacity), "floor" (the share a full store keeps for it), "refused_hour", "refused_day" (new
         records refused), "evicted_hour", "evicted_day" (records evicted to make room)}}}."""
         with self._lock:
             count, capacity = self._count(), self._capacity()
-            size = self.fixed_record_bytes or self._record_bytes
+            full = count >= capacity
+            used, capacity = self._reported_usage(count, capacity)
             records, publishers = list(self._tier_records), self._publishers
         tiers = {}
         for tier in reversed(TIERS):  # highest first, as rnfs status lists them
@@ -1197,8 +1203,28 @@ class ProviderStore:
                                        "share": round(records[tier] / capacity, 4) if capacity > 0 else 0.0,
                                        "floor": FLOORS[tier], "refused_hour": refused_hour, "refused_day": refused_day,
                                        "evicted_hour": evicted_hour, "evicted_day": evicted_day}
-        return {"bytes": round(count * size), "budget": self.record_budget, "capacity": math.floor(capacity),
-                "full": count >= capacity, "publishers": publishers, "own_records": records[OWN], "tiers": tiers}
+        return {"bytes": round(used), "budget": self.record_budget, "capacity": math.floor(capacity),
+                "full": full, "publishers": publishers, "own_records": records[OWN], "tiers": tiers}
+
+    def _reported_usage(self, count: int, capacity: float) -> tuple[float, float]:
+        """(bytes counting against the budget, records the store would hold when full) for usage(), with count records
+        held and _capacity() capacity. Lock held.
+
+        _capacity divides the database by the records (at least MEASURE_RECORDS), so while they are few next to the
+        rest of rnfs's state (a node's block sizes alone take tens of megabytes for a million blocks) each looks
+        to cost kilobytes and the capacity looks a fraction of what it is. Whether the store is full goes by the
+        database reaching the budget either way; for the report, the room left is counted at RECORD_BYTES_ESTIMATE a
+        record instead, within the free disk. A fixed record size (record_bytes) is reported as it is."""
+        if self.fixed_record_bytes is not None or self._db_bytes is None:
+            size = self.fixed_record_bytes or self._record_bytes
+            return count * size, capacity
+        used = self._db_bytes + max(0, count - self._measured) * RECORD_BYTES_ESTIMATE
+        if count >= capacity:
+            return used, count
+        room = max(0, self.record_budget - used)
+        if self._room is not None:
+            room = min(room, max(0, self._room - max(0, count - self._measured) * RECORD_BYTES_ESTIMATE))
+        return used, count + room / RECORD_BYTES_ESTIMATE
 
     def publisher_count(self) -> int:
         """Number of publishers with records here."""

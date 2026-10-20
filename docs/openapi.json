@@ -6741,7 +6741,7 @@
         "properties": {
           "bytes": {
             "type": "integer",
-            "description": "What the records count for against the budget: the records held times the bytes a record takes, as last measured."
+            "description": "What counts against the budget: the state database's size in use (its other state included, such as block sizes), as last measured, and about 180 bytes for each record stored since."
           },
           "budget": {
             "type": "integer",
@@ -6749,7 +6749,7 @@
           },
           "capacity": {
             "type": "integer",
-            "description": "Records the store holds when full: the budget's, or fewer while the free disk is short."
+            "description": "Records the store would hold when full: those held plus the budget's room left at about 180 bytes a record, fewer while the free disk is short; those held once full."
           },
           "full": {
             "type": "boolean",

@@ -789,6 +789,29 @@ class BudgetTest(StoreTestCase):
         self.assertTrue(store.store(ident(1), ident(5000)))
         self.assertEqual(store.record_count(), 12_000)  # it made room rather than grow
 
+    def test_capacity_is_reported_from_the_room_left(self):
+        """While the records are few next to the rest of rnfs's state (a node's block sizes alone take tens of
+        megabytes), the measure counts each as costing kilobytes; usage() reports the database's size as the bytes
+        against the budget and the room left at RECORD_BYTES_ESTIMATE a record as the capacity, while whether the
+        store is full still goes by the database reaching the budget."""
+        store = self.new_store(record_bytes=None)
+        store.record_budget = 1 << 30
+        with store._db.transaction(durable=False) as tx:  # the rest of rnfs's state, about 20 MB of it
+            tx.execute("CREATE TABLE other_state (x BLOB)")
+            tx.executemany("INSERT INTO other_state VALUES (?)", [(bytes(1000),) for _ in range(20_000)])
+        for n in range(200):
+            store.store(ident(10_000 + n), ident(1 + n % 5))
+        store.save()
+        usage = store.usage()
+        self.assertGreater(usage["bytes"], 20_000_000)
+        self.assertLess(usage["bytes"], 30_000_000)
+        expected = 200 + (store.record_budget - usage["bytes"]) / providers.RECORD_BYTES_ESTIMATE
+        self.assertAlmostEqual(usage["capacity"], expected, delta=2)
+        self.assertGreater(usage["capacity"], 5_000_000)
+        self.assertLess(store._capacity(), usage["capacity"] / 10)  # what the report said before
+        self.assertFalse(usage["full"])
+        self.assertAlmostEqual(usage["tiers"]["newcomer"]["share"], 0.0, places=4)
+
     def test_free_disk_bounds_the_store(self):
         """Records never take the disk the blocks' reserve needs: free_space() is the room left beyond it."""
         room = [50 * SIZE]
