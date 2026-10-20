@@ -171,3 +171,4 @@ A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
 | REV5 | `test_rev5_nomadnet_page_memory.py` | `rnfs/network/nomadnet.py` (`MAX_PAGE_SIZE`, `Transfer.resource_started`, `_outcome`) | `ac38138` |
+| REV6 | `test_rev6_site_upload_render.py` | `rnfs/gateway.py` (`serve_target`, `serve_file`, `file_type`, `SITE_SNIFFED_TYPES`) | `abf8ab0` |

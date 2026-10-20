@@ -860,7 +860,16 @@ the request is read). `serve` hands a site request to
 every segment with `decode_segment` (an empty one is 400), resolves a name through `resolve_name` (the same cache
 and `gateway_fetches` slot) and calls `serve_target`, the path gateway's own serving, with a redirect location
 rebuilt from the decoded names (`quote(name, safe="")`), so it is always a path on the site. Logs name the site
-by its base32 CID or name (`path_for_log`, and `host_for_log` for the debug log's Host). No Origin header is
+by its base32 CID or name (`path_for_log`, and `host_for_log` for the debug log's Host). A site's page has a real
+origin, so a file someone else put into the site's DAG must not render there (REV6): on a site `serve_target`
+passes `serve_file` the path's own last name, never `?filename=`, which only sets `Content-Disposition: attachment`
+(the path gateway keeps `inline` and the type from it), and for a file reached by a path inside the site's DAG
+(`serve_file(..., passive_only=True)`) `file_type` turns a sniffed type outside `SITE_SNIFFED_TYPES` (images,
+audio, video, `font/woff2`, `application/wasm`, UTF-8 plain text) into `application/octet-stream`. An allow-list
+rather than a deny-list, so a type `sniff` learns later is passive on sites until added. A site whose root is
+itself a file is sniffed freely, HTML included: it is its origin's only content, so an attacker gains nothing they
+couldn't with a CID of their own, and a name can point straight at a one-page HTML file. The HEAD and range paths, which use the name alone when the first bytes aren't stored, get the
+same name. No Origin header is
 checked: a page's `fetch()` of its own site is same-origin and needs no CORS header, and every other origin is
 refused by the browser for want of one, as on the path gateway. `rnfs url` (`cli.site_url`) prints a target's site
 URL without asking the daemon: the gateway port from `daemon.json`, else `rnfs.toml`.

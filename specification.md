@@ -1889,6 +1889,18 @@ gateway can never reach the API.
     `gateway_scripts` off, `allow-scripts` and `'unsafe-eval'` are dropped and `script-src 'none'` added, as on
     the path gateway. `allow-same-origin` keeps the page's own origin (the sandbox still stops it navigating
     its top window or opening unsandboxed popups), and only its own origin's pages may frame it.
+  - A file is a page there only if its DAG names it so. A site's pages run script in its own origin, and a site
+    may hold files other people supplied (uploads, attachments, a mirror), so one of those must not be made to
+    render as HTML, SVG or XML there. `?filename=` only names a download: it sets `Content-Disposition:
+    attachment; filename*=UTF-8''<name>` and never the type, which comes from the path's own last name as
+    below. A file reached by a path inside the site's DAG whose name gives no type is sniffed only to a passive
+    type: an image, audio, video, font, `application/wasm` or `text/plain; charset=utf-8` (rnfs:
+    `gateway.SITE_SNIFFED_TYPES`); content that would sniff as anything else (HTML, SVG, PDF) is
+    `application/octet-stream`. With `nosniff` on every response, the browser doesn't second-guess either. A
+    site's `index.html`, and the files its DAG names `.html`, `.svg` or another page type, render as before:
+    those are the site. A site whose root is itself a file (no path) is sniffed as on the path gateway, HTML
+    included: that file is its origin's only content, so whoever made it could have published it as a site of
+    its own, and a name can point straight at a one-page HTML file.
   - Everything else is as on the path gateway: no CORS headers (a page's `fetch()` of its own site is
     same-origin and needs none, and every other origin is refused for want of one), sealed files never
     decrypted, the deny list, sizes, `gateway_fetches` and the caching rules.
@@ -1896,7 +1908,9 @@ gateway can never reach the API.
     gateway. Links between sites must be absolute (`http://<other>.rnfs.localhost:<port>/`), and the cookie
     caveat of section 10 applies.
 - **Files.**
-  - Content-Type comes from the path's file name or `?filename=`, or else from sniffing the content.
+  - Content-Type comes from the path's file name or `?filename=`, or else from sniffing the content. On the path
+    gateway, `?filename=` also gives `Content-Disposition: inline; filename*=UTF-8''<name>`; sites use the path's
+    name only and sniff a file inside their DAG only to passive types (above).
   - Range requests for one `bytes=` range are supported; another or malformed `Range` header is ignored and
     the whole file sent.
   - `/rnfs/` responses carry `ETag: "<cid>"` and `Cache-Control: immutable`.

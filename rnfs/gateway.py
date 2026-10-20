@@ -10,7 +10,8 @@ GET/HEAD http://<name>.name.localhost:<port>/[path]            as /name/<name>/[
 Behaviour:
 - Path segments are percent-decoded one by one; a decoded segment can't contain "/" or NUL, so every
   segment is exactly one name.
-- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes. The
+- Files: Content-Type from ?filename=, else the path's last name, else sniffed from the first bytes (on site
+  hosts, never from ?filename=, and a file inside the site's DAG never sniffed as a page: see Sites). The
   user's own HEAD, or range not starting at byte 0, uses the first bytes only if they are stored (else the
   name, or application/octet-stream), so it never fetches what it doesn't send; the deny list applies to
   them as to any read (451). A web page's request (see
@@ -35,7 +36,12 @@ Behaviour:
   every other origin is still refused by the browser for want of one. Its path is a DAG path and nothing else
   (no /rnfs/ or /name/ prefix, no ?format=), every segment a valid name, and its redirects are rebuilt from
   the decoded names. Requests for a service worker script (Service-Worker header) get 403: a worker on a
-  name's site could go on serving old content after the name moves. Everything else is as on the path gateway.
+  name's site could go on serving old content after the name moves. A site's page runs script in the site's own
+  origin, so a file put into its DAG mustn't become one unless the DAG names it so (REV6): ?filename= only names a
+  download (Content-Disposition: attachment, the type still from the path's own name), and a file reached by a path
+  inside the site's DAG is sniffed only to the passive types of SITE_SNIFFED_TYPES (never HTML, SVG, XML or PDF;
+  anything else is application/octet-stream). A site whose root is itself a file is sniffed as on the path gateway:
+  that file is its origin's only content. Everything else is as on the path gateway.
 - A GatewayError (the gateway's own refusals) or NotFound says what went wrong. Every other error (a 400,
   413, 422, 503 or 507 from the node, 451 for content the deny list blocks, or a 500) gets only a fixed
   message for its status: a node error's text
@@ -114,6 +120,14 @@ EXTRA_TYPES = {".html": "text/html", ".htm": "text/html", ".css": "text/css", ".
                ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm",
                ".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml", ".json": "application/json",
                ".md": "text/markdown", ".webm": "video/webm", ".opus": "audio/ogg", ".woff2": "font/woff2"}
+
+# What sniffing may give a file inside a site's DAG (REV6), whose pages keep their origin: only types a browser never
+# renders as a document running script there, so a file put into a site's DAG under a name that gives no type can't
+# run script in the site's origin (a site whose root is a file is sniffed freely: it is its origin's only content). Anything else sniff() returns (HTML, SVG, PDF...) is served as SITE_UNSNIFFED
+SITE_SNIFFED_TYPES = frozenset({
+    "image/png", "image/jpeg", "image/gif", "image/webp", "audio/ogg", "audio/mpeg", "audio/flac", "audio/wav",
+    "video/webm", "video/mp4", "font/woff2", "application/wasm", "text/plain; charset=utf-8"})
+SITE_UNSNIFFED = "application/octet-stream"
 
 # Tags that make a document HTML when it starts with them (WHATWG MIME sniffing, "identifying HTML")
 HTML_TAGS = (b"<!doctype html", b"<html", b"<head", b"<script", b"<iframe", b"<h1", b"<div", b"<font", b"<table",
@@ -615,8 +629,13 @@ class GatewayHandler(TimedHandler):
             if not slash:
                 return self.redirect_to_slash(location)
             return self.serve_directory(target, "/".join([title, *names]) + "/", bool(names), cache)
-        filename = self.param("filename") or (names[-1] if names else None)
-        self.serve_file(target, info["size"], filename, cache)
+        if self.site is None:
+            filename = self.param("filename") or (names[-1] if names else None)
+        else:
+            filename = names[-1] if names else None  # ?filename= only names the download on a site (REV6)
+        # A site's root that is a file is its origin's only content, so sniffing it as a page gains nobody anything;
+        # a file reached by a path inside a site's DAG may be someone else's, put there (REV6)
+        self.serve_file(target, info["size"], filename, cache, passive_only=self.site is not None and bool(names))
 
     def decode_segment(self, segment: str) -> str:
         """One percent-decoded path segment, which must be a single valid name."""
@@ -670,12 +689,12 @@ class GatewayHandler(TimedHandler):
                 if self.limited() and not self.node.is_local(index_target):
                     self.need_network()  # the directory may be stored without its index.html
                 log(f"gateway: serving {index_target}", LOG_DEBUG)
-                return self.serve_file(index_target, entry["size"], INDEX, cache)
+                return self.serve_file(index_target, entry["size"], INDEX, cache, passive_only=self.site is not None)
         log(f"gateway: listing {target} ({len(entries)} entries)", LOG_DEBUG)
         self.send_body(200, "text/html; charset=utf-8", listing_html(title, entries, has_parent), cache)
 
-    def serve_file(self, target: str, size: int, filename: str | None, cache: dict):
-        """Serve a file, or the requested byte range of it."""
+    def serve_file(self, target: str, size: int, filename: str | None, cache: dict, passive_only: bool = False):
+        """Serve a file, or the requested byte range of it; passive_only: sniff only to SITE_SNIFFED_TYPES."""
         byte_range = parse_range(self.headers.get("Range"), size)
         if_range = self.headers.get("If-Range")
         if if_range is not None and if_range.strip() != cache.get("ETag"):
@@ -684,10 +703,12 @@ class GatewayHandler(TimedHandler):
             raise GatewayError(416, "range not satisfiable", {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
         # A web page's HEAD or later range reads the first bytes too: its type mustn't depend on what is stored
         content_type = self.file_type(target, size, filename, self.limited() or (
-            self.command != "HEAD" and (byte_range is None or byte_range[0] == 0)))
+            self.command != "HEAD" and (byte_range is None or byte_range[0] == 0)), passive_only)
         headers = {"Accept-Ranges": "bytes", **cache}
         if self.param("filename"):
-            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
+            # On a site, a link naming a file x.html mustn't make it render in the site's origin (REV6)
+            disposition = "inline" if self.site is None else "attachment"
+            headers["Content-Disposition"] = f"{disposition}; filename*=UTF-8''{quote(self.param('filename'), safe='')}"
 
         if byte_range is None:
             status, start, length = 200, 0, size
@@ -701,8 +722,10 @@ class GatewayHandler(TimedHandler):
         chunks = iter(self.node.read(target, offset=start, length=length, for_gateway=True))
         self.send_stream(status, content_type, length, headers, chunks)
 
-    def file_type(self, target: str, size: int, filename: str | None, read_start: bool) -> str:
-        """A file's Content-Type: octet-stream for a sealed file (never decrypted here), else by name or sniffed.
+    def file_type(self, target: str, size: int, filename: str | None, read_start: bool,
+                  passive_only: bool = False) -> str:
+        """A file's Content-Type: octet-stream for a sealed file (never decrypted here), else by name or sniffed
+        (with passive_only, a file inside a site's DAG, only to SITE_SNIFFED_TYPES).
 
         With read_start (a response that sends the first bytes anyway, or any web page's request) they are
         read, fetched if need be. Otherwise (the user's own HEAD or range starting later) they are used only if
@@ -715,7 +738,15 @@ class GatewayHandler(TimedHandler):
             head = self.node.stored_head(target, length)
             if head is None:
                 return type_from_name(filename) or "application/octet-stream"
-        return "application/octet-stream" if is_sealed(head) else type_from_name(filename) or sniff(head)
+        if is_sealed(head):
+            return "application/octet-stream"
+        by_name = type_from_name(filename)
+        if by_name:
+            return by_name
+        sniffed = sniff(head)
+        if passive_only and sniffed not in SITE_SNIFFED_TYPES:
+            return SITE_UNSNIFFED  # a file its DAG doesn't name as a page never becomes one in a site's origin
+        return sniffed
 
     def send_stream(self, status: int, content_type: str, length: int, headers: dict, chunks):
         """Send length bytes from chunks. The first chunk is read before the status, so early errors show."""
