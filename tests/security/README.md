@@ -170,6 +170,6 @@ A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2
 
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
-| REV2 | `test_rev2_provider_write_budget.py`; also `tests/test_providers.py` (`WriteBudgetTest`) | `rnfs/dht/providers.py` (`_WriteBudget`, `ProviderStore._store`, `_withdraw`, `REFRESH_WRITE`) | the REV2 commit |
-| REV3 | `test_rev3_full_key_takeover.py`; also `tests/test_providers.py` (`KeyCapTest`) | `rnfs/dht/providers.py` (`ProviderStore._key_room`, `KEY_NEWCOMER_SHARE`) | the REV3 commit |
-| REV11 | `test_rev11_standings_cap.py`; also `tests/test_providers.py` (`test_departed_standings_are_capped_on_disk`) | `rnfs/dht/providers.py` (`ProviderStore._cap_departed`, `maintain`, `MAX_DEPARTED`) | the REV11 commit |
+| REV2 | `test_rev2_provider_write_budget.py`; also `tests/test_providers.py` (`WriteBudgetTest`) | `rnfs/dht/providers.py` (`_WriteBudget`, `ProviderStore._store`, `_withdraw`, `REFRESH_WRITE`) | `63201f5` |
+| REV3 | `test_rev3_full_key_takeover.py`; also `tests/test_providers.py` (`KeyCapTest`) | `rnfs/dht/providers.py` (`ProviderStore._key_room`, `KEY_NEWCOMER_SHARE`) | `18897a5` |
+| REV11 | `test_rev11_standings_cap.py`; also `tests/test_providers.py` (`test_departed_standings_are_capped_on_disk`) | `rnfs/dht/providers.py` (`ProviderStore._cap_departed`, `maintain`, `MAX_DEPARTED`) | `f5dd6e8` |
