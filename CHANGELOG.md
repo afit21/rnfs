@@ -721,7 +721,8 @@ Faster:
   800 with 16 at once over local TCP and the CPU busy) the request waited out RNS's whole timeout, 11 s at least,
   and failed. One such `/find` held back a whole publishing round: `tests/interop.py` sometimes took 10 to 25 s
   longer to find a node providing what it had just added. The answer is now kept and handed over once the request
-  is registered.
+  is registered, on `rnfs.dht` links and on the link of a NomadNet add, where a page small enough for one packet
+  (NomadNet's "Request Not Allowed" among them) could be lost the same way and the add fail.
 
 ## 0.1.6
 

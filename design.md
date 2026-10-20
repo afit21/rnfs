@@ -695,7 +695,8 @@ Every link `LinkPool` opens gets an `EarlyResponses` (`PeerLink.early`, 0.2.0) i
 (RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept (at most
 `MAX_EARLY_RESPONSES`, 16, for `EARLY_RESPONSE_LIFE`, 30 s), and `LinkPool._request`, once `Link.request` has
 returned the registered receipt, hands RNS the one kept for it (`deliver`), both under one lock, so an answer that
-beat its receipt (RNS registers it only after sending) isn't dropped. NomadNet fetches (`nomadnet.py`) don't use it.
+beat its receipt (RNS registers it only after sending) isn't dropped. NomadNet fetches (`nomadnet.py`) install one on
+their own link too (0.2.0).
 
 `paths.py` — `PathRequests(transport=lambda: RNS.Transport, reticulum=RNS.Reticulum.get_instance, clock, sleep,
 spacing=SPACING, slow_bitrate=None)`, the node's path-request budget (spec section 3, "Path requests"): `LinkPool` makes
@@ -1616,8 +1617,16 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   (pinned with the caller's source; `pin ls`'s origin is the link, and a user's label stays), removing the copy afterwards; the node removes copies a crash left
   (`remove_leftovers`, at start). `network/nomadnet.fetch` opens its own link (`open_link`: `await_path`, a recall
   loop as `LinkPool._recall`, the `nomadnetwork.node` destination whose hash is the one given, marked with
-  `guards.mark_nomadnet` right after `RNS.Link` is made), identifies if asked, and sends one request; a "Request
-  Not Allowed" answer on an identified link is retried once after identifying again. Per request a `Transfer` holds
+  `guards.mark_nomadnet` right after `RNS.Link` is made), installs a `links.EarlyResponses` on it (0.2.0), identifies
+  if asked, and sends one request; a "Request Not Allowed" answer on an identified link is retried once after
+  identifying again. `_request` hands RNS an answer that came as a packet before `Link.request` had registered its
+  receipt (`deliver`, as `LinkPool._request`: a page that fits a packet, NomadNet's "Request Not Allowed" among
+  them), whose callbacks then run on the fetching thread. An answer sent as a Resource can beat its receipt too,
+  but RNS ignores its advertisement inside `Link.receive` (it matches no pending request), out of
+  `handle_response`'s reach; the node advertises again once its Resource's timeout passes (round trip ×
+  `traffic_timeout_factor`, plus `Resource.PROCESSING_GRACE`, 1 s), by when the request is registered, so that answer
+  comes a second late rather than not at all. `Transfer.receive` sees the advertisement first and could replay it,
+  but feeding a packet back into RNS's `Link.receive` to save a second isn't worth it. Per request a `Transfer` holds
   the state RNS's callbacks fill in, hooked on the link: `set_resource_started_callback` (`resource_started`:
   `max_decompressed_size` = `MAX_EFFICIENT_SIZE` + 1, then `segment_refusal`, then on the first segment of an
   answer without metadata its total against `MAX_PAGE_SIZE`, 16 MiB, reported as `TooLarge`: RNS's
