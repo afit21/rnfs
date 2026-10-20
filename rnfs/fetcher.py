@@ -17,9 +17,10 @@ Providers, in the order they are tried:
    by default none are known).
 `get --from` uses only the given node.
 
-A provider fails, and isn't used again during the fetch, when its link fails, it answers None for a block
-of the root it advertised, it is busy max_failures times in a row (each retried after BUSY_DELAY), or it
-stalls twice. When no providers are left, the lookup runs again for a fresh random half of providers,
+A provider fails, and isn't used again during the fetch, when its link fails (no path, closed by the provider, a
+malformed answer), it answers None for a block of the root it advertised, it is busy max_failures times in a row
+(each retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses
+them (peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no providers are left, the lookup runs again for a fresh random half of providers,
 within the same lookup_timeout. A block not matching its CID bans the provider; a correctly hashed block
 that isn't a valid DAG node marks the root invalid locally and fails the fetch (a stored block that no
 longer matches its CID is local damage: it is deleted and fetched again). A fetch that gets no verified
@@ -456,7 +457,7 @@ class _Walk:
 class _Provider:
     """What a fetch knows about one provider."""
 
-    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "failed", "path", "pacing_until",
+    __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "lost", "failed", "path", "pacing_until",
                  "pacing_retry")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
@@ -467,6 +468,7 @@ class _Provider:
         self.busy = 0  # busy refusals in a row
         self.busy_until = 0.0
         self.stalls = 0
+        self.lost = 0  # requests unanswered in a row the way a lossy link loses them (peer_client.LOST)
         self.failed = False
         self.pacing_until = 0.0  # until then, a refusal is most likely the responder's upload pacing...
         self.pacing_retry = 0.0  # ...and is retried after this many seconds
@@ -1287,6 +1289,7 @@ class Fetch:
 
     def _send(self, node_id: bytes, cids: list[Cid]):
         """Ask node_id for cids on a request thread, which queues the result."""
+        self._links_closed.discard(node_id)  # a link closed before (a lost request's) isn't this request's
         def progress(fraction: float):
             """The response is arriving: the fetch isn't hung (on the request thread, so only _heard_at is written)."""
             self._heard_at = self.fetcher.clock()
@@ -1454,6 +1457,8 @@ class Fetch:
         if provider is None or provider.failed or not counted:
             return
         now = self.fetcher.clock()
+        if result.status != peer_client.LOST:
+            provider.lost = 0  # it answered (or failed outright)
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
@@ -1474,6 +1479,16 @@ class Fetch:
             provider.stalls += 1
             if provider.stalls >= MAX_STALLS:
                 self._fail(provider, f"stalled {provider.stalls} times")
+        elif result.status == peer_client.LOST:
+            # A lost packet, most likely (at 5% packet loss, more than half of 1 MiB fetches lose a request): asked
+            # again on a new link after the busy delay. The link is closed first, so a response still being
+            # sent on it stops (a link closing starts no cooldown, section 3) and the next isn't refused for it
+            provider.lost += 1
+            self._close_link(node_id)
+            if provider.lost >= self.config.max_failures:
+                self._fail(provider, f"{result.reason or 'no answer'} {provider.lost} times in a row")
+            else:
+                provider.busy_until = now + self.fetcher.busy_delay
         else:
             self._fail(provider, result.reason or "request failed")
 

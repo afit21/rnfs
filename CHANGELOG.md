@@ -421,6 +421,15 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
 
 Changed:
+- A lost packet no longer drops a provider: a `/blocks` request RNS times out (its packet or its answer's lost,
+  which RNS doesn't resend), whose link times out under it, or whose new link isn't established, failed its
+  provider for the rest of the fetch at once, so at 5% packet loss most 1 MiB fetches from one provider failed.
+  Now its link is closed (which starts no cooldown at the provider) and the request asked again on a new link
+  after the busy delay; the provider fails after `max_failures` such requests in a row. A link closed by either
+  end, no path, or a malformed answer still fails it at once. Measured over the fake link of
+  `tests/test_fetcher.py`'s `LossyLinkTest` (one provider, each request lost with probability 5%), 1 MiB fetches
+  succeeded 39% of the time before and 99.7% after (300 fetches each), or 97.6% when each new link's request and
+  proof are lost at 5% too.
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
   mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
   announces again at once when it starts to provide. Servers, and clients that provide, announce as before.

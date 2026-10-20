@@ -19,7 +19,7 @@ class FakeReceipt:
     def __init__(self, link):
         """Receipt for a request on link."""
         self.link = link
-        self.request_id = bytes([len(link.requests)]) * 16
+        self.request_id = bytes([len(link.requests) % 256]) * 16  # a link may carry more than 256 requests
         self.response = None
         self.response_size = None
         self.progress = 0.0
@@ -39,6 +39,7 @@ class FakeLink:
     PENDING, ACTIVE, CLOSED = 0, 2, 4
     TRAFFIC_TIMEOUT_FACTOR = 6
     establish_delay = 0.0
+    establishes = None  # function(link) -> False to have establishment time out, as a lost link request does
     responder = None  # function(link, path, data) -> response, SILENT, FAIL or a Stall
     response_size = 10  # what receipts report as the response's size
     created: list["FakeLink"] = []
@@ -58,6 +59,10 @@ class FakeLink:
         def establish():
             """Become active and report it."""
             time.sleep(FakeLink.establish_delay)
+            if FakeLink.establishes is not None and not FakeLink.establishes(self):
+                self.teardown_reason = links.LINK_TIMEOUT
+                self.teardown()
+                return
             if self.status == FakeLink.PENDING:
                 self.status = FakeLink.ACTIVE
                 established_callback(self)

@@ -720,9 +720,16 @@ and repeat.
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
 
-  A provider *fails* when its link fails, it answers `None` for a block of the root it advertised, it answers
-  `False` (busy or refused) `max_failures` times in a row, or it stalls twice (section 7). A `False` is retried
-  after a short delay. A `False` soon after the provider served a response (within 4 × that request's round
+  A provider *fails* when its link fails (there is no path to it, or the link is closed under a request by either
+  end), its answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy
+  or refused) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it
+  stalls twice (section 7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times
+  it out with the link up (on a lossy path its packet or its answer's was lost: RNS resends neither), the link
+  times out under it, or a new link to a node RNS has a path to isn't established (its link request or proof
+  lost); the requester closes that link (which starts no cooldown, section 3) and asks again on a new one after
+  the same short delay. (Failing the provider at once, rnfs before 0.2.0 failed most 1 MiB fetches from one
+  provider at 5% packet loss.) A response RNS rejects at its advertisement as too large fails its request the
+  same way, so it is asked again too, `max_failures` times at most, as a `False` is. A `False` soon after the provider served a response (within 4 × that request's round
   trip, counted from when it was sent) is taken as upload pacing (section 3) and not counted; it is retried
   after an eighth of that round trip, or the usual delay if longer. Failed providers are removed and not
   retried during that fetch. When no providers are left, `/find` runs again for a fresh random half, within the

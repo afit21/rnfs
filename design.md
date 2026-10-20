@@ -605,7 +605,9 @@ node also drops non-members' records at start (`ProviderStore.retain`).
 `find(node_id, key) -> (providers, nodes) | None`, `provide(node_id, keys, withdrawn) -> set[bytes]` (identified
 link, batched; the keys the node may have recorded: every key, or those of the batches up to and including the
 first refused or unanswered one), `blocks(node_id, cids, on_progress=None) -> BlocksResult` (status OK / BUSY /
-FAILED / STALLED; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None,
+FAILED / STALLED / LOST, unanswered as a lossy link loses a request (`PeerClient._lost`: RNS gave up on it with
+the link up, or the link timed out under it, `links.timed_out`; or a new link to a node with a path and identity
+wasn't established, `LinkPool.unestablished`), which the fetcher retries on a new link; blocks verified against their CIDs; `.blocks: dict[Cid, bytes]`, `.missing` answered None,
 `.unsent` cut by the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which the fetcher
 paces by), `link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`, `ping(node_id) -> float |
 None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht` destination of the identity
@@ -2069,7 +2071,9 @@ Everything in the specification is implemented, with these simplifications and a
   RNS's request timeout without RTT) and refuses one that would wait longer. After a response on a slow link,
   `Fetch._pace` waits as long again as the request took before asking that provider again, and a refusal within
   4 × that time of the request being sent isn't counted towards `max_failures` (retried after an eighth of it,
-  at least `busy_delay`). A `Fetch` exiting with an error (or cancelled) closes the links of its requests still
+  at least `busy_delay`). A `LOST` result (above) closes the provider's link (`Fetch._close_link`, so not one
+  another fetch uses) and asks again after `busy_delay`, failing the provider after `max_failures` in a row
+  (`_Provider.lost`, reset by any other outcome). A `Fetch` exiting with an error (or cancelled) closes the links of its requests still
   in flight. It never cancels a response's Resource (`Resource.cancel()`), and nothing in the fetcher may: on
   RNS 1.5.6 that reaches the provider as a rejection, which before a quarter of the response is sent cools the
   requester down there (`RequestServer._concluded`), while a closed link doesn't. In private mode, incoming

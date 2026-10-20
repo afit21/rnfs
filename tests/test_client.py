@@ -241,12 +241,55 @@ class PeerClientTest(unittest.TestCase):
         result = self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertEqual((result.status, result.unsent), (client.BUSY, [cid]))
 
-    def test_blocks_malformed_or_unanswered(self):
+    def test_blocks_malformed_fails(self):
         cid = block_of(10, 1)[0]
-        for answer in ([b"a", b"b"], "x", fakes.FAIL, []):
+        for answer in ([b"a", b"b"], "x", []):
             with self.subTest(answer=answer):
                 self.respond(lambda link, path, data: answer)
                 self.assertEqual(self.call(lambda: self.client.blocks(NODE, [cid])).status, client.FAILED)
+
+    def test_blocks_timed_out_is_lost(self):
+        # RNS gave up on the request with the link up: its packet or its answer's was lost, most likely
+        self.respond(lambda link, path, data: fakes.FAIL)
+        cid = block_of(10, 1)[0]
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        self.assertEqual((result.status, result.unsent), (client.LOST, [cid]))
+        self.assertTrue(self.client.has_link(NODE))  # the fetcher decides whether to close it
+
+    def close_under_request(self, reason):
+        """Respond by closing the link with RNS's teardown reason (None: closed by this node's teardown())."""
+        def answer(link, path, data):
+            """Close the link instead of answering."""
+            link.teardown_reason = reason
+            link.teardown()
+            return fakes.SILENT
+        self.respond(answer)
+
+    def test_blocks_on_a_link_that_timed_out_is_lost(self):
+        self.close_under_request(links.LINK_TIMEOUT)
+        result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+        self.assertEqual(result.status, client.LOST)
+
+    def test_blocks_on_a_link_closed_by_an_end_fails(self):
+        for reason in (links.DESTINATION_CLOSED, links.INITIATOR_CLOSED):
+            with self.subTest(reason=reason):
+                self.close_under_request(reason)
+                result = self.call(lambda: self.client.blocks(NODE, [block_of(10, 1)[0]]))
+                self.assertEqual(result.status, client.FAILED)
+
+    def test_blocks_link_not_established_is_lost_no_path_fails(self):
+        cid = block_of(10, 1)[0]
+        self.respond(lambda link, path, data: [None])
+        fakes.FakeLink.establishes = staticmethod(lambda link: False)
+        self.addCleanup(setattr, fakes.FakeLink, "establishes", None)
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        self.assertEqual((result.status, result.reason), (client.LOST, "link not established"))
+        fakes.FakeLink.establishes = None  # established now: what get() last saw is forgotten
+        self.assertEqual(self.call(lambda: self.client.blocks(NODE, [cid])).status, client.OK)
+        self.pool.close(NODE)
+        links.RNS.Transport.await_path = lambda node_id, timeout: False
+        result = self.call(lambda: self.client.blocks(NODE, [cid]))
+        self.assertEqual((result.status, result.reason), (client.FAILED, "unreachable"))
 
     def test_blocks_empty_answer_is_a_failure(self):
         # An honest node always answers at least the first CID, so an empty answer is malformed: as OK it

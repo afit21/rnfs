@@ -22,7 +22,7 @@ from rnfs.errors import InvalidDag, NotFound, StorageFull, TooLarge
 from rnfs import fetcher as fetcher_module
 from rnfs.fetcher import Fetcher
 from rnfs.network import client as client_module, links, protocol, server
-from rnfs.network.client import BUSY, FAILED, OK, STALLED, BlocksResult
+from rnfs.network.client import BUSY, FAILED, LOST, OK, STALLED, BlocksResult
 from tests.fakes.client import BATCH, FakeClient
 from tests.fakes.log import quiet_log
 from tests.support import FakeClock, failing_commits, state_execute, state_rows
@@ -262,6 +262,55 @@ class FailureRuleTest(FetcherTest):
         self.runs.append([P1, P2])
         self.fetch_all(built.cid)
         self.assertEqual(len([n for n, _ in self.client.requests if n == P1]), 1)
+
+    def test_lost_request_is_retried_on_a_new_link(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        answers = [BlocksResult(LOST, unsent=[built.cid], reason="no answer")]
+        self.client.behaviour[P1] = lambda cids: answers.pop() if answers else None
+        self.runs.append([P1])
+        with self.fetcher.open(built.cid) as fetch:
+            fetch.fetch_dag(fetch.resolve())
+            provider = fetch._providers[P1]
+            self.assertEqual((provider.failed, provider.lost), (False, 0))
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.closed, [P1])  # closed, so the retry goes out on a new link
+        self.assertEqual(self.client.asked(P1)[:2], [built.cid, built.cid])
+
+    def test_lost_max_failures_times_in_a_row_fails(self):
+        built = self.file(b"l" * 3000)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(LOST, unsent=list(cids), reason="no answer")
+        self.runs.append([P1])
+        with self.assertRaises(NotFound):
+            self.fetch_all(built.cid)
+        self.assertEqual(len(self.client.requests), self.config.max_failures)
+        self.assertEqual(self.client.closed, [P1] * self.config.max_failures)
+
+    def test_another_provider_is_asked_while_a_lost_request_waits(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(b"m" * 3000)
+        self.hold(P2)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(LOST, unsent=list(cids), reason="no answer")
+        self.runs.append([P1, P2])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual([node for node, _ in self.client.requests], [P1, P2])
+
+    def test_an_answer_resets_the_lost_count(self):
+        self.config.max_parallel_providers = 1
+        built = self.file(os.urandom(6 * CHUNK_SIZE))
+        self.hold(P1)
+        # Two lost of every three requests: never max_failures in a row
+        count = [0]
+
+        def lossy(cids):
+            """Lose the first two requests of every three."""
+            count[0] += 1
+            return BlocksResult(LOST, unsent=list(cids), reason="no answer") if count[0] % 3 else None
+        self.client.behaviour[P1] = lossy
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
 
     def test_bad_block_bans_the_provider(self):
         self.config.max_parallel_providers = 1
@@ -967,6 +1016,70 @@ class ReadAheadLinkTest(unittest.TestCase):
         self.assertEqual(len(link_fakes.FakeLink.created), 1)  # the one link, never closed
         self.assertEqual(link.status, link_fakes.FakeLink.ACTIVE)
         response.cancel.assert_not_called()
+
+
+class LossyLinkTest(unittest.TestCase):
+    """1 MiB fetches from one provider over the real PeerClient and LinkPool (RNS faked as in test_links), on a path
+    losing 5% of packets. RNS resends neither a request nor a link's request or proof: a lost request times out, a
+    lost link request or proof leaves the link unestablished. Before 0.2.0 the first lost request failed the only
+    provider, and with it more than half of these fetches (16 chunks and the root: 1 - 0.95^17); now a lost request
+    is retried on a new link and the provider fails only after max_failures in a row."""
+
+    LOSS = 0.05
+    TRIALS = 30
+
+    def setUp(self):
+        """A fetcher using a PeerClient whose links are FakeLinks; P1 serves whatever it is asked for, but each
+        request, and each link's request and proof, is lost with probability LOSS (a seeded draw, one at a time:
+        with one provider, one request is in flight at a time, so the draws come in the same order every run)."""
+        patcher = mock.patch.object(links, "RNS", link_fakes.fake_rns())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        link_fakes.FakeLink.created = []
+        link_fakes.FakeLink.establish_delay = 0.0
+        self.random = random.Random(5)
+        self.lock = threading.Lock()
+        self.network: dict[Cid, bytes] = {}
+
+        def lost() -> bool:
+            """One packet's fate."""
+            with self.lock:
+                return self.random.random() < self.LOSS
+
+        def respond(link, path, data):
+            """Serve every CID asked for, unless the request is lost: RNS then times it out."""
+            if lost():
+                return link_fakes.FAIL
+            return [self.network.get(Cid.from_bytes(binary)) for binary in data[1]]
+        link_fakes.FakeLink.responder = staticmethod(respond)
+        link_fakes.FakeLink.establishes = staticmethod(lambda link: not lost() and not lost())  # request, proof
+        self.addCleanup(setattr, link_fakes.FakeLink, "establishes", None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(rnfs_dir=tmp.name, slow="no")
+        self.storage = Storage(os.path.join(tmp.name, "blocks"), os.path.join(tmp.name, "state"), 10**9)
+        self.addCleanup(self.storage.close)
+        self.pool = links.LinkPool(object(), config)
+        self.addCleanup(self.pool.close_all)
+        self.fetcher = Fetcher(self.storage, client_module.PeerClient(self.pool, config), config, OWN,
+                               RoutingTable(OWN, config), lambda key: FakeLookup([[P1]]), busy_delay=0.01)
+        self.addCleanup(self.fetcher.close)
+
+    def test_a_lossy_link_fetches_a_mebibyte_from_one_provider(self):
+        failed = 0
+        for _ in range(self.TRIALS):
+            root = builder.build_bytes(os.urandom(1024 * 1024), self.network.__setitem__).cid
+            try:
+                with self.fetcher.open(root) as fetch:
+                    fetch.fetch_dag(fetch.resolve())
+            except NotFound:
+                failed += 1
+                continue
+            self.assertTrue(self.storage.is_complete(root))
+        # About 2% fail now (three losses in a row, each retry on a new link that may itself not be established);
+        # 56-58% did
+        self.assertLessEqual(failed, 2, f"{failed} of {self.TRIALS} fetches failed")
+        self.assertGreater(len(link_fakes.FakeLink.created), 1, "nothing was lost")
 
 
 class WalkTest(FetcherTest):
