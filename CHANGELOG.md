@@ -487,7 +487,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   judged from the path to each server as its announces arrive and from one read of the path table every 10 minutes
   (through `rnsd`, one RPC: a client's own path table starts empty). It also stores each key it provides on its
   `local_replicas` (3, at most 5) closest local servers (*two-level records*: ordinary `/provide`s, withdrawn like
-  the rest), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
+  the rest; a local server no link could be opened to is tried once more at once, since over LoRa one lost link
+  request left the island without its replica until the next republish), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
   rest of the lookup. In the topology simulation an island neighbour found content during a partition 100% of the
   time instead of 55–72%, and island-to-island lookups took 42% less airtime, for 12% more publish airtime. Fast
   nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,

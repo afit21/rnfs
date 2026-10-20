@@ -1135,7 +1135,8 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   database, read per round, rather than in memory.
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
-  refused or failed store isn't retried until the next republish. A responder may have recorded some keys of
+  refused or failed store isn't retried until the next republish, but for a local server ("LoRa islands", two-level
+  records) no link could be opened to, which a node MAY try once more at once (rnfs does). A responder may have recorded some keys of
   a request it refused (e.g. up to a local limit), so the publisher SHOULD count every key it sent to that
   node, up to and including that request, as possibly recorded there.
 - To stop providing a CID (unpinned, deleted), a node SHOULD send it as a withdrawn key to the nodes it last

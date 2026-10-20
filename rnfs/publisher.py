@@ -22,7 +22,9 @@
   the density check flags it on its region's servers (set_widening; the widened lookup counts as one of the round's
   lookups), and the servers of the parts add_store_part added. Keys are grouped by node, and each node gets its
   keys (and any withdrawals for it) in as few /provide requests as fit, over one identified link. A refused or
-  failed store isn't retried until the next republish. The node also records itself locally.
+  failed store isn't retried until the next republish, but for a local server no link could be opened to, which is
+  tried once more at once (partition mode's islands: one of few local replicas, over a lossy radio). The node also
+  records itself locally.
 - **Withdrawing.** When a CID stops being provided (unpinned, evicted, gc'd, damaged), its key is withdrawn
   from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or
   of a round cut short) whose record may not have expired yet: the closest set changes as nodes come and go.
@@ -1512,6 +1514,14 @@ class Publisher:
             # Not retried until the next republish whatever the outcome, so it counts as sent either way.
             # The node may hold records of the keys it got before any refusal: those are withdrawn later
             recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
+            if not recorded and cids and islands is not None and islands.is_local(node_id) and not should_stop():
+                # No link to a local server: its record is one of local_replicas (3 at most), and over a radio one lost
+                # packet is enough (measured on LoRa: a link request lost to the other node's transmission), which
+                # would leave the island without it until the next republish. Opened once more; off-island stores
+                # aren't (K of them, and their failures count towards partition mode)
+                log(f"couldn't reach local server {node_name(node_id)} to store {plural(len(cids), 'key')}; trying "
+                    "once more", LOG_VERBOSE)
+                recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
             if islands is not None and cids:
                 # No key recorded: no identified link could be opened (a refusal still names the batch's keys)
                 (islands.answered if recorded else islands.failed)(node_id)

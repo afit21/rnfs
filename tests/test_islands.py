@@ -363,6 +363,38 @@ class LocalWiringTest(IslandCase):
         withdrawn = {node_id for node_id, _, gone in self.net.provide_calls if key in gone}
         self.assertLessEqual(set(expected), withdrawn)
 
+    def test_a_local_server_no_link_reached_is_tried_once_more(self):
+        """A local replica is one of few, and over a radio one lost packet loses its store: a local server no link
+        could be opened to is tried again at once; an off-island one isn't (K servers, and partition mode counts
+        its failures)."""
+        node = self.make_node(local_replicas=1)
+        islander = self.server(1, LORA)
+        backbone = [self.server(n, HUB) for n in range(0x80, 0x8c)]
+        for n in [islander] + backbone:
+            node._heard_server(n)
+        provide = self.net.provide
+        lost = {islander}  # its first link request is lost
+        broken = backbone[0]  # never reached
+
+        def lossy(node_id, keys, withdrawn):
+            """No link to islander the first time, nor ever to broken."""
+            if node_id in lost or node_id == broken:
+                lost.discard(node_id)
+                self.net.provide_calls.append((node_id, list(keys), list(withdrawn)))
+                return set()
+            return provide(node_id, keys, withdrawn)
+
+        self.net.provide = lossy
+        node.add_path(self.write(b"one replica, one loss"))
+        node.publisher.publish_due()
+        item = next(iter(node.publisher.provided()))
+        tries = [node_id for node_id, keys, _ in self.net.provide_calls if item.key in keys]
+        self.assertEqual(tries.count(islander), 2)
+        self.assertEqual(tries.count(broken), 1)
+        recorded = node.publisher.states()[item]["nodes"]
+        self.assertIn(islander, recorded)
+        self.assertNotIn(broken, recorded)
+
     def test_no_replicas_when_zero(self):
         node = self.make_node(local_replicas=0)
         self.assertEqual(len(node.publisher._store_parts), 1)  # the senior servers only
