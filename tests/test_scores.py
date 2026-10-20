@@ -154,6 +154,22 @@ class SeedTest(unittest.TestCase):
             s.close()
             self.assertEqual(state_rows(state_dir, "SELECT seeded FROM peer_scores"), [(None,)])
 
+    def test_losing_the_seed_keeps_the_score_within_the_limit(self):
+        # A bootstrap node whose bad blocks took it to -SCORE_LIMIT (the seed's share lost in the clamp) mustn't go
+        # below it when it stops being one: found by tests/security/test_fuzz_parsers.py (SavedRowsFuzzTest)
+        with tempfile.TemporaryDirectory() as state_dir:
+            clock = FakeClock(WALL)
+            boot = node_id(1)
+            s = Scores(state_dir, seeded=[boot], clock=clock)
+            for _ in range(3):
+                s.bad_block(boot)
+            self.assertEqual(s.score(boot), -SCORE_LIMIT)
+            s.save()
+            s.close()
+            s = Scores(state_dir, seeded=[], clock=clock)
+            self.assertEqual(s.score(boot), -SCORE_LIMIT)
+            s.close()
+
 
 class SavedTest(unittest.TestCase):
     """Scores in the state database."""

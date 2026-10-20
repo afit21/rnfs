@@ -150,7 +150,9 @@ class Scores:
             now = self.clock()
             for node_id, row in self._rows.items():
                 if row.seeded is not None and node_id not in bootstrap:
-                    row.score = decayed(row.score, row.updated, now) - decayed(BOOTSTRAP_SEED, row.seeded, now)
+                    # Within the limit: a score clamped at -SCORE_LIMIT has already lost the seed's share
+                    row.score = max(-SCORE_LIMIT, decayed(row.score, row.updated, now)
+                                    - decayed(BOOTSTRAP_SEED, row.seeded, now))
                     row.updated, row.seeded = now, None
                     self._changed(node_id)
             for node_id in sorted(bootstrap - self._rows.keys()):
