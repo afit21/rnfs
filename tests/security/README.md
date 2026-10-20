@@ -12,6 +12,8 @@ Where the IDs come from:
   `sec/*` branches, merged through `security/audit-2026-10` and released in 0.1.4. The commits named are those
   branches' commits, all in the history of the `v0.1.4` tag.
 - **0.1.5 audit** (CONT, DHT, API, FEAT, NET and SUP): `0.1.5-audit.md`, fixed in 0.1.6 (`0.1.6-plan.md`).
+- **0.2.0 review** (REV): a read-only review of 0.2.0, fixed before 0.2.0 was released; the findings and how each
+  was built are the roadmap's "Security fixes from the 0.2.0 review".
 - **No ID:** tests from an earlier review or from the security tooling, listed under the subsystem they guard.
 
 Test modules are in this directory unless a path says otherwise. A commit marked "(test)" only added or updated
