@@ -752,7 +752,9 @@ Fixed:
   a request without a handler, so through a start (80 s on a cloud node with 857k blocks working out what it
   provides, minutes at the first start after this upgrade) every request other nodes sent waited out its timeout.
   Over LoRa a slow node's join asked a gateway restarting meanwhile and waited 20 s for nothing. Links are refused
-  (RNS drops the link request, which fails in seconds) until the request server is in place.
+  (RNS drops the link request, which fails in seconds) until the request server is in place. A stop now starts by
+  refusing new links and answering every request `False`: a request arriving while the state was being closed failed
+  in its handler, logged as an error ("the state database ... is closed", seen restarting a cloud node).
 - **What a node publishes after starting cut off is healed too** (spec section 6, "The heal republish"): a node
   that starts while its island is cut off never enters partition mode (its failures are all for want of a path, which
   don't count) and its rounds find local servers only, so nothing marked their keys for the heal republish. Over LoRa

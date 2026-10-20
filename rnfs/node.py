@@ -942,9 +942,14 @@ class RnfsNode:
         self._stopped = True
         log("stopping", LOG_NOTICE)
         deadline = time.monotonic() + timeout
-        steps: list[tuple[str, Callable[[], object]]] = [
-            (f"stopping feature {feature.name}", partial(features.stop_feature, feature, deadline))
-            for feature in reversed(list(self.features.values()))]
+        steps: list[tuple[str, Callable[[], object]]] = []
+        if self.server is not None:
+            # First: no new links, and every request refused, as the state they read is saved and closed below (as at
+            # the start, links are taken only while the node can answer on them)
+            steps += [("refusing links", partial(self.destination.accepts_links, False)),
+                      ("refusing requests", self.server.close)]
+        steps += [(f"stopping feature {feature.name}", partial(features.stop_feature, feature, deadline))
+                  for feature in reversed(list(self.features.values()))]
         steps += [("signalling the threads to stop", self.stop_event.set),
                   ("waking the publisher", self.publisher.wake), ("waking the local servers", self._local_wake.set)]
         if getattr(self, "folder_syncs", None) is not None:

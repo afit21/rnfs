@@ -752,6 +752,7 @@ class RequestServer:
         self.watched: set[bytes] = set()  # links whose outgoing Resource registrations we see
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.closing = False  # set by close(): the node is stopping, and every request is refused
         self.wake = threading.Event()
         self.pin_identities = config.remote_pin_set
         # Identity hashes RNS blackholes (rnfs.network.blackhole.Blackhole.identity_listed, set by the node): requests
@@ -792,6 +793,12 @@ class RequestServer:
         """Stop the response monitor."""
         self.stop_event.set()
         self.wake.set()
+
+    def close(self):
+        """The node is stopping: refuse every request from now on (False), quietly. Its handlers would read state
+        that is being saved and closed, and failed at the end of every stop: a refusal sends the requester elsewhere
+        at once."""
+        self.closing = True
 
     # Incoming links
 
@@ -872,11 +879,13 @@ class RequestServer:
     # Handlers
 
     def _guarded(self, handler):
-        """Wrap handler with the link's rate limit (over it: False, or None, which RNS doesn't answer), False for a
-        link identified as an identity RNS blackholes, the private-mode membership check (False for a non-member), and
+        """Wrap handler with False once the node is stopping (close), the link's rate limit (over it: False, or None,
+        which RNS doesn't answer), False for a link identified as an identity RNS blackholes, the private-mode membership check (False for a non-member), and
         an answer of False for an unexpected error rather than leaving the requester waiting."""
         def response_generator(path, data, request_id, link_id, remote_identity, requested_at):
             """RNS's six-argument request handler signature."""
+            if self.closing:
+                return False  # the node is stopping (close)
             # First, before any parsing: the link's rate limit. None: RNS sends no answer
             allowed = self.incoming.take_token(link_id)
             if allowed != REQUEST_OK:

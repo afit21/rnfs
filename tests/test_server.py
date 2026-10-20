@@ -446,6 +446,21 @@ class RequestServerTest(unittest.TestCase):
         self.assertEqual(len(providers), K)
         self.assertEqual(nodes, [KEY])
 
+    def test_a_stopping_node_refuses_every_request_quietly(self):
+        """Once the node is stopping (close), its state is being saved and closed: a request then failed in its
+        handler and was logged as an error (seen on a cloud node's restart); now each is refused before any handler
+        runs, so the requester asks elsewhere at once."""
+        link = self.connect(b"a")
+        self.server.close()
+        self.backend.find = mock.Mock(side_effect=AssertionError("a handler ran"))
+        with mock.patch.object(server, "log") as logged:
+            for path, data in ((FIND_PATH, KEY), (PROVIDE_PATH, [[KEY], []]),
+                               (BLOCKS_PATH, protocol.encode_blocks(MAX_RESPONSE_SIZE, [self.big[0][0]]))):
+                with self.subTest(path=path):
+                    self.assertIs(self.ask(path, data, link, self.identity), False)
+        self.assertEqual(logged.call_args_list, [])
+        self.backend.find.assert_not_called()
+
     def test_client_mode_refuses_find_and_provide(self):
         self.backend.dht_server = False
         link = self.connect(b"a")

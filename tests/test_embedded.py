@@ -471,7 +471,7 @@ def run_host(configdir: str, rnfs_dir: str, peer_echo_hex: str, peer_dht_hex: st
 
 def run_links_gate(configdir: str, rnfs_dir: str):
     """A node on a Reticulum of its own without interfaces: whether its rnfs.dht destination accepted links while it
-    was set up, and once it had started. Prints RESULT and a JSON object."""
+    was set up, once it had started, and once it had stopped. Prints RESULT and a JSON object."""
     import rnfs
     from rnfs.node import RnfsNode
 
@@ -486,14 +486,16 @@ def run_links_gate(configdir: str, rnfs_dir: str):
 
     with mock.patch.object(RnfsNode, "_setup_or_close", recording):
         node = rnfs.Node(rnfs_dir, reticulum=reticulum, settings={"default_bootstrap": False})
-    seen["started"] = node.internal.destination.accepts_links()
+    destination = node.internal.destination
+    seen["started"] = destination.accepts_links()
     node.close()
+    seen["stopped"] = destination.accepts_links()
     print("RESULT", json.dumps(seen), flush=True)
     os._exit(0)
 
 
 class LinkGateTest(unittest.TestCase):
-    """A node accepts links on its rnfs.dht destination only once it can answer requests on them."""
+    """A node accepts links on its rnfs.dht destination only while it can answer requests on them."""
 
     def test_no_links_while_the_node_is_set_up(self):
         """RNS accepts a link to a destination as soon as it exists and drops requests without a handler: through a
@@ -511,7 +513,8 @@ class LinkGateTest(unittest.TestCase):
                               errors="replace", env=env, timeout=120)
         lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
         self.assertTrue(lines, done.stdout + done.stderr)
-        self.assertEqual(json.loads(lines[-1][len("RESULT "):]), {"during_setup": False, "started": True})
+        self.assertEqual(json.loads(lines[-1][len("RESULT "):]), {"during_setup": False, "started": True,
+                                                                  "stopped": False})
 
 
 @unittest.skipUnless(os.environ.get("RNFS_E2E") == "1", "set RNFS_E2E=1 to run")
