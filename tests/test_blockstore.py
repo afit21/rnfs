@@ -375,6 +375,17 @@ class FlatLayoutTest(unittest.TestCase):
         self.assertEqual(moved[0], "moved 1 of 40 blocks")
         self.assertIn("moved 40 blocks into subdirectories in", reports[-1])
 
+    def test_entries_named_as_blocks_that_arent_files_are_not_reported(self):
+        """A directory or link in blocks/ named as a CID is never moved, so nothing is said about it: else every start
+        would say it is moving blocks an older rnfs left."""
+        BlockStore(self.dir)  # the blocks moved
+        os.mkdir(os.path.join(self.dir, str(next(iter(self.blocks)))))
+        if not fsutil.IS_WINDOWS:
+            os.symlink(os.path.join(self.dir, "notes.txt"), os.path.join(self.dir, str(list(self.blocks)[1])))
+        reports = []
+        self.check(BlockStore(self.dir, report=reports.append))
+        self.assertEqual(reports, [])
+
     @unittest.skipIf(fsutil.IS_WINDOWS, "Windows can't sync a directory")
     def test_directories_are_synced_after_the_move(self):
         synced = []
@@ -432,6 +443,7 @@ class FlatLayoutTest(unittest.TestCase):
             store = BlockStore(self.dir, report=reports.append)
         self.assertEqual(store.path(stuck), os.path.join(self.dir, str(stuck)))
         self.check(store)
+        self.assertIn("moved 39 blocks into subdirectories in", reports[-2])  # not counting the one left
         self.assertIn("1 block couldn't be moved", reports[-1])
         self.assertEqual(listing(self.dir)[""], sorted(["notes.txt", str(stuck)]))
         store.put(stuck, self.blocks[stuck])  # stored already: nothing written

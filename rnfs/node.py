@@ -62,7 +62,8 @@ from rnfs.dht.scores import Scores
 from rnfs.errors import Cancelled, Denied, InvalidDag, NotFound, RnfsError, StorageFull, TooLarge
 from rnfs.fetcher import Fetch, Fetcher, Observer, describe, observing
 from rnfs.mesh import PathInfo, RnsPaths, SlowPaths, is_local_path, no_path_info
-from rnfs.log import LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, cap_warnings, log, node_name, plural, size
+from rnfs.log import (LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, LOG_WARNING, SlowStep, cap_warnings, log,
+                      node_name, plural, size)
 from rnfs.name_sync import NameSync
 from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
@@ -858,8 +859,12 @@ class RnfsNode:
         self._unpacks_lock = threading.Lock()
         node_content.collect_unpack_leftovers(self)
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
-        # otherwise all be withdrawn at every start
-        self.publisher.refresh()
+        # otherwise all be withdrawn at every start. It walks the DAG of every pin: 80 s for 857k blocks on a small
+        # cloud VM, so said in the log if it takes a while
+        pins = plural(len(self.storage.pins()), "pin")
+        with SlowStep(f"working out what this node provides: walking the blocks of {pins}",
+                      "worked out what this node provides"):
+            self.publisher.refresh()
         # Changes apply at once; what the list denied at start, maintenance applies first
         self.deny.add_listener(self._apply_deny)
 

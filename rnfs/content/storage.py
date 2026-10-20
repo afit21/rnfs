@@ -48,7 +48,7 @@ from rnfs.content.blockstore import BlockStore
 from rnfs.content.cid import Cid
 from rnfs.content.dag import DirectoryNode, IndexNode
 from rnfs.errors import BlockMismatch, Closed, Denied, InvalidDag, NotFound, StorageFull
-from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, log, plural, size
+from rnfs.log import LOG_ERROR, LOG_NOTICE, LOG_VERBOSE, SlowStep, log, plural, size
 
 USER, FOLDER = "user", "folder"
 SIZES_STORE = "block_sizes"  # its meta value "clean": 1 once close() saved the block_sizes table whole
@@ -424,18 +424,22 @@ class Storage:
             return sizes
         if clean == 0:
             log("storage: listing every stored block, since rnfs didn't stop cleanly last time", LOG_NOTICE)
-        sizes = dict(self.blocks.scan(tidy=True))
-        # Only the rows that differ are written: after a crash most are right, and reading them back and comparing
-        # costs less than rewriting them all (a third less with a million blocks)
-        saved = self._load_sizes(quiet=True)
-        with self._db.transaction() as tx:
-            if saved is None:
-                tx.execute("DELETE FROM block_sizes")
-                saved = {}
-            tx.executemany("DELETE FROM block_sizes WHERE cid = ?", [(cid.binary,) for cid in saved.keys() - sizes])
-            tx.executemany("INSERT OR REPLACE INTO block_sizes (cid, size) VALUES (?, ?)",
-                           [(cid.binary, length) for cid, length in sizes.items() if saved.get(cid) != length])
-            statedb.set_meta(tx, SIZES_STORE, "clean", 0)
+        # At the first start of 0.2.0 (no mark yet) this lists every block quietly, unless it takes a while: on a
+        # large store, minutes, right after the move out of the flat layout
+        with SlowStep("storage: listing every stored block to record its size", "storage: listed every stored block"):
+            sizes = dict(self.blocks.scan(tidy=True))
+            # Only the rows that differ are written: after a crash most are right, and reading them back and comparing
+            # costs less than rewriting them all (a third less with a million blocks)
+            saved = self._load_sizes(quiet=True)
+            with self._db.transaction() as tx:
+                if saved is None:
+                    tx.execute("DELETE FROM block_sizes")
+                    saved = {}
+                tx.executemany("DELETE FROM block_sizes WHERE cid = ?",
+                               [(cid.binary,) for cid in saved.keys() - sizes])
+                tx.executemany("INSERT OR REPLACE INTO block_sizes (cid, size) VALUES (?, ?)",
+                               [(cid.binary, length) for cid, length in sizes.items() if saved.get(cid) != length])
+                statedb.set_meta(tx, SIZES_STORE, "clean", 0)
         return sizes
 
     def _load_sizes(self, quiet: bool = False) -> dict[Cid, int] | None:

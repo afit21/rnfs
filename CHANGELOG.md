@@ -39,12 +39,13 @@ Upgrade notes:
   refused as an unknown setting; `rnfs config unset max_records` removes it.
 - **Blocks:** they move from `blocks/<cid>` into 1,024 subdirectories, `blocks/<xy>/<cid>` (the CID's third- and
   second-to-last characters), at the first start, which takes a while on a large store (a rename per block; the API
-  answers once it is done: 6 minutes for 883k blocks on a desktop SSD, the log saying how far it got about every 30
-  seconds, as it does while the state database is upgraded). Each start moves whatever is left, so an interrupted
-  upgrade loses nothing, and a block Windows won't let rnfs move stays readable until a later start moves it. An older
-  rnfs doesn't find the moved blocks. A subdirectory of `blocks/` that is a link, not a directory or another user's
-  stops the start. The state database gains a `block_sizes` table, every stored block's size, which the first start
-  fills by listing the blocks.
+  answers once it is done: 6 minutes for 883k blocks on a desktop SSD, and 6 for 857k on a 2-vCPU cloud VM, of which
+  110 s the move; the log says how far the listing and the move got about every 30 seconds, and, if they take over 10
+  seconds, the listing of every block that follows and the first working out of what the node provides). Each start
+  moves whatever is left, so an interrupted upgrade loses nothing, and a block Windows won't let rnfs move stays
+  readable until a later start moves it. An older rnfs doesn't find the moved blocks. A subdirectory of `blocks/` that
+  is a link, not a directory or another user's stops the start. The state database gains a `block_sizes` table, every
+  stored block's size, which the first start fills by listing the blocks.
 - **`<rnfs dir>/daemon.json`:** the daemon writes it while it runs. Clients from 0.2.0 on read the API port from
   it first, so one that can't read a newer daemon's `rnfs.toml` still finds it.
 - **Settings:** `rnfs.toml` may now be rewritten by the daemon (`rnfs config set`, `POST /api/config/set`). Only the

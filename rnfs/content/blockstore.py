@@ -107,8 +107,9 @@ class BlockStore:
                 else:
                     try:
                         cid = Cid.from_block_name(name)
-                        if entry.is_file(follow_symlinks=False):
-                            flat.append((cid, entry.stat(follow_symlinks=False).st_size))
+                        if not entry.is_file(follow_symlinks=False):
+                            continue  # never moved, so not reported: else every start would say it moves blocks
+                        flat.append((cid, entry.stat(follow_symlinks=False).st_size))
                     except (ValueError, OSError):
                         continue
                     if started is None:
@@ -134,7 +135,8 @@ class BlockStore:
         with self._lock:
             self._top_dirty = True
         self.sync()
-        self._tell(f"moved {len(flat)} block{'' if len(flat) == 1 else 's'} into subdirectories in "
+        moved = len(flat) - len(self._flat)  # those that stay are said below, and moved by a later start
+        self._tell(f"listed and moved {moved} block{'' if moved == 1 else 's'} into subdirectories in "
                    f"{time.monotonic() - started:.0f} s")
         if self._flat:
             self._tell(f"{len(self._flat)} block{'' if len(self._flat) == 1 else 's'} couldn't be moved into "

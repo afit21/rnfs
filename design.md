@@ -42,7 +42,9 @@ authority on behaviour; this file fixes module boundaries and the interfaces bet
   (`set_debug_sink`), every message also goes to it, whatever RNS's loglevel. `ThrottledLog(interval, clock)`
   logs one line about a kind of event at most every interval (60 s), with a count of those left out; `due()` is
   the check alone. The response guards, the request rate limit (`RequestServer._over_rate`), `RnsPaths` and the
-  peers listing use it. An unexpected exception caught by a broad `except` (a `# noqa: BLE001` reason says why
+  peers listing use it. `SlowStep(doing, done, after=10, interval=30)`, a context manager, says a start step's
+  `doing` once it has run `after` seconds, that it still is every `interval`, and `done` with the time it took (a
+  quick step says nothing): storage's listing of every block, and the node's first `Publisher.refresh`. An unexpected exception caught by a broad `except` (a `# noqa: BLE001` reason says why
   it's caught) is logged at `LOG_WARNING` inside the `except`, so the debug log gets its traceback: among them the
   fetcher's `/blocks` worker, the lookup's routing-table callbacks and `LinkPool.request`.
 - `rnfs/debuglog.py` — the debug log file (`debug_log`, `daemon --debug-log`), `<rnfs dir>/debug.log` (0600),
@@ -1927,6 +1929,7 @@ at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job
 | `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-lookup-path`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, a disjoint lookup's paths (all but the first, which runs in the caller's thread; every path for `find_providers`), fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
+| `rnfs-slow-step` | `log.SlowStep` (storage, node) | while a start step that can take minutes runs (listing every block, the first provide set): says what it does after 10 s, that it still is every 30 s, and how long it took (`SlowStep`) |
 | `rnfs-write` | storage | an add's, shared-folder import's or archive import's block writes (`Session.writer()`), up to 16 at once, ended with it |
 | `rnfs-job-<id>` | jobs | one per running job, at most `max_jobs`; `stop()` waits for them until the node's stop deadline |
 | `rnfs-keepers`, `rnfs-keeper-query` | keepers | pending refreshes (≤ 64 queued), own-name sync, saves, re-asking every `announce_interval`; parallel `/name` queries |
