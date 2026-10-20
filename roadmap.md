@@ -832,8 +832,9 @@ Fetching files of a few hundred KiB over LoRa is the use to keep working well. A
     is, so never provided as the user's download
   - Remote pins and jobs: the asker is probed first (a fetch hint from the `/pin`'s identity), a not-found pin or
     get/pin/export job waits 10 minutes doubling to 6 h for 3 days (`rnfs/retry.py`, `remote_pin_retries`,
-    `retry_at` in jobs and served pin status `waiting`). Jobs take an optional `retry` (default true); the CLI's
-    foreground commands send `false`, so they fail as in 0.1.6
+    `retry_at` in jobs and served pin status `waiting`). Jobs take an optional `retry` (default false, 0.1.6's
+    behaviour: a job whose content isn't found fails at once); the CLI's `--background` get, pin and export send
+    `true` and wait, and the library's `jobs.get/pin/export` default to `retry=False`
   - Slow links per provider: rate estimate below `slow_bitrate`, or with none a slow next-hop interface or slow
     path; providers behind one slow interface share one request at a time; a node that isn't slow probes no open
     link over a slow link (a slow node keeps its one probe); nothing is duplicated onto a slow link, and a batch
