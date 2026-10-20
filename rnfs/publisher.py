@@ -438,6 +438,13 @@ class Publisher:
         self.generation = generation
         self.bitrate = bitrate
         self.known_servers = known_servers
+        # A slow node's radio's measured load (rnfs.network.channel.ChannelLoad, set by the node): stretch(wait, slack)
+        # is how long a round's lookups pace the next round instead of wait (at most max(wait, slack), slack being how
+        # long republishing may slip before a record would go unrepublished past PROVIDER_TTL / 2), and
+        # measured_airtime() the share of the channel this node's own transmissions took over the last hour (None:
+        # unknown), over ENTRY_AIRTIME_ON of which a slow node's default doesn't turn entries on
+        self.stretch: Callable[[float, float], float] = lambda wait, slack: wait
+        self.measured_airtime: Callable[[], float | None] = lambda: None
         self.lookups_at_once = PUBLISH_LOOKUPS if lookups_at_once is None else max(1, lookups_at_once)
         self._lock = threading.RLock()
         self._wake = threading.Event()
@@ -472,6 +479,8 @@ class Publisher:
         self._withdrawals: dict[bytes, set[bytes]] = {}  # node -> keys to withdraw from it
         self._retry_at: dict[ProvidedItem, float] = {}  # items whose last lookup found no nodes
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
+        # ... at most this far from now (a wall clock corrected backwards): a full round's pacing, or the last stretched
+        self._pace_cap = SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
         self._region_bits: int | None = None  # the prefix length of a recent region (sweep providing), or None
         self._store_parts: list[StorePart] = []  # add_store_part
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
@@ -724,6 +733,12 @@ class Publisher:
                               f"{plural(servers, 'server')}); entries are provided by default only under "
                               f"{ENTRY_AIRTIME_ON:.0%} (provide_entries = true provides them anyway)")
                     chosen = frozenset()
+                elif not self._entries_on and self._measured_busy():
+                    # The estimate covers republishing alone; the radio measures all this node sends
+                    reason = (f"slow node: its radio measured its own transmissions at over {ENTRY_AIRTIME_ON:.0%} of "
+                              "the channel in the last hour; entries are turned on by default only under that "
+                              "(provide_entries = true provides them anyway)")
+                    chosen = frozenset()
         on = bool(chosen)
         if on != self._entries_on:
             self._entries_on = on
@@ -808,8 +823,13 @@ class Publisher:
         node's default the network size and republish interval its estimate uses. Lock held."""
         setting = self.config.provide_entries
         if setting is None and self.slow_node:
-            return setting, self._network_size(), self.interval
+            return setting, self._network_size(), self.interval, self._measured_busy()
         return (setting,)
+
+    def _measured_busy(self) -> bool:
+        """True if the radio measured this node's own airtime over the last hour above ENTRY_AIRTIME_ON."""
+        measured = self.measured_airtime()
+        return measured is not None and measured > ENTRY_AIRTIME_ON
 
     def _denied(self, cid: Cid, blocks: frozenset[Cid], denied: frozenset[bytes]) -> bool:
         """True if one of blocks (cid's DAG) is in denied, the deny list's binary CIDs; memoised. Lock held."""
@@ -915,7 +935,7 @@ class Publisher:
                 self._touch_item(cid)
         for cid, retry in list(self._retry_at.items()):
             self._retry_at[cid] = min(retry, now + self.retry_interval)
-        self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)
+        self._next_lookup = min(self._next_lookup, now + self._pace_cap)
 
     def pace_lookups(self, count: int) -> float:
         """Slow nodes: may count lookups outside publishing (a search's fallback over disjoint paths) start now? 0.0 if
@@ -923,7 +943,7 @@ class Publisher:
         each); otherwise the seconds until it would, and nothing is counted."""
         now = self.clock()
         with self._lock:
-            self._next_lookup = min(self._next_lookup, now + SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS)  # as _clamp
+            self._next_lookup = min(self._next_lookup, now + self._pace_cap)  # as _clamp
             wait = self._next_lookup - now
             if wait > 0:
                 return wait
@@ -1027,7 +1047,14 @@ class Publisher:
                     del withdrawals[node_id]
                 spent = lookups + sweep.widened + min(room, len(alone))
                 if spent:
-                    self._next_lookup = self.clock() + SLOW_LOOKUP_PACE * spent
+                    # Stretched while the channel is busy (self.stretch), never past PROVIDER_TTL / 2 for a record this
+                    # round doesn't republish
+                    slack = min((PROVIDER_TTL / 2 - max(now - when, self.interval_for(item))
+                                 for item, (when, _) in self._published.items() if item not in closest),
+                                default=PROVIDER_TTL / 2)
+                    wait = self.stretch(SLOW_LOOKUP_PACE * spent, slack)
+                    self._pace_cap = max(SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS, wait)
+                    self._next_lookup = self.clock() + wait
         accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
         sent_withdrawals: dict[bytes, set[bytes]] = {}
         unsaved, saved_at = 0, self.clock()

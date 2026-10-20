@@ -10,7 +10,9 @@ resolution too. A node therefore paces its own:
   path request rnfs sends (link opens, so lookups, stores, fetches and keeper queries; a lookup's path check; name
   resolves; NomadNet adds) takes a turn, at least `spacing` (SPACING, 1 s) after the last. Requests 1 s apart peak at
   an estimate of 1.5 a second at the next hop, half a new interface's limit. Waiting for a turn isn't a failure and
-  isn't part of `path_timeout`, which starts once the request is sent. Turns are taken in order of asking.
+  isn't part of `path_timeout`, which starts once the request is sent. Turns are taken in order of asking. On a slow
+  node the spacing stretches while the radio's channel is busy (stretch: rnfs.network.channel.ChannelLoad.stretch,
+  which the node sets), up to 4 s.
 - **A ceiling**: before a request goes, the busiest interface's `outgoing_pr_frequency` (RNS's estimate of the path
   requests this instance sends there, other applications' included; Reticulum.get_interface_stats, which works through
   a shared instance too) must be at most CEILING, else the request takes a later turn, for at most CEILING_HOLD. Not
@@ -127,6 +129,9 @@ class PathRequests:
         self.clock = clock
         self.sleep = sleep
         self.spacing = spacing
+        # How many times longer the spacing is now: 1 but on a slow node, whose radio's channel load stretches it
+        # (rnfs.network.channel.ChannelLoad.stretch, set by the node; it reads the radios at most every 15 s)
+        self.stretch: Callable[[], float] = lambda: 1.0
         self._lock = threading.Lock()
         self._next_turn = -math.inf  # the earliest time the next turn may be
         self._waits: dict[bytes, threading.Event] = {}  # destination -> set when its owner's wait ends
@@ -182,9 +187,10 @@ class PathRequests:
     def charge(self, destination: bytes):
         """A link to destination failed to establish: RNS expires the path and requests it again by itself, which takes
         a turn now and counts as a request for destination (none is sent again within PATH_REQUEST_MI)."""
+        spacing = self._spacing()
         with self._lock:
             now = self.clock()
-            self._next_turn = max(now, self._next_turn) + self.spacing
+            self._next_turn = max(now, self._next_turn) + spacing
             self._remember_sent(destination, now)
             self.charged += 1
 
@@ -261,9 +267,10 @@ class PathRequests:
         held_since: float | None = None
         try:
             while True:
+                spacing = self._spacing()  # outside the lock: it may read the interface stats
                 with self._lock:
                     turn = max(self.clock(), self._next_turn)
-                    self._next_turn = turn + self.spacing
+                    self._next_turn = turn + spacing
                 while (now := self.clock()) < turn:
                     if ready() or (cancel is not None and cancel.is_set()):
                         return False
@@ -284,6 +291,15 @@ class PathRequests:
                 self.waited += waited
             if waited >= self.spacing:
                 log(f"path request for {node_name(destination)} waited {waited:.0f}s for its turn", LOG_DEBUG)
+
+    def _spacing(self) -> float:
+        """The spacing of the next turn: spacing, stretched (at least 1 time) while a slow node's channel is busy."""
+        try:
+            stretch = float(self.stretch())
+        except Exception as e:  # noqa: BLE001 - a broken reading must not stop path requests; logged
+            self._failure_log(f"couldn't read the channel load: {e!r}", LOG_WARNING)
+            stretch = 1.0
+        return self.spacing * (stretch if math.isfinite(stretch) and stretch > 1.0 else 1.0)
 
     def _over_ceiling(self) -> bool:
         """True if the busiest interface already sends more than CEILING path requests a second (False if the stats

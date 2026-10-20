@@ -699,7 +699,22 @@ request can leave by (`_sendable`: `OUT`, `online`, not `detached`, no `spawned_
 nor in `local_client_interfaces`); a spawned interface (a `parent_interface`) widens to every sendable interface of that
 parent. A scope covering every sendable interface is no scope. One interface: RNS's `await_path(on_interface=)`;
 several: `request_path(on_interface=, tag=)` on each with one random tag, then polled. `scoped` counts scoped requests.
-Counters `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
+Counters `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements. `stretch()` (1 by
+default; on a slow node `ChannelLoad.stretch`) multiplies `spacing` for each turn and `charge` (`_spacing`, read outside
+the lock; a value that isn't a finite number above 1 counts as 1).
+
+`channel.py` (0.2.0) — `ChannelLoad(reticulum, clock, poll=POLL)`, a slow node's radios' measured load (spec section 3,
+"Measured airtime"), made in `RnfsNode._start_network` on a slow node only. `load()` reads
+`reticulum.get_interface_stats()` (through a shared instance one RPC) at most every `POLL` (15 s), lazily: only a
+caller asks (a path request's turn, a publishing round's end, a `/blocks` request, a refresh), and one caller reads
+while the others use the last reading. `measured_load(stats)` takes the highest of each figure (`airtime_short`,
+`airtime_long`, `channel_load_short`, `channel_load_long`) among online entries that aren't local interfaces, a figure
+counting only as a finite number in (0, 100] (`_percent`: an RNode's 0.0 before its first measurement is unknown);
+`Load.channel` is the short channel figure while known, else the long one. A stats failure is logged (throttled) and
+reads `UNKNOWN`. Its hooks: `stretch()` (`stretch_for(load)`: 1 up to `BUSY_LOAD`, 25%, then `load / 25`, at most
+`MAX_STRETCH`, 4) is `PathRequests.stretch`; `stretch_wait(wait, slack)` (`max(wait, min(wait × stretch, slack))`) is
+`Publisher.stretch`; `over_budget()` (`airtime_long` above `AIRTIME_BUDGET`, 50%) is `AirtimePolicy.over_airtime`;
+`airtime_share()` (`airtime_long / 100`, None if unknown) is `Publisher.measured_airtime`.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
@@ -800,8 +815,10 @@ are equal, so a refresh caused by a fetch or a block stored walks and chooses no
 `_compute` asserts they are inside the served set, which doesn't change. On a slow node with the setting unset, the
 entries are dropped whole when `republish_airtime(roots + keys + entries, network_size(...), bitrate) /
 interval` exceeds `ENTRY_AIRTIME_ON` (2%), or `ENTRY_AIRTIME_OFF` (2.5%) while they are on (`_entries_on`); the
-reason is kept in `_entries_off` and logged when it starts or stops applying. `bitrate` is the slowest counted
-interface's (`rates.slowest_bitrate`, read once at start; the node passes it and `_known_servers`, the larger of
+reason is kept in `_entries_off` and logged when it starts or stops applying. While they are off, they also stay off
+while `measured_airtime()` (the node's `ChannelLoad.airtime_share` on a slow node; None, unknown, by default) is above
+`ENTRY_AIRTIME_ON` (`_measured_busy`, part of `_entries_input()`, so its change makes a refresh compute). `bitrate`
+is the slowest counted interface's (`rates.slowest_bitrate`, read once at start; the node passes it and `_known_servers`, the larger of
 the routing table's size and the density check's estimate `sizes.estimate()`), and the
 network size `network_size(_region_bits_mean, known)`: a running mean (weight 1/16) of the prefix length of the
 regions each round found (`_learn_network_size`, in `publish_due`), at least `known_servers()`, at least
@@ -815,7 +832,10 @@ withdrawal of any key it provides to the same node in that round, and finds the 
 (`_sweep` over `dht.sweep`): due items in urgency order (never published first, then the longest unpublished), one
 lookup per region, up to `PUBLISH_LOOKUPS` (4) at once on `rnfs-publish-lookup` threads (`_sweep_at_once`), the
 batches built in due order whatever order the regions finished in; on slow nodes one region lookup at a time, at
-most 10 per round, waiting 30 s × the round's lookups before the next. Slow nodes pace withdrawals with them: a
+most 10 per round, waiting 30 s × the round's lookups before the next, or `stretch(wait, slack)` of that (the node's
+`ChannelLoad.stretch_wait`; the wait itself by default), slack being `PROVIDER_TTL / 2` less the larger of the age and
+the interval of the record this round doesn't republish that is nearest to it; `_pace_cap` (a full round's wait, or
+the last stretched one) bounds `_next_lookup` when the wall clock goes back. Slow nodes pace withdrawals with them: a
 server only withdrawals reach counts as a lookup (those with the most keys queued first; while any are queued, the
 round's lookups are limited to leave up to 5 for them), the others stay queued, and `next_due` counts queued
 withdrawals as due only once the pacing allows; other nodes send them all at once. `_region_bits` carries the last
@@ -1561,8 +1581,9 @@ interfaces from `RNS.Transport`, or through a shared instance's RPC with its int
 and each node's next-hop interface name for 15 s, `PATH_CACHE`, in an LRU of at most 1024 nodes; `infos()` fills
 the names of many nodes from one `get_path_table` RPC, for `rnfs peers`);
 the airtime policy (`TokenBucket`, `AirtimePolicy`, interface matching, quiet-hours parsing, all with
-injected clocks); and `Traffic`, thread-safe counters per peer (LRU, at most 1000), per interface (at most 64)
-and in total, never persisted.
+injected clocks; `AirtimePolicy.over_airtime`, None but on a slow node, refuses as `REFUSED_AIRTIME` after the interface
+rules and quiet hours, before the budget); and `Traffic`, thread-safe counters per peer (LRU, at most 1000), per
+interface (at most 64) and in total, never persisted.
 - `is_local_path(path, interfaces, max_hops, slow_bitrate)` judges a local server (spec section 6, "LoRa islands"):
   `matches(path.names, interfaces)` when interfaces are named, else hops at most `max_hops` and a known bitrate below
   `slow_bitrate`. `PathInfo.names` (not compared) holds every name a rule may match: `interface_names` of RNS's

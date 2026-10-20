@@ -624,6 +624,15 @@ Changed:
   peers count as one interface), so a gateway's lookups no longer send requests for internet nodes over its radio.
   A node named over a slow interface, joins, names, providers and links to known nodes ask on every interface, and
   nothing changes through a shared instance.
+- A slow node paces by its radio's measured load: RNodes report their own airtime and the channel's load (over 15 s
+  and an hour, through rnsd too), which a slow node reads at most every 15 s while it has paced work. While the
+  channel's load is above 25% its path requests and publishing rounds (the heal republish's too) are spaced further
+  apart in proportion (twice as far at 50%, at most 4 times), never so far that a record would go unrepublished for
+  half its 7-day lifetime; while its own airtime over the last hour is above 50% it refuses `/blocks` (a new airtime
+  refusal, `blocks_refused_airtime` in `rnfs status`, `airtime` in `GET /api/stats`'s `refused`); and while its own
+  transmissions took over 2% of the channel in the last hour, `provide_entries`' default doesn't turn entries on. A
+  figure of 0.0 counts as unknown (RNodes report it before their first measurement); other nodes and interfaces
+  without the figures keep the estimates they had.
 
 Faster:
 - Fetching something again doesn't look it up again. Nothing was kept between fetches, so once its links had closed

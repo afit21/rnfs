@@ -68,6 +68,7 @@ from rnfs.names import NameManager, RnsNetwork, key_backup_warning, parse_name
 from rnfs.pin_names import PinNames
 from rnfs.network import guards, nomadnet, rates
 from rnfs.network.announces import DhtAnnounceHandler, DhtAnnouncer, parse_mode
+from rnfs.network.channel import ChannelLoad
 from rnfs.network.client import PeerClient
 from rnfs.network.identity import load_or_create_identity, parse_node_id
 from rnfs.network.links import LinkPool
@@ -578,6 +579,15 @@ class RnfsNode:
         self._path_named = self.links.paths.named
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
+        if slow:
+            # A slow node paces by its radios' measured load (spec section 3, "Measured airtime"): path requests and
+            # publishing rounds spaced further while the channel is busy, /blocks refused while its own airtime is over
+            # budget, and entries not turned on by default while it transmits more than their estimate allows
+            self.channel = ChannelLoad(lambda: self.reticulum)
+            self.links.paths.stretch = self.channel.stretch
+            self.publisher.stretch = self.channel.stretch_wait
+            self.publisher.measured_airtime = self.channel.airtime_share
+            self.server.airtime.over_airtime = self.channel.over_budget
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
         self.announce_handler = DhtAnnounceHandler(self._heard_server, self._heard_client, self.routing.is_banned,
                                                    self.node_id, on_announced=self._announced)
@@ -640,6 +650,7 @@ class RnfsNode:
         # What changed, for local clients (GET /api/events, rnfs.events); first, so every part may publish
         self.events = events.EventLog()
         self.slow = slow
+        self.channel: ChannelLoad | None = None  # a slow node's radios' measured load, once Reticulum runs
         self._is_known = is_known
         self.members = config.member_set
         # Private mode: node IDs that sent /provide as a member this run (their identity was checked then)

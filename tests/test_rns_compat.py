@@ -273,6 +273,26 @@ INTERNALS = [
                                "spawned_interfaces", "bitrate"),
                       _has(RNS.Interfaces.Interface.Interface, "OUT"))),
 
+    Internal("network/channel.py", "Reticulum.get_interface_stats() entries {airtime_short, airtime_long, "
+             "channel_load_short, channel_load_long} from an interface's r_airtime_* and r_channel_load_*, which "
+             "RNodeInterface starts at 0.0 and sets in percent; a shared instance's RPC answering interface_stats with "
+             "its own get_interface_stats()",
+             lambda: (_source(RNS.Reticulum.get_interface_stats,
+                              "if hasattr(interface, 'r_airtime_short'): ifstats['airtime_short'] = "
+                              "interface.r_airtime_short",
+                              "if hasattr(interface, 'r_airtime_long'): ifstats['airtime_long'] = interface.r_airtime_long",
+                              "if hasattr(interface, 'r_channel_load_short'): ifstats['channel_load_short'] = "
+                              "interface.r_channel_load_short",
+                              "if hasattr(interface, 'r_channel_load_long'): ifstats['channel_load_long'] = "
+                              "interface.r_channel_load_long",
+                              "rpc_connection.send_bytes(mp.packb({'get': 'interface_stats'}))"),
+                      _source(RNS.Reticulum.rpc_loop,
+                              "if path == 'interface_stats': self.rpc_return(conn, self.get_interface_stats())"),
+                      _assigns(_rnode().__init__, r_airtime_short="0.0", r_airtime_long="0.0",
+                               r_channel_load_short="0.0", r_channel_load_long="0.0"),
+                      _source(_rnode(), "self.r_airtime_short = ats/100.0", "self.r_airtime_long = atl/100.0",
+                              "self.r_channel_load_short = cus/100.0", "self.r_channel_load_long = cul/100.0"))),
+
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "
              "AES.AES_256_CBC.encrypt/decrypt(data, key, iv), and Identity.encrypt of a content key being "
@@ -364,6 +384,12 @@ def _destination(app: str, *aspects: str, identity=None, direction=RNS.Destinati
     """A Destination that isn't registered with Transport."""
     with mock.patch.object(RNS.Transport, "register_destination"):
         return RNS.Destination(identity or RNS.Identity(), direction, RNS.Destination.SINGLE, app, *aspects)
+
+
+def _rnode():
+    """RNS's RNodeInterface class (imported here: other tests needn't load the serial interfaces)."""
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    return RNodeInterface
 
 
 def _incoming_link():

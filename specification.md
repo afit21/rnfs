@@ -132,7 +132,8 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 - A node SHOULD pace its own path requests, so RNS's estimate for it at the next hop's interface stays well under a
   new interface's 3 a second. rnfs keeps one budget per node for every path request it sends (link opens, so lookups,
   stores, fetches and keeper queries; a lookup's path check; name resolves; NomadNet adds): each takes a turn at least
-  1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. A request waiting for its turn
+  1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. On a slow node the spacing grows
+  while its radio measures the channel busy (up to 4 s; "Measured airtime", below). A request waiting for its turn
   hasn't failed, and the wait isn't part of `path_timeout`, which starts once it is sent. A turn is also put off while
   the busiest interface's outgoing estimate (RNS's `outgoing_pr_frequency` from `get_interface_stats`, through a
   shared instance too, which counts other applications' requests; a hub's server interface, which counts a copy for
@@ -392,6 +393,26 @@ refused by them SHOULD be answered at once, before a response slot is reserved o
     7) is cut to what the bucket holds less what is committed, less 1 KiB.
   - A request arriving while the bucket is empty or in debt is refused before its response is built.
   - Responses of only `None` entries are not charged.
+- **Measured airtime** (no setting; a slow node only, below): `/blocks` is refused while the node's radio measured its
+  own airtime over the last hour (`airtime_long`) above 50%. A single paced transfer stays under it, as a slow link's
+  upload cap is half its rate estimate (above), so the node refuses only while it serves several at once or is busy
+  with other traffic. `rnfs status` counts these refusals as `blocks_refused_airtime`.
+
+**Measured airtime.** RNodes measure their own airtime and the load of the channel they are on, over 15 s and over an
+hour, and RNS reports them with each interface's stats (`Reticulum.get_interface_stats`: `airtime_short`,
+`airtime_long`, `channel_load_short`, `channel_load_long`, in percent; through a shared instance too, by RPC). An RNode
+reports 0.0 until its first measurement, so 0.0 counts as unknown, as does an interface without the figures. A slow
+node (section 2) MAY pace by them; rnfs:
+- reads them at most every 15 s, and only while it has paced work asking (a path request taking its turn, a publishing
+  round, a `/blocks` request, a refresh choosing entries), taking each figure from the busiest online radio (a shared
+  instance's local interfaces left out) and the channel's load from the 15 s figure while known, else the hour's;
+- while the channel's load is above 25%, spaces its path requests (below) and its publishing rounds' lookups (the heal
+  republish's included, section 6) further apart, in proportion to the load (twice as far at 50%, at most 4 times),
+  never so far that a record a round doesn't republish would go unrepublished past `PROVIDER_TTL / 2`;
+- refuses `/blocks` while its own airtime is over budget (the airtime control above);
+- doesn't turn `provide_entries` on by default while its own airtime over the last hour is above the estimate's 2%
+  (section 6): the estimate covers republishing alone, the radio everything the node sent.
+Other nodes, and nodes whose interfaces don't report the figures, keep the estimates they use without them.
 
 **Private mode.** RNS Interface Access Codes keep outsiders off an interface. To restrict rnfs itself
 across shared interfaces and transport nodes, a node MAY run in private mode:
@@ -1097,7 +1118,9 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 - A slow node SHOULD pace its closest-nodes lookups, since each is several `/find` exchanges at radio rates
   (rnfs: at most 10 region and widened lookups per publish round, each region lookup publishing every due key of
   its region, and after a round of n lookups the next waits 30 × n s, as does a search's fallback; items never
-  published go first, then those unpublished longest).
+  published go first, then those unpublished longest). rnfs stretches that wait while its radio measures the channel
+  busy (section 3, "Measured airtime"), never past where a record the round didn't republish would go unrepublished
+  for `PROVIDER_TTL / 2`.
   It SHOULD pace withdrawals too: each server they alone reach costs an identified link and a request, and
   unpinning many keys reaches many servers (1,000 keys at 1,000 servers: about 2.9 h of airtime at 1 kbit/s).
   rnfs sends a slow node's withdrawals along with the round's stores to the same servers, and counts each server
@@ -1214,6 +1237,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
     table's size and the density check's estimate (below), and taken as 1,000 or more until a region has been found (past about 500 servers the answer no
     longer changes). One mid-size folder already exceeds what a 1 kbit/s node can republish: past that, remote
     pinning on a fast node (the existing `/pin`) shares it instead.
+  - The estimate is checked against what the radio measures (section 3, "Measured airtime"): while the node's own
+    transmissions took over 2% of the channel in the last hour, a slow node doesn't turn entries on by default, though
+    the estimate allows it; once on, a busy hour doesn't withdraw them (the estimate alone does). Unknown (no radio
+    reporting it): the estimate decides.
   - `provide_entries = true` provides entries whatever the estimate (still up to the cap); `false` provides none.
     When none are provided, the node's status says why.
   - Privacy: each entry provided tells anyone looking up its CID that this node has that file or folder, without
