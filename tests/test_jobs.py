@@ -185,12 +185,14 @@ class JobsTest(JobsBase):
         self.jobs._schedule()
 
     def test_content_not_found_is_tried_again(self):
-        """A get whose content isn't found is queued again, keeping its protection and saying why, 10 minutes on
-        (saved); once due it runs again, and is done once the content can be found. Its record is as 0.1.6 saved
-        it again once done."""
+        """A get submitted with retry whose content isn't found is queued again, keeping its protection and saying
+        why, 10 minutes on (saved, with its retry flag); once due it runs again, and is done once the content can be
+        found. Its record holds only the flag beyond what 0.1.6 saved once done."""
         data = b"published later"
         missing = str(Cid.for_block(RAW, data))
-        job = self.waiting(self.jobs.submit("get", missing, self.out("later"))["id"])
+        job = self.waiting(self.jobs.submit("get", missing, self.out("later"), retry=True)["id"])
+        self.assertIs(job["retry"], True)
+        self.assertIs(self.saved()[0]["retry"], True)
         self.assertEqual(job["state"], "queued")
         self.assertIn("no provider", job["error"])
         self.assertAlmostEqual(job["retry_at"], time.time() + retry.RETRY_FIRST, delta=30)
@@ -207,27 +209,38 @@ class JobsTest(JobsBase):
         job = self.finished(job["id"])
         self.assertEqual((job["state"], job["error"], job["retry_at"]), ("done", None, None))
         self.assertNotIn("retry_since", self.saved()[0])
+        self.assertNotIn("retry_at", self.saved()[0])
         with open(self.out("later"), "rb") as f:
             self.assertEqual(f.read(), data)
 
     def test_content_not_found_for_three_days_fails(self):
         """A pin job whose content still isn't found 3 days after it first wasn't fails, releasing its blocks."""
         missing = str(Cid.for_block(RAW, b"never published"))
-        job = self.waiting(self.jobs.submit("pin", missing)["id"])
+        job = self.waiting(self.jobs.submit("pin", missing, retry=True)["id"])
         self.due_now(job["id"], since=time.time() - retry.RETRY_FOR)
         job = self.finished(job["id"])
         self.assertEqual((job["state"], job["retry_at"]), ("failed", None))
         self.assertIn("no provider", job["error"])
         self.assertIsNone(self.jobs._job(job["id"]).protection)
 
-    def test_retry_false_fails_as_before(self):
-        """A job submitted with retry false fails at once when its content isn't found, and keeps the flag in its
-        record; retry must be a boolean."""
+    def test_without_retry_fails_as_in_0_1_6(self):
+        """A get, pin or export job submitted without retry (or with retry false) fails at once when its content
+        isn't found, as in 0.1.6: failed, with the error the equivalent call reports, and a record with no retry
+        fields, as 0.1.6 saved it. retry must be a boolean."""
+        from rnfs.errors import NotFound
         missing = str(Cid.for_block(RAW, b"not waited for"))
-        job = self.finished(self.jobs.submit("pin", missing, retry=False)["id"])
-        self.assertEqual((job["state"], job["retry_at"], job["retry"]), ("failed", None, False))
-        self.assertIn("no provider", job["error"])
-        self.assertIs(self.saved()[0]["retry"], False)
+        with self.assertRaises(NotFound) as raised:
+            self.b.pin_add(missing)
+        submitted = [self.jobs.submit("get", missing, self.out("none")), self.jobs.submit("pin", missing),
+                     self.jobs.submit("export", missing, self.out("none.rnfs")),
+                     self.jobs.submit("pin", missing, retry=False)]
+        for job in submitted:
+            job = self.finished(job["id"])
+            self.assertEqual((job["state"], job["error"], job["retry_at"]), ("failed", str(raised.exception), None))
+            self.assertNotIn("retry", job)
+        for record in self.saved():
+            self.assertEqual(record.keys() & {"retry", "retry_at", "retry_since"}, set(), record)
+        self.assertFalse(os.path.exists(self.out("none")))
         with self.assertRaises(ValueError):
             self.jobs.submit("pin", missing, retry="no")
 
@@ -238,20 +251,20 @@ class JobsTest(JobsBase):
             f.write(b"there")
         directory = self.a.add_path(self.out("tree"))["cid"]
         self.a.records.store(Cid.parse(directory).key, A_ID)
-        job = self.finished(self.jobs.submit("get", f"{directory}/no-such-entry", self.out("none"))["id"])
+        job = self.finished(self.jobs.submit("get", f"{directory}/no-such-entry", self.out("none"), retry=True)["id"])
         self.assertEqual((job["state"], job["retry_at"]), ("failed", None))
         self.assertIn("does not exist", job["error"])
 
     def test_a_job_waiting_survives_a_restart_and_can_be_cancelled(self):
         """A job waiting to be tried again is loaded waiting, its retry_at kept; cancelling it ends it at once."""
         missing = str(Cid.for_block(RAW, b"still missing"))
-        job = self.waiting(self.jobs.submit("export", missing, self.out("archive"))["id"])
+        job = self.waiting(self.jobs.submit("export", missing, self.out("archive"), retry=True)["id"])
         self.b.stop()
         self.b = self.make_node("b", B_ID)
         self.jobs = self.b.feature("jobs")
         loaded = self.jobs.get(job["id"])
-        self.assertEqual((loaded["state"], loaded["retry_at"], loaded["retry_since"]),
-                         ("queued", job["retry_at"], job["retry_since"]))
+        self.assertEqual((loaded["state"], loaded["retry_at"], loaded["retry_since"], loaded["retry"]),
+                         ("queued", job["retry_at"], job["retry_since"], True))
         cancelled = self.jobs.cancel(job["id"])
         self.assertEqual((cancelled["state"], cancelled["retry_at"]), ("cancelled", None))
 
@@ -444,8 +457,12 @@ class JobsTest(JobsBase):
     def test_fallback_dht(self):
         cid = self.share(b"only A has it")
         absent = "cc" * 16  # a from node that answers nothing
-        # Without fallback_dht it waits for that node (it could not supply it: NotFound), to be tried again later
-        job = self.waiting(self.jobs.submit("get", cid, self.out("strict"), absent)["id"])
+        # Without fallback_dht it fails, as in 0.1.6: that node could not supply it (NotFound)
+        job = self.finished(self.jobs.submit("get", cid, self.out("strict"), absent)["id"])
+        self.assertEqual(job["state"], "failed", job)
+        self.assertIn("could not supply", job["error"])
+        # With retry it waits for that node, to be tried again later
+        job = self.waiting(self.jobs.submit("get", cid, self.out("strict"), absent, retry=True)["id"])
         self.assertIn("could not supply", job["error"])
         self.jobs.cancel(job["id"])
         job = self.finished(self.jobs.submit("get", cid, self.out("fallback"), absent, fallback_dht=True)["id"])
@@ -662,6 +679,22 @@ class ApiTest(ApiBase):
         self.assertEqual(self.call("POST", "/api/jobs/clear", {})[1], {"removed": 1})
         self.assertEqual(self.call("GET", "/api/status")[1]["jobs_queued"], 0)
 
+    def test_retry_is_opt_in(self):
+        """POST /api/jobs without retry: a job whose content isn't found fails at once, as 0.1.6's did, with the
+        error POST /api/pin/add reports; with "retry": true it waits to be tried again; retry must be a boolean."""
+        missing = str(Cid.for_block(RAW, b"nobody has it"))
+        status, refused = self.call("POST", "/api/pin/add", {"target": missing})
+        self.assertEqual(status, 404, refused)
+        status, job = self.call("POST", "/api/jobs", {"kind": "pin", "target": missing})
+        self.assertEqual(status, 200, job)
+        status, job = self.call("GET", f"/api/jobs/get?id={job['id']}&wait=10")
+        self.assertEqual((status, job["state"], job["error"], job["retry_at"]), (200, "failed", refused["error"], None))
+        self.assertNotIn("retry", job)
+        status, job = self.call("POST", "/api/jobs", {"kind": "pin", "target": missing, "retry": True})
+        self.assertEqual((status, job["retry"]), (200, True), job)
+        self.assertTrue(wait_for(lambda: self.jobs.get(job["id"])["retry_at"] is not None, what="the job waiting"))
+        self.assertEqual(self.call("POST", "/api/jobs", {"kind": "pin", "target": missing, "retry": "yes"})[0], 400)
+
     def test_daemon_without_job_manager(self):
         server = ApiServer(FakeNode(), 0, token="secret")
         server.start()
@@ -730,13 +763,16 @@ class CliTest(ApiBase):
         code, _, err = self.run_cli("get", missing, "-o", self.out("nothing"))
         self.assertEqual(code, 1)
         self.assertIn("no provider", err)
-        # A foreground command submits with retry false: the job fails as in 0.1.6 rather than waiting
+        # A foreground command submits without retry: the job fails as in 0.1.6 rather than waiting
         last = self.jobs.list()[-1]
-        self.assertEqual((last["state"], last["retry_at"], last["retry"]), ("failed", None, False))
-        code, out, _ = self.run_cli("pin", "add", missing, "--background")
-        self.assertEqual(code, 0)
-        job = self.jobs.get(out.strip())
-        self.assertNotIn("retry", job)  # --background: the default, waiting when not found
+        self.assertEqual((last["state"], last["retry_at"]), ("failed", None))
+        self.assertNotIn("retry", last)
+        for argv in (("get", missing, "-o", self.out("later")), ("pin", "add", missing),
+                     ("export", missing, "-o", self.out("later.rnfs"))):
+            code, out, err = self.run_cli(*argv, "--background")
+            self.assertEqual(code, 0, err)
+            job = self.jobs.get(out.strip())
+            self.assertIs(job["retry"], True, argv)  # --background opts in: it waits when not found
 
     def test_get_without_output_takes_a_safe_sealed_name(self):
         cid = self.share(b"sealed stand-in")

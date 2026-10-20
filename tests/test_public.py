@@ -539,18 +539,21 @@ class PublicTests:
         self.b.config.max_download_size = None
         self.assertEqual(failed.state, "failed")
         self.assertIn("max_download_size", failed.error)
-        # Content not found yet: queued again, saying why and when it is tried again (rnfs 0.2.0)
-        waiting = self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this"))
+        # retry=True, content not found yet: queued again, saying why and when it is tried again (rnfs 0.2.0)
+        waiting = self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this"), retry=True)
         self.assertTrue(wait_for(lambda: waiting.refresh().retry_at is not None, what="the job queued again"))
         waiting = waiting.refresh()
         self.assertEqual(waiting.state, "queued")
         self.assertIn("no provider", waiting.error)
         self.assertIsNotNone(waiting.retry_since)
+        self.assertIs(waiting.retry, True)
         self.assertEqual(waiting.cancel().state, "cancelled")
-        # retry=False: it fails at once, as before rnfs 0.2.0
-        failed = self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this either"), retry=False).wait(10)
-        self.assertEqual((failed.state, failed.retry, failed.retry_at), ("failed", False, None))
-        self.assertIn("no provider", failed.error)
+        # By default (and retry=False) it fails at once, as in 0.1.6
+        for job in (self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this either")),
+                    self.rnfs.jobs.get(Cid.for_block(RAW, b"nor this"), self.out("none"), retry=False)):
+            failed = job.wait(10)
+            self.assertEqual((failed.state, failed.retry, failed.retry_at), ("failed", False, None))
+            self.assertIn("no provider", failed.error)
         with self.assertRaises(ValueError):
             self.rnfs.jobs.pin(Cid.for_block(RAW, b"x"), retry=0)
 
