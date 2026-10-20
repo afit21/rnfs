@@ -267,15 +267,26 @@ def build_tar(stream: BinaryIO, put: Put, warn: Callable[[str], None], max_entri
 def _add_member(archive: tarfile.TarFile, member: tarfile.TarInfo, tree: _Tree, put: Put,
                 warn: Callable[[str], None], options: BuildOptions | None):
     """Put one member into tree (or warn why it is skipped); a file's data is built as it is read."""
+    placed = _place(member, tree, warn)
+    if placed is not None:
+        parent, name = placed
+        kind = dag.KIND_EXECUTABLE if member.mode & 0o100 else dag.KIND_FILE
+        parent[name] = builder.build_file(archive.extractfile(member), put, member.size, kind, options)
+
+
+def _place(member: tarfile.TarInfo, tree: _Tree, warn: Callable[[str], None]) -> tuple[dict, str] | None:
+    """Make the directory a member is, or those a file member goes in, in tree (or warn why it is skipped): for a file
+    to build, (the directory it goes in, its name); None for anything else. Raises TooLarge past MAX_DEPTH or the
+    tree's max_entries."""
     shown = _shown(builder.display_path(member.name))
     parts = _parts(member.name)
     if isinstance(parts, str):
         warn(f"skipped {shown}: {parts}")
-        return
+        return None
     if not parts:  # "." or "./": the root itself
         if not member.isdir():
             warn(f"skipped {shown}: not a valid entry name")
-        return
+        return None
     if len(parts) > constants.MAX_DEPTH:
         raise TooLarge(f"{shown} is nested deeper than MAX_DEPTH ({constants.MAX_DEPTH})")
     if member.issym():
@@ -291,9 +302,9 @@ def _add_member(archive: tarfile.TarFile, member: tarfile.TarInfo, tree: _Tree, 
         parent = tree.file_parent(parts)  # checked before its data is read: a skipped file's is passed over
         if isinstance(parent, str):
             warn(f"skipped {shown}: {parent}")
-            return
-        kind = dag.KIND_EXECUTABLE if member.mode & 0o100 else dag.KIND_FILE
-        parent[parts[-1]] = builder.build_file(archive.extractfile(member), put, member.size, kind, options)
+            return None
+        return parent, parts[-1]
+    return None
 
 
 # Writing
