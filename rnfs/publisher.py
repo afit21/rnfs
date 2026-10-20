@@ -646,6 +646,7 @@ class Publisher:
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
         self._sizes: Callable[[bytes], float | None] | None = None  # set_network_size
         self._islands = None  # set_islands: the node's partition mode (rnfs.dht.local.PartitionMode), if any
+        self._off_island_known: Callable[[], bool] = lambda: False  # set_islands: a server beyond the island is known
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
         # Writes what changed since the last save (_touch_item, _touch_node); without a state directory, to a
@@ -1562,6 +1563,8 @@ class Publisher:
                 unsaved, saved_at = 0, answered
 
         unfinished: list[ProvidedItem] = []
+        # Whether a server beyond the island is known at all (read before the lock: the routing table's has its own)
+        off_island = islands is not None and self._off_island_known()
         with self._lock:
             for node_id, keys in sent_withdrawals.items():
                 remaining = self._withdrawals.get(node_id, set()) - keys
@@ -1585,7 +1588,7 @@ class Publisher:
                     continue
                 state.retry = None
                 if islands is not None:
-                    marked = self._mark_heal(state, nodes, accepted[cid], partitioned or islands.active)
+                    marked = self._mark_heal(state, nodes, accepted[cid], partitioned or islands.active, off_island)
                     if marked and partitioned and not islands.active:
                         # Partition mode ended while this round ran, after heal() made the marks due: due again
                         state.retry = now
@@ -1620,15 +1623,18 @@ class Publisher:
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds,
                 "widened": sweep.widened}
 
-    def _mark_heal(self, state: _Item, nodes: list[bytes], accepted: list[bytes], partitioned: bool) -> bool:
+    def _mark_heal(self, state: _Item, nodes: list[bytes], accepted: list[bytes], partitioned: bool,
+                   off_island: bool = False) -> bool:
         """Mark an item (its state) for the heal republish if its round (store set nodes, accepted those that may
-        hold it) reached no off-island server, in partition mode or after trying one; clear the mark if it reached
-        one. True if it is marked now. Lock held."""
+        hold it) reached no off-island server, in partition mode, after trying one, or while off-island servers are
+        known (off_island) though none was in its store set: a node started while its island was cut off never enters
+        partition mode (its failures are for want of a path, which don't count), and its lookups find local servers
+        only. Clear the mark if it reached one. True if it is marked now. Lock held."""
         islands = self._islands
         if any(not islands.is_local(node_id) for node_id in accepted):
             state.heal = False
             return False
-        if partitioned or any(not islands.is_local(node_id) for node_id in nodes):
+        if partitioned or off_island or any(not islands.is_local(node_id) for node_id in nodes):
             state.heal = True
         return state.heal
 
@@ -1688,11 +1694,14 @@ class Publisher:
         with self._lock:
             self._store_parts.append(part)
 
-    def set_islands(self, islands):
+    def set_islands(self, islands, off_island_known: Callable[[], bool] = lambda: False):
         """Publish under islands, the node's partition mode (rnfs.dht.local.PartitionMode): only to the servers its
-        allows() takes, telling it each server's answer (answered) or failure (failed) to a /provide."""
+        allows() takes, telling it each server's answer (answered) or failure (failed) to a /provide.
+        off_island_known() says whether a server beyond the island is known (the routing table holds one): a round
+        that reached none while one is known marks its keys for the heal republish (_mark_heal)."""
         with self._lock:
             self._islands = islands
+            self._off_island_known = off_island_known
 
     def set_widening(self, flags: Flags, widen: Widen):
         """Check each key of a region found for a dense core: flags(key, region) says whether it needs a widened lookup

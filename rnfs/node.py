@@ -799,7 +799,10 @@ class RnfsNode:
         if local and config.local_replicas:
             self.publisher.add_store_part(self._local_replicas)
         if local:
-            self.publisher.set_islands(self.partition)  # in partition mode, rounds reach local servers only
+            # In partition mode, rounds reach local servers only; one that reached no off-island server while one is
+            # known marks its keys for the heal republish
+            self.publisher.set_islands(self.partition, lambda: any(
+                not self.local.is_local(node_id) for node_id in self.routing.nodes()))
         # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
         self.names.held_listener = self._name_event

@@ -7,6 +7,7 @@ import unittest
 
 import RNS
 
+from rnfs import publisher as publisher_module
 from rnfs.config import Config
 from rnfs.dht.local import (FAILURES_TO_ENTER, GAP_SAMPLES, LOCAL_FIRST, LOCAL_FIRST_RADIUS, MAX_JUDGED, MIN_GAPS,
                             MIN_SILENCE, PROBE_INTERVAL, SILENCE_FACTOR, SLOW_PROBE_INTERVAL, SLOW_PROBE_MAX,
@@ -644,6 +645,27 @@ class PartitionWiringTest(IslandCase):
         self.assertGreater(node.publisher.next_due(), 3600)
         node._answered(self.backbone[0])
         self.assertLess(node.publisher.next_due(), 3600)
+
+    def test_a_round_that_found_only_the_island_is_marked_while_servers_beyond_are_known(self):
+        """A node started while its island was cut off never enters partition mode (its failures are for want of a
+        path) and its rounds find local servers only, so no off-island server is in their store sets: over LoRa a
+        gateway restarted during an outage stored a new key on its one neighbour and nothing marked it, leaving it on
+        the island for days. Known servers beyond the island mark such a round; an island that knows of none, isn't
+        cut off from anything, and marks nothing."""
+        publisher = self.node.publisher
+        self.assertTrue(publisher._off_island_known())  # the backbone's servers are in its routing table
+        state = publisher_module._Item()
+        island = self.islanders[:1]
+        self.assertTrue(publisher._mark_heal(state, island, island, False, publisher._off_island_known()))
+        self.assertFalse(publisher._mark_heal(state, island + self.backbone[:1], island + self.backbone[:1], False,
+                                              True))  # reaching beyond clears it
+        lonely = self.make_node(ident(0xC0), slow="yes", local_interfaces=["LoRa"])
+        for n in self.islanders:
+            lonely._heard_server(n)
+            lonely.routing.heard(n)
+        self.assertFalse(lonely.publisher._off_island_known())
+        self.assertFalse(lonely.publisher._mark_heal(publisher_module._Item(), island, island, False,
+                                                     lonely.publisher._off_island_known()))
 
     def test_rounds_reaching_beyond_the_island_mark_nothing(self):
         self.node.add_path(self.write(b"connected"))

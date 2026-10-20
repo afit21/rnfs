@@ -976,7 +976,9 @@ or protocol constant changes.
 - **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
   network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
   the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
-  or after trying one), and republish the marked keys when partition mode ends, paced as its rounds are (a slow node's
+  after trying one, or while its routing table holds an off-island server though the round found none: a node started
+  while its island was cut off never enters partition mode, its failures being for want of a path, and its rounds find
+  local servers only), and republish the marked keys when partition mode ends, paced as its rounds are (a slow node's
   10 lookups a round). rnfs keeps the marks across restarts (in the state database), republishes them at the first
   off-island answer or fresh announce after a restart too (the partition may have ended while it was down), and clears
   a key's mark when a round reaches an off-island server. In the simulation this found such records in hours instead of days while about

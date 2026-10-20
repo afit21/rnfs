@@ -753,6 +753,13 @@ Fixed:
   provides, minutes at the first start after this upgrade) every request other nodes sent waited out its timeout.
   Over LoRa a slow node's join asked a gateway restarting meanwhile and waited 20 s for nothing. Links are refused
   (RNS drops the link request, which fails in seconds) until the request server is in place.
+- **What a node publishes after starting cut off is healed too** (spec section 6, "The heal republish"): a node
+  that starts while its island is cut off never enters partition mode (its failures are all for want of a path, which
+  don't count) and its rounds find local servers only, so nothing marked their keys for the heal republish. Over LoRa
+  the gateway PC, restarted during an outage, stored a new key on its one neighbour, and once the backbone was back
+  nothing republished it beyond the island until its next republish, days later on a slow node. A round that reached
+  no off-island server now marks its keys while the routing table holds any off-island server; an island that knows of
+  none still marks nothing.
 - **A fetch uses the provider records its own node holds** (spec section 6, Finding providers): a search started
   with nothing, though a DHT server holds records for the keys near it, and on an island a node holds the local
   replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its
