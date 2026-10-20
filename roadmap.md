@@ -330,7 +330,7 @@ rnfs nodes; at 100k nodes announces approach RNS's per-interface ingress limit o
 * As implemented: as written. Whether a client needs reaching is checked every minute, and it announces at once
   when it starts to. Servers and names announce as before.
 
-## Pacing path requests (to do)
+## Pacing path requests (implemented)
 
 Since RNS 1.2.5 every interface limits the path requests arriving on it, and the release notes say applications
 that send many will see their users lose path resolution, by design. In RNS 1.5.6 (`Interface.should_ingress_limit_pr`,
@@ -394,8 +394,22 @@ by publishing. All local; no wire change.
 * Spec section 6 (or Appendix A) says what announces carry and why provider records aren't announced: servers
   are found from `rnfs.dht` announces and names live in their own, but a 1 kbit/s channel's 2% allowance (about
   1,150 announces a day) covers node presence for about 290 nodes, not an announce for each CID
+* As implemented: one `PathRequests` per node (`rnfs/network/paths.py`) for link opens, lookup path checks,
+  identity recalls, name resolves and NomadNet adds: turns first in, first out, at least 1 s apart; the busiest
+  interface's `outgoing_pr_frequency` above 1.5 a second (local interfaces and the parents of spawned ones left
+  out) holds a turn up to 15 s, so a busy transport node's own forwarding can't stop it for ever; concurrent waits
+  for one destination join; nothing re-sent within 20 s of the last request for a destination (path and
+  identity waits, not name resolves); a failed link establishment costs a turn. A fresh node's join and first
+  region lookups against a new hub interface: 16 requests, 14 limited, one trip, peak 17.7/s → 14 requests (2
+  joined), none limited, peak 1.5/s, in 13 s instead of 0.9 s. A query that failed for want of a path doesn't
+  count towards partition mode (`PartitionMode(no_path=)`); probes count whatever the reason
+* Found while building: RNS never re-sends a path request on the interface it arrived on (`Transport.path_request`
+  forwards to every other interface), so on an island of single-radio relays `gateway` mode or `recursive_prs`
+  doesn't flood requests across the island: it lets the gateway forward its radio neighbours' requests to the
+  internet side, or a two-radio relay bridge its radios. The documentation says so. RNS 1.5.6 raises `KeyError` on
+  `interface_mode = gateway`; the README says `mode = gateway`
 
-## Less link and lookup traffic (to do)
+## Less link and lookup traffic (implemented, but for the owner's open items)
 
 Traffic rnfs sends that does no work. Counts are from RNS 1.5.6's code, not yet measured. All local; no wire change.
 
@@ -426,6 +440,23 @@ Traffic rnfs sends that does no work. Counts are from RNS 1.5.6's code, not yet 
   it has open links to, before looking up; one that answers `None` is forgotten for that CID. A lookup that found
   no providers isn't repeated for the same CID for 10 minutes, except when the user asks again explicitly (spec
   section 7, Fetching a target)
+* As implemented:
+  - Idle links: a shared link with nothing in progress closes after `link_idle_timeout` if it holds a rate
+    estimate, else 1 s plus two round trips before RNS's keepalive interval if that is sooner (RNS counts the
+    interval from the earlier of the last packet in and out); the sweeper runs when the next link is due. A
+    simulated 8 h of gateway browsing on 50 ms paths: open, close and keepalive packets 346k → 46k (keepalives
+    328k → 20k, reopens within 5 minutes 1,123 → 1,971); radio paths unchanged
+  - Path requests only where the node can be: with its own instance, the request for an unknown ID named in a
+    `/find` reply goes only on the replying node's next-hop interface when that interface is fast (bitrate at
+    least `slow_bitrate`); a spawned interface stands for its parent's spawned interfaces. An ID named over a slow
+    interface or one of unknown bitrate, joins, names, providers and links to known IDs ask on every interface;
+    nothing is scoped through a shared instance (RNS's `on_interface` behaves the same on every interface mode)
+  - Remembered providers: only nodes that served verified blocks of a root (a `/find` reply can't plant
+    entries), for 3 h, `K` a root, 4,096 roots; asked in step 1 after a remote pin's hint and before open links,
+    under the probe rules; forgotten on `None`, a failed request, a failure in a fetch or a ban. A lookup that ran
+    to its end, was answered and found nothing isn't repeated for 10 minutes by gateway fetches and follow and
+    deny-list retries; CLI and API calls, jobs and remote pins always search. Fixed on the way: a probe that
+    brought the first block was asked for it again (a whole chunk sent twice)
 
 Open (owner's decision):
 * One link for publishing. A publish looks up servers over the shared anonymous link, then opens a separate
@@ -757,7 +788,7 @@ local or an existing refusal (`False`), and gets a regression test in `tests/sec
     headers scanned before anything is stored; a `meta` mark collects after a start that finds it (no schema step)
   - REV11: `MAX_DEPARTED` = 50,000 standings without records, fewest refresh days first
 
-## Fetching reliably on LoRa (to do)
+## Fetching reliably on LoRa (implemented, but for the last bullet)
 
 Fetching files of a few hundred KiB over LoRa is the use to keep working well. At 1 kbit/s a 100 KiB file is about
 123 KB on air (16 minutes), a 2 KiB file about 9.5 KB, more than half of it the lookup.
@@ -793,6 +824,35 @@ Fetching files of a few hundred KiB over LoRa is the use to keep working well. A
 * A start after an unclean stop lists only the block subdirectories that changed since the last durability
   point (by recorded directory times, compared for equality; a full scan where the filesystem doesn't keep
   them), if the Raspberry Pi measurement shows the full scan hurts
+* As implemented (all measured on fakes; real LoRa untested):
+  - Lost packets: a request RNS times out, whose link times out under it, or whose new link isn't established
+    is `LOST` (`PeerClient`): its link is closed and the request retried on a new one after the busy delay; the
+    provider fails after `max_failures` in a row. An oversized response's rejection looks the same to RNS and is
+    retried too, within the same bound. 1 MiB from one provider at 5% request loss: 39% → 99.7% of fetches
+    succeed (97.3% with link establishment lost at 5% too)
+  - Failed pinned fetches keep their progress through `RnfsNode.pinned_fetch` (pin add, dir set/rm, remote pins,
+    follows and deny lists too), not for `Denied`, `InvalidDag` or any `TooLarge`; recorded as a gateway fetch
+    is, so never provided as the user's download
+  - Remote pins and jobs: the asker is probed first (a fetch hint from the `/pin`'s identity), a not-found pin or
+    get/pin/export job waits 10 minutes doubling to 6 h for 3 days (`rnfs/retry.py`, `remote_pin_retries`,
+    `retry_at` in jobs and served pin status `waiting`). Jobs take an optional `retry` (default true); the CLI's
+    foreground commands send `false`, so they fail as in 0.1.6
+  - Slow links per provider: rate estimate below `slow_bitrate`, or with none a slow next-hop interface or slow
+    path; providers behind one slow interface share one request at a time; a node that isn't slow probes no open
+    link over a slow link (a slow node keeps its one probe); nothing is duplicated onto a slow link, and a batch
+    on a measured link only after max(`deadline_slack`, 1.5 × its expected time)
+  - Range reads: 32-chunk windows while some provider is on a fast link, else one chunk with the next asked
+    ahead: the first byte over LoRa after one chunk (about 9 minutes at 1 kbit/s) instead of 32
+  - A pacing wait holds its link (`LinkPool.hold`), so the next response keeps the rate estimate
+  - Clock problems: a name's announces are held while the clock is behind its last announce (persisted in
+    `name_announces`), rechecked each minute, released once the clock passes it or after 7 days held; a held
+    publish is committed and says so (`announce_held`); `status` gives `announces_held` and `clock_offset` (median
+    over at least 5 senders' announces, warning above 5 minutes)
+  - `max_storage` counts each block rounded up to the store's allocation unit (`fsutil.allocation_unit`, at least
+    4 KiB); `status` adds `allocated_bytes` and `allocation_unit`, `used_bytes` unchanged. A mixed 297 MiB store
+    takes 298 MiB at 4 KiB units and 312 MiB at 32 KiB; 2,000 small notes 4.1 MiB → 9.4 / 63 MiB. Quotas on
+    what others make the node store still count bytes, as in 0.1.x
+  - The last bullet waits on the Raspberry Pi measurement
 
 ## Using more of Reticulum (to do)
 
