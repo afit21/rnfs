@@ -111,9 +111,17 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   answer for other node IDs through its other destinations.
 
 **Links.**
-- Requests to a node share one outgoing link, opened on demand and closed after `link_idle_timeout` without
-  traffic (`Link.no_data_for()`). These links don't identify, so lookups and downloads don't reveal who is
-  asking.
+- Requests to a node share one outgoing link, opened on demand and closed once it has had no request in progress
+  and no traffic (`Link.no_data_for()`) for `link_idle_timeout`, or, if it has no rate estimate (section 2), for
+  its keepalive interval if that is shorter (rnfs 0.2.0). The node that opened a link sends a keepalive once the
+  interval has passed without a packet either way, and the other node answers (RNS 1.5.6: `Link.keepalive`,
+  `max(5 s, RTT × 360 / 1.75)`, at most 360 s); keepalives don't count as traffic. On a 50 ms path that is a pair
+  every ~10 s, about 58 packets in 5 minutes, which every transport node on the path relays, while reopening the
+  link costs about 4; on radio paths (RTT ≥ 1.75 s) the interval is 360 s, so none are sent. rnfs closes such a
+  link 1 s plus two round trips before the interval has passed (RNS counts it from the earlier of the last packet
+  in and out). A link with a rate estimate, which carried `/blocks`, keeps `link_idle_timeout`: closing it would
+  reset the responder's rate estimate (its next response held to one chunk) and RNS's Resource window. These
+  links don't identify, so lookups and downloads don't reveal who is asking.
 - A node identifies (`Link.identify()`) only:
   - on a separate link opened to publish (section 6) or to send `/pin` (section 8), closed when done; or
   - on every link, in private mode.
@@ -1156,6 +1164,21 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    slow, asks its one (`max_parallel_providers` is 1 there): a hit saves a whole lookup over the radio for one
    request on a link already open. For a remote pin, the node that asked is asked first, link or not and over any
    link (rnfs 0.2.0): it is the one node known to hold the content before its provider records are out.
+   - **Remembered providers** (rnfs 0.2.0). A node SHOULD remember, for a few hours, the providers that served
+     verified blocks of a root, and ask them in this step, after a remote pin's asker and before the nodes with open
+     links, so fetching a root again once its links have closed (a gateway reload, `pin add` after `cat`) doesn't
+     repeat its lookup. Asking one is a probe like an open link's, under the same slow-link rule; a link need not be
+     open. One that answers `None`, or whose request fails, is forgotten for that root (one that is busy is kept), as
+     is one that fails during a fetch or is banned. rnfs remembers them for 3 hours after they last served, up to `K`
+     per root and 4,096 roots, the least recently used forgotten first, in memory only. It remembers only nodes that
+     served verified blocks, not the providers a lookup reports: a `/find` reply can't make it ask a node again.
+   - **Searches that found none** (rnfs 0.2.0). A lookup that ran to its end, was answered by some node and found
+     no provider, in a fetch whose other requests found none either, SHOULD NOT be repeated for the same root for
+     10 minutes, except when the user asks again: a search for content nobody provides costs about 13.5 `/find`.
+     The nodes above are still asked. In rnfs the gateway, and the retries of followed names and deny lists, keep
+     to it, and fail at once with "not found"; `get`, `cat`, `pin add` and the rest of the CLI and API, and remote
+     pins (whose own retries are 10 minutes or more apart), always search. Only the node's own lookups set it,
+     keyed on the root, so another node can't keep it from searching; it is kept for at most 4,096 roots.
 2. Fetch the root block and decode it. Fetch the blocks not already stored: those along the requested path,
    then every block of the target's DAG — or, for a byte range (`cat --offset`, gateway Range requests), only
    the chunks covering it and the nodes above them. Each block is fetched once, even if it appears several
@@ -1281,6 +1304,12 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   it isn't provided (the pin is, once complete).
 - When storage exceeds `max_storage`, cached fetches are evicted least recently used first; `gc` evicts them
   all, and `cache rm <cid>` those leading to one CID (a pin of the same content keeps its blocks).
+- Storage, for `max_storage`, is what the blocks take on disk: each block is a file of its own, so it counts as
+  its size rounded up to the allocation unit of the filesystem holding `<rnfs dir>/blocks/` (its fragment or
+  cluster size, at least 4096 bytes, read when the node starts), and an empty block as one unit (rnfs 0.2.0; 0.1.x
+  counted each block's length, and a FAT32 drive's 16–32 KiB clusters made a store of small blocks take several
+  times `max_storage`). Quotas (`follow_quota`, `remote_pin_quota`) and `max_download_size` count bytes of
+  content and blocks, not allocation.
 - `add --no-pin` stores what it adds as a cached fetch of its CID instead of pinning it: evicted least recently
   used like any other, removed by `gc`, never provided under `pinned`, and under `roots` provided while it is
   cached (it counts as a target the user fetched).
@@ -2354,7 +2383,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `max_upload_rate` | none; half the rate estimate on slow links that have one | An explicit value applies to every `/blocks` response, with or without a rate estimate |
 | `record_budget` | 1 GiB | Disk the provider records stored for others may take, never the free disk the blocks' reserve needs; past it, the storage tiers decide whose records stay (section 6). Replaces 0.1.x's `max_records` (a record count), which a node ignores with a warning |
 | `ban_time` | 1 h | |
-| `max_storage` | 10 GiB | |
+| `max_storage` | 10 GiB | What the blocks take on disk, each rounded up to the filesystem's allocation unit (section 8) |
 | `max_download_size` | none | |
 | `max_output_entries` | 100 000 | |
 | `name_table_size` | 10 000 | Records kept for names this node hasn't resolved through the CLI or API (four times as many sequence floors, section 9) |

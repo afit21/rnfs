@@ -98,7 +98,7 @@ DESCRIPTIONS = {
     "lookup_timeout": "Longest a DHT lookup runs",
     "path_timeout": "Longest to wait for an RNS path",
     "max_failures": "Unanswered queries in a row before a node is dropped",
-    "link_idle_timeout": "Idle links are closed after this long",
+    "link_idle_timeout": "Idle links are closed after this long at most (sooner without a rate estimate)",
     "max_incoming_links": "Links other nodes may have open to this one",
     "max_blocks_responses": "/blocks responses in progress at once (half of them for slow links); at least 2",
     "fast_blocks_responses": "/blocks responses in progress on links that aren't slow, if more than the rest",

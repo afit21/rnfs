@@ -10,7 +10,7 @@ from collections import deque
 from unittest import mock
 
 from rnfs.config import Config
-from rnfs.constants import CHUNK_SIZE, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
+from rnfs.constants import CHUNK_SIZE, K, MAX_BLOCK_SIZE, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, RESPONSE_OVERHEAD
 from rnfs.content import builder, dag, walker
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.content.dag import Child, Entry, FileNode
@@ -65,6 +65,12 @@ class FakeLookup:
     def remaining(self) -> float:
         """Time is never up."""
         return 100.0
+
+    def closest_answered(self) -> list[bytes]:
+        """Some node answered (the search reached the DHT), unless a test said none did."""
+        return [] if self.unanswered else [P4]
+
+    unanswered = False  # set by a test: no node answered (the node is offline)
 
 
 class FetcherTest(unittest.TestCase):
@@ -142,6 +148,27 @@ class ProviderDiscoveryTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertEqual(self.lookups, [])  # no lookup needed
 
+    def test_a_probe_that_brings_the_block_isnt_asked_for_it_again(self):
+        built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        asked = self.client.asked(P1)
+        self.assertEqual(asked[0], built.cid)
+        self.assertEqual(len(asked), len(set(asked)))  # the root once: the probe brought it
+        self.assertEqual(sorted(map(str, asked)), sorted(map(str, self.network)))
+
+    def test_a_probe_that_misses_leaves_the_block_to_the_lookup(self):
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P3)
+        self.client.links = [P1, P2]  # neither holds anything
+        self.runs.append([P3])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.asked(P1), [built.cid])
+        self.assertEqual(self.client.asked(P2), [built.cid])
+        self.assertEqual(self.client.asked(P3)[0], built.cid)
+
     def test_open_link_without_the_root_falls_back_to_lookup(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P2)
@@ -201,6 +228,185 @@ class ProviderDiscoveryTest(FetcherTest):
             for node_id in (four, P1, P2, P3):
                 fetch._add_provider(node_id)
             self.assertEqual([p.node_id for p in fetch._usable()], [P2, P3, P1, four])
+
+
+class RememberTest(FetcherTest):
+    """Providers that served a root are asked first when it is fetched again; a search that found none isn't repeated
+    by a fetch that isn't explicit (section 7, Fetching a target, step 1)."""
+
+    LORA = mesh.PathInfo(1, "LoRa", 1200)
+
+    def setUp(self):
+        """A file of a few chunks; the fetcher's clock set by hand."""
+        super().setUp()
+        self.built = self.file(os.urandom(3 * CHUNK_SIZE))
+        self.now = [1000.0]
+        self.fetcher.clock = lambda: self.now[0]
+
+    def resolve(self, root: Cid, **kwargs):
+        """Fetch the root block only."""
+        with self.fetcher.open(root, **kwargs) as fetch:
+            fetch.resolve()
+
+    def test_a_provider_that_served_is_asked_first_without_a_lookup(self):
+        self.hold(P1)
+        self.runs.append([P1])
+        self.resolve(self.built.cid)  # the root, from the provider a lookup found
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P1])
+        self.client.requests.clear()
+        self.fetch_all(self.built.cid)  # its links closed since: no open link to ask
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 1)  # no second lookup
+        self.assertEqual(self.client.requests[0][0], P1)
+
+    def test_only_providers_that_served_are_remembered(self):
+        self.hold(P2)
+        self.runs.append([P1, P3, P2])  # a /find reply's word isn't enough: P1 and P3 hold nothing
+        self.fetch_all(self.built.cid)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2])
+
+    def test_a_remembered_provider_that_answers_none_is_forgotten(self):
+        self.hold(P1)
+        self.runs.append([P1])
+        self.resolve(self.built.cid)
+        self.client.holdings[P1] = {}  # it unpinned it
+        self.hold(P2)
+        self.runs[:] = [[P2]]
+        self.fetch_all(self.built.cid)
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 2)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2])
+        self.assertFalse(self.routing.is_banned(P1))  # not penalised: it was only asked first
+
+    def test_a_remembered_provider_that_fails_is_forgotten_and_a_busy_one_kept(self):
+        for status, kept in ((FAILED, False), (LOST, False), (BUSY, True)):
+            with self.subTest(status=status):
+                built = self.file(os.urandom(2 * CHUNK_SIZE) + status.encode())
+                self.client.behaviour.clear()
+                self.hold(P1)
+                self.runs[:] = [[P1]]
+                self.resolve(built.cid)
+                self.client.behaviour[P1] = lambda cids, status=status: BlocksResult(status, unsent=list(cids))
+                self.hold(P2)
+                self.runs[:] = [[P2]]
+                self.fetch_all(built.cid)
+                self.assertEqual(P1 in self.fetcher.remembered(built.cid), kept)
+
+    def test_a_provider_that_fails_during_a_fetch_is_forgotten(self):
+        self.hold(P1)
+        self.runs.append([P1])
+        self.resolve(self.built.cid)
+        root = self.network[self.built.cid]
+        self.client.holdings[P1] = {self.built.cid: root}  # the root, but none of its chunks
+        self.hold(P2)
+        self.client.links = [P2]
+        self.fetch_all(self.built.cid)
+        self.assertNotIn(P1, self.fetcher.remembered(self.built.cid))
+
+    def test_remembered_for_a_few_hours_and_never_once_banned(self):
+        self.fetcher.remember(self.built.cid, P1)
+        self.now[0] += fetcher_module.REMEMBER_FOR - 1
+        self.fetcher.remember(self.built.cid, P2)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2, P1])  # the most recent to serve first
+        self.now[0] += 1
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [P2])
+        self.routing.ban(P2)
+        self.assertEqual(self.fetcher.remembered(self.built.cid), [])
+
+    def test_bounded(self):
+        for i in range(K + 5):
+            self.now[0] += 1
+            self.fetcher.remember(self.built.cid, bytes([i + 10]) * 16)
+        remembered = self.fetcher.remembered(self.built.cid)
+        self.assertEqual(remembered, [bytes([i + 10]) * 16 for i in reversed(range(5, K + 5))])  # the latest K
+        roots = [Cid.for_block(RAW, bytes([i])) for i in range(4)]
+        with mock.patch.object(fetcher_module, "MAX_REMEMBERED", 3), \
+                mock.patch.object(fetcher_module, "MAX_UNFOUND", 3):
+            for root in roots:
+                self.fetcher.remember(root, P1)
+                self.fetcher.note_unfound(root)
+            self.fetcher.remembered(roots[1])  # used: kept over roots[2]
+            self.fetcher.remember(self.built.cid, P1)
+            self.assertEqual([root for root in roots if self.fetcher.remembered(root)], [roots[1], roots[3]])
+            self.assertEqual([root for root in roots if self.fetcher.unfound(root) is not None], roots[1:])
+
+    def test_the_hint_then_remembered_providers_then_open_links(self):
+        for node_id in (P1, P2, P3):
+            self.hold(node_id)
+        self.fetcher.remember(self.built.cid, P2)
+        self.client.links = [P3, P2]
+        self.config.max_parallel_providers = 2
+        with self.fetcher.open(self.built.cid, hint=P4) as fetch:
+            fetch.resolve()
+        self.assertEqual(sorted(node for node, _ in self.client.requests[:2]), [P2, P4])  # P3 left out
+        self.assertEqual(self.client.asked(P3), [])
+
+    def test_a_fast_node_asks_no_remembered_provider_over_a_slow_link_first(self):
+        self.hold(P1)
+        self.hold(P2)
+        self.fetcher.remember(self.built.cid, P1)
+        self.fetcher.path_info = lambda node_id: self.LORA if node_id == P1 else mesh.NO_PATH
+        self.runs.append([P2])
+        self.fetch_all(self.built.cid)
+        self.assertEqual(self.client.asked(P1), [])  # the lookup over fast links first
+        self.assertEqual(len(self.lookups), 1)
+        self.assertIn(P1, self.fetcher.remembered(self.built.cid))  # kept: it wasn't asked
+
+    def test_a_slow_node_asks_its_one_remembered_provider_before_an_open_link(self):
+        self.config.max_parallel_providers = None  # its default: 1 on a slow node
+        self.fetcher = self.make_fetcher(slow=True)
+        self.fetcher.clock = lambda: self.now[0]
+        self.hold(P1)
+        self.hold(P2)
+        self.fetcher.remember(self.built.cid, P1)
+        self.client.links = [P2]
+        self.fetcher.path_info = lambda node_id: self.LORA
+        self.resolve(self.built.cid)
+        self.assertEqual(self.client.requests, [(P1, [self.built.cid])])
+        self.assertEqual(self.lookups, [])
+
+    def test_a_search_that_found_nothing_isnt_repeated_by_a_fetch_that_isnt_explicit(self):
+        self.runs.append([])
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertEqual(len(self.lookups), 1)
+        self.now[0] += fetcher_module.UNFOUND_FOR - 1
+        with self.assertRaises(NotFound) as caught:
+            self.resolve(self.built.cid, explicit=False)  # a gateway reload
+        self.assertEqual(len(self.lookups), 1)
+        self.assertIn("a search 599s ago found none", str(caught.exception))
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid)  # the user asks again: searched
+        self.assertEqual(len(self.lookups), 2)
+        self.now[0] += fetcher_module.UNFOUND_FOR
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertEqual(len(self.lookups), 3)
+
+    def test_nodes_asked_first_are_still_asked(self):
+        self.runs.append([])
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.hold(P1)
+        self.client.links = [P1]  # an open link that has it now
+        self.fetch_all(self.built.cid, explicit=False)
+        self.assertTrue(self.storage.is_complete(self.built.cid))
+        self.assertEqual(len(self.lookups), 1)
+        self.assertIsNone(self.fetcher.unfound(self.built.cid))  # it was found after all
+
+    def test_only_a_search_that_was_answered_and_found_nobody_counts(self):
+        FakeLookup.unanswered = True  # offline: no node answered
+        self.addCleanup(setattr, FakeLookup, "unanswered", False)
+        self.runs.append([])
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertIsNone(self.fetcher.unfound(self.built.cid))
+        FakeLookup.unanswered = False
+        self.runs[:] = [[P1]]  # a provider found, which fails: someone provides it
+        with self.assertRaises(NotFound):
+            self.resolve(self.built.cid, explicit=False)
+        self.assertIsNone(self.fetcher.unfound(self.built.cid))
+        self.assertEqual(len(self.lookups), 2)
 
 
 class FailureRuleTest(FetcherTest):
@@ -1477,6 +1683,24 @@ class LimitTest(FetcherTest):
         self.assertTrue(self.storage.is_complete(built.cid))
         self.assertFalse(self.storage.has(cached.cid))
         self.assertLessEqual(self.storage.used_bytes(), self.storage.max_storage)
+
+    def test_unpinned_fetch_makes_room_by_disk_allocation(self):
+        # On FAT32 each block takes a 32 KiB cluster: cache that is little in bytes but much on disk makes room
+        self.storage.allocation_unit = 32 * 1024  # nothing is stored yet, so there's no total to redo
+        small = [builder.build_bytes(b"%d" % i * 10, self.storage.put) for i in range(20)]
+        cached = builder.build_directory([Entry(f"{i:02d}", f.cid, f.size, 0) for i, f in enumerate(small)],
+                                         self.storage.put)
+        self.storage.record_fetch(cached.cid, [], cached.cid)
+        self.assertLess(self.storage.used_bytes(), 2000)
+        self.storage.max_storage = 25 * 32 * 1024  # the cache takes 21 clusters, the file 9 more
+        built = self.file(os.urandom(4 * CHUNK_SIZE))
+        self.hold(P1)
+        self.runs.append([P1])
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertFalse(self.storage.has(cached.cid))
+        self.assertLess(self.storage.used_bytes() + 2000, self.storage.max_storage)  # bytes alone would have fit
+        self.assertLessEqual(self.storage.allocated_bytes(), self.storage.max_storage)
 
     def disk(self, free: int):
         """A mock disk_usage reporting free bytes on a 1 GiB filesystem (reserve: DISK_RESERVE_MIN)."""

@@ -537,6 +537,21 @@ Changed:
   `tests/test_fetcher.py`'s `LossyLinkTest` (one provider, each request lost with probability 5%), 1 MiB fetches
   succeeded 39% of the time before and 99.7% after (300 fetches each), or 97.6% when each new link's request and
   proof are lost at 5% too.
+- Idle links close before RNS keeps them alive. The node that opens a link sends a keepalive after
+  `max(5 s, RTT × 206)` without a packet (at most 360 s) and the other node answers, and keepalives don't count as
+  traffic, so a link left open for `link_idle_timeout` (5 minutes) on a 50 ms path carried about 58 packets, relayed
+  by every transport node on the way, against about 6 for the lookup that opened it. A link without a rate estimate
+  now closes just before its first keepalive (1 s and two round trips before the interval), if that is sooner:
+  reopening it costs about 4 packets. A link that carried `/blocks` and holds a rate estimate keeps
+  `link_idle_timeout`, since closing it resets the provider's estimate and RNS's transfer window. On radio paths
+  (RTT ≥ 1.75 s) nothing changes. Simulated over 8 hours of browsing through the gateway (lookups of 8 servers of
+  300, fetches from 1 of 40 providers, half with a rate estimate; mean of 5 runs) on 50 ms paths, links are opened
+  6,431 times rather than 4,490, 1,971 of them within 5 minutes of closing rather than 1,123, while keepalive
+  packets fall from 328,237 to 19,826, and link opening, closing and keepalive packets together from 346,199 to
+  45,548.
+- A node asked first for a fetch's first block (one with an open link, or a remote pin's asker) that had it was
+  asked for that block again in its next request, so it sent it twice: on LoRa, a whole chunk's airtime more. Now
+  it is asked for the blocks after it.
 - A DHT client that only fetches (it provides nothing, owns no names, accepts no remote pins and isn't in private
   mode) announces `rnfs.dht` only at startup, no longer every `announce_interval`; nothing needs to reach it. It
   announces again at once when it starts to provide. Servers, and clients that provide, announce as before.
@@ -547,6 +562,15 @@ Changed:
   (1,029 blocks) to a new store on a desktop NVMe disk: 1.02 → 1.41 s; a tree of 1,024 8 KiB files 0.95 → 1.43 s;
   fetching them (each block synced on its own) unchanged at about 13.5 s (`tests/bench_block_writes.py`,
   `today`, median of 3). Raspberry Pi SD-card numbers are still to be measured.
+- `max_storage` counts what blocks take on disk: each block is a file of its own, so its size rounded up to the
+  filesystem's block or cluster (read once at the start: at least 4 KiB, 16–32 KiB on a FAT32 USB drive), not its
+  length. On FAT32 a store of small files took several times `max_storage`: 2,000 notes of 200 B–8 KB are 4.1 MiB
+  of blocks but 63 MiB of 32 KiB clusters (9.4 MiB at 4 KiB). Stores of large files barely change (64 KiB chunks
+  fill whole clusters: a mixed store of 297 MiB takes 298 MiB at 4 KiB, 312 MiB at 32 KiB), so cache is evicted a
+  little sooner. `rnfs status` (`GET /api/status`) gains `allocated_bytes`, what `max_storage` counts, and
+  `allocation_unit`; `used_bytes` stays the blocks' bytes. Quotas (`follow_quota`, `remote_pin_quota`) and
+  `max_download_size` still count bytes of content and blocks. Nothing is stored for it: it follows from the block
+  sizes rnfs keeps.
 - `rnfs.apiclient` (the CLI, `rnfs.Client`) refuses a daemon older than 0.1.5 before sending it the token, rather
   than sending the request on a second connection as it did for them until now (the fallback planned to go in
   0.2.0): stop such a daemon and start the new one. Every daemon of 0.1.5 or later works as before.
@@ -572,6 +596,14 @@ Changed:
   foreground `rnfs get`, `pin add` or `export` submits so, and still fails at once; `--background` jobs wait.
 
 Faster:
+- Fetching something again doesn't look it up again. Nothing was kept between fetches, so once its links had closed
+  a gateway reload or a `pin add` after `cat` repeated the lookup (about 13.5 `/find` on a fast node). The nodes
+  that served a root are now remembered for 3 hours after they last did (in memory, up to 10 per root and 4,096
+  roots) and asked for its first block before the nodes with open links, after a remote pin's asker, under the same
+  slow-link rule; one that doesn't have it any more, or fails, is forgotten. Only nodes that served verified blocks
+  are remembered, never the providers a lookup reports. And a search that found nobody providing a root isn't
+  repeated for 10 minutes by the gateway or by the retries of followed names and deny lists, which then fail at
+  once; `get`, `cat`, `pin add`, the rest of the CLI and API, jobs and remote pins always search.
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks
   (2 MiB) before handing over the first byte, about 5 hours at LoRa's 1 kbit/s. While no provider known is reached
   over a fast link (or none is known yet), the window is one chunk with the next asked for ahead, so the first

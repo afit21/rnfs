@@ -287,6 +287,12 @@ def _windows_final_path(fd: int) -> str:
         size = length + 1  # the buffer was too small, and length is what it needs
 
 
+def allocated(size: int, unit: int) -> int:
+    """What size bytes take on a filesystem allocating unit bytes at a time: rounded up, and one unit for nothing,
+    since an empty file or a directory takes a block file, an inode or a directory record."""
+    return max(-(-size // unit), 1) * unit
+
+
 def allocation_unit(path: str) -> int:
     """The bytes the filesystem holding path (which must exist) allocates a file's data in (its fragment or cluster
     size), at least MIN_ALLOCATION_UNIT: a smaller unit doesn't make an entry cheaper than that, since a file or

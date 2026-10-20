@@ -244,7 +244,10 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 `storage.py` — `Storage(blocks_dir, state_dir, max_storage)`, thread-safe:
 - blocks: `has(cid)`, `get(cid, verify=False) -> bytes | None` (with `verify`, a block no longer matching its
   CID is deleted), `put(cid, block)` (verifies, even a block already stored; atomic, the file fsynced),
-  `used_bytes()`. Adds, the shared folder and archive import store through `with session.writer() as put:`,
+  `used_bytes()` (the blocks' bytes), `allocated_bytes()` (what they take on disk: each block's size rounded up
+  by `fsutil.allocated` to `allocation_unit`, which `fsutil.allocation_unit(blocks_dir)` gives once at the start,
+  kept as a running total beside `used_bytes` and derived from the block sizes at each start, so nothing extra is
+  stored or stat'ed). Adds, the shared folder and archive import store through `with session.writer() as put:`,
   which writes blocks on up to 16 threads (`WRITE_THREADS`, at most 32 queued) so their fsyncs overlap, and
   has stored every one, or raised the first error, before the block exits: nothing is pinned before its blocks
   are. It is handed only blocks built from, or checked against, their CIDs. `BlockStore.sync()` syncs the
@@ -280,7 +283,8 @@ packaging/            requirements.lock (hash-pinned runtime dependencies), upda
 - `check_disk(nbytes)` raises `StorageFull` when storing `nbytes` would leave less than the disk reserve
   (max(256 MiB, 2% of the filesystem)) free. `max_storage` itself never refuses a fetch: it is enforced by
   eviction once fetches end.
-- `evict() -> set[Cid]` enforce `max_storage` (LRU cached fetches); `gc() -> stats` evicts every cached fetch;
+- `evict() -> set[Cid]` enforce `max_storage` over `allocated_bytes()` (LRU cached fetches; the fetcher's
+  `_make_room` and the node's `_enforce_storage` compare `allocated_bytes()` with it too); `gc() -> stats` evicts every cached fetch;
   both delete unreachable blocks and report targets no longer complete, so the node can withdraw them. Both
   first read, without the lock, the DAG nodes they will walk (`_warm`, filling the `_links` and `_steps`
   memos, its path walk the one `_path_cids` makes under the lock, `_walk_path`; completeness via `dag_blocks`),
@@ -654,7 +658,13 @@ the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which
 `link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`,
 `ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
-that identity is on `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
+that identity is on `members`); the idle sweep (`LinkPool.sweep`) closes a shared link with no request in progress
+once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its idle limit (`links.idle_limit`:
+`link_idle_timeout` if it holds a rate estimate, `PeerLink.rate`, or RNS gives no `Link.keepalive`; else at most
+`Link.keepalive` less `KEEPALIVE_MARGIN`, 1 s, and two round trips, so before RNS's first keepalive, 0.2.0), and
+not within `link_idle_timeout` of the end of a `hold`. The `rnfs-link-sweeper` thread sweeps when the next link kept
+is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quarter of `link_idle_timeout` within 1 to
+30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
@@ -733,7 +743,7 @@ subclasses it, turning each `ApiError` into `fail(str(e))`, so its messages are 
 | `export(target, output)` / `import_archive(path, progress=None)` | `{"roots", "blocks"}` / `{"roots", "incomplete", "blocks"}`; `import_archive` opens `path` with `O_NONBLOCK` and refuses (ValueError) anything but a regular file, so a FIFO can't hold it (or an import job) |
 | `import_stream(stream, label="(archive upload)", progress=None)` | as `import_archive`, of an archive read from `stream` to its end (`POST /api/import/stream`; `import_archive` opens the file and calls it). `progress` here and in `add_path` is told each read's length (`builder.BuildOptions.progress`, `builder.counted`) and may raise to stop: an add or import job's `Job.read` |
 | `app_add(name)`, `app_ls()`, `app_rm(name)` | `{"name", "created", "token"}` / `[{"name", "created"}]` / `{"released"}`: `AppRegistry` (rnfs/apps.py); `app_rm` revokes the token, calls every feature's `app_removed(name)`, releases every `app:<name>[:<key>]` pin, then deletes the row |
-| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "names", "unexported_names", "announces_held", "clock_offset", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
+| `status()` | (API: without the token, only `{"version"}`) `{"version", "node_id", "identity_hash", "dht_mode", "slow", "private", "known_nodes", "records", "pins", "provided", "provided_entries", "provide_entries_off", "provide_entries_capped", "blocks", "used_bytes", "max_storage", "allocated_bytes", "allocation_unit", "names", "unexported_names", "announces_held", "clock_offset", "local_servers", "partition", "partition_since", "network", "record_store"}` plus every feature's `status()` fields (traffic, jobs); `identity_hash` is the RNS identity hash (None on offline test nodes); `network` is `_network_status()` (`sizes.estimate()` rounded, `len(sizes)`, `lookups.checks.status()`), `record_store` `records.usage()`: counts in memory, no read of the state database (specification section 11, "Network status") |
 
 `RnfsNode.offline(config, node_id, client, names_network)` builds a node without Reticulum or background
 threads, for tests (tests/test_node.py). The request server's backend is `node.backend` (`NodeBackend`).
@@ -1157,7 +1167,7 @@ Every object is a frozen dataclass with `to_dict()` (the API's JSON form, CIDs a
 | `Setting` | `rnfs.config.settings_schema()`'s `name`, `group`, `type`, `choices`, `nullable`, `default`, `unit`, `minimum`, `maximum`, `exclusive_minimum`, `description`, `live`, and `value`, `file`, `overridden`, `pending` (lists as tuples) | the name |
 | `Settings` / `SettingsChange` | `path`, `settings: tuple[Setting]` (`settings["max_jobs"]`, iteration), `file_error`, `warnings` / `path`, `applied`, `restart_required`, `overridden`, `warnings` | — |
 | `Record` | `name: bytes`, `cid`, `sequence`, `age` (seconds since heard, or None) | — |
-| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
+| `Status` | `version`, `node_id`, `identity_hash`, `dht_mode`, `slow`, `private`, `known_nodes`, `records`, `pins`, `provided`, `provided_entries`, `provide_entries_off`, `provide_entries_capped`, `blocks`, `used_bytes`, `max_storage`, `allocated_bytes`, `allocation_unit`, `names`, `unexported_names`, `announces_held`, `clock_offset`, `local_servers`, `partition`, `partition_since`, `features: dict` (every other field) | — |
 | `Collected` / `Verified` | `removed_blocks`, `freed_bytes` / `checked`, `bad: tuple[Cid]` | — |
 | `Exported` / `Imported` | `roots: tuple[Cid]`, `blocks` / and `incomplete` | — |
 | `DenyState` | `entries: tuple[str]`, `lists: tuple[dict]` | — |
@@ -2084,7 +2094,8 @@ Everything in the specification is implemented, with these simplifications and a
   session, then enforces `max_storage`. Its record is made as a gateway fetch's is (`_record_fetch(for_gateway=True)`:
   not a target `roots` provides), since it was fetched to be pinned; a remote pin's quota check that drops the pin
   returns inside the fetch rather than raising, so it records nothing either.
-- `max_storage` is soft. An unpinned fetch evicts other cached fetches (LRU) to make room for each response
+- `max_storage` is soft, and counts the blocks' disk allocation (`Storage.allocated_bytes`), not their bytes. An
+  unpinned fetch evicts other cached fetches (LRU) to make room for each response
   and goes above `max_storage` when nothing is evictable; when its session ends the node evicts again, which
   may evict what it fetched if pins alone fill `max_storage`. Any fetch is refused with `StorageFull` ("not
   enough free disk space") if its remaining size, the range's size, or a response would leave less than
@@ -2109,7 +2120,7 @@ Everything in the specification is implemented, with these simplifications and a
   (`_remote_workers` maps each source to its thread) within its budget.
 - A remote pin's fetch asks the node that asked first (0.2.0): `Fetcher.open`'s `hint`, its node ID
   `Destination.hash(identity, "rnfs", "dht")` from the `/pin`'s identity hash (no wire change), probed for the
-  first missing block along with the open links (`Fetch._discover`, taking one of the `max_parallel` probe slots;
+  first missing block before the remembered providers and open links (`Fetch._discover`, taking the first probe slot;
   one that hasn't it isn't penalised, and the lookup follows). The asker serves what it provides before its records
   are out. A fetch failing with `NotFound` keeps the pin queued (`_not_found`): `_remote_retry[(source, cid)]` holds
   `(retry_at, since)` (Unix times, `rnfs.retry.next_retry`: `RETRY_FIRST` 10 min plus the time since it was first
@@ -2173,16 +2184,35 @@ Everything in the specification is implemented, with these simplifications and a
   if it has one (below `slow_bitrate`), else if the cached `PathInfo`'s next-hop bitrate is below it or
   `Fetcher.slow_path` (the node's `SlowPaths`) says so. `_assign` gives the providers over slow links behind one
   next-hop interface one slot (`Fetch._slot`, `("slow", interface)`), and on a node that isn't slow `_discover`
-  probes no open link that is slow, so a gateway with TCP and LoRa interfaces fetches in parallel over TCP only. A
-  slow node still probes its `max_parallel` (by default one) open links, as before: a hit saves a lookup.
+  probes no open link or remembered provider that is slow, so a gateway with TCP and LoRa interfaces fetches in
+  parallel over TCP only. A slow node still probes its `max_parallel` (by default one) nodes, as before: a hit saves a
+  lookup.
+- Remembered providers (0.2.0; in memory only): `Fetcher._remembered`, an `OrderedDict` root -> {node ID: when it last
+  served}, least recently used root first, holds every node `Fetch._served` reports (verified blocks of the fetch's
+  root, `Fetcher.remember`), at most `K` per root (the least recent to serve dropped) and `MAX_REMEMBERED` (4,096)
+  roots. `Fetcher.remembered(root)` gives them most recent first, dropping those older than `REMEMBER_FOR` (3 h) and
+  banned ones. `Fetch._discover` probes, within `max_parallel`, the hint, then the remembered providers, then the open
+  links, each group ranked by `_rank` (its own order breaking ties), and the probe takes the first missing CID from
+  `pending` (requeued by `_handle_event` if no probe brings it). A remembered provider probed (`_remembered_asked`)
+  that answers without the block and isn't `BUSY` is forgotten for the root (`Fetcher.forget`), as is any provider
+  `_fail` fails. A `/find` reply's providers aren't remembered until they serve, so an attacker's reply can't plant
+  entries.
+- Searches that found none (0.2.0): the lookup thread queues `LookupDone(found, answered)`, `answered` when the fetch
+  didn't end meanwhile and `closest_answered()` isn't empty; one with nothing found, in a fetch with no provider at
+  all, calls `Fetcher.note_unfound(root)` (`_unfound`, at most `MAX_UNFOUND`, 4,096, oldest dropped). A fetch opened
+  with `explicit=False` for which `Fetcher.unfound(root)` (within `UNFOUND_FOR`, 600 s) answers still probes, then
+  sets `_unfound_ago` instead of starting its lookup, so `_download` fails with `NotFound` saying when the search
+  was. `Fetcher.remember` clears it. The node opens gateway fetches (`_fetching(for_gateway=True)`) and the
+  `pinned_fetch`es of followed names and deny lists (`explicit=False`) that way; every CLI and API fetch, jobs and
+  remote pins are explicit.
 - Archive import pins only roots whose every block was in the archive, and reads at most 1024 roots. It
   verifies every block, including ones already stored, and stops with `StorageFull` like a fetch when a block
   not yet stored would leave less than the disk reserve free (`Storage.check_disk`).
 - Upload pacing: `RequestServer` holds an accepted `/blocks` back at most `MAX_PACING_WAIT` (5.625 s, half of RNS's
   request timeout without RTT) and refuses one that would wait longer. After a response on a slow link, `Fetch._pace`
   waits as long again as the request took before asking that provider again, holding its link meanwhile
-  (`PeerClient.hold_link`, `LinkPool.hold`: the idle sweep counts it as handed out when the wait ends), so the link and
-  its rate estimate survive a wait longer than `link_idle_timeout`, and a refusal within 4 × that time of the request
+  (`PeerClient.hold_link`, `LinkPool.hold`: the idle sweep keeps it for `link_idle_timeout` after the wait ends, whatever
+  its idle limit), so the link and its rate estimate survive a wait longer than `link_idle_timeout`, and a refusal within 4 × that time of the request
   being sent isn't counted towards `max_failures` (retried after an eighth of it, at least `busy_delay`). A `LOST`
   result (above) closes the provider's link (`Fetch._close_link`, so not one another fetch uses) and asks again after
   `busy_delay`, failing the provider after `max_failures` in a row (`_Provider.lost`, reset by any other outcome). A

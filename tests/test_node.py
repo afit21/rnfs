@@ -341,6 +341,47 @@ class NetworkFacadeTest(NodeTest):
         b"".join(self.b.read(second, for_gateway=True))
         self.assertEqual(self.b.publisher.provided(), {Cid.parse(first)})
 
+    def finds(self) -> list:
+        """Count the /find B's lookups send from now on (the list fills as they go)."""
+        sent = []
+        find = self.net.find
+
+        def counted(node_id, key):
+            """Note the query, then answer it as before."""
+            sent.append((node_id, key))
+            return find(node_id, key)
+        self.net.find = counted
+        return sent
+
+    def test_fetching_again_asks_the_provider_that_served_without_a_lookup(self):
+        cid = self.a.add_path(self.tree())["cid"]
+        self.advertise(cid)
+        sent = self.finds()
+        b"".join(self.b.read(f"{cid}/big.bin", length=10))  # cat: a lookup finds A
+        self.assertTrue(sent)
+        sent.clear()
+        self.b.pin_add(cid)  # no link stays open here (NetClient): A is remembered
+        self.assertEqual(sent, [])
+        self.assertTrue(self.b.storage.is_complete(Cid.parse(cid)))
+
+    def test_the_gateway_doesnt_search_again_for_what_nobody_provides(self):
+        data = b"not added yet"
+        cid = str(Cid.for_block(RAW, data))
+        sent = self.finds()
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(cid, for_gateway=True))
+        self.assertEqual({key for _, key in sent}, {Cid.parse(cid).key})
+        searched = len(sent)
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(cid, for_gateway=True))  # the page reloaded: no search
+        self.assertEqual(len(sent), searched)
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(cid))  # the user's cat searches again
+        self.assertGreater(len(sent), searched)
+        self.assertEqual(self.a.add_stream(io.BytesIO(data))["cid"], cid)
+        self.advertise(cid)
+        self.assertEqual(b"".join(self.b.read(cid)), data)
+
     def test_from_node(self):
         cid = self.a.add_stream(io.BytesIO(b"direct"))["cid"]
         self.b.routing.remove(A_ID)  # B knows no DHT node
@@ -851,6 +892,23 @@ class SecurityTest(NodeTest):
         self.assertTrue(small.storage.is_complete(Cid.parse(mine)))
         self.assertEqual(small.storage.cached_fetches(), [])
         self.assertLessEqual(small.storage.used_bytes(), small.storage.pinned_bytes())
+
+    def test_max_storage_counts_disk_allocation(self):
+        # On FAT32 (32 KiB clusters) small files' blocks take far more disk than their bytes
+        with mock.patch.object(fsutil, "allocation_unit", return_value=32 * 1024):
+            small = self.make_node("fat", N1, max_storage=10**9)
+        cids = [small.add_stream(io.BytesIO(b"%d" % i * 100), pin=False)["cid"] for i in range(20)]
+        status = small.status()
+        self.assertEqual(status["allocation_unit"], 32 * 1024)
+        self.assertEqual(status["allocated_bytes"], 20 * 32 * 1024)
+        self.assertEqual(status["used_bytes"], 10 * 100 + 10 * 200)  # still the blocks' bytes, as in 0.1.6
+        # A lower max_storage: the bytes fit, the allocation doesn't
+        small.storage.max_storage = small.config.max_storage = 10 * 32 * 1024
+        small._enforce_storage()  # what the maintenance pass and the setting run
+        self.assertLessEqual(small.storage.allocated_bytes(), small.config.max_storage)
+        kept = {str(target) for target in small.storage.cached_targets()}
+        self.assertTrue(kept)
+        self.assertEqual(kept, set(cids[-len(kept):]))  # the least recently added went first
 
     def test_fetch_too_big_for_the_disk_is_refused(self):
         big = self.a.add_stream(io.BytesIO(os.urandom(4 * CHUNK_SIZE)))["cid"]

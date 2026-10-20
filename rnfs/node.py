@@ -1465,7 +1465,7 @@ class RnfsNode:
 
     def _enforce_storage(self):
         """Evict cached fetches over max_storage, withdrawing targets no longer complete."""
-        if self.storage.used_bytes() <= self.config.max_storage:
+        if self.storage.allocated_bytes() <= self.config.max_storage:
             return
         self._make_room(0)
 
@@ -1703,9 +1703,12 @@ class RnfsNode:
 
         Storage may go over max_storage while it runs (its blocks are protected); once its session has ended,
         eviction brings storage back to max_storage, which may evict what it fetched if pins alone fill it.
+
+        A gateway fetch isn't explicit (Fetcher.open): a page reloaded, or one a site's page asks for, doesn't search
+        again for a root a search found no provider of within the last 10 minutes; the CLI's and API's fetches do.
         """
         try:
-            with self.fetcher.open(root, names, from_node) as fetch:
+            with self.fetcher.open(root, names, from_node, explicit=not for_gateway) as fetch:
                 try:
                     yield fetch
                 finally:
@@ -1718,10 +1721,12 @@ class RnfsNode:
 
     @contextmanager
     def pinned_fetch(self, root: Cid, names: list[str] | tuple[str, ...] = (),
-                     hint: bytes | None = None) -> Iterator[Fetch]:
+                     hint: bytes | None = None, explicit: bool = True) -> Iterator[Fetch]:
         """A fetch to pin what it fetches (pin add, dir set and rm, remote pins, followed names, deny lists): its
         caller pins inside it, so nothing it fetched is unprotected. hint is a node to ask first (Fetcher.open: a
-        remote pin's asker).
+        remote pin's asker); explicit is False for the retries of followed names and deny lists, which don't search
+        again for a root a search found no provider of within the last 10 minutes (Fetcher.open). A remote pin's fetch
+        is explicit: another node asked for it, and its own retries are 10 minutes or more apart.
 
         A fetch that fails keeps what it got as a cached fetch of <root>/<names>, as get's and cat's do, so trying
         again resumes from there rather than from nothing (a 4 MiB pin over LoRa failing at 90%), unless it failed
@@ -1732,7 +1737,7 @@ class RnfsNode:
         """
         recorded = False
         try:
-            with self.fetcher.open(root, names, pinned=True, hint=hint) as fetch:
+            with self.fetcher.open(root, names, pinned=True, hint=hint, explicit=explicit) as fetch:
                 try:
                     yield fetch
                 except (Denied, InvalidDag, TooLarge):
@@ -3013,6 +3018,8 @@ class RnfsNode:
                 "provided": len(self.publisher.provided()), **self.publisher.entries_status(),
                 "blocks": self.storage.block_count(),
                 "used_bytes": self.storage.used_bytes(), "max_storage": self.config.max_storage,
+                # What max_storage counts: the blocks' disk allocation, each rounded up to the unit (rnfs 0.2.0)
+                "allocated_bytes": self.storage.allocated_bytes(), "allocation_unit": self.storage.allocation_unit,
                 "names": len(self.names.list()), "unexported_names": self.names.unexported(),
                 **self.names.announce_status(),
                 "local_servers": len(self.local), **self.partition.state(),

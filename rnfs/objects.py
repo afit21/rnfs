@@ -222,8 +222,12 @@ class Status(_Object):
     provide_entries_off: str | None = None  # why no entries are provided, or None
     provide_entries_capped: int | None = None  # pins whose entries were left out at the cap
     blocks: int | None = None
-    used_bytes: int | None = None
+    used_bytes: int | None = None  # the stored blocks' bytes
     max_storage: int | None = None
+    # What the stored blocks take on disk, each rounded up to allocation_unit (the filesystem's block or cluster):
+    # what max_storage counts (rnfs 0.2.0)
+    allocated_bytes: int | None = None
+    allocation_unit: int | None = None
     names: int | None = None
     unexported_names: list | None = None  # aliases whose key was never exported or imported (rnfs 0.2.0)
     announces_held: list | None = None  # aliases whose announces wait for the clock to pass their last (rnfs 0.2.0)
