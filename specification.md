@@ -787,30 +787,38 @@ or protocol constant changes.
   their replies lists a provider; their replies seed the rest of the lookup as any answer does (its start nodes),
   and the lookup's bounds and checks are unchanged. Its fallback over disjoint paths doesn't ask them first again.
 - **Partition mode.** Servers that aren't local are *off-island*. A node with local servers SHOULD notice when it is
-  cut off from them and then use its local servers only. rnfs enters partition mode:
-  - after 3 failures in a row reaching off-island servers (a `/find` unanswered, or a `/provide` for which no
-    identified link could be opened; any off-island answer between resets the count; local ones don't count), or
+  cut off from them and then use its local servers only. rnfs enters partition mode when a probe of an off-island
+  server (below) goes unanswered:
+  - after 3 failures in a row reaching off-island servers it knows (a `/find` unanswered, or a `/provide` for which
+    no identified link could be opened; any off-island answer between resets the count; local ones don't count).
+    A server it knows is one in its routing table or announce first-seen log, or whose identity or path RNS knows:
+    a `/find` reply can name made-up IDs, which always fail, and they don't count. The probe goes at once, to a
+    server that answered or announced itself recently (with none, nothing beyond the island having been heard since
+    the start, the failures enter partition mode without one); or
   - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the
     off-island announces it heard (their mean over the last 32 gaps, counted once it has 8, and none that spanned
-    partition mode), and at least 10 minutes, if a probe (below) then goes unanswered. Silence alone doesn't enter
-    it: with servers announcing every 6 hours, an island hearing 20 of them hears one about every 18 minutes, and
-    such gaps vary, so a fixed silence would flap on a small connected network. A fresh announce is one RNS didn't
-    mark as a path response, emitted within the last 15 minutes (allowing 5 minutes of clock difference, as a peer's
-    online state is judged, section 11): an island node's cached answer for an off-island server says nothing about
-    the way off the island.
+    partition mode), and at least 10 minutes. Silence alone doesn't enter it: with servers announcing every 6 hours,
+    an island hearing 20 of them hears one about every 18 minutes, and such gaps vary, so a fixed silence would flap
+    on a small connected network. A fresh announce is one RNS didn't mark as a path response, emitted within the last
+    15 minutes (allowing 5 minutes of clock difference, as a peer's online state is judged, section 11): an island
+    node's cached answer for an off-island server says nothing about the way off the island.
+
+  Failures alone don't enter it either, as a server beyond the island can name in its replies servers it controls
+  and lets fail.
 
   In partition mode, lookups (searches and their fallback, publishing's region and widened lookups) query local
   servers only, starting from the local servers closest to the key, and a lookup running when it begins drops its
   off-island nodes as their turn comes; a publish round stores to and withdraws from local servers only (the
   withdrawals for others stay queued, and a store set's off-island servers are left out). So a search on the island
   ends in about the time its local servers take instead of minutes of link timeouts. Any off-island answer or fresh
-  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to those
-  that failed and those heard most recently in turn; a failed probe isn't counted against the server in the routing
-  table) every 5 minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a
-  probe costs a path request and a link's airtime on radio, and every node of a cut-off island probes. The node's
-  status says whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops`
-  count as off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands
-  set `local_interfaces`.
+  off-island announce ends it. While in it the node probes one off-island server (a `/find` for its own ID, to the
+  servers that answered or announced themselves most recently in turn, those that failed since after the rest, never
+  an ID that only ever failed; a failed probe isn't counted against the server in the routing table) every 5
+  minutes, or on a slow node after 15 minutes, doubling after each unanswered probe up to 2 hours: a probe costs a
+  path request and a link's airtime on radio, and every node of a cut-off island probes. The node's status says
+  whether it is in partition mode and since when. With a hop radius, island servers beyond `local_hops` count as
+  off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands set
+  `local_interfaces`.
 - **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
   network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
   the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
@@ -827,8 +835,8 @@ or protocol constant changes.
   content published before a partition was found 78% of the time (55% with none). Over the fake network of
   `tests/test_topology.py` (1,000 servers, 21% on 8 islands; a `/find` over LoRa taking 8 s, one to a server out of
   reach 40 s), with partition mode and the heal republish (below): a neighbour found what an island node published
-  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.15
-  timeouts and 31 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
+  before a partition 100% of the time instead of 67%, and what it published during it 100% instead of 91%, with 0.2
+  timeouts and 33 s per search instead of 11.7 and 490 s; the backbone found what was published during the partition
   0% of the time until the heal republish, 99.5% after it.
 
 **Local scores.** A node MAY keep a private score for each peer it deals with, earned by work it checked itself.
@@ -856,10 +864,15 @@ mode, whether or not the server enters its routing table, and keep the record ac
 in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
 near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
 the log gives the `K` closest of them to a key, which publishers also store to and searchers ask (below). It is
-local state: nothing about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536
-servers, forgetting the least recently heard first (about 12 MB of memory when full), so a flood of new identities
-pushes out only servers silent longer than every one of them; announces are recorded in memory and written together
-every 30 s.
+local state: nothing about it is sent. A server that announces client mode is forgotten. A full log SHOULD NOT let
+new identities push out its senior servers: forgetting the least recently heard first would let about 3 fresh
+identities a second push out every server announcing every 6 hours between its announces, so that none ever became
+senior. rnfs keeps at most 65,536 servers (about 12 MB of memory when full) and, when full, forgets first a server
+silent for 2 × `announce_interval` (as `/find` replies leave such servers out; counted from the later of its last
+announce and the node's start, so a restart doesn't make every server silent), then the server not yet senior that
+it first heard most recently (in a flood, the newcomer itself), and only if every server is senior and heard lately
+the least recently heard. A flood can then keep new servers out while it lasts, but never takes the place of the
+servers that were already there. Announces are recorded in memory and written together every 30 s.
 
 **Identities placed next to a key.** RNS identities are free, and one closer to a key than every honest server costs
 about as many key generations as there are servers (about 4 s of one core among 10,000). `K` of them that answer
@@ -871,8 +884,17 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   d_K, is about K × 2^128 / N. A node estimates N as (K − 1/3) × 2^128 over the median d_K of its last 16 complete
   lookups for other keys (the latest lookup for each key; the key checked is always left out, so identities next to
   it can't shrink its own yardstick). Pooled over many keys it is 2 to 4 times less noisy than the node's own
-  neighbourhood. rnfs keeps the samples in the state database (written with the periodic saves), so a restart has
-  the estimate at once, and runs no density check until it has 8.
+  neighbourhood. A lookup's sample SHOULD count only servers it verified, those that answered or whose identity
+  is known: a `/find` reply can name made-up IDs just beyond the closest that answered,
+  which a lookup completes without querying, and they shrank d_K and inflated the estimate about 3 times. rnfs takes
+  the run of verified servers closest to the key, up to the first that isn't verified and at most `K` long, and
+  scales its last distance d_j to rank `K` (d_j × (K − 1/3) / (j − 1/3), the medians of Gamma(j) and Gamma(K)); a
+  run shorter than 3 gives no sample. Counting every verified server instead would skip the servers a node doesn't
+  know the identity of too: a node on a LoRa island, hearing few announces, underestimated the network about 4 times
+  and flagged 93% of its searches in the topology simulation. An attacker that knows the true distances and is asked
+  in every lookup can still end the runs where they bias the estimate most, by about 1.3 times (1.6 for 1 estimate in
+  20). rnfs keeps the samples in the state database (written with the periodic saves), so a restart has the
+  estimate at once, and runs no density check until it has 8.
 - **Density check** (T = 2). The servers known near a key are anomalously dense when some rank j ≥ `K` (1-based,
   by distance) lies closer than j × 2^128 / (T × N); the *dense core* ends at the last such rank. Ranks below `K`
   never fire: a few close servers happen by chance, and fewer than `K` identities can't take every place anyway.

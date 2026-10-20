@@ -122,6 +122,26 @@ Security:
   record a day later and withdrew it grew the state database (and took room from the record budget, which measures
   it). At most 50,000 are kept (about 5 MB); past that the hourly pass forgets those with the fewest refresh days
   first, so Earned publishers that left outlast such a flood.
+- **Partition mode can't be forced from outside** (spec section 6, "LoRa islands"; REV4): a server beyond the island
+  could answer a slow node's `/find` with 3 made-up IDs, whose failures entered partition mode at once. Only failures
+  of servers the node knows (its routing table or first-seen log, or an identity or path RNS knows) count, and 3 in a
+  row ask for a probe of an off-island server that answered or announced itself recently, as silence does: partition
+  mode starts only if that probe fails (or nothing beyond the island was heard to probe). An ID that only ever failed
+  is never a probe target.
+- **The announce first-seen log keeps its senior servers** (spec section 6, "Announce first-seen log"; REV7): it
+  forgot the least recently heard server first, so about 3 announces a second of fresh identities pushed every honest
+  server out between its 6-hourly announces, and none ever became senior (`provider_seniority`), which publishing and
+  searching's senior rule needs. When full it now forgets first a server silent for 2 × `announce_interval` (counted
+  from the start at the earliest), then the server not yet senior that it first heard most recently (in a flood, the
+  newcomer itself), and a senior server heard lately only when nothing else can go. At a tenth of the scale (6,553
+  rows, 200 honest servers, a fresh identity every 3.3 s for 2 days) every honest server became senior, against none.
+- **Made-up IDs can't inflate the network size estimate** (spec section 6, "Identities placed next to a key"; REV8):
+  a lookup took its sample, the distance to the 10th-closest server, over every ID replies named, so a server naming
+  made-up IDs just beyond the 3 closest (which a lookup completes without asking) inflated the estimate about 3
+  times, weakening the density check. A sample now counts only servers that answered or whose identity is known,
+  from the closest up to the first that isn't (its distance scaled to the 10th), so a node that knows few identities,
+  on a LoRa island, doesn't underestimate the network instead. Over 300 servers with such a server in every lookup:
+  288 -> 743 before, 288 -> 318 now.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -375,7 +395,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 - Choosing providers: within each seniority group (seniority stays first), providers with a better local score
   are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
-  servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
+  servers, about 12 MB when full: servers silent for 2 × `announce_interval` forgotten first, then the newest not
+  yet senior, Security above), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
   next to a key can't be. Publishing and searching use it (below).
 - **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every
@@ -396,8 +417,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   nodes and 90.8% on slow ones across every attack of the eclipse simulation). Four local mechanisms, nothing on
   the wire changed:
   - a network size estimate: the median distance to the 10th-closest server over the node's last 16 complete
-    lookups for other keys, kept in the state database's `meta` table so a restart has it at once (the density
-    check waits for 8);
+    lookups for other keys, counting only servers the lookup verified (Security above), kept in the state
+    database's `meta` table so a restart has it at once (the density check waits for 8);
   - the density check: when the servers found near a key are packed more than twice as densely as the estimate
     allows (from the 10th on), a search waits until 5 servers of each of two rings beyond them have answered (those
     ranked after the dense core, and those beyond where 10 honest servers would be expected), and a publisher gives
@@ -445,12 +466,12 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
   `local_hops`, `local_replicas`; `rnfs status` gains `local_servers`.
 - **Partition mode** (spec section 6, "LoRa islands"): a node with local servers that fails 3 times in a row to reach
-  off-island servers, or hears no off-island announce or answer for over 4 times the usual gap between off-island
-  announces (at least 10 minutes) and then gets no answer from one it probes, uses its local servers only for
-  lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of minutes
-  of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server every 5
-  minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never enters
-  it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
+  off-island servers it knows, or hears no off-island announce or answer for over 4 times the usual gap between
+  off-island announces (at least 10 minutes), and then gets no answer from one it probes, uses its local servers
+  only for lookups and publishing, so a search during a gateway outage ends in the time its island takes instead of
+  minutes of link timeouts. Any off-island answer or fresh announce ends it, and a probe of one off-island server
+  every 5 minutes (on slow nodes after 15 minutes, doubling up to 2 hours) keeps it from sticking. Silence alone never
+  enters it, so a small connected network with sparse announces doesn't flap. `rnfs status` gains `partition` and
   `partition_since`.
 - **The heal republish:** keys whose last publish round reached no server beyond the island (during a partition) are
   marked, and republished as soon as partition mode ends, paced as a slow node's rounds are, so the rest of the
@@ -459,7 +480,7 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 
   Together, over the fake network of `tests/test_topology.py` (1,000 servers, 21% on 8 islands, an island's gateway
   down): a neighbour found what an island node published before the partition 100% of the time instead of 67%, and
-  what it published during it 100% instead of 91%, with 0.15 timeouts and 31 s of simulated time per search instead
+  what it published during it 100% instead of 91%, with 0.2 timeouts and 33 s of simulated time per search instead
   of 11.7 and 490 s; the backbone found what was published during the partition 0% of the time until the heal
   republish, 99.5% after it. Over a simulated week with 5 or 20 servers beyond the island announcing every 6 hours,
   partition mode was entered only while the gateway was down, and left within 49 minutes of its coming back.

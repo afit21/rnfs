@@ -665,8 +665,10 @@ class RnfsNode:
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
         self.scores = self._add_store(Scores(config.state_dir, seeded=self._bootstrap_set()))
         # When each server's announce was first heard (section 6; for publishing and searching); saved with the
-        # batched stores
-        self.first_seen = self._add_store(FirstSeenLog(config.state_dir))
+        # batched stores. When full it keeps its senior servers (provider_seniority) until silent as long as /find
+        # replies allow (2 × announce_interval), so a flood of fresh identities can't push them out
+        self.first_seen = self._add_store(FirstSeenLog(config.state_dir, seniority=config.provider_seniority,
+                                                       silence=2 * config.announce_interval))
         # The network size estimate of the density check (section 6), from recent complete lookups; saved with the
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))
@@ -679,8 +681,11 @@ class RnfsNode:
         self._path_hops: Callable[[bytes], int | None] = lambda node_id: None
         self._scan_paths: Callable[[int | None], dict[bytes, PathInfo]] = lambda max_hops: {}
         self._scanned_at: float | None = None  # monotonic time of the last scan
-        # Partition mode: fed only on a node with local servers (local_on), so never entered on another
-        self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed)
+        # Partition mode: fed only on a node with local servers (local_on), so never entered on another. Failures of
+        # servers it knows ask for a probe, which wakes the local-servers thread to send it (_run_local)
+        self._local_wake = threading.Event()
+        self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed,
+                                       known=self._knows_server, on_probe=self._local_wake.set)
         # Keys marked for the heal republish before a restart are republished at the first off-island contact after
         # it (the partition may have ended while the node was down, and then no partition mode ends to start it)
         self._heal_at_contact = local
@@ -896,7 +901,7 @@ class RnfsNode:
             (f"stopping feature {feature.name}", partial(features.stop_feature, feature, deadline))
             for feature in reversed(list(self.features.values()))]
         steps += [("signalling the threads to stop", self.stop_event.set),
-                  ("waking the publisher", self.publisher.wake)]
+                  ("waking the publisher", self.publisher.wake), ("waking the local servers", self._local_wake.set)]
         if getattr(self, "folder_syncs", None) is not None:
             steps.append(("waking the name sync", self.folder_syncs.wake))
         if self.announcer is not None:
@@ -1057,6 +1062,12 @@ class RnfsNode:
         """True if node_id is a DHT server this node knows of (in its routing table or announce first-seen log)."""
         return self.routing.contains(node_id) or self.first_seen.first_heard(node_id) is not None
 
+    def _knows_server(self, node_id: bytes) -> bool:
+        """Partition mode's known (section 6): True if node_id's failure says something about the way off the island,
+        as a server this node knows of (_is_server) or one whose identity or path RNS knows. A /find reply can name
+        made-up IDs, which always fail."""
+        return self._is_server(node_id) or self._is_known(node_id) or self._path_hops(node_id) is not None
+
     def scan_local(self):
         """Judge every server known with a path from one read of the path table (RnsPaths.scan: through a shared
         instance one RPC, within local_hops unless local_interfaces names the interfaces): the local servers are then
@@ -1114,7 +1125,9 @@ class RnfsNode:
                 self.check_local()
             except Exception as e:  # noqa: BLE001 - the loop keeps running; logged
                 log(f"checking the local servers failed: {e!r}", LOG_ERROR)
-            self.stop_event.wait(LOCAL_CHECK)
+            # Woken early when failures ask for a probe (PartitionMode's on_probe), and at stop
+            self._local_wake.wait(LOCAL_CHECK)
+            self._local_wake.clear()
 
     def _new_lookup(self, key: bytes, start: list[bytes], exclude: Callable[[bytes], bool], **options) -> Lookup:
         """A Lookup for key from start, wired to the routing table (answers, failures, unreliable nodes and
@@ -1138,7 +1151,7 @@ class RnfsNode:
 
     def _query_failed(self, node_id: bytes):
         """A /find to node_id went unanswered: counted in the routing table, and lowering its score (and towards
-        partition mode, if it is off-island)."""
+        partition mode's probe, if it is an off-island server this node knows: PartitionMode's known)."""
         self.routing.failed(node_id)
         self.scores.failed(node_id)
         if self.local_on:

@@ -489,8 +489,14 @@ which turns the density check on) make `required()` name the nodes that must ans
 by distance, ordered by tier; `dense` notes that it fired). They are queried among the window's nodes in rank order;
 those sent outside the window (`extras`) count towards `max_queries` but never against the stall rule. `claim`/`taken`
 (a disjoint lookup's) drop a node another path owns before querying it and leave such nodes out of replies.
-`on_complete(key, kth)` is told the K-th closest known distance after each run that ended "complete" (`ended` holds how
-the last run ended); the size estimate samples it. `first` (a search's closest local servers, specification section 6
+`on_complete(key, kth)` is told the run's sample after each run that ended "complete" (`ended` holds how the last run
+ended); the size estimate samples it. The sample is `density.verified_sample(known, verified())`: over the known
+nodes by distance (failed ones are out of `known`), the run of those `verified()` accepts (answered in any run, or
+`is_known`: a node still out at completion counts if known, as real servers often answer late), from the closest up
+to the first it doesn't, at most K long, its last distance d_j scaled by (K − 1/3) / (j − 1/3); none under
+`MIN_VERIFIED` (3). Made-up IDs a reply names just beyond the beta closest, left unqueried by completion, end the run
+instead of counting (REV8); `known_distances()` and `verified()` give the same view to `DisjointLookup`. `first` (a
+search's closest local servers, specification section 6
 "LoRa islands") are added to the first run's known nodes and launched before the window's while any is left unqueried;
 a reply listing a provider empties them (`first.clear()`), and a later run doesn't have them (`_first` is emptied).
 They skip `check_path`, and count as `extras` when outside the window. `allowed(id)` (partition mode's local-only rule)
@@ -506,6 +512,8 @@ and `rnfs.statedb` loads RNS. `dense_core(distances, size)` (last rank j >= K cl
 stopping past 2K once a rank lies 4 times further out), `radius(size)` and `rings(nodes, distances, size, count,
 later)`: `count` from the rank after the core and from the first node beyond the radius, each ring ordered by
 `later` (a lookup's tier), stably, without duplicates. `DENSITY_THRESHOLD` (2), `RING_ANSWERS` (5).
+`verified_sample(distances, verified)`: a lookup's sample, d_j of the verified run from the closest (at most K,
+none under `MIN_VERIFIED`, 3) scaled to rank K; the samples stay d_K's stand-ins, so the saved blob is unchanged.
 `CheckCounts(clock=time.monotonic)`: `checked` and `flagged`, two `recent.RecentCounts`; `note(flagged)` counts one
 check, `status()` gives the four `density_*` fields of the node's status.
 
@@ -519,7 +527,8 @@ reporting into one queue; the caller's thread passes providers on (once each, `_
 `should_stop`, setting the paths' stop flag and waking them. `candidates()` merges the paths' (a node takes the
 lowest tier a path knowing it gives it); `path_candidates()` each path's own; `ask` goes through the path knowing
 the node; `remaining`, `allow_unknown` (the first path's budget), `listing_nodes`, `listers`, `closest_answered`,
-`dense`, `ended`. It samples the size estimate once per call, from the merged candidates, if every path completed.
+`dense`, `ended`. It samples the size estimate once per call if every path completed: `verified_sample` over the
+paths' `known_distances()` merged, a node verified if any path's `verified()` accepts it.
 
 `lookups.py` — `Lookups(new_lookup, start, sizes, seniors, paths=DISJOINT_PATHS, pace=None, publish_unknowns=None,
 search_unknowns=None)`: the node's recipe.
@@ -584,28 +593,37 @@ becomes exactly those it found local, and earlier local ones it didn't see are j
 `closest(key, count, exclude)`, `nodes()`, `len()`. `judge_all(paths, is_server, is_local)` judges a scan's
 `PathInfo`s of the destinations that are known servers. `first_count(named)`: `LOCAL_FIRST` (1) when
 `local_interfaces` names the island, else `LOCAL_FIRST_RADIUS` (3). `Lookups(local_first=)` passes those nodes as a
-search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock)`: `active`,
-`since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)` (off-island: resets the failures,
-notes contact, ends it), `failed(id)` (off-island: the `FAILURES_TO_ENTER`-th in a row enters it), `announced(id)` (a
-fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the last
-(`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`, `SILENCE_FACTOR` ×
-the mean)); `probe_due()` (active: `_next_probe` passed; else silence since `_last_contact` over the limit);
-`probe_target()` (`_unreached` then `_recent`, most recent first, each at most `RECENT_OFF_ISLAND`, taken in turn);
-`probed(id, answered)` (answered: as `answered`; else counted, and outside partition mode it enters; in it the next
-probe is `PROBE_INTERVAL`, 300 s, later, or on slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`,
-7200 s, reset at each entry); `no_target()` (silence counts from now); `state()` (`partition`, `partition_since`).
+search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock, known,
+on_probe)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)` (off-island:
+resets the failures, notes contact, ends it), `failed(id)` (off-island and `known(id)`: the `FAILURES_TO_ENTER`-th in
+a row sets `_wanted`, a probe due at once, and calls `on_probe()`, or with no `_targets()` enters it), `announced(id)`
+(a fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the
+last (`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`,
+`SILENCE_FACTOR` × the mean)); `probe_due()` (active: `_next_probe` passed; else `_wanted`, or silence since
+`_last_contact` over the limit); `probe_target()` (`_targets()`: the off-island servers of `_recent`, heard or
+answered, most recent first, those not in `_unreached` (failed since) before those in it, each at most
+`RECENT_OFF_ISLAND`, taken in turn; an ID only in `_unreached` is never one, REV4); `probed(id, answered)` (answered:
+as `answered`; else outside partition mode it enters; in it the next probe is `PROBE_INTERVAL`, 300 s, later, or on
+slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`, 7200 s, reset at each entry); `no_target()`
+(silence counts from now; if `_wanted`, enters it); `state()` (`partition`, `partition_since`).
 `on_change(active)` runs outside its lock.
 
-`firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
+`firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN,
+seniority=DEFAULT_SENIORITY, silence=DEFAULT_SILENCE)` (the node passes `provider_seniority` and 2 ×
+`announce_interval`), a `node.Store`:
 `heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
 table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
 exclude, heard_within=None)`: the count closest to key of the servers first heard at least min_age ago (publishers
 and searchers pass `provider_seniority`), heard within `heard_within` seconds if given, not excluded (`exclude` runs
-under the log's lock). Memory: an `OrderedDict` node ID -> first heard, least recently heard first (a heard moves to
-the end; past `MAX_FIRST_SEEN`, 65,536, the front is forgotten), a dict node ID -> last heard (loaded as the
-`last_heard` the save wrote), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a
-new server at 65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a
-contiguous run of the sorted list, all closer to the key than any outside it: `closest` binary-searches the
+under the log's lock). Memory: a dict node ID -> first heard, in the order first heard (loaded `ORDER BY
+first_heard`), an `OrderedDict` node ID -> last heard, least recently heard first (a heard moves to the end; loaded as
+the `last_heard` the save wrote), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a
+new server at 65,536, 1 µs for one heard before, 17 µs when evicting). Past `MAX_FIRST_SEEN`, 65,536, `_evict`
+forgets `_victim(now)` until it fits (REV7): the front of the last-heard order if silent for `silence` since
+`max(last heard, _loaded)` (`_loaded`: the construction's time), else the newest of the first-heard order if first
+heard less than `seniority` ago (if the newest is senior, all are), else the front of the last-heard order; each an
+O(1) look. With `seniority` 0 it is least recently heard first, as before the fix. The IDs sharing the key's first p
+bits are a contiguous run of the sorted list, all closer to the key than any outside it: `closest` binary-searches the
 narrowest run holding count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old
 enough, and ranks only that run (about 20 µs at 65,536). Saved in `announce_first_seen` through a SNAPSHOT
 `RowStore`: an announce only marks its row, and a row's `last_heard` is the time of the save writing it (within 30 s
@@ -1738,7 +1756,7 @@ at most every `EVENT_INTERVAL` (1 s) on the job's thread, its progress is a `job
 | Thread | Owner | Does |
 |---|---|---|
 | `rnfs-join`, `rnfs-publisher`, `rnfs-names`, `rnfs-maintenance` | node | joining (and joining again while under `MIN_SERVERS`), publishing, name announces, periodic saves and eviction |
-| `rnfs-local` | node (`_run_local`), only on a node that may have local servers | every 30 s: the path table read for the local servers every 10 minutes, and partition mode's off-island probes (`check_local`) |
+| `rnfs-local` | node (`_run_local`), only on a node that may have local servers | every 30 s, or at once when failures ask for a probe: the path table read for the local servers every 10 minutes, and partition mode's off-island probes (`check_local`) |
 | `rnfs-remote-pin-checks`, `rnfs-remote-pin-check` | node | checking whether the remote pins asked for are done: a pass every 30 s once joined, its provider lookups on up to 4 threads at once (1 on slow nodes, shared with on-demand checks) |
 | `rnfs-announcer`, `rnfs-response-monitor`, `rnfs-link-sweeper` | network | rnfs.dht announces, `/blocks` deadlines and displacement, idle links |
 | `rnfs-lookup`, `rnfs-lookup-path`, `rnfs-fetch`, `rnfs-find-providers`, `rnfs-remote-pin`, `rnfs-publish-lookup`, `rnfs-publish-provide` | per operation | lookups, a disjoint lookup's paths (all but the first, which runs in the caller's thread; every path for `find_providers`), fetch workers, provider search, remote-pin fetches (one thread per source with pins waiting), a publishing round's region lookups (up to 4 at once) and its `/provide`s (`rnfs-publish-provide`, up to 16 at once), both ended with the round and none on slow nodes |
@@ -1956,7 +1974,10 @@ Everything in the specification is implemented, with these simplifications and a
   `Traffic.announced` counts as fresh to `_fresh_announce`, which tells it of servers `_heard_server` judged off-island
   (`local.judged(id) is False`); the publisher (`set_islands`) each `/provide` that recorded keys or opened no link.
   `_wired_lookup` adds `allowed=partition.allows`, and `_start_nodes` puts the K closest local servers first while it
-  is active. `check_local` probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
+  is active. Its `known` is `_knows_server` (`_is_server`, or RNS knows the identity, `_is_known`, or a path,
+  `_path_hops`), so made-up IDs a reply names don't count; its `on_probe` sets `_local_wake`, which `_run_local` waits
+  on between checks (`LOCAL_CHECK`), so the probe failures ask for goes at once; `stop` sets it too. `check_local`
+  probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
   `rnfs-local` thread; an answer goes to `routing.answered`, a failure isn't counted there). `_partition_changed` logs
   the change and, on leaving, calls `Publisher.heal()`; `_contact` (an off-island answer, fresh announce or probe
   answer outside partition mode) calls it once after a start too (`_heal_at_contact`), for marks a restart kept after

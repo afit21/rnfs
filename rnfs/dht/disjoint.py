@@ -115,10 +115,16 @@ class DisjointLookup:
             raise failures[0]
 
     def _sample(self):
-        """Tell on_complete the k-th closest distance, if every path completed."""
+        """Tell on_complete the size estimate's sample (density.verified_sample) over the nodes the paths knew of
+        together, if every path completed: verified if a path verified it."""
         if self.ended != "complete":
             return
-        kth = density.kth_distance([distance(node_id, self.key) for node_id in self.candidates()])
+        known: dict[bytes, int] = {}
+        checks = []
+        for path in self.paths:
+            known.update(path.known_distances())
+            checks.append(path.verified())
+        kth = density.verified_sample(known, lambda node_id: any(check(node_id) for check in checks))
         if kth is not None:
             self.on_complete(self.key, kth)
 
