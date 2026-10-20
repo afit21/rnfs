@@ -960,7 +960,8 @@ mirror) would also take 2.5–3.5× less airtime compressed.
 
 # Future
 
-What isn't in 0.2.0: it waits on older nodes leaving the network, on Reticulum or on evidence it is needed, or isn't planned.
+What isn't in 0.2.0: it waits on older nodes leaving the network, on Reticulum or on evidence it is needed, or
+isn't planned.
 
 ## Fewer name announces (once 0.1.5 and 0.1.6 resolvers are gone)
 
