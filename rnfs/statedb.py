@@ -254,6 +254,12 @@ SCHEMA: tuple[tuple[str, tuple[Step, ...]], ...] = (
         # 0.2.0, section 6 "LoRa islands"): republished when partition mode ends, also after a restart
         "CREATE TABLE published_heal (item TEXT PRIMARY KEY) WITHOUT ROWID",
     )),
+    ("remote_pin_retry", (
+        # The remote pins waiting (remote_pins) whose content wasn't found (rnfs 0.2.0; rnfs.retry): when each is
+        # tried again and when it was first not found (Unix times). Saved with remote_pins, in the same transaction
+        "CREATE TABLE remote_pin_retries (source TEXT NOT NULL, cid BLOB NOT NULL, retry_at REAL NOT NULL,"
+        " since REAL NOT NULL, PRIMARY KEY (source, cid)) WITHOUT ROWID",
+    )),
 )
 
 

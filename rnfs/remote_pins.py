@@ -43,7 +43,8 @@ MAX_DETAIL = 400  # characters of an outcome's detail (an error message) kept
 # released: a release the node accepted
 WAITING, DONE, MISSING, REFUSED, RELEASED = "waiting", "done", "missing", "refused", "released"
 ASKED_STATES = (WAITING, DONE, MISSING, REFUSED, RELEASED)
-# Served states (RELEASED as above: released by its identity), and the reasons a pin was dropped or refused
+# Served states (RELEASED as above: released by its identity), and the reasons a pin was dropped or refused (and
+# not_found for one waiting to be tried again because its content wasn't found: rnfs 0.2.0, rnfs.retry)
 FETCHING, PINNED, DROPPED = "fetching", "pinned", "dropped"
 SERVED_STATES = (WAITING, FETCHING, PINNED, DROPPED, REFUSED, RELEASED)
 REASONS = ("quota", "not_found", "denied", "invalid_dag", "too_large", "storage_full", "failed", "queue_full",

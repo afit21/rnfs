@@ -462,7 +462,8 @@ class RemotePin(_Object):
 class ServedPin(_Object):
     """A remote pin another identity asked of this node (served_pins()): the identity hash (16 bytes), the CID, its
     state ("waiting", "fetching", "pinned", "dropped", "refused", "released"), why for one dropped or refused
-    ("quota", "not_found", "denied", "queue_full", ...), when (Unix time; None where not recorded) and a detail."""
+    ("quota", "not_found", "denied", "queue_full", ...), when (Unix time; None where not recorded) and a detail.
+    retry_at: for one waiting because its content wasn't found yet (reason "not_found"), when it is tried again."""
 
     identity: bytes = _field(_hex)
     cid: Cid = _field(_cid)
@@ -470,6 +471,7 @@ class ServedPin(_Object):
     reason: str | None = None
     at: float | None = None
     detail: str | None = None
+    retry_at: float | None = None
 
     def __str__(self) -> str:
         """The CID's written form."""

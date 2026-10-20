@@ -31,7 +31,7 @@ code}` (below).
 | POST | /api/pin/rm | JSON `cid` | `{}` after `pin_rm(cid)` |
 | POST | /api/pin/remote | JSON `node`, `cid`, `pin` | `{"accepted": bool}` |
 | GET  | /api/pin/remote | `node`, `cid` (both optional), `check` | `{"pins": pin_remote_ls(...)}`: the remote pins this node asked for, most recently asked first (`node`, `cid`, `pin`, `accepted`, `asked`, `state`, `done`, `checked`, `seen`); `check=1` checks them first (provider lookups, paced) |
-| GET  | /api/pin/remote/served | | `pin_remote_served()`: `{"pins": [{"identity", "cid", "state", "reason", "at", "detail"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
+| GET  | /api/pin/remote/served | | `pin_remote_served()`: `{"pins": [{"identity", "cid", "state", "reason", "at", "detail", "retry_at"}], "usage": [{"identity", "used", "quota", "pinned", "waiting", "allowed"}], "quota"}` |
 | POST | /api/pin/label | JSON `cid`, `label` (null or "" clears it) | `pin_label(cid, label)`: the pin's `pin_ls` entry |
 | GET  | /api/cache/ls | | `{"cache": cache_ls()}`: the cached fetches, most recently used first |
 | POST | /api/cache/rm | JSON `cid` | `cache_rm(cid)`: `{"removed_records", "removed_blocks", "freed_bytes"}` |

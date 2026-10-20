@@ -1093,7 +1093,8 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    has it, find providers (section 6). A node that isn't slow asks none over a slow link (item 7): on a radio each
    would hold the search up a round trip, and several would each send the root. A slow node, whose links are all
    slow, asks its one (`max_parallel_providers` is 1 there): a hit saves a whole lookup over the radio for one
-   request on a link already open.
+   request on a link already open. For a remote pin, the node that asked is asked first, link or not and over any
+   link (rnfs 0.2.0): it is the one node known to hold the content before its provider records are out.
 2. Fetch the root block and decode it. Fetch the blocks not already stored: those along the requested path,
    then every block of the target's DAG — or, for a byte range (`cat --offset`, gateway Range requests), only
    the chunks covering it and the nodes above them. Each block is fetched once, even if it appears several
@@ -1277,6 +1278,13 @@ a directory above the folder can be changed by other users, who could replace th
 - `/pin` is best effort: an accepted pin may still be dropped (quota, or the CID can't be found). rnfs saves the
   pins waiting (in its state database, about once a second and at stop) and resumes them after a restart,
   unless their identity has left `remote_pin_identities`; a crash may lose those accepted in the last second.
+- The node asked to pin asks the node that asked first (rnfs 0.2.0): its identity, from the identified link, gives
+  its node ID, and it serves what it provides even before its provider records are out. One that hasn't it isn't
+  held against it, and the providers are looked up as usual.
+- A pin whose content can't be found (no provider could supply it) isn't dropped at once (rnfs 0.2.0): it waits and
+  is tried again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it was first not found;
+  then it is dropped (`not_found`). What a try fetched is kept as a cached fetch (above). Pins accepted after it
+  are fetched meanwhile, a release ends the wait at once, and the waits are kept across a restart.
 - `rnfs pin remote add|rm <node ID> <cid>` sends these requests over an identified link; `rnfs pin remote ls`
   shows their status (below, and section 11).
 - **Status** (rnfs 0.2.0; local only: `/pin` and every other message are unchanged).
@@ -1295,7 +1303,8 @@ a directory above the folder can be changed by other users, who could replace th
     checked first, skipping pins checked in the last minute (10 minutes on a slow node), its lookups sharing the
     same limit at once. rnfs keeps at most 10 000 entries: past that the oldest released or refused go first,
     then the oldest done, then the oldest of the rest.
-  - A node serving remote pins records what became of each pin an identity asked of it: *waiting*, *fetching*,
+  - A node serving remote pins records what became of each pin an identity asked of it: *waiting* (with reason
+    `not_found` and when it is tried again while it waits for its content to be found), *fetching*,
     *pinned*, *dropped* (`quota`; the fetch failing: `not_found`, `denied`, `invalid_dag`, `too_large`,
     `storage_full`, `failed`; released by the deny list, `denied`; waiting at a start from an identity no longer
     on `remote_pin_identities`, `identity_removed`; recorded as current but lost in a crash, `lost`), *refused*
@@ -1997,6 +2006,12 @@ at such a path) — and a state: `queued`, `running`, `done`, `failed` or `cance
 MUST be what the equivalent API call returns (`POST /api/get`, `/api/pin/add`, `/api/export`, `/api/add`, `/api/import`), and its error, when failed, the
 message that call would have reported.
 - At most `max_jobs` jobs run at once; queued jobs MUST be started oldest first.
+- A `get`, `pin` or `export` job that fails because no provider could supply its content (`404`, but not for a path
+  that the target's stored directories show doesn't exist) MAY be queued again rather than failed (rnfs 0.2.0),
+  keeping its blocks as a queued job does, with its `error` and `retry_at`, the time before which it isn't started.
+  rnfs tries it again after 10 minutes, the wait doubling up to 6 hours, until 3 days after it first wasn't found
+  (`retry_since`), then fails it. A client following a transfer in the foreground (the CLI without `--background`)
+  cancels such a job and reports its error, so it never waits hours.
 - Jobs MUST be persisted in the state directory, each change saved atomically and durably. When the node starts, jobs that were
   queued or running MUST be queued again. A resumed job MUST NOT fetch again blocks that are still stored.
 - While a job is queued or running, the blocks stored below its root MUST be kept as if pinned, including

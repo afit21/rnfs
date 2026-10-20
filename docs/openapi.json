@@ -5190,6 +5190,17 @@
           "nomadnet": {
             "type": "string",
             "description": "An add of a NomadNet link: the link."
+          },
+          "retry_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "A get, pin or export queued again because its content wasn't found (rnfs 0.2.0): when it is tried again (Unix time); `error` says why. Null otherwise."
+          },
+          "retry_since": {
+            "type": "number",
+            "description": "Present while it waits to be tried again: when its content first wasn't found (Unix time). It is tried for up to 3 days from then."
           }
         },
         "required": [
@@ -5213,7 +5224,8 @@
           "blocks_total",
           "downloaded_bytes",
           "rate",
-          "eta"
+          "eta",
+          "retry_at"
         ],
         "description": "A background job (the jobs feature; specification section 11, Background jobs)."
       },
@@ -5298,6 +5310,13 @@
           "removed": {
             "const": true,
             "description": "Present on a job forgotten (`jobs clear`, or past `max_finished_jobs`), which carries only `id`, `job_kind`, `state` and this."
+          },
+          "retry_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "When a job queued again because its content wasn't found is tried again (Unix time)."
           }
         },
         "required": [
@@ -6037,6 +6056,13 @@
                     "null"
                   ],
                   "description": "At most 400 characters."
+                },
+                "retry_at": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "description": "A pin waiting (reason `not_found`) whose content wasn't found yet: when it is tried again (Unix time; rnfs 0.2.0). Null otherwise."
                 }
               },
               "required": [
@@ -6045,7 +6071,8 @@
                 "state",
                 "reason",
                 "at",
-                "detail"
+                "detail",
+                "retry_at"
               ]
             },
             "description": "Most recent first."

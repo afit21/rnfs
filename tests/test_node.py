@@ -928,7 +928,8 @@ class SecurityTest(NodeTest):
             accepted = [self.a.backend.remote_pin(IDENTITY, Cid.for_block(RAW, b"%d" % i), True) for i in range(5)]
             go.set()
         self.assertEqual(accepted, [True, True, True, False, False])
-        self.assertTrue(self.wait_for(lambda: not self.a._remote_reserved.get(remote_source(IDENTITY)), 30))
+        # Nobody provides them: the three accepted wait to be tried again (rnfs 0.2.0), still queued
+        self.assertTrue(self.wait_for(lambda: len(self.a._remote_retry) == 3, 30))
 
     def test_remote_pin_released_while_fetching_isnt_pinned(self):
         cid = self.b.add_stream(io.BytesIO(os.urandom(2 * CHUNK_SIZE)))["cid"]

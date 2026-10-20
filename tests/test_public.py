@@ -526,9 +526,19 @@ class PublicTests:
             self.assertLess(time.monotonic() - started, 5)
             self.assertEqual(job.cancel().state, "cancelled")
         self.assertEqual(job.wait(10).state, "cancelled")
-        failed = self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this")).wait(10)
+        self.b.config.max_download_size = 1
+        failed = self.rnfs.jobs.pin(self.share(b"over max_download_size")).wait(10)
+        self.b.config.max_download_size = None
         self.assertEqual(failed.state, "failed")
-        self.assertIn("no provider", failed.error)
+        self.assertIn("max_download_size", failed.error)
+        # Content not found yet: queued again, saying why and when it is tried again (rnfs 0.2.0)
+        waiting = self.rnfs.jobs.pin(Cid.for_block(RAW, b"nobody has this"))
+        self.assertTrue(wait_for(lambda: waiting.refresh().retry_at is not None, what="the job queued again"))
+        waiting = waiting.refresh()
+        self.assertEqual(waiting.state, "queued")
+        self.assertIn("no provider", waiting.error)
+        self.assertIsNotNone(waiting.retry_since)
+        self.assertEqual(waiting.cancel().state, "cancelled")
 
     def test_deny(self):
         """The deny list: add, list, remove, and malformed entries."""

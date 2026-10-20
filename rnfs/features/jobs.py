@@ -43,6 +43,12 @@ or import job; `rnfs jobs` lists, shows, waits for, cancels and clears jobs.
   name of the directory written. With no_extract, a sealed folder is written as its tar rather than unpacked
   (node.get's no_extract). With fallback_dht, a get whose from node fails is retried with ordinary DHT
   discovery.
+- A get, pin or export job whose content no provider could supply (NotFound, but not a path its stored directories
+  show doesn't exist) is queued again rather than failed, keeping its protection, to start no sooner than its
+  retry_at (rnfs.retry: 10 minutes, doubling up to 6 hours, for up to 3 days after it first wasn't found; then it
+  fails as before). Its error says why it waits; retry_since is when it was first not found. The rnfs-job-retry
+  thread starts the jobs due (RETRY_POLL). A foreground transfer (run_transfer) doesn't wait: the CLI cancels a job
+  it follows once it is queued again, and fails with its error, as before 0.2.0.
 - Finished jobs (done, failed, cancelled) are kept for `rnfs jobs`, at most max_finished_jobs, but each
   for at least FINISHED_GRACE: a CLI following a fast job must still find it once it ends.
 - Job threads are daemon threads, so they never hold up the process; stop() asks running fetches to stop
@@ -65,6 +71,7 @@ from typing import Callable
 
 from rnfs import ids
 from rnfs.constants import PARTIAL_SUFFIX
+from rnfs.retry import next_retry
 from rnfs.features import Feature, _common
 from rnfs.features._common import LOG_ERROR, LOG_INFO, LOG_NOTICE, LOG_WARNING
 from rnfs.fsutil import printable
@@ -91,10 +98,12 @@ POLL_TTY = 1  # seconds between progress updates the CLI shows
 POLL_QUIET = 10  # seconds a CLI without a progress line waits per request (it returns early when the job ends)
 FINISHED_GRACE = 60.0  # seconds a finished job is kept whatever max_finished_jobs says
 EVENT_INTERVAL = 1.0  # seconds between a running job's progress events, at least
+RETRY_POLL = 30.0  # seconds between the checks for queued jobs whose retry_at has come
+RETRYING_KINDS = frozenset({"get", "pin", "export"})  # queued again when their content isn't found (rnfs.retry)
 # A "job" event's fields (rnfs.events): what changes, not the result (clients fetch the job for that); "kind" is
 # sent as "job_kind", since an event's own "kind" is "job"
 EVENT_FIELDS = ("id", "kind", "state", "error", "total_bytes", "done_bytes", "blocks", "blocks_total",
-                "downloaded_bytes", "rate", "eta")
+                "downloaded_bytes", "rate", "eta", "retry_at")
 _JOB_ID = re.compile(r"[0-9a-f]{8}")
 _NODE_ID = ids.HEX16_LOWER  # a saved job's from_node, as bytes.hex() writes it (a row that fails is deleted)
 
@@ -133,6 +142,9 @@ class Job:
         self.finished: float | None = None
         self.error: str | None = None
         self.result: dict | None = None
+        # Queued again because its content wasn't found (rnfs.retry): when it may start, and when it first wasn't
+        self.retry_at: float | None = None
+        self.retry_since: float | None = None
         self.runs = 0  # runs started, counting resumes after a restart
         self.total_bytes: int | None = None  # verified content size, once the target's block is checked
         self.done_bytes = 0  # content bytes stored of it, whether downloaded or already stored
@@ -223,6 +235,7 @@ class Job:
         with self._lock:
             self.state = RUNNING
             self.started = time.time()
+            self.retry_at = None
             self.runs += 1
             self.done_bytes = self.blocks = self.downloaded_bytes = self._moved = 0
             self._seen = set()
@@ -256,7 +269,7 @@ class Job:
         eta = None
         if rate and self.total_bytes is not None:
             eta = max(0.0, (self.total_bytes - self.done_bytes) / rate)
-        return {**self.to_record(), "state": self.state, "rate": rate, "eta": eta}
+        return {**self.to_record(), "state": self.state, "rate": rate, "eta": eta, "retry_at": self.retry_at}
 
     def event(self) -> dict:
         """The job's "job" event fields (EVENT_FIELDS): its state and progress, not its result. Its kind is
@@ -267,8 +280,8 @@ class Job:
     def to_record(self) -> dict:
         """The job as saved (a running job is saved as such, and queued again when loaded). path and options
         only for the kinds that have them (add, import), no_extract only when set, source only when it isn't "user"
-        (an app's), and nomadnet only for an add of a NomadNet link, so the record of every other job is as 0.1.6
-        saved it."""
+        (an app's), nomadnet only for an add of a NomadNet link, and retry_at and retry_since only while it waits
+        to be tried again, so the record of every other job is as 0.1.6 saved it."""
         record = {"id": self.id, "kind": self.kind, "target": self.target, "output": self.output,
                   "from": self.from_node, "sealed_name": self.sealed_name, "fallback_dht": self.fallback_dht}
         if self.no_extract:
@@ -279,6 +292,8 @@ class Job:
             record["source"] = self.source
         if self.nomadnet is not None:
             record["nomadnet"] = self.nomadnet
+        if self.retry_since is not None:
+            record.update(retry_at=self.retry_at, retry_since=self.retry_since)
         record.update({"state": self.state, "created": self.created, "started": self.started,
                        "finished": self.finished, "error": self.error, "result": self.result, "runs": self.runs,
                        "total_bytes": self.total_bytes, "done_bytes": self.done_bytes, "blocks": self.blocks,
@@ -313,6 +328,9 @@ class Job:
             setattr(job, name, _count(record.get(name), 0))
         job.total_bytes = _count(record.get("total_bytes"), None)
         job.blocks_total = _count(record.get("blocks_total"), None)
+        job.retry_since = _number(record.get("retry_since"), None)
+        if job.retry_since is not None:
+            job.retry_at = _number(record.get("retry_at"), None)
         return job
 
 
@@ -609,6 +627,17 @@ class JobsFeature(Feature):
         with self._lock:
             self._started = True
         self._schedule()
+        self._spawn(self._retry_loop, "rnfs-job-retry")
+
+    def _retry_loop(self):
+        """Start the queued jobs whose retry_at has come, every RETRY_POLL, until the node stops."""
+        while not self._stop_event.wait(RETRY_POLL):
+            now = time.time()
+            with self._lock:
+                due = any(job.state == QUEUED and job.retry_at is not None and job.retry_at <= now
+                          for job in self._jobs.values())
+            if due:
+                self._schedule()
 
     def stop(self, deadline: float | None = None):
         """Ask running jobs to stop (they are saved as queued, to resume), wait for them until deadline (as
@@ -636,10 +665,11 @@ class JobsFeature(Feature):
             if not self._started or self._stop_event.is_set():
                 return False
             running = sum(1 for job in self._jobs.values() if job.state == RUNNING)
+            now = time.time()
             for job in self._jobs.values():
                 if running >= self.max_jobs:
                     break
-                if job.state != QUEUED:
+                if job.state != QUEUED or (job.retry_at is not None and job.retry_at > now):
                     continue
                 job.begin_run()
                 self._store.changed(job.id)
@@ -669,10 +699,49 @@ class JobsFeature(Feature):
             state = CANCELLED if job.cancel_requested or not self._stop_event.is_set() else QUEUED
         except (RnfsError, ValueError, OSError) as e:
             error = str(e) or type(e).__name__
+            if self._retries(job, e):
+                state = QUEUED
         except Exception as e:  # noqa: BLE001 - a job's failure mustn't take its thread's bookkeeping with it
             error = str(e) or type(e).__name__
             _log(f"job {job.id} ({job.kind} {job.subject}) failed: {e!r}", LOG_ERROR)
         self._finish(job, state, error, result)
+
+    def _retries(self, job: Job, error: Exception) -> bool:
+        """Whether a run that failed with error is tried again later: a get, pin or export whose content no provider
+        could supply (NotFound), unless the job was cancelled, the node is stopping, its path is known not to exist
+        (_absent_path) or rnfs.retry.RETRY_FOR has passed since it first wasn't found. Sets its retry_at (and
+        retry_since, the first time)."""
+        from rnfs.errors import NotFound, Unsupported
+        if (job.kind not in RETRYING_KINDS or not isinstance(error, NotFound) or isinstance(error, Unsupported)
+                or job.cancel_requested or self._stop_event.is_set() or self._absent_path(job.target)):
+            return False
+        now = time.time()
+        since = job.retry_since if job.retry_since is not None else now
+        retry_at = next_retry(since, now)
+        if retry_at is None:
+            return False
+        with self._lock:
+            job.retry_at, job.retry_since = retry_at, since
+        _log(f"job {job.id} ({job.kind} {job.subject}): {error}; trying again in {(retry_at - now) / 60:.0f} minutes",
+             LOG_NOTICE)
+        return True
+
+    def _absent_path(self, target: str) -> bool:
+        """True if target's path is known not to exist: every block along it that is needed to tell is stored, and a
+        name isn't there (trying again can't change that: a CID's content never does)."""
+        from rnfs.content import walker
+        from rnfs.errors import NotFound
+        root, names = walker.parse_target(target)
+        expect = walker.root_expect(root)
+        get = self.node.storage.getter()
+        try:
+            for name in names:
+                expect = walker.step_name(expect, name, get)
+                if expect is None:
+                    return True
+        except (NotFound, ValueError):  # a block along it isn't stored (or isn't a directory's): not known
+            return False
+        return False
 
     def _execute(self, job: Job) -> dict:
         """The facade call the job stands for; its result."""
@@ -777,6 +846,7 @@ class JobsFeature(Feature):
                 job.done_bytes = job.total_bytes
             if state in FINISHED:
                 job.finished = time.time()
+                job.retry_at = job.retry_since = None
             self._threads.pop(job.id, None)
             self._store.changed(job.id)
             self._cap_finished()
@@ -873,6 +943,7 @@ class JobsFeature(Feature):
             if job.state == QUEUED:
                 job.state = CANCELLED
                 job.finished = time.time()
+                job.retry_at = job.retry_since = None
                 self._store.changed(job.id)
                 ended = True
             elif job.state == RUNNING:
@@ -1080,6 +1151,9 @@ def format_progress(job: dict, width: int = 20) -> str:
     """A job's progress on one line: bar, percent, bytes, rate and ETA while running; its outcome after."""
     state = job.get("state")
     total, done = job.get("total_bytes"), job.get("done_bytes") or 0
+    if state == QUEUED and job.get("retry_at") is not None:
+        when = time.strftime("%H:%M", time.localtime(job["retry_at"]))
+        return f"waiting, tried again at {when}: " + (job.get("error") or "not found")
     if state == QUEUED:
         return "queued"
     if state == RUNNING:
@@ -1125,7 +1199,7 @@ def job_fields(job: dict) -> dict:
     if job.get("rate") is not None:
         fields["rate"] = f"{human_size(job['rate'])}/s"
         fields["eta"] = human_duration(job.get("eta"))
-    for name in ("created", "started", "finished"):
+    for name in ("created", "started", "finished", "retry_at", "retry_since"):
         if job.get(name):
             fields[name] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(job[name]))
     fields["runs"] = job.get("runs", 0)
@@ -1204,7 +1278,8 @@ def follow(api, job_id: str, cancel_on_interrupt: bool) -> dict:
     """Poll a job until it ends, with a progress line if stderr is a terminal; the finished job.
 
     Ctrl+C cancels the job if cancel_on_interrupt (a foreground transfer), else just stops waiting; both
-    exit with status 130.
+    exit with status 130. A foreground transfer queued again because its content wasn't found (its retry_at) is
+    cancelled too, and returned with its error: a command or script doesn't wait hours for it (--background does).
     """
     line = ProgressLine() if sys.stderr.isatty() else None
     try:
@@ -1212,6 +1287,8 @@ def follow(api, job_id: str, cancel_on_interrupt: bool) -> dict:
             job = api.get("/api/jobs/get", id=job_id, wait=POLL_TTY if line else POLL_QUIET)
             if job["state"] in FINISHED:
                 return job
+            if cancel_on_interrupt and job["state"] == QUEUED and job.get("retry_at") is not None:
+                return {**api.post("/api/jobs/cancel", id=job_id), "error": job.get("error")}
             if line:
                 line.show(printable(format_progress(job)))
     except KeyboardInterrupt:
