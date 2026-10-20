@@ -914,7 +914,7 @@ rnfs already uses most of what RNS 1.5.6 offers an application. Worth adopting, 
   content others asked it to keep. Its cap of 100,000 entry keys becomes a setting (`provide_entries_max`), as a
   large mirror (the Gutenberg mirror's files and folders) passes it and gets none
 
-## Resumable and compressed block transfers (to do)
+## Resumable and compressed block transfers (implemented)
 
 An RNS Resource is all or nothing, and the first block of a response is always whole, so at 1 kbit/s every
 response is a whole 64–128 KiB chunk (10–20 minutes) and a stall loses half of one on average. Text (the Gutenberg
@@ -927,6 +927,19 @@ mirror) would also take 2.5–3.5× less airtime compressed.
 * An older node drops an unknown request unanswered (`Link.handle_request`), so whether a node supports it is
   learnt once (one timeout) and kept per node (persisted, asked again weekly); one answer covers both
   compression and ranges
+* As implemented: `/range`, `[cid, offset, max_bytes, flags]` → `[size, encoding, bytes]` (`[]` when the block
+  isn't served, `False` when refused). Compression is bz2 inside the message (RNS's Resource compression is fixed
+  per handler and every rnfs requester refuses compressed Resources): 3.2× on text in 64 KiB pieces (zlib 2.6×),
+  decompressed to at most the expected length + 1 byte, one complete stream. Served through the same `_serve`
+  path as `/blocks` (its slot, pools, cooldowns, pacing, airtime controls and `upload_budget`), plus a 256 KiB/s
+  compression budget past which bytes go uncompressed. Requesters use it over slow links for raw chunks of 4 KiB
+  or more, after a stall on any link, and to resume a block held in part (`<state>/partial`, 64 at most, deleted at
+  start, never served). An older node drops the request silently and 0.1.6 counts nothing for it: a provider that
+  leaves a `/range` unanswered gets `/blocks` for the rest of that fetch, and two such silences in a row
+  (`range_support`, forgotten 7 days after the last) mark it as not answering, so an older node costs two request
+  timeouts a week (one lost packet on LoRa doesn't turn ranges off). Measured on a fake 1 kbit/s link: a Gutenberg
+  text 2.76× less airtime (1.74 h → 0.63 h); a stall mid-chunk resends 8 KiB instead of 32 KiB on average. Wire
+  vectors added (the old ones unchanged); `tests/interop.py` has `ranges` rows both ways
 
 # Future
 
