@@ -111,9 +111,17 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   answer for other node IDs through its other destinations.
 
 **Links.**
-- Requests to a node share one outgoing link, opened on demand and closed after `link_idle_timeout` without
-  traffic (`Link.no_data_for()`). These links don't identify, so lookups and downloads don't reveal who is
-  asking.
+- Requests to a node share one outgoing link, opened on demand and closed once it has had no request in progress
+  and no traffic (`Link.no_data_for()`) for `link_idle_timeout`, or, if it has no rate estimate (section 2), for
+  its keepalive interval if that is shorter (rnfs 0.2.0). The node that opened a link sends a keepalive once the
+  interval has passed without a packet either way, and the other node answers (RNS 1.5.6: `Link.keepalive`,
+  `max(5 s, RTT × 360 / 1.75)`, at most 360 s); keepalives don't count as traffic. On a 50 ms path that is a pair
+  every ~10 s, about 58 packets in 5 minutes, which every transport node on the path relays, while reopening the
+  link costs about 4; on radio paths (RTT ≥ 1.75 s) the interval is 360 s, so none are sent. rnfs closes such a
+  link 1 s plus two round trips before the interval has passed (RNS counts it from the earlier of the last packet
+  in and out). A link with a rate estimate, which carried `/blocks`, keeps `link_idle_timeout`: closing it would
+  reset the responder's rate estimate (its next response held to one chunk) and RNS's Resource window. These
+  links don't identify, so lookups and downloads don't reveal who is asking.
 - A node identifies (`Link.identify()`) only:
   - on a separate link opened to publish (section 6) or to send `/pin` (section 8), closed when done; or
   - on every link, in private mode.

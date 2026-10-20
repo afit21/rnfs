@@ -654,7 +654,13 @@ the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which
 `link_mdu(node_id)` (an open link's, which the fetcher sizes batches by), `pin(node_id, cid, pin) -> bool`,
 `ping(node_id) -> float | None`, `has_link(node_id)`, `close(node_id)`. `links.py` links only to the `rnfs.dht`
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
-that identity is on `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
+that identity is on `members`); the idle sweep (`LinkPool.sweep`) closes a shared link with no request in progress
+once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its idle limit (`links.idle_limit`:
+`link_idle_timeout` if it holds a rate estimate, `PeerLink.rate`, or RNS gives no `Link.keepalive`; else at most
+`Link.keepalive` less `KEEPALIVE_MARGIN`, 1 s, and two round trips, so before RNS's first keepalive, 0.2.0), and
+not within `link_idle_timeout` of the end of a `hold`. The `rnfs-link-sweeper` thread sweeps when the next link kept
+is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quarter of `link_idle_timeout` within 1 to
+30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
@@ -2181,8 +2187,8 @@ Everything in the specification is implemented, with these simplifications and a
 - Upload pacing: `RequestServer` holds an accepted `/blocks` back at most `MAX_PACING_WAIT` (5.625 s, half of RNS's
   request timeout without RTT) and refuses one that would wait longer. After a response on a slow link, `Fetch._pace`
   waits as long again as the request took before asking that provider again, holding its link meanwhile
-  (`PeerClient.hold_link`, `LinkPool.hold`: the idle sweep counts it as handed out when the wait ends), so the link and
-  its rate estimate survive a wait longer than `link_idle_timeout`, and a refusal within 4 × that time of the request
+  (`PeerClient.hold_link`, `LinkPool.hold`: the idle sweep keeps it for `link_idle_timeout` after the wait ends, whatever
+  its idle limit), so the link and its rate estimate survive a wait longer than `link_idle_timeout`, and a refusal within 4 × that time of the request
   being sent isn't counted towards `max_failures` (retried after an eighth of it, at least `busy_delay`). A `LOST`
   result (above) closes the provider's link (`Fetch._close_link`, so not one another fetch uses) and asks again after
   `busy_delay`, failing the provider after `max_failures` in a row (`_Provider.lost`, reset by any other outcome). A

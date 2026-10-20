@@ -119,6 +119,24 @@ INTERNALS = [
              "before the established callback runs (LinkPool.on_rtt reads it once established, for `rnfs peers`)",
              lambda: _source(RNS.Link.validate_proof, "self.rtt = time.time() - self.request_time",
                              "self.callbacks.link_established")),
+    Internal("network/links.py", "Link.keepalive: the interval after which the node that opened a link sends a "
+             "keepalive (answered by the other end) when no packet has crossed it either way, max(KEEPALIVE_MIN, "
+             "rtt × KEEPALIVE_MAX / KEEPALIVE_MAX_RTT) capped at KEEPALIVE_MAX (5 s, 360 s, 1.75 s), and keepalives "
+             "not counted by no_data_for (idle_limit closes an idle link before its first one)",
+             lambda: (_assigns(RNS.Link.__init__, "keepalive", "rtt"),
+                      _true((RNS.Link.KEEPALIVE_MIN, RNS.Link.KEEPALIVE_MAX, RNS.Link.KEEPALIVE_MAX_RTT)
+                            == (5, 360, 1.75), "keepalive constants changed"),
+                      _source(RNS.Link._Link__update_keepalive,
+                              "self.keepalive = max(min(self.rtt * (Link.KEEPALIVE_MAX / Link.KEEPALIVE_MAX_RTT), "
+                              "Link.KEEPALIVE_MAX), Link.KEEPALIVE_MIN)"),
+                      _source(RNS.Link._Link__watchdog_job,
+                              "if now >= last_inbound + self.keepalive or now >= self.last_outbound + self.keepalive:",
+                              "if self.initiator and now >= self.last_keepalive + self.keepalive:",
+                              "self.send_keepalive()"),
+                      _source(RNS.Link.had_outbound, "if not is_keepalive: self.last_data = self.last_outbound"),
+                      _source(RNS.Link._Link__receive,
+                              "if packet.context != RNS.Packet.KEEPALIVE: self.last_data = self.last_inbound"),
+                      _source(RNS.Link.no_data_for, "return time.time() - self.last_data"))),
 
     # Requests
     Internal("network/links.py, network/server.py", "Link.request's own timeout, rtt × traffic_timeout_factor + "

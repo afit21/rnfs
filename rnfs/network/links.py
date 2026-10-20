@@ -1,9 +1,11 @@
 """Outgoing RNS links to other nodes (specification section 3).
 
-- Requests to a node share one outgoing link, opened on demand and closed after link_idle_timeout without traffic
-  (Link.no_data_for()) or being handed out by LinkPool.get() or held (LinkPool.hold: a requester waiting out the
-  provider's upload pacing, so the next response keeps the link's rate estimate). These links don't identify, so lookups
-  and downloads don't reveal who asks.
+- Requests to a node share one outgoing link, opened on demand and closed once idle: no request in progress, no data
+  (Link.no_data_for()) and not handed out by LinkPool.get() for its idle limit (idle_limit), nor held (LinkPool.hold: a
+  requester waiting out the provider's upload pacing, so the next response keeps the link's rate estimate). The idle
+  limit is link_idle_timeout for a link holding a rate estimate; any other closes just before RNS would send its first
+  keepalive, if that is sooner, since reopening it costs less than two keepalive pairs. These links don't identify, so
+  lookups and downloads don't reveal who asks.
 - A link goes only to a destination whose hash is the node ID asked for (rnfs.dht of the identity RNS
   recalls for it), so one identity can't pose as many node IDs by announcing other destinations.
 - Publishing and /pin use a separate link that identifies, closed when done.
@@ -46,6 +48,10 @@ LINK_TIMEOUT, INITIATOR_CLOSED, DESTINATION_CLOSED = (RNS.Link.TIMEOUT, RNS.Link
                                                        RNS.Link.DESTINATION_CLOSED)
 RECEIPT_FAILED = RNS.RequestReceipt.FAILED  # a request RNS gave up on
 MAX_NOT_ESTABLISHED = 1024  # nodes LinkPool remembers a link not established to (LinkPool.unestablished)
+# An idle link without a rate estimate is closed this many seconds, plus two round trips, before RNS's keepalive
+# interval has passed (idle_limit): room for the sweep's own timing
+KEEPALIVE_MARGIN = 1.0
+MIN_SWEEP_WAIT = 0.25  # the idle sweep runs at most this often, however soon a link is due
 
 
 def close_reason(link) -> str:
@@ -60,6 +66,29 @@ def close_reason(link) -> str:
     if reason in (INITIATOR_CLOSED, DESTINATION_CLOSED):
         return "closed by the other node"
     return "closed"
+
+
+def idle_limit(link_idle_timeout: float, keepalive, rtt, rated: bool) -> float:
+    """Seconds without data after which the idle sweep closes a shared link with nothing in progress.
+
+    The node that opens a link sends a keepalive once RNS's keepalive interval (RNS 1.5.6: max(5 s, RTT × 360 / 1.75),
+    at most 360 s; Link.keepalive) has passed without a packet either way, and the other node answers: on a 50 ms path a
+    pair every ~10 s, about 58 packets in link_idle_timeout (5 minutes), while reopening the link costs about 4. So a
+    link closes just before its first keepalive, if that is sooner than link_idle_timeout: KEEPALIVE_MARGIN and two
+    round trips early, since RNS counts the interval from the earlier of the last packet in and out (the request, for a
+    link that was waiting for an answer) and no_data_for from the later (the answer). A link holding a rate estimate
+    (rated: it carried /blocks responses) keeps link_idle_timeout, as does one whose keepalive interval isn't known:
+    closing it would take the estimate, and the provider's for its next response, with it (section 3, Links).
+    """
+    if rated or not _positive(keepalive):
+        return link_idle_timeout
+    early = keepalive - KEEPALIVE_MARGIN - 2 * (rtt if _positive(rtt) else 0.0)
+    return max(KEEPALIVE_MARGIN, min(link_idle_timeout, early))
+
+
+def _positive(value) -> bool:
+    """True if value is a finite positive number (not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < float("inf")
 
 
 def timed_out(link) -> bool:
@@ -256,6 +285,10 @@ class LinkPool:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sweeper: threading.Thread | None = None
+        # Set to run the idle sweep now: a request ended or a link was handed out, so a link may be due sooner than
+        # the sweep's next run (next_sweep), which the last sweep worked out from the links it kept
+        self.wake = threading.Event()
+        self.next_sweep = self._sweep_interval()
         # Called with (node ID, seconds) for the round trip RNS measured on each link established, shared, one-shot
         # (ping's) or identified, on the thread that opened it; PeerClient sets its traffic counters' (`rnfs peers`)
         self.on_rtt: Callable[[bytes, float], None] | None = None
@@ -273,6 +306,7 @@ class LinkPool:
             peer = self.shared.get(node_id)
             if peer is not None and peer.is_active():
                 peer.handed_out = self.clock()  # under the lock, so sweep() sees it before closing the link
+                self.wake.set()  # it may now be due sooner than the sweep's next run
                 return peer
             if peer is not None:
                 del self.shared[node_id]
@@ -311,6 +345,7 @@ class LinkPool:
         if not (opened and peer.is_active()):
             return None
         self._start_sweeper()
+        self.wake.set()  # a new link may be due before the sweep's next run
         return peer
 
     def unestablished(self, node_id: bytes) -> bool:
@@ -464,9 +499,9 @@ class LinkPool:
             return self.shared.get(node_id)
 
     def hold(self, node_id: bytes, seconds: float) -> bool:
-        """Count the shared link to node_id as in use for seconds more, as if get() handed it out then (a requester
-        waiting out a provider's upload pacing before its next request): sweep() closes it only link_idle_timeout
-        after that. False if there is no such link."""
+        """Count the shared link to node_id as in use for seconds more (a requester waiting out a provider's upload
+        pacing before its next request): sweep() closes it only link_idle_timeout after that, whatever its idle limit.
+        False if there is no such link."""
         with self.lock:
             peer = self.shared.get(node_id)
             if peer is None:
@@ -491,15 +526,26 @@ class LinkPool:
     def close_all(self):
         """Stop the idle sweeper and tear down every link."""
         self.stop_event.set()
+        self.wake.set()
         with self.lock:
             peers = list(self.shared.values()) + list(self.oneshot)
         for peer in peers:
             self.close_link(peer)
 
+    def idle_limit(self, peer: PeerLink) -> float:
+        """Seconds without data after which sweep() closes peer's link if nothing is in progress on it (idle_limit():
+        link_idle_timeout with a rate estimate, else at most until just before RNS's first keepalive)."""
+        link = peer.link
+        return idle_limit(self.config.link_idle_timeout, getattr(link, "keepalive", None), getattr(link, "rtt", None),
+                          peer.rate is not None)
+
     def sweep(self) -> int:
-        """Close shared links with no request in progress, no data and not handed out by get() for
-        link_idle_timeout. Returns how many."""
+        """Close shared links with no request in progress that have had no data and not been handed out by get() for
+        their idle limit (idle_limit), nor been held (hold) within link_idle_timeout. Returns how many. Sets
+        next_sweep: seconds until the next link kept may be due, at least MIN_SWEEP_WAIT and at most the sweep
+        interval (a request ending or a link handed out wakes the sweeper sooner)."""
         timeout = self.config.link_idle_timeout
+        wait = self._sweep_interval()
         with self.lock:
             peers = list(self.shared.values())
         idle = []
@@ -508,16 +554,24 @@ class LinkPool:
                 quiet = peer.link.no_data_for()
             except Exception:  # noqa: BLE001 - a link closing meanwhile is skipped
                 continue
-            if not peer.busy() and quiet >= timeout:
-                idle.append(peer)
+            if peer.busy():
+                continue  # its request ending wakes the sweeper
+            limit = self.idle_limit(peer)
+            if quiet >= limit:
+                idle.append((peer, limit))
+            else:
+                wait = min(wait, limit - quiet)
         closing = []
-        for peer in idle:
+        for peer, limit in idle:
             with self.lock:
                 # get() may have handed it out since (its caller is about to send a request): it marks the peer
                 # under this lock, and once the peer is out of the pool here no get() can return it
-                if peer.handed_out is not None and self.clock() - peer.handed_out < timeout:
+                now = self.clock()
+                if peer.handed_out is not None and now - peer.handed_out < limit:
+                    wait = min(wait, peer.handed_out + limit - now)
                     continue
-                if peer.held_until is not None and self.clock() - peer.held_until < timeout:
+                if peer.held_until is not None and now - peer.held_until < timeout:
+                    wait = min(wait, peer.held_until + timeout - now)
                     continue
                 if self.shared.get(peer.node_id) is peer:
                     del self.shared[peer.node_id]
@@ -525,7 +579,12 @@ class LinkPool:
         for peer in closing:
             log(f"closing idle link to {node_name(peer.node_id)}", LOG_VERBOSE)
             self.close_link(peer)
+        self.next_sweep = max(MIN_SWEEP_WAIT, wait)
         return len(closing)
+
+    def _sweep_interval(self) -> float:
+        """The longest the sweeper waits between sweeps: a quarter of link_idle_timeout, within 1 to 30 s."""
+        return max(1.0, min(30.0, self.config.link_idle_timeout / 4))
 
     def _start_sweeper(self):
         """Start the thread closing idle links, once."""
@@ -536,13 +595,20 @@ class LinkPool:
         self.sweeper.start()
 
     def _sweep_loop(self):
-        """Sweep idle links until close_all."""
-        interval = max(1.0, min(30.0, self.config.link_idle_timeout / 4))
-        while not self.stop_event.wait(interval):
+        """Sweep idle links until close_all: when the last sweep said the next link is due, or when woken."""
+        wait = self._sweep_interval()
+        while True:
+            self.wake.wait(wait)
+            # Cleared before sweeping: a request ending during the sweep wakes the next wait at once
+            self.wake.clear()
+            if self.stop_event.is_set():
+                return
             try:
                 self.sweep()
+                wait = self.next_sweep
             except Exception as e:  # noqa: BLE001 - the sweeper thread keeps running; logged
                 log(f"error closing idle links: {e}", LOG_WARNING)
+                wait = self._sweep_interval()
 
     # Queries
 
@@ -626,6 +692,8 @@ class LinkPool:
             return exchange
         finally:
             peer.release(blocks)
+            if peer.shared:
+                self.wake.set()  # the link may be idle now: the sweep works out when it is due
 
     def _wait(self, peer: PeerLink, path: str, exchange: Exchange, receipt, deadline: float | None,
               watchdog: Callable[[Exchange, float], str | None] | None, on_progress: Callable[[float], None] | None):
