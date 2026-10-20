@@ -341,6 +341,47 @@ class NetworkFacadeTest(NodeTest):
         b"".join(self.b.read(second, for_gateway=True))
         self.assertEqual(self.b.publisher.provided(), {Cid.parse(first)})
 
+    def finds(self) -> list:
+        """Count the /find B's lookups send from now on (the list fills as they go)."""
+        sent = []
+        find = self.net.find
+
+        def counted(node_id, key):
+            """Note the query, then answer it as before."""
+            sent.append((node_id, key))
+            return find(node_id, key)
+        self.net.find = counted
+        return sent
+
+    def test_fetching_again_asks_the_provider_that_served_without_a_lookup(self):
+        cid = self.a.add_path(self.tree())["cid"]
+        self.advertise(cid)
+        sent = self.finds()
+        b"".join(self.b.read(f"{cid}/big.bin", length=10))  # cat: a lookup finds A
+        self.assertTrue(sent)
+        sent.clear()
+        self.b.pin_add(cid)  # no link stays open here (NetClient): A is remembered
+        self.assertEqual(sent, [])
+        self.assertTrue(self.b.storage.is_complete(Cid.parse(cid)))
+
+    def test_the_gateway_doesnt_search_again_for_what_nobody_provides(self):
+        data = b"not added yet"
+        cid = str(Cid.for_block(RAW, data))
+        sent = self.finds()
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(cid, for_gateway=True))
+        self.assertEqual({key for _, key in sent}, {Cid.parse(cid).key})
+        searched = len(sent)
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(cid, for_gateway=True))  # the page reloaded: no search
+        self.assertEqual(len(sent), searched)
+        with self.assertRaises(NotFound):
+            b"".join(self.b.read(cid))  # the user's cat searches again
+        self.assertGreater(len(sent), searched)
+        self.assertEqual(self.a.add_stream(io.BytesIO(data))["cid"], cid)
+        self.advertise(cid)
+        self.assertEqual(b"".join(self.b.read(cid)), data)
+
     def test_from_node(self):
         cid = self.a.add_stream(io.BytesIO(b"direct"))["cid"]
         self.b.routing.remove(A_ID)  # B knows no DHT node

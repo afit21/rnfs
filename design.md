@@ -2115,7 +2115,7 @@ Everything in the specification is implemented, with these simplifications and a
   (`_remote_workers` maps each source to its thread) within its budget.
 - A remote pin's fetch asks the node that asked first (0.2.0): `Fetcher.open`'s `hint`, its node ID
   `Destination.hash(identity, "rnfs", "dht")` from the `/pin`'s identity hash (no wire change), probed for the
-  first missing block along with the open links (`Fetch._discover`, taking one of the `max_parallel` probe slots;
+  first missing block before the remembered providers and open links (`Fetch._discover`, taking the first probe slot;
   one that hasn't it isn't penalised, and the lookup follows). The asker serves what it provides before its records
   are out. A fetch failing with `NotFound` keeps the pin queued (`_not_found`): `_remote_retry[(source, cid)]` holds
   `(retry_at, since)` (Unix times, `rnfs.retry.next_retry`: `RETRY_FIRST` 10 min plus the time since it was first
@@ -2179,8 +2179,27 @@ Everything in the specification is implemented, with these simplifications and a
   if it has one (below `slow_bitrate`), else if the cached `PathInfo`'s next-hop bitrate is below it or
   `Fetcher.slow_path` (the node's `SlowPaths`) says so. `_assign` gives the providers over slow links behind one
   next-hop interface one slot (`Fetch._slot`, `("slow", interface)`), and on a node that isn't slow `_discover`
-  probes no open link that is slow, so a gateway with TCP and LoRa interfaces fetches in parallel over TCP only. A
-  slow node still probes its `max_parallel` (by default one) open links, as before: a hit saves a lookup.
+  probes no open link or remembered provider that is slow, so a gateway with TCP and LoRa interfaces fetches in
+  parallel over TCP only. A slow node still probes its `max_parallel` (by default one) nodes, as before: a hit saves a
+  lookup.
+- Remembered providers (0.2.0; in memory only): `Fetcher._remembered`, an `OrderedDict` root -> {node ID: when it last
+  served}, least recently used root first, holds every node `Fetch._served` reports (verified blocks of the fetch's
+  root, `Fetcher.remember`), at most `K` per root (the least recent to serve dropped) and `MAX_REMEMBERED` (4,096)
+  roots. `Fetcher.remembered(root)` gives them most recent first, dropping those older than `REMEMBER_FOR` (3 h) and
+  banned ones. `Fetch._discover` probes, within `max_parallel`, the hint, then the remembered providers, then the open
+  links, each group ranked by `_rank` (its own order breaking ties), and the probe takes the first missing CID from
+  `pending` (requeued by `_handle_event` if no probe brings it). A remembered provider probed (`_remembered_asked`)
+  that answers without the block and isn't `BUSY` is forgotten for the root (`Fetcher.forget`), as is any provider
+  `_fail` fails. A `/find` reply's providers aren't remembered until they serve, so an attacker's reply can't plant
+  entries.
+- Searches that found none (0.2.0): the lookup thread queues `LookupDone(found, answered)`, `answered` when the fetch
+  didn't end meanwhile and `closest_answered()` isn't empty; one with nothing found, in a fetch with no provider at
+  all, calls `Fetcher.note_unfound(root)` (`_unfound`, at most `MAX_UNFOUND`, 4,096, oldest dropped). A fetch opened
+  with `explicit=False` for which `Fetcher.unfound(root)` (within `UNFOUND_FOR`, 600 s) answers still probes, then
+  sets `_unfound_ago` instead of starting its lookup, so `_download` fails with `NotFound` saying when the search
+  was. `Fetcher.remember` clears it. The node opens gateway fetches (`_fetching(for_gateway=True)`) and the
+  `pinned_fetch`es of followed names and deny lists (`explicit=False`) that way; every CLI and API fetch, jobs and
+  remote pins are explicit.
 - Archive import pins only roots whose every block was in the archive, and reads at most 1024 roots. It
   verifies every block, including ones already stored, and stops with `StorageFull` like a fetch when a block
   not yet stored would leave less than the disk reserve free (`Storage.check_disk`).

@@ -587,6 +587,14 @@ Changed:
   foreground `rnfs get`, `pin add` or `export` submits so, and still fails at once; `--background` jobs wait.
 
 Faster:
+- Fetching something again doesn't look it up again. Nothing was kept between fetches, so once its links had closed
+  a gateway reload or a `pin add` after `cat` repeated the lookup (about 13.5 `/find` on a fast node). The nodes
+  that served a root are now remembered for 3 hours after they last did (in memory, up to 10 per root and 4,096
+  roots) and asked for its first block before the nodes with open links, after a remote pin's asker, under the same
+  slow-link rule; one that doesn't have it any more, or fails, is forgotten. Only nodes that served verified blocks
+  are remembered, never the providers a lookup reports. And a search that found nobody providing a root isn't
+  repeated for 10 minutes by the gateway or by the retries of followed names and deny lists, which then fail at
+  once; `get`, `cat`, `pin add`, the rest of the CLI and API, jobs and remote pins always search.
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks
   (2 MiB) before handing over the first byte, about 5 hours at LoRa's 1 kbit/s. While no provider known is reached
   over a fast link (or none is known yet), the window is one chunk with the next asked for ahead, so the first
