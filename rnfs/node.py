@@ -806,6 +806,11 @@ class RnfsNode:
         # Releasing a deleted name key's pin recomputes what is provided, so it waits for the features too; and
         # name pins are made to match the names state, which a crash inside a publish can leave them disagreeing with
         self.names.reconcile_pins(self.storage.pins())
+        # Sealed-folder unpacks running (node_content._unpacking); once every pin is in place, the decrypted blocks
+        # of one the process died in are deleted, before anything is served
+        self._unpacks = 0
+        self._unpacks_lock = threading.Lock()
+        node_content.collect_unpack_leftovers(self)
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start
         self.publisher.refresh()

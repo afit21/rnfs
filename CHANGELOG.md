@@ -60,6 +60,17 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **Unpacking a sealed folder counts what its entries take on disk** (REV10; specification section 5,
+  Unpacking): the tar's headers are read first, before anything is stored, and every file and directory counts
+  at least one filesystem allocation unit (4 KiB or the filesystem's own, if larger) in the block store and
+  again as written, where the plaintext's bytes were counted before. A sender could seal a folder of many tiny
+  files that passed the check and then took 4 to 8 times as much, twice, filling the recipient's disk past the
+  reserve (1,000 one-byte files: 10.9 MB written where 2 MB was checked). Such a get is now refused (413, naming
+  `--no-extract`).
+- **An unpack the process died in no longer leaves the plaintext stored** (REV10): its decrypted blocks used to
+  stay in the block store, unpinned, until a gc or an eviction. An unpack now marks the state database while it
+  runs, and a start that finds the mark deletes every block nothing reaches before serving anything (the
+  unrecorded blocks of a fetch the same crash interrupted too: a retry fetches them again).
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

@@ -1358,16 +1358,32 @@ in these, each tested (tests/test_embedded.py: the guards in both scopes, and a 
   the marker as one global header (its 47 bytes well within `MAX_GLOBAL_BYTES`), which `tarfile` keeps as the
   stream's `pax_headers`; a marker with nothing after it but the end blocks isn't a tar to `tarfile` (it fails
   at offset 0), but packing always writes the top directory after it.
-- Unpacking a sealed folder (`get_sealed`, for a sealed folder unless `no_extract`): `unpack_sealed` checks the free space for the plaintext twice where the blocks and the output share a
-  filesystem (`_check_free_space` with the plaintext added to what is still to fetch, and `Storage.check_disk`
-  for the blocks' own), then, inside a protection session of its own (within the fetch's), feeds the
+- Unpacking a sealed folder (`get_sealed`, for a sealed folder unless `no_extract`): `unpack_sealed` first reads
+  the tar's headers (`tarstream.scan_tar` over a seekable `_PlainReader`, which decrypts a segment only when a
+  read reaches it and keeps the last one, so the data `tarfile` seeks past isn't decrypted), placing members by
+  `build_tar`'s own rules (`_place`) without storing anything: an invalid tar is `NotATar`, a limit `TooLarge`,
+  before the first block. Its `Extent` gives what the entries take in allocation units, not bytes
+  (`fsutil.allocation_unit`: `statvfs`'s `f_frsize`, the cluster size on Windows, at least 4 KiB): in the store
+  each file's 64 KiB chunks and the nodes above them and each directory's listing, every block rounded up to a
+  unit; on output each file's size and each directory's listing rounded up the same way, at least a unit each.
+  `_check_unpack_space` checks both where they share a filesystem (`_check_free_space` with the stored part
+  added to what is still to fetch, and `Storage.check_disk` for the blocks' own); a tar of tiny files takes
+  about 8 KiB an entry on 4 KiB filesystems where the plaintext's bytes, counted twice, said 2 KiB. Then,
+  inside `_unpacking` (below) and a protection session of its own (within the fetch's), it feeds the
   decrypted segments (`IteratorReader` over `SealedFile.read()`) to `tarstream.build_tar` through a
   `Session.writer()`, with the deny list's hash check, and writes out with `walker.write_out` from the stored
   blocks (`Storage.getter()`). The target is the root's one entry if it is a directory, else the root. A
   `ValueError` from `build_tar` (not `SealError` or `BlockMismatch`) means the plaintext isn't a valid tar:
   `NotATar`, and `get_sealed` writes the file with `write_sealed` and a warning (only a marked tar gets here). `TooLarge` is raised again
   naming `--no-extract`. In every case the session ends and `storage.collect()` deletes what nothing else
-  reaches, so the plaintext is never pinned, recorded as a fetch or provided.
+  reaches, so the plaintext is never pinned, recorded as a fetch or provided. The session is in memory, so
+  `_unpacking` keeps a mark in the state database for a process that dies before that collection: the first of
+  the unpacks running sets meta `sealed_unpack`/`open` to 1, durably, before any block is stored, and after each
+  collection the mark is cleared once no unpack is running (a count under `node._unpacks_lock`). A start that
+  finds it set (`collect_unpack_leftovers`, in `_setup` once the name pins are reconciled, before anything is
+  provided) runs `storage.collect()` and clears it; a failure is logged and leaves it for the next start. That
+  collection takes every unreached block, so the unrecorded blocks of a fetch the same crash interrupted go too
+  (a retry fetches them again), as any collection would take them. No schema step: the meta table holds it.
 - Sealed folders (`add_sealed_path` of a directory): `folder_sealed_name` refuses a name `<name>.tar` couldn't
   carry (over 251 bytes, invalid) and `seal_name=False` before anything is read, rather than sealing unnamed as
   a file with an invalid name is. `tarstream.folder_chunks` is a generator writing the tar as it walks
@@ -2219,10 +2235,13 @@ Everything in the specification is implemented, with these simplifications and a
   nick; the gateway never expands nicks. A nick at the start of a target reuses the CID resolved for it for
   60 s (`EXPAND_AGE`) from the time of the resolve, not from when the record was heard.
 - **Sealed folders.** Unpacking stores the plaintext as blocks before writing the files (both rule sets
-  reused as they are, rather than a second tar extractor), so it needs the space twice on one disk; they are
-  collected by `storage.collect()`, which walks every pin, right after. A marked sealed `.tar` that isn't a
-  valid tar is decrypted twice (once into `build_tar`, once to the file); one with a malformed header after the
-  marker fails at once, before anything is stored. Where the output's name must be chosen before the get (a
+  reused as they are, rather than a second tar extractor), so it needs the space twice on one disk, counted in
+  allocation units; they are collected by `storage.collect()`, which walks every pin, right after (or at the
+  next start, if the process died first). The header scan decrypts the segments holding headers once more: for
+  a tar of large files a few segments, for one of small files all of it (bounded by `max_output_entries`
+  entries). A marked sealed `.tar` that isn't a valid tar is found so by the scan, before anything is stored,
+  and decrypted again to the file. The disk count is an estimate: filesystem metadata beyond a unit per entry
+  (a fresh block store's shard directories, up to 4 MiB once) falls within the disk reserve. Where the output's name must be chosen before the get (a
   daemon without the job manager, or a path target ending in `.tar`, whose job keeps its visible name), the CLI
   asks `GET /api/info` first and drops `.tar` only when it says `sealed_folder`; an older daemon doesn't say
   it, and doesn't unpack. `POST /api/add/stream?format=tar`

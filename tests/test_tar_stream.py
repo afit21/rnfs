@@ -107,10 +107,56 @@ class BuildTarTest(unittest.TestCase):
         self.store = Blocks()
 
     def build(self, data: bytes, max_entries: int = 1000, **kwargs) -> tuple[builder.Built, dict]:
-        """(the DAG built from data, its warnings' result)."""
+        """(the DAG built from data, its warnings' result). scan_tar, which unpacking a sealed folder runs first,
+        must agree: refuse data with the same kind of error, or accept it."""
+        try:
+            tarstream.scan_tar(io.BytesIO(data), max_entries)
+            scanned = None
+        except (ValueError, NodeTooLarge) as e:
+            scanned = e
         warnings = tarstream.Warnings()
-        built = tarstream.build_tar(io.BytesIO(data), self.store.put, warnings, max_entries, **kwargs)
+        try:
+            built = tarstream.build_tar(io.BytesIO(data), self.store.put, warnings, max_entries, **kwargs)
+        except (ValueError, NodeTooLarge) as e:
+            self.assertIs(type(scanned), type(e), f"build_tar: {e!r}, scan_tar: {scanned!r}")
+            raise
+        self.assertIsNone(scanned)
         return built, warnings.result()
+
+    def test_scan_counts_allocation_units(self):
+        """scan_tar's Extent: each file and directory listing rounded up to the unit, at least one unit each (an
+        empty file, an empty directory); a file of several chunks counts each chunk and the node listing them; a
+        file replaced by a later member counts in the store only. Only headers are read."""
+        data = b"".join([member("top/a", b"x" * 5000), member("top/empty"), member("top/d", type=tarfile.DIRTYPE),
+                         member("top/big", bytes(3 * CHUNK_SIZE + 1)), member("top/a", b"y"),
+                         member("top/sym", type=tarfile.SYMTYPE, linkname="a")]) + END
+        extent = tarstream.scan_tar(io.BytesIO(data), 1000)
+        self.assertEqual(extent.sizes, [5000, 0, 3 * CHUNK_SIZE + 1, 1])
+        unit = 4096
+        listings = 3 * unit  # the root's, top's and d's, each under a unit
+        big = 3 * CHUNK_SIZE + unit + 4 * unit  # its chunks, then the node listing 4 (MAX_CHILDREN * 64 bytes)
+        self.assertEqual(extent.stored(unit), 2 * unit + unit + big + unit + listings)
+        self.assertEqual(extent.written(unit), unit + 3 * CHUNK_SIZE + unit + unit + listings)
+        cluster = 128 * 1024  # exFAT's on a large card: each chunk takes a cluster in the store, the file two
+        self.assertEqual(extent.stored(cluster), (3 + (3 + 1 + 1) + 3) * cluster)
+        self.assertEqual(extent.written(cluster), (2 + 2 + 3) * cluster)
+        self.assertEqual(tarstream.allocated(0, unit), unit)
+        self.assertEqual(tarstream.allocated(unit + 1, unit), 2 * unit)
+
+        class Counting(io.BytesIO):
+            """A stream counting the bytes read from it."""
+
+            read_bytes = 0
+
+            def read(self, size=-1):
+                """Read, counting."""
+                data = super().read(size)
+                self.read_bytes += len(data)
+                return data
+
+        stream = Counting(member("top/huge", bytes(100 * CHUNK_SIZE)) + END)
+        self.assertEqual(tarstream.scan_tar(stream, 1000).sizes, [100 * CHUNK_SIZE])
+        self.assertLess(stream.read_bytes, 100 * CHUNK_SIZE)  # the data was passed over
 
     def test_same_cid_as_add(self):
         top = tree(os.path.join(self.tmp, "top"))

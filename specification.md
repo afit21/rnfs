@@ -540,10 +540,16 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
     taken from the tar. A tar past a limit is refused (rnfs: 413, naming `--no-extract`) rather than written in
     part. The output is the tar's one top directory, or the whole tar as a directory when it holds anything else;
     without `-o` it is named by `get`'s default-name rule (section 11) after that directory (or the sealed name
-    without `.tar`). The node MUST check that its free space holds the plaintext twice where its blocks and the
-    output share a filesystem (rnfs builds the tar into its block store, then writes the files), and MUST NOT
-    pin, cache or provide those plaintext blocks: rnfs holds them in a protection session (section 8) while
-    unpacking and collects them at once after, so none stays stored unless something else keeps the same block.
+    without `.tar`). Before storing anything the node MUST check that its free space holds what the entries take
+    on disk, counted in the filesystem's allocation unit rather than in bytes, in its block store and again as
+    written where the two share a filesystem (rnfs builds the tar into its block store, then writes the files):
+    every file and directory takes at least one unit on each side (rnfs reads the tar's headers first and
+    counts each file's chunks and each directory's listing rounded up to the unit, at least 4 KiB), since a tar
+    spends only 512 bytes on an empty file or directory. It MUST NOT pin, cache or provide those plaintext
+    blocks: rnfs holds them in a protection session (section 8) while unpacking and collects them at once
+    after, so none stays stored unless something else keeps the same block; and it marks its state database
+    while an unpack runs, so a start after the process died mid-unpack collects every block nothing reaches
+    before serving anything.
     `--no-extract` writes the decrypted `.tar` instead, as `get` of a 0.1.x node does.
 
   Sealing is randomised, so a sealed file's CID can't be predicted (`--only-hash` is refused).
