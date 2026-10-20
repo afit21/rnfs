@@ -900,8 +900,11 @@ What a companion app needs from the daemon beyond the facade calls (specificatio
   `ApiHandler.caller()` answers `api.CLI` for the API token (no `X-Rnfs-App`), `"app:<name>"` for an app's token
   with `X-Rnfs-App` naming it (`AppRegistry.verify`, constant time, also for names there aren't), None
   otherwise; `dispatch` keeps it in `principal`. `proof_key()` keys `X-Rnfs-Proof` with the API token, or
-  (`X-Rnfs-App`) with `AppRegistry.proof_key` (the verifier in hex), None for an app there isn't. A node without
-  `apps` (a stand-in) lets no app in.
+  (`X-Rnfs-App`) with `AppRegistry.proof_key`: the verifier in hex, or for an app there isn't
+  HMAC-SHA256(`_secret`, name) in hex, `_secret` being random bytes made when the registry is (each start). Both
+  are computed for every name, so the answer and its time are the same whether or not the app exists, and anyone
+  who can reach the port can't list the apps (REV9). A node without `apps` (a stand-in) lets no app in and sends
+  no proof for one.
 - **Discovery.** `cli.run_daemon` writes `<rnfs dir>/daemon.json` (`apiclient.DAEMON_FILE`; `cli.write_daemon_info`,
   `fsutil.write_atomic`, 0600, private) once its servers listen and its token is written, and removes it when it
   stops if it still names its PID (`remove_daemon_info`). `apiclient.read_daemon_info` reads it without following a

@@ -60,6 +60,10 @@ Security:
   assembled may not outgrow the advertised total; a file's metadata must be a small flat map, checked before RNS
   decodes it; a page must be one flat byte string, checked from its msgpack headers before RNS decodes it. The
   daemon's process-wide decompression limit stays 0, and `rnfs.dht` links keep every rule they have.
+- **App names stay private** (specification section 11): a request naming an app that doesn't exist in
+  `X-Rnfs-App` gets an `X-Rnfs-Proof` too, keyed by an HMAC of a secret made at each start and the name, which no
+  client can check, instead of none; so every answer, the open `GET /api/status` and the 403s included, looks the
+  same whether or not the app exists, and anyone who can reach the API port can no longer list the installed apps.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves

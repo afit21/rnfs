@@ -1830,7 +1830,11 @@ gateway can never reach the API.
   accepted: holding every slot was already possible by opening connections, and the keep-open is bounded to
   exactly one more request. A request carrying `X-Rnfs-App: <name>` gets its proof keyed by that app's verifier
   (above), written as 64 lowercase hex digits, instead of the token: an app computes it from its own token, and
-  checks the proof the same way before sending that token. No proof is sent for an app the node doesn't have.
+  checks the proof the same way before sending that token. The answer MUST NOT say whether the app exists: for a
+  name the node has no app by, the proof is keyed by a value no client can know, the same for that name until the
+  node restarts (rnfs: hex(HMAC-SHA256(secret, name)), the secret 32 random bytes made at each start), so every
+  response looks the same (status, headers, body, a proof of the same length) whether or not the app exists, and
+  anyone who can reach the port can't list the installed apps. The client's check then fails as for a wrong token.
   Whoever can read the node's state could answer an app's proof while the daemon is down, and so be sent that
   app's token; they can read the CLI's token already.
 - The API never sends CORS headers.

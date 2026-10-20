@@ -4067,7 +4067,7 @@
     },
     "headers": {
       "Proof": {
-        "description": "Answer to `X-Rnfs-Challenge`: hex(HMAC-SHA256(key, \"rnfs api proof <port> <challenge>\")), key being the token, or for a request with `X-Rnfs-App` that app's verifier (hex SHA-256 of \"rnfs app token \" + token). None for an app the daemon doesn't have.",
+        "description": "Answer to `X-Rnfs-Challenge`: hex(HMAC-SHA256(key, \"rnfs api proof <port> <challenge>\")), key being the token, or for a request with `X-Rnfs-App` that app's verifier (hex SHA-256 of \"rnfs app token \" + token). For an app the daemon doesn't have, it is keyed by a value no client knows (HMAC-SHA256 of a per-start secret and the name, since 0.2.0), so the response doesn't say whether the app exists; the client's check then fails.",
         "schema": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"

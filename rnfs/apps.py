@@ -10,12 +10,19 @@ dependency.
   app (the challenge, X-Rnfs-Proof) with it (proof_key): so the token itself never has to be stored. Whoever can
   read rnfs.db could answer an app's proof in the daemon's place while it is down, and so be sent that app's
   token; they can read the rnfs directory, api_token included, already.
+- App names stay private (0.2.0 review, REV9): the proof needs no token, so proof_key keys a name there isn't
+  with HMAC-SHA256 of a random secret made at each start and the name, a key no client has: the API's answer
+  (status, headers, body, a proof of the same shape, the same each time within a start) is then the same whether
+  or not the app exists, and both are made with the same work, so neither the answer nor its time says which
+  names are installed.
 - App tokens are not scoped: an app can do anything the CLI can (export name keys, change settings, stop the
   daemon), but manage apps, which only the CLI's token may (rnfs.api).
 - remove forgets an app at once, so its token stops passing, then calls the release it is given (the node
   releases the app's pins), then deletes its row; if either fails the app is put back, to be removed again.
   Rows are written durably, one per change. A row that doesn't parse is logged and deleted at load.
 """
+import hashlib
+import hmac
 import math
 import secrets
 import threading
@@ -30,6 +37,7 @@ from rnfs.log import LOG_NOTICE, LOG_WARNING, log
 
 TOKEN_BYTES = 32  # an app token's randomness
 VERIFIER_LENGTH = 32  # bytes of apiclient.app_verifier's digest
+SECRET_BYTES = 32  # the per-start secret keying the proof of an app there isn't (proof_key)
 
 
 class AppRegistry:
@@ -39,6 +47,8 @@ class AppRegistry:
         """Load the apps saved in state_dir; a row that doesn't parse is logged and deleted."""
         self._lock = threading.Lock()
         self._apps: dict[str, tuple[bytes, float]] = {}  # name -> (verifier, created)
+        # Keys the proof for names there aren't (proof_key): new at each start, never stored or sent
+        self._secret = secrets.token_bytes(SECRET_BYTES)
         self._db = statedb.open_store(state_dir, self._load)
 
     def _load(self, db: statedb.StateDb):
@@ -102,12 +112,15 @@ class AppRegistry:
         # Compared even for an app there isn't, so the time taken doesn't say which names exist
         return secrets.compare_digest(app_verifier(token), expected) and app is not None
 
-    def proof_key(self, name: str) -> str | None:
-        """What keys the proof the API gives app name (apiclient.api_proof's token: its verifier in hex, which the
-        app computes from its token); None for an app there isn't."""
+    def proof_key(self, name: str) -> str:
+        """What keys the proof the API gives app name (apiclient.api_proof's token): its verifier in hex, which the
+        app computes from its token; for an app there isn't, HMAC-SHA256 of this start's secret and the name in hex,
+        which no client can compute, so the answer doesn't say whether the app exists."""
+        # Made for every name, and the same steps after, so the time taken doesn't say which names exist either
+        stand_in = hmac.new(self._secret, name.encode("utf-8", "surrogatepass"), hashlib.sha256).digest()
         with self._lock:
             app = self._apps.get(name)
-        return None if app is None else app[0].hex()
+        return (stand_in if app is None else app[0]).hex()
 
     def remove(self, name: str, release: Callable[[], object] = lambda: None):
         """Remove app name: its token stops passing at once, then release() runs (the node releases its pins),
