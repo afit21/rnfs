@@ -4,12 +4,14 @@
 Not a unittest module (discovery runs test_*.py only) and not run by the suite: a script the maintainer runs by
 hand. It provides --keys raw CIDs (each a complete pin of one block, through a stand-in for the storage) from a
 publisher on a state database in --dir, publishes them over a fake network of --servers servers (each lookup finds
-the K closest; every /provide is recorded), and reports:
+the K closest, a region's extra /find is answered; every /provide is recorded), and reports:
 
 - the rounds that publish them all, the region lookups they took and the bytes written (Linux: the process's write()
   total, which counts SQLite's WAL and its checkpoints), then the same for a republish of every key;
 - a wake: next_due() and publish_due() with nothing due (the median of 5), after the rounds and after a restart;
 - the database's size per key, and its pages in use per table and index (SQLite's dbstat, if compiled in);
+- the regions are sized by the network size estimate as a node's are (Publisher.set_network_size, given the
+  true server count; --no-size leaves the publisher without one);
 - with --trace, the memory the publisher holds per key (tracemalloc, which slows everything 2-3x): with the keys
   provided and never published, after the rounds, after a restart, and a round's peak.
 
@@ -104,31 +106,42 @@ class _Client:
         return set(keys)
 
 
+def _closest(servers, values, key: bytes, count: int = K) -> list[bytes]:
+    """The count of servers (sorted, values their integers) closest to key."""
+    value = int.from_bytes(key, "big")
+    at = bisect.bisect_left(values, value)
+    near = servers[max(0, at - 2 * count):at + 2 * count]
+    return sorted(near, key=lambda node: int.from_bytes(node, "big") ^ value)[:count]
+
+
 class _Lookup:
-    """A lookup finding the K servers closest to key."""
+    """A lookup finding the K servers closest to key, having learned the 3K closest on its way (a real lookup's
+    last hops answer with their K closest each); a region's extra /find is answered with the K closest to what it
+    asks about, as a server knowing that part of the network would."""
 
     def __init__(self, servers, values, key):
-        """The K of servers (sorted, values their integers) closest to key."""
-        value = int.from_bytes(key, "big")
-        at = bisect.bisect_left(values, value)
-        near = servers[max(0, at - 2 * K):at + 2 * K]
-        self.nodes = sorted(near, key=lambda node: int.from_bytes(node, "big") ^ value)[:K]
+        """A lookup for key over servers (sorted, values their integers)."""
+        self.servers, self.values = servers, values
+        self.nodes = _closest(servers, values, key)
+        self.known = dict.fromkeys(_closest(servers, values, key, 3 * K), 0)
 
     def find_closest(self):
         """The K closest."""
         return list(self.nodes)
 
     def candidates(self):
-        """The K closest, all answered."""
-        return {node: 0 for node in self.nodes}
+        """Every server learned, all answered."""
+        return dict(self.known)
 
     def remaining(self):
         """Time left: plenty."""
         return 600.0
 
     def ask(self, node_id, key):
-        """A region's extra /find: no answer."""
-        return None
+        """A region's extra /find: the K closest to key, learned too."""
+        named = _closest(self.servers, self.values, key)
+        self.known.update(dict.fromkeys(named, 0))
+        return named
 
 
 class _Clock:
@@ -183,6 +196,7 @@ def main() -> int:
     parser.add_argument("--keys", type=int, default=100_000, help="CIDs provided (default 100,000)")
     parser.add_argument("--servers", type=int, default=2000, help="servers of the fake network (default 2,000)")
     parser.add_argument("--trace", action="store_true", help="measure memory (tracemalloc; much slower)")
+    parser.add_argument("--no-size", action="store_true", help="give the publisher no network size estimate")
     parser.add_argument("--dir", help="where to put the state database (default: a new directory here)")
     args = parser.parse_args()
     RNS.loglevel = RNS.LOG_CRITICAL
@@ -210,9 +224,12 @@ def main() -> int:
                 print(f"memory {label}: {held / 1e6:.1f} MB, {held / keys:.0f} B a key", flush=True)
 
         def make() -> Publisher:
-            """A publisher on the state database."""
-            return Publisher(bytes(16), config, storage, _Records(), client,
+            """A publisher on the state database, told the network's size unless --no-size."""
+            made = Publisher(bytes(16), config, storage, _Records(), client,
                              lambda key: _Lookup(servers, values, key), False, state, clock=clock)
+            if not args.no_size:
+                made.set_network_size(lambda key: float(args.servers))
+            return made
 
         def publish_all(label: str):
             """Run rounds until nothing is due; report them."""
