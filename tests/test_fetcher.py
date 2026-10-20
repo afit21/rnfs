@@ -228,6 +228,39 @@ class ProviderDiscoveryTest(FetcherTest):
                 self.assertEqual(len(started), before + 1, wait)
                 fetch._searched_at = now[0]  # that search ended at once
 
+    def test_a_provider_unreachable_once_is_asked_again(self):
+        """Over LoRa the one provider of a file was out of reach for a minute (its rnsd restarting): failed at its
+        first unanswered path request, it was never asked again, and the fetch failed though it was back by then."""
+        built = self.file(os.urandom(2 * CHUNK_SIZE))
+        self.hold(P1)
+        tries = []
+
+        def back_after_one(cids):
+            """No path the first time."""
+            tries.append(cids)
+            return BlocksResult(FAILED, unsent=list(cids), reason="unreachable") if len(tries) == 1 else None
+        self.client.behaviour[P1] = back_after_one
+        self.runs.append([P1])
+        with mock.patch.object(fetcher_module, "UNREACHABLE_RETRY", 0.05):
+            self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertGreater(len(tries), 1)
+
+    def test_a_provider_unreachable_twice_in_a_row_fails(self):
+        built = self.file(os.urandom(CHUNK_SIZE))
+        self.hold(P1)
+        tries = []
+
+        def never(cids):
+            """No path, ever."""
+            tries.append(cids)
+            return BlocksResult(FAILED, unsent=list(cids), reason="unreachable")
+        self.client.behaviour[P1] = never
+        self.runs.append([P1])
+        with mock.patch.object(fetcher_module, "UNREACHABLE_RETRY", 0.05), self.assertRaises(NotFound):
+            self.fetch_all(built.cid)
+        self.assertEqual(len(tries), 2)
+
     def test_open_link_nodes_are_asked_first(self):
         built = self.file(os.urandom(3 * CHUNK_SIZE))
         self.hold(P1)
@@ -650,7 +683,8 @@ class ScoreTest(FetcherTest):
         self.config.max_parallel_providers = 1
         built = self.file(b"f" * 3000)
         self.hold(P3)
-        self.client.behaviour[P1] = lambda cids: BlocksResult(FAILED, unsent=list(cids), reason="unreachable")
+        # (a failure other than no path: one of those is asked again a minute later before it counts)
+        self.client.behaviour[P1] = lambda cids: BlocksResult(FAILED, unsent=list(cids), reason="request failed")
         self.client.behaviour[P2] = lambda cids: BlocksResult(OK, bad=[cids[0]], unsent=list(cids[1:]))
         self.runs.append([P1, P2, P3])
         self.listed[P2] = {P1}  # P1 listed P2, which sent nothing verified: no credit for that

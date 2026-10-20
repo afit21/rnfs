@@ -777,6 +777,10 @@ Fixed:
   no off-island server now marks its keys while the routing table holds off-island servers but none has answered or
   announced itself since the start; an island that knows of none, or a node that was heard from beyond it, marks
   nothing more than before.
+- **A provider out of reach for a minute isn't dropped from the fetch**: one no path was found to failed at once and
+  was never asked again during the fetch. Over LoRa, a fetch from a file's one provider, whose `rnsd` had just
+  restarted, failed after its search reported the provider again, back by then. A provider with no path is now asked
+  again a minute later, and fails only if it is unreachable then too.
 - **A fetch uses the provider records its own node holds** (spec section 6, Finding providers): a search started
   with nothing, though a DHT server holds records for the keys near it, and on an island a node holds the local
   replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its

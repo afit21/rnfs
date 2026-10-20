@@ -34,7 +34,8 @@ in a fetch that found none either, is remembered for UNFOUND_FOR (MAX_UNFOUND ro
 nodes, but doesn't search again within it and fails with NotFound. An explicit fetch (the user's get, cat, pin add and
 the rest of the CLI and API, a remote pin's) always searches. Only this node's own lookups set it, keyed on the root.
 
-A provider fails, and isn't used again during the fetch, when its link fails (no path, a malformed answer), it answers
+A provider fails, and isn't used again during the fetch, when its link fails (a malformed answer; no path twice in a
+row, the second try UNREACHABLE_RETRY after the first), it answers
 None for a block of the root it advertised, it is busy (refuses, or closes the link: peer_client.BUSY) max_failures
 times in a row (each retried after BUSY_DELAY), its requests go unanswered max_failures times in a row the way a lossy link loses them
 (peer_client.LOST: each has its link closed and is retried on a new one after BUSY_DELAY), or it stalls twice. When no
@@ -170,6 +171,9 @@ UNFOUND_FOR = 600
 # Searching again during a long fetch (Fetch._search_again): on a node that isn't slow, with fewer providers usable than
 # max_parallel, a search starts this long after the last one ended, the wait doubling each time up to SEARCH_AGAIN_MAX
 SEARCH_AGAIN_AFTER = 60.0
+# A provider no path was found to is asked again this long after, and fails only if it is unreachable again then: on a
+# radio a node is out of reach for a minute when its rnsd restarts or a path request is lost
+UNREACHABLE_RETRY = 60.0
 SEARCH_AGAIN_MAX = 600.0
 MAX_UNFOUND = 4096
 # Ranges (the module docstring): raw chunks declared this large or larger are fetched in ranges over slow links, and a
@@ -528,7 +532,7 @@ class _Provider:
     """What a fetch knows about one provider."""
 
     __slots__ = ("node_id", "order", "busy", "busy_until", "stalls", "lost", "failed", "path", "pacing_until",
-                 "pacing_retry", "ratio", "no_ranges")
+                 "pacing_retry", "ratio", "no_ranges", "unreached")
 
     def __init__(self, node_id: bytes, order: int, path: mesh.PathInfo = mesh.NO_PATH):
         """A provider found order-th, path hops away (looked up once, when found)."""
@@ -544,6 +548,7 @@ class _Provider:
         self.pacing_retry = 0.0  # ...and is retried after this many seconds
         self.ratio = 1.0  # the compression its last compressed /range answer achieved (ranges)
         self.no_ranges = False  # it left a /range unanswered (UNSUPPORTED): /blocks for the rest of the fetch
+        self.unreached = False  # its last request found no path to it: the next unreachable one fails it
 
 
 class Fetcher:
@@ -1862,6 +1867,8 @@ class Fetch:
             provider.lost = 0  # it answered (or failed outright)
         if result.ratio is not None:
             provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
+        if result.status not in (peer_client.FAILED, peer_client.LOST):
+            provider.unreached = False  # reached
         if result.status == peer_client.OK:
             provider.busy = 0
             if result.missing:
@@ -1903,6 +1910,12 @@ class Fetch:
                 self._fail(provider, f"{result.reason or 'no answer'} {provider.lost} times in a row")
             else:
                 provider.busy_until = now + self.fetcher.busy_delay
+        elif result.reason == "unreachable" and not provider.unreached:
+            # No path to it, once: asked again after UNREACHABLE_RETRY rather than failed for the rest of the fetch (over
+            # LoRa a fetch from its one provider failed so when the provider's rnsd restarted, a minute's outage)
+            provider.unreached = True
+            provider.busy_until = now + UNREACHABLE_RETRY
+            log(f"no path to {node_name(provider.node_id)}; asking it again in {UNREACHABLE_RETRY:.0f}s", LOG_VERBOSE)
         else:
             self._fail(provider, result.reason or "request failed")
 

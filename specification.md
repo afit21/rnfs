@@ -884,7 +884,8 @@ and repeat.
   answer for a node's next-hop interface for up to 15 seconds (each answer is an RPC to it); hops, and whether
   there is a path at all, are read fresh.
 
-  A provider *fails* when its link fails (there is no path to it, or this node closed the link under a request), its
+  A provider *fails* when its link fails (there is no path to it twice in a row, a minute apart: rnfs 0.2.0, as a
+  radio node is out of reach for a minute when its `rnsd` restarts; or this node closed the link under a request), its
   answer is malformed, it answers `None` for a block of the root it advertised, it answers `False` (busy or refused)
   or closes the link (`DESTINATION_CLOSED`, a refusal: above; asked again on a new link) `max_failures` times in a row, its requests go unanswered `max_failures` times in a row, or it stalls twice (section
   7). A `False` is retried after a short delay. A request goes *unanswered* when RNS times it out with the link up (on a
