@@ -1,9 +1,10 @@
 """H2: one anonymous view of the display-mu-file page made the node permanently pin (source "user") and
 provide content the visitor chose. The CID comes from var_cid; the page ran stat, ls, `pin add` and cat on it
 with no allowlist and no per-visitor limit. `pin add` pins USER (RnfsNode.pin_add), which the node then
-provides; and with the default provide_strategy="roots", stat/cat alone already make a cached complete fetch
-be provided, so dropping only the pin would not stop the seeding. That part is documented behaviour of
-"roots" (kept as the default by the user's decision; "pinned" avoids it), tested as such below.
+provides; and under provide_strategy="roots" (the default on a node that isn't slow: "auto"), stat/cat alone
+already make a cached complete fetch be provided, so dropping only the pin would not stop the seeding. That part is
+documented behaviour of "roots" (kept as the default by the user's decision; "pinned" avoids it, and is what a slow
+node uses by default since 0.2.0), tested as such below.
 
 The fixed page shows only the operator's own complete pins (source user or folder) and CIDs in the operator's
 allowlist file; for anything else it runs nothing but `rnfs pin ls`, which never fetches. Allowlisted CIDs are
@@ -105,12 +106,13 @@ class DisplayPagePinTest(PageTestCase):
 
     def test_stat_and_cat_of_remote_content_are_provided_under_roots(self):
         """Documented behaviour (specification section 6, "Provide strategy", and section 7, "What a node
-        serves"; README `provide_strategy`): under the default "roots", every complete download is provided,
+        serves"; README `provide_strategy`): under "roots", the default on a node that isn't slow, every complete
+        download is provided,
         including reads through `rnfs stat` and `rnfs cat`, so anyone can learn what the node fetched. That is
         why the page runs neither for CIDs it doesn't share (the test above)."""
         self.victim.stat(self.cid)  # the old page's `rnfs stat`
         b"".join(self.victim.read(self.cid))  # the old page's `rnfs cat`
-        self.assertEqual(self.victim.config.provide_strategy, "roots")
+        self.assertEqual(self.victim.publisher.strategy, "roots")  # "auto", on a node that isn't slow
         self.assertIn(self.key, self.victim.publisher.provided())
 
     def test_pinned_strategy_does_not_provide_reads(self):
