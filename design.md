@@ -565,7 +565,8 @@ iterator. `None` passes no `unknowns` (alpha per Lookup). The node passes `SLOW_
 
 `sweep.py` — no RNS. `find_region(lookup, key, own_id, members, size=None) -> Region` runs a `Lookup`'s
 `find_closest`, sets the region's prefix length p from the farthest of the `K` closest found (0 with none); with
-`size` (the network size estimate, read once the lookup has run), p is at least `size_bits(estimate)`
+`size` (the network size estimate, read once the lookup has run; `Region.heard` is kept only then), p is at least
+`size_bits(estimate)`
 (⌊log2(N ÷ `K`) − `SIZE_MARGIN`⌋, margin 1), and while the estimate is `None` the region is `single` (the key alone:
 `Region.__contains__`, nothing explored, its p not taken as `Sweep.estimate` nor by the publisher's network size).
 When `members(p)` (due keys sharing it) is 2 or more, it calls `explore` with p as found (the far half of the region
@@ -579,9 +580,11 @@ lookup's result, every candidate learned and the finds; `closest_to(key)` ranks 
 estimate)` is one round's bookkeeping, under a condition: `take()` gives the next key in the given order that is
 neither covered nor inside a claim and claims the keys sharing `estimate − 1` of its bits (everything before any
 region is known, so the first lookup runs alone), waiting while every key left is claimed; `cover(region)` covers
-the region's uncovered keys that `Region.knows` (a bisect over the sorted keys, then: its `K`-th closest candidate
-by distance within `SPARSE` (1.5) × (`K` − 1/3) × 2^128 ÷ `Region.size`, always for the key looked up or without an
-estimate; the rest are taken in turn), releases the claim and updates `estimate`;
+the region's uncovered keys that `Region.knows` (a bisect over the sorted keys, then: at most `UNSTORABLE` (2) of
+the key's `K` closest of `Region.heard` are in `Region.unstorable`, what the lookup heard of (`Lookup.heard()`, every
+path's for a `DisjointLookup`: named in any answer, also refused unknown IDs, not failed ones) but `nodes` leaves
+out as their identity isn't known; always for the key looked up, or when no more than that is unstorable at all, as
+on a node that knows every identity; the rest are taken in turn), releases the claim and updates `estimate`;
 `members`, `release`, `stop`. With disjoint paths, `find_region` also keeps each path's candidates
 (`Region.paths`, from `path_candidates()`), and `Region.path_closest(key)` gives each path's K closest together; the
 publisher fills `Region.rings` (key -> ring servers of its widened lookup) and `Region.deferred`. `Sweep.spend(limit)`
@@ -926,7 +929,8 @@ to change it). `next_due` asks the index for the earliest due row memory doesn't
 and sorts them as before (never published first, then the longest unpublished, then by key). Items published in one
 round share a due time, and never-published ones have 0, so the index hands them out in key order: a first round of
 more than `ROUND_KEYS` keys is cut into slices of the key space, which come due again as slices, and the rounds need
-no more region lookups than one would (100,000 keys on 2,000 servers: 78 + 80 lookups against 157). A round holds
+no more region lookups than one would (100,000 keys on 2,000 servers: 78 + 80 lookups against 157, with or without
+the network size estimate). A round holds
 about 2 KB per item while it runs, then lets go (`_end_round`). The first refresh looks through every row (by key,
 `SCAN_BATCH` at a time) for items no longer provided (`_unprovided_rows`), deleting rows whose item doesn't parse;
 later refreshes compare the provide sets. Added items go in `_added` and get a never-published row (`INSERT OR

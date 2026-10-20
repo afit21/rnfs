@@ -652,6 +652,20 @@ class Lookup:
         """The nodes the last run knew of and hadn't seen fail, with their distances to the key."""
         return dict(self._last_known)
 
+    def heard(self) -> set[bytes]:
+        """Every node the runs and ask() heard of that may be queried and hasn't failed: the nodes they knew of and
+        those any answer named (also one that came after its run ended), whether or not their identity is known.
+        candidates() is the part of it a store can reach without a path request; sweep providing compares the two."""
+        with self._lock:
+            heard = set(self._named_by) | self._answered
+            for nodes in self._replies.values():
+                heard.update(nodes)
+        heard.update(self._last_known)
+        # Not _usable: an unknown ID over the budget of path requests was still heard of
+        return {node_id for node_id in heard
+                if is_id(node_id) and node_id != self.own_id and node_id not in self._failed
+                and not self.exclude(node_id) and self.allowed(node_id)}
+
     def _credit(self, introducer: bytes | None, node_id: bytes):
         """node_id answered: if introducer named it and it is closer to the key, introducer's answer was useful
         (an answer of made-up IDs never is, as they don't answer). Once per introducer per lookup."""

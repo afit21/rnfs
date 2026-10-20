@@ -10,11 +10,17 @@ region rather than one per key. No RNS dependency: the lookups are made by the c
   identities (on a LoRa island, or just started) finds x's K closest among them, padded with servers it knows far
   from x: p comes out short and the region holds many due keys the lookup knows little about (topology study section
   11.3: 3.7 of their 10 closest on an island against 7.0 with a lookup per key). So the region's prefix is never
-  shorter than size_bits of the estimate (log2(N / K) less SIZE_MARGIN), the far half is still the one p as found
-  gives, and a key of the region is covered only if the region knows servers near it as densely as the estimate
-  expects (Region.knows: its K-th closest learned within SPARSE times the median distance of a K-th closest); the
-  others are looked up in turn like any key not yet covered. While there is no estimate (a node's first lookups
-  after its first start), a region is the key looked up alone.
+  shorter than size_bits of the estimate (log2(N / K) less SIZE_MARGIN), and the far half is still the one p as found
+  gives. While there is no estimate (a node's first lookups after its first start), a region is the key looked up
+  alone.
+- **Keys the region can store to.** Such a node also hears of servers near the region's keys (named in answers)
+  whose identity it doesn't know, so storing to them would cost a path request each, which its lookups budget: a key
+  of the region is covered only if at most UNSTORABLE of its K closest servers heard of are outside what the region
+  learned (Region.knows); the others are looked up in turn like any key not yet covered. A node that knows every
+  identity (one on the backbone that has heard every announce) covers every key of its regions, whatever the
+  distances: the rule compares what was heard with what can be stored to, not with the size estimate, so it costs
+  no lookups where nothing is missing (a rule from the estimate, the K-th closest within 1.5 times its median
+  distance, looked up about 8% of keys on their own there, as K-th distances spread that far by chance).
 - **The far half.** The half of the region holding x is known in full: its servers are all closer to x than the
   K-th. If the region holds 2 or more due keys, one /find goes to the known server nearest the centre of the other
   half, about that centre; a reply naming K servers inside it means there may be more, so each half of it is asked
@@ -39,7 +45,6 @@ import threading
 from collections.abc import Callable, Iterable
 
 from rnfs.constants import ID_LENGTH, K
-from rnfs.dht.density import SPACE
 from rnfs.dht.lookup import FIRST
 from rnfs.dht.routing import distance
 
@@ -52,12 +57,10 @@ REGION_FIND_TRIES = 3  # servers asked about one part, nearest its centre first,
 # shares about log2(N / K) - 0.5 bits with it, so on a network that is known well the bound seldom binds (1 bit: at
 # 1,000 servers no more lookups than without it; 0 bits: 4-11% more, for nothing measurable)
 SIZE_MARGIN = 1.0
-# A region covers a key only if its K-th closest server learned is within this many times the median distance of a
-# K-th closest among N servers (Region.knows). Measured in test_topology's world, island node at 1,000 servers: 6.6 of
-# 10 placed against 7.9 a lookup per key (2: 6.2, 1.25: 7.4; at 3,000 all three about a lookup per key's); fast
-# backbone nodes, 1,000 and 3,000 servers: 15-45% more lookups (2: 3-21%, 1.25: 32-98%); a slow one's round as many
-# keys (1.25: 8-36% fewer)
-SPARSE = 1.5
+# A region covers a key only if at most this many of its K closest servers heard of are ones it can't store to
+# (Region.knows). Measured in test_topology's world, island node at 1,000 servers: 7.0 of 10 placed against 7.8 a lookup
+# per key, 1.5 keys a region lookup (1: 7.4 in 1.3; 3: 6.6 in 2.0); at 3,000 about a lookup per key's either way
+UNSTORABLE = 2
 
 
 def prefix_length(a: bytes, b: bytes) -> int:
@@ -75,14 +78,16 @@ class Region:
     """What one region's lookup learned: the region is the keys sharing the first `bits` bits of `key`, the key looked
     up (only `key` itself if `single`: there was no network size estimate to size it by); `closest` is that lookup's
     result for it; `nodes` every server learned, each with its rank tier (dht.lookup: UNRELIABLE if unreliable and not
-    answered); `paths` each disjoint path's own (none for a single lookup); `finds` the extra /find sent; `size` the
-    network size estimate it was sized by (None: none). The publisher adds `rings` (key -> the ring servers its widened
-    lookup found) and `deferred` (keys flagged whose widened lookup the round couldn't afford)."""
+    answered); `paths` each disjoint path's own (none for a single lookup); `finds` the extra /find sent; `heard` every
+    server its lookup heard of, also those `nodes` leaves out as their identity isn't known (None: not judged). The
+    publisher adds `rings` (key -> the ring servers its widened lookup found) and `deferred` (keys flagged whose widened
+    lookup the round couldn't afford)."""
 
-    __slots__ = ("key", "bits", "closest", "nodes", "finds", "paths", "single", "size", "rings", "deferred")
+    __slots__ = ("key", "bits", "closest", "nodes", "finds", "paths", "single", "heard", "unstorable", "rings",
+                 "deferred")
 
     def __init__(self, key: bytes, bits: int, closest: list[bytes], nodes: dict[bytes, int], finds: int = 0,
-                 paths: list[dict[bytes, int]] | None = None, single: bool = False, size: float | None = None):
+                 paths: list[dict[bytes, int]] | None = None, single: bool = False, heard: set[bytes] | None = None):
         """A region found by a lookup for key."""
         self.key = key
         self.bits = bits
@@ -91,7 +96,8 @@ class Region:
         self.finds = finds
         self.paths = paths or []
         self.single = single
-        self.size = size
+        self.heard = heard
+        self.unstorable = frozenset() if heard is None else frozenset(heard - nodes.keys())
         self.rings: dict[bytes, list[bytes]] = {}
         self.deferred: set[bytes] = set()
 
@@ -102,15 +108,15 @@ class Region:
         return prefix_length(key, self.key) >= self.bits
 
     def knows(self, key: bytes) -> bool:
-        """True if the region knows servers near key, a key in it, as densely as the network size estimate (size)
-        expects: its K-th closest server learned is within SPARSE times the median distance of a K-th closest among
-        size servers. Always for the key looked up, or without an estimate."""
+        """True if the region can store key, a key in it, on its K closest servers heard of, but for at most UNSTORABLE
+        it heard of without learning their identity. Always for the key looked up, or one region that heard of no such
+        server; for a single region, only its key."""
         if self.single:
             return key == self.key
-        if key == self.key or self.size is None:
+        if key == self.key or len(self.unstorable) <= UNSTORABLE:
             return True
-        nearest = heapq.nsmallest(K, (distance(n, key) for n in self.nodes))
-        return len(nearest) == K and nearest[-1] <= SPARSE * (K - 1 / 3) * SPACE / self.size
+        nearest = heapq.nsmallest(K, self.nodes.keys() | self.unstorable, key=lambda n: distance(n, key))
+        return sum(1 for n in nearest if n in self.unstorable) <= UNSTORABLE
 
     def closest_to(self, key: bytes, count: int = K) -> list[bytes]:
         """The count servers learned closest to key, ranked as a lookup ranks them (by tier: unreliable ones that
@@ -141,8 +147,8 @@ def find_region(lookup, key: bytes, own_id: bytes, members: Callable[[int], int]
     """Run lookup (a dht.lookup.Lookup for key) and find key's region; members(bits) is how many due keys share key's
     first bits bits, so the far half is asked about only for a region of 2 or more. size() is the network size
     estimate once the lookup has run: the region's prefix is never shorter than size_bits of it, it covers only the
-    keys it knows well enough (Region.knows), and while there is no estimate (None) it is key alone. Without size, the
-    lookup alone sizes the region."""
+    keys it can store to (Region.knows, from what lookup.heard() names), and while there is no estimate (None) it is
+    key alone. Without size, the lookup alone sizes the region."""
     closest = [n for n in lookup.find_closest() if n != own_id]
     ranked = sorted(closest, key=lambda n: distance(n, key))[:K]
     # Without any server found there is nothing to learn: every due key shares the outcome (retried soon)
@@ -163,7 +169,9 @@ def find_region(lookup, key: bytes, own_id: bytes, members: Callable[[int], int]
     # A disjoint lookup's paths (rnfs.dht.disjoint), each storing to its own K closest too
     paths = [{n: tier for n, tier in path.items() if n != own_id}
              for path in getattr(lookup, "path_candidates", list)()]
-    return Region(key, bits, closest, nodes, finds, paths, single, estimate)
+    # What it heard of beyond what it can store to, judged only when sizing by the estimate (as the node does)
+    heard = lookup.heard() - {own_id} if size is not None and hasattr(lookup, "heard") else None
+    return Region(key, bits, closest, nodes, finds, paths, single, heard)
 
 
 def explore(lookup, key: bytes, bits: int, own_id: bytes) -> int:
@@ -265,7 +273,7 @@ class Sweep:
             return sum(1 for k in self._in_prefix(key, bits) if k not in self.covered)
 
     def cover(self, region: Region) -> list[bytes]:
-        """region was found (for a key take() gave): its keys not yet covered that it knows well enough (Region.knows)
+        """region was found (for a key take() gave): its keys not yet covered that it can store to (Region.knows)
         are covered by it, and returned in sorted order. Releases the key's claim; a single region's prefix doesn't
         become the estimate."""
         with self._cond:

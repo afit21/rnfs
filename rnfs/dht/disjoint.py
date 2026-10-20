@@ -210,6 +210,10 @@ class DisjointLookup:
         """Each path's own candidates()."""
         return [path.candidates() for path in self.paths]
 
+    def heard(self) -> set[bytes]:
+        """Every node a path heard of (Lookup.heard)."""
+        return set().union(*(path.heard() for path in self.paths))
+
     def ask(self, node_id: bytes, key: bytes) -> list[bytes] | None:
         """Lookup.ask, through the path that knows node_id (the first if none does)."""
         path = next((path for path in self.paths if node_id in path.candidates()), self.paths[0])
