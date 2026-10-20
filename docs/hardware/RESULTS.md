@@ -54,6 +54,14 @@ The hour after these fetches, with nothing asked of either node: the laptop tran
 had just fetched (2 keys, then 1, batched per server: about 25 identified links, to every one of the network's 12–13
 servers); the PC's was its serving, its own records and the announces it relays from the backbone.
 
+With `auto` (`d95a2d8`), the same test: the laptop fetched two 6 KB files and the following hour it made no publishing
+link at all (about 25 before) and transmitted 4.65 % of the time, all of it serving other nodes: 42 incoming links,
+26 `/provide` and 21 `/find`, from cloud nodes publishing their own keys (during the cloud feature tests). From
+Madrid the laptop is 3 hops away with no rate estimate, so it isn't a slow path, and on a network of 15 servers it
+is among a key's 10 closest (and closest senior servers) about two times in three; on a large network a slow server
+holds few records. Not changed: a long round trip alone is kept out of the slow-path rule (I2P), and ranking slow
+servers last among the senior servers would put records outside the set a searcher asks.
+
 At this rate one node's own work fills the channel: a fetch, its search running on until the root arrives, and the
 publisher storing the roots of what was just fetched (`provide_strategy = "roots"`: each cached download is
 published, an identified link to each of about 10 servers, about 6.4 s of airtime each at 1 kbit/s by the load
@@ -136,3 +144,39 @@ rnfs's to change; the API answers only after it.
 - `10763e3`: one-byte answers were logged as "-1 B" (RNS sizes a one-packet response as its msgpack length less 2).
 - A request packet can be lost when both radios transmit at once (seen twice): RNS doesn't resend a request, so it
   times out. rnfs's retries cover it; the link fix above keeps a working link that heard from the other end meanwhile.
+
+## Second round (October 21)
+
+The fixes above were deployed (laptop, PC, five cloud nodes) and the untested ones re-checked on the hardware; two
+agents ran feature and packaging tests meanwhile.
+
+- **LoRa, 3.52 kbit/s:** the laptop, slow, came up with `provide_strategy` `auto` and withdrew the records of its
+  cached downloads (12 keys a server, paced). A probe to an open link not known to answer `/range` used `/blocks`;
+  one to the PC, known to, brought a 12 KB text as one 4.8 KB bz2 range in 18.8 s, with no search. From the 0.1.6 node
+  in Sydney: the provider came from a record the laptop held ("a record held here", no search wait), its second
+  `/range` silence marked it as not answering, and `/blocks` followed on the same link (`0dafaa6`); 10 KB in 59 s.
+- **LoRa, 977 bit/s:** a fetch from the PC while its `rnsd` restarted failed after 338 s (fixed by `7bd50b7`: no path
+  once is asked again a minute later); after the fix the same sequence logged "no path …; asking it again in 60s" and
+  fetched the file 163 s in.
+- **NomadNet gateway:** a NomadNet-style client (RNS link to its destination, `/page/get.mu` then `/file/get` with
+  `var_cid`) got a 12 KB file the gateway's upgraded daemon had just fetched from the PC, bytes identical.
+- **Cloud features** (four development nodes, a gateway node and two 0.1.6 nodes): sealed files and folders
+  (recipients, a non-recipient, a 0.1.6 recipient getting a folder as `.tar`), names (publish, keep, `name sync`
+  publishing an edit within two minutes), remote pins with status (`--check`, `--served`, quotas, denied), deny lists,
+  app tokens and their pins, events, tar streams, cache, settings applied live, the path gateway with ranges and site
+  hosts, and interop with 0.1.6 all passed. Searching again (`17bc360`): with only Montreal holding a 20 MB file, Madrid
+  ran at 10–18 KB/s until it found US central and Johannesburg, which had fetched it meanwhile, then at 23–53 KB/s:
+  554 s, against about 1,230 s at its first rate. Found and fixed: a `sha256:` deny entry didn't stop a one-block file
+  being served or provided (`7958129`); the first sealed-folder unpack after a start on Montreal held its result 3
+  minutes in a collection that read the whole store (`00660d7`); `cache rm` counted an unpinned add's blocks as the
+  first CID's (`2b3318c`); the `Server` header ended in a space (`52e40c1`).
+- **Packaging** (Docker): `install.sh` from the development sdist on Ubuntu 24.04, Debian 12 and 13 (user and
+  `--system`), the `.deb` built and installed on all three with its smoke test, pipx, Python 3.11 accepted and 3.10
+  refused, and a real 0.1.6 `~/.rnfs` (pins, names, contacts, retired settings, an LXMF pin) upgraded with every
+  upgrade note holding, 0.1.6 then refusing the upgraded state database cleanly. Fixed: a missing local `RNFS_SOURCE`
+  printed a traceback, Ubuntu 22.04's Python advice named a package it doesn't have (`6760409`), `rnfs stop` waited out
+  its timeout for a daemon that had exited unreaped (`2f422ec`), and `config unset` said "saved" (`e67395d`).
+- **Starting a large node** (`5da2c3c`): each DAG node is read once (the entries walk takes what the served set's
+  walk collects) and decoded without the canonical re-encode (an equivalent shortest-header check); on a synthetic
+  565k-block store the first refresh went from 6.26 s to 3.81 s and 177.6 MB to 159.5 MB at its peak.
+
