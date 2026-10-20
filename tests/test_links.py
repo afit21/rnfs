@@ -220,6 +220,11 @@ class LinkPoolTest(unittest.TestCase):
         self.now = [1000.0]  # the pool's clock, which sweep() compares with when get() last handed a link out
         self.pool = links.LinkPool(self.identity, Config(link_idle_timeout=300), clock=lambda: self.now[0])
         self.addCleanup(self.pool.close_all)
+        # The tests here call sweep() themselves, at the times they set on the pool's clock. The sweeper thread would
+        # sweep too, whenever get() or a request's end wakes it: on a loaded machine after a test has moved the clock
+        # on, closing a link the test means to see kept, handed out again or closed by its own sweep() (rightly so,
+        # by the clock it reads). test_sweeper_closes_a_link_when_it_is_due tests the thread, on a pool of its own.
+        self.pool._start_sweeper = lambda: None
 
     def test_reuses_shared_link(self):
         first = run(self, lambda: self.pool.get(NODE))
