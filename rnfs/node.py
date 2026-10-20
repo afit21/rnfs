@@ -658,8 +658,10 @@ class RnfsNode:
         # Local scores (section 6): bootstrap nodes seeded; saved with the batched stores
         self.scores = self._add_store(Scores(config.state_dir, seeded=self._bootstrap_set()))
         # When each server's announce was first heard (section 6; for publishing and searching); saved with the
-        # batched stores
-        self.first_seen = self._add_store(FirstSeenLog(config.state_dir))
+        # batched stores. When full it keeps its senior servers (provider_seniority) until silent as long as /find
+        # replies allow (2 × announce_interval), so a flood of fresh identities can't push them out
+        self.first_seen = self._add_store(FirstSeenLog(config.state_dir, seniority=config.provider_seniority,
+                                                       silence=2 * config.announce_interval))
         # The network size estimate of the density check (section 6), from recent complete lookups; saved with the
         # batched stores, so a restart has it at once
         self.sizes = self._add_store(SizeEstimate(config.state_dir))

@@ -66,6 +66,13 @@ Security:
   row ask for a probe of an off-island server that answered or announced itself recently, as silence does: partition
   mode starts only if that probe fails (or nothing beyond the island was heard to probe). An ID that only ever failed
   is never a probe target.
+- **The announce first-seen log keeps its senior servers** (spec section 6, "Announce first-seen log"; REV7): it
+  forgot the least recently heard server first, so about 3 announces a second of fresh identities pushed every honest
+  server out between its 6-hourly announces, and none ever became senior (`provider_seniority`), which publishing and
+  searching's senior rule needs. When full it now forgets first a server silent for 2 × `announce_interval` (counted
+  from the start at the earliest), then the server not yet senior that it first heard most recently (in a flood, the
+  newcomer itself), and a senior server heard lately only when nothing else can go. At a tenth of the scale (6,553
+  rows, 200 honest servers, a fresh identity every 3.3 s for 2 days) every honest server became senior, against none.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -309,7 +316,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
 - Choosing providers: within each seniority group (seniority stays first), providers with a better local score
   are tried first, before fewer hops: a provider whose blocks verified before is preferred to an unknown one.
 - The announce first-seen log: each node records when it first heard each server's announce (at most 65,536
-  servers, the least recently heard forgotten first; about 12 MB when full), kept across restarts, and can give
+  servers, about 12 MB when full: servers silent for 2 × `announce_interval` forgotten first, then the newest not
+  yet senior, Security above), kept across restarts, and can give
   the closest servers to a key among those heard for at least `provider_seniority`, which identities generated
   next to a key can't be. Publishing and searching use it (below).
 - **Sweep providing:** republishing many keys takes far fewer lookups. One closest-nodes lookup now serves every

@@ -838,10 +838,15 @@ mode, whether or not the server enters its routing table, and keep the record ac
 in the future when loaded counts as now). Identities generated next to a key can't be old ones, so among the servers
 near a key, those first heard at least `provider_seniority` ago were there before any such identity was made for it;
 the log gives the `K` closest of them to a key, which publishers also store to and searchers ask (below). It is
-local state: nothing about it is sent. A server that announces client mode is forgotten. rnfs keeps at most 65,536
-servers, forgetting the least recently heard first (about 12 MB of memory when full), so a flood of new identities
-pushes out only servers silent longer than every one of them; announces are recorded in memory and written together
-every 30 s.
+local state: nothing about it is sent. A server that announces client mode is forgotten. A full log SHOULD NOT let
+new identities push out its senior servers: forgetting the least recently heard first would let about 3 fresh
+identities a second push out every server announcing every 6 hours between its announces, so that none ever became
+senior. rnfs keeps at most 65,536 servers (about 12 MB of memory when full) and, when full, forgets first a server
+silent for 2 × `announce_interval` (as `/find` replies leave such servers out; counted from the later of its last
+announce and the node's start, so a restart doesn't make every server silent), then the server not yet senior that
+it first heard most recently (in a flood, the newcomer itself), and only if every server is senior and heard lately
+the least recently heard. A flood can then keep new servers out while it lasts, but never takes the place of the
+servers that were already there. Announces are recorded in memory and written together every 30 s.
 
 **Identities placed next to a key.** RNS identities are free, and one closer to a key than every honest server costs
 about as many key generations as there are servers (about 4 s of one core among 10,000). `K` of them that answer

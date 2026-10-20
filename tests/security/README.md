@@ -172,3 +172,4 @@ the roadmap's "Security fixes from the 0.2.0 review".
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
 | REV4 | `test_rev4_forced_partition.py` | `rnfs/dht/local.py` (`PartitionMode.failed`, `probe_target`), `rnfs/node.py` (`_knows_server`, `_run_local`) | "Partition mode can't be forced from outside (REV4)" |
+| REV7 | `test_rev7_firstseen_seniors.py` | `rnfs/dht/firstseen.py` (`FirstSeenLog._evict`, `_victim`), `rnfs/node.py` (the log's settings) | "The announce first-seen log keeps its senior servers (REV7)" |

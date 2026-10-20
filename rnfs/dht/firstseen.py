@@ -7,9 +7,15 @@ least provider_seniority were there before any such identity was made for it. cl
 the count closest of them, for publishers to store to as well (rnfs.node's _senior_servers, a store part of the
 publisher) and searchers to ask (to come). It is local state: nothing about it is sent.
 
-- At most MAX_FIRST_SEEN servers (about 12 MB of memory when full); the least recently heard is forgotten first, so
-  a flood of new identities pushes out only servers silent longer than every one of them. A server that announces
-  client mode is forgotten (it is no longer a server; if it comes back, it is new again).
+- At most MAX_FIRST_SEEN servers (about 12 MB of memory when full). When full, it forgets first a server silent for
+  `silence` (2 × announce_interval: /find replies and closest(heard_within) leave such servers out anyway), counted
+  from the later of its last announce and the log's load, so a restart doesn't make every server silent; then the
+  server not yet senior (first heard less than `seniority`, provider_seniority, ago) that was first heard most
+  recently; and only if every server is senior and heard lately, the least recently heard. A flood of new identities
+  therefore pushes out only its own newest, and servers gone silent: forgetting the least recently heard first, as
+  0.2.0's first version did, let about 3 fresh identities a second (65,536 in 6 hours) push out every honest server
+  between its 6-hourly announces, so none ever became senior (REV7). A server that announces client mode is forgotten
+  (it is no longer a server; if it comes back, it is new again).
 - Each announce costs a dictionary update, and a sorted insert (a memory move) for a server not heard before; the
   rows changed are written together with the node's batched saves (every 30 s) and at stop, not durably, so a flood
   of announces costs one transaction per save, not one per announce. A row's last-heard time is the time of the
@@ -35,7 +41,9 @@ from rnfs import statedb
 from rnfs.constants import ID_LENGTH, K
 from rnfs.dht.routing import check_id, distance, is_id
 
-MAX_FIRST_SEEN = 65_536  # servers kept; the least recently heard is forgotten first
+MAX_FIRST_SEEN = 65_536  # servers kept (see the module docstring for which go first)
+DEFAULT_SENIORITY = 86_400.0  # seconds: the default provider_seniority
+DEFAULT_SILENCE = 2 * 6 * 3600.0  # seconds: twice the default announce_interval
 TABLE = "announce_first_seen"
 _ID_BITS = ID_LENGTH * 8
 
@@ -49,13 +57,20 @@ class FirstSeenLog:
     """When each server's announce was first heard. Thread-safe; a node.Store (save, close) given a state_dir."""
 
     def __init__(self, state_dir: str | None = None, clock: Callable[[], float] = time.time,
-                 max_rows: int = MAX_FIRST_SEEN):
-        """The log saved in state_dir (only in memory without one), on clock (Unix time)."""
+                 max_rows: int = MAX_FIRST_SEEN, seniority: float = DEFAULT_SENIORITY,
+                 silence: float = DEFAULT_SILENCE):
+        """The log saved in state_dir (only in memory without one), on clock (Unix time). When full, it keeps servers
+        first heard at least seniority seconds ago (provider_seniority) unless silent for silence seconds (2 ×
+        announce_interval)."""
         self.clock = clock
         self.max_rows = max_rows
+        self.seniority = seniority
+        self.silence = silence
         self._lock = threading.Lock()
-        self._first: OrderedDict[bytes, float] = OrderedDict()  # node ID -> first heard; least recently heard first
-        self._last: dict[bytes, float] = {}  # node ID -> last heard (as loaded: the save that wrote it)
+        self._loaded = clock()  # silence counts from here at the earliest
+        self._first: dict[bytes, float] = {}  # node ID -> first heard; in the order first heard
+        # node ID -> last heard (as loaded: the save that wrote it); least recently heard first
+        self._last: OrderedDict[bytes, float] = OrderedDict()
         self._sorted: list[bytes] = []  # the same node IDs in ascending order (as 128-bit big-endian integers)
         self._store: statedb.RowStore | None = None
         self._db = statedb.open_store(os.path.expanduser(state_dir), self._load) if state_dir else None
@@ -63,20 +78,23 @@ class FirstSeenLog:
     # Persistence
 
     def _load(self, db: statedb.StateDb):
-        """Read the saved log, least recently heard first."""
+        """Read the saved log, in the order first heard."""
         self._store = statedb.RowStore(db, TABLE, ("node",), durable=False, mode=statedb.SNAPSHOT, lock=self._lock,
                                        row=self._row)
         now = self.clock()
         changed = []
-        for node, first, last in db.query(f"SELECT node, first_heard, last_heard FROM {TABLE} ORDER BY last_heard"):
-            first, last_heard = _time(first), _time(last)
+        last = {}
+        for node, first, last_heard in db.query(f"SELECT node, first_heard, last_heard FROM {TABLE} "
+                                                "ORDER BY first_heard, node"):
+            first, last_heard = _time(first), _time(last_heard)
             if not is_id(node) or first is None or last_heard is None:
                 changed.append(node)
                 continue
             if first > now or last_heard > now:
                 changed.append(node)
             self._first[bytes(node)] = min(first, now)
-            self._last[bytes(node)] = min(max(first, last_heard), now)
+            last[bytes(node)] = min(max(first, last_heard), now)
+        self._last = OrderedDict(sorted(last.items(), key=lambda item: item[1]))
         self._sorted = sorted(self._first)
         with self._lock:
             changed += self._evict()
@@ -111,15 +129,29 @@ class FirstSeenLog:
         del self._sorted[index]
 
     def _evict(self) -> list[bytes]:
-        """Forget the least recently heard servers past max_rows (lock held); the nodes forgotten."""
+        """Forget servers past max_rows, as the module docstring says (lock held); the nodes forgotten."""
         gone = []
+        now = self.clock()
         while len(self._first) > self.max_rows:
-            node_id, _ = self._first.popitem(last=False)
-            self._last.pop(node_id, None)
+            node_id = self._victim(now)
+            del self._first[node_id]
+            del self._last[node_id]
             self._remove(node_id)
             self._changed(node_id)
             gone.append(node_id)
         return gone
+
+    def _victim(self, now: float) -> bytes:
+        """The server a full log forgets next (lock held): the least recently heard if silent for self.silence (since
+        the load at the earliest), else the most recently first heard if not yet senior, else the least recently
+        heard. First-heard order is insertion order, so if the newest is senior every other is too."""
+        oldest = next(iter(self._last))
+        if now - max(self._last[oldest], self._loaded) > self.silence:
+            return oldest
+        newest = next(reversed(self._first))
+        if self._first[newest] > now - self.seniority:
+            return newest
+        return oldest
 
     # The log
 
@@ -131,14 +163,14 @@ class FirstSeenLog:
         with self._lock:
             now = self.clock()
             if node_id in self._first:
-                self._first.move_to_end(node_id)
+                self._last.move_to_end(node_id)
             else:
                 self._first[node_id] = now
                 bisect.insort(self._sorted, node_id)
             self._last[node_id] = now
-            if len(self._first) > self.max_rows:
-                self._evict()
             self._changed(node_id)
+            if len(self._first) > self.max_rows:
+                self._evict()  # possibly node_id itself, if new
 
     def forget(self, node_id: bytes):
         """node_id announces client mode: it isn't a server any more."""

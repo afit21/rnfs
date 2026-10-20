@@ -575,16 +575,22 @@ slow nodes `SLOW_PROBE_INTERVAL`, 900 s, doubling to `SLOW_PROBE_MAX`, 7200 s, r
 (silence counts from now; if `_wanted`, enters it); `state()` (`partition`, `partition_since`).
 `on_change(active)` runs outside its lock.
 
-`firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN)`, a `node.Store`:
+`firstseen.py` — `FirstSeenLog(state_dir=None, clock=time.time, max_rows=MAX_FIRST_SEEN,
+seniority=DEFAULT_SENIORITY, silence=DEFAULT_SILENCE)` (the node passes `provider_seniority` and 2 ×
+`announce_interval`), a `node.Store`:
 `heard(node_id)` (the node's `_heard_server`, for every server-mode announce or path response, before the routing
 table), `forget(node_id)` (`_heard_client`), `first_heard(node_id)`, `len()`, and `closest(key, count=K, min_age=0,
 exclude, heard_within=None)`: the count closest to key of the servers first heard at least min_age ago (publishers
 and searchers pass `provider_seniority`), heard within `heard_within` seconds if given, not excluded (`exclude` runs
-under the log's lock). Memory: an `OrderedDict` node ID -> first heard, least recently heard first (a heard moves to
-the end; past `MAX_FIRST_SEEN`, 65,536, the front is forgotten), a dict node ID -> last heard (loaded as the
-`last_heard` the save wrote), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a
-new server at 65,536, 1 µs for one heard before, 17 µs when evicting). The IDs sharing the key's first p bits are a
-contiguous run of the sorted list, all closer to the key than any outside it: `closest` binary-searches the
+under the log's lock). Memory: a dict node ID -> first heard, in the order first heard (loaded `ORDER BY
+first_heard`), an `OrderedDict` node ID -> last heard, least recently heard first (a heard moves to the end; loaded as
+the `last_heard` the save wrote), and the same IDs in a sorted list (`bisect.insort`, a memory move: about 7 µs for a
+new server at 65,536, 1 µs for one heard before, 17 µs when evicting). Past `MAX_FIRST_SEEN`, 65,536, `_evict`
+forgets `_victim(now)` until it fits (REV7): the front of the last-heard order if silent for `silence` since
+`max(last heard, _loaded)` (`_loaded`: the construction's time), else the newest of the first-heard order if first
+heard less than `seniority` ago (if the newest is senior, all are), else the front of the last-heard order; each an
+O(1) look. With `seniority` 0 it is least recently heard first, as before the fix. The IDs sharing the key's first p
+bits are a contiguous run of the sorted list, all closer to the key than any outside it: `closest` binary-searches the
 narrowest run holding count IDs (`_run`, two bisects), then widens it a bit at a time until it holds count old
 enough, and ranks only that run (about 20 µs at 65,536). Saved in `announce_first_seen` through a SNAPSHOT
 `RowStore`: an announce only marks its row, and a row's `last_heard` is the time of the save writing it (within 30 s
