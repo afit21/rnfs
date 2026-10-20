@@ -719,10 +719,15 @@ class CliTest(SettingsBase):
         self.assertEqual(json.loads(self.run_cli("config", "get", "beta", "--json")[1])["value"], 3)
 
         code, out, _ = self.run_cli("config", "unset", "quiet_hours")
-        self.assertEqual(out, "quiet_hours: saved in rnfs.toml and applied\n")
+        self.assertEqual(out, "quiet_hours: removed from rnfs.toml and applied (its default)\n")
         self.assertEqual(self.b.config.quiet_hours, "")
         self.assertNotIn("quiet_hours", self.read())
         self.assertIn("# mine\n", self.read())
+        with open(self.toml, "a", encoding="utf-8") as f:
+            f.write("max_records = 5000\n")  # retired in 0.2.0
+        code, out, _ = self.run_cli("config", "unset", "max_records")
+        self.assertEqual((code, out), (0, "max_records: removed from rnfs.toml (it is no longer a setting)\n"))
+        self.assertNotIn("max_records", self.read())
 
         for argv in (("config", "set", "nope", "1"), ("config", "set", "max_storage", "lots"),
                      ("config", "get", "nope"), ("config", "unset", "rnfs_dir")):

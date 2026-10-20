@@ -385,18 +385,22 @@ def setting_fields(entry: dict) -> dict:
     return fields
 
 
-def print_change(result: dict, name: str):
-    """What `config set` or `config unset` did to name."""
+def print_change(result: dict, name: str, unset: bool = False):
+    """What `config set` or `config unset` (unset) did to name."""
     from rnfs import cli
+    from rnfs.config import RETIRED_SETTINGS
     cli.print_warnings(result)
-    if name in result["applied"]:
-        print(f"{printable(name)}: saved in rnfs.toml and applied")
+    done = "removed from rnfs.toml" if unset else "saved in rnfs.toml"
+    if unset and name in RETIRED_SETTINGS:
+        print(f"{printable(name)}: removed from rnfs.toml (it is no longer a setting)")
+    elif name in result["applied"]:
+        print(f"{printable(name)}: {done} and applied" + (" (its default)" if unset else ""))
     elif name in result["restart_required"]:
-        print(f"{printable(name)}: saved in rnfs.toml; restart the daemon to apply it")
+        print(f"{printable(name)}: {done}; restart the daemon to apply it")
     elif name in result["overridden"]:
-        print(f"{printable(name)}: saved in rnfs.toml, but the daemon's command line sets it, which wins")
+        print(f"{printable(name)}: {done}, but the daemon's command line sets it, which wins")
     else:
-        print(f"{printable(name)}: saved in rnfs.toml (the daemon already runs with that value)")
+        print(f"{printable(name)}: {done} (the daemon already runs with that value)")
 
 
 def run_list(args):
@@ -435,7 +439,7 @@ def run_set(args):
 def run_unset(args):
     """Remove one setting from rnfs.toml."""
     from rnfs import cli
-    print_change(cli.client(args).config_set({args.name: None}), args.name)
+    print_change(cli.client(args).config_set({args.name: None}), args.name, unset=True)
 
 
 FEATURE = SettingsFeature
