@@ -18,9 +18,9 @@ status of 0.1.6 is unchanged but LXMF's, which are gone, and error bodies gain a
 Upgrade notes:
 - **State:** the state database gains tables (`pin_times`, `pin_labels`, `name_exports`, `apps`, `block_sizes`,
   `routing`, `peer_scores`, `announce_first_seen`, `provider_standing`, `remote_pins_asked`, `remote_pins_served`,
-  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`); an older rnfs can't open it afterwards. Pins made before the
-  `name_syncs`, `name_sync_files`, `published_heal`, `remote_pin_retries`); an older rnfs can't open it
-  afterwards. Pins made before the
+  `name_syncs`, `name_sync_files`, `published_heal`, `name_announces`, `remote_pin_retries`, `publish_items`,
+  `publish_stores`); an older rnfs can't open it afterwards. The publisher's `published` and `published_earlier`
+  rows move into `publish_items` (a row per provided item), leaving those tables empty. Pins made before the
   upgrade have no `added` time, name keys made before it count as never exported (`rnfs status` lists them until
   `rnfs name export` is run), and remote pins asked before it have no status entry.
 - **LXMF:** rnfs no longer sends or receives LXMF (Removed, below). Pins of links auto-fetched over LXMF change
@@ -670,6 +670,20 @@ Faster:
   layout, took 4.2 s and 74 s. A cold cache and a slow disk should gain more, as the table is one file read in
   order: Raspberry Pi SD-card numbers are still to be measured (`tests/bench_startup.py`, `--cold` for a cache
   dropped as after a reboot).
+- The publisher's state is on disk: where and when each provided key was last published lives in the state
+  database (`publish_items`, indexed by when each is next due) and is read per round, rather than held in memory
+  for every key. A wake asks the index when the next key is due, and a round reads the due keys only, at most
+  50,000 of them (the rest in the rounds that follow at once, in slices of the key space, so the rounds need no
+  more region lookups than one would), so neither looks at every provided key; while a round runs only the stores
+  servers answered are saved, in a small table written in order, and each key's row is written once at its end.
+  Measured with `tests/bench_publisher.py` (a 2,000-server fake network, desktop NVMe disk), before → after:
+  memory per provided key 632 B → 213 B after a round and 1,326 → 187 B after a restart at 100,000 keys, 582 →
+  161 B and 1,287 → 158 B at 1M (what is left is the provide set itself: a 4 GB Raspberry Pi held about 1.5–2M
+  keys; what bounds a node now is how many it can republish a day); a wake (`next_due`, a round
+  with nothing due) 80 → 0.1 ms at 100,000 keys and about 1,100 → 0.1 ms at 1M; disk 278 → 290 B a key (the due
+  index); bytes written per round 55–83 KB → 0.8–0.95 KB a key (SQLite's WAL and checkpoints: rows are written in
+  key order, and an item's row once a round instead of at each save). A first round of 1M keys took 20 rounds of
+  50,000 and 175 region lookups, against one round of 157. Raspberry Pi SD-card numbers are still to be measured.
 
 ## 0.1.6
 

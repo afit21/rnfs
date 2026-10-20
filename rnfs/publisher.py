@@ -26,12 +26,19 @@
   from the nodes it was last published to, at once (paced on slow nodes), and from nodes of earlier rounds (or
   of a round cut short) whose record may not have expired yet: the closest set changes as nodes come and go.
 
-Last-published nodes and times, earlier rounds' nodes and pending withdrawals are persisted in the state
-database (rnfs.statedb: the published, published_earlier and withdrawals tables), each save writing only the
-items and nodes changed since the last, so a restart doesn't republish what isn't due. A CID whose lookup found
-no node at all (nothing was sent) is retried after RETRY_INTERVAL rather than a whole republish interval; one
-whose round was stopped before every node was sent its keys stays due. Times are wall clock: any in the future
-(the clock was corrected) count as now.
+- **State on disk.** What each provided item was last published to, and when, lives in the state database rather
+  than in memory (rnfs.statedb: publish_items, a row per provided item with the time it is next due, indexed), and is
+  read per round: a round reads the due rows, the most overdue first and at most ROUND_KEYS of them, and a wake asks
+  the index for the earliest due time, so neither looks at the whole provided set; what memory holds per provided
+  item is the provide set itself. Changes are kept in memory until the next save (the existing durability points: a
+  refresh that changed the provide set, every SAVE_EVERY_NODES nodes or SAVE_EVERY_SECONDS of a round, its end, the
+  node's stop), which writes them in one transaction (not durably: NORMAL). A round writes each item it published
+  once, at its end; while it runs, only the stores servers answered are saved (publish_stores, a small row each), so a
+  crash in a round still leaves where it stored, merged into the items' rows at the next start. Pending withdrawals
+  stay in memory, saved with the rest (withdrawals). A restart doesn't republish what isn't due. A CID whose lookup
+  found no node at all (nothing was sent) is retried after RETRY_INTERVAL rather than a whole republish interval; one
+  whose round was stopped before every node was sent its keys stays due. Times are wall clock: when the clock goes
+  back (by more than CLOCK_SLACK), times after it are brought back to it.
 
 - **Feature keys** (DhtKey, e.g. kept names) are republished at max(republish interval, KEY_MIN_INTERVAL),
   with a fixed jitter of up to +-KEY_JITTER from the key's first byte, so they don't all come due in one burst
@@ -55,8 +62,10 @@ whose round was stopped before every node was sent its keys stays due. Times are
 """
 import hashlib
 import math
+import struct
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Callable
 
@@ -81,6 +90,16 @@ KEY_JITTER = 0.1  # +-10% of the interval, fixed per first byte of the key (256 
 # crash loses at most that much of it (a record no saved state lists can't be withdrawn: it lives PROVIDER_TTL)
 SAVE_EVERY_NODES = 10
 SAVE_EVERY_SECONDS = 30.0
+# Due items a round takes at most, the most overdue first (never published ones by key, so a large first round's
+# items come due again in slices of the key space, each region's together, and later rounds need no more lookups
+# than one round would): memory for a round stays bounded however many keys are due. A round holds about 2 KB per
+# key while it runs (about 100 MB at most)
+ROUND_KEYS = 50_000
+# The wall clock going back by more than this brings the times after it back to it (a full pass over the items);
+# less is left: a time a few seconds ahead only delays a republish by as much
+CLOCK_SLACK = 60.0
+READ_BATCH = 500  # items read from the state database in one query (well within SQLite's variable limit)
+SCAN_BATCH = 10_000  # rows the first refresh reads at a time looking for items no longer provided
 # Slow nodes: a closest-nodes lookup is several /find exchanges (alpha 1, a few hops), seconds of airtime at
 # LoRa rates. One per 30 s keeps republishing a hundred keys to well under 1% of a day's airtime per hour
 SLOW_LOOKUP_PACE = 30.0
@@ -123,7 +142,9 @@ SERVERS_PER_REGION = 12.5
 # about 500 servers the estimate no longer changes (every key is a region of its own), so this is the cautious end
 UNKNOWN_NETWORK = 1000
 REGION_SMOOTHING = 16  # the network size estimate follows region sizes as a running mean over about this many
-META_STORE = "publisher"  # its meta values: "region_bits" (that mean), "entries_on" (the last decision)
+# Its meta values: "region_bits" (that mean), "entries_on" (the last decision), "interval" (the republish interval the
+# items' due times were computed with) and "clock" (the latest wall-clock time the rows may hold)
+META_STORE = "publisher"
 
 
 def _in_order(items: list, work: Callable, should_stop: Callable[[], bool], parallel: int):
@@ -316,11 +337,12 @@ def _ids(blob) -> list[bytes]:
 
 def import_published(value: dict, tx) -> int:
     """Import published.json (statedb.migrate): its last rounds, earlier rounds' nodes and pending withdrawals
-    replace the published, published_earlier and withdrawals tables. Each entry is checked as rnfs 0.1.4 loaded
-    it, one of the wrong shape being skipped, and node IDs, keys and DhtKeys must be ID_LENGTH bytes; times are
-    kept as written (the load clamps them and drops earlier nodes past PROVIDER_TTL). Returns the number of rows
-    imported."""
-    for table in ("published", "published_earlier", "withdrawals"):
+    replace the publisher's rows (publish_items, through the published and published_earlier tables rnfs 0.1.x kept,
+    which statedb.move_published empties again, and withdrawals). Each entry is checked as rnfs 0.1.4 loaded it, one
+    of the wrong shape being skipped, and node IDs, keys and DhtKeys must be ID_LENGTH bytes; times are kept as
+    written (the load clamps them, and earlier nodes past PROVIDER_TTL are dropped as rows are read). Returns the
+    number of rows imported."""
+    for table in ("published", "published_earlier", "withdrawals", "publish_items"):
         tx.execute(f"DELETE FROM {table}")
     published: dict[str, tuple[float, bytes]] = {}
     for text, record in value.get("published", {}).items():
@@ -353,56 +375,181 @@ def import_published(value: dict, tx) -> int:
     tx.executemany("INSERT INTO published (item, at, nodes) VALUES (?, ?, ?)", rows[0])
     tx.executemany("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", rows[1])
     tx.executemany("INSERT INTO withdrawals (node, key) VALUES (?, ?)", rows[2])
+    statedb.move_published(tx)
     return sum(len(table) for table in rows)
 
 
+def _item_id(item: ProvidedItem) -> bytes:
+    """item as publish_items keys it: a CID's binary form, or KEY_ITEM_PREFIX and a DhtKey's key."""
+    return statedb.KEY_ITEM_PREFIX + item.key if isinstance(item, DhtKey) else item.binary
+
+
+def _from_id(blob) -> ProvidedItem:
+    """The item publish_items' item names (_item_id). Raises ValueError."""
+    if not isinstance(blob, bytes):
+        raise ValueError(f"not an item: {blob!r}")
+    if blob[:1] == statedb.KEY_ITEM_PREFIX:
+        if len(blob) != 1 + ID_LENGTH:
+            raise ValueError(f"not a provided key: {blob!r}")
+        return DhtKey(blob[1:])
+    return Cid.from_bytes(blob)
+
+
+def _maybe_item(blob) -> ProvidedItem | None:
+    """The item publish_items' item names, or None if it is malformed."""
+    try:
+        return _from_id(blob)
+    except ValueError:
+        return None
+
+
+def _optional_time(value) -> float | None:
+    """A saved time that may be NULL; ValueError if it is neither."""
+    return None if value is None else _time(value)
+
+
+class _Item:
+    """What the publisher knows of one provided item, a publish_items row: when it was last published (at, None if
+    never or that round was cut short) and to which servers (nodes), other servers that may still hold a record of it
+    with when it was stored there (earlier), when it is tried again sooner than its republish (retry, or None), and
+    whether its last round reached no server beyond the island (heal)."""
+
+    __slots__ = ("at", "nodes", "earlier", "retry", "heal")
+
+    def __init__(self, at: float | None = None, nodes: list[bytes] | None = None,
+                 earlier: dict[bytes, float] | None = None, retry: float | None = None, heal: bool = False):
+        """An item's state; by default one never published."""
+        self.at = at
+        self.nodes = nodes if nodes is not None else []
+        self.earlier = earlier if earlier is not None else {}
+        self.retry = retry
+        self.heal = heal
+
+    @classmethod
+    def from_row(cls, at, retry, nodes, earlier, heal, now: float) -> "_Item":
+        """The state a row's columns hold; times after now (the clock went back) read as now, and earlier servers
+        whose record has expired (PROVIDER_TTL) are left out. Raises ValueError (or TypeError) if a column is
+        malformed."""
+        if not isinstance(earlier, bytes) or len(earlier) % (ID_LENGTH + statedb.ITEM_TIME.size) or heal not in (0, 1):
+            raise ValueError("malformed earlier servers or mark")
+        at, retry = _optional_time(at), _optional_time(retry)
+        servers: dict[bytes, float] = {}
+        step = ID_LENGTH + statedb.ITEM_TIME.size
+        for i in range(0, len(earlier), step):
+            stored = _time(statedb.ITEM_TIME.unpack_from(earlier, i + ID_LENGTH)[0])
+            if now - stored < PROVIDER_TTL:
+                servers[earlier[i:i + ID_LENGTH]] = min(stored, now)
+        return cls(None if at is None else min(at, now), _ids(nodes), servers, retry, bool(heal))
+
+    def row(self, item: ProvidedItem, due: float) -> tuple:
+        """The publish_items row of item in this state, due at due."""
+        earlier = b"".join(node + statedb.ITEM_TIME.pack(at) for node, at in self.earlier.items())
+        return (item.key, _item_id(item), due, self.at, self.retry, b"".join(self.nodes), earlier, int(self.heal))
+
+
 _ITEM, _NODE, _META = "item", "node", "meta"  # the kinds of key _PublishState writes
+# Its markers: what else a save writes
+_ADDED, _STORES, _ROUND_END = (("marker", "added"), ("marker", "stores"), ("marker", "round end"))
+_MISSING = object()  # Publisher._items has no entry for an item
 
 
 class _PublishState(statedb.RowStore):
-    """The publisher's tables and its meta values, saved together (not durably: NORMAL) in one transaction. A key is
-    (_ITEM, item), whose published, published_earlier and published_heal rows are written again, (_NODE, node ID),
-    whose withdrawals rows are, or (_META, name), the meta value name (META_STORE)."""
+    """The publisher's rows and its meta values, saved together (not durably: NORMAL) in one transaction. A key is
+    (_ITEM, item), whose publish_items row is written again as Publisher._items holds it (deleted if None), (_NODE,
+    node ID), whose withdrawals rows are, (_META, name), the meta value name (META_STORE), or a marker: _ADDED (the
+    items refresh() added get a row if they have none), _STORES (the round's stores so far go to publish_stores) or
+    _ROUND_END (publish_stores is emptied: the round's items have their rows).
+
+    Once a save is written, the items it wrote that haven't changed since leave Publisher._items (unless the round in
+    progress holds them): the database has them as memory did."""
 
     def __init__(self, db: statedb.StateDb, publisher: "Publisher"):
         """The saves of publisher's state, whose lock guards it."""
-        super().__init__(db, "published", ("item",), durable=False, mode=statedb.SNAPSHOT, lock=publisher._lock)
+        super().__init__(db, "publish_items", ("key",), durable=False, mode=statedb.SNAPSHOT, lock=publisher._lock)
         self.publisher = publisher
 
-    def snapshot(self, keys) -> tuple:
-        """The rows of keys (lock held): (item texts, published rows, earlier rows, node IDs, withdrawal rows, meta
-        values)."""
+    def is_dirty(self, key) -> bool:
+        """True if key changed and isn't written yet (lock held)."""
+        return key in self._dirty
+
+    def snapshot(self, keys) -> dict:
+        """What a write of keys writes, taken under the lock: the items written ("items"), their rows ("rows") and
+        those deleted ("deleted"), the batches of items refresh() added and the provide set then ("added",
+        "provided"), the round's stores so far ("stores", how many "stored", their rows "store_rows", and the round
+        whose item list they include, if they do: "listed"), whether the round ended ("round_end"), the node IDs and
+        their withdrawal rows ("nodes", "withdrawals") and the meta values ("meta")."""
         publisher = self.publisher
         items = [key for kind, key in keys if kind == _ITEM]
+        rows, deleted = [], []
+        for item in items:
+            state = publisher._items.get(item, _MISSING)
+            if state is None:
+                deleted.append((item.key,))
+            elif state is not _MISSING:
+                rows.append(state.row(item, publisher._due_of(item, state)))
+        added = list(publisher._added) if _ADDED in keys else []
+        stores, store_rows, listed = publisher._stores, [], None
+        if _STORES in keys and stores:
+            if not publisher._round_listed:
+                # The round's items, once, so each server's row needs only their places
+                listed = publisher._round_number
+                store_rows.append((b"", 0.0, b"".join(bytes([len(item_id)]) + item_id
+                                                      for item_id in map(_item_id, publisher._round_order))))
+            index = publisher._round_index
+            store_rows += [(node, at, struct.pack(f">{len(items)}I", *(index[item] for item in items)))
+                           for node, at, items in stores]
         nodes = [key for kind, key in keys if kind == _NODE]
-        texts = {item: str(item) for item in items}
-        published = [(texts[item], publisher._published[item][0], b"".join(publisher._published[item][1]))
-                     for item in items if item in publisher._published]
-        marked = {item for item in items if item in publisher._published and item in publisher._heal}
-        heal = [(texts[item],) for item in marked]
-        # Only an item ever marked may have a published_heal row to delete
-        unmarked = [(texts[item],) for item in items if item in publisher._heal_rows and item not in marked]
-        earlier = [(texts[item], node, at) for item in items for node, at in publisher._earlier.get(item, {}).items()]
         withdrawals = [(node, key) for node in nodes for key in publisher._withdrawals.get(node, ())]
         meta = [(name, publisher._meta_value(name)) for kind, name in keys if kind == _META]
-        return list(texts.values()), published, earlier, nodes, withdrawals, meta, heal, unmarked
+        if rows or store_rows or added:
+            publisher._latest = max(publisher._latest, publisher.clock())
+            meta.append(("clock", publisher._latest))  # every time written is at most this
+        return {"items": items, "rows": rows, "deleted": deleted, "added": added, "provided": publisher._provided,
+                "stores": stores, "stored": len(stores) if _STORES in keys else 0, "store_rows": store_rows,
+                "listed": listed, "round_end": _ROUND_END in keys, "nodes": nodes,
+                "withdrawals": withdrawals, "meta": meta}
 
-    def write_rows(self, tx, snapshot: tuple):
-        """Replace the rows of the snapshot's items and nodes, and its meta values, inside transaction tx."""
-        texts, published, earlier, nodes, withdrawals, meta, heal, unmarked = snapshot
-        for name, value in meta:
+    def write_rows(self, tx, snapshot: dict):
+        """Write the snapshot inside transaction tx."""
+        rows, deleted, added, provided = snapshot["rows"], snapshot["deleted"], snapshot["added"], snapshot["provided"]
+        for name, value in snapshot["meta"]:
             if value is None:
                 tx.execute("DELETE FROM meta WHERE store = ? AND key = ?", (META_STORE, name))
             else:
                 statedb.set_meta(tx, META_STORE, name, value)
-        tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in texts])
-        tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in texts])
-        tx.executemany("DELETE FROM published_heal WHERE item = ?", unmarked)
-        tx.executemany("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", published)
-        tx.executemany("INSERT OR REPLACE INTO published_heal (item) VALUES (?)", heal)
-        tx.executemany("INSERT OR REPLACE INTO published_earlier (item, node, at) VALUES (?, ?, ?)", earlier)
-        tx.executemany("DELETE FROM withdrawals WHERE node = ?", [(node,) for node in nodes])
-        tx.executemany("INSERT OR REPLACE INTO withdrawals (node, key) VALUES (?, ?)", withdrawals)
+        # Each in the table's order: a transaction changing more pages than SQLite's cache holds writes some of them
+        # more than once in random order, many times in all (a round's rows: about 20x)
+        tx.executemany("DELETE FROM publish_items WHERE key = ?", sorted(deleted))
+        tx.executemany("INSERT OR REPLACE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
+                       " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", sorted(rows))
+        # A new item's row says it was never published; one already there (a restart) is kept. Items no longer
+        # provided (removed since) get none
+        gone = {key for (key,) in deleted}
+        new = sorted((item.key, _item_id(item)) for batch in added for item in batch
+                     if item in provided and item.key not in gone)
+        tx.executemany("INSERT OR IGNORE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
+                       " VALUES (?, ?, 0, NULL, NULL, x'', x'', 0)", new)
+        if snapshot["round_end"]:
+            tx.execute("DELETE FROM publish_stores")
+        tx.executemany("INSERT INTO publish_stores (node, at, items) VALUES (?, ?, ?)", snapshot["store_rows"])
+        tx.executemany("DELETE FROM withdrawals WHERE node = ?", [(node,) for node in snapshot["nodes"]])
+        tx.executemany("INSERT OR REPLACE INTO withdrawals (node, key) VALUES (?, ?)", snapshot["withdrawals"])
+
+    def written(self, snapshot: dict):
+        """The snapshot was committed: forget what it wrote that hasn't changed since."""
+        publisher = self.publisher
+        stores, stored = snapshot["stores"], snapshot["stored"]
+        with self.lock:
+            for item in snapshot["items"]:
+                if (item not in publisher._round and not self.is_dirty((_ITEM, item))
+                        and item in publisher._items):
+                    del publisher._items[item]
+            done = {id(batch) for batch in snapshot["added"]}
+            publisher._added = [batch for batch in publisher._added if id(batch) not in done]
+            if stored and stores is publisher._stores:
+                del stores[:stored]
+            if snapshot["listed"] is not None and snapshot["listed"] == publisher._round_number:
+                publisher._round_listed = True
 
 
 class Publisher:
@@ -472,12 +619,22 @@ class Publisher:
         # (generation(), deny list's CID set, keys, strategy, what entries depend on) of the last full refresh;
         # None: the next computes
         self._inputs: tuple | None = None
-        self._published: dict[ProvidedItem, tuple[float, list[bytes]]] = {}  # item -> (when, nodes that recorded it)
-        # Other nodes that may still hold our record of an item (earlier rounds' closest nodes, or a round cut
-        # short), with when it was stored there; withdrawn from too, and forgotten once PROVIDER_TTL has passed
-        self._earlier: dict[ProvidedItem, dict[bytes, float]] = {}
+        # The items' state changed since the last save, and that of the items the round in progress holds (_round),
+        # over what the state database has (publish_items): item -> its state, or None if its row is to go
+        self._items: dict[ProvidedItem, _Item | None] = {}
+        self._round: set[ProvidedItem] = set()  # items of the round in progress, kept in _items until it ends
+        # The round's stores not saved yet (publish_stores): (server, when it answered, the items it recorded)
+        self._stores: list[tuple[bytes, float, list[ProvidedItem]]] = []
+        self._round_stored: set[ProvidedItem] = set()  # the round's items a server recorded
+        self._round_order: list[ProvidedItem] = []  # the round's items in order, and each one's place in it
+        self._round_index: dict[ProvidedItem, int] = {}
+        self._round_listed = False  # whether publish_stores lists the round's items
+        self._round_number = 0  # counts rounds, so a save of an earlier round's list isn't taken for this one's
+        self._added: list[frozenset[ProvidedItem]] = []  # items refresh() added, to get a row at the next save
+        self._synced = False  # whether a refresh has looked for rows of items no longer provided (the first does)
+        self._latest = 0.0  # the latest clock time seen (CLOCK_SLACK), and saved ("clock")
+        self._due_interval: float | None = None  # the republish interval the rows' due times were computed with
         self._withdrawals: dict[bytes, set[bytes]] = {}  # node -> keys to withdraw from it
-        self._retry_at: dict[ProvidedItem, float] = {}  # items whose last lookup found no nodes
         self._next_lookup = 0.0  # slow nodes: clock time before which no lookup round starts
         # ... at most this far from now (a wall clock corrected backwards): a full round's pacing, or the last stretched
         self._pace_cap = SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
@@ -486,13 +643,16 @@ class Publisher:
         self._widening: tuple[Flags, Widen] | None = None  # set_widening
         self._sizes: Callable[[bytes], float | None] | None = None  # set_network_size
         self._islands = None  # set_islands: the node's partition mode (rnfs.dht.local.PartitionMode), if any
-        self._heal: set[ProvidedItem] = set()  # items whose last round reached no off-island server (persisted)
-        self._heal_rows: set[ProvidedItem] = set()  # items that may have a published_heal row (ever marked)
         # Functions returning the non-CID keys features provide (add_key_source); polled by refresh()
         self._key_sources: list[Callable[[], set[bytes]]] = []
-        # Writes what changed since the last save (_touch_item, _touch_node), when persisted
+        # Writes what changed since the last save (_touch_item, _touch_node); without a state directory, to a
+        # private in-memory database
         self._store: _PublishState | None = None
-        self._db = None if state_dir is None else statedb.open_store(state_dir, self._load)
+        if state_dir is None:
+            self._db = statedb.connect_memory(("statedb", "publisher", "publisher_heal", "publisher_on_disk"))
+            self._load(self._db)
+        else:
+            self._db = statedb.open_store(state_dir, self._load)
 
     def add_key_source(self, source: Callable[[], set[bytes]]):
         """Also provide the keys source() returns (DhtKeys), recomputed at each refresh(). Must not block."""
@@ -514,66 +674,14 @@ class Publisher:
     # Persistence
 
     def _load(self, db: statedb.StateDb):
-        """Load last-published times and nodes, earlier rounds' nodes and pending withdrawals. Rows of the wrong
-        shape are skipped (logged) and deleted; those the load changes (times clamped, earlier nodes past
-        PROVIDER_TTL dropped) are marked changed, so the next save writes them as memory has them."""
-        self._store = _PublishState(db, self)
+        """Load pending withdrawals and the meta values, and make the items' rows ready to be read per round: the
+        stores of a round a crash ended are merged into them, and if the clock has gone back since they were written
+        (or the republish interval isn't the one their due times were computed with) they are brought up to date.
+        Withdrawal rows of the wrong shape are skipped (logged) and deleted by the next save; malformed item rows are
+        skipped (and rewritten) as rounds read them."""
+        self._db, self._store = db, _PublishState(db, self)
         now = self.clock()
-
-        def when(number) -> float:
-            """A saved time, clamped to now; ValueError if it isn't a finite number."""
-            return min(_time(number), now)
-
-        doomed: set = set()  # item texts whose rows are deleted here: they don't parse, or aren't as str() writes
         malformed = 0
-
-        def item_of(text) -> ProvidedItem | None:
-            """The item a row's text names, or None if it doesn't parse (counted and doomed)."""
-            nonlocal malformed
-            try:
-                item = _item(text)
-            except (ValueError, TypeError):
-                malformed += 1
-                doomed.add(text)
-                return None
-            if str(item) != text:  # deleted, and written again as str() writes it
-                doomed.add(text)
-                self._touch_item(item)
-            return item
-
-        marked = {text for (text,) in db.query("SELECT item FROM published_heal")}
-        for text, at, nodes in db.query("SELECT item, at, nodes FROM published"):
-            item = item_of(text)
-            if item is None:
-                continue
-            try:
-                self._published[item] = (when(at), _ids(nodes))
-            except (ValueError, TypeError, OverflowError):
-                malformed += 1
-                self._touch_item(item)
-                continue
-            if text in marked:
-                self._heal.add(item)
-                self._heal_rows.add(item)
-                marked.discard(text)
-            if self._published[item][0] != at:
-                self._touch_item(item)
-        for text, node, stored in db.query("SELECT item, node, at FROM published_earlier"):
-            item = item_of(text)
-            if item is None:
-                continue
-            try:
-                if not isinstance(node, bytes) or len(node) != ID_LENGTH:
-                    raise ValueError(f"not a node ID: {node!r}")
-                stored_at = when(stored)
-            except (ValueError, TypeError, OverflowError):
-                malformed += 1
-                self._touch_item(item)
-                continue
-            if now - stored_at < PROVIDER_TTL:
-                self._earlier.setdefault(item, {})[node] = stored_at
-            if stored_at != stored or now - stored_at >= PROVIDER_TTL:
-                self._touch_item(item)
         for node, key in db.query("SELECT node, key FROM withdrawals"):
             if not all(isinstance(value, bytes) and len(value) == ID_LENGTH for value in (node, key)):
                 malformed += 1
@@ -586,15 +694,132 @@ class Publisher:
         self._entries_on = db.meta(META_STORE, "entries_on") == 1
         if malformed:
             log(f"publisher: ignoring {plural(malformed, 'malformed row')} in the state database", LOG_WARNING)
-        if doomed:
-            with db.transaction() as tx:
-                tx.executemany("DELETE FROM published WHERE item = ?", [(text,) for text in doomed])
-                tx.executemany("DELETE FROM published_earlier WHERE item = ?", [(text,) for text in doomed])
-        # Marks of items without a published row (or one doomed) mean nothing
-        marked |= doomed & {text for (text,) in db.query("SELECT item FROM published_heal")}
-        if marked:
-            with db.transaction() as tx:
-                tx.executemany("DELETE FROM published_heal WHERE item = ?", [(text,) for text in marked])
+        malformed += self._merge_stores(db, now)
+        interval, latest = db.meta(META_STORE, "interval"), db.meta(META_STORE, "clock")
+        if _is_number(interval):
+            self._due_interval = float(interval)
+        self._latest = float(latest) if _is_number(latest) else math.inf  # unknown: as if the clock had gone back
+        with self._lock:
+            self._clamp(now)
+            self._check_interval()
+
+    def _merge_stores(self, db: statedb.StateDb, now: float) -> int:
+        """Merge the stores a round saved as it went (publish_stores, left by a crash in it) into their items' earlier
+        servers, and queue withdrawals of those whose item has no row (it stopped being provided meanwhile), in one
+        transaction. Returns how many rows were malformed (skipped)."""
+        rows = db.query("SELECT node, at, items FROM publish_stores ORDER BY rowid")
+        if not rows:
+            return 0
+        stored: dict[bytes, dict[bytes, float]] = defaultdict(dict)  # item -> server -> when
+        malformed = 0
+        listed: list[bytes] = []  # the round's items, from its first row
+        for node, at, items in rows:
+            try:
+                if not isinstance(node, bytes) or not isinstance(items, bytes):
+                    raise ValueError(f"not a store: {node!r}")
+                if node == b"":
+                    listed, i = [], 0
+                    while i < len(items):
+                        listed.append(items[i + 1:i + 1 + items[i]])
+                        _from_id(listed[-1])
+                        i += 1 + items[i]
+                    continue
+                if len(node) != ID_LENGTH or len(items) % 4:
+                    raise ValueError(f"not a store: {node!r}")
+                when = min(_time(at), now)
+                ids = [listed[n] for n in struct.unpack(f">{len(items) // 4}I", items)]
+            except (ValueError, TypeError, IndexError):
+                malformed += 1
+                continue
+            for item_id in ids:
+                stored[item_id][node] = max(when, stored[item_id].get(node, when))
+        found = {}
+        keys = [_from_id(item_id).key for item_id in stored]
+        for start in range(0, len(keys), READ_BATCH):
+            batch = keys[start:start + READ_BATCH]
+            found.update({row[0]: row for row in db.query(
+                "SELECT key, item, due, at, retry, nodes, earlier, heal FROM publish_items WHERE key IN "
+                f"({', '.join('?' * len(batch))})", batch)})
+        merged = []
+        with self._lock:
+            for item_id, servers in stored.items():
+                item = _from_id(item_id)
+                row = found.get(item.key)
+                if row is None:
+                    for node in servers:
+                        self._withdrawals.setdefault(node, set()).add(item.key)
+                        self._touch_node(node)
+                    continue
+                try:
+                    state = _Item.from_row(*row[3:], now)
+                except (ValueError, TypeError):
+                    state = _Item()  # malformed: never published, so republished soon
+                    malformed += 1
+                for node, at in servers.items():
+                    state.earlier[node] = max(at, state.earlier.get(node, at))
+                merged.append(state.row(item, row[2]))
+        with db.transaction() as tx:
+            tx.executemany("INSERT OR REPLACE INTO publish_items (key, item, due, at, retry, nodes, earlier, heal)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", sorted(merged))
+            tx.execute("DELETE FROM publish_stores")
+        log(f"publisher: the last round was cut short; kept where it stored {plural(len(stored), 'key')}", LOG_NOTICE)
+        return malformed
+
+    def _check_interval(self):
+        """If the republish interval isn't the one the rows' due times were computed with, compute them again. Lock
+        held."""
+        if self._due_interval != self.interval:
+            self._recompute()
+
+    def _clamp(self, now: float):
+        """If the wall clock has gone back (by more than CLOCK_SLACK) since a time was saved or seen, bring every
+        time after now back to now (retries to now + retry_interval), so republishing and pacing don't stall until
+        the clock catches up. Lock held."""
+        if now < self._latest - CLOCK_SLACK:
+            self._recompute(now)
+            self._latest = now
+            self._touch_meta("clock")
+        self._latest = max(self._latest, now)
+        self._next_lookup = min(self._next_lookup, now + self._pace_cap)
+
+    def _recompute(self, clamp_to: float | None = None):
+        """Compute the rows' due times again with the republish interval (and first, with clamp_to, bring their times
+        after it back to it: retries to clamp_to + retry_interval), in one transaction, and the same in memory: a pass
+        over every row, writing only those that change. Lock held.
+
+        A direct write: a save in progress may land after it, but only with rows of items memory still holds (_items),
+        which the next save writes again as they are now."""
+        interval = self.interval
+        due = "CASE WHEN retry IS NOT NULL THEN retry WHEN at IS NULL THEN 0 ELSE at + ? END"
+        with self._db.transaction() as tx:
+            if clamp_to is not None:
+                retry = clamp_to + self.retry_interval
+                # Earlier servers' times are brought back as rows are read (_Item.from_row)
+                tx.execute("UPDATE publish_items SET at = MIN(at, ?), retry = MIN(retry, ?) WHERE at > ? OR retry > ?",
+                           (clamp_to, retry, clamp_to, retry))
+            tx.execute(f"UPDATE publish_items SET due = {due} WHERE item >= x'01' AND due != {due}", (interval, interval))
+            # A DhtKey's interval is its own (key_interval)
+            changed = []
+            for item_id, saved, at, retry_at in tx.execute(
+                    "SELECT item, due, at, retry FROM publish_items WHERE item < x'01'").fetchall():  # a scan: rare
+                try:
+                    item = _from_id(item_id)
+                    state = _Item(_optional_time(at), retry=_optional_time(retry_at))
+                except (ValueError, TypeError):
+                    continue  # written again when a round reads it
+                if self._due_of(item, state) != saved:
+                    changed.append((self._due_of(item, state), item.key))
+            tx.executemany("UPDATE publish_items SET due = ? WHERE key = ?", changed)
+        for item, state in self._items.items():
+            if state is None:
+                continue
+            if clamp_to is not None:
+                state.at = None if state.at is None else min(state.at, clamp_to)
+                state.retry = None if state.retry is None else min(state.retry, clamp_to + self.retry_interval)
+                state.earlier = {node: min(at, clamp_to) for node, at in state.earlier.items()}
+            self._touch_item(item)
+        self._due_interval = interval
+        self._touch_meta("interval")
 
     def save(self):
         """Persist the publish state changed since the last save, if any. Called without the lock: it is written
@@ -609,7 +834,7 @@ class Publisher:
             self._db.close()
 
     def _touch_item(self, item: ProvidedItem):
-        """Note that item's published or earlier entry changed, for the next save. Caller holds the lock."""
+        """Note that item's state (in _items) changed, for the next save. Caller holds the lock."""
         if self._store is not None:
             self._store.changed((_ITEM, item))
 
@@ -624,11 +849,95 @@ class Publisher:
             self._store.changed((_META, name))
 
     def _meta_value(self, name: str):
-        """The meta value name as saved (META_STORE): "region_bits" (None while there is no estimate), or
-        "entries_on" (1 or 0). Lock held."""
+        """The meta value name as saved (META_STORE): "region_bits" (None while there is no estimate), "entries_on"
+        (1 or 0), "interval" or "clock". Lock held."""
         if name == "region_bits":
             return self._region_bits_mean
+        if name == "interval":
+            return self._due_interval
+        if name == "clock":
+            return self._latest
         return int(self._entries_on)
+
+    # Item states: _items over the state database
+
+    def _due_of(self, item: ProvidedItem, state: _Item) -> float:
+        """When item, in state, is next due: its retry if any, else its last publish plus its republish interval, or
+        0 if never published."""
+        if state.retry is not None:
+            return state.retry
+        if state.at is None:
+            return 0.0
+        return state.at + self.interval_for(item)
+
+    def _read(self, items: Iterable[ProvidedItem]) -> dict[ProvidedItem, _Item]:
+        """The states the state database holds of items (none for one without a row; a malformed row reads as never
+        published, and is written again). Lock held."""
+        wanted = {item.key: item for item in items}
+        found: dict[ProvidedItem, _Item] = {}
+        if not wanted:
+            return found
+        now = self.clock()
+        keys = list(wanted)
+        for start in range(0, len(keys), READ_BATCH):
+            batch = keys[start:start + READ_BATCH]
+            for key, *columns in self._db.query(
+                    f"SELECT key, at, retry, nodes, earlier, heal FROM publish_items WHERE key IN "
+                    f"({', '.join('?' * len(batch))})", batch):
+                item = wanted[key]
+                found[item] = self._parse(item, columns, now)
+        return found
+
+    def _parse(self, item: ProvidedItem, columns, now: float) -> _Item:
+        """item's state from its row's columns (at, retry, nodes, earlier, heal); a malformed row reads as never
+        published, kept in _items so the next save writes it again (logged). Lock held."""
+        try:
+            return _Item.from_row(*columns, now)
+        except (ValueError, TypeError):
+            log(f"publisher: ignoring a malformed row for {item} in the state database", LOG_WARNING)
+            state = self._items[item] = _Item()
+            self._touch_item(item)
+            return state
+
+    def _peek(self, item: ProvidedItem) -> _Item | None:
+        """item's state, from memory or the state database (None if it has none), without keeping it. Lock held."""
+        state = self._items.get(item, _MISSING)
+        if state is _MISSING:
+            return self._read([item]).get(item)
+        return state
+
+    def _get(self, item: ProvidedItem) -> _Item:
+        """The state of item, a provided item, kept in _items (to change it: then _touch_item, or to hold it for the
+        round in progress); one never published if it has none. Lock held."""
+        state = self._items.get(item)
+        if state is None:
+            state = self._read([item]).get(item) if item not in self._items else None
+            state = self._items[item] = state if state is not None else _Item()
+        return state
+
+    def states(self) -> dict[ProvidedItem, dict]:
+        """Every provided item's state, read whole (for tests and diagnostics, not for a running node's use): item ->
+        {"at": last published or None, "nodes": servers that recorded it then, "earlier": {server: when stored},
+        "retry": when it is tried again sooner or None, "heal": marked for the heal republish, "due": when next due}."""
+        with self._lock:
+            now = self.clock()
+            states: dict[ProvidedItem, _Item] = {}
+            for item_id, *columns in self._db.query("SELECT item, at, retry, nodes, earlier, heal FROM publish_items"):
+                try:
+                    item = _from_id(item_id)
+                    states[item] = _Item.from_row(*columns, now)
+                except (ValueError, TypeError):
+                    continue
+            for item, state in self._items.items():
+                if state is None:
+                    states.pop(item, None)
+                else:
+                    states[item] = state
+            for item in self._provided:
+                states.setdefault(item, _Item())  # added, its row not written yet
+            return {item: {"at": state.at, "nodes": list(state.nodes), "earlier": dict(state.earlier),
+                           "retry": state.retry, "heal": state.heal, "due": self._due_of(item, state)}
+                    for item, state in states.items() if item in self._provided}
 
     # The provide set
 
@@ -843,11 +1152,11 @@ class Publisher:
         """Recompute what is provided (after pins, fetches, evictions); withdraw what no longer is, at once.
 
         Skipped when generation(), the deny list, the key sources' keys and the strategy are as at the last
-        refresh that computed: the same inputs give the same sets, so nothing would be added or removed.
-        removed also takes in _published, but _published stays within _provided between refreshes: a refresh
-        drops from _published what it doesn't provide, only refresh() changes _provided, and a round records
-        only items still in _provided. _load fills _published before any refresh, so the first refresh after
-        construction always computes (as does the first after add_key_source).
+        refresh that computed: the same inputs give the same sets, so nothing would be added or removed. The state
+        database holds a row for exactly the items provided (once a save has written what a refresh changed): the
+        first refresh looks through its rows for items no longer provided (removed while the node was stopped: a
+        setting, the deny list), later ones only compare the provide sets. The first refresh after construction
+        always computes (as does the first after add_key_source).
         """
         with self._lock:
             keys, denied = self._keys(), self.storage.deny.cids  # the deny set is swapped whole
@@ -860,30 +1169,66 @@ class Publisher:
                     and last[0] == inputs[0] and last[2:] == inputs[2:]):
                 return
             provided, served = self._compute(keys, denied)
-            removed = (set(self._provided) | set(self._published)) - provided
+            removed = set(self._provided - provided)
+            if not self._synced:
+                removed |= self._unprovided_rows(provided)
             added = provided - self._provided
             self._provided, self._served = provided, served
+            now = self.clock()
+            states = {item: self._items[item] for item in removed if item in self._items}
+            states.update(self._read(item for item in removed if item not in self._items))
             for cid in removed:
-                self._retry_at.pop(cid, None)
-                self._heal.discard(cid)
                 self.providers.withdraw(cid.key, self.own_id)
-                record = self._published.pop(cid, None)
-                earlier = self._earlier.pop(cid, {})
-                if record is not None or earlier:
-                    self._touch_item(cid)
-                for node_id in set(record[1] if record else []) | set(earlier):
+                state = states.get(cid)
+                self._items[cid] = None  # its row (if any) goes at the next save
+                self._touch_item(cid)
+                if state is None:
+                    continue
+                earlier = {node for node, at in state.earlier.items() if now - at < PROVIDER_TTL}
+                for node_id in set(state.nodes) | earlier:
                     self._withdrawals.setdefault(node_id, set()).add(cid.key)
                     self._touch_node(node_id)
+            if added:
+                self._added.append(added)  # each gets a row at the next save, unless it has one
+                self._store.changed(_ADDED)
             # The keys withdrawals are queued for, gathered once: most added items have none to cancel
             pending = {key for keys in self._withdrawals.values() for key in keys} if added else set()
-            cancelled = [cid for cid in added if self._provide_again(cid, pending)]
+            for cid in added:
+                self._provide_again(cid, pending)
+            self._synced = True
             self._inputs = inputs  # only once everything above is done: an exception computes again next time
             if removed:
                 log(f"no longer providing {plural(len(removed), 'CID')}", LOG_VERBOSE)
-        if removed or cancelled:
+        if removed or added:
             self.save()
-        if removed or any(self._is_due(cid, self.clock()) for cid in added):
             self.wake()
+
+    def _unprovided_rows(self, provided: frozenset[ProvidedItem]) -> set[ProvidedItem]:
+        """The items with a row in the state database that aren't in provided, read SCAN_BATCH rows at a time; rows
+        whose item doesn't parse are deleted. Lock held."""
+        found: set[ProvidedItem] = set()
+        malformed: list[tuple[bytes]] = []
+        after = b""
+        while True:
+            rows = self._db.query("SELECT key, item FROM publish_items WHERE key > ? ORDER BY key LIMIT ?",
+                                  (after, SCAN_BATCH))
+            for key, item_id in rows:
+                try:
+                    item = _from_id(item_id)
+                    if item.key != key:
+                        raise ValueError("not its key")
+                except ValueError:
+                    malformed.append((key,))
+                    continue
+                if item not in provided:
+                    found.add(item)
+            if len(rows) < SCAN_BATCH:
+                break
+            after = rows[-1][0]
+        if malformed:
+            log(f"publisher: ignoring {plural(len(malformed), 'malformed row')} in the state database", LOG_WARNING)
+            statedb.delete_rows(self._db, "publish_items", ("key",), malformed)
+        return found
 
     def _provide_again(self, cid: ProvidedItem, pending: set[bytes]) -> bool:
         """cid is provided (again): record ourselves locally and cancel withdrawals of its key still queued;
@@ -905,7 +1250,7 @@ class Publisher:
             keys.discard(key)
             if not keys:
                 del self._withdrawals[node_id]
-            earlier = self._earlier.setdefault(cid, {})
+            earlier = self._get(cid).earlier
             earlier[node_id] = max(now, earlier.get(node_id, now))
             self._touch_node(node_id)
             self._touch_item(cid)
@@ -919,23 +1264,10 @@ class Publisher:
         self._wake.set()
 
     def _is_due(self, cid: ProvidedItem, now: float) -> bool:
-        """True if cid should be (re)published now (lock held or not; reads are atomic)."""
-        retry = self._retry_at.get(cid)
-        if retry is not None:
-            return now >= retry
-        record = self._published.get(cid)
-        return record is None or now - record[0] >= self.interval_for(cid)
-
-    def _clamp(self, now: float):
-        """Bring times after now back to now (the wall clock was corrected backwards), so republishing and
-        pacing don't stall until the clock catches up. Caller holds the lock."""
-        for cid, (when, nodes) in list(self._published.items()):
-            if when > now:
-                self._published[cid] = (now, nodes)
-                self._touch_item(cid)
-        for cid, retry in list(self._retry_at.items()):
-            self._retry_at[cid] = min(retry, now + self.retry_interval)
-        self._next_lookup = min(self._next_lookup, now + self._pace_cap)
+        """True if cid should be (re)published now."""
+        with self._lock:
+            state = self._peek(cid)
+            return state is None or self._due_of(cid, state) <= now
 
     def pace_lookups(self, count: int) -> float:
         """Slow nodes: may count lookups outside publishing (a search's fallback over disjoint paths) start now? 0.0 if
@@ -951,47 +1283,152 @@ class Publisher:
             return 0.0
 
     def next_due(self) -> float:
-        """Seconds until something is due (0 if now); withdrawals pending count as due (paced on slow nodes)."""
+        """Seconds until something is due (0 if now); withdrawals pending count as due (paced on slow nodes). Asks the
+        state database's index for the earliest due time, over what memory holds changed."""
         now = self.clock()
         with self._lock:
             self._clamp(now)
+            self._check_interval()
             waits = []
             if any(self._withdrawals.values()):
                 if not self.slow_node:
                     return 0.0
                 waits.append(0.0)
-            for cid in self._provided:
-                retry = self._retry_at.get(cid)
-                record = self._published.get(cid)
-                if retry is not None:
-                    waits.append(retry - now)
-                elif record is None:
-                    waits.append(0.0)
-                else:
-                    waits.append(record[0] + self.interval_for(cid) - now)
+            if self._added:
+                waits.append(0.0)  # items added whose rows aren't written yet: perhaps never published
+            held = {item.key for item in self._items}
+            if self._synced:
+                # The earliest row memory doesn't hold changed (rows are of provided items only)
+                for key, due in self._db.query("SELECT key, due FROM publish_items ORDER BY due LIMIT ?",
+                                               (len(held) + 1,)):
+                    if key not in held:
+                        waits.append(due - now)
+                        break
+            for item, state in self._items.items():
+                if state is not None and item in self._provided:
+                    waits.append(self._due_of(item, state) - now)
             wait = min(waits, default=MAX_WAIT)
             if self.slow_node and waits:
                 wait = max(wait, self._next_lookup - now)  # lookups and withdrawals paced
         return max(0.0, wait)
 
+    def _take_due(self, now: float) -> list[ProvidedItem]:
+        """The items due now, never published first, then the longest unpublished, at most ROUND_KEYS, their states
+        held in _items for the round (_round). Read from the state database through its due index, over what memory
+        holds changed. Lock held."""
+        found: dict[ProvidedItem, _Item] = {}
+        if not self._synced:
+            return []  # nothing is provided before the first refresh
+        # In the due index's order (no sort): items published in one round share a due time, and the index holds the
+        # table's key after it, so they come in key order, and never published ones too
+        rows = self._db.query("SELECT item, at, retry, nodes, earlier, heal FROM publish_items WHERE due <= ?"
+                              " ORDER BY due LIMIT ?", (now, ROUND_KEYS))
+        for item_id, *columns in rows:
+            try:
+                item = _from_id(item_id)
+            except ValueError:
+                continue  # deleted by the next start's first refresh
+            if item in self._items:
+                continue  # memory's state wins
+            if item not in self._provided:
+                # A row left of an item no longer provided (a save that failed): it goes at the next save
+                self._items[item] = None
+                self._touch_item(item)
+                continue
+            found[item] = self._parse(item, columns, now)
+        for item, state in self._items.items():
+            if state is not None and item in self._provided and self._due_of(item, state) <= now:
+                found[item] = state
+        due = sorted(found, key=lambda item: (found[item].at if found[item].at is not None else -math.inf,
+                                              item.key))[:ROUND_KEYS]
+        for item in due:
+            self._items.setdefault(item, found[item])
+        self._round = set(due)
+        self._round_order, self._round_index = due, {item: n for n, item in enumerate(due)}
+        return due
+
+    def _slack(self, now: float, skip) -> float:
+        """How long republishing may slip before a published item not in skip (this round's) would go unrepublished
+        past PROVIDER_TTL / 2: PROVIDER_TTL / 2 - max(its age, its interval) at its smallest (PROVIDER_TTL / 2 with
+        none). Lock held.
+
+        The smallest is the oldest publish's or the longest interval's, so it reads the oldest rows (as many as skip
+        and memory hold, plus one) and the DhtKeys' (a feature's few keys; CIDs share one interval), never every
+        item's: a slow node's own, which provides few keys."""
+        held = {item.key for item in self._items}
+        candidates: dict[ProvidedItem, float] = {}
+        rows = self._db.query("SELECT item, at FROM publish_items WHERE at IS NOT NULL ORDER BY at LIMIT ?",
+                              (len(held) + len(skip) + 1,))
+        rows += self._db.query("SELECT item, at FROM publish_items WHERE at IS NOT NULL AND item < x'01'")
+        for item_id, at in rows:
+            item = _maybe_item(item_id)
+            if item is not None and item.key not in held and item not in skip and _is_number(at):
+                candidates[item] = min(float(at), candidates.get(item, at))
+        for item, state in self._items.items():
+            if state is not None and state.at is not None and item not in skip and item in self._provided:
+                candidates[item] = state.at
+        # Is any CID published (and not skipped)? Among one more published CID than skip and memory hold, one is
+        cids = any(not isinstance(item, DhtKey) for item in candidates) or any(
+            item is not None and item.key not in held and item not in skip for item in (
+                _maybe_item(item_id) for (item_id,) in self._db.query(
+                "SELECT item FROM publish_items WHERE at IS NOT NULL AND item >= x'01' LIMIT ?",
+                (len(held) + len(skip) + 1,))))
+        oldest = min(candidates.values(), default=None)
+        longest = max([self.interval_for(item) for item in candidates] + ([self.interval] if cids else []),
+                      default=None)
+        if oldest is None and longest is None:
+            return PROVIDER_TTL / 2
+        return PROVIDER_TTL / 2 - max(now - oldest if oldest is not None else 0.0, longest or 0.0)
+
+    def _end_round(self, finished: bool):
+        """The round ended (finished: it reached its end; else it raised): memory lets go of the states it held that
+        haven't changed. A round that raised has the items servers recorded written whole at the next save, so where
+        they were stored isn't only in publish_stores. Lock held."""
+        if not finished:
+            for item in self._round_stored:
+                if self._items.get(item) is not None:
+                    self._touch_item(item)
+        if self._round_stored:
+            # Every store is in its item's row now (or a withdrawal): publish_stores is emptied in the same save
+            self._stores = []
+            self._store.changed(_ROUND_END)
+        for item in self._round:
+            if not self._store.is_dirty((_ITEM, item)):
+                self._items.pop(item, None)
+        self._round, self._round_stored, self._round_order, self._round_index = set(), set(), [], {}
+        self._round_listed = False
+        self._round_number += 1
+
     def publish_due(self, should_stop: Callable[[], bool] = lambda: False) -> dict:
-        """One publishing round: provide every due CID and send pending withdrawals, batched per node.
+        """One publishing round: provide every due CID (the ROUND_KEYS most overdue) and send pending withdrawals,
+        batched per node.
 
         Returns {"published": CIDs published, "nodes": nodes contacted, "withdrawn": keys withdrawn, "lookups":
         region lookups run, "finds": extra /find their regions sent, "widened": widened lookups run for keys the
-        density check flagged}.
+        density check flagged}. One round at a time.
         """
+        if self._added:
+            self.save()  # the rows of items a refresh added, so they are read with the rest
         now = self.clock()
+        with self._lock:
+            self._clamp(now)
+            self._check_interval()
+            paced = self.slow_node and now < self._next_lookup
+            due = [] if paced else self._take_due(now)
+        finished = False
+        try:
+            result = self._publish(due, paced, now, should_stop)
+            finished = True
+            return result
+        finally:
+            with self._lock:
+                self._end_round(finished)
+
+    def _publish(self, due: list[ProvidedItem], paced: bool, now: float, should_stop: Callable[[], bool]) -> dict:
+        """publish_due's round over due (its items, in order; none if paced), started at now."""
         islands = self._islands
         partitioned = islands is not None and islands.active  # at the round's start (or its end, below)
         with self._lock:
-            self._clamp(now)
-            # Never published first, then the longest unpublished: what pacing defers is the least urgent
-            due = sorted((cid for cid in self._provided if self._is_due(cid, now)),
-                         key=lambda item: (self._published.get(item, (float("-inf"),))[0], item.key))
-            paced = self.slow_node and now < self._next_lookup
-            if paced:
-                due = []
             limit = None
             if self.slow_node:
                 # Servers only withdrawals reach cost a lookup's worth each: while any are queued, up to half the
@@ -1049,10 +1486,7 @@ class Publisher:
                 if spent:
                     # Stretched while the channel is busy (self.stretch), never past PROVIDER_TTL / 2 for a record this
                     # round doesn't republish
-                    slack = min((PROVIDER_TTL / 2 - max(now - when, self.interval_for(item))
-                                 for item, (when, _) in self._published.items() if item not in closest),
-                                default=PROVIDER_TTL / 2)
-                    wait = self.stretch(SLOW_LOOKUP_PACE * spent, slack)
+                    wait = self.stretch(SLOW_LOOKUP_PACE * spent, self._slack(now, closest))
                     self._pace_cap = max(SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS, wait)
                     self._next_lookup = self.clock() + wait
         accepted: dict[ProvidedItem, list[bytes]] = {cid: [] for cid in closest}
@@ -1087,19 +1521,25 @@ class Publisher:
             cids, withdrawn, recorded, answered = outcome
             sent_withdrawals[node_id] = withdrawn
             with self._lock:
+                kept = []
                 for cid in cids:
                     if cid.key not in recorded:
                         continue
                     accepted[cid].append(node_id)
-                    # Remembered at once, and saved every few nodes, so a round cut short by a crash still
-                    # leaves a record of where it stored, to withdraw from (the round's end settles the rest)
+                    # Remembered at once, and saved every few nodes (publish_stores), so a round cut short by a crash
+                    # still leaves a record of where it stored, to withdraw from (the round's end writes each item's
+                    # row)
                     if cid in self._provided:
-                        earlier = self._earlier.setdefault(cid, {})
+                        earlier = self._get(cid).earlier
                         earlier[node_id] = max(answered, earlier.get(node_id, answered))
-                        self._touch_item(cid)
+                        kept.append(cid)
                     else:
                         self._withdrawals.setdefault(node_id, set()).add(cid.key)
                         self._touch_node(node_id)
+                if kept:
+                    self._stores.append((node_id, answered, kept))
+                    self._round_stored.update(kept)
+                    self._store.changed(_STORES)
             missed = sum(1 for cid in cids if cid.key not in recorded)
             if missed:
                 log(f"{node_name(node_id)} didn't record {plural(missed, 'key')}", LOG_VERBOSE)
@@ -1125,32 +1565,34 @@ class Publisher:
                         self._withdrawals.setdefault(node_id, set()).add(cid.key)
                         self._touch_node(node_id)
                     continue
-                if not nodes:
-                    self._retry_at[cid] = self.clock() + self.retry_interval
-                    continue
-                self._retry_at.pop(cid, None)
+                state = self._get(cid)
                 self._touch_item(cid)
+                if not nodes:
+                    state.retry = self.clock() + self.retry_interval
+                    continue
+                state.retry = None
                 if islands is not None:
-                    marked = self._mark_heal(cid, nodes, accepted[cid], partitioned or islands.active)
+                    marked = self._mark_heal(state, nodes, accepted[cid], partitioned or islands.active)
                     if marked and partitioned and not islands.active:
                         # Partition mode ended while this round ran, after heal() made the marks due: due again
-                        self._retry_at[cid] = now
+                        state.retry = now
                 # Nodes this round didn't store it on may still hold an earlier record: withdrawn from too
-                earlier = {n: t for n, t in self._earlier.pop(cid, {}).items() if now - t < PROVIDER_TTL}
-                previous = self._published.pop(cid, None)
-                for node_id in (previous[1] if previous else []):
-                    earlier[node_id] = max(previous[0], earlier.get(node_id, previous[0]))
+                earlier = {n: t for n, t in state.earlier.items() if now - t < PROVIDER_TTL}
+                if state.at is not None:
+                    for node_id in state.nodes:
+                        earlier[node_id] = max(state.at, earlier.get(node_id, state.at))
                 if all(node_id in sent_withdrawals for node_id in nodes):
-                    self._published[cid] = (now, accepted[cid])
+                    state.at, state.nodes = now, accepted[cid]
                     for node_id in accepted[cid]:
                         earlier.pop(node_id, None)
                 else:
                     # Stopped before every node was sent its keys: left due (unpublished), keeping where it went
+                    state.at, state.nodes = None, []
                     for node_id in accepted[cid]:
                         earlier[node_id] = max(now, earlier.get(node_id, now))
                     unfinished.append(cid)
-                if earlier:
-                    self._earlier[cid] = earlier
+                state.earlier = earlier
+            self._end_round(True)
         published = [cid for cid in closest if cid not in unfinished]
         if closest or sent_withdrawals:
             self.save()
@@ -1165,38 +1607,55 @@ class Publisher:
                 "withdrawn": sum(len(keys) for keys in sent_withdrawals.values()), "lookups": lookups, "finds": finds,
                 "widened": sweep.widened}
 
-    def _mark_heal(self, item: ProvidedItem, nodes: list[bytes], accepted: list[bytes], partitioned: bool) -> bool:
-        """Mark item for the heal republish if its round (store set nodes, accepted those that may hold it) reached
-        no off-island server, in partition mode or after trying one; clear the mark if it reached one. True if it is
-        marked now. Lock held."""
+    def _mark_heal(self, state: _Item, nodes: list[bytes], accepted: list[bytes], partitioned: bool) -> bool:
+        """Mark an item (its state) for the heal republish if its round (store set nodes, accepted those that may
+        hold it) reached no off-island server, in partition mode or after trying one; clear the mark if it reached
+        one. True if it is marked now. Lock held."""
         islands = self._islands
         if any(not islands.is_local(node_id) for node_id in accepted):
-            self._heal.discard(item)
+            state.heal = False
             return False
         if partitioned or any(not islands.is_local(node_id) for node_id in nodes):
-            self._heal.add(item)
-            self._heal_rows.add(item)
-            return True
-        return item in self._heal
+            state.heal = True
+        return state.heal
 
     def heal(self) -> int:
         """Partition mode ended: every item marked (its last round reached no off-island server) is due now, so the
         rounds that follow (paced on slow nodes as ever) republish it beyond the island. Returns how many."""
         now = self.clock()
         with self._lock:
-            marked = [item for item in self._heal if item in self._provided]
-            for item in marked:
-                self._retry_at[item] = now
+            marked = self._marked()
+            if marked:
+                with self._db.transaction() as tx:  # a direct write, as _recompute's
+                    tx.execute("UPDATE publish_items SET retry = ?, due = ? WHERE heal != 0", (now, now))
+                for item, state in self._items.items():
+                    if state is not None and state.heal and item in self._provided:
+                        state.retry = now
+                    if state is not None:
+                        self._touch_item(item)
         if marked:
-            log(f"partition mode ended: republishing {plural(len(marked), 'key')} stored only on the island",
-                LOG_NOTICE)
+            log(f"partition mode ended: republishing {plural(marked, 'key')} stored only on the island", LOG_NOTICE)
             self.wake()
-        return len(marked)
+        return marked
 
     def heal_marked(self) -> int:
         """How many provided items are marked for the heal republish."""
         with self._lock:
-            return sum(1 for item in self._heal if item in self._provided)
+            return self._marked()
+
+    def _marked(self) -> int:
+        """How many provided items are marked for the heal republish: the marked rows (an index of their own), with
+        memory's states over theirs. Lock held."""
+        if not self._synced:
+            return 0  # nothing is provided before the first refresh
+        count = self._db.query("SELECT COUNT(*) FROM publish_items WHERE heal != 0")[0][0]
+        held = [item.key for item in self._items]
+        for start in range(0, len(held), READ_BATCH):
+            batch = held[start:start + READ_BATCH]
+            count -= self._db.query(f"SELECT COUNT(*) FROM publish_items WHERE heal != 0 AND key IN "
+                                    f"({', '.join('?' * len(batch))})", batch)[0][0]
+        return count + sum(1 for item, state in self._items.items()
+                           if state is not None and state.heal and item in self._provided)
 
     def _learn_network_size(self, regions: list[Region]):
         """Fold the prefix lengths of regions a round found (those that found a server) into the running mean the

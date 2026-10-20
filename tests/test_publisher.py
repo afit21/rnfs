@@ -1,5 +1,6 @@
 """Tests for the provide strategy, batched publishing, republishing and withdrawal (rnfs/publisher.py)."""
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -28,6 +29,43 @@ OWN = bytes(16)
 N1, N2, N3 = (bytes([i]) * 16 for i in (1, 2, 3))
 
 setUpModule, tearDownModule = quiet_log()
+
+
+def saved_state(state: str) -> dict:
+    """The publisher's tables in state: {"published": {item: (at, nodes)} of the items published, "earlier": {(item,
+    node): at}, "withdraw": {node: {key, ...}}, "heal": {item, ...}, "retry": {item: when}}, items as str() writes
+    them."""
+    withdraw: dict[bytes, set[bytes]] = {}
+    for node, key in state_rows(state, "SELECT node, key FROM withdrawals"):
+        withdraw.setdefault(node, set()).add(key)
+    saved: dict = {"published": {}, "earlier": {}, "withdraw": withdraw, "heal": set(), "retry": {}}
+    step = 16 + 8
+    for item_id, at, retry, nodes, earlier, heal in state_rows(
+            state, "SELECT item, at, retry, nodes, earlier, heal FROM publish_items"):
+        item = str(publisher_module._from_id(item_id))
+        if at is not None:
+            saved["published"][item] = (at, nodes)
+        for i in range(0, len(earlier), step):
+            saved["earlier"][(item, earlier[i:i + 16])] = struct.unpack(">d", earlier[i + 16:i + step])[0]
+        if heal:
+            saved["heal"].add(item)
+        if retry is not None:
+            saved["retry"][item] = retry
+    return saved
+
+
+def held_state(publisher: Publisher) -> dict:
+    """What publisher holds, its tables with what memory holds changed over them (Publisher.states), shaped as
+    saved_state reads the tables."""
+    with publisher._lock:
+        states = publisher.states()
+        return {"published": {str(item): (state["at"], b"".join(state["nodes"])) for item, state in states.items()
+                              if state["at"] is not None},
+                "earlier": {(str(item), node): at for item, state in states.items()
+                            for node, at in state["earlier"].items()},
+                "withdraw": {node: set(keys) for node, keys in publisher._withdrawals.items() if keys},
+                "heal": {str(item) for item, state in states.items() if state["heal"]},
+                "retry": {str(item): state["retry"] for item, state in states.items() if state["retry"] is not None}}
 
 
 class FakeLookup:
@@ -211,25 +249,16 @@ class PublisherCase(unittest.TestCase):
         return publisher
 
     def saved(self) -> dict:
-        """The publisher's tables: {"published": {item: (at, nodes)}, "earlier": {(item, node): at},
-        "withdraw": {node: {key, ...}}}."""
-        withdraw: dict[bytes, set[bytes]] = {}
-        for node, key in state_rows(self.state, "SELECT node, key FROM withdrawals"):
-            withdraw.setdefault(node, set()).add(key)
-        return {"published": {item: (at, nodes) for item, at, nodes in
-                              state_rows(self.state, "SELECT item, at, nodes FROM published")},
-                "earlier": {(item, node): at for item, node, at in
-                            state_rows(self.state, "SELECT item, node, at FROM published_earlier")},
-                "withdraw": withdraw}
+        """The publisher's tables (saved_state)."""
+        return saved_state(self.state)
 
     def held(self, publisher: Publisher) -> dict:
-        """What publisher holds in memory, shaped as saved() reads the tables."""
-        with publisher._lock:
-            return {"published": {str(item): (at, b"".join(nodes))
-                                  for item, (at, nodes) in publisher._published.items()},
-                    "earlier": {(str(item), node): at for item, nodes in publisher._earlier.items()
-                                for node, at in nodes.items()},
-                    "withdraw": {node: set(keys) for node, keys in publisher._withdrawals.items() if keys}}
+        """What publisher holds, in memory and its tables (held_state)."""
+        return held_state(publisher)
+
+    def saved_in(self, state: str) -> dict:
+        """The publisher's tables in another state directory (saved_state)."""
+        return saved_state(state)
 
     def withdrawn(self) -> dict[bytes, set[bytes]]:
         """The keys withdrawn from each node by the calls made so far."""
@@ -328,6 +357,73 @@ class PublisherTest(PublisherCase):
         restarted.refresh()
         self.assertEqual(restarted.publish_due()["published"], [])
         self.assertEqual(self.client.calls, [])
+
+    def test_memory_holds_no_item_between_rounds(self):
+        """Once a round's state is saved, memory holds nothing of each item but the provide set: the state database
+        has it, and a wake asks its index when the next is due; the round's stores are emptied with its end."""
+        cids = [self.pinned(b"held %d" % i) for i in range(30)]
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.assertEqual((self.publisher._items, self.publisher._round, self.publisher._added), ({}, set(), []))
+        self.assertEqual(self.publisher._stores, [])
+        self.assertEqual(state_rows(self.state, "SELECT COUNT(*) FROM publish_stores"), [(0,)])
+        self.assertEqual(set(self.saved()["published"]), {str(cid) for cid in cids})
+        self.clock.now += 400
+        self.assertEqual(self.publisher.next_due(), 600)
+        self.assertEqual(self.publisher.publish_due()["published"], [])
+        self.assertEqual(self.publisher._items, {})
+
+    def test_rounds_take_the_most_overdue_up_to_round_keys(self):
+        """A round takes at most ROUND_KEYS due items, the most overdue first: never published ones in key order,
+        so the items of each round are a slice of the key space, and come due again together."""
+        cids = sorted((self.pinned(b"capped %d" % i) for i in range(7)), key=lambda cid: cid.key)
+        self.publisher.refresh()
+        with mock.patch.object(publisher_module, "ROUND_KEYS", 3):
+            rounds = []
+            while self.publisher.next_due() == 0:
+                rounds.append(self.publisher.publish_due()["published"])
+                self.clock.now += 10
+            self.assertEqual(rounds, [cids[:3], cids[3:6], cids[6:]])
+            self.clock.now += 1000
+            self.assertEqual(self.publisher.publish_due()["published"], cids[:3])  # due again first
+            self.assertEqual(self.publisher.next_due(), 0)
+            self.assertEqual(self.publisher.publish_due()["published"], cids[3:6])
+
+    def test_a_round_reads_only_the_due_rows(self):
+        """A round reads the due rows through the index, never every provided item's: with many provided and one
+        due, it reads that one."""
+        cids = [self.pinned(b"read %d" % i) for i in range(40)]
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        self.clock.now += 500
+        late = self.pinned(b"late")
+        self.publisher.refresh()
+        reads = []
+        real = self.publisher._parse
+        with mock.patch.object(self.publisher, "_parse", side_effect=lambda item, *a: reads.append(item) or
+                               real(item, *a)):
+            self.assertEqual(self.publisher.next_due(), 0)
+            self.assertEqual(self.publisher.publish_due()["published"], [late])
+        self.assertEqual(reads, [late])
+        self.assertEqual(len(self.publisher.states()), len(cids) + 1)
+
+    def test_a_changed_republish_interval_moves_every_due_time(self):
+        """Due times are computed with the republish interval: a start with another one computes them again."""
+        cid = self.pinned(b"interval")
+        key = DhtKey(bytes([5]) * 16)
+        self.publisher.add_key_source(lambda: {key.key})
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        published = self.clock.now
+        self.config.republish_interval = 500
+        restarted = self.make_publisher()
+        restarted.add_key_source(lambda: {key.key})
+        restarted.refresh()
+        states = restarted.states()
+        self.assertEqual(states[cid]["due"], published + 500)
+        self.assertEqual(states[key]["due"], published + publisher_module.key_interval(key.key, 500))
+        self.assertEqual(state_rows(self.state, "SELECT due FROM publish_items WHERE key = ?", (cid.key,)),
+                         [(published + 500,)])
 
     def test_unpin_withdraws_from_last_published_nodes(self):
         cid = self.pinned(b"z")
@@ -518,36 +614,42 @@ class PublisherTest(PublisherCase):
                 self.assertFalse(os.path.exists(path))
                 for table in ("published", "published_earlier", "withdrawals"):
                     self.assertEqual(state_rows(state, f"SELECT * FROM {table}"), [])
+                self.assertEqual(self.saved_in(state)["published"], {})
                 publisher.close()
 
     def test_malformed_rows_are_skipped_and_deleted(self):
-        """Rows that don't parse are skipped, the rest loaded; the load deletes those whose item doesn't parse,
-        and the next save the others, so the tables hold what memory does."""
+        """Rows that don't parse are skipped: the first refresh deletes those whose item doesn't (or isn't their
+        key's), a round reads one whose other columns don't as never published (republished, its row written again),
+        and the next save deletes withdrawal rows of the wrong shape, so the tables hold what memory does."""
         a, b = self.pinned(b"a"), self.pinned(b"b")
         self.publisher.refresh()
         self.publisher.publish_due()
         self.publisher.close()
-        rows = [("INSERT INTO published (item, at, nodes) VALUES (?, ?, ?)", ("not an item", 1, N1)),
-                ("INSERT OR REPLACE INTO published (item, at, nodes) VALUES (?, ?, ?)", (str(b), "yesterday", N1)),
-                ("INSERT INTO published (item, at, nodes) VALUES (?, ?, ?)", ("key:abcd", 1, N1)),  # 2 bytes
-                ("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", (str(a), b"short", 1)),
-                ("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", (str(a), N3, "x")),
-                ("INSERT INTO published_earlier (item, node, at) VALUES (?, ?, ?)", ("bad", N3, 1)),
+        planted = "INSERT INTO publish_items VALUES (?, ?, 0, NULL, NULL, x'', x'', 0)"
+        rows = [(planted, (bytes(16), b"not an item")),
+                (planted, (bytes([1]) * 16, b"\0abcd")),  # a key of 4 bytes
+                (planted, (bytes([2]) * 16, a.binary)),  # not a's key
+                ("UPDATE publish_items SET at = 'yesterday', due = 0 WHERE key = ?", (b.key,)),
+                ("UPDATE publish_items SET earlier = x'01' WHERE key = ?", (a.key,)),
                 ("INSERT INTO withdrawals (node, key) VALUES (?, ?)", (b"short", a.key)),
                 ("INSERT INTO withdrawals (node, key) VALUES (?, ?)", (N3, "text"))]
         for sql, row in rows:
             state_execute(self.state, sql, row)
         publisher = self.make_publisher()
         publisher.refresh()
-        self.assertEqual(set(publisher._published), {a})  # b's row was replaced by the malformed one
+        self.assertEqual(state_rows(self.state, "SELECT COUNT(*) FROM publish_items"), [(2,)])
         self.assertEqual(publisher._withdrawals, {})
-        self.assertEqual(self.saved()["published"].keys(), {str(a), str(b)})  # parsed items wait for the save
+        self.assertEqual(publisher.publish_due()["published"], [b])  # due, and read as never published
+        self.clock.now += 1000
+        self.assertEqual(sorted(publisher.publish_due()["published"]), sorted([a, b]))  # a's read as never published
         publisher.save()
         self.assertEqual(self.saved(), self.held(publisher))
+        self.assertEqual(set(self.saved()["published"]), {str(a), str(b)})
 
     def test_times_clamped_and_earlier_nodes_expired_at_load_are_saved(self):
-        """A last-published time in the future loads as now, and earlier nodes past PROVIDER_TTL are dropped;
-        the next save writes both."""
+        """A last-published time in the future is brought back to now when the publisher loads, at once, and so is
+        its due time; earlier nodes past PROVIDER_TTL are left out as rows are read, and go when the row is next
+        written."""
         cid = self.pinned(b"ahead")
         self.publisher.refresh()
         self.clock.now += 10**6
@@ -557,14 +659,32 @@ class PublisherTest(PublisherCase):
         self.publisher.publish_due()  # N1, N2 earlier now
         self.clock.now -= 10**6
         restarted = self.make_publisher()
-        self.assertEqual(restarted._published[cid][0], self.clock.now)
-        restarted.save()
         self.assertEqual(self.saved()["published"], {str(cid): (self.clock.now, N3)})
+        restarted.refresh()
+        self.assertEqual(restarted.states()[cid]["due"], self.clock.now + 1000)
+        self.assertEqual(restarted.next_due(), 1000)
         self.clock.now += 10**6 + PROVIDER_TTL
         restarted = self.make_publisher()
-        self.assertEqual(restarted._earlier, {})
-        restarted.save()
+        restarted.refresh()
+        self.assertEqual(restarted.states()[cid]["earlier"], {})
+        self.assertEqual(set(self.saved()["earlier"]), {(str(cid), N1), (str(cid), N2)})
+        restarted.publish_due()
         self.assertEqual(self.saved()["earlier"], {})
+
+    def test_the_clock_going_back_at_runtime_brings_times_back(self):
+        """The wall clock going back by more than CLOCK_SLACK while running brings every time after it back to it,
+        on disk and in memory, so republishing doesn't stall; less is left alone."""
+        a, b = self.pinned(b"a"), self.pinned(b"b")
+        self.publisher.refresh()
+        self.publisher.publish_due()
+        published = self.clock.now
+        self.clock.now -= publisher_module.CLOCK_SLACK / 2
+        self.assertEqual(self.publisher.next_due(), 1000 + publisher_module.CLOCK_SLACK / 2)  # left alone
+        self.clock.now = published - 10**5
+        self.assertEqual(self.publisher.next_due(), 1000)
+        self.assertEqual({item: state["at"] for item, state in self.publisher.states().items()},
+                         {a: self.clock.now, b: self.clock.now})
+        self.assertEqual(self.saved()["published"], {str(a): (self.clock.now, N1 + N2), str(b): (self.clock.now, N1 + N2)})
 
     def test_provided_again_cancels_only_its_queued_withdrawals(self):
         """A CID provided (again) cancels the withdrawals queued for its key at every node, whose nodes join its
@@ -579,8 +699,9 @@ class PublisherTest(PublisherCase):
         self.publisher.refresh()
         self.assertEqual(self.publisher.provided(), {a, b})
         self.assertEqual(self.publisher._withdrawals, {N1: {other}, N3: {other}})
-        self.assertEqual(set(self.publisher._earlier[a]), {N1, N2})
-        self.assertNotIn(b, self.publisher._earlier)
+        states = self.publisher.states()
+        self.assertEqual(set(states[a]["earlier"]), {N1, N2})
+        self.assertEqual(states[b]["earlier"], {})
         self.assertEqual(self.saved()["withdraw"], {N1: {other}, N3: {other}})
         self.assertEqual(self.records.providers(a.key), [OWN])
         self.assertEqual(self.records.providers(b.key), [OWN])  # recorded locally, nothing to cancel
@@ -692,8 +813,8 @@ class PublisherTest(PublisherCase):
             self.storage.unpin(cids[0], USER)
             self.publisher.refresh()
         self.assertEqual(len(transactions), 1)
-        # Its published row and earlier rows deleted (one item: 2), N1's and N2's withdrawals deleted and written (4)
-        self.assertEqual(rows_written(transactions), 6)
+        # Its row deleted (1), N1's and N2's withdrawals deleted and written (4)
+        self.assertEqual(rows_written(transactions), 5)
         self.assertEqual(self.saved(), self.held(self.publisher))
         with recorded_writes(self.publisher._db) as transactions:
             self.publisher.save()
@@ -780,12 +901,15 @@ class PublisherTest(PublisherCase):
         # A record the next round won't reach (10 keys never published go first) is 400 s from PROVIDER_TTL / 2 old:
         # the stretch stops there
         self.clock.now += 2 * SLOW_LOOKUP_PACE * SLOW_ROUND_LOOKUPS
-        old = sorted(publisher._published, key=str)[0]
+        old = sorted((item for item, state in publisher.states().items() if state["at"] is not None), key=str)[0]
         long_ago = self.clock.now - PROVIDER_TTL / 2 + 400
         with publisher._lock:
-            publisher._published[old] = (long_ago, [N1])
+            state = publisher._get(old)
+            state.at, state.nodes = long_ago, [N1]
+            publisher._touch_item(old)
+        publisher.save()
         self.assertEqual(len(publisher.publish_due()["published"]), SLOW_ROUND_LOOKUPS)
-        self.assertEqual(publisher._published[old][0], long_ago)  # not reached this round
+        self.assertEqual(publisher.states()[old]["at"], long_ago)  # not reached this round
         self.assertEqual(publisher.next_due(), 400)
         # A quiet channel: as ever
         stats["interfaces"][0]["channel_load_short"] = 10.0
@@ -974,8 +1098,13 @@ class PublisherTest(PublisherCase):
             publisher.publish_due()
         stored = {node for node, _, _ in self.client.calls}
         self.assertEqual(len(stored), SAVE_EVERY_NODES + 5)
+        # The round's item list and a row per server of the first save's: the items' rows aren't written mid-round
+        self.assertEqual(state_rows(self.state, "SELECT COUNT(*) FROM publish_stores"), [(1 + SAVE_EVERY_NODES,)])
+        self.assertEqual(self.saved()["earlier"], {})
         self.client = FakeClient()
         restarted = self.make_publisher()
+        self.assertEqual(state_rows(self.state, "SELECT COUNT(*) FROM publish_stores"), [(0,)])  # merged
+        self.assertGreaterEqual(len(self.saved()["earlier"]), SAVE_EVERY_NODES)
         restarted.refresh()
         for cid in cids:
             self.storage.unpin(cid, USER)
@@ -1145,7 +1274,7 @@ class PublisherTest(PublisherCase):
         self.assertEqual(restarted.publish_due()["published"], [])
 
     def test_saves_are_one_transaction_not_durable(self):
-        """A save writes published, published_earlier and withdrawals in one transaction, not durably (NORMAL)."""
+        """A save writes the items' rows and withdrawals in one transaction, not durably (NORMAL)."""
         cid = self.pinned(b"normal")
         self.publisher.refresh()
         self.publisher.publish_due()
@@ -1223,8 +1352,9 @@ class ParallelSendsTest(unittest.TestCase):
         # The refusing server may hold the keys of the batches it was sent, the refused one included (withdrawn
         # from later), not those after it
         maybe_held = set(expected[0][0]) | set(expected[1][0])
-        for item, (_, nodes) in self.publisher._published.items():
-            self.assertEqual(set(nodes), set(self.servers) - ({refusing} if item.key not in maybe_held else set()))
+        for item, state in self.publisher.states().items():
+            self.assertEqual(set(state["nodes"]),
+                             set(self.servers) - ({refusing} if item.key not in maybe_held else set()))
 
 
 class RecordingLink(fake_links.FakeLink):

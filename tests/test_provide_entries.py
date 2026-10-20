@@ -13,7 +13,7 @@ from rnfs.content.storage import USER
 from rnfs.publisher import (ENTRY_AIRTIME_OFF, ENTRY_AIRTIME_ON, MAX_ENTRY_KEYS, UNKNOWN_NETWORK, network_size,
                             republish_airtime)
 from tests.fakes.log import quiet_log
-from tests.support import state_rows
+from tests.support import state_execute, state_rows
 from tests.test_publisher import N1, N2, PublisherCase, near
 
 setUpModule, tearDownModule = quiet_log()
@@ -95,10 +95,13 @@ class EntriesTest(PublisherCase):
         files = {f"f{i:05d}": self.file() for i in range(count)}
         return self.folder(files), {built.cid for built in files.values()}
 
-    def slow_publisher(self, servers: int | None = None, bitrate: float | None = None, generation: bool = False):
+    def slow_publisher(self, servers: int | None = None, bitrate: float | None = None, generation: bool = False,
+                       fresh: bool = False):
         """A slow publisher at the default republish interval (3 days), whose network size estimate is servers (or
-        none yet)."""
+        none yet); fresh: one whose entries were never on (an earlier publisher's saved decision forgotten)."""
         self.config.republish_interval = None
+        if fresh:
+            state_execute(self.state, "DELETE FROM meta WHERE store = 'publisher' AND key = 'entries_on'")
         publisher = self.make_publisher(slow=True, bitrate=bitrate, generation=generation)
         if servers is not None:
             publisher._region_bits_mean = math.log2(servers / K) - 0.5  # network_size gives servers back
@@ -319,7 +322,7 @@ class EntriesTest(PublisherCase):
         self.storage.unpin(folder.cid, USER)
         bigger, bigger_files = self.flat(on_limit)  # one key too many
         self.pin(bigger)
-        publisher = self.slow_publisher(servers=1000)  # fresh: never on yet
+        publisher = self.slow_publisher(servers=1000, fresh=True)  # never on yet
         publisher.refresh()
         self.assertEqual(publisher.provided(), {bigger.cid})
         reason = publisher.entries_status()["provide_entries_off"]
@@ -343,7 +346,7 @@ class EntriesTest(PublisherCase):
         self.assertEqual(len(publisher.provided_entries()), on_limit - 1)
         extra = self.file()
         self.pin(extra)  # one key more
-        publisher = self.slow_publisher(servers=100)
+        publisher = self.slow_publisher(servers=100, fresh=True)
         publisher.refresh()
         self.assertEqual(publisher.provided(), {folder.cid, extra.cid})
 
@@ -489,8 +492,8 @@ class EntriesTest(PublisherCase):
         self.assertEqual(restarted.provided(), {folder.cid} | files)
         self.assertEqual(restarted.publish_due()["published"], [])  # not due again
         self.assertEqual(self.client.calls, [])
-        published = {item for item, _, _ in state_rows(self.state, "SELECT item, at, nodes FROM published")}
-        self.assertEqual(published, {str(cid) for cid in {folder.cid} | files})
+        published = {item for (item,) in state_rows(self.state, "SELECT item FROM publish_items WHERE at IS NOT NULL")}
+        self.assertEqual(published, {cid.binary for cid in {folder.cid} | files})
 
     def test_entries_are_served_with_their_pin(self):
         """Entries are chosen from complete pins provided here only (_compute asserts it), so each is in the served

@@ -1111,6 +1111,10 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
   hear 16% of the rest, an island node's records reached 6.6 of their 10 closest instead of 3.8 (a lookup per key:
   7.9), and a node's first round after its first start 6.3 instead of 0.3; a backbone node needs 15–45% more
   lookups for the keys a region knows too sparsely by chance (1,000 servers, 3,000 keys: 114 instead of 80).
+  A round takes at most 50,000 keys, those due longest (never published ones in key order), and the rounds that
+  follow at once take the rest: the keys of a round are a slice of the key space, and come due again together, so
+  the rounds need no more lookups than one would. rnfs keeps where and when it last published each key in its state
+  database, read per round, rather than in memory.
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
   refused or failed store isn't retried until the next republish. A responder may have recorded some keys of

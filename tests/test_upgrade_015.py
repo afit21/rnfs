@@ -4,7 +4,8 @@
 The expectation is the fixture's expected.json, every table's rows as 0.1.5 left them. The current code may add
 rows and tables (its own schema steps), but none of 0.1.5's rows may change or go, except as upgraded() says:
 the two `lxmf:<address>` pins become `app:lxmf:<address>` (0.2.0's "lxmf_app_pins", the LXMF wrapper app's
-source), and 0.2.0's provider store keeps no newcomer pool and no departed or evicted publishers. The database
+source), 0.2.0's provider store keeps no newcomer pool and no departed or evicted publishers, and the publisher's
+published and published_earlier rows become publish_items rows (PublishedRowsTest). The database
 upgrades, passes quick_check, sets nothing aside, and a second start changes nothing. The tables 0.1.5 created
 must also be exactly those a fresh database gets, so a released schema step edited in place (which a database
 0.1.5 wrote would never see) fails here as well as in test_statedb's digest.
@@ -21,6 +22,7 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
 import tempfile
 import time
 import unittest
@@ -35,6 +37,7 @@ from rnfs.content import builder
 from rnfs.content.blockstore import PARTIAL_PREFIX, BlockStore, shard_of
 from rnfs.content.cid import Cid
 from rnfs.node import RnfsNode
+from rnfs.publisher import DhtKey
 from tests.support import FakeClock, pinned_entries, state_rows
 from tests.test_names import FakeNetwork
 from tests.test_node import NetClient
@@ -92,12 +95,14 @@ def upgraded(table: str, values: tuple) -> tuple | None:
     source lxmf:<address> as app:lxmf:<address> (storage.LXMF_PREFIX). Its provider store (the step
     "providers_on_disk") drops the newcomer pool and the memories of departed and evicted publishers, which went
     with the per-publisher caps, replaced by the record budget and its storage tiers: a pooled record is no longer
-    pooled, and those memories are emptied. Every other row is kept as it was."""
+    pooled, and those memories are emptied. The publisher (the step "publisher_on_disk") keeps its state in
+    publish_items, a row per item: the published and published_earlier rows move there (PublishedRowsTest checks
+    each). Every other row is kept as it was."""
     if table == "pins" and values[1].startswith("lxmf:"):
         return (values[0], "app:" + values[1])
     if table == "provider_records":
         return (*values[:4], 0)
-    if table in ("provider_departed", "provider_evicted"):
+    if table in ("provider_departed", "provider_evicted", "published", "published_earlier"):
         return None
     return values
 
@@ -156,6 +161,51 @@ class FixtureCase(unittest.TestCase):
         return node
 
 
+class PublishedRowsTest(FixtureCase):
+    """0.2.0's step "publisher_on_disk" moves the publisher's rows into publish_items: each item's published row,
+    its earlier servers and its heal mark become one row, keyed by its DHT key, with the times as 0.1.5 wrote them;
+    the publisher computes each row's due time when it loads, from its republish interval."""
+
+    def test_published_rows_become_publish_items(self):
+        """Every published and published_earlier row of 0.1.5's is in its item's publish_items row, as written."""
+        db = statedb.connect(self.state)  # the schema steps, and nothing else
+        try:
+            rows = {item: (key, at, nodes, earlier, heal) for key, item, at, nodes, earlier, heal in db.query(
+                "SELECT key, item, at, nodes, earlier, heal FROM publish_items")}
+            self.assertEqual(db.query("SELECT COUNT(*) FROM published"), [(0,)])
+            self.assertEqual(db.query("SELECT COUNT(*) FROM published_earlier"), [(0,)])
+        finally:
+            db.close()
+        published = [row(values) for values in EXPECTED["tables"]["published"]]
+        earlier = [row(values) for values in EXPECTED["tables"]["published_earlier"]]
+        self.assertTrue(any(text.startswith("key:") for text, _, _ in published))
+        expected: dict[bytes, list] = {}
+        for text, at, nodes in published:
+            item, key = statedb._published_item(text)
+            expected[item] = [key, at, nodes, {}, 0]
+        for text, node, at in earlier:
+            item, key = statedb._published_item(text)
+            expected.setdefault(item, [key, None, b"", {}, 0])[3][node] = at
+        self.assertEqual({item: (key, at, nodes, earlier, heal) for item, (key, at, nodes, blob, heal) in rows.items()
+                          for earlier in [{blob[i:i + 16]: struct.unpack(">d", blob[i + 16:i + 24])[0]
+                                           for i in range(0, len(blob), 24)}]},
+                         {item: tuple(values) for item, values in expected.items()})
+        for item, (key, *_) in rows.items():
+            self.assertEqual(key, (DhtKey(item[1:]) if item[:1] == b"\0" else Cid.from_bytes(item)).key)
+
+    def test_the_publisher_reads_them(self):
+        """Started on the upgraded database, the publisher has what 0.1.5 published, due times computed from it."""
+        node = self.start()
+        states = node.publisher.states()
+        published = {Cid.parse(text) if not text.startswith("key:") else DhtKey(bytes.fromhex(text[4:])): (at, nodes)
+                     for text, at, nodes in map(row, EXPECTED["tables"]["published"])}
+        held = {item: (state["at"], b"".join(state["nodes"])) for item, state in states.items()
+                if state["at"] is not None}
+        self.assertEqual({item: value for item, value in published.items() if item in states}, held)
+        for item in held:
+            self.assertEqual(states[item]["due"], held[item][0] + node.publisher.interval_for(item))
+
+
 class UpgradeTest(FixtureCase):
     """Every row 0.1.5 left is kept."""
 
@@ -192,6 +242,7 @@ class UpgradeTest(FixtureCase):
                 self.assertEqual(expected - found[table] - {None}, set())
         self.assertTrue(EXPECTED["tables"]["provider_departed"] and EXPECTED["tables"]["provider_evicted"])
         self.assertEqual((found["provider_departed"], found["provider_evicted"]), (set(), set()))
+        self.assertEqual((found["published"], found["published_earlier"]), (set(), set()))
         self.assertIn(1, {values[4] for values in map(row, EXPECTED["tables"]["provider_records"])})
 
     def test_provider_standing_is_built(self):
