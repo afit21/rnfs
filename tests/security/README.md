@@ -163,3 +163,11 @@ N1's page half is in the content table.
 | ID | Test modules | Code guarded | Fix commits |
 |---|---|---|---|
 | none (fuzzing) | `test_fuzz_parsers.py` (needs hypothesis) | the strict parsers of untrusted bytes: `rnfs/content/cid.py`, `rnfs/content/dag.py`, `rnfs/content/storage.py`, `rnfs/names.py`, `rnfs/network/`, `rnfs/uris.py`, `rnfs/gateway.py` | `077f33a` (test); found T1 |
+
+## 0.2.0 review (REV)
+
+A read-only review of 0.2.0 against remote and local attackers, fixed before 0.2.0 was released; the findings are the roadmap's "Security fixes from the 0.2.0 review".
+
+| ID | Test modules | Code guarded | Fix commits |
+|---|---|---|---|
+| REV10 | `test_rev10_sealed_unpack.py`; also `tests/test_tar_stream.py` (`test_scan_counts_allocation_units`, scan_tar agreeing with build_tar), `tests/test_fsutil.py` (`AllocationUnitTest`) | `rnfs/node_content.py` (`unpack_sealed`, `_check_unpack_space`, `_unpacking`, `collect_unpack_leftovers`), `rnfs/content/tarstream.py` (`scan_tar`, `Extent`), `rnfs/fsutil.py` (`allocation_unit`), `rnfs/node.py` (`_setup`) | `76b5af4` |
