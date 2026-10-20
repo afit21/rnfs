@@ -737,23 +737,25 @@ class LinkPool:
 
     def request(self, peer: PeerLink, path: str, data, blocks: bool = False, max_response_size: int | None = None,
                 watchdog: Callable[[Exchange, float], str | None] | None = None,
-                on_progress: Callable[[float], None] | None = None) -> Exchange:
+                on_progress: Callable[[float], None] | None = None, silence_expected: bool = False) -> Exchange:
         """Send one request on peer's link and wait for its outcome, within the per-link limits.
 
         watchdog(exchange, now) may return a reason to stop waiting (a stall). on_progress(fraction) is
         called from this thread, never an RNS one. A request other than /blocks gives up (.stalled set) once
         request_deadline has passed since it was sent, or if it waited that long for a slot. A request larger
-        than the link's packet MDU isn't sent (the exchange is returned unanswered).
+        than the link's packet MDU isn't sent (the exchange is returned unanswered). A request left unanswered on a
+        link that heard nothing meanwhile closes it (_went_dead), unless silence_expected: a /range to a node not known
+        to answer it, which an older node leaves unanswered on a working link.
         """
         peer.enter()
         try:
-            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress)
+            return self._request(peer, path, data, blocks, max_response_size, watchdog, on_progress, silence_expected)
         finally:
             peer.leave()
 
     def _request(self, peer: PeerLink, path: str, data, blocks: bool, max_response_size: int | None,
                  watchdog: Callable[[Exchange, float], str | None] | None,
-                 on_progress: Callable[[float], None] | None) -> Exchange:
+                 on_progress: Callable[[float], None] | None, silence_expected: bool = False) -> Exchange:
         """request(), with the calling thread counted among the link's users."""
         exchange = Exchange(self.clock)
         deadline = None if blocks else self.request_deadline(peer)
@@ -793,12 +795,14 @@ class LinkPool:
                 self._wait(peer, path, exchange, receipt, deadline, watchdog, on_progress)
             finally:
                 self._log_outcome(peer, path, exchange)
-            if self._went_dead(peer, exchange):
+            if not silence_expected and self._went_dead(peer, exchange):
                 # Nothing at all came back on the link while the request waited out RNS's timeout: the other end
                 # most likely lost it (its rnsd or a transport node on the way restarted), which RNS notices only at
                 # its keepalive, about 10 minutes on LoRa; meanwhile every request on it waited out its timeout too.
-                # Closed, unless another request is using it, so the next one opens a link that works or fails fast
-                if self.close_unless_used(peer.node_id, {threading.get_ident()}):
+                # This link (not one opened since) is closed, unless another request is using it, so the next one
+                # opens a link that works or fails fast
+                if not peer.used_by_others({threading.get_ident()}):
+                    self.close_link(peer)
                     log(f"closed the link to {node_name(peer.node_id)}: nothing came back on it while {path} waited",
                         LOG_VERBOSE)
             return exchange

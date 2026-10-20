@@ -543,6 +543,31 @@ class LinkPoolTest(unittest.TestCase):
         self.assertEqual(peer.link.status, FakeLink.ACTIVE)
         self.assertIs(run(self, lambda: self.pool.get(NODE)), peer)
 
+    def test_an_expected_silence_keeps_the_link(self):
+        # A /range to a node not known to answer it: an older node leaves it unanswered on a working link, and the
+        # /blocks that follows goes on the same link
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        peer = run(self, lambda: self.pool.get(NODE))
+        peer.link.silence = 10_000.0
+        self.assertFalse(run(self, lambda: self.pool.request(peer, "/range", b"k", silence_expected=True)).answered)
+        self.assertEqual(peer.link.status, FakeLink.ACTIVE)
+
+    def test_only_the_dead_link_is_closed(self):
+        """A link opened to the node since (by another thread) is left alone."""
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        dead = run(self, lambda: self.pool.get(NODE))
+        dead.link.silence = 10_000.0
+        self.pool.close_link(dead)
+        FakeLink.responder = staticmethod(lambda link, path, data: True)
+        fresh = run(self, lambda: self.pool.get(NODE))
+        self.assertIsNot(fresh, dead)
+        FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
+        dead.closed = False
+        dead.link.status = FakeLink.ACTIVE  # as if this thread's request had been sent before the other thread's link
+        run(self, lambda: self.pool.request(dead, "/find", b"k"))
+        self.assertEqual(fresh.link.status, FakeLink.ACTIVE)
+        self.assertIs(self.pool.shared_peer(NODE), fresh)
+
     def test_a_silent_link_another_request_uses_is_left_to_it(self):
         FakeLink.responder = staticmethod(lambda link, path, data: FAIL)
         peer = run(self, lambda: self.pool.get(NODE))

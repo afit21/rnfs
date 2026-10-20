@@ -316,7 +316,8 @@ class Ranges:
         max_bytes = max(1, min(wanted, MAX_BLOCK_SIZE))
         if known is not None:
             max_bytes = max(1, min(max_bytes, known - len(held)))
-        result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress)
+        result = client.block_range(node_id, cid, held, max_bytes, compress, known, on_progress,
+                                    answers=self.support.answers(node_id))
         if result.silent and self.support.answers(node_id) is not True:
             # As an older node leaves it (no handler for /range, section 3), or a lost packet on a lossy path: asked
             # with /blocks for the rest of this fetch; twice in a row and it is taken for an older node

@@ -487,8 +487,8 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   judged from the path to each server as its announces arrive and from one read of the path table every 10 minutes
   (through `rnsd`, one RPC: a client's own path table starts empty). It also stores each key it provides on its
   `local_replicas` (3, at most 5) closest local servers (*two-level records*: ordinary `/provide`s, withdrawn like
-  the rest; a local server no link could be opened to is tried once more at once, since over LoRa one lost link
-  request left the island without its replica until the next republish), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
+  the rest; a local server no link could be opened to, though a path was found, is tried once more at once, since over
+  LoRa one lost link request left the island without its replica until the next republish), and a search asks the closest local server first (3 of them with a hop radius), its answer seeding the
   rest of the lookup. In the topology simulation an island neighbour found content during a partition 100% of the
   time instead of 55–72%, and island-to-island lookups took 42% less airtime, for 12% more publish airtime. Fast
   nodes with no slow interface and no `local_interfaces` are unchanged. New settings `local_interfaces`,
@@ -547,9 +547,10 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   `max(min_rate_sample, response_target` at the link's rate estimate) bytes on the wire (16 KiB at 1 kbit/s, about 2
   minutes, instead of a whole 64–128 KiB chunk), compressed with bz2, and keeps what arrived in a partial block
   (`<rnfs dir>/state/partial`, at most 64, deleted at start), verified whole against the CID before it is stored and
-  never served; a provider whose response stalled gets ranges on any link. The first request of a fetch, to a node with
-  an open link or a remembered provider before any search, uses ranges by the same rule: on a radio it is most often
-  what brings a single-chunk file (over LoRa between two Heltec V3 RNodes at 3.5 kbit/s, a 24 KB text came whole in
+  never served; a provider whose response stalled gets ranges on any link. The first request of a fetch, before any
+  search, uses ranges by the same rule when it goes to the hint, a remembered provider or a node known to answer
+  `/range` (an open link otherwise gets `/blocks`, as an older node's silence would hold the search up): on a radio it
+  is most often what brings a single-chunk file (over LoRa between two Heltec V3 RNodes at 3.5 kbit/s, a 24 KB text came whole in
   88 s, where bz2 makes it 9.8 KB). Measured with the real fetcher over a fake
   1 kbit/s link: a stall anywhere in a 64 KiB chunk now resends 8 KiB on average (1.1 minutes) instead of 32 KiB
   (4.4 minutes), at most 15.6 KB instead of 64.7 KB; a Gutenberg book (Pride and Prejudice, 772 KB) takes 2.8–2.9×
@@ -745,8 +746,9 @@ Fixed:
   this one until RNS's keepalive noticed, 12 minutes on a radio path; every request on them waited out its timeout.
   Over LoRa, after the gateway's `rnsd` restarted, a slow node's every `/find` to the gateway took 21–23 s and failed,
   so a search during the partition that followed found nothing in 3.5 minutes. A link that received nothing at all
-  while a request on it went unanswered is now closed, unless another request is using it, and the next request
-  opens a new one.
+  while a request on it went unanswered is now closed, unless another request is using it or the request was a
+  `/range` to a node not known to answer it (an older node's silence, on a working link), and the next request opens a
+  new one.
 - **No links accepted until the node can answer on them** (spec section 3, Links): the `rnfs.dht` destination
   accepted links from its creation, at the start of the daemon, but requests only once the node was set up; RNS drops
   a request without a handler, so through a start (80 s on a cloud node with 857k blocks working out what it
@@ -760,8 +762,9 @@ Fixed:
   don't count) and its rounds find local servers only, so nothing marked their keys for the heal republish. Over LoRa
   the gateway PC, restarted during an outage, stored a new key on its one neighbour, and once the backbone was back
   nothing republished it beyond the island until its next republish, days later on a slow node. A round that reached
-  no off-island server now marks its keys while the routing table holds any off-island server; an island that knows of
-  none still marks nothing.
+  no off-island server now marks its keys while the routing table holds off-island servers but none has answered or
+  announced itself since the start; an island that knows of none, or a node that was heard from beyond it, marks
+  nothing more than before.
 - **A fetch uses the provider records its own node holds** (spec section 6, Finding providers): a search started
   with nothing, though a DHT server holds records for the keys near it, and on an island a node holds the local
   replicas of its neighbours' content. Over LoRa the laptop held the island record of a file and waited 51 s for its

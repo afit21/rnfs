@@ -112,7 +112,7 @@ class FakeClient:
         return result
 
     def block_range(self, node_id: bytes, cid: Cid, held: bytes = b"", max_bytes: int = 0, compress: bool = False,
-                    block_size: int | None = None, on_progress=None) -> RangeResult:
+                    block_size: int | None = None, on_progress=None, answers: bool | None = None) -> RangeResult:
         """Serve the next range of cid's block from what node_id holds, as a 0.2.0 node answers /range; recorded in
         ranges, and the first range of a block also in requests (as a request for [cid]: asked() counts each block
         asked for once, however many ranges it takes). A node in no_range leaves it unanswered, as one before 0.2.0

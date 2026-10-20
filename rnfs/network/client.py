@@ -318,15 +318,18 @@ class PeerClient:
     # /range (rnfs 0.2.0)
 
     def block_range(self, node_id: bytes, cid: Cid, held: bytes = b"", max_bytes: int = 0, compress: bool = False,
-                    block_size: int | None = None, on_progress: Callable[[float], None] | None = None) -> RangeResult:
+                    block_size: int | None = None, on_progress: Callable[[float], None] | None = None,
+                    answers: bool | None = None) -> RangeResult:
         """Ask node_id for at most max_bytes of cid's block after the held bytes (the start of the block, received
-        from node_id before), compressed if compress, over its shared link; counted in traffic (mesh).
+        from node_id before), compressed if compress, over its shared link; counted in traffic (mesh). answers: whether
+        node_id is known to answer /range (rnfs.ranges.RangeSupport); one not known to may leave it unanswered on a
+        link that works, which is then kept for the /blocks that follows.
 
         The answer is checked (protocol.parse_range_response: its size against block_size, if known, and the length
         of its bytes, decompressed within that bound); a range that completes the block has the whole block, held
         and data, verified against cid. on_progress(fraction) is called from this thread as the answer arrives.
         """
-        result = self._range(node_id, cid, held, max_bytes, compress, block_size, on_progress)
+        result = self._range(node_id, cid, held, max_bytes, compress, block_size, on_progress, answers is not True)
         if result.status != OK or result.block is not None or result.missing or result.bad:
             outcome = {OK: mesh.ANSWERED, BUSY: mesh.REFUSED}.get(result.status, mesh.FAILED)
             if not result.silent:  # an older node's silence isn't its failure (rnfs.ranges)
@@ -337,7 +340,7 @@ class PeerClient:
         return result
 
     def _range(self, node_id: bytes, cid: Cid, held: bytes, max_bytes: int, compress: bool, block_size: int | None,
-               on_progress: Callable[[float], None] | None) -> RangeResult:
+               on_progress: Callable[[float], None] | None, silence_expected: bool = False) -> RangeResult:
         """block_range(), uncounted."""
         peer = self.links.get(node_id)
         if peer is None:
@@ -351,7 +354,8 @@ class PeerClient:
         request = protocol.encode_range(cid, offset, max_bytes, RANGE_BZ2 if compress else 0)
         exchange = self.links.call(peer, RANGE_PATH, request, blocks=True,
                                    max_response_size=protocol.range_max_response_size(max_bytes),
-                                   watchdog=self._stall_watchdog(rate), on_progress=on_progress)
+                                   watchdog=self._stall_watchdog(rate), on_progress=on_progress,
+                                   silence_expected=silence_expected)
         name = node_name(node_id)
         if exchange.stalled:
             log(f"/range from {name} stalled ({exchange.stalled}); closing the link", LOG_WARNING)

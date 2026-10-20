@@ -395,6 +395,14 @@ class LocalWiringTest(IslandCase):
         recorded = node.publisher.states()[item]["nodes"]
         self.assertIn(islander, recorded)
         self.assertNotIn(broken, recorded)
+        # A local server no path was found to (switched off, out of reach) isn't waited for twice
+        self.net.provide_calls.clear()
+        lost.add(islander)
+        node._path_lacked = {islander}.__contains__
+        node.add_path(self.write(b"a second key, its server off"))
+        node.publisher.publish_due()
+        second = next(i for i in node.publisher.provided() if i != item)
+        self.assertEqual([n for n, keys, _ in self.net.provide_calls if second.key in keys].count(islander), 1)
 
     def test_no_replicas_when_zero(self):
         node = self.make_node(local_replicas=0)
@@ -650,10 +658,10 @@ class PartitionWiringTest(IslandCase):
         """A node started while its island was cut off never enters partition mode (its failures are for want of a
         path) and its rounds find local servers only, so no off-island server is in their store sets: over LoRa a
         gateway restarted during an outage stored a new key on its one neighbour and nothing marked it, leaving it on
-        the island for days. Known servers beyond the island mark such a round; an island that knows of none, isn't
-        cut off from anything, and marks nothing."""
+        the island for days. Known servers beyond the island, none heard from since the start, mark such a round; an
+        island that knows of none isn't cut off from anything, nor a node an off-island server has answered."""
         publisher = self.node.publisher
-        self.assertTrue(publisher._off_island_known())  # the backbone's servers are in its routing table
+        self.assertTrue(publisher._off_island_known())  # the backbone's servers are in its routing table, unheard
         state = publisher_module._Item()
         island = self.islanders[:1]
         self.assertTrue(publisher._mark_heal(state, island, island, False, publisher._off_island_known()))
@@ -666,6 +674,12 @@ class PartitionWiringTest(IslandCase):
         self.assertFalse(lonely.publisher._off_island_known())
         self.assertFalse(lonely.publisher._mark_heal(publisher_module._Item(), island, island, False,
                                                      lonely.publisher._off_island_known()))
+        # Once a server beyond the island has answered, the node isn't cut off since its start: a round whose store
+        # set was all local (its K closest on the island) marks nothing
+        self.node._answered(self.backbone[0])
+        self.assertFalse(publisher._off_island_known())
+        self.assertFalse(publisher._mark_heal(publisher_module._Item(), island, island, False,
+                                              publisher._off_island_known()))
 
     def test_rounds_reaching_beyond_the_island_mark_nothing(self):
         self.node.add_path(self.write(b"connected"))

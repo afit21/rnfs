@@ -1261,11 +1261,12 @@ class Fetch:
             asked_now = [cid for cid in cids if cid in outstanding]
             self._handle(event.node_id, cids, event.result, probe, wanted, children, outstanding, budget,
                          event.sent_at, event.rate, counted=not abandoned)
-            if probe and event.result.status == peer_client.UNSUPPORTED and not self.closed:
+            left = [cid for cid in cids if cid in outstanding]  # not brought meanwhile by another probe
+            if probe and event.result.status == peer_client.UNSUPPORTED and left and not self.closed:
                 # A probe with /range left unanswered, as an older node leaves it: asked again at once with /blocks,
                 # on the same link, as a provider would be (rnfs.ranges counted the silence)
-                in_flight[event.node_id] = (cids, True)
-                self._send(event.node_id, cids)
+                in_flight[event.node_id] = (left, True)
+                self._send(event.node_id, left)
             self._settle_duplicate(event.node_id, in_flight)
             still_asked = {cid for asked, _ in in_flight.values() for cid in asked}
             requeue = [cid for cid in cids if cid in outstanding and cid not in pending and cid not in still_asked]
@@ -1659,9 +1660,15 @@ class Fetch:
                 for node_id in candidates:
                     in_flight[node_id] = ([first], True)
                     # With /range where a provider would be asked with it: over a slow link the probe is most often
-                    # what brings a single-chunk file, so it is compressed and resumable as any other request there
-                    path = paths[node_id] if node_id in paths else self._path(node_id)
-                    self._send(node_id, [first], self._plan(node_id, path, first, wanted))
+                    # what brings a single-chunk file, so it is compressed and resumable as any other request there.
+                    # Only of a node likely to hold it (the hint, a remembered provider) or known to answer /range: an
+                    # open link is a guess, and an older node's silence would hold the search up a request timeout
+                    likely = node_id in hinted or node_id in self._remembered_asked
+                    plan = None
+                    if likely or self.fetcher.ranges.support.answers(node_id):
+                        path = paths[node_id] if node_id in paths else self._path(node_id)
+                        plan = self._plan(node_id, path, first, wanted)
+                    self._send(node_id, [first], plan)
                 return
         if self._lookup is None and self.from_node is None and self._unfound_ago is None:
             ago = None if self.explicit else self.fetcher.unfound(self.root)
@@ -1682,9 +1689,7 @@ class Fetch:
                 log(f"couldn't read the records held of {self.root}: {e!r}", LOG_WARNING)
                 held = []
             for node_id in held:
-                if node_id not in self._providers:
-                    log(f"{node_name(node_id)} provides {self.root}, by a record held here", LOG_VERBOSE)
-                self._add_provider(node_id)
+                self._add_provider(node_id, " (a record held here)")
 
     def _start_lookup(self):
         """Run find_providers on a thread of its own; providers and its end arrive as events."""
@@ -1721,8 +1726,9 @@ class Fetch:
         self._start_lookup()
         return True
 
-    def _add_provider(self, node_id: bytes):
-        """Use a provider the lookup found, unless it is us, banned, known, or over the unknown-ID budget."""
+    def _add_provider(self, node_id: bytes, source: str = ""):
+        """Use a provider the lookup found (or a record held here named: source, for the log), unless it is us,
+        banned, known, or over the unknown-ID budget."""
         if node_id == self.fetcher.own_id or node_id in self._providers or self.fetcher.routing.is_banned(node_id):
             return
         if self._lookup is not None and not self._lookup.allow_unknown(node_id):
@@ -1730,7 +1736,7 @@ class Fetch:
                 LOG_VERBOSE)
             return
         self._new_provider(node_id)
-        log(f"found provider {node_name(node_id)} for {self.root}", LOG_VERBOSE)
+        log(f"found provider {node_name(node_id)} for {self.root}{source}", LOG_VERBOSE)
 
     # Results
 
@@ -1800,14 +1806,15 @@ class Fetch:
         if probe:
             # A node asked first that has the block (or sent part of it, with /range) becomes a provider; one that
             # hasn't isn't penalised
-            if (result.blocks or result.partial) and provider is None:
-                provider = self._new_provider(node_id)
-                log(f"{node_name(node_id)} (asked first) has {self.root}", LOG_VERBOSE)
+            if result.blocks or result.partial:
+                if provider is None:  # else the lookup found it meanwhile
+                    provider = self._new_provider(node_id)
+                    log(f"{node_name(node_id)} (asked first) has {self.root}", LOG_VERBOSE)
                 if result.ratio is not None:
                     provider.ratio = min(max(result.ratio, 1.0), ranges.MAX_RATIO)
                 for cid in result.partial:
                     if cid in outstanding:
-                        self._owners[cid] = node_id  # it resumes from what it sent
+                        self._owners.setdefault(cid, node_id)  # the first to send part of it resumes it
                 if result.partial:
                     self._progress_at = self.fetcher.clock()
                 self._pace(provider, sent_at, rate)

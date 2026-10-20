@@ -800,8 +800,9 @@ class RnfsNode:
             self.publisher.add_store_part(self._local_replicas)
         if local:
             # In partition mode, rounds reach local servers only; one that reached no off-island server while one is
-            # known marks its keys for the heal republish
-            self.publisher.set_islands(self.partition, lambda: any(
+            # known, but none has answered or announced itself since the start (cut off since), marks its keys for
+            # the heal republish
+            self.publisher.set_islands(self.partition, lambda: not self.partition.contacted() and any(
                 not self.local.is_local(node_id) for node_id in self.routing.nodes()))
         # Saves its state itself, and at stop (names.stop)
         self.names = NameManager(config, _NamePins(self), network=names_network)
@@ -872,7 +873,7 @@ class RnfsNode:
         # What is provided, before /blocks can be asked; after the features, whose keys (kept names) would
         # otherwise all be withdrawn at every start. It walks the DAG of every pin: 80 s for 857k blocks on a small
         # cloud VM, so said in the log if it takes a while
-        pins = plural(len(self.storage.pins()), "pin")
+        pins = plural(len(self.storage.pinned_cids()), "pin")
         with SlowStep(f"working out what this node provides: walking the blocks of {pins}",
                       "worked out what this node provides"):
             self.publisher.refresh()

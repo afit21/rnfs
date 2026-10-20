@@ -110,7 +110,8 @@ class NetClient:
         result.unsent = list(cids[8:])
         return result
 
-    def block_range(self, node_id, cid, held=b"", max_bytes=0, compress=False, block_size=None, on_progress=None):
+    def block_range(self, node_id, cid, held=b"", max_bytes=0, compress=False, block_size=None, on_progress=None,
+                    answers=None):
         """Serve a range from a node's backend as a 0.2.0 node answers /range (uncompressed)."""
         node = self.nodes.get(node_id)
         if node is None:
@@ -1309,12 +1310,12 @@ class PartialBlockTest(NodeTest):
         ranges = []
 
         def one_range_of_the_chunk(node_id, asked, held=b"", max_bytes=0, compress=False, block_size=None,
-                                   on_progress=None):
+                                   on_progress=None, answers=None):
             """A's first range of the chunk, then a lost link."""
             ranges.append((asked, len(held)))
             if asked == chunk and held:
                 return RangeResult("failed", reason="unreachable")
-            return real(node_id, asked, held, max_bytes, compress, block_size, on_progress)
+            return real(node_id, asked, held, max_bytes, compress, block_size, on_progress, answers)
         self.net.block_range = one_range_of_the_chunk
         with self.assertRaises(NotFound):
             b"".join(self.b.read(str(cid)))

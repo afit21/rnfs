@@ -204,7 +204,9 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   path, restarted. RNS notices that only when a keepalive goes unanswered, 12 minutes on a radio path, and meanwhile
   every request on the link waits out its timeout (measured over LoRa after a gateway's `rnsd` restarted: every
   `/find` to it, 21–23 s each, for minutes, so a search during a partition found nothing). A new link either works
-  or fails fast. A link that received anything meanwhile is kept: the request or its answer was lost on the way.
+  or fails fast. A link that received anything meanwhile is kept: the request or its answer was lost on the way; so
+  is one whose request was a `/range` to a node not known to answer it, which an older node leaves unanswered on a
+  working link (the `/blocks` that follows goes on the same link).
 - A node identifies (`Link.identify()`) only:
   - on a separate link opened to publish (section 6) or to send `/pin` (section 8), closed when done; or
   - on every link, in private mode.
@@ -976,15 +978,16 @@ or protocol constant changes.
   off-island: their announces and answers keep a node out of partition mode or end it, so on wide islands set
   `local_interfaces`.
 - **The heal republish.** Records stored during a partition sit on island servers only, so after it the rest of the
-  network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in
-  the simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
-  after trying one, or while its routing table holds an off-island server though the round found none: a node started
-  while its island was cut off never enters partition mode, its failures being for want of a path, and its rounds find
-  local servers only), and republish the marked keys when partition mode ends, paced as its rounds are (a slow node's
-  10 lookups a round). rnfs keeps the marks across restarts (in the state database), republishes them at the first
-  off-island answer or fresh announce after a restart too (the partition may have ended while it was down), and clears
-  a key's mark when a round reaches an off-island server. In the simulation this found such records in hours instead of days while about
-  5 keys or fewer per node were affected on a 30-node island (more queue behind the channel).
+  network finds them only once the publisher republishes (rnfs: every 3 days on a slow node): 1–14% of the time in the
+  simulation. A node SHOULD mark each key whose last round reached no off-island server (rnfs: in partition mode,
+  after trying one, or while its routing table holds off-island servers but none has answered or announced itself
+  since the start: a node started while its island was cut off never enters partition mode, its failures being for
+  want of a path, and its rounds find local servers only), and republish the marked keys when partition mode ends,
+  paced as its rounds are (a slow node's 10 lookups a round). rnfs keeps the marks across restarts (in the state
+  database), republishes them at the first off-island answer or fresh announce after a restart too (the partition may
+  have ended while it was down), and clears a key's mark when a round reaches an off-island server. In the simulation
+  this found such records in hours instead of days while about 5 keys or fewer per node were affected on a 30-node
+  island (more queue behind the channel).
 - **What it buys.** In the simulation (islands of 10–50 servers, all nodes upgraded) a neighbour on the island found
   content published there 100% of the time during a partition, in about 28 s instead of 300, and island-to-island
   lookups took 42% less airtime while connected; asking only the one closest local server first costs nothing
@@ -1155,7 +1158,8 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
 - `/provide` is answered `True` if the keys were recorded, or `False` if the request was refused (the link
   isn't identified, or a section 3 limit applied). Apart from the one re-identify retry of section 3, a
   refused or failed store isn't retried until the next republish, but for a local server ("LoRa islands", two-level
-  records) no link could be opened to, which a node MAY try once more at once (rnfs does). A responder may have recorded some keys of
+  records) no link could be opened to though a path was found, which a node MAY try once more at once (rnfs does). A
+  responder may have recorded some keys of
   a request it refused (e.g. up to a local limit), so the publisher SHOULD count every key it sent to that
   node, up to and including that request, as possibly recorded there.
 - To stop providing a CID (unpinned, deleted), a node SHOULD send it as a withdrawn key to the nodes it last
@@ -1418,7 +1422,9 @@ link in about a third of the airtime.
    request on a link already open. For a remote pin, the node that asked is asked first, link or not and over any
    link (rnfs 0.2.0): it is the one node known to hold the content before its provider records are out. A node that
    would ask a provider for the root with `/range` (item 7: over a slow link, a single-chunk file's root) SHOULD ask
-   it so in this step too (rnfs 0.2.0): on a radio this request is most often what brings a small file. One that
+   it so in this step too (rnfs 0.2.0), of the hint, a remembered provider or a node known to answer `/range`: on a
+   radio this request is most often what brings a small file. An open link is asked with `/blocks` otherwise, as it is
+   only a guess, and an older node's silence would hold the search up a request timeout. One that
    sends part of the block is a provider holding a partial block, and one that leaves the `/range` unanswered is
    asked again at once with `/blocks` (section 7, `/range`), not taken as a miss.
    - **Remembered providers** (rnfs 0.2.0). A node SHOULD remember, for a few hours, the providers that served

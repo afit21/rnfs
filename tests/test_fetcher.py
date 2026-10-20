@@ -967,6 +967,7 @@ class RangeTransferTest(FetcherTest):
         self.assertTrue(built.cid.is_raw)
         self.hold(P1)
         self.client.links = [P1]
+        self.fetcher.ranges.support.answered(P1)  # an open link to a node known to answer /range
         self.fetch_all(built.cid)
         self.assertEqual(self.read(built.cid), data)
         asked = self.ranges_of(P1, built.cid)
@@ -975,14 +976,43 @@ class RangeTransferTest(FetcherTest):
         self.assertEqual(self.lookups, [])
         self.assertEqual(self.fetcher.ranges.partials.count(), 0)
 
+    def test_a_probes_partial_from_a_node_already_a_provider_keeps_it(self):
+        """The lookup can find the node a probe went to before the probe's first range comes back: it stays a
+        provider, remembered, and owns the block it is sending; a second node's partial doesn't take it over."""
+        built = self.file(text_of(CHUNK_SIZE // 2))
+        cid = built.cid
+        with self.fetcher.open(cid) as fetch:
+            fetch._remembered_asked = {P1, P2}
+            self.fetcher.remember(cid, P1)
+            fetch._new_provider(P1)  # found by the lookup meanwhile
+            wanted = {cid: [walker.root_expect(cid)]}
+            for node_id in (P1, P2):
+                fetch._handle(node_id, [cid], BlocksResult(OK, partial={cid: 4096}), True, wanted, {}, {cid},
+                              fetch.budget)
+            self.assertEqual(fetch._owners[cid], P1)
+            self.assertIn(P1, self.fetcher.remembered(cid))
+            self.assertIn(P2, fetch._providers)
+
+    def test_an_open_link_not_known_to_answer_ranges_is_probed_with_blocks(self):
+        # An open link is only a guess: an older node's silence to a /range would hold the search up a request timeout
+        self.fetcher = self.make_fetcher(slow=True)
+        self.config.max_parallel_providers = None
+        built = self.file(text_of(CHUNK_SIZE // 2))
+        self.hold(P1)
+        self.client.links = [P1]
+        self.fetch_all(built.cid)
+        self.assertTrue(self.storage.is_complete(built.cid))
+        self.assertEqual(self.client.requests[0], (P1, [built.cid]))
+        self.assertEqual(self.ranges_of(P1, built.cid), [])
+
     def test_a_probe_an_old_node_leaves_unanswered_is_asked_again_with_blocks(self):
         self.fetcher = self.make_fetcher(slow=True)
         self.config.max_parallel_providers = None
         data = text_of(CHUNK_SIZE // 2)
         built = self.file(data)
         self.hold(P1)
-        self.client.no_range.add(P1)  # an rnfs 0.1.x node
-        self.client.links = [P1]
+        self.client.no_range.add(P1)  # an rnfs 0.1.x node, which served this root before (remembered)
+        self.fetcher.remember(built.cid, P1)
         self.fetch_all(built.cid)
         self.assertEqual(self.read(built.cid), data)
         self.assertEqual(len(self.ranges_of(P1, built.cid)), 1)
@@ -1007,6 +1037,7 @@ class RangeTransferTest(FetcherTest):
             return None
         self.client.range_behaviour[P1] = stall_once
         self.client.links = [P1]
+        self.fetcher.ranges.support.answered(P1)
         self.fetch_all(built.cid)
         self.assertEqual(self.read(built.cid), data)
         offsets = [offset for offset, _, _ in self.ranges_of(P1, built.cid)]

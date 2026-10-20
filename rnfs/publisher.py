@@ -1515,10 +1515,12 @@ class Publisher:
             # Not retried until the next republish whatever the outcome, so it counts as sent either way.
             # The node may hold records of the keys it got before any refusal: those are withdrawn later
             recorded = self.client.provide(node_id, [cid.key for cid in cids], sorted(withdrawn))
-            if not recorded and cids and islands is not None and islands.is_local(node_id) and not should_stop():
+            if (not recorded and cids and islands is not None and islands.is_local(node_id) and not should_stop()
+                    and not islands.no_path(node_id)):
                 # No link to a local server: its record is one of local_replicas (3 at most), and over a radio one lost
                 # packet is enough (measured on LoRa: a link request lost to the other node's transmission), which
-                # would leave the island without it until the next republish. Opened once more; off-island stores
+                # would leave the island without it until the next republish. Opened once more, unless no path was
+                # found (it's off, or out of reach: a second try would only wait as long again); off-island stores
                 # aren't (K of them, and their failures count towards partition mode)
                 log(f"couldn't reach local server {node_name(node_id)} to store {plural(len(cids), 'key')}; trying "
                     "once more", LOG_VERBOSE)
@@ -1563,7 +1565,8 @@ class Publisher:
                 unsaved, saved_at = 0, answered
 
         unfinished: list[ProvidedItem] = []
-        # Whether a server beyond the island is known at all (read before the lock: the routing table's has its own)
+        # Whether servers beyond the island are known but none has been heard from since the start (read before the
+        # lock: the routing table's and partition mode's have their own)
         off_island = islands is not None and self._off_island_known()
         with self._lock:
             for node_id, keys in sent_withdrawals.items():
@@ -1627,9 +1630,9 @@ class Publisher:
                    off_island: bool = False) -> bool:
         """Mark an item (its state) for the heal republish if its round (store set nodes, accepted those that may
         hold it) reached no off-island server, in partition mode, after trying one, or while off-island servers are
-        known (off_island) though none was in its store set: a node started while its island was cut off never enters
-        partition mode (its failures are for want of a path, which don't count), and its lookups find local servers
-        only. Clear the mark if it reached one. True if it is marked now. Lock held."""
+        known though none has answered since the start (off_island): a node started while its island was cut off
+        never enters partition mode (its failures are for want of a path, which don't count), and its lookups find
+        local servers only. Clear the mark if it reached one. True if it is marked now. Lock held."""
         islands = self._islands
         if any(not islands.is_local(node_id) for node_id in accepted):
             state.heal = False
@@ -1697,8 +1700,9 @@ class Publisher:
     def set_islands(self, islands, off_island_known: Callable[[], bool] = lambda: False):
         """Publish under islands, the node's partition mode (rnfs.dht.local.PartitionMode): only to the servers its
         allows() takes, telling it each server's answer (answered) or failure (failed) to a /provide.
-        off_island_known() says whether a server beyond the island is known (the routing table holds one): a round
-        that reached none while one is known marks its keys for the heal republish (_mark_heal)."""
+        off_island_known() says whether a server beyond the island is known (the routing table holds one) but none has
+        answered or announced itself since the start: a round that reached none then marks its keys for the heal
+        republish (_mark_heal)."""
         with self._lock:
             self._islands = islands
             self._off_island_known = off_island_known

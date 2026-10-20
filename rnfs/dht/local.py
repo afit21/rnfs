@@ -267,6 +267,11 @@ class PartitionMode:
         if left:
             self.on_change(False)
 
+    def contacted(self) -> bool:
+        """Whether an off-island server has answered or announced itself since the start."""
+        with self._lock:
+            return bool(self._recent)
+
     def silence_limit(self) -> float | None:
         """Seconds of off-island silence that count (a probe then), or None while too few gaps were measured."""
         with self._lock:

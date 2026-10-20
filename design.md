@@ -701,8 +701,9 @@ is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quar
 30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
 A request on a shared link that RNS fails (`RECEIPT_FAILED`, nothing of an answer started) while the link, still
 active, received nothing since it was sent (`Link.no_inbound_for()` longer than the request took: `_went_dead`) closes
-the link, unless another thread uses it (`close_unless_used`, 0.2.0): the far end lost it, which RNS would notice
-only at its keepalive.
+that link (not one opened since), unless another thread uses it or the caller expected silence (`silence_expected`: a
+`/range` to a node not known to answer it, `PeerClient.block_range(answers=)`), 0.2.0: the far end lost it, which RNS
+would notice only at its keepalive.
 Every link `LinkPool` opens gets an `EarlyResponses` (`PeerLink.early`, 0.2.0) in place of its `handle_response`
 (RNS looks it up on the link): a response no `Link.pending_requests` entry matches is kept (at most
 `MAX_EARLY_RESPONSES`, 16, for `EARLY_RESPONSE_LIFE`, 30 s), and `LinkPool._request`, once `Link.request` has
@@ -2404,9 +2405,11 @@ Everything in the specification is implemented, with these simplifications and a
   `pending` (requeued by `_handle_event` if no probe brings it). A remembered provider probed (`_remembered_asked`)
   that answers without the block and isn't `BUSY` is forgotten for the root (`Fetcher.forget`), as is any provider
   `_fail` fails. A `/find` reply's providers aren't remembered until they serve, so an attacker's reply can't plant
-  entries. A probe uses `/range` where a provider would (`Fetch._plan`, which `_range_plan` calls with the provider's
-  state); one that sends part of the block makes its node a provider owning the partial, and one left unanswered as
-  an older node leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`.
+  entries. A probe of the hint, a remembered provider or a node known to answer `/range` uses `/range` where a provider
+  would (`Fetch._plan`, which `_range_plan` calls with the provider's state); one that sends part of the block makes
+  its node a provider (if the lookup hasn't already) owning the partial unless another probe's partial got there first,
+  and one left unanswered as an older node leaves it (`UNSUPPORTED`) is sent again with `/blocks` by `_handle_event`,
+  for what no other probe brought meanwhile.
 - Records held here (0.2.0): when `_discover` starts the search it adds, as providers, `Fetcher.held_providers(key)`
   (the node's `ProviderRecords.for_reply`, what its own `/find` answer lists), so a record this node holds names a
   provider at once; the search runs all the same.
