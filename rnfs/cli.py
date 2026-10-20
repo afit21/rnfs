@@ -984,10 +984,11 @@ def run_app_add(args):
         print(printable(f"app {name}: its token is in {args.output}"))
     else:
         print(token)
-    print(printable(f"rnfs: app {name} can do anything this command line can (fetch and pin, read local files as "
-                    f"the daemon's user, export name keys, change settings, stop the daemon), except manage apps. "
-                    f"Its pins are app:{name}'s. Give its token only to an app you trust that far; `rnfs app rm "
-                    f"{name}` revokes it and releases its pins."), file=sys.stderr)
+    print(printable(f"rnfs: app {name} can do anything this command line can (fetch and pin, read and write local "
+                    f"files as the daemon's user, export name keys, change settings, stop the daemon), and so in "
+                    f"effect manage apps too, though `rnfs app` refuses its token. Its pins are app:{name}'s. Give "
+                    f"its token only to software you would trust with this command line; `rnfs app rm {name}` "
+                    f"revokes it and releases its pins."), file=sys.stderr)
 
 
 def run_app_ls(args):
@@ -1257,7 +1258,7 @@ def build_parser() -> argparse.ArgumentParser:
     app_commands = commands.add_parser("app", help="tokens for apps that use the API").add_subparsers(
         dest="app_command", required=True, metavar="command")
     app_add = command(app_commands, "add", run_app_add,
-                      "issue a token to an app (it can do anything rnfs can, but manage apps): print it once")
+                      "issue a token to an app (it can do anything rnfs can): print it once")
     app_add.add_argument("name", help="the app's name: a-z, 0-9, '.', '_', '-'")
     app_add.add_argument("-o", "--output", metavar="FILE", help="write the token to FILE (a new file, mode 0600)")
     app_ls = command(app_commands, "ls", run_app_ls, "list the apps")

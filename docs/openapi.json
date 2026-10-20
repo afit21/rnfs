@@ -4041,7 +4041,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-Rnfs-App",
-        "description": "An app's name (since 0.2.0): the request is that app's, and `X-Rnfs-Api` carries its token. An app may do everything the CLI may but manage apps; what it pins gets the source `app:<name>` (`app:<name>:<key>` with `X-Rnfs-Pin-Key`)."
+        "description": "An app's name (since 0.2.0): the request is that app's, and `X-Rnfs-Api` carries its token. An app may do everything the CLI may but use the `/api/apps` routes (403 `forbidden`); that is no boundary, since it reads and writes files as the daemon's user (`add`, `get`, `export`) and so can reach the CLI's token: give an app a token only if you would trust it with the CLI. What it pins gets the source `app:<name>` (`app:<name>:<key>` with `X-Rnfs-Pin-Key`)."
       }
     },
     "parameters": {

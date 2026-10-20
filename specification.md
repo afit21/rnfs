@@ -1796,20 +1796,22 @@ gateway can never reach the API.
   settings, then checks the subdirectories, then takes the directory's lock, in the daemon and in an embedded
   node alike; clients (the CLI, `rnfs.Client`) check `rnfs.toml` the same way when they read it, and show
   what was changed (the CLI prints it, `rnfs.Client` raises a `RuntimeWarning`, an embedded node logs it).
-- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications
-  tokens of their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name
-  rule). A request naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes
-  only with it; a request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never
-  taken for another's. App tokens outlive restarts. The node needn't keep the token itself: rnfs keeps
-  `SHA-256("rnfs app token " + token)` (the app's *verifier*), from which the token can't be found, and checks
-  a presented token against it. App tokens are not scoped: an app can do anything the CLI can (export name keys,
-  change settings, stop the daemon), except manage apps, so an app's token is to be given only to an app trusted
-  that far. Removing an app revokes its token at once, cancels its queued and running jobs and releases every
-  pin it holds (a pin a request let in before the removal makes after it is released as it is made). Only the
-  CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token, the
-  only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden`
-  there. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF made before 0.2.0 (section 13): adding
-  it, then removing it, releases them.
+- **App tokens** (rnfs 0.2.0). Besides that token, which stays the CLI's, the node MAY issue applications tokens of
+  their own (rnfs: `rnfs app add <name>`), each labelled with the app's name (section 8's app-name rule). A request
+  naming an app in `X-Rnfs-App: <name>` MUST carry that app's token in `X-Rnfs-Api`, and passes only with it; a
+  request without `X-Rnfs-App` passes only with the CLI's token, so an app's token is never taken for another's. App
+  tokens outlive restarts. The node needn't keep the token itself: rnfs keeps `SHA-256("rnfs app token " + token)`
+  (the app's *verifier*), from which the token can't be found, and checks a presented token against it. App tokens are
+  not scoped: an app can do anything the CLI can (export name keys, change settings, stop the daemon), and in effect
+  manage apps too. The app routes below refuse it, but that is no boundary: an app's token reads files as the node's
+  user (`add`, then `cat`) and writes new files wherever that user can (`get`, `export`), which is enough to run
+  programs as that user and so to read the CLI's token. An app's token is to be given only to software the user would
+  trust with the CLI itself. Removing an app revokes its token at once, cancels its queued and running jobs and
+  releases every pin it holds (a pin a request let in before the removal makes after it is released as it is made).
+  Only the CLI's token manages apps (rnfs: `GET /api/apps`, `POST /api/apps/add {"name"}`, which answers the token,
+  the only time it is given, and `POST /api/apps/rm {"name"}`); an app's token gets `403` with code `forbidden` there.
+  An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF made before 0.2.0 (section 13): adding it, then
+  removing it, releases them.
 - **An app's pins.** What a request with an app's token pins or releases for its caller (rnfs: `POST /api/add`,
   `/api/add/stream`, `/api/dir/set`, `/api/dir/rm`, `/api/pin/add`, `/api/pin/rm`, `/api/import`,
   `/api/import/stream`, and `pin`, `add` and `import` jobs, below) uses the source `app:<app>` instead of

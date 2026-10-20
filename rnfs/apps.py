@@ -16,7 +16,8 @@ dependency.
   or not the app exists, and both are made with the same work, so neither the answer nor its time says which
   names are installed.
 - App tokens are not scoped: an app can do anything the CLI can (export name keys, change settings, stop the
-  daemon), but manage apps, which only the CLI's token may (rnfs.api).
+  daemon), but manage apps through the /api/apps routes, which only the CLI's token may (rnfs.api). That is no
+  real limit: whatever reads and writes files as the daemon's user can read api_token (specification section 11).
 - remove forgets an app at once, so its token stops passing, then calls the release it is given (the node
   releases the app's pins), then deletes its row; if either fails the app is put back, to be removed again.
   Rows are written durably, one per change. A row that doesn't parse is logged and deleted at load.

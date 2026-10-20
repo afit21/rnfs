@@ -64,6 +64,10 @@ Security:
   `X-Rnfs-App` gets an `X-Rnfs-Proof` too, keyed by an HMAC of a secret made at each start and the name, which no
   client can check, instead of none; so every answer, the open `GET /api/status` and the 403s included, looks the
   same whether or not the app exists, and anyone who can reach the API port can no longer list the installed apps.
+- **What an app's token can do, said plainly** (specification section 11, README): an app can do anything the CLI
+  can, managing apps included in effect. The `/api/apps` routes refuse its token, but it reads and writes files as
+  the daemon's user, which reaches the CLI's token; `rnfs app add` now says so. Give a token only to software you
+  would trust with the CLI.
 
 Removed:
 - **LXMF messaging left rnfs** for an app of its own, built on the local API and the library (roadmap "LXMF moves
@@ -106,7 +110,7 @@ Added, for apps:
   request without `X-Rnfs-App` is checked exactly as before.
 - **Managing apps:** `rnfs app add <name> [-o file]` issues an app a token, printed once (alone on stdout, for
   scripts) or written to a new file only you can read, and says on stderr that the app can do anything the CLI
-  can (export name keys, change settings, stop the daemon) except manage apps; `rnfs app ls [--json]`;
+  can (export name keys, change settings, stop the daemon), managing apps included in effect; `rnfs app ls [--json]`;
   `rnfs app rm <name>` revokes the token and releases every pin the app made. Routes `GET /api/apps`,
   `POST /api/apps/add`, `POST /api/apps/rm`, for the CLI's token only (an app's gets 403 with the new error code
   `forbidden`); capability `apps`. An app called `lxmf` holds the `app:lxmf:` pins rnfs's own LXMF left

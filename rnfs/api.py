@@ -119,11 +119,12 @@ Security:
   per-start secret and the name (AppRegistry.proof_key), which no client can check: every response, the 403s included,
   looks the same whether or not the app exists, so the open proof doesn't list the installed apps (REV9).
   ApiHandler.caller() says who called: CLI ("cli") or "app:<name>", which dispatch keeps in principal. An app's token
-  does everything the API token does but manage apps: the /api/apps routes (CLI_ROUTES) answer it 403 `forbidden`. The
-  routes that pin or release for the caller (add, add/stream, dir/set, dir/rm, pin/add, pin/rm, import, import/stream,
-  and the pin, add and import jobs) use source "user" for the CLI and "app:<name>" for an app, "app:<name>:<key>" with
-  `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a pin key is refused, 400): an app's pin rm releases only
-  its own.
+  does everything the API token does but use the /api/apps routes (CLI_ROUTES), which answer it 403 `forbidden`. That
+  doesn't keep an app from managing apps in effect: it reads and writes files as the daemon's user (add, get, export),
+  which reaches api_token (specification section 11). The routes that pin or release for the caller (add, add/stream,
+  dir/set, dir/rm, pin/add, pin/rm, import, import/stream, and the pin, add and import jobs) use source "user" for the
+  CLI and "app:<name>" for an app, "app:<name>:<key>" with `X-Rnfs-Pin-Key: <key>` (pin_source; with the CLI's token a
+  pin key is refused, 400): an app's pin rm releases only its own.
 - Errors map to statuses as design.md says (rnfs.errors.STATUSES): ValueError 400, NotFound 404, TooLarge 413,
   Denied 451 (the deny list), InvalidDag 422, Busy 503, StorageFull 507, other errors 500. A 500 is logged as an
   error, and a BlockMismatch (a 400, but a bug: the node handed the store a block that doesn't match) as a
