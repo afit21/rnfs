@@ -2062,6 +2062,9 @@ the library). Never through the gateway: web pages must not make the node fetch.
     metadata (stored by RNS before it decodes it) must be a map of at most 16 entries whose keys are strings and
     whose values are strings, integers, booleans or nil, at most 4 KiB in all; otherwise it is removed unread and
     the link closed;
+  - an answer without metadata (a page) whose advertised total size is over 16 MiB is refused at its first segment,
+    before any part is requested (the add fails as too large): RNS reads such an answer whole into memory and
+    decodes it before handing it over, while a file comes as an open file, so files keep only the bound above;
   - a page answer must be `[request_id, page]` with the page one `bin` or `str` (or `nil` or `False`, which fail the
     add), checked from its msgpack headers before RNS decodes it, as `rnfs.dht` responses are (section 3); a file
     answer is copied, no larger than the advertised total, inside the response callback (RNS deletes it after);
