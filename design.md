@@ -461,7 +461,7 @@ the bytes a record takes, `capacity` `_capacity()` rounded down, each tier's `sh
 `FindQuery = Callable[[node_id, key], tuple[list[bytes], list[bytes]] | None]` returning (providers, nodes).
 `Lookup(key, start_nodes, query, own_id, alpha, beta, k, timeout, is_known, on_answer, on_failure, exclude, report,
 unreliable, may_retry, max_queries, on_useful, size, seniors, claim, taken, on_complete, unknowns, slow_path,
-check_path, first, allowed)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
+check_path, first, allowed, named)` with `find_closest() -> list[bytes]` and `find_providers(on_provider, should_stop) -> list[bytes]`. Besides
 completion and the deadline, a run (`_iterate`) ends once it has sent `max_queries` (`MAX_QUERIES`, 8 × K) queries and
 their answers are in ("query cap"), or after `STALL_WINDOWS` (3) × max(alpha, beta) answers in a row that leave the bit
 length of the beta-th closest known distance (`_reach`) unchanged ("no progress"). A run ranks its nodes by `tier()`,
@@ -475,7 +475,10 @@ instead of an answer, and the run gives the query back (`queried`, `sent`, `in_f
 ranks again, so it is asked at once (unchecked) only if it still ranks among the nodes to query; False counts as a
 failed query, not sent. An unreliable node that distance alone would rank within the query window is asked again when
 `may_retry` says so, as a query beyond `alpha` (`retrying`) that the run waits for only if the node comes to rank within
-the window by `rank` (it is then counted in flight). `is_known(id)` says whether RNS knows its identity; at most
+the window by `rank` (it is then counted in flight). `named(id, by)` (the node's `PathRequests.named`, given by
+`_wired_lookup` once Reticulum runs) is told by `_send`, before a query to a node charged to the unknown-ID budget
+(`_allowed_unknown`), which node's answer first named it (`_named_by`, kept across runs and by `ask`). `is_known(id)`
+says whether RNS knows its identity; at most
 `unknowns` unknown IDs are tried per lookup (`allow_unknown(id)`, also used by the fetcher for provider IDs; `alpha` if
 not given, never fewer). `listing_nodes()` is the nodes that have answered with at least one provider, and
 `listers(provider)` those that listed a given provider, so the keeper search can tell who vouches for its candidates
@@ -556,9 +559,13 @@ remainder, and `DisjointLookup` makes its paths in order, so `_disjoint`'s `make
 iterator. `None` passes no `unknowns` (alpha per Lookup). The node passes `SLOW_PUBLISH_UNKNOWNS` (10) and
 `SLOW_SEARCH_UNKNOWNS` (3) on slow nodes, `None` otherwise.
 
-`sweep.py` — no RNS. `find_region(lookup, key, own_id, members) -> Region` runs a `Lookup`'s `find_closest`, sets
-the region's prefix length p from the farthest of the `K` closest found (0 with none), and, when
-`members(p)` (due keys sharing it) is 2 or more, calls `explore`: breadth first over parts of the region, starting
+`sweep.py` — no RNS. `find_region(lookup, key, own_id, members, size=None) -> Region` runs a `Lookup`'s
+`find_closest`, sets the region's prefix length p from the farthest of the `K` closest found (0 with none); with
+`size` (the network size estimate, read once the lookup has run), p is at least `size_bits(estimate)`
+(⌊log2(N ÷ `K`) − `SIZE_MARGIN`⌋, margin 1), and while the estimate is `None` the region is `single` (the key alone:
+`Region.__contains__`, nothing explored, its p not taken as `Sweep.estimate` nor by the publisher's network size).
+When `members(p)` (due keys sharing it) is 2 or more, it calls `explore` with p as found (the far half of the region
+the lookup found, which a narrower region's keys may reach into): breadth first over parts of the region, starting
 with the far half, it asks the candidate nearest each part's centre (`ask`, by tier first) about that
 centre; a reply naming `K` servers inside the part queues its two halves; a server outside the part hands over to
 the one it named inside it (its bucket holding the part may have been full); a part gives up after
@@ -568,7 +575,9 @@ lookup's result, every candidate learned and the finds; `closest_to(key)` ranks 
 estimate)` is one round's bookkeeping, under a condition: `take()` gives the next key in the given order that is
 neither covered nor inside a claim and claims the keys sharing `estimate − 1` of its bits (everything before any
 region is known, so the first lookup runs alone), waiting while every key left is claimed; `cover(region)` covers
-the region's uncovered keys (a bisect over the sorted keys), releases the claim and updates `estimate`;
+the region's uncovered keys that `Region.knows` (a bisect over the sorted keys, then: its `K`-th closest candidate
+by distance within `SPARSE` (1.5) × (`K` − 1/3) × 2^128 ÷ `Region.size`, always for the key looked up or without an
+estimate; the rest are taken in turn), releases the claim and updates `estimate`;
 `members`, `release`, `stop`. With disjoint paths, `find_region` also keeps each path's candidates
 (`Region.paths`, from `path_candidates()`), and `Region.path_closest(key)` gives each path's K closest together; the
 publisher fills `Region.rings` (key -> ring servers of its widened lookup) and `Region.deferred`. `Sweep.spend(limit)`
@@ -598,8 +607,9 @@ becomes exactly those it found local, and earlier local ones it didn't see are j
 `PathInfo`s of the destinations that are known servers. `first_count(named)`: `LOCAL_FIRST` (1) when
 `local_interfaces` names the island, else `LOCAL_FIRST_RADIUS` (3). `Lookups(local_first=)` passes those nodes as a
 search's first lookup's `first`. `PartitionMode(is_local, slow, on_change, clock=monotonic, wall_clock, known,
-on_probe)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)` (off-island:
-resets the failures, notes contact, ends it), `failed(id)` (off-island and `known(id)`: the `FAILURES_TO_ENTER`-th in
+on_probe, no_path)`: `active`, `since` (wall time), `entered`; `allows(id)` (not active, or local); `answered(id)`
+(off-island: resets the failures, notes contact, ends it), `failed(id)` (off-island, `known(id)` and not
+`no_path(id)`, a failure for want of a path: the `FAILURES_TO_ENTER`-th in
 a row sets `_wanted`, a probe due at once, and calls `on_probe()`, or with no `_targets()` enters it), `announced(id)`
 (a fresh off-island announce: a gap sample in `_gaps`, a deque of `GAP_SAMPLES`, only if no partition mode since the
 last (`_clean`); contact; ends it); `silence_limit()` (None below `MIN_GAPS`, else max(`MIN_SILENCE`,
@@ -665,6 +675,31 @@ once it has had no data, and hasn't been handed out by `LinkPool.get()`, for its
 not within `link_idle_timeout` of the end of a `hold`. The `rnfs-link-sweeper` thread sweeps when the next link kept
 is due (`LinkPool.next_sweep`, at least `MIN_SWEEP_WAIT`, 0.25 s, at most a quarter of `link_idle_timeout` within 1 to
 30 s), and is woken (`LinkPool.wake`) by each request on a shared link ending and each link `get()` hands out.
+
+`paths.py` — `PathRequests(transport=lambda: RNS.Transport, reticulum=RNS.Reticulum.get_instance, clock, sleep,
+spacing=SPACING, slow_bitrate=None)`, the node's path-request budget (spec section 3, "Path requests"): `LinkPool` makes
+it (`LinkPool.paths`, over its own module's RNS, which tests replace) and the node hands it to `RnsNetwork(paths=)`
+(names) and `network/nomadnet.fetch(paths=)`. `await_path(destination, timeout, cancel)` (a known path returns at once;
+else a turn, then RNS's `Transport.await_path` with the whole timeout), `await_known(destination, known, timeout,
+cancel)` (a turn, `request_path`, then `known()` polled every `POLL`: `LinkPool._recall`'s identity wait),
+`send(destination)` (a turn, then `request_path`, unwaited: names), `charge(destination)` (`LinkPool._open` and
+NomadNet's `open_link` on a link not established: a turn taken, and the destination counted as requested). A turn
+(`_take_turn`) reserves `max(now, _next_turn)` and moves `_next_turn` a `spacing` on, so turns go in order of asking and
+never closer; `ready()` (the path or identity arrived) or `cancel` end the wait with nothing sent, and a turn lost so
+leaves a gap. At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5),
+else it reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later
+callers wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than
+`PATH_REQUEST_MI` forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without
+sending. `lacked(destination)`: the last `await_path` or `await_known` for it ended without (`_lacked`, at most
+`MAX_TRACKED`). `named(node_id, by)` keeps a scope for node_id's next request (`_named`, `HINT_LIFE`, 300 s; popped by
+the request). `_scope` turns it into interfaces only with the node's own instance (`is_connected_to_shared_instance`
+false) and a `slow_bitrate` (`LinkPool` passes the config's): the `next_hop_interface` of the path to `by`, if it is
+fast (`_fast`: a finite `bitrate` at least `slow_bitrate`; slow or unknown: every interface) and among the interfaces a
+request can leave by (`_sendable`: `OUT`, `online`, not `detached`, no `spawned_interfaces`, not a local interface type
+nor in `local_client_interfaces`); a spawned interface (a `parent_interface`) widens to every sendable interface of that
+parent. A scope covering every sendable interface is no scope. One interface: RNS's `await_path(on_interface=)`;
+several: `request_path(on_interface=, tag=)` on each with one random tag, then polled. `scoped` counts scoped requests.
+Counters `requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
 
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
@@ -784,7 +819,10 @@ most 10 per round, waiting 30 s × the round's lookups before the next. Slow nod
 server only withdrawals reach counts as a lookup (those with the most keys queued first; while any are queued, the
 round's lookups are limited to leave up to 5 for them), the others stay queued, and `next_due` counts queued
 withdrawals as due only once the pacing allows; other nodes send them all at once. `_region_bits` carries the last
-region's p to the next round. Each item's store set (`_store_set`) is its K closest from its region
+region's p to the next round. `set_network_size(estimate)` (the node passes `SizeEstimate.estimate`) gives
+`find_region` the size estimate leaving out each key's own sample; without it regions are sized by their lookups
+alone. `lookups_at_once` (constructor; `PUBLISH_LOOKUPS` if `None`) sets the region lookups run at once, 1 for tests
+that measure placement. Each item's store set (`_store_set`) is its K closest from its region
 (`Region.closest_to`), then each part added by `add_store_part(part)`, a `(key, region) -> servers` called without
 the lock after the lookups (the node adds `_senior_servers`: `first_seen.closest(key, K, min_age=provider_seniority,
 exclude=banned or, in private mode, not a member, heard_within=2 × announce_interval)`, and on a node that may have
@@ -1985,7 +2023,9 @@ Everything in the specification is implemented, with these simplifications and a
   (`local.judged(id) is False`); the publisher (`set_islands`) each `/provide` that recorded keys or opened no link.
   `_wired_lookup` adds `allowed=partition.allows`, and `_start_nodes` puts the K closest local servers first while it
   is active. Its `known` is `_knows_server` (`_is_server`, or RNS knows the identity, `_is_known`, or a path,
-  `_path_hops`), so made-up IDs a reply names don't count; its `on_probe` sets `_local_wake`, which `_run_local` waits
+  `_path_hops`), so made-up IDs a reply names don't count; its `no_path` is `_lacked_path` (`_path_lacked`:
+  `LinkPool.paths.lacked` once Reticulum runs, never before), so a query whose path request went unanswered doesn't
+  count either (the routing table still counts it); its `on_probe` sets `_local_wake`, which `_run_local` waits
   on between checks (`LOCAL_CHECK`), so the probe failures ask for goes at once; `stop` sets it too. `check_local`
   probes when `probe_due()` (`probe_off_island`: `client.find(target, own ID)` on the
   `rnfs-local` thread; an answer goes to `routing.answered`, a failure isn't counted there). `_partition_changed` logs

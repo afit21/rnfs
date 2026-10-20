@@ -22,6 +22,8 @@
   node (specification section 6, unanswered requests).
 - A request that wouldn't fit one packet on its link isn't sent: RNS would send it as a Resource, which nodes
   refuse (network/guards.py) and RNS may compress.
+- Every path request goes through the node's budget (LinkPool.paths, network/paths.py), whose wait doesn't count
+  towards path_timeout; a link that fails to establish costs a turn of it, as RNS then requests the path again.
 
 Everything here blocks its caller, so never call it from an RNS callback thread.
 """
@@ -36,6 +38,7 @@ from rnfs.constants import APP_NAME, DHT_ASPECT, MAX_REQUESTS_PER_LINK
 from rnfs import log as rnfs_log
 from rnfs.log import LOG_DEBUG, LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, protocol, rates
+from rnfs.network.paths import PathRequests
 
 POLL_INTERVAL = 0.25  # how often a waiting request checks its link, progress and stall conditions
 CANCEL_GRACE = 2.0  # seconds a started response may be missing from the link's incoming Resources
@@ -100,6 +103,13 @@ def _debug_logged() -> bool:
     """True if a LOG_DEBUG message is kept anywhere: RNS logs at debug level, or the debug log (which keeps
     every message, whatever RNS's loglevel) is on."""
     return RNS.loglevel >= LOG_DEBUG or rnfs_log._debug_sink is not None
+
+
+def _reticulum():
+    """The running Reticulum instance as this module's RNS knows it (None if none runs): the path-request budget's
+    ceiling reads its interface stats."""
+    reticulum = getattr(RNS, "Reticulum", None)
+    return reticulum.get_instance() if reticulum is not None else None
 
 
 def path_description(node_id: bytes) -> str:
@@ -270,11 +280,15 @@ class PeerLink:
 class LinkPool:
     """Outgoing links: one shared link per node, plus one-shot identified links. Thread-safe."""
 
-    def __init__(self, identity: RNS.Identity, config: Config, clock: Callable[[], float] = time.monotonic):
-        """Empty pool; links identify as identity when they identify."""
+    def __init__(self, identity: RNS.Identity, config: Config, clock: Callable[[], float] = time.monotonic,
+                 paths: PathRequests | None = None):
+        """Empty pool; links identify as identity when they identify. paths is the node's path-request budget (default:
+        a new one over this module's RNS, which tests replace)."""
         self.identity = identity
         self.config = config
         self.clock = clock
+        self.paths = paths if paths is not None else PathRequests(transport=lambda: RNS.Transport, reticulum=_reticulum,
+                                                                  slow_bitrate=config.slow_bitrate)
         # Private mode links only to members: every link identifies, and an outsider mustn't learn who we are
         self.members = config.member_set
         self.shared: dict[bytes, PeerLink] = {}
@@ -356,13 +370,14 @@ class LinkPool:
             return node_id in self.not_established
 
     def await_path(self, node_id: bytes) -> bool:
-        """Wait up to path_timeout for a path to node_id, requesting one if RNS has none (as opening a link would): True
-        once there is one. A lookup asks it before a query, to see how many hops the path takes (rnfs.mesh.SlowPaths).
+        """Wait up to path_timeout for a path to node_id, requesting one in its turn if RNS has none (as opening a link
+        would): True once there is one. A lookup asks it before a query, to see how many hops the path takes
+        (rnfs.mesh.SlowPaths).
         """
         if RNS.Transport.has_path(node_id):
             return True
         log(f"requesting a path to {node_name(node_id)}", LOG_VERBOSE)
-        if RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
+        if self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
             return True
         log(f"no path to {node_name(node_id)} after {self.config.path_timeout:g}s")
         return False
@@ -388,7 +403,7 @@ class LinkPool:
         name = node_name(node_id)
         if not RNS.Transport.has_path(node_id):
             log(f"requesting a path to {name}", LOG_VERBOSE)
-        if not RNS.Transport.await_path(node_id, timeout=self.config.path_timeout):
+        if not self.paths.await_path(node_id, self.config.path_timeout, cancel=self.stop_event):
             log(f"no path to {name} after {self.config.path_timeout:g}s")
             return False
         if _debug_logged():  # RNS path lookups, only for a message that will be kept
@@ -432,6 +447,7 @@ class LinkPool:
             link.teardown()
             peer.mark_closed()
             peer.unestablished = True
+            self.paths.charge(node_id)  # RNS now requests the path again by itself
             return False
 
         if peer.identified:
@@ -451,7 +467,7 @@ class LinkPool:
             listener(node_id, float(rtt))
 
     def _recall(self, node_id: bytes):
-        """The node's identity from RNS, asking for a path again (whose response carries it) if needed.
+        """The node's identity from RNS, asking for a path again (whose response carries it) in its turn if needed.
 
         A recall marks the destination used, which keeps it in RNS's known destinations for longer (and is
         an RPC of its own on a shared instance): right for a node being contacted, but not for each of the
@@ -460,13 +476,9 @@ class LinkPool:
         identity = RNS.Identity.recall(node_id)
         if identity is not None:
             return identity
-        RNS.Transport.request_path(node_id)
-        deadline = time.monotonic() + self.config.path_timeout
-        while time.monotonic() < deadline:
-            time.sleep(0.1)
-            found = RNS.Identity.recall(node_id, _no_use=True)
-            if found is not None:
-                return RNS.Identity.recall(node_id) or found
+        if self.paths.await_known(node_id, lambda: RNS.Identity.recall(node_id, _no_use=True) is not None,
+                                  self.config.path_timeout, cancel=self.stop_event):
+            return RNS.Identity.recall(node_id) or RNS.Identity.recall(node_id, _no_use=True)
         return None
 
     def identify(self, peer: PeerLink):

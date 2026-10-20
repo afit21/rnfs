@@ -546,7 +546,7 @@ class RnfsNode:
         self.server = self.announcer = self.announce_handler = None  # made below; stop() skips those not made
         try:
             self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
-                                 names_network=None, is_known=_rns_is_known,
+                                 names_network=RnsNetwork(paths=self.links.paths), is_known=_rns_is_known,
                                  bitrate=rates.slowest_bitrate(self.reticulum), local=local)
         except BaseException:
             if embedded:
@@ -573,6 +573,9 @@ class RnfsNode:
         self._path_of = self.paths.info
         self._path_hops = self.paths.hops
         self._scan_paths = self.paths.scan
+        # Partition mode leaves out queries that failed for want of a path
+        self._path_lacked = self.links.paths.lacked
+        self._path_named = self.links.paths.named
 
         self.server = RequestServer(self.destination, config, self.backend, traffic=self.client.traffic)
         self.announcer = DhtAnnouncer(self.destination, config, needs_reach=self._needs_reach)
@@ -680,12 +683,17 @@ class RnfsNode:
         self._path_of: Callable[[bytes], PathInfo] = no_path_info
         self._path_hops: Callable[[bytes], int | None] = lambda node_id: None
         self._scan_paths: Callable[[int | None], dict[bytes, PathInfo]] = lambda max_hops: {}
+        # Whether the last path request for a node went unanswered (PathRequests.lacked, once Reticulum runs)
+        self._path_lacked: Callable[[bytes], bool] = lambda node_id: False
+        # Scopes the path request for a node a /find reply named (PathRequests.named, once Reticulum runs)
+        self._path_named: Callable[[bytes, bytes], object] | None = None
         self._scanned_at: float | None = None  # monotonic time of the last scan
         # Partition mode: fed only on a node with local servers (local_on), so never entered on another. Failures of
         # servers it knows ask for a probe, which wakes the local-servers thread to send it (_run_local)
         self._local_wake = threading.Event()
         self.partition = PartitionMode(self.local.is_local, slow, on_change=self._partition_changed,
-                                       known=self._knows_server, on_probe=self._local_wake.set)
+                                       known=self._knows_server, on_probe=self._local_wake.set,
+                                       no_path=self._lacked_path)
         # Keys marked for the heal republish before a restart are republished at the first off-island contact after
         # it (the partition may have ended while the node was down, and then no partition mode ends to start it)
         self._heal_at_contact = local
@@ -755,6 +763,7 @@ class RnfsNode:
                                                    known_servers=self._known_servers), batched=False)
         # A key the density check flags on its region's servers gets a widened lookup and K more stores per ring
         self.publisher.set_widening(self.lookups.flags, self.lookups.widen)
+        self.publisher.set_network_size(self.sizes.estimate)  # sweep regions sized by it too
         # Each key is also stored on the closest servers heard for provider_seniority (section 6)
         self.publisher.add_store_part(self._senior_servers)
         # Two-level records: and on its closest local servers (section 6, "LoRa islands")
@@ -994,10 +1003,15 @@ class RnfsNode:
     def _wired_lookup(self, key: bytes, start: list[bytes], **options) -> Lookup:
         """A Lookup for key from start leaving out banned nodes, with options (Lookups' checks and paths). On a node
         that isn't slow, servers behind a slow path rank after the rest (section 6): searches and publishing only,
-        not the join's lookups (which fill the routing table, as it always was)."""
+        not the join's lookups (which fill the routing table, as it always was). Once Reticulum runs, the path request
+        for a node a reply named goes only where the path to the node that named it goes (named; not the join's either).
+        """
         if not self.slow:
             options.setdefault("slow_path", self.slow_paths)
             options.setdefault("check_path", self._check_path)
+        if self._path_named is not None:
+            # A node a reply named is asked for its path where the path to the node that named it goes (spec section 3)
+            options.setdefault("named", self._path_named)
         if self.local_on:
             # Partition mode (section 6, "LoRa islands"): local servers only, also for a lookup running when it begins
             options.setdefault("allowed", self.partition.allows)
@@ -1067,6 +1081,11 @@ class RnfsNode:
         as a server this node knows of (_is_server) or one whose identity or path RNS knows. A /find reply can name
         made-up IDs, which always fail."""
         return self._is_server(node_id) or self._is_known(node_id) or self._path_hops(node_id) is not None
+
+    def _lacked_path(self, node_id: bytes) -> bool:
+        """Partition mode's no_path (section 6): True if a failure of node_id was for want of a path, the last path
+        request for it having gone unanswered (it still counts in the routing table)."""
+        return self._path_lacked(node_id)
 
     def scan_local(self):
         """Judge every server known with a path from one read of the path table (RnsPaths.scan: through a shared
