@@ -32,7 +32,7 @@ from rnfs.constants import ID_LENGTH
 from rnfs.content import seal
 from rnfs.content.cid import RAW, Cid
 from rnfs.features import keepers
-from rnfs.network import guards, protocol, rates
+from rnfs.network import guards, paths, protocol, rates
 
 
 class Internal(NamedTuple):
@@ -235,6 +235,43 @@ INTERNALS = [
                               "ifstats['status'] = interface.online", "ifstats['bitrate'] = interface.bitrate",
                               "stats['interfaces'] = interfaces"),
                       _has(RNS.Interfaces.LocalInterface, *rates.LOCAL_INTERFACE_TYPES))),
+    Internal("network/paths.py", "Transport.PATH_REQUEST_MI; await_path(destination_hash, timeout) and "
+             "request_path(destination_hash) sending one request; Transport.jobs requesting a path again after a link "
+             "that never established, at most every PATH_REQUEST_MI; get_interface_stats() entries {hash, type, status, "
+             "outgoing_pr_frequency, parent_interface_hash}",
+             lambda: (_true(RNS.Transport.PATH_REQUEST_MI == paths.PATH_REQUEST_MI, "PATH_REQUEST_MI changed"),
+                      _params(RNS.Transport.await_path, "destination_hash", "timeout"),
+                      _params(RNS.Transport.request_path, "destination_hash"),
+                      _source(RNS.Transport.await_path, "if Transport.has_path(destination_hash): return True",
+                              "else: Transport.request_path(destination_hash, on_interface=on_interface)"),
+                      _source(RNS.Transport.jobs, "Transport.expire_path(link.destination.hash)",
+                              "if time.time() - last_path_request > Transport.PATH_REQUEST_MI:"),
+                      _source(RNS.Reticulum.get_interface_stats, "ifstats['hash'] = interface.get_hash()",
+                              "ifstats['parent_interface_hash'] = interface.parent_interface.get_hash()",
+                              "ifstats['outgoing_pr_frequency'] = interface.outgoing_pr_frequency()",
+                              "ifstats['type'] = str(type(interface).__name__)",
+                              "ifstats['status'] = interface.online"))),
+    Internal("network/paths.py", "request_path(destination_hash, on_interface, tag) sending on that interface alone "
+             "(the packet's attached_interface, the only filter _outbound applies to a path request going out), as RNS "
+             "itself forwards a local client's request; await_path(on_interface=); next_hop_interface giving the path "
+             "table entry's interface; Transport.interfaces and local_client_interfaces; an Interface's OUT, online, "
+             "detached, parent_interface, spawned_interfaces and bitrate",
+             lambda: (_params(RNS.Transport.request_path, "destination_hash", "on_interface", "tag"),
+                      _params(RNS.Transport.await_path, "on_interface"),
+                      _source(RNS.Transport.request_path, "attached_interface = on_interface",
+                              "packet.is_outbound_pr = True"),
+                      _source(RNS.Transport._outbound,
+                              "if packet.attached_interface: potential_interfaces = [packet.attached_interface]",
+                              "if packet.attached_interface != None and interface != packet.attached_interface: "
+                              "continue"),
+                      _source(RNS.Transport.path_request,
+                              "Transport.request_path(destination_hash, interface, tag = request_tag)"),
+                      _source(RNS.Transport.next_hop_interface,
+                              "return Transport.path_table[destination_hash][IDX_PT_RVCD_IF]"),
+                      _has(RNS.Transport, "interfaces", "local_client_interfaces"),
+                      _assigns(RNS.Interfaces.Interface.Interface.__init__, "online", "detached", "parent_interface",
+                               "spawned_interfaces", "bitrate"),
+                      _has(RNS.Interfaces.Interface.Interface, "OUT"))),
 
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "

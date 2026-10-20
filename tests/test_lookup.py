@@ -388,6 +388,29 @@ class UnknownIdTest(LookupTestCase):
             lookup.find_closest()
             self.assertEqual(len([n for n in tried if n in fakes]), expected, (alpha, unknowns))
 
+    def test_named_tells_who_named_each_unknown_id_queried(self):
+        """named(id, by) before a query costs a path request: the node scopes it to the path to by (paths.named)."""
+        first, second, known_one = ident(1), ident(2), ident(3)
+        fakes = [ident(0x100 + i) for i in range(4)]
+        replies = {first: [second, fakes[0], known_one], second: fakes[1:]}
+
+        def query(n, key):
+            """first names second, a fake and a known node; second names the other fakes; fakes don't answer."""
+            return ([], replies[n]) if n in replies else (([], []) if n == known_one else None)
+
+        told: list[tuple[bytes, bytes]] = []
+        lookup = Lookup(ident(0x100), [first], query, ident(0), alpha=1, unknowns=10, poll_interval=0.05,
+                        is_known=lambda n: n in (first, known_one), named=lambda n, by: told.append((n, by)))
+        lookup.find_closest()
+        # Unknown IDs only, each with the node whose answer first named it; the known node isn't told
+        self.assertEqual(dict(told), {second: first, fakes[0]: first, **{n: second for n in fakes[1:]}})
+        self.assertEqual(len(told), len(dict(told)))
+        # A callback that raises doesn't end the lookup
+        lookup = Lookup(ident(0x100), [first], query, ident(0), alpha=1, unknowns=10, poll_interval=0.05,
+                        is_known=lambda n: n in (first, known_one), named=lambda n, by: 1 / 0)
+        with mock.patch("rnfs.log.log"):
+            self.assertIn(known_one, lookup.find_closest())
+
     def test_budget_shared_with_providers(self):
         lookup = Lookup(ident(1), [], lambda n, k: None, ident(0), alpha=2, is_known=lambda n: n == ident(9))
         self.assertTrue(lookup.allow_unknown(ident(9)))  # known: free

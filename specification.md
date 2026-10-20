@@ -94,12 +94,12 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   - A client (section 6) MAY skip the periodic announces while nothing needs other nodes to reach it, but MUST
     announce while it provides anything (section 6), owns names (it answers `/name` for them, section 9),
     accepts remote pins (section 8) or is in private mode, and SHOULD announce at once when that starts. A
-    transport node forwards a path request only for a destination it has a path to, unless the request arrived
-    on an access-point, gateway, roaming or boundary interface, or one with `recursive_prs` (RNS 1.5.6
-    `Transport.path_request`); interfaces default to `full` mode, so a destination that never announces is
-    usually reachable from one hop away only. And private-mode servers of rnfs 0.1.4 to 0.1.6 drop at start the
-    records of publishers whose identity RNS doesn't recall. (rnfs: checked every minute; servers always
-    announce.)
+    transport node answers a path request only for a destination it has a path to, and forwards one for a path it
+    lacks only if the request arrived on an access-point, gateway, roaming or boundary interface, or one with
+    `recursive_prs` (RNS 1.5.6 `Transport.path_request`); interfaces default to `full` mode, so a destination that
+    never announces is usually reachable from one hop away only. And private-mode servers of rnfs 0.1.4 to 0.1.6
+    drop at start the records of publishers whose identity RNS doesn't recall. (rnfs: checked every minute; servers
+    always announce.)
 - The announce's `app_data` is the node's DHT mode as a msgpack integer: `1` server, `0` client (section 6).
   - Anything other than msgpack `1` means client. A node re-announces when its mode changes.
   - It is set with `Destination.set_default_app_data()`, so path responses carry it too.
@@ -109,6 +109,66 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
   (`Identity.recall`, filled from announces and path responses). A node MUST link only to the `rnfs.dht`
   destination of the recalled identity, and only if its hash is the node ID asked for, so one identity can't
   answer for other node IDs through its other destinations.
+
+**Path requests.** RNS limits path requests as it limits announces (to 2% of an interface's bitrate, section 6).
+- Since RNS 1.2.5 every interface limits the path requests arriving on it. In RNS 1.5.6
+  (`Interface.should_ingress_limit_pr`, `Transport.inbound`) an interface, each TCP client a hub spawns included,
+  estimates the rate of incoming path requests from its last few (n requests over the time since the oldest; one
+  older than 10 s is dropped at each estimate). Above 8 a second, or 3 while the interface is under 2 hours old (as a
+  hub's interface for a client that just connected is), later requests wait in one queue of 8, shared by the
+  instance's interfaces, behind all other traffic, and the rest are dropped. A request let through is still answered
+  from the path table, but not forwarded to discover an unknown path. The limit holds for at least 15 s after the
+  rate falls back.
+- The limit counts every application's requests on the interface, so a burst from one costs the others on that
+  interface their path resolution too; RNS's release notes say applications that send many will see their users lose
+  path resolution, by design. On a shared radio channel the gateway's interface counts every node's requests.
+- RNS also sends path requests of its own: after a link that fails to establish, a node that isn't a transport node
+  expires the path and requests it again on every interface, at most once per destination every `PATH_REQUEST_MI`
+  (20 s) (RNS 1.5.6 `Transport.jobs`; `rnsd` does the same for its local clients' links).
+- A transport node answers a request for a destination it has a path to; it forwards one for a path it lacks only as
+  above (an access-point, gateway, roaming or boundary interface, or `recursive_prs`), and then only on its other
+  interfaces: RNS never sends a path request out again on the interface it arrived on. A node that isn't a transport
+  node answers only for its own destinations.
+- A node SHOULD pace its own path requests, so RNS's estimate for it at the next hop's interface stays well under a
+  new interface's 3 a second. rnfs keeps one budget per node for every path request it sends (link opens, so lookups,
+  stores, fetches and keeper queries; a lookup's path check; name resolves; NomadNet adds): each takes a turn at least
+  1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. A request waiting for its turn
+  hasn't failed, and the wait isn't part of `path_timeout`, which starts once it is sent. A turn is also put off while
+  the busiest interface's outgoing estimate (RNS's `outgoing_pr_frequency` from `get_interface_stats`, through a
+  shared instance too, which counts other applications' requests; a hub's server interface, which counts a copy for
+  each client, left out) is above 1.5 a second, for at most 15 s. Not while an interface's own limit is active
+  (`pr_burst_active`): that comes from other nodes' requests, so on a shared channel every node would wait on the same
+  signal and resume together (in the topology simulation it raised an island-wide cold start's trips from 0.9 to 9.8
+  an hour). A link that fails to establish costs a turn, as RNS then requests the path again. One wait per
+  destination runs at a time (RNS's `Transport.await_path` doesn't join concurrent callers; later callers wait for
+  it), and nothing is sent again for a destination within `PATH_REQUEST_MI` of its last request, RNS's own included: a
+  caller then waits `path_timeout` for the answer still on its way.
+- In the topology simulation (docs/simulations/topology, section 11; 1,000 and 3,000 servers) the pacing keeps a fast
+  node that starts for the first time from tripping its hub's interface (peak estimate 1.5 a second): none of its
+  ~45 requests is dropped (7–10 were at a hub taking 2–10 ms a packet), and no such node has 3 failed queries in a
+  row (58–68% did, enough for partition mode on a gateway). Its first publish round takes 41–45 s instead of 7 s
+  (22–25 s with drops); an island publisher's 25–31 minute round takes 60–80 s more; searches send none. On a shared
+  radio channel the gateway's interface counts every node's requests, so pacing can't keep it under the limit in an
+  island-wide cold start on faster LoRa; that is harmless for rnfs, as a limited request is still answered when the
+  gateway has the path. Established nodes send almost none: they have every path from announces.
+- **Path requests only where the node can be.** A path request with no interface given goes out on every interface
+  (`Transport.request_path`), so a node with a LoRa and a TCP interface would send its lookups' requests for internet
+  nodes over its radio too. A node running its own RNS instance SHOULD send the path request for a node a `/find` reply
+  named, whose identity it doesn't know, only on the interface its path to the replying node uses
+  (`Transport.next_hop_interface`, `request_path(on_interface=...)`; rnfs: searches' and publishing's lookups, not the
+  join's), when that interface is fast (its bitrate at least `slow_bitrate`): an ID named by a node reached over the
+  internet side is asked only there. One named by a node reached over a slow interface, or one whose bitrate RNS
+  doesn't give, is asked on every interface: it may be an island server, reachable only over the radio, or an
+  internet one, reachable only over the other side. An interface RNS spawned (a hub's interface for one client, an
+  AutoInterface's for one peer) stands for all its parent's: the request goes on each of them with one tag, as RNS
+  itself forwards a local client's request. A lookup has other candidates, so a miss isn't asked again on every
+  interface. Joins, names, providers and links to
+  known IDs ask on every interface. Through a shared instance nothing changes: the instance forwards a client's request
+  on all its interfaces (`Transport.path_request`), so scoping it there would need an RNS change. RNS documents
+  `on_interface` as not for normal use, but in RNS 1.5.6 an outgoing path request is filtered by nothing else (no
+  interface mode applies to it, `Transport._outbound`), so it behaves alike on every mode; an interface a request can't
+  leave by (offline, not outgoing, a local interface, a parent of spawned ones) is never chosen, and the request then
+  goes on every interface.
 
 **Links.**
 - Requests to a node share one outgoing link, opened on demand and closed once it has had no request in progress
@@ -583,6 +643,13 @@ segment_i   = iv || AES-256-CBC(enc_key, iv, PKCS7(plaintext_i)) || tag_i
 Kademlia, used only for provider records. The distance between IDs `a` and `b` is `a XOR b` as a 128-bit
 big-endian integer; "closest" means smallest distance.
 
+**What announces carry.** Servers are found from their `rnfs.dht` announces (which carry the DHT mode, section 3),
+and names live in announces of their own (section 9). Provider records are never announced: they are stored on the
+servers closest to their key (`/provide`) and looked up (`/find`). RNS floods announces and lets them take at most
+2% of an interface's bitrate, which on a 1 kbit/s channel is about 1,150 announces a day: the presence of about 290
+nodes announcing every `announce_interval` (6 h), not an announce for each CID (one node providing 1,150 CIDs, each
+announced once a day, would take all of it).
+
 **Servers and clients.** As in IPFS, a node runs the DHT as a *server* or a *client* (`dht_mode`):
 - A server answers `/find` and `/provide`, stores provider records, and appears in routing tables.
 - A client only makes requests: it answers `/find` and `/provide` with `False`, and is never added to routing
@@ -794,13 +861,31 @@ or protocol constant changes.
   radius, which misses some of the island), one at a time on a slow node, before any other server, until one of
   their replies lists a provider; their replies seed the rest of the lookup as any answer does (its start nodes),
   and the lookup's bounds and checks are unchanged. Its fallback over disjoint paths doesn't ask them first again.
+- **Path requests on an island.** RNS never sends a path request out again on the interface it arrived on (section 3),
+  so on an island whose relays have one radio a request reaches only the nodes in radio range of its sender, each
+  transport node among them answering from its own path table; nothing floods it across the island. A slow node's
+  larger budgets of unknown IDs (Lookups, above) therefore find paths beyond its neighbours' path tables only one
+  hop from the gateway, and only if the gateway forwards requests for paths it lacks to its internet side: its radio
+  interface in `gateway` (or `access_point`, `roaming`) mode or with `recursive_prs`, transport enabled. A relay
+  bridging two radios forwards from one to the other likewise. The topology simulation's island rows (section 11 of
+  its results) assumed requests flood the island; with relays that can't forward, its `-full` rows are closer.
+  Island operators SHOULD run gateways (and relays with more than one interface) so; rnfs's README says how.
 - **Partition mode.** Servers that aren't local are *off-island*. A node with local servers SHOULD notice when it is
   cut off from them and then use its local servers only. rnfs enters partition mode when a probe of an off-island
   server (below) goes unanswered:
   - after 3 failures in a row reaching off-island servers it knows (a `/find` unanswered, or a `/provide` for which
     no identified link could be opened; any off-island answer between resets the count; local ones don't count).
     A server it knows is one in its routing table or announce first-seen log, or whose identity or path RNS knows:
-    a `/find` reply can name made-up IDs, which always fail, and they don't count. The probe goes at once, to a
+    a `/find` reply can name made-up IDs, which always fail, and they don't count. Nor does a failure for want of a
+    path (rnfs: the last path request for the server went unanswered), which still counts in the routing table:
+    island relays in RNS's default `full` mode never forward a request for a path they lack, and a hub drops
+    requests over its limit (section 3), so on a connected network such failures are common (counted, 65–72% of
+    island publish rounds in the topology simulation entered partition mode with `full` relays). In a real
+    partition each off-island server's first failure is a link failure (a node that isn't a transport node then
+    expires the path and asks again, so later queries fail for want of one), so it is still detected: measured,
+    partition mode comes 2–14 s later (75 → 78 s, 131 → 145 s), and every partitioned publisher still enters it.
+    A probe's outcome counts whatever the reason. A node dropped wrongly from the routing table regains its
+    seniority within 2 × `announce_interval`. The probe goes at once, to a
     server that answered or announced itself recently (with none, nothing beyond the island having been heard since
     the start, the failures enter partition mode without one); or
   - after off-island silence (no off-island answer nor fresh announce) longer than 4 times the usual gap between the
@@ -2374,7 +2459,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
 | `blocks_cooldown` | 300 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
-| `path_timeout` | 30 s | Waiting for an RNS path |
+| `path_timeout` | 30 s | Waiting for an RNS path, from when the path request is sent (a wait for its turn, section 3, isn't counted) |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |
 | `link_idle_timeout` | 5 min | |
 | `max_incoming_links` | 128 | |

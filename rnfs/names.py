@@ -335,6 +335,11 @@ def import_floor(value: dict, tx) -> int:
 class RnsNetwork:
     """The RNS calls names make. Tests replace it with a fake; this one needs a running Reticulum."""
 
+    def __init__(self, paths=None):
+        """RNS calls; paths is the node's path-request budget (rnfs.network.paths.PathRequests), which a name's path
+        request waits its turn in (None: sent at once)."""
+        self.paths = paths
+
     def name_destination(self, identity: RNS.Identity) -> RNS.Destination:
         """Register the IN/SINGLE rnfs.name destination of identity (raises KeyError if already registered)."""
         destination = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, APP_NAME, NAME_ASPECT)
@@ -355,8 +360,12 @@ class RnsNetwork:
         RNS.Transport.deregister_announce_handler(handler)
 
     def request_path(self, name: bytes):
-        """Ask the network for name's announce; answers arrive as path responses."""
-        RNS.Transport.request_path(name)
+        """Ask the network for name's announce, on every interface; answers arrive as path responses. With a budget,
+        the request waits its turn first (not part of the caller's path_timeout, which starts once this returns)."""
+        if self.paths is not None:
+            self.paths.send(name)
+        else:
+            RNS.Transport.request_path(name)
 
     def recall_app_data(self, name: bytes) -> bytes | None:
         """The app_data of the last validly signed announce RNS heard for name."""

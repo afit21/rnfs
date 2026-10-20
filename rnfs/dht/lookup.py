@@ -89,6 +89,10 @@ def _never(node_id: bytes) -> bool:
     return False
 
 
+def _unnamed(node_id: bytes, by: bytes) -> None:
+    """Default named: does nothing."""
+
+
 def _quiet(text: str) -> None:
     """Default report: says nothing."""
 
@@ -132,6 +136,8 @@ class Lookup:
       (a failed query, not sent). Nodes that aren't slow give both; slow nodes neither.
     - `first`: nodes the first run asks before any other, until a reply lists a provider (see above); `allowed(id)`:
       whether a node may be queried at all (see above).
+    - `named(id, by)`: told, just before a query goes to a node whose identity isn't known (a path request), which node's
+      answer first named it (the node scopes that path request to the path to `by`, rnfs.network.paths).
 
     After find_closest, candidates() gives every node it chose from and ask() sends one more /find about a nearby
     key, so one lookup serves the keys of a region (sweep providing, rnfs.publisher).
@@ -153,7 +159,8 @@ class Lookup:
                  on_complete: Callable[[bytes, int], object] = _unsampled, unknowns: int | None = None,
                  slow_path: Callable[[bytes], bool] = _never,
                  check_path: Callable[[bytes], bool | None] | None = None, first: Iterable[bytes] = (),
-                 allowed: Callable[[bytes], bool] = _always):
+                 allowed: Callable[[bytes], bool] = _always,
+                 named: Callable[[bytes, bytes], object] = _unnamed):
         """A lookup for key; nothing is sent until find_closest() or find_providers() runs it."""
         self.key = key
         self.query = query
@@ -181,6 +188,8 @@ class Lookup:
         self.slow_path = slow_path
         self.check_path = check_path
         self.allowed = allowed
+        self.named = named
+        self._named_by: dict[bytes, bytes] = {}  # node -> the node whose answer first named it, in any run
         self._slow: dict[bytes, bool] = {}  # slow_path's answers, asked once per node (and check_path's True)
         self._checked: set[bytes] = set()  # nodes check_path was asked about
         self.ended = ""  # how the last run ended ("complete", "no progress", ...; "" before the first)
@@ -306,6 +315,8 @@ class Lookup:
         for new_id in nodes:
             if new_id not in known and new_id not in self._last_queried and self._usable(new_id):
                 known[new_id] = self._distance(new_id)
+                with self._lock:
+                    self._named_by.setdefault(new_id, node_id)
                 if self.unreliable(new_id):
                     self._last_doubtful.add(new_id)
                 if self._is_slow(new_id):
@@ -593,6 +604,8 @@ class Lookup:
                 if new_id not in known and new_id not in queried and self._usable(new_id) and not self.taken(new_id):
                     known[new_id] = self._distance(new_id)
                     introduced.setdefault(new_id, node_id)
+                    with self._lock:
+                        self._named_by.setdefault(new_id, node_id)
                     if self.unreliable(new_id):
                         doubtful.add(new_id)
                     if self._is_slow(new_id):
@@ -657,6 +670,15 @@ class Lookup:
         and queues it for the run. check: ask check_path first, and queue _SLOWER instead if the path is slow."""
         key = self.key if key is None else key
         about = "" if key == self.key else f" about {key.hex()}"
+        with self._lock:
+            # Charged to the budget of unknown IDs (allow_unknown): its query starts with a path request
+            by = self._named_by.get(node_id) if node_id in self._allowed_unknown else None
+        if by is not None:
+            try:
+                self.named(node_id, by)
+            except Exception as e:  # noqa: BLE001 - a caller's callback must not end the lookup; logged
+                from rnfs.log import LOG_WARNING, log
+                log(f"lookup for {self.key.hex()}: the named callback for {_name(node_id)} raised {e!r}", LOG_WARNING)
 
         def work():
             """Run the blocking query, report it, and hand the cleaned reply to the run."""

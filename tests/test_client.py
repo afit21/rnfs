@@ -22,7 +22,7 @@ if ROOT not in sys.path:
 from rnfs.config import Config  # noqa: E402
 from rnfs.constants import BLOCKS_PATH, CHUNK_SIZE, FIND_PATH, KIB, MAX_BLOCK_SIZE, PIN_PATH, PROVIDE_PATH  # noqa: E402
 from rnfs.content.cid import RAW, Cid  # noqa: E402
-from rnfs.network import client, links, protocol  # noqa: E402
+from rnfs.network import client, links, paths, protocol  # noqa: E402
 
 import tests.test_links as fakes  # noqa: E402  (a module, so its test cases don't run twice)
 from tests.support import free_port  # noqa: E402
@@ -113,6 +113,7 @@ class PeerClientTest(unittest.TestCase):
         self.assertEqual(self.call(lambda: self.client.find(NODE, KEY)), ([KEY], [NODE]))
 
     def test_find_unreachable(self):
+        links.RNS.Transport.has_path = lambda node_id: False
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertIsNone(self.call(lambda: self.client.find(NODE, KEY)))
 
@@ -146,6 +147,7 @@ class PeerClientTest(unittest.TestCase):
         self.assertEqual([len(data[0]) for path, data, _ in link.requests], [22, 22, 22])  # one retry
 
     def test_provide_without_a_link_reports_nothing_sent(self):
+        links.RNS.Transport.has_path = lambda node_id: False
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertEqual(self.call(lambda: self.client.provide(NODE, [KEY], [])), set())
 
@@ -293,6 +295,10 @@ class PeerClientTest(unittest.TestCase):
         fakes.FakeLink.establishes = None  # established now: what get() last saw is forgotten
         self.assertEqual(self.call(lambda: self.client.blocks(NODE, [cid])).status, client.OK)
         self.pool.close(NODE)
+        # A budget that hasn't seen the failed link: after one, the pool waits path_timeout for the path RNS requests
+        # again by itself (network/paths.py) rather than failing at once
+        self.pool.paths = paths.PathRequests(transport=lambda: links.RNS.Transport, reticulum=lambda: None)
+        links.RNS.Transport.has_path = lambda node_id: False
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         result = self.call(lambda: self.client.blocks(NODE, [cid]))
         self.assertEqual((result.status, result.reason), (client.FAILED, "unreachable"))

@@ -617,7 +617,8 @@ def add_nomadnet(node, link: str, wrap: bool = False, only_hash: bool = False, p
         identity = load_or_create_identity(nomadnet_identity_path(node.config))
     snapshot = fetching.fetch(target, node.config, node.config.state_dir, identity=identity,
                               max_size=nomadnet_room(node), progress=progress,
-                              stop_event=getattr(node, "stop_event", None))
+                              stop_event=getattr(node, "stop_event", None),
+                              paths=getattr(getattr(node, "links", None), "paths", None))
     try:
         entry = name or nomadnet.snapshot_name(target, snapshot.sent_name)
         sealing = bool(to or to_self)
