@@ -221,6 +221,12 @@ class PeerClientTest(unittest.TestCase):
         self.respond(lambda link, path, data: False)
         self.assertIsNone(self.call(lambda: self.client.blocks(NODE, [cid])).elapsed)
 
+    def test_hold_link(self):
+        self.assertFalse(self.client.hold_link(NODE, 60))  # no link to hold
+        peer = self.call(lambda: self.pool.get(NODE))
+        self.assertTrue(self.client.hold_link(NODE, 60))
+        self.assertIsNotNone(peer.held_until)
+
     def test_link_mdu(self):
         self.assertIsNone(self.client.link_mdu(NODE))
         peer = self.call(lambda: self.pool.get(NODE))

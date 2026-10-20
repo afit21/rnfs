@@ -332,6 +332,24 @@ class LinkPoolTest(unittest.TestCase):
         self.now[0] += 301  # not used after all
         self.assertEqual(self.pool.sweep(), 1)
 
+    def test_sweep_keeps_a_held_link(self):
+        # A requester waiting out the provider's upload pacing (9 minutes for a LoRa chunk) holds its link
+        self.assertFalse(self.pool.hold(NODE, 600))  # no link yet
+        peer = run(self, lambda: self.pool.get(NODE))
+        self.assertTrue(self.pool.hold(NODE, 600))
+        self.assertTrue(self.pool.hold(NODE, 10))  # a shorter hold doesn't cut a longer one short
+        peer.link.idle = 590
+        self.now[0] += 590
+        self.assertEqual(self.pool.sweep(), 0)
+        self.assertIs(run(self, lambda: self.pool.get(NODE)), peer)  # handed out meanwhile: still held
+        peer.link.idle = 600 + 299
+        self.now[0] += 10 + 299  # link_idle_timeout after the hold ends, less a second
+        self.assertEqual(self.pool.sweep(), 0)
+        peer.link.idle += 2
+        self.now[0] += 2
+        self.assertEqual(self.pool.sweep(), 1)
+        self.assertEqual(peer.link.status, FakeLink.CLOSED)
+
     def test_sweep_rechecks_under_the_lock(self):
         # get() hands the link out after sweep() found it idle but before it is closed
         peer = run(self, lambda: self.pool.get(NODE))

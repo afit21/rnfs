@@ -421,6 +421,11 @@ The DHT and provider records (local behaviour: nothing on the wire changes):
   still lives `PROVIDER_TTL`, 7 days). A key still keeps at most 1000 publishers, now giving way lowest tier first.
 
 Changed:
+- A pacing wait no longer closes the link: after a response on a slow link the fetcher waits as long again before
+  asking that provider again (the responder's upload pacing), and on LoRa a 64 KiB chunk takes about 9 minutes, so
+  the wait outlasted `link_idle_timeout` (5 minutes) and the idle link was closed, taking its rate estimate with it:
+  the next response was sized and paced as on a new link. The link now counts as in use while its provider is
+  waited for.
 - Slow links are judged per provider, not per node: a gateway with a TCP and a LoRa interface isn't a slow node,
   so it ran 3 parallel `/blocks`, probed open links for the root and duplicated any batch out for 30 s, all over
   the radio. Now a provider is reached over a slow link when the link's rate estimate is below `slow_bitrate` (or,

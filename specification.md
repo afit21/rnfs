@@ -278,7 +278,9 @@ pass a `max_response_size` just above their largest honest answer.
     have to wait longer.
   - So a requester on a slow link SHOULD, after a response, wait as long again as that request took before
     sending its next `/blocks` to that node (at the default cap, half the rate estimate, the next response may
-    start twice its transfer time after the last one started).
+    start twice its transfer time after the last one started). The link counts as in use while it waits, so it
+    isn't closed as idle (`link_idle_timeout`): a 64 KiB chunk takes about 9 minutes at 1 kbit/s, and so does the
+    wait, and a new link would have no rate estimate for the next response's size and pacing.
 
 **Airtime controls.** A node MAY limit the airtime it spends answering `/blocks` with the settings below.
 Each limit answers `/blocks` with `False`, which the requester treats as busy (section 6), moving on to

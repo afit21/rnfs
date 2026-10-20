@@ -71,6 +71,12 @@ class PeerClient:
         peer = self.links.shared_peer(node_id)
         return peer.mdu() if peer is not None and peer.is_active() else None
 
+    def hold_link(self, node_id: bytes, seconds: float) -> bool:
+        """Count the shared link to node_id as in use for seconds more (LinkPool.hold): the fetcher waiting out the
+        node's upload pacing, so the idle sweep doesn't close the link, and with it the rate estimate the next
+        request is sized and paced by. False if there is no open link."""
+        return self.links.hold(node_id, seconds)
+
     def close(self, node_id: bytes):
         """Close the shared link to node_id, cancelling any transfer on it."""
         self.links.close(node_id)

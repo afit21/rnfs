@@ -2079,7 +2079,9 @@ Everything in the specification is implemented, with these simplifications and a
   not yet stored would leave less than the disk reserve free (`Storage.check_disk`).
 - Upload pacing: `RequestServer` holds an accepted `/blocks` back at most `MAX_PACING_WAIT` (5.625 s, half of
   RNS's request timeout without RTT) and refuses one that would wait longer. After a response on a slow link,
-  `Fetch._pace` waits as long again as the request took before asking that provider again, and a refusal within
+  `Fetch._pace` waits as long again as the request took before asking that provider again, holding its link
+  meanwhile (`PeerClient.hold_link`, `LinkPool.hold`: the idle sweep counts it as handed out when the wait ends),
+  so the link and its rate estimate survive a wait longer than `link_idle_timeout`, and a refusal within
   4 × that time of the request being sent isn't counted towards `max_failures` (retried after an eighth of it,
   at least `busy_delay`). A `LOST` result (above) closes the provider's link (`Fetch._close_link`, so not one
   another fetch uses) and asks again after `busy_delay`, failing the provider after `max_failures` in a row

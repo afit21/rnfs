@@ -42,7 +42,8 @@ request on it: then it is left to finish), and its outcome isn't counted against
 Upload pacing (section 3): a responder starts a slow link's next /blocks response no sooner than its size at
 the upload cap (by default half the rate estimate) after the previous one started, and refuses a request it
 would have to hold back for longer than a few seconds. So after a response on a slow link, a provider isn't
-asked again until as long as that request took has passed again. Refusals within four times that of a
+asked again until as long as that request took has passed again, and its link counts as in use meanwhile
+(PeerClient.hold_link), so the idle sweep doesn't close it and lose the rate estimate. Refusals within four times that of a
 served response aren't counted towards max_failures (the estimates at the two ends differ, and a responder
 may set a lower cap): they are retried every eighth of that time, or BUSY_DELAY if longer.
 
@@ -1607,6 +1608,9 @@ class Fetch:
             # transfer time has passed UPLOAD_CAP_DIVISOR times since it started: took has passed once already
             provider.busy_until = max(provider.busy_until, now + (rates.UPLOAD_CAP_DIVISOR - 1) * took)
             self._progress_at = max(self._progress_at, provider.busy_until)  # waiting isn't hanging
+            # Waiting is using the link: on LoRa a 64 KiB chunk takes about 9 minutes, and so does the wait, longer
+            # than link_idle_timeout; a link swept meanwhile would take its rate estimate, and the pacing, with it
+            self.client.hold_link(provider.node_id, provider.busy_until - now)
 
 
 def describe(fetch: Fetch) -> str:

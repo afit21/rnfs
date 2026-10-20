@@ -400,6 +400,8 @@ class PacingTest(FetcherTest):
         # At the default cap, half the rate estimate, the next response may start 2 × 40 s after the last one
         self.assertEqual(self.provider.busy_until, self.now + 40)
         self.assertGreaterEqual(self.fetch._progress_at, self.now + 40)  # waiting isn't counted as hanging
+        # ...nor leaving the link idle: the sweep would close it, and its rate estimate (and this pacing) with it
+        self.assertEqual(self.client.held, [(P1, 40)])
 
     def test_response_progress_doesnt_cut_a_pacing_wait_short(self):
         self.result(OK, sent_at=self.now - 40, rate=50_000)
@@ -416,6 +418,7 @@ class PacingTest(FetcherTest):
         self.assertEqual(self.provider.busy_until, 0)
         self.result(OK, sent_at=self.now - 40, rate=None)
         self.assertEqual(self.provider.busy_until, 0)
+        self.assertEqual(self.client.held, [])
 
     def test_refusals_soon_after_serving_are_not_failures(self):
         self.result(OK, sent_at=self.now - 40, rate=50_000)

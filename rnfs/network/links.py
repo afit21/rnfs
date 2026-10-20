@@ -1,7 +1,8 @@
 """Outgoing RNS links to other nodes (specification section 3).
 
 - Requests to a node share one outgoing link, opened on demand and closed after link_idle_timeout without
-  traffic (Link.no_data_for()) or being handed out by LinkPool.get(). These links don't identify, so lookups
+  traffic (Link.no_data_for()) or being handed out by LinkPool.get() or held (LinkPool.hold: a requester waiting
+  out the provider's upload pacing, so the next response keeps the link's rate estimate). These links don't identify, so lookups
   and downloads don't reveal who asks.
 - A link goes only to a destination whose hash is the node ID asked for (rnfs.dht of the identity RNS
   recalls for it), so one identity can't pose as many node IDs by announcing other destinations.
@@ -156,6 +157,7 @@ class PeerLink:
         # lost on the way (LinkPool._open), rather than the node being out of reach
         self.unestablished = False
         self.handed_out: float | None = None  # when LinkPool.get() last returned it (the pool's clock)
+        self.held_until: float | None = None  # LinkPool.hold: in use until then, as if handed out then
         self.cond = threading.Condition()
 
     def is_active(self) -> bool:
@@ -461,6 +463,18 @@ class LinkPool:
         with self.lock:
             return self.shared.get(node_id)
 
+    def hold(self, node_id: bytes, seconds: float) -> bool:
+        """Count the shared link to node_id as in use for seconds more, as if get() handed it out then (a requester
+        waiting out a provider's upload pacing before its next request): sweep() closes it only link_idle_timeout
+        after that. False if there is no such link."""
+        with self.lock:
+            peer = self.shared.get(node_id)
+            if peer is None:
+                return False
+            until = self.clock() + max(0.0, seconds)
+            peer.held_until = until if peer.held_until is None else max(peer.held_until, until)
+            return True
+
     def close(self, node_id: bytes):
         """Tear down the shared link to node_id, if any (e.g. after a stalled transfer)."""
         self.close_link(self.shared_peer(node_id))
@@ -502,6 +516,8 @@ class LinkPool:
                 # get() may have handed it out since (its caller is about to send a request): it marks the peer
                 # under this lock, and once the peer is out of the pool here no get() can return it
                 if peer.handed_out is not None and self.clock() - peer.handed_out < timeout:
+                    continue
+                if peer.held_until is not None and self.clock() - peer.held_until < timeout:
                     continue
                 if self.shared.get(peer.node_id) is peer:
                     del self.shared[peer.node_id]
