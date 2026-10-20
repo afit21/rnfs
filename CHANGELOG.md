@@ -457,6 +457,10 @@ Changed:
 - `Config.load` reports invalid TOML as "<path> isn't valid TOML: …" (still a `ValueError`).
 
 Faster:
+- Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks
+  (2 MiB) before handing over the first byte, about 5 hours at LoRa's 1 kbit/s. While no provider known is reached
+  over a fast link (or none is known yet), the window is one chunk with the next asked for ahead, so the first
+  byte comes after one chunk (about 9 minutes at 1 kbit/s); over fast links it stays 32.
 - A start no longer lists every stored block before the API answers: their sizes are kept in the state database
   (`block_sizes`) and read from there after a clean stop. After a crash or power loss the start lists them all,
   as before, and corrects the table. Opening storage on a desktop NVMe disk (warm cache), small blocks: 100 000

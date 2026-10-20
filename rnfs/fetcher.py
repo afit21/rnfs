@@ -82,8 +82,9 @@ soon as it is met, stored or downloaded, rather than once its whole tree level h
 for a level's last response. A parent is always stored before its children are asked for, so whatever an
 interrupted fetch stored hangs together from the target, and the next fetch resumes from it.
 
-read_range fetches WINDOW chunks at a time, and asks for the next window's before handing the reader this one's
-bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
+read_range fetches WINDOW chunks at a time (SLOW_WINDOW while no provider known is reached over a fast link: 32
+chunks take about 5 hours on LoRa before the first byte), and asks for the next window's before handing the reader
+this one's bytes, so the providers don't sit idle between windows; a block that a request brings after the call that asked
 for it has returned is stored all the same. A fetch that ends by an error, is cancelled, or ends with requests it
 no longer needs (a reader that stopped early, which has had at most one window fetched that it didn't read)
 closes the links of its requests still in flight, unless another fetch has a request on the same (shared) link:
@@ -118,6 +119,7 @@ from rnfs import mesh
 BUSY_DELAY = 2.0  # seconds before a busy provider is asked again
 MAX_STALLS = 2  # a provider that stalls this often fails
 WINDOW = 32  # chunks fetched ahead of what a byte-range read has written out
+SLOW_WINDOW = 1  # the same while no provider known is over a fast link (Fetch._window): one chunk, one ahead
 POLL = 0.5  # seconds between checks while waiting for responses
 DAG_NODE_GUESS = 8 * KIB  # assumed size of a DAG node block when reserving a request's batch
 MAX_BATCH = 32  # CIDs reserved for one request at most; the client sends as many as fit one packet
@@ -827,7 +829,8 @@ class Fetch:
 
     def read_range(self, target: Expect, offset: int = 0, length: int | None = None) -> Iterator[bytes]:
         """The bytes of the file target in [offset, offset + length), fetching only the chunks covering them
-        and the nodes above, WINDOW chunks at a time. Raises ValueError for a directory.
+        and the nodes above, a window of chunks at a time (_window: WINDOW, or SLOW_WINDOW while no provider known
+        is over a fast link). Raises ValueError for a directory.
 
         The next window's chunks are asked for before this one's bytes are handed to the reader, so the
         providers keep working while it reads; a reader that stops early has fetched at most one window more
@@ -862,15 +865,30 @@ class Fetch:
                 yield from self._read_window(window, ahead)
                 window = ahead
 
-    @staticmethod
-    def _next_window(leaves: Iterator[tuple[Expect, int, int]],
+    def _next_window(self, leaves: Iterator[tuple[Expect, int, int]],
                      small: walker.SmallLeaves) -> list[tuple[Expect, int, int]]:
-        """The next WINDOW chunks of a range's walk (fewer at its end, none past it), each met by small."""
-        window = []
-        for leaf in islice(leaves, WINDOW):
-            small.meet(leaf[2])
+        """The next window of chunks of a range's walk (fewer at its end, none past it), each met by small: sized by
+        _window once its first chunk is reached, so the file nodes above it, fetched on the way, have brought
+        their providers."""
+        first = next(leaves, None)
+        if first is None:
+            return []
+        small.meet(first[2])
+        window = [first]
+        for leaf in islice(leaves, self._window() - 1):
+            small.meet(leaf[2])  # each as it is reached, before the walk fetches the nodes above the next
             window.append(leaf)
         return window
+
+    def _window(self) -> int:
+        """Chunks a byte-range read fetches at a time: WINDOW if a usable provider is reached over a fast link
+        (not _slow), else SLOW_WINDOW, with as many asked for ahead. With every provider over a slow link (or none
+        known yet: say, the root and file nodes were stored already), a large window would hold the reader's first
+        byte back for hours, while the providers can't send any faster anyway (they share one request per slow
+        interface, _slot)."""
+        if any(not self._slow(provider.node_id, provider.path) for provider in self._usable()):
+            return WINDOW
+        return SLOW_WINDOW
 
     def _read_window(self, window: list[tuple[Expect, int, int]],
                      ahead: list[tuple[Expect, int, int]]) -> Iterator[bytes]:

@@ -2050,8 +2050,10 @@ Everything in the specification is implemented, with these simplifications and a
   holding pins. Both stores are `RowStore`s in SNAPSHOT mode, NORMAL: asked entries saved after each ask and with
   the batched saves, served outcomes with the remote pins waiting (every second, in `maintain`); each change tells
   the node, which publishes a `remote_pin` event.
-- Byte-range reads (`cat`, gateway) walk the file lazily and fetch 32 chunks (`WINDOW`) at a time ahead of what
-  has been written out. The next window is asked for before the current one is handed to the reader, so every
+- Byte-range reads (`cat`, gateway, sealed reads) walk the file lazily and fetch a window of chunks at a time
+  ahead of what has been written out: `WINDOW` (32) while a usable provider is reached over a fast link, else
+  `SLOW_WINDOW` (1), also while none is known yet (`Fetch._window`, asked once each window's first chunk is reached,
+  so the file nodes above it have brought their providers). The next window is asked for before the current one is handed to the reader, so every
   provider stays busy across window boundaries (a block that arrives after the call that asked for it is stored,
   not dropped). A reader that stops early has fetched at most one window more than it read; when its fetch ends,
   the links it still has requests on are closed (`PeerClient.close_unless_used`) unless another fetch is using one,

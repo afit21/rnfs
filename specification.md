@@ -1127,9 +1127,12 @@ protocol constants are unchanged, and each run of a lookup keeps its termination
    chunks of 4 KiB or more (one level up to 1 MiB, seven for any size): a range ends inside at most two nodes
    of a level. Otherwise it fails ("too large"); a requester counts a file node not yet received as
    `MAX_BLOCK_SIZE`, as in item 5, so a small range ending in two nodes of a level asks for them one at a
-   time. The chunks are fetched a window (32 chunks) at a time, and the next window's are asked for before the
+   time. The chunks are fetched a window at a time, and the next window's are asked for before the
    reader is handed the current one's bytes, so the providers don't wait for the reader; a reader that stops
-   early has had at most one window fetched that it didn't read.
+   early has had at most one window fetched that it didn't read. rnfs sizes each window by the providers' links
+   (item 7): 32 chunks while a provider is reached over a fast link, else one (one chunk, the next asked for
+   ahead), also while no provider is known yet; 32 chunks (2 MiB) would hold the first byte back for about 5 hours
+   at 1 kbit/s.
 7. Spread requests over up to `max_parallel_providers` providers (1 on slow nodes, where parallel transfers only
    contend for the same channel). Whether a link is slow is judged per provider, not per node, so a node with a
    fast and a slow interface (a gateway) isn't slow but doesn't run parallel transfers over its radio either: a

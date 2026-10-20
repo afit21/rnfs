@@ -1096,6 +1096,50 @@ class ReadAheadTest(FetcherTest):
         self.assertEqual(self.client.closed, [])
 
 
+class RangeWindowTest(FetcherTest):
+    """A byte-range read's window follows the providers' links: WINDOW chunks while one is over a fast link, else
+    SLOW_WINDOW (one chunk, one more asked for ahead), so the first byte over LoRa doesn't wait for 32 chunks."""
+
+    def setUp(self):
+        """A file of eight chunks, held by P1."""
+        super().setUp()
+        self.data = os.urandom(8 * CHUNK_SIZE)
+        self.built = self.file(self.data)
+        self.chunks = [child.cid for child in dag.decode(self.network[self.built.cid]).children]
+        self.hold(P1)
+        self.runs.append([P1])
+
+    def first_piece(self, path: mesh.PathInfo) -> list[Cid]:
+        """Read the file with P1 behind path; the CIDs asked for by the time the reader has its first bytes (and the
+        whole file read after)."""
+        self.fetcher.path_info = lambda node_id: path
+        with self.fetcher.open(self.built.cid) as fetch:
+            reader = fetch.read_range(fetch.resolve())
+            pieces = [next(reader)]
+            asked = self.client.asked(P1)
+            pieces.extend(reader)
+        self.assertEqual(b"".join(pieces), self.data)
+        return asked
+
+    def test_a_slow_link_reads_one_chunk_at_a_time_one_ahead(self):
+        asked = self.first_piece(mesh.PathInfo(1, "LoRa", 1200))
+        self.assertEqual(asked, [self.built.cid] + self.chunks[:2])
+
+    def test_a_fast_link_reads_a_full_window(self):
+        asked = self.first_piece(mesh.PathInfo(1, "TCP", 10_000_000))
+        self.assertEqual(sorted(asked), sorted([self.built.cid] + self.chunks))  # fewer than WINDOW: all of them
+
+    def test_with_no_provider_known_yet_the_first_window_is_small(self):
+        self.storage.put(self.built.cid, self.network[self.built.cid])  # the root stored: no provider asked for it
+        with self.fetcher.open(self.built.cid) as fetch:
+            reader = fetch.read_range(fetch.resolve())
+            pieces = [next(reader)]
+            self.assertEqual(self.client.asked(P1), self.chunks[:2])
+            pieces.extend(reader)  # P1 is known, over a link not known to be slow: the rest in one window
+            self.assertEqual(fetch._window(), fetcher_module.WINDOW)
+        self.assertEqual(b"".join(pieces), self.data)
+
+
 class ReadAheadLinkTest(unittest.TestCase):
     """An early-closing reader over the real PeerClient and LinkPool (RNS faked as in test_links): its link is torn
     down, which stops the response, unless another fetch has a request on it; it never cancels the response's
