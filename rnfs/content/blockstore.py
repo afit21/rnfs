@@ -31,6 +31,7 @@ import os
 import stat
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterator
 
@@ -44,6 +45,7 @@ SHARD_DIGITS = "abcdefghijklmnopqrstuvwxyz234567"  # the lowercase base32 digits
 # Subdirectories sync() syncs at once: a large add writes into most of the 1,024, and directory syncs that overlap
 # share the filesystem's journal commits (one at a time took 3 ms each on an NVMe SSD, 16 at once a fifth of that)
 SYNC_THREADS = 16
+PROGRESS_INTERVAL = 30.0  # seconds between reports while blocks an older rnfs stored flat are listed and moved
 
 
 def matches(cid: Cid, block: bytes) -> bool:
@@ -87,8 +89,13 @@ class BlockStore:
         self._open()
 
     def _open(self):
-        """List blocks/ itself: delete partial files, check the subdirectories, and move flat blocks into theirs."""
+        """List blocks/ itself: delete partial files, check the subdirectories, and move flat blocks into theirs.
+
+        On a store an older rnfs wrote, listing and moving its flat blocks takes minutes for a million of them, before
+        the node starts: that is reported (once the first is met, then about every PROGRESS_INTERVAL), so a start
+        that is busy with it isn't taken for a hung one."""
         flat = []
+        started = next_report = None
         with os.scandir(self.directory) as listing:
             for entry in listing:
                 name = entry.name
@@ -104,21 +111,39 @@ class BlockStore:
                             flat.append((cid, entry.stat(follow_symlinks=False).st_size))
                     except (ValueError, OSError):
                         continue
+                    if started is None:
+                        started = time.monotonic()
+                        next_report = started + PROGRESS_INTERVAL
+                        self._tell(f"found blocks an older rnfs stored directly in {self.directory}: listing them "
+                                   "to move them into subdirectories (once; on a large store this takes minutes)")
+                    elif time.monotonic() >= next_report:
+                        next_report = time.monotonic() + PROGRESS_INTERVAL
+                        self._tell(f"listed {len(flat)} blocks to move so far")
         if not flat:
             return
-        if self._report is not None:
-            self._report(f"moving {len(flat)} block{'' if len(flat) == 1 else 's'} into subdirectories of "
-                         f"{self.directory} (on a large store this takes a while, once)")
-        for cid, size in flat:
+        self._tell(f"moving {len(flat)} block{'' if len(flat) == 1 else 's'} into subdirectories of "
+                   f"{self.directory} (on a large store this takes a while, once)")
+        next_report = time.monotonic() + PROGRESS_INTERVAL
+        for done, (cid, size) in enumerate(flat, 1):
             self.found_flat[cid] = size
             if not self._move_flat(cid):
                 self._flat.add(cid)
+            if time.monotonic() >= next_report and done < len(flat):
+                next_report = time.monotonic() + PROGRESS_INTERVAL
+                self._tell(f"moved {done} of {len(flat)} blocks")
         with self._lock:
             self._top_dirty = True
         self.sync()
-        if self._flat and self._report is not None:
-            self._report(f"{len(self._flat)} block{'' if len(self._flat) == 1 else 's'} couldn't be moved into "
-                         f"subdirectories; they stay readable, and the next start tries again")
+        self._tell(f"moved {len(flat)} block{'' if len(flat) == 1 else 's'} into subdirectories in "
+                   f"{time.monotonic() - started:.0f} s")
+        if self._flat:
+            self._tell(f"{len(self._flat)} block{'' if len(self._flat) == 1 else 's'} couldn't be moved into "
+                       f"subdirectories; they stay readable, and the next start tries again")
+
+    def _tell(self, text: str):
+        """Report text through report, if one was given."""
+        if self._report is not None:
+            self._report(text)
 
     def _move_flat(self, cid: Cid) -> bool:
         """Move the block for cid from blocks/ into its subdirectory, or delete it if one is there already (the same

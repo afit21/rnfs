@@ -114,6 +114,21 @@ class OpenTest(StateDbTest):
         self.assertEqual(db.query("SELECT cid, source FROM pins"), [(b"x", "user")])
         self.assertEqual(db.query("SELECT count(*) FROM lxmf_messages"), [(0,)])
 
+    def test_an_upgrade_is_said(self):
+        """Upgrading an existing database is logged before and after (on a large one it takes minutes of a start);
+        creating a new one isn't."""
+        with mock.patch.object(statedb, "SCHEMA", statedb.SCHEMA[:2]):
+            statedb.connect(self.state).close()
+        with mock.patch.object(statedb, "log") as log:
+            self.connect()
+        said = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(said[0].startswith("upgrading the state database"), said)
+        self.assertIn(f"{len(statedb.SCHEMA) - 2} steps", said[0])
+        self.assertTrue(said[1].startswith("upgraded the state database in"), said)
+        with tempfile.TemporaryDirectory() as fresh, mock.patch.object(statedb, "log") as log:
+            statedb.connect(fresh).close()
+        self.assertEqual([call for call in log.call_args_list if "upgrad" in call.args[0]], [])
+
     def test_lxmf_pins_become_app_pins(self):
         """The 0.2.0 step "lxmf_app_pins" rewrites valid lxmf:<address> pins as app:lxmf:<address>, the LXMF wrapper
         app's; other sources, and lxmf: ones that aren't valid (which storage deletes at load, as before), are left

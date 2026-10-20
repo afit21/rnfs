@@ -458,6 +458,13 @@ class _Database:
             raise RnfsError(f"the state database {self.path} was written by a newer version of rnfs (schema "
                             f"{version}; this version knows up to {len(SCHEMA)}); run that version or a later "
                             "one (rnfs never moves state back to an older format)")
+        # An existing database's upgrade can take minutes on a large one (steps that move rows): said, so a start that
+        # is busy with it isn't taken for a hung one. A new database's steps only create tables
+        started = time.monotonic()
+        if 0 < version < len(SCHEMA):
+            steps = plural(len(SCHEMA) - version, "step")
+            log(f"upgrading the state database {self.path} for this version of rnfs ({steps}; once, and on a large "
+                "database it takes a while)", LOG_NOTICE)
         for number in range(version, len(SCHEMA)):
             with self.transaction(durable=True) as tx:
                 for step in SCHEMA[number][1]:
@@ -466,6 +473,8 @@ class _Database:
                     else:
                         tx.execute(step)
                 tx.execute(f"PRAGMA user_version = {number + 1}")
+        if 0 < version < len(SCHEMA):
+            log(f"upgraded the state database in {time.monotonic() - started:.1f} s", LOG_NOTICE)
 
     @contextmanager
     def transaction(self, durable: bool) -> Iterator:

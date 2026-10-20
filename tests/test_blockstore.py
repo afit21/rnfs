@@ -10,6 +10,7 @@ from unittest import mock
 
 from rnfs import fsutil
 from rnfs.constants import MAX_BLOCK_SIZE
+from rnfs.content import blockstore
 from rnfs.content.blockstore import PARTIAL_PREFIX, SHARD_DIGITS, BlockStore, is_shard_name, matches, shard_of
 from rnfs.content.cid import DAG, RAW, Cid
 from rnfs.errors import RnfsError
@@ -352,11 +353,27 @@ class FlatLayoutTest(unittest.TestCase):
         self.assertEqual(found.pop(""), ["notes.txt"])  # the partial file deleted, the blocks moved
         self.assertEqual(found, {shard: sorted(str(cid) for cid in self.blocks if shard_of(str(cid)) == shard)
                                  for shard in {shard_of(str(cid)) for cid in self.blocks}})
-        self.assertEqual(len(reports), 1)
-        self.assertIn("moving 40 blocks", reports[0])
+        # Said as soon as the first is met (listing a million takes minutes), then the move and its end
+        self.assertEqual(len(reports), 3, reports)
+        self.assertIn("found blocks an older rnfs stored directly in", reports[0])
+        self.assertIn("moving 40 blocks", reports[1])
+        self.assertIn("moved 40 blocks into subdirectories in", reports[2])
         reports.clear()
         self.check(BlockStore(self.dir, report=reports.append))  # nothing left to move, nothing said
         self.assertEqual(reports, [])
+
+    def test_progress_is_reported_while_listing_and_moving(self):
+        """A start busy listing and moving many flat blocks says how far it got about every PROGRESS_INTERVAL, so it
+        isn't taken for a hung one (here every block, the interval being 0)."""
+        reports = []
+        with mock.patch.object(blockstore, "PROGRESS_INTERVAL", 0):
+            self.check(BlockStore(self.dir, report=reports.append))
+        listed = [text for text in reports if text.startswith("listed ")]
+        moved = [text for text in reports if text.startswith("moved ") and " of " in text]
+        self.assertTrue(listed)
+        self.assertEqual(len(moved), 39)  # each block but the last, whose end is said once
+        self.assertEqual(moved[0], "moved 1 of 40 blocks")
+        self.assertIn("moved 40 blocks into subdirectories in", reports[-1])
 
     @unittest.skipIf(fsutil.IS_WINDOWS, "Windows can't sync a directory")
     def test_directories_are_synced_after_the_move(self):
