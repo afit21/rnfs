@@ -2527,8 +2527,11 @@ Everything in the specification is implemented, with these simplifications and a
   both reading the path's newest emission, which is the announce's own since RNS calls handlers only for one that
   takes the path. Each sample is kept as emission less monotonic arrival, per sender its largest in a window of
   2 × `announce_interval`, at most 128 nodes and 128 names; the estimate is the median over the nodes and as many
-  names as make up 5 senders, otherwise fewer than the nodes. It is reported (`report`, logged by names) past
-  300 s, and again once back within 240 s.
+  names as make up 5 senders, otherwise fewer than the nodes. Only "behind" is reported: RNS delivers many
+  announces late (it holds those arriving on an interface that just came up and releases one every few seconds,
+  `Interface.held_announces`; transport nodes queue them past the 2% cap), which looks just like a clock ahead.
+  So a warning (`report`, logged by names) comes past 300 s behind, and again once back within 240 s, and
+  `status()` gives `behind()`, 0 when the estimate says ahead.
 - **Names.** A key imported, or found without a `names_published` row, is marked `imported`: its first publish
   offers kept records, makes a path request and queries keepers before choosing a sequence. `publish()` pins the new
   target, saves its row (the commit point; a failed commit rolls the record back and releases the new pin) and only

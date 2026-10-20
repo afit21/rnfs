@@ -373,7 +373,9 @@ class OtherCommandTest(CliTestCase):
 
     def test_status_clock(self):
         """status prints clock_offset and announces_held as fields, and warns on stderr of a clock estimated over 5
-        minutes off and of names whose announces are held; not within 5 minutes, nor from a daemon before 0.2.0."""
+        minutes behind and of names whose announces are held; not within 5 minutes, never of a clock ahead (a
+        negative clock_offset, which an earlier 0.2.0 build reported: late announces look the same), nor from a
+        daemon before 0.2.0."""
         status = {"node_id": "ab" * 16, "announces_held": ["site", "blog"], "clock_offset": 3720}
         with mock.patch.object(self.node, "status", return_value=status):
             code, out, err = self.run_cli("status")
@@ -386,6 +388,7 @@ class OtherCommandTest(CliTestCase):
             "rnfs: warning: the announces of site, blog are held until the clock passes their last announce (RNS would "
             "drop them)"])
         for quiet in ({"node_id": "ab" * 16, "announces_held": [], "clock_offset": -300},
+                      {"node_id": "ab" * 16, "announces_held": [], "clock_offset": -7200},
                       {"node_id": "ab" * 16, "announces_held": [], "clock_offset": None}, {"node_id": "ab" * 16}):
             with mock.patch.object(self.node, "status", return_value=quiet):
                 self.assertEqual(self.run_cli("status")[2], "")

@@ -8,11 +8,14 @@ least delayed announce in the window), so a few wrong or lying clocks don't move
 senders. A node with many names has one clock, so names' announces count for fewer senders than nodes' do, except
 to make up the MIN_SENDERS an estimate needs.
 
-Late announces (a busy announce queue, a path answer a shared instance passes on as an announce) and replayed old
-ones can only make this node's clock look ahead, never behind; a clock that looks behind, which is what drops a
-name's announces (rnfs.names), takes senders whose clocks are ahead. The estimate is only reported: to report
-(rnfs.names logs it) when it passes WARN_OFFSET, and in `status` (clock_offset). It never changes the clock or what
-the node does. No RNS here: the CLI reads the texts.
+Late announces and replayed old ones can only make this node's clock look ahead, never behind, and RNS delivers
+many late: it holds the announces arriving on an interface that just came up (a laptop waking, a node starting)
+and releases them one every few seconds (Interface.held_announces), and each transport node queues announces past
+its 2% cap. A clock that looks ahead therefore can't be told from announces arriving late, so only "behind" is
+reported: as a warning (rnfs.names logs it) when it passes WARN_OFFSET, and in `status` (clock_offset, 0 when the
+estimate says ahead). Behind is also the direction that matters: a clock behind a name's last announce is what makes
+RNS drop the name's announces (rnfs.names), and only senders whose clocks are ahead can make this node's look so.
+It never changes the clock or what the node does. No RNS here: the CLI reads the texts.
 """
 import math
 import statistics
@@ -20,7 +23,7 @@ import threading
 import time
 from collections import OrderedDict
 
-WARN_OFFSET = 300.0  # seconds: an estimate further off than this is reported as a warning
+WARN_OFFSET = 300.0  # seconds: an estimate further behind than this is reported as a warning
 CLEAR_OFFSET = 240.0  # ... and once warned, one back within this is reported as fixed (not again at each sample)
 MIN_SENDERS = 5  # distinct senders heard within the window before there is an estimate
 MAX_SENDERS = 128  # senders kept per kind (nodes, names), the least recently heard forgotten first
@@ -93,14 +96,15 @@ class ClockSkew:
                 senders.popitem(last=False)
             offset, count = self._estimate(now)
             message = None
-            if offset is not None and not self._warned and abs(offset) > WARN_OFFSET:
+            # Only behind: ahead can't be told from announces delivered late (the module's docstring)
+            if offset is not None and not self._warned and offset > WARN_OFFSET:
                 self._warned = True
                 message = (f"this node's clock seems to be {offset_text(offset)}, going by the median of {count} "
                            "senders' recent announces; set it right: while the clock is behind a name's last "
                            "announce, the name's announces are held, since RNS would drop them")
-            elif offset is not None and self._warned and abs(offset) < CLEAR_OFFSET:
+            elif offset is not None and self._warned and offset < CLEAR_OFFSET:
                 self._warned = False
-                message = f"this node's clock is within {duration_text(offset)} of the network's again"
+                message = "this node's clock is no longer behind the network's"
             warned = self._warned
         if message is not None and self._report is not None:
             self._report(message, warned)
@@ -123,7 +127,13 @@ class ClockSkew:
         with self._lock:
             return self._estimate(self._monotonic())
 
-    def status(self) -> dict:
-        """{"clock_offset": the estimate in whole seconds, or None}: a part of the node's status."""
+    def behind(self) -> float | None:
+        """How far behind the network's this node's clock seems, in seconds: the estimate, or 0 when it says ahead
+        (which can't be told from announces arriving late); None before there is an estimate."""
         offset, _ = self.estimate()
-        return {"clock_offset": None if offset is None else round(offset)}
+        return None if offset is None else max(0.0, offset)
+
+    def status(self) -> dict:
+        """{"clock_offset": behind() in whole seconds, or None}: a part of the node's status."""
+        behind = self.behind()
+        return {"clock_offset": None if behind is None else round(behind)}

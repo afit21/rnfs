@@ -66,6 +66,19 @@ class ClockSkewTest(unittest.TestCase):
         self.nodes([0])
         self.assertEqual(self.reports, [True, False])
 
+    def test_ahead_is_never_reported(self):
+        """Announces RNS delivered late (held after an interface came up, or queued past a transport node's cap) make
+        the estimate say ahead; that can't be told from a clock ahead, so it is neither warned of nor shown: status
+        reads 0 and behind() 0, while the estimate itself stays as measured."""
+        self.nodes([-7200] * 8)  # every sender's only announce heard two hours after it was emitted
+        self.assertEqual(self.skew.estimate()[0], -7200)
+        self.assertEqual(self.skew.behind(), 0)
+        self.assertEqual(self.skew.status(), {"clock_offset": 0})
+        self.assertEqual(self.reports, [])
+        self.nodes([600] * 9, start=8)  # a clock really behind is still told, once most senders say so
+        self.assertEqual(self.skew.status(), {"clock_offset": 600})
+        self.assertEqual(self.reports, [True])
+
     def test_late_announces_count_as_their_least_delayed(self):
         """A sender's least delayed announce in the window counts: an announce held in a queue (emitted long before
         it arrived) doesn't replace a timely one."""

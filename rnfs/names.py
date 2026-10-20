@@ -1588,11 +1588,11 @@ class NameManager:
                 f"announce: held {duration_text(held)}, by when every path taken from that announce has lapsed",
                 LOG_WARNING)
             return False
-        offset, _ = self.clock_skew.estimate()
+        behind = self.clock_skew.behind()
         reason = (f"announce held: this node's clock is {duration_text(last - now)} behind the name's last announce, "
                   "and RNS drops an announce emitted no later than the one a node took its path from; it goes out "
-                  "once the clock passes it" + ("" if offset is None else
-                                                f" (going by the announces heard, it is {offset_text(offset)})"))
+                  "once the clock passes it" + ("" if not behind else
+                                                f" (going by the announces heard, it is {offset_text(behind)})"))
         if hold is None:
             self._holding[alias] = _Hold(self._monotonic(), reason)
             log(f"name {alias}: {reason}", LOG_WARNING)

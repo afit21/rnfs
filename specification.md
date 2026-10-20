@@ -1739,9 +1739,12 @@ interfaces, 6 hours on roaming ones).
   pass on as announces): per sender its least delayed announce over 2 × `announce_interval`, and the median over
   senders, so that a few wrong or lying clocks can't move it. A node publishing many names has one clock, so
   names count for fewer senders than nodes do, except to make up the 5 an estimate needs. Late and replayed
-  announces can only make the clock look ahead, never behind. rnfs reports the estimate in `status`
-  (`clock_offset`, seconds, positive when this node's clock is behind; null until 5 senders were heard) and logs a
-  warning while it is over 5 minutes off; it never changes the clock or what the node does.
+  announces can only make the clock look ahead, never behind, and RNS delivers many announces late (it holds those
+  arriving on an interface that just came up, and transport nodes queue announces past their 2% cap), so a clock
+  that looks ahead can't be told from late announces. A node SHOULD therefore report only a clock that looks behind,
+  which is also what makes RNS drop a name's announces. rnfs reports it in `status` (`clock_offset`, seconds this
+  node's clock is behind, 0 when the estimate says ahead; null until 5 senders were heard) and logs a warning while
+  it is over 5 minutes behind; it never changes the clock or what the node does.
 
 Before the first publish of a key imported from elsewhere, or found without stored state, the node resolves
 the name through the network and asks keepers (below), since the key's earlier records may be held only there.

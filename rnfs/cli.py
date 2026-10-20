@@ -1093,13 +1093,14 @@ def run_status(args):
 
 
 def clock_warnings(status: dict) -> list[str]:
-    """`rnfs status`'s warnings of the clock: an estimated offset beyond WARN_OFFSET, and names whose announces are
-    held because the clock is behind their last announce; none from a daemon before 0.2.0."""
+    """`rnfs status`'s warnings of the clock: the clock estimated behind by more than WARN_OFFSET (never ahead, which
+    can't be told from announces arriving late: rnfs.clockskew), and names whose announces are held because the clock
+    is behind their last announce; none from a daemon before 0.2.0."""
     from rnfs.clockskew import WARN_OFFSET, offset_text  # no RNS
 
     warnings = []
     offset = status.get("clock_offset")
-    if type(offset) in (int, float) and abs(offset) > WARN_OFFSET:
+    if type(offset) in (int, float) and offset > WARN_OFFSET:
         warnings.append(f"this node's clock seems to be {offset_text(offset)}, going by the announces it hears; "
                         "set it right")
     held = status.get("announces_held")

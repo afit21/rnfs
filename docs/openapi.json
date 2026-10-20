@@ -6539,7 +6539,7 @@
               "integer",
               "null"
             ],
-            "description": "The network's clock less this node's, in seconds (positive: this node's is behind), estimated from the emission times of the announces it hears: the median over the nodes and names heard in the last 2 x announce_interval, one value each; null until 5 were. Only reported, and logged past 5 minutes (rnfs 0.2.0)."
+            "description": "How many seconds this node's clock seems behind the network's, estimated from the emission times of the announces it hears: the median over the nodes and names heard in the last 2 x announce_interval, one value each; null until 5 were. Never negative: a clock that looks ahead can't be told from announces delivered late, so it reads 0. Only reported, and logged past 5 minutes behind (rnfs 0.2.0)."
           },
           "local_servers": {
             "type": "integer",

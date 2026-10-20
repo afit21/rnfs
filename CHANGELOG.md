@@ -299,8 +299,9 @@ Added:
   out once the clock passes the last one, or after a week held in all. `GET /api/status` (`Status`) gains
   `announces_held` and `clock_offset`, the clock's offset from the network's estimated from the emission times of
   the announces heard (the median over senders, so a few wrong clocks don't move it); a warning is logged, and
-  printed by `rnfs status`, while it is over 5 minutes off. The estimate never changes the clock or what the node
-  does. Name syncs publish through the same path.
+  printed by `rnfs status`, while the clock is over 5 minutes behind. Only behind is reported: RNS delivers many
+  announces late (it holds those arriving on an interface that just came up), which looks like a clock ahead, so
+  `clock_offset` reads 0 then. The estimate never changes the clock or what the node does. Name syncs publish through the same path.
 - **Pin by NomadNet address:** `rnfs add <destination>:/page/<path>` (a page as the node renders it) or
   `<destination>:/file/<path>` (a file it serves) fetches it from that NomadNet node over a link of rnfs's own and adds
   it like a file, pinned `user` (with an app's token, that app's source) with the link as its origin in `pin ls`; the
