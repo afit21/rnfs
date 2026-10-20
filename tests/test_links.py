@@ -240,6 +240,7 @@ class LinkPoolTest(unittest.TestCase):
         self.assertIsNot(run(self, lambda: self.pool.get(NODE)), peer)
 
     def test_unreachable(self):
+        links.RNS.Transport.has_path = lambda node_id: False
         links.RNS.Transport.await_path = lambda node_id, timeout: False
         self.assertIsNone(run(self, lambda: self.pool.get(NODE)))
 
@@ -252,8 +253,9 @@ class LinkPoolTest(unittest.TestCase):
         links.RNS.Transport.has_path = lambda node_id: False
         self.assertTrue(self.pool.await_path(NODE))
         self.assertEqual(waited, [(NODE, self.pool.config.path_timeout)])
+        # Another node: NODE's path was just requested, so it isn't asked again within PATH_REQUEST_MI (test_paths)
         links.RNS.Transport.await_path = lambda node_id, timeout: False
-        self.assertFalse(self.pool.await_path(NODE))
+        self.assertFalse(self.pool.await_path(OTHER))
 
     def test_awaited_identity_marked_used_once(self):
         # Polls for an identity still on its way don't mark the destination used; contacting it does, once (C2)

@@ -546,7 +546,7 @@ class RnfsNode:
         self.server = self.announcer = self.announce_handler = None  # made below; stop() skips those not made
         try:
             self._setup_or_close(config, bytes(self.destination.hash), PeerClient(self.links, config), slow,
-                                 names_network=None, is_known=_rns_is_known,
+                                 names_network=RnsNetwork(paths=self.links.paths), is_known=_rns_is_known,
                                  bitrate=rates.slowest_bitrate(self.reticulum), local=local)
         except BaseException:
             if embedded:

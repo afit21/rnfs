@@ -656,6 +656,22 @@ the budget, `.bad` hash mismatches, `.elapsed` from sending to the answer, which
 destination of the identity RNS recalls, and only if its hash is the node ID asked for (in private mode, also only if
 that identity is on `members`); the idle sweep spares a link `LinkPool.get()` handed out within `link_idle_timeout`.
 
+`paths.py` — `PathRequests(transport=lambda: RNS.Transport, reticulum=RNS.Reticulum.get_instance, clock, sleep,
+spacing=SPACING)`, the node's path-request budget (spec section 3, "Path requests"): `LinkPool` makes it
+(`LinkPool.paths`, over its own module's RNS, which tests replace) and the node hands it to `RnsNetwork(paths=)` (names)
+and `network/nomadnet.fetch(paths=)`. `await_path(destination, timeout, cancel)` (a known path returns at once; else a
+turn, then RNS's `Transport.await_path` with the whole timeout), `await_known(destination, known, timeout, cancel)`
+(a turn, `request_path`, then `known()` polled every `POLL`: `LinkPool._recall`'s identity wait), `send(destination)`
+(a turn, then `request_path`, unwaited: names), `charge(destination)` (`LinkPool._open` and NomadNet's `open_link` on a
+link not established: a turn taken, and the destination counted as requested). A turn (`_take_turn`) reserves
+`max(now, _next_turn)` and moves `_next_turn` a `spacing` on, so turns go in order of asking and never closer;
+`ready()` (the path or identity arrived) or `cancel` end the wait with nothing sent, and a turn lost so leaves a gap.
+At its turn a request goes unless `busiest_pr_frequency(get_interface_stats())` is over `CEILING` (1.5), else it
+reserves the next turn, for `CEILING_HOLD` (15 s) at most. `_waits` keeps one owner per destination; later callers
+wait on its event (polling `ready()`). `_sent` (an `OrderedDict`, at most `MAX_TRACKED`, older than `PATH_REQUEST_MI`
+forgotten) makes a wait within `PATH_REQUEST_MI` of the last request poll for `timeout` without sending. Counters
+`requests`, `charged`, `joined`, `reused`, `held`, `waited` are for tests and measurements.
+
 `announces.py` — `DhtAnnouncer(destination, config, needs_reach=None)` sets `app_data` to the mode and runs the
 announce schedule; a client announces periodically only while `needs_reach()` (the node's `_needs_reach`:
 provides, owns names, accepts remote pins, private mode) holds, checked every `REACH_CHECK` (60 s), announcing at

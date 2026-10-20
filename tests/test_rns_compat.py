@@ -32,7 +32,7 @@ from rnfs.constants import ID_LENGTH
 from rnfs.content import seal
 from rnfs.content.cid import RAW, Cid
 from rnfs.features import keepers
-from rnfs.network import guards, protocol, rates
+from rnfs.network import guards, paths, protocol, rates
 
 
 class Internal(NamedTuple):
@@ -217,6 +217,22 @@ INTERNALS = [
                               "ifstats['status'] = interface.online", "ifstats['bitrate'] = interface.bitrate",
                               "stats['interfaces'] = interfaces"),
                       _has(RNS.Interfaces.LocalInterface, *rates.LOCAL_INTERFACE_TYPES))),
+    Internal("network/paths.py", "Transport.PATH_REQUEST_MI; await_path(destination_hash, timeout) and "
+             "request_path(destination_hash) sending one request; Transport.jobs requesting a path again after a link "
+             "that never established, at most every PATH_REQUEST_MI; get_interface_stats() entries {hash, type, status, "
+             "outgoing_pr_frequency, parent_interface_hash}",
+             lambda: (_true(RNS.Transport.PATH_REQUEST_MI == paths.PATH_REQUEST_MI, "PATH_REQUEST_MI changed"),
+                      _params(RNS.Transport.await_path, "destination_hash", "timeout"),
+                      _params(RNS.Transport.request_path, "destination_hash"),
+                      _source(RNS.Transport.await_path, "if Transport.has_path(destination_hash): return True",
+                              "else: Transport.request_path(destination_hash, on_interface=on_interface)"),
+                      _source(RNS.Transport.jobs, "Transport.expire_path(link.destination.hash)",
+                              "if time.time() - last_path_request > Transport.PATH_REQUEST_MI:"),
+                      _source(RNS.Reticulum.get_interface_stats, "ifstats['hash'] = interface.get_hash()",
+                              "ifstats['parent_interface_hash'] = interface.parent_interface.get_hash()",
+                              "ifstats['outgoing_pr_frequency'] = interface.outgoing_pr_frequency()",
+                              "ifstats['type'] = str(type(interface).__name__)",
+                              "ifstats['status'] = interface.online"))),
 
     # Sealed files
     Internal("content/seal.py", "RNS.Cryptography.hkdf(length, derive_from, salt, context), "

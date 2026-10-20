@@ -128,6 +128,28 @@ names in `lower_case` are local settings; both are listed in section 12. Appendi
 - A transport node answers a request for a destination it has a path to; it forwards one for a path it lacks only as
   above (an access-point, gateway, roaming or boundary interface, or `recursive_prs`). A node that isn't a transport
   node answers only for its own destinations.
+- A node SHOULD pace its own path requests, so RNS's estimate for it at the next hop's interface stays well under a
+  new interface's 3 a second. rnfs keeps one budget per node for every path request it sends (link opens, so lookups,
+  stores, fetches and keeper queries; a lookup's path check; name resolves; NomadNet adds): each takes a turn at least
+  1 s after the last, and requests 1 s apart peak at an estimate of 1.5 a second. A request waiting for its turn
+  hasn't failed, and the wait isn't part of `path_timeout`, which starts once it is sent. A turn is also put off while
+  the busiest interface's outgoing estimate (RNS's `outgoing_pr_frequency` from `get_interface_stats`, through a
+  shared instance too, which counts other applications' requests; a hub's server interface, which counts a copy for
+  each client, left out) is above 1.5 a second, for at most 15 s. Not while an interface's own limit is active
+  (`pr_burst_active`): that comes from other nodes' requests, so on a shared channel every node would wait on the same
+  signal and resume together (in the topology simulation it raised an island-wide cold start's trips from 0.9 to 9.8
+  an hour). A link that fails to establish costs a turn, as RNS then requests the path again. One wait per
+  destination runs at a time (RNS's `Transport.await_path` doesn't join concurrent callers; later callers wait for
+  it), and nothing is sent again for a destination within `PATH_REQUEST_MI` of its last request, RNS's own included: a
+  caller then waits `path_timeout` for the answer still on its way.
+- In the topology simulation (docs/simulations/topology, section 11; 1,000 and 3,000 servers) the pacing keeps a fast
+  node that starts for the first time from tripping its hub's interface (peak estimate 1.5 a second): none of its
+  ~45 requests is dropped (7–10 were at a hub taking 2–10 ms a packet), and no such node has 3 failed queries in a
+  row (58–68% did, enough for partition mode on a gateway). Its first publish round takes 41–45 s instead of 7 s
+  (22–25 s with drops); an island publisher's 25–31 minute round takes 60–80 s more; searches send none. On a shared
+  radio channel the gateway's interface counts every node's requests, so pacing can't keep it under the limit in an
+  island-wide cold start on faster LoRa; that is harmless for rnfs, as a limited request is still answered when the
+  gateway has the path. Established nodes send almost none: they have every path from announces.
 
 **Links.**
 - Requests to a node share one outgoing link, opened on demand and closed after `link_idle_timeout` without
@@ -2371,7 +2393,7 @@ Reticulum, the DHT mode and private mode never apply before a restart.
 | `stall_timeout` | 120 s | A response with no progress for this long is cancelled and refunded |
 | `blocks_cooldown` | 300 s | A link (and its identity) whose response made no progress is refused `/blocks` this long |
 | `lookup_timeout` | 10 min | |
-| `path_timeout` | 30 s | Waiting for an RNS path |
+| `path_timeout` | 30 s | Waiting for an RNS path, from when the path request is sent (a wait for its turn, section 3, isn't counted) |
 | `max_failures` | 3 | Unanswered queries in a row before a node is dropped; busy refusals in a row before a provider fails |
 | `link_idle_timeout` | 5 min | |
 | `max_incoming_links` | 128 | |

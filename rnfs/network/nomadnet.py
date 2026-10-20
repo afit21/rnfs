@@ -28,6 +28,8 @@ links keep every rule they have, and an embedded node leaves its host's settings
 - A page answer is checked from its msgpack headers before RNS decodes it (guards: protocol.page_response_refusal):
   one flat byte string. A file answer is copied, no larger than the advertised total, inside the response callback,
   since RNS deletes its file once the callback returns.
+- Path requests take their turn in the node's budget (network/paths.py: not part of path_timeout), and a link that
+  fails to establish costs a turn, as RNS then requests the path again.
 - Timeouts: the path and the identity (path_timeout each), the link's establishment (RNS's timeout plus
   links.ESTABLISH_GRACE), and the answer: RNS's own request timeout until an answer starts, then no progress for
   stall_timeout, or an overall deadline (the answer's size at FLOOR_RATE) fails the fetch.
@@ -47,6 +49,7 @@ from rnfs import nomadnet
 from rnfs.errors import Cancelled, NotFound, TooLarge
 from rnfs.log import LOG_VERBOSE, LOG_WARNING, log, node_name, size
 from rnfs.network import guards, links, protocol
+from rnfs.network.paths import PathRequests
 
 SEGMENT_SIZE = RNS.Resource.MAX_EFFICIENT_SIZE  # the most an honest Resource segment holds, metadata included
 SEGMENT_LIMIT = SEGMENT_SIZE + 1  # each segment's max_decompressed_size: RNS refuses one that reaches it unfinished
@@ -297,30 +300,29 @@ def remove_leftovers(directory: str):
             _remove(os.path.join(directory, name))
 
 
-def _recall(destination_hash: bytes, timeout: float):
-    """The identity RNS knows for destination_hash, after a path request (whose answer carries it) if needed."""
+def _recall(destination_hash: bytes, timeout: float, paths: PathRequests):
+    """The identity RNS knows for destination_hash, after a path request in its turn in paths (whose answer carries
+    it) if needed."""
     identity = RNS.Identity.recall(destination_hash)
     if identity is not None:
         return identity
-    RNS.Transport.request_path(destination_hash)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        time.sleep(0.1)
-        found = RNS.Identity.recall(destination_hash, _no_use=True)
-        if found is not None:
-            return RNS.Identity.recall(destination_hash) or found
+    if paths.await_known(destination_hash, lambda: RNS.Identity.recall(destination_hash, _no_use=True) is not None,
+                         timeout):
+        return RNS.Identity.recall(destination_hash) or RNS.Identity.recall(destination_hash, _no_use=True)
     return None
 
 
-def open_link(target: nomadnet.NomadnetLink, path_timeout: float):
-    """An established link to target's NomadNet node, marked for the guards. Raises NotFound if there is no path,
-    no identity, or the link can't be established in time."""
+def open_link(target: nomadnet.NomadnetLink, path_timeout: float, paths: PathRequests | None = None):
+    """An established link to target's NomadNet node, marked for the guards; its path requests take their turns in
+    paths (the node's budget; None: a budget of this fetch's own). Raises NotFound if there is no path, no identity,
+    or the link can't be established in time."""
     destination_hash, name = target.destination, node_name(target.destination)
+    paths = paths if paths is not None else PathRequests()
     if not RNS.Transport.has_path(destination_hash):
         log(f"requesting a path to NomadNet node {name}", LOG_VERBOSE)
-    if not RNS.Transport.await_path(destination_hash, timeout=path_timeout):
+    if not paths.await_path(destination_hash, path_timeout):
         raise NotFound(f"no path to NomadNet node {name} after {path_timeout:g}s")
-    identity = _recall(destination_hash, path_timeout)
+    identity = _recall(destination_hash, path_timeout, paths)
     if identity is None:
         raise NotFound(f"have a path to NomadNet node {name} but not its identity (none after {path_timeout:g}s)")
     destination = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, nomadnet.APP_NAME,
@@ -337,6 +339,7 @@ def open_link(target: nomadnet.NomadnetLink, path_timeout: float):
     settled.wait(timeout + links.ESTABLISH_GRACE)
     if link.status != RNS.Link.ACTIVE:
         link.teardown()
+        paths.charge(destination_hash)  # RNS now requests the path again by itself
         raise NotFound(f"couldn't connect to NomadNet node {name}: " + (
             links.close_reason(link) if link.status == RNS.Link.CLOSED else "not established in time"))
     return link
@@ -344,7 +347,7 @@ def open_link(target: nomadnet.NomadnetLink, path_timeout: float):
 
 def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, max_size: int | None = None,
           progress: Callable[[int, int | None], None] | None = None,
-          stop_event: threading.Event | None = None) -> Snapshot:
+          stop_event: threading.Event | None = None, paths: PathRequests | None = None) -> Snapshot:
     """Fetch target from its NomadNet node into a file in directory (see the module): its Snapshot.
 
     identity (an RNS.Identity) identifies the link first; a "Request Not Allowed" page on an identified link is
@@ -352,9 +355,10 @@ def fetch(target: nomadnet.NomadnetLink, config, directory: str, identity=None, 
     progress(received, total) is called from this thread about every links.POLL_INTERVAL while the answer arrives
     (total None until it is known), and may raise to stop the fetch (a job's Cancelled); stop_event, once set, stops
     it too. Raises NotFound (unreachable, no answer, an answer refused, or NomadNet's "Request Not Allowed" page),
-    TooLarge (the answer is over max_size, or a page over MAX_PAGE_SIZE), Cancelled, OSError.
+    TooLarge (the answer is over max_size, or a page over MAX_PAGE_SIZE), Cancelled, OSError. paths is the node's
+    path-request budget (open_link).
     """
-    link = open_link(target, config.path_timeout)
+    link = open_link(target, config.path_timeout, paths)
     try:
         if identity is not None:
             link.identify(identity)

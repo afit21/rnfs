@@ -570,6 +570,16 @@ Changed:
   it waiting. Not for a path its directory shows doesn't exist, nor for a job submitted with the new `retry: false`
   (`POST /api/jobs`; `retry=False` in the library's `jobs.get`, `pin` and `export`), which fails as in 0.1.6. A
   foreground `rnfs get`, `pin add` or `export` submits so, and still fails at once; `--background` jobs wait.
+- Path requests are paced node-wide: since RNS 1.2.5 every interface limits the path requests arriving on it (3 a
+  second while it is under 2 hours old, as a hub's interface for a newly connected client is), and a fresh node's
+  join and first publish round sent dozens at once, so its hub dropped some and the queries failed after
+  `path_timeout`, enough for partition mode on a gateway. Every path request rnfs sends (link opens, a lookup's path
+  check, name resolves, NomadNet adds) now waits its turn, at least 1 s after the last, and while the busiest
+  interface already sends more than 1.5 a second (other applications' requests included, at most 15 s); the wait
+  isn't counted in `path_timeout`. A link that fails to establish costs a turn, as RNS then asks again by itself;
+  concurrent waits for one destination share one request, and none is sent again within 20 s of the last. In the
+  topology simulation a fresh fast node's hub no longer drops any of its requests and its first publish round takes
+  41–45 s instead of 7 s (22–25 s with drops); island rounds take 60–80 s more of 25–31 minutes.
 
 Faster:
 - Range reads (`cat`, the gateway, sealed reads) size their window by the providers' links: they fetched 32 chunks

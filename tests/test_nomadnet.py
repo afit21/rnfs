@@ -59,7 +59,8 @@ class FakeNomadnet:
                         "/file/music/song.mp3": (FILE_BYTES, b"song.mp3", True)}
         self.calls: list[dict] = []
 
-    def __call__(self, target, config, directory, identity=None, max_size=None, progress=None, stop_event=None):
+    def __call__(self, target, config, directory, identity=None, max_size=None, progress=None, stop_event=None,
+                 paths=None):
         """The fetch."""
         self.calls.append({"target": target, "directory": directory, "identity": identity, "max_size": max_size})
         if target.path not in self.answers:
@@ -136,7 +137,7 @@ class FetchFlowTest(unittest.TestCase):
         self.tmp = self.enterContext(tempfile.TemporaryDirectory())
         self.link = mock.Mock()
         self.answers: list[bytes] = []
-        self.enterContext(mock.patch.object(fetching, "open_link", lambda target, timeout: self.link))
+        self.enterContext(mock.patch.object(fetching, "open_link", lambda target, timeout, paths=None: self.link))
         self.enterContext(mock.patch.object(fetching, "_request", self.request))
         self.config = mock.Mock(path_timeout=1)
 
